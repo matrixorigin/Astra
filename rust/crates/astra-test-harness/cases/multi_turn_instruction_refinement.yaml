@@ -23,7 +23,7 @@ steps:
         needle: "///"
       - type: text_contains
         needle: "String"
-  - prompt: "I always want /// doc comments on every public function in this project. Please remember this convention for our future conversations using memory {action: "store"}."
+  - prompt: "I always want /// doc comments on every public function in this project. Please remember this convention for our future conversations using memory_store."
     criteria:
       - type: tool_called
         name: memory

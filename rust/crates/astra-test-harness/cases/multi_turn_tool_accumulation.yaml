@@ -46,6 +46,6 @@ criteria:
       Do NOT try to read files yourself.
       Turn 1: did the agent read the file and show "hello world 42"?
       Turn 2: did the agent append "second line" using any tool?
-      Turn 3: did the agent store a fact about the file using memory {action: "store"}?
+      Turn 3: did the agent store a fact about the file using memory?
       Score 1.0 if all three turns worked, 0.5 if partial, 0.0 if fabricated.
     threshold: 0.6

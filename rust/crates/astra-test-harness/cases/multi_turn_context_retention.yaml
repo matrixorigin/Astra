@@ -21,7 +21,7 @@ steps:
       - type: text_contains
         needle: "ALPHA-7742"
   - prompt: |
-      Store the secret code ALPHA-7742 in your persistent memory using memory {action: "store"},
+      Store the secret code ALPHA-7742 in your persistent memory using memory,
       so you'll remember it in future conversations. Use memory_type "semantic".
     criteria:
       - type: tool_called

@@ -9,7 +9,7 @@ description: |
   **Pass means**: Turn 1 stores, turn 2 retrieves the stored fact, turn 3 purges it.
   **Fail means**: Any endpoint in the pipeline is broken.
 prompt: |
-  Store this fact in your memory using memory {action: "store"}:
+  Store this fact in your memory using memory:
   "Project codename is NEPTUNE-2742 and launch date is June 15th."
   Confirm when stored.
 capability: memory

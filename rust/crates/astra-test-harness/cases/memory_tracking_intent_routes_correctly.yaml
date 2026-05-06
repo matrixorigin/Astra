@@ -40,7 +40,7 @@ criteria:
       "I'm following/tracking the oceanbase project, please remember this."
       This is a MEMORY routing intent, not a code search intent.
       Did the agent:
-      1. Route to memory tools (memory {action: "store"} OR memory {action: "retrieve"} to verify deduplication)? (required)
+      1. Route to memory tools (memory (store or retrieve) to verify deduplication)? (required)
       2. Avoid unnecessary codebase exploration (bash, grep, glob, list_dir)? (required)
       3. Confirm the interest was captured (either newly stored, or acknowledging it was already stored)?
       Score 1.0 if memory tool was used without exploration, 0.5 if also explored,
