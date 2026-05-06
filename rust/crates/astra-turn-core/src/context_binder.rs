@@ -144,26 +144,29 @@ fn bind_working_memory(sources: &ContextSources<'_>) -> String {
 
 /// Bind the **session-stable** runtime identity fragments.
 ///
-/// Includes model/cwd/branch/session header + fragments that only change at
+/// Includes model/cwd/branch header + fragments that only change at
 /// session boundaries: `self_model_text` (tools-dependent), `tool_conditional`
 /// guidance, `profile_desc`, `learned_context`, `system_override`. These
 /// sit in `CacheScope::Session` so Anthropic's per-session cache captures
 /// them behind the 2nd cache marker.
+///
+/// NOTE: `session_id` is deliberately emitted in the **volatile** section
+/// (`bind_runtime_volatile`) rather than here. Placing a per-session UUID
+/// in the Session-scoped (cacheable) block breaks cross-session prefix
+/// sharing — every new session would invalidate the cached prefix even
+/// though the model/cwd/branch/tools are identical.
 fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     let ep = &sources.session.edge_profile;
     let ext = &sources.external;
     let mut parts = Vec::new();
 
-    // Core identity (always present)
+    // Core identity (always present). Session UUID moved to volatile block.
     parts.push(format!("Model: {}", sources.session.model_id));
     if let Some(cwd) = &ep.cwd {
         parts.push(format!("CWD: {cwd}"));
     }
     if let Some(branch) = &ep.git_branch {
         parts.push(format!("Branch: {branch}"));
-    }
-    if !sources.session.session_id.is_empty() {
-        parts.push(format!("Session: {}", sources.session.session_id));
     }
 
     // Session-stable dynamic fragments. Order matches the legacy
@@ -209,6 +212,14 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
 fn bind_runtime_volatile(sources: &ContextSources<'_>) -> String {
     let ext = &sources.external;
     let mut parts = Vec::new();
+
+    // Session UUID lives here (None scope) so it doesn't break cross-session
+    // prefix sharing. The LLM still sees it, but it sits AFTER the Session
+    // cache marker — meaning two different sessions with the same
+    // model/cwd/tools share the same cached prefix.
+    if !sources.session.session_id.is_empty() {
+        parts.push(format!("Session: {}", sources.session.session_id));
+    }
 
     if let Some(ref text) = ext.effort_hint {
         parts.push(text.clone());
