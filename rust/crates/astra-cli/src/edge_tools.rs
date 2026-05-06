@@ -1205,6 +1205,12 @@ impl ToolExecutor {
                         .unwrap_or_else(|| self.project_root.to_string_lossy().to_string());
                     astra_tools::web_fetch::fetch_with_cache_scope(None, args, &cache_scope).await
                 }
+                "memory" => {
+                    let op = args.get("action").and_then(|v| v.as_str()).unwrap_or("retrieve");
+                    let mut clean_args = args.clone();
+                    if let Some(obj) = clean_args.as_object_mut() { obj.remove("action"); }
+                    self.memoria_call(op, &clean_args).await
+                }
                 "memory_retrieve" => self.memoria_call("retrieve", args).await,
                 "memory_store" => self.memoria_call("store", args).await,
                 "memory_search" => self.memoria_call("search", args).await,
