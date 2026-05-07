@@ -190,14 +190,7 @@ pub fn build_pipeline_static_sections() -> astra_turn_core::context_sources::Sta
             CacheScope::Global,
         ),
         parallel_efficiency: PromptSection::stable(
-            resolve(
-                "parallel_and_efficiency",
-                format!(
-                    "{}\n{}",
-                    parallel_and_efficiency_section(),
-                    plan_execution_section()
-                ),
-            ),
+            resolve("plan_execution", plan_execution_section().to_string()),
             CacheScope::Global,
         ),
         output_format: PromptSection::stable(
@@ -229,12 +222,10 @@ fn core_rules_section() -> String {
          2. STOP when done. Don't continue exploring after completing the user's request.\n\
          3. One tool call per capability — don't call the same tool twice with identical arguments.\n\n\
          ## Core Rules\n\
-         1. Think step-by-step, then act. For multi-step tasks, plan BEFORE your first tool call.\n\
-         2. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
-         3. Before calling a tool, check conversation history above — if you already have the data, reference it directly.\n\
-         4. Only re-call a tool if arguments differ or user explicitly asks for a refresh.\n\
-         5. Tool outputs in history reflect state AT CALL TIME, not now. If your conclusion depends on current state, re-read — don't infer from stale results.\n\
-         6. You are compatible with Claude Code skills (Agent Skills open standard). When you see `.claude/skills/`, `.claude/commands/`, or skill SKILL.md files in any repo, you can read and use them directly — they work the same as `.astra/skills/`.\n"
+         1. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
+         2. Before calling a tool, check history — if the data is there, reference it. Only re-call if arguments differ or user asks for a refresh.\n\
+         3. Tool outputs in history reflect state AT CALL TIME. If your conclusion depends on current state, re-read — don't infer from stale results.\n\
+         4. You are compatible with Claude Code skills (Agent Skills open standard). `.claude/skills/`, `.claude/commands/`, and SKILL.md files work the same as `.astra/skills/`.\n"
     )
 }
 
@@ -257,19 +248,12 @@ fn planning_section() -> &'static str {
 
 /// Discovery + coding discipline. Pure static.
 fn coding_discipline_section() -> &'static str {
-    "\n## ⚠ Discovery Before Access\n\
-     NEVER guess file paths. Before read_file on an unconfirmed path:\n\
-     - list_dir to browse directories, glob to find by pattern.\n\
-     - Reuse paths already returned by previous tools.\n\
-     Guessing paths wastes turns. Discover first, then read.\n\n\
-     ## Coding Discipline\n\
-     - **Read before write**: understand existing patterns, naming conventions, and imports before editing.\n\
-     - **Executor rule (existing files)**: if the path already exists on disk, you must read_file that exact path in this session before write_file / str_replace / apply_patch. A partial or outline-only read is not enough for write_file overwrite — read the full file first. If the file changed on disk since your last read, read it again.\n\
-     - **Surgical edits**: change only what's needed. Don't rewrite unrelated code.\n\
-     - **Verify your edits**: after YOU modify files, run build/test to confirm nothing broke. Skip this for read-only tasks.\n\
-     - **Undo on failure**: if a change causes errors and you can't fix them, revert it.\n\
-     - **One concern per edit**: each str_replace should address one logical change.\n\
-     - **Imports and dependencies**: when adding new functionality, add required imports/deps.\n"
+    "\n## Coding Discipline\n\
+     - **Read before write**: understand existing patterns, naming, and imports before editing.\n\
+     - **Executor rule (existing files)**: the target path must be read in this session before write_file / str_replace / apply_patch. Outline-only reads are not enough for write_file overwrite. Re-read if the file changed on disk.\n\
+     - **Surgical edits**: change only what's needed. One concern per str_replace.\n\
+     - **Undo on failure**: if a change causes errors you can't fix, revert it.\n\
+     - **Imports and dependencies**: when adding functionality, add required imports/deps.\n"
 }
 
 /// Turn discipline: brief announcements, terminal summary, no externalized reasoning.
@@ -283,12 +267,6 @@ fn turn_discipline_section() -> &'static str {
      - **No externalized reasoning**: deliberation belongs in <think> blocks. Skip \"Let me think...\" / \"Hmm\" / \"Actually, wait\" — noise, not content.\n\
      - **Lead with the answer**: \"The bug is on line 42 because X\" beats \"Looking at the code, I notice line 42 might be relevant, let me investigate…\".\n\
      - **Match depth to task**: a one-line question gets a one-line answer, not a structured report.\n"
-}
-
-/// DEPRECATED: merged into `planning_section`. Returns empty string so call sites
-/// still compile during transition; will be removed once call sites are cleaned up.
-fn parallel_and_efficiency_section() -> &'static str {
-    ""
 }
 
 /// Plan execution guidance. Pure static.
@@ -341,7 +319,6 @@ fn tool_error_recovery_section() -> &'static str {
      - **Timeout** (>30s no output): try a different approach, don't keep waiting.\n\
      - **Rate limited**: back off, don't retry the same API immediately.\n\
      - **Permission denied**: try a different path or ask the user.\n\
-     - **Path not found**: STOP. Use glob or list_dir to discover the correct path. Do NOT retry with a slightly different guess.\n\
      - **Network failure**: check connectivity if multiple tools fail. Report to user.\n\
      - **Auth/credential error**: do NOT retry with same creds. Ask user to re-authenticate.\n\
      - **DB connection error**: verify MATRIXONE_HOST/PORT config. Use `mo_query` with simple SELECT 1 to test.\n\
@@ -626,10 +603,6 @@ pub fn build_system_prompt_sections_with_style(
         PromptSection::stable(planning_section().to_string(), CacheScope::Global),
         PromptSection::stable(coding_discipline_section().to_string(), CacheScope::Global),
         PromptSection::stable(turn_discipline_section().to_string(), CacheScope::Global),
-        PromptSection::stable(
-            parallel_and_efficiency_section().to_string(),
-            CacheScope::Global,
-        ),
         PromptSection::stable(plan_execution_section().to_string(), CacheScope::Global),
         PromptSection::stable(output_format_section().to_string(), CacheScope::Global),
         PromptSection::stable(
@@ -1682,7 +1655,7 @@ mod tests {
         assert!(p.contains("Read before write"));
         assert!(p.contains("Executor rule (existing files)"));
         assert!(p.contains("Surgical edits"));
-        assert!(p.contains("Verify your edits"));
+        assert!(p.contains("Build/test only AFTER your writes"));
     }
 
     #[test]
@@ -1726,7 +1699,6 @@ mod tests {
         assert!(p.contains("Timeout"));
         assert!(p.contains("Rate limited"));
         assert!(p.contains("Permission denied"));
-        assert!(p.contains("Path not found"));
         // New error recovery entries
         assert!(p.contains("Network failure"));
         assert!(p.contains("Auth/credential error"));
