@@ -7,8 +7,7 @@ use serde_json::Value;
 use super::agentic_adaptive_tuning::apply_adaptive_execution_profile;
 use super::agentic_headless_round::HeadlessStderrStyle;
 use super::agentic_loop_host::{
-    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, delegate_tool_schema,
-    try_write_heavy_checkpoint,
+    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, try_write_heavy_checkpoint,
 };
 use crate::orchestration::permission_sync::PermissionResponseMessaging;
 use astra_services::SessionArtifactStore;
@@ -333,14 +332,6 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
         }
     }
 
-    if state.delegation_engine.is_some() {
-        host.inject_tool_schema(delegate_tool_schema());
-    }
-
-    if state.messaging.mailbox.is_some() {
-        host.inject_tool_schema(astra_messaging::send_tool::send_message_tool_schema());
-    }
-
     if let Some(resolver) = &state.skills.resolver {
         let full = resolver.available_skills();
         if !full.is_empty() {
@@ -358,9 +349,6 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
                 &visible,
                 open_skill_name,
             ));
-            if open_skill_name {
-                host.inject_tool_schema(crate::turn::skill_tool::discover_skills_tool_schema());
-            }
         }
     }
 
@@ -1053,9 +1041,7 @@ mod tests {
     use serde_json::json;
 
     use crate::turn::agentic_loop_host::run_agentic_loop_with_host;
-    use crate::turn::agentic_loop_host::tests::{
-        MockHost, make_state, make_test_delegation_engine, text_result,
-    };
+    use crate::turn::agentic_loop_host::tests::{MockHost, make_state, text_result};
 
     use super::*;
 
@@ -1111,53 +1097,6 @@ mod tests {
             })
             .count();
         assert_eq!(budget_messages, 1, "budget message must be idempotent");
-    }
-
-    #[tokio::test]
-    async fn auto_inject_delegate_schema_when_engine_present() {
-        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
-        let mut state = make_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "hello"}));
-        state.delegation_engine = Some(make_test_delegation_engine());
-
-        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        assert_eq!(host.injected_schemas.len(), 1);
-        let injected = &host.injected_schemas[0];
-        let name = injected["function"]["name"].as_str().unwrap();
-        assert_eq!(name, "delegate");
-        assert!(host.valid_tools.contains("delegate"));
-    }
-
-    #[tokio::test]
-    async fn no_inject_when_delegation_engine_absent() {
-        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
-        let mut state = make_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "hello"}));
-
-        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        assert!(host.injected_schemas.is_empty());
-        assert!(!host.valid_tools.contains("delegate"));
-    }
-
-    #[tokio::test]
-    async fn injected_schema_matches_delegate_tool_schema() {
-        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
-        let mut state = make_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "hello"}));
-        state.delegation_engine = Some(make_test_delegation_engine());
-
-        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        let expected = delegate_tool_schema();
-        assert_eq!(host.injected_schemas[0], expected);
     }
 
     #[tokio::test]

@@ -481,6 +481,42 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         scope: Scope::External,
         schema_tokens: 40,
     },
+    ToolMeta {
+        name: "symbols",
+        description: "Extract function/class/struct signatures from a file using tree-sitter",
+        triggers: &[
+            "symbols",
+            "functions",
+            "classes",
+            "signatures",
+            "outline",
+            "符号",
+            "函数列表",
+            "类列表",
+        ],
+        pinned: true,
+        intents: &[IntentType::CodeRead],
+        scope: Scope::Local,
+        schema_tokens: 25,
+    },
+    ToolMeta {
+        name: "powershell",
+        description: "Execute PowerShell commands for Windows shell tasks and cross-platform automation",
+        triggers: &["powershell", "pwsh", "ps1", "windows", "PowerShell"],
+        pinned: true,
+        intents: &[IntentType::CodeEdit, IntentType::CodeRead],
+        scope: Scope::Local,
+        schema_tokens: 15,
+    },
+    ToolMeta {
+        name: "run_script",
+        description: "Execute a structured script via sandbox RPC transport (Unix-only)",
+        triggers: &["run_script", "script", "sandbox", "rpc"],
+        pinned: true,
+        intents: &[IntentType::CodeEdit],
+        scope: Scope::Local,
+        schema_tokens: 40,
+    },
 ];
 
 /// Returns `true` when `name` matches a pinned tool in [`TOOL_CATALOG`].

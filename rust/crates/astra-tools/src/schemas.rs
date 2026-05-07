@@ -335,107 +335,38 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "lsp",
-                "description": "Interact with Language Server Protocol for editor-grade code intelligence from an active language server. Prefer this over text search when you need symbol-aware navigation, autocomplete, quick fixes, auto-imports, signature help, diagnostics, rename/code actions, or other follow-up actions. Advanced editor-rendering operations such as document highlights/links, inlay hints, folding ranges, colors, semantic tokens, selection ranges, and linked editing are also available but are usually lower ROI unless the task explicitly needs IDE-style rendering details. Use action_index with code_actions apply, item_index to resolve or execute/apply a returned completion or code lens, and dry_run=false only for supported write operations. On Rust files, code_lenses first use native rust-analyzer textDocument/codeLens Run/Debug lenses when available; if standard LSP code lenses are empty, they can still fall back to rust-analyzer runnables. Rust hover can also include action links for runnable symbols (for example Run/Debug on tests) when the server provides them. Rust signature_help can include precise parameter label offsets, Rust completions can expose richer postfix/snippet-style candidates, and Rust code_actions can surface real assists such as import fixes. Both native and fallback Rust code lenses support item_index + dry_run=false execution. Without a file, diagnostics reports backend availability; with a file, diagnostics first tries textDocument/diagnostic and falls back to the latest publishDiagnostics snapshot.",
+                "description": "Language Server Protocol operations. Requires a running LSP server for the target language. Operations: goto_definition, find_references, rename (symbol across files), hover (type info), call_hierarchy/incoming_calls/outgoing_calls, supertypes/subtypes (type hierarchy), implementation, declaration, type_definition, document_symbols, workspace_symbols, code_actions (quick fixes, refactors), completions, signature_help, diagnostics, format_document/format_range/format_on_type, code_lenses, prepare_rename, document_highlight, document_links, inlay_hints, folding_ranges, semantic_tokens, selection_ranges, linked_editing_range, document_colors/color_presentations. Use action_index for code_actions apply, item_index for completions/code_lenses resolve/execute, dry_run=false to apply writes. Without a file, diagnostics reports backend availability.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "operation": {
                             "type": "string",
                             "enum": [
-                                "goto_definition",
-                                "find_references",
-                                "hover",
-                                "document_symbols",
-                                "workspace_symbols",
-                                "call_hierarchy",
-                                "incoming_calls",
-                                "outgoing_calls",
-                                "declaration",
-                                "type_definition",
-                                "implementation",
-                                "supertypes",
-                                "subtypes",
-                                "prepare_rename",
-                                "rename",
-                                "code_actions",
-                                "completions",
-                                "signature_help",
-                                "document_highlight",
-                                "document_links",
-                                "inlay_hints",
-                                "folding_ranges",
-                                "document_colors",
-                                "color_presentations",
-                                "semantic_tokens",
-                                "code_lenses",
-                                "selection_ranges",
-                                "linked_editing_range",
-                                "format_document",
-                                "format_range",
-                                "format_on_type",
-                                "diagnostics"
+                                "goto_definition","find_references","hover","document_symbols",
+                                "workspace_symbols","call_hierarchy","incoming_calls","outgoing_calls",
+                                "declaration","type_definition","implementation","supertypes","subtypes",
+                                "prepare_rename","rename","code_actions","completions","signature_help",
+                                "document_highlight","document_links","inlay_hints","folding_ranges",
+                                "document_colors","color_presentations","semantic_tokens","code_lenses",
+                                "selection_ranges","linked_editing_range",
+                                "format_document","format_range","format_on_type","diagnostics"
                             ],
-                            "description": "LSP operation to perform. Prefer high-ROI operations like goto_definition/find_references/hover/completions/code_actions/signature_help/diagnostics first; editor-rendering operations like document_colors/color_presentations/semantic_tokens/folding_ranges/selection_ranges/linked_editing_range are lower ROI unless you explicitly need IDE-style view state."
+                            "description": "LSP operation to perform"
                         },
-                        "file": {
-                            "type": "string",
-                            "description": "File path. Required for almost all operations; diagnostics is the main operation that can omit it."
-                        },
-                        "line": {
-                            "type": "integer",
-                            "description": "Line number (1-based). Required for position-based operations."
-                        },
-                        "column": {
-                            "type": "integer",
-                            "description": "Column/character offset (1-based). Required for position-based operations."
-                        },
-                        "end_line": {
-                            "type": "integer",
-                            "description": "End line number (1-based). Required for range-based operations like format_range."
-                        },
-                        "end_column": {
-                            "type": "integer",
-                            "description": "End column/character offset (1-based). Required for range-based operations like format_range."
-                        },
-                        "trigger_character": {
-                            "type": "string",
-                            "description": "Typed character that triggered on-type formatting. Required for format_on_type."
-                        },
-                        "symbol": {
-                            "type": "string",
-                            "description": "Symbol name for symbol-based operations (alternative to line/column)"
-                        },
-                        "query": {
-                            "type": "string",
-                            "description": "Search query for workspace_symbols operation"
-                        },
-                        "new_name": {
-                            "type": "string",
-                            "description": "New identifier name for rename operations"
-                        },
-                        "dry_run": {
-                            "type": "boolean",
-                            "description": "Preview by default. Set false only to apply a supported rename, document/range/on-type format, code action edit, selected completion item, or selected code lens command/runnable."
-                        },
-                        "action_index": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "description": "For code_actions apply, choose which returned action to apply by index (default: 0)."
-                        },
-                        "item_index": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "description": "For completions or code_lenses, optionally choose a specific returned item by index to resolve in preview mode, or to apply/execute when dry_run=false."
-                        },
-                        "scope": {
-                            "type": "string",
-                            "enum": ["file", "project"],
-                            "description": "Scope for certain operations (default: file)"
-                        },
-                        "include_body": {
-                            "type": "boolean",
-                            "description": "Include function bodies in results (default: false)"
-                        }
+                        "file": {"type": "string", "description": "File path (required for most operations)"},
+                        "line": {"type": "integer", "description": "1-based line number (position-based ops)"},
+                        "column": {"type": "integer", "description": "1-based column (position-based ops)"},
+                        "end_line": {"type": "integer", "description": "End line (range ops like format_range)"},
+                        "end_column": {"type": "integer", "description": "End column (range ops)"},
+                        "trigger_character": {"type": "string", "description": "Trigger char (format_on_type)"},
+                        "symbol": {"type": "string", "description": "Symbol name (alternative to line/column)"},
+                        "query": {"type": "string", "description": "Query for workspace_symbols"},
+                        "new_name": {"type": "string", "description": "New name for rename"},
+                        "dry_run": {"type": "boolean", "description": "Preview mode (default true). Set false to apply rename/format/code_action/completion/code_lens."},
+                        "action_index": {"type": "integer", "minimum": 0, "description": "Code action index to apply (default 0)"},
+                        "item_index": {"type": "integer", "minimum": 0, "description": "Item index for completions/code_lenses resolve or execute"},
+                        "scope": {"type": "string", "enum": ["file", "project"], "description": "Operation scope (default: file)"},
+                        "include_body": {"type": "boolean", "description": "Include function bodies (default false)"}
                     },
                     "required": ["operation"]
                 }
