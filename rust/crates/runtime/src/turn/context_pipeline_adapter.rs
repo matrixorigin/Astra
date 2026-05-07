@@ -14,7 +14,6 @@ use astra_turn_core::context_sources::{
     EdgeProfile, ExternalSources, MemoryEntry, SessionContext, TurnState,
 };
 use astra_turn_core::microcompact::ProviderCacheStrategy;
-use astra_turn_core::pipeline_config::ProviderCachePolicy;
 use astra_turn_core::recovery_state::RecoveryState;
 use astra_turn_core::token_accounting::TokenAccounting;
 
@@ -355,7 +354,7 @@ pub(crate) fn build_session_context(
     provider: &str,
     project_context: Option<&str>,
 ) -> SessionContext {
-    let provider_policy = provider_policy_for(provider, model_name);
+    let provider_policy = super::prompt_cache::provider_cache_policy_for(provider, model_name);
     SessionContext {
         session_id: session_id.to_string(),
         run_id: run_id.unwrap_or_default().to_string(),
@@ -382,24 +381,6 @@ pub(crate) fn build_session_context(
         },
         self_model: None,
     }
-}
-
-/// Map a provider name to its cache policy.
-///
-/// Anthropic-family providers use `cache_control` markers; everyone else gets
-/// prefix-only caching. Bedrock is provider-multiplexed, so it must opt in only
-/// for Claude model IDs rather than all `provider=bedrock` traffic.
-fn provider_policy_for(provider: &str, model_name: &str) -> ProviderCachePolicy {
-    match provider {
-        "anthropic" => ProviderCachePolicy::anthropic(),
-        "bedrock" if is_bedrock_claude_model(model_name) => ProviderCachePolicy::anthropic(),
-        _ => ProviderCachePolicy::openai_compatible(),
-    }
-}
-
-fn is_bedrock_claude_model(model_name: &str) -> bool {
-    let model = model_name.to_ascii_lowercase();
-    model.contains("anthropic.claude")
 }
 
 #[cfg(test)]

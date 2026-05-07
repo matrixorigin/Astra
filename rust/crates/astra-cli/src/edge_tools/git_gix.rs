@@ -1081,10 +1081,13 @@ mod tests {
     }
 
     #[test]
-    fn git_show_missing_commit() {
+    fn git_show_missing_commit_defaults_to_head() {
         let root = repo_root();
         let result = git_show(&root, &json!({}), 0.0, 0);
-        assert!(result.contains("Error: missing"));
+        assert!(
+            result.contains("commit ") || result.contains("Author:"),
+            "empty args should default to HEAD, got: {result}"
+        );
     }
 
     #[test]

@@ -10,6 +10,8 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::{Value, json};
 
 use crate::prompts;
+use astra_turn_core::microcompact::{PromptCacheProtocol, ProviderCacheStrategy};
+use astra_turn_core::pipeline_config::ProviderCachePolicy;
 
 const DEFAULT_CACHE_EDIT_PIN_KEY: &str = "__default__";
 const MAX_PINNED_CACHE_EDIT_SESSIONS: usize = 1024;
@@ -88,6 +90,21 @@ pub(crate) struct BridgePipelineOutcome {
     pub tier: astra_turn_core::compaction_types::CompactionTier,
     /// Tool schemas already pruned to `tier` by the pipeline's Optimize phase.
     pub tool_schemas: Vec<Value>,
+}
+
+/// Resolve the context-pipeline cache policy from the same provider+model
+/// classification used by [`PromptCacheConfig::latch`].
+///
+/// This matters for multiplexed providers like Bedrock: Claude models support
+/// Anthropic-style cache markers (translated to Bedrock cache points), while
+/// Nova/Titan models must remain prefix-only.
+pub(crate) fn provider_cache_policy_for(provider: &str, model_name: &str) -> ProviderCachePolicy {
+    let strategy = ProviderCacheStrategy::from_provider_and_model(Some(provider), Some(model_name));
+    if strategy.prompt_cache_protocol == PromptCacheProtocol::AnthropicCacheControl {
+        ProviderCachePolicy::anthropic()
+    } else {
+        ProviderCachePolicy::openai_compatible()
+    }
 }
 
 /// Assemble a system message via the context pipeline directly, without
@@ -188,8 +205,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     use astra_turn_core::context_sources::{
         AgentContext, EdgeProfile, ExternalSources, SessionContext, TurnState,
     };
-    use astra_turn_core::microcompact::ProviderCacheStrategy;
-    use astra_turn_core::pipeline_config::{PipelineConfig, ProviderCachePolicy};
+    use astra_turn_core::pipeline_config::PipelineConfig;
     use astra_turn_core::pipeline_session::{AdaptiveTurnInput, PipelineSession};
 
     // Build ExternalSources from bridge-side signals. Tool-dependent prompt
@@ -252,10 +268,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         extra_dynamic_sections: volatile,
     };
 
-    let provider_policy = match provider {
-        "anthropic" | "bedrock" => ProviderCachePolicy::anthropic(),
-        _ => ProviderCachePolicy::openai_compatible(),
-    };
+    let provider_policy = provider_cache_policy_for(provider, model_id);
     let session_ctx = SessionContext {
         session_id: session_id.to_string(),
         run_id: String::new(),
@@ -1361,6 +1374,32 @@ mod tests {
         let cfg = PromptCacheConfig::latch("bedrock", "us.amazon.nova-micro-v1:0");
         assert!(cfg.cache_enabled);
         assert!(!cfg.is_anthropic);
+    }
+
+    #[test]
+    fn bridge_provider_policy_keeps_non_claude_bedrock_prefix_only() {
+        let policy = provider_cache_policy_for("bedrock", "us.amazon.nova-micro-v1:0");
+
+        assert_eq!(
+            policy.protocol,
+            astra_turn_core::microcompact::PromptCacheProtocol::Prefix,
+            "non-Claude Bedrock models must not receive Anthropic cache_control markers"
+        );
+        assert_eq!(policy.max_markers, 0);
+        assert!(!policy.supports_global_scope);
+    }
+
+    #[test]
+    fn bridge_provider_policy_enables_anthropic_for_bedrock_claude() {
+        let policy =
+            provider_cache_policy_for("bedrock", "anthropic.claude-sonnet-4-20250514-v1:0");
+
+        assert_eq!(
+            policy.protocol,
+            astra_turn_core::microcompact::PromptCacheProtocol::AnthropicCacheControl
+        );
+        assert!(policy.max_markers > 0);
+        assert!(policy.supports_global_scope);
     }
 
     #[test]

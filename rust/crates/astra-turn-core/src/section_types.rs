@@ -171,9 +171,10 @@ impl SectionKind {
         ]
     }
 
-    /// Sections whose budget is pre-allocated by `ContextBudget::allocate`
-    /// (or carried outside the planned-text stream, e.g. `History`) and must
-    /// NOT be included in the remainder distribution.
+    /// Sections whose budget is pre-allocated by `ContextBudget::allocate`,
+    /// carried outside the planned-text stream (`History`), or emitted with a
+    /// fixed zero budget (`Emergent*`) and must NOT be included in the
+    /// remainder distribution.
     ///
     /// Centralising this predicate means adding a new "pre-allocated" variant
     /// only requires updating this match. The exhaustive match forces
@@ -183,18 +184,18 @@ impl SectionKind {
         match self {
             // Pre-allocated with explicit budget in `ContextBudget::allocate`.
             Self::Identity | Self::Constraints | Self::Memory => true,
-            // Carried as provider messages, not a planned text section.
-            Self::History => true,
+            // Carried as provider messages, not a planned text section, or
+            // emitted as opportunistic zero-budget context by the planner.
+            Self::History | Self::EmergentSkills | Self::EmergentMemory | Self::EmergentSummary => {
+                true
+            }
             // Remaining variants participate in the remainder distribution.
             Self::SelfModel
             | Self::ProjectContext
             | Self::WorkingMemory
             | Self::Skills
             | Self::RuntimeIdentity
-            | Self::RuntimeVolatile
-            | Self::EmergentSkills
-            | Self::EmergentMemory
-            | Self::EmergentSummary => false,
+            | Self::RuntimeVolatile => false,
         }
     }
 
