@@ -652,21 +652,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn selected_tool_guidance_is_volatile() {
-        let ep = serde_json::Map::new();
-        let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
-
-        let dynamic_text: String = sources
-            .extra_dynamic_sections
-            .iter()
-            .map(|section| section.text.as_str())
-            .collect();
-        // self_model_text and tool_conditional fields removed — volatile content routes to extra_dynamic_sections only
-        assert!(dynamic_text.contains("## Self-Model"));
-        assert!(dynamic_text.contains("Explicit Tool Requests"));
-    }
+    // `selected_tool_guidance_is_volatile` was deleted: it asserted on
+    // `## Self-Model` + `Explicit Tool Requests` strings that originated
+    // from the now-empty `self_model_section` / `tool_conditional_section`
+    // bodies (commit a1187f76). The volatile-lane routing contract is
+    // covered by the composite integration tests below.
 
     #[test]
     fn external_sources_empty_memory_when_edge_profile_has_none() {

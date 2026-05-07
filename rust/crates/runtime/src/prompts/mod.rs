@@ -57,9 +57,11 @@ mod tests {
     }
 
     #[test]
-    fn build_main_system_prompt_includes_tool_names() {
+    fn build_main_system_prompt_core_rules_and_protocol() {
+        // Tool names were previously asserted via the `## Self-Model\nTools:
+        // ...` block. That block was removed — tool names are now only
+        // visible through the provider `tools` array, not the system text.
         let p = build_main_system_prompt(&["read_file", "write_file"], "", 1.0, None);
-        assert!(p.contains("read_file, write_file"), "should list tools");
         assert!(p.contains("Core Rules"), "should include rules");
         assert!(
             p.contains("NEVER fabricate"),
@@ -141,15 +143,6 @@ mod tests {
         assert!(block.contains("Output Constraint: Concise"));
     }
 
-    #[test]
-    fn memory_rules_include_negative_examples() {
-        let p = build_main_system_prompt(&["memory_store", "memory_retrieve"], "", 1.0, None);
-        assert!(
-            p.contains("What NOT to save"),
-            "should have negative guidance (What NOT to save)"
-        );
-    }
-
     // ── Conditional prompt sections ──
 
     /// When no memory tools are selected, memory rules must be omitted.
@@ -180,26 +173,6 @@ mod tests {
         );
     }
 
-    /// When GitHub tools are selected, GitHub rules are included.
-    #[test]
-    fn github_tools_include_github_rules() {
-        let p = build_main_system_prompt(&["github_list_prs", "github_get_pr"], "", 1.0, None);
-        assert!(
-            p.contains("github_list_prs"),
-            "should mention github_list_prs when GitHub tools selected"
-        );
-    }
-
-    /// Implicit preference instruction is present when memory tools available.
-    #[test]
-    fn memory_rules_include_store_guidance() {
-        let p = build_main_system_prompt(&["memory_store", "memory_retrieve"], "", 1.0, None);
-        assert!(
-            p.contains("memory_store"),
-            "should mention memory_store when memory tools available"
-        );
-    }
-
     /// History awareness rule prevents re-reading data already in context.
     #[test]
     fn prompt_includes_history_awareness() {
@@ -207,20 +180,6 @@ mod tests {
         assert!(
             p.contains("check conversation history"),
             "should instruct checking history before calling tools"
-        );
-    }
-
-    /// Tool selection guidance: prefer specific tools for single ops, bash for compound.
-    #[test]
-    fn git_tools_get_compound_bash_guidance() {
-        let p = build_main_system_prompt(&["git_diff", "git_log", "bash"], "", 1.0, None);
-        assert!(
-            p.contains("SINGLE operations"),
-            "should guide git tools for single operations"
-        );
-        assert!(
-            p.contains("COMPOUND git operations"),
-            "should guide bash for compound git operations"
         );
     }
 
@@ -843,61 +802,12 @@ mod tests {
         );
     }
 
-    // ─── Tool guidance section tests ────────────────────────────────────
-
-    #[test]
-    fn prompt_includes_code_navigation_guidance() {
-        let p = build_main_system_prompt(
-            &["find_definition", "find_references", "read_file"],
-            "",
-            1.0,
-            None,
-        );
-        assert!(
-            p.contains("## Code Navigation"),
-            "should include code nav section"
-        );
-        assert!(
-            p.contains("find_definition"),
-            "should mention find_definition"
-        );
-        assert!(
-            p.contains("find_references"),
-            "should mention find_references"
-        );
-    }
-
-    #[test]
-    fn prompt_includes_call_graph_guidance() {
-        let p = build_main_system_prompt(
-            &["find_definition", "call_graph", "read_file"],
-            "",
-            1.0,
-            None,
-        );
-        assert!(p.contains("call_graph"), "should mention call_graph tool");
-        assert!(
-            p.contains("refactoring") || p.contains("dependencies"),
-            "should mention use case"
-        );
-    }
-
-    #[test]
-    fn prompt_includes_editing_strategy_guidance() {
-        let p = build_main_system_prompt(
-            &["multi_edit", "str_replace", "delete_file", "read_file"],
-            "",
-            1.0,
-            None,
-        );
-        assert!(
-            p.contains("## Editing Strategy"),
-            "should include editing section"
-        );
-        assert!(p.contains("multi_edit"), "should mention multi_edit");
-        assert!(p.contains("dry_run"), "should mention dry_run preview");
-        assert!(p.contains("delete_file"), "should mention delete_file");
-    }
+    // Tool-conditional guidance (## Code Navigation, ## Editing Strategy,
+    // ## Build & Test Loop, ## Git Workflow, call_graph reminders, etc.)
+    // was emitted by `tool_conditional_section` which is now a no-op —
+    // tool schemas already carry per-tool usage guidance. Tests that
+    // asserted those Markdown headers were deleted along with the
+    // emitter in commit a1187f76.
 
     #[test]
     fn prompt_omits_editing_guidance_without_multi_edit() {
@@ -905,61 +815,6 @@ mod tests {
         assert!(
             !p.contains("## Editing Strategy"),
             "should not include editing section without multi_edit"
-        );
-    }
-
-    #[test]
-    fn prompt_full_toolset_under_budget() {
-        // Test with a realistic full toolset that triggers all guidance sections
-        let p = build_main_system_prompt(
-            &[
-                "read_file",
-                "bash",
-                "str_replace",
-                "write_file",
-                "delete_file",
-                "multi_edit",
-                "list_dir",
-                "grep",
-                "glob",
-                "find_definition",
-                "find_references",
-                "call_graph",
-                "symbols",
-                "rename_symbol",
-                "dead_code",
-                "extract_members",
-                "type_hierarchy",
-                "hover_info",
-                "symbol_search",
-                "run_build_test",
-                "git_diff",
-                "git_log",
-                "git_commit",
-                "git_stash",
-                "github_list_prs",
-                "github_repo_stats",
-                "memory_store",
-                "memory_retrieve",
-            ],
-            "",
-            1.0,
-            Some("code_review"),
-        );
-        // All sections should be present
-        assert!(p.contains("## Code Navigation"));
-        assert!(p.contains("## Editing Strategy"));
-        assert!(p.contains("## Build & Test Loop"));
-        assert!(p.contains("## Git Workflow"));
-        assert!(p.contains("## Memory Rules"));
-        // Budget: full prompt should still be reasonable (allows for Executor rule addition,
-        // Parallel Tool Calls Limit/Anti-pattern, Search Strategy Simple vs Complex,
-        // Batching read-only tool calls, and Turn Discipline (announce/summary/no-narration)).
-        // Headroom: ~200 chars above measured size. Bump when adding new rules.
-        assert!(
-            p.len() < 24000,
-            "full toolset prompt should be under 24000 chars, got {}",
-            p.len()
         );
     }
 
