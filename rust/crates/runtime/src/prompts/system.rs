@@ -1195,12 +1195,19 @@ pub fn parallel_batching_nudge_directive(messages: &[serde_json::Value]) -> Stri
     if streak < PARALLEL_BATCHING_NUDGE_THRESHOLD {
         return String::new();
     }
+    // Compacted from a 3-bullet form (~450c) to one line (~165c). The
+    // long form explained *why* parallel is cheaper and enumerated
+    // examples — both derivable from the header and the model's
+    // existing tool-use training. What the directive has to assert is
+    // just: "you did N single-tool rounds in a row; batch the next
+    // independent calls". Rides the volatile lane once the streak
+    // threshold trips, so bytes here are per-turn waste until the
+    // model batches (which resets the streak).
     format!(
         "\n\n## ⚠ Sequential Tool Calls Detected\n\
-         Your last {streak} rounds each ran exactly ONE tool. This is the most expensive way to gather information.\n\
-         - Look at the next set of files / commands you intend to inspect.\n\
-         - If they are independent (different files, different greps, different reads), batch them ALL into the next single round in parallel.\n\
-         - Reserve sequential single-tool rounds for cases where each call genuinely depends on the previous result.\n"
+         Last {streak} rounds each ran one tool. Batch independent calls \
+         (different files, greps, reads) into a single parallel round; \
+         keep sequential rounds only when a call depends on the previous result.\n"
     )
 }
 
