@@ -78,16 +78,32 @@ pub(crate) fn merge_memory_results(results: &[&str]) -> Vec<String> {
 
 /// Build the memory section for the profile block.
 /// Returns None if no memories matched.
+///
+/// Applies the same `is_memory_worthy` filter as `build_memory_entries` so
+/// that session-replay lines (`[session:…] Recent conversation: Assistant:
+/// Step 15 done. yyyy…`), L1 protocol markers, bare headers, and
+/// single-token echoes never leak into the volatile `## User Memories`
+/// block. Without this filter the unstructured fallback path
+/// (`memory_proto::format_for_llm` → `**Context:** …`) burned 3,000+
+/// characters per turn on session-replay noise (observed in session
+/// `e61916d6`, turn 4: 3,129c of `**Context:** Assistant: Step N done. yyy`).
 pub(crate) fn build_memory_section(merged_lines: &[String]) -> Option<String> {
     if merged_lines.is_empty() {
         return None;
     }
-    let refs: Vec<&str> = merged_lines.iter().map(|s| s.as_str()).collect();
+    let filtered: Vec<&String> = merged_lines
+        .iter()
+        .filter(|s| is_memory_worthy(s.trim()))
+        .collect();
+    if filtered.is_empty() {
+        return None;
+    }
+    let refs: Vec<&str> = filtered.iter().map(|s| s.as_str()).collect();
     let formatted = astra_prompts::memory_proto::format_for_llm(&refs);
     if !formatted.is_empty() {
         Some(format!("## User Memories\n{formatted}"))
     } else {
-        Some(format!("## User Memories\n{}", merged_lines.join("\n")))
+        Some(format!("## User Memories\n{}", refs.join("\n")))
     }
 }
 
@@ -162,8 +178,15 @@ fn is_memory_worthy(trimmed: &str) -> bool {
         }
     }
 
-    // Reject L1 protocol markers.
-    if trimmed.starts_with("[session-memory:") || trimmed.starts_with("[attention:") {
+    // Reject L1 protocol markers and session-replay lines. These last
+    // two shapes surface when Memoria indexes session-memory / L1 docs
+    // per-line and retrieval matches a fragment; keeping parity with
+    // `memoria_insights::is_digest_worthy` so both the CLI-side digest
+    // and the bridge-side `## User Memories` filter out the same noise.
+    if trimmed.starts_with("[session-memory:")
+        || trimmed.starts_with("[attention:")
+        || trimmed.starts_with("[session:")
+    {
         return false;
     }
 
@@ -415,6 +438,71 @@ mod tests {
         let lines = vec!["just a plain memory without tags".to_string()];
         let section = build_memory_section(&lines).unwrap();
         assert!(section.contains("just a plain memory"), "got: {section}");
+    }
+
+    // ── Session-replay noise rejection (volatile-lane dominance fix)
+    // Without `is_memory_worthy` filtering inside build_memory_section,
+    // every line that survived merge_memory_results went through
+    // `memory_proto::format_for_llm`, which wraps unstructured text as
+    // `**Context:** …`. Memoria's L1 session-memory indexing produces
+    // `[session:xyz] Recent conversation: Assistant: Step 15 done. yyyyy…`
+    // fragments — 30+ of these at ~100c each burned ~3,000 characters of
+    // volatile-lane budget per turn (observed in session `e61916d6`,
+    // turn 4: 3,129c `## User Memories` block).
+
+    #[test]
+    fn build_memory_section_drops_session_replay_lines() {
+        let lines = vec![
+            "[session:abc] Recent conversation: Assistant: Step 15 done. yyyyy".to_string(),
+            "User prefers Rust for CLI work.".to_string(),
+        ];
+        let section = build_memory_section(&lines).expect("some survivors");
+        assert!(
+            !section.contains("[session:"),
+            "session-replay lines must be filtered from section, got: {section}"
+        );
+        assert!(section.contains("User prefers Rust"));
+    }
+
+    #[test]
+    fn build_memory_section_drops_l1_protocol_markers() {
+        let lines = vec![
+            "[session-memory:v1] # Session Title".to_string(),
+            "[attention:v1] turn budget tight".to_string(),
+            "Legitimate memory survives.".to_string(),
+        ];
+        let section = build_memory_section(&lines).expect("legit survivor");
+        assert!(!section.contains("session-memory:v1"), "got: {section}");
+        assert!(!section.contains("attention:v1"), "got: {section}");
+        assert!(section.contains("Legitimate memory"));
+    }
+
+    #[test]
+    fn build_memory_section_returns_none_when_all_filtered() {
+        // All lines are noise — section should collapse to None so the
+        // caller knows there is nothing worth emitting, and the bridge's
+        // "section only if entries empty" path doesn't inject a bare
+        // header into the volatile lane.
+        let lines = vec![
+            "[session:abc] Recent conversation: foo".to_string(),
+            "[session-memory:v1] # Session Title hi".to_string(),
+            "None".to_string(),
+        ];
+        assert!(
+            build_memory_section(&lines).is_none(),
+            "all-noise input must return None, not an empty-body section"
+        );
+    }
+
+    #[test]
+    fn build_memory_section_keeps_structured_tagged_entries() {
+        // `[@ns/type] body` entries always pass — they carry structured
+        // semantics even when short. Parallel to the behavior in
+        // `build_memory_entries`.
+        let lines = vec!["[@swap/archived] Turns 1-1 swapped out".to_string()];
+        let section = build_memory_section(&lines).expect("tagged entry survives");
+        assert!(section.contains("Archived Context") || section.contains("[@swap/archived]"),
+            "structured-tagged entries must pass through, got: {section}");
     }
 
     #[test]
