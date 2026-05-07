@@ -107,10 +107,11 @@ pub struct ContextSources<'a> {
 #[derive(Debug, Clone)]
 pub struct StaticSections {
     pub core_rules: PromptSection,
+    pub safety: PromptSection,
     pub planning_protocol: PromptSection,
     pub coding_discipline: PromptSection,
     pub turn_discipline: PromptSection,
-    pub parallel_efficiency: PromptSection,
+    pub plan_execution: PromptSection,
     pub output_format: PromptSection,
     pub tool_error_recovery: PromptSection,
 }
@@ -226,10 +227,11 @@ impl StaticSections {
     pub fn as_vec(&self) -> Vec<&PromptSection> {
         vec![
             &self.core_rules,
+            &self.safety,
             &self.planning_protocol,
             &self.coding_discipline,
             &self.turn_discipline,
-            &self.parallel_efficiency,
+            &self.plan_execution,
             &self.output_format,
             &self.tool_error_recovery,
         ]
@@ -258,10 +260,14 @@ impl StaticSections {
                 token_bucket: crate::section_types::PromptTokenBucket::BasePersona,
                 trace_signals: PromptTraceSignals::default(),
             },
+            safety: PromptSection::stable("Refuse harmful requests.", CacheScope::Global),
             planning_protocol: PromptSection::stable("Plan carefully.", CacheScope::Global),
             coding_discipline: PromptSection::stable("Read before write.", CacheScope::Global),
             turn_discipline: PromptSection::stable("Announce actions.", CacheScope::Global),
-            parallel_efficiency: PromptSection::stable("Batch tool calls.", CacheScope::Global),
+            plan_execution: PromptSection::stable(
+                "Execute plan subtasks faithfully.",
+                CacheScope::Global,
+            ),
             output_format: PromptSection::stable("Be concise.", CacheScope::Global),
             tool_error_recovery: PromptSection::stable("Retry on error.", CacheScope::Global),
         }
@@ -273,9 +279,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn static_sections_as_vec_has_7_entries() {
+    fn static_sections_as_vec_has_8_entries() {
         let s = StaticSections::test_default();
-        assert_eq!(s.as_vec().len(), 7);
+        assert_eq!(s.as_vec().len(), 8);
     }
 
     #[test]

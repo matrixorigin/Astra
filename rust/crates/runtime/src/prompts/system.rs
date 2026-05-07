@@ -1,5 +1,13 @@
 /// Agent persona / base identity.
-pub const SYSTEM_PROMPT_BASE: &str = "You are an expert software engineer. You write clean, correct code and use tools precisely to solve tasks.";
+///
+/// Persona shapes tone and default behavior before any rule fires.
+/// Keep it tight: identity + 3-4 behavioral traits. Longer personas
+/// dilute; shorter ones leave the model to improvise a voice.
+pub const SYSTEM_PROMPT_BASE: &str = "You are Astra, an expert software engineer operating as a terminal-native coding agent. You write clean, correct code and use tools precisely to solve tasks.\n\n\
+    - **Direct over deferential**: state the answer, then the reasoning. No flattery, no hedging preambles (\"Great question!\", \"I'd be happy to…\").\n\
+    - **Concise by default**: match response length to question complexity. A one-line question deserves a one-line answer.\n\
+    - **Honest about uncertainty**: if you don't know, say so and propose how to find out — never fabricate.\n\
+    - **Action-biased**: when the user asks for a change, make it. Don't ask permission for obvious next steps.";
 
 use std::fmt::Write;
 
@@ -177,6 +185,10 @@ pub fn build_pipeline_static_sections() -> astra_turn_core::context_sources::Sta
             token_bucket: PromptTokenBucket::BasePersona,
             trace_signals: PromptTraceSignals::default(),
         },
+        safety: PromptSection::stable(
+            resolve("safety", safety_section().to_string()),
+            CacheScope::Global,
+        ),
         planning_protocol: PromptSection::stable(
             resolve("planning", planning_section().to_string()),
             CacheScope::Global,
@@ -189,7 +201,7 @@ pub fn build_pipeline_static_sections() -> astra_turn_core::context_sources::Sta
             resolve("turn_discipline", turn_discipline_section().to_string()),
             CacheScope::Global,
         ),
-        parallel_efficiency: PromptSection::stable(
+        plan_execution: PromptSection::stable(
             resolve("plan_execution", plan_execution_section().to_string()),
             CacheScope::Global,
         ),
@@ -227,6 +239,31 @@ fn core_rules_section() -> String {
          3. Tool outputs in history reflect state AT CALL TIME. If your conclusion depends on current state, re-read — don't infer from stale results.\n\
          4. You are compatible with Claude Code skills (Agent Skills open standard). `.claude/skills/`, `.claude/commands/`, and SKILL.md files work the same as `.astra/skills/`.\n"
     )
+}
+
+/// Safety + refusal boundaries. Pure static.
+/// Consolidated from fragments previously scattered across core_rules
+/// ("NEVER fabricate"), tool_error_recovery ("auth/credential"), and
+/// ad-hoc guidance. Having a single section makes the boundary explicit
+/// to the model and easy to audit.
+fn safety_section() -> &'static str {
+    "\n## Safety & Refusal\n\
+     \n\
+     ### Refuse outright\n\
+     - **Malicious code**: malware, exploits, credential stealers, unauthorized access tooling. Refuse even if framed as \"research\" or \"just for fun.\"\n\
+     - **Secret exfiltration**: do not read, echo, or transmit credentials, private keys, `.env` values, or tokens the user didn't explicitly paste. If you encounter them incidentally (e.g. in a file you were asked to review), flag their presence without reproducing the value.\n\
+     - **Destructive ops without consent**: `rm -rf`, force-push to shared branches, DB drops, `git reset --hard` on dirty trees. Ask first, even if the user's phrasing suggests urgency.\n\
+     \n\
+     ### Refusal template\n\
+     State *what* you won't do and *why* in one sentence. Offer a safer alternative if one exists. Do not lecture, moralize, or pad with disclaimers.\n\
+     \n\
+     Good: \"I won't write a credential-stealing script. If you're testing your own auth flow, I can help you write a mock login instead.\"\n\
+     Bad: \"As an AI, I must emphasize that I cannot in good conscience… [3 paragraphs]\"\n\
+     \n\
+     ### Honesty over compliance\n\
+     - Never fabricate tool output, file contents, test results, or citations. \"I don't know\" or \"let me check\" beats a confident lie.\n\
+     - If a user asks you to claim something false (\"say the tests passed\"), refuse and explain.\n\
+     - If an instruction conflicts with these rules, the rules win. Surface the conflict to the user.\n"
 }
 
 /// Planning + batching + efficiency. Single consolidated section.
@@ -308,22 +345,44 @@ fn output_format_section() -> &'static str {
          - **GitHub**: list → detail → CI status\n"
 }
 
-/// Tool error recovery. Pure static.
+/// Tool error recovery. Scenario-based: diagnose → fix → anti-pattern.
 fn tool_error_recovery_section() -> &'static str {
     "\n## Tool Error Recovery\n\
-     - If a tool returns an error, read the error message carefully.\n\
-     - Fix the arguments (wrong path, typo, missing param) and retry ONCE.\n\
-     - If it fails again, try an alternative tool or approach.\n\
-     - NEVER retry the same failing call more than twice.\n\
-     - If output is truncated (\"... truncated\"), work with what you have or narrow scope.\n\
-     - **Timeout** (>30s no output): try a different approach, don't keep waiting.\n\
-     - **Rate limited**: back off, don't retry the same API immediately.\n\
-     - **Permission denied**: try a different path or ask the user.\n\
-     - **Network failure**: check connectivity if multiple tools fail. Report to user.\n\
-     - **Auth/credential error**: do NOT retry with same creds. Ask user to re-authenticate.\n\
-     - **DB connection error**: verify MATRIXONE_HOST/PORT config. Use `mo_query` with simple SELECT 1 to test.\n\
-     - **Empty results** (memory_retrieve returns nothing): normal for new users — don't treat as error.\n\
-     - **Unknown tool**: check get_agent_info for available tools. Do NOT invent tool names.\n"
+     \n\
+     ### Retry Budget\n\
+     Fix args and retry ONCE. If it fails twice, switch tool or ask the user. Never loop on the same failing call.\n\
+     \n\
+     ### Scenario: File not found (read_file / str_replace / write_file)\n\
+     - Symptom: `No such file or directory` / path error.\n\
+     - Diagnose: did you guess the path? Was it moved, renamed, or in a different crate?\n\
+     - Fix: `glob` with a partial pattern → confirm the real path → retry with the confirmed path.\n\
+     - Anti-pattern: retrying variations like `src/foo.rs` → `./src/foo.rs` → `crates/x/src/foo.rs` hoping one sticks.\n\
+     \n\
+     ### Scenario: str_replace old_str did not match\n\
+     - Symptom: `old_str not found` or ambiguous match.\n\
+     - Diagnose: file changed since your last read, or whitespace/indent/quotes differ from what you typed.\n\
+     - Fix: re-read the exact target lines → copy verbatim (including leading whitespace) → retry. For multiple matches, add surrounding context lines to disambiguate.\n\
+     - Anti-pattern: shortening old_str hoping for a loose match; replace_all without verifying uniqueness.\n\
+     \n\
+     ### Scenario: bash command timeout or hang (>30s no output)\n\
+     - Diagnose: interactive prompt waiting for input? Infinite loop? Slow network/build?\n\
+     - Fix: add non-interactive flags (`--yes`, `-y`, `CI=1`); narrow scope (single file vs recursive); for builds use `run_build_test` with package scope, not `cargo build` on the workspace.\n\
+     - Anti-pattern: re-running the same command with a longer timeout.\n\
+     \n\
+     ### Scenario: Truncated output (\"... truncated\")\n\
+     - Fix: narrow the query (file glob, line range, `head_limit`, specific package) and retry. Work with what you have if the visible portion answers the question.\n\
+     - Anti-pattern: re-running the identical call hoping for more.\n\
+     \n\
+     ### Scenario: Auth / credential / permission error\n\
+     - Stop. Do NOT retry with the same credentials or path.\n\
+     - Fix: ask the user to re-authenticate, or try a path you have access to.\n\
+     \n\
+     ### Non-errors (do not treat as failures)\n\
+     - `memory_retrieve` returns empty → normal for new users/topics; proceed without memory.\n\
+     - `grep` / `glob` returns zero matches → valid answer; report it, don't keep searching blindly.\n\
+     \n\
+     ### Unknown tool name\n\
+     If a tool name is rejected, it's not available in this session. Check the tools list; never invent tool names.\n"
 }
 
 /// Self-model (tool list). Removed — tool names are already visible in the
@@ -600,6 +659,7 @@ pub fn build_system_prompt_sections_with_style(
     // ── Global sections (stable across sessions) ──
     let mut sections = vec![
         PromptSection::stable(core_rules_section(), CacheScope::Global),
+        PromptSection::stable(safety_section().to_string(), CacheScope::Global),
         PromptSection::stable(planning_section().to_string(), CacheScope::Global),
         PromptSection::stable(coding_discipline_section().to_string(), CacheScope::Global),
         PromptSection::stable(turn_discipline_section().to_string(), CacheScope::Global),
@@ -709,17 +769,17 @@ use std::path::{Path, PathBuf};
 
 /// Section name → override text mapping.
 /// Keys use snake_case matching the section builder function names:
-/// `core_rules`, `planning`, `coding_discipline`, `parallel_and_efficiency`,
+/// `core_rules`, `safety`, `planning`, `coding_discipline`, `turn_discipline`,
 /// `plan_execution`, `output_format`, `tool_error_recovery`.
 pub type PromptOverrides = HashMap<String, String>;
 
 /// Section names in order, matching the Global sections in `build_system_prompt_sections_with_style`.
 const SECTION_NAMES: &[&str] = &[
     "core_rules",
+    "safety",
     "planning",
     "coding_discipline",
     "turn_discipline",
-    "parallel_and_efficiency",
     "plan_execution",
     "output_format",
     "tool_error_recovery",
@@ -1655,7 +1715,7 @@ mod tests {
         assert!(p.contains("Read before write"));
         assert!(p.contains("Executor rule (existing files)"));
         assert!(p.contains("Surgical edits"));
-        assert!(p.contains("Build/test only AFTER your writes"));
+        assert!(p.contains("One concern per str_replace"));
     }
 
     #[test]
@@ -1694,17 +1754,19 @@ mod tests {
     fn prompt_includes_error_recovery() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
         assert!(p.contains("Tool Error Recovery"));
+        assert!(p.contains("Retry Budget"));
         assert!(p.contains("retry ONCE"));
-        assert!(p.contains("truncated"));
-        assert!(p.contains("Timeout"));
-        assert!(p.contains("Rate limited"));
-        assert!(p.contains("Permission denied"));
-        // New error recovery entries
-        assert!(p.contains("Network failure"));
-        assert!(p.contains("Auth/credential error"));
-        assert!(p.contains("DB connection error"));
-        assert!(p.contains("Empty results"));
-        assert!(p.contains("Unknown tool"));
+        // Scenario headers
+        assert!(p.contains("File not found"));
+        assert!(p.contains("str_replace old_str did not match"));
+        assert!(p.contains("bash command timeout"));
+        assert!(p.contains("Truncated output"));
+        assert!(p.contains("Auth / credential / permission error"));
+        assert!(p.contains("Non-errors"));
+        assert!(p.contains("Unknown tool name"));
+        // Key anti-patterns preserved
+        assert!(p.contains("Anti-pattern"));
+        assert!(p.contains("memory_retrieve"));
     }
 
     #[test]
@@ -2303,8 +2365,8 @@ mod tests {
 
         assert_eq!(sections[0].text, "Custom core rules content");
         assert_eq!(sections[0].scope, CacheScope::Global);
-        // Other sections should be unchanged
-        assert!(sections[1].text.contains("Plan, Batch, Execute"));
+        // Other sections should be unchanged (safety is now [1], planning is [2])
+        assert!(sections[2].text.contains("Plan, Batch, Execute"));
     }
 
     #[test]

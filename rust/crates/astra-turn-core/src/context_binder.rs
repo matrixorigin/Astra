@@ -13,8 +13,8 @@ use serde_json::Value;
 use crate::context_planner::ContextPlan;
 use crate::context_sources::ContextSources;
 use crate::section_types::{
-    BYTES_PER_TOKEN_ESTIMATE, BoundSection, PlannedSection, SectionArtifact, SectionKind,
-    estimate_text_tokens,
+    estimate_text_tokens, BoundSection, PlannedSection, SectionArtifact, SectionKind,
+    BYTES_PER_TOKEN_ESTIMATE,
 };
 use crate::working_memory::WorkingMemoryState;
 
@@ -86,13 +86,15 @@ fn bind_identity(sources: &ContextSources<'_>) -> String {
     let mut text = String::new();
     text.push_str(&sources.statics.core_rules.text);
     text.push('\n');
+    text.push_str(&sources.statics.safety.text);
+    text.push('\n');
     text.push_str(&sources.statics.planning_protocol.text);
     text.push('\n');
     text.push_str(&sources.statics.coding_discipline.text);
     text.push('\n');
     text.push_str(&sources.statics.turn_discipline.text);
     text.push('\n');
-    text.push_str(&sources.statics.parallel_efficiency.text);
+    text.push_str(&sources.statics.plan_execution.text);
     text
 }
 

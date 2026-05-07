@@ -69,10 +69,10 @@ mod tests {
             "should include anti-fabrication rule"
         );
         assert!(
-            p.contains("check conversation history"),
+            p.contains("check history"),
             "should include history awareness"
         );
-        assert!(p.contains("Planning Protocol"), "should include protocol");
+        assert!(p.contains("Plan, Batch, Execute"), "should include protocol");
     }
 
     #[test]
@@ -179,7 +179,7 @@ mod tests {
     fn prompt_includes_history_awareness() {
         let p = build_main_system_prompt(&["read_file"], "", 1.0, None);
         assert!(
-            p.contains("check conversation history"),
+            p.contains("check history") || p.contains("Reuse history"),
             "should instruct checking history before calling tools"
         );
     }
@@ -226,11 +226,11 @@ mod tests {
     fn prompt_includes_discovery_before_access() {
         let p = build_main_system_prompt(&["read_file", "list_dir", "glob"], "", 1.0, None);
         assert!(
-            p.contains("Discovery Before Access"),
-            "should include discovery-first discipline section"
+            p.contains("Discover before reading"),
+            "should include discovery-first discipline guidance"
         );
         assert!(
-            p.contains("NEVER guess file paths"),
+            p.contains("Never guess"),
             "should warn against guessing paths"
         );
     }
