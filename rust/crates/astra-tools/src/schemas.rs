@@ -499,17 +499,15 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session state and lifecycle operations. Actions: config, prioritize, deprioritize, set_goal, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep, tool_search.",
+                "description": "Session state and lifecycle operations. Actions: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, tool_search.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","enter_plan","exit_plan","rollback_edits","ask_user","sleep","tool_search"], "description": "Session operation"},
+                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","rollback_edits","ask_user","sleep","tool_search"], "description": "Session operation"},
                         "key": {"type": "string", "description": "Config key (for config)"},
                         "value": {"type": "string", "description": "Config value"},
                         "tool": {"type": "string", "description": "Tool name (for prioritize/deprioritize)"},
-                        "goal": {"type": "string", "description": "Goal or plan goal text (for set_goal, enter_plan)"},
-                        "plan_id": {"type": "string", "description": "Existing plan to re-link (for enter_plan resume flows)"},
-                        "approved": {"type": "boolean", "description": "Whether plan is approved (for exit_plan, default true)"},
+                        "goal": {"type": "string", "description": "Goal text (for set_goal)"},
                         "scope": {"type": "string", "enum": ["current_turn","turn","file","list"], "description": "Rollback scope (for rollback_edits)"},
                         "path": {"type": "string", "description": "File path (for rollback_edits scope=file)"},
                         "turn_index": {"type": "integer", "description": "Turn index (for rollback_edits scope=turn)"},
@@ -695,6 +693,14 @@ mod tests {
         assert!(!names.contains(&"memory_store"));
         assert!(!names.contains(&"powershell"));
         assert!(!names.contains(&"multi_edit"));
+        // Legacy top-level tool names removed in dd556ec — these actions now
+        // live under the consolidated `session` / `write_file` / `str_replace`
+        // surfaces. Catch any accidental re-registration.
+        assert!(!names.contains(&"delete_file"));
+        assert!(!names.contains(&"enter_plan_mode"));
+        assert!(!names.contains(&"exit_plan_mode"));
+        assert!(!names.contains(&"ask_user"));
+        assert!(!names.contains(&"sleep"));
     }
 
     #[test]

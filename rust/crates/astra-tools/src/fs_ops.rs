@@ -18,7 +18,7 @@ use crate::{ToolResult, per_tool_output_limit, truncate_output};
 const READ_FILE_SIZE_LIMIT: usize = 80 * 1024;
 /// Hard ceiling: files above this size are never read into memory for preview.
 const READ_FILE_HARD_LIMIT: usize = 10 * 1024 * 1024;
-const IMAGE_READ_SIZE_LIMIT: u64 = 1_500_000;
+const IMAGE_READ_SIZE_LIMIT: u64 = 10 * 1024 * 1024;
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
 const BINARY_EXTS: &[&str] = &[
     "svg", "pdf", "zip", "gz", "tar", "bz2", "xz", "7z", "rar", "exe", "dll", "so", "dylib", "o",
@@ -179,8 +179,8 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         if IMAGE_EXTS.contains(&ext_lower.as_str()) {
             if metadata.len() > IMAGE_READ_SIZE_LIMIT {
                 return ToolResult::error(format!(
-                    "Error: image too large ({} bytes). Use bash to resize first.",
-                    metadata.len()
+                    "Error: image file too large ({} MB). Maximum supported: 10MB.",
+                    metadata.len() / (1024 * 1024)
                 ));
             }
             let bytes = match std::fs::read(&path) {

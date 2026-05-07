@@ -4001,8 +4001,9 @@ esac
 
         let result = exec
             .execute_with_metadata(
-                "ask_user",
+                "session",
                 &json!({
+                    "action": "ask_user",
                     "question": "Which option?",
                     "choices": ["first", "second"],
                     "default": "first"
@@ -4025,7 +4026,10 @@ esac
     async fn ask_user_requires_interactive_gate() {
         let (exec, _dir) = test_executor();
         let result = exec
-            .execute_with_metadata("ask_user", &json!({"question": "Continue?"}))
+            .execute_with_metadata(
+                "session",
+                &json!({"action": "ask_user", "question": "Continue?"}),
+            )
             .await;
 
         assert!(result.is_error);
@@ -4037,8 +4041,8 @@ esac
         let (exec, _dir) = test_executor();
         let result = exec
             .execute_with_metadata(
-                "ask_user",
-                &json!({"question": "Pick one", "choices": ["only-one"]}),
+                "session",
+                &json!({"action": "ask_user", "question": "Pick one", "choices": ["only-one"]}),
             )
             .await;
 
@@ -4291,7 +4295,10 @@ esac
         std::fs::write(&target, "temp").unwrap();
         assert!(target.exists());
         let result = exec
-            .execute("delete_file", &json!({"path": "to_delete.txt"}))
+            .execute(
+                "write_file",
+                &json!({"path": "to_delete.txt", "delete": true}),
+            )
             .await;
         assert!(result.contains("Successfully deleted"));
         assert!(!target.exists());
@@ -4301,7 +4308,7 @@ esac
     async fn delete_file_nonexistent_returns_error() {
         let (exec, _dir) = test_executor();
         let result = exec
-            .execute("delete_file", &json!({"path": "ghost.txt"}))
+            .execute("write_file", &json!({"path": "ghost.txt", "delete": true}))
             .await;
         assert!(result.contains("File not found"));
     }
@@ -4321,7 +4328,10 @@ esac
         assert!(second.contains("Successfully wrote"));
 
         let rollback = exec
-            .execute("rollback_file_edits", &json!({"scope": "current_turn"}))
+            .execute(
+                "session",
+                &json!({"action": "rollback_edits", "scope": "current_turn"}),
+            )
             .await;
         let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
         assert_eq!(
@@ -4345,7 +4355,7 @@ esac
 
         let edited = exec
             .execute(
-                "multi_edit",
+                "str_replace",
                 &json!({
                     "path": "edit.txt",
                     "edits": [
@@ -4359,7 +4369,10 @@ esac
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "AAA bbb CCC");
 
         let rollback = exec
-            .execute("rollback_file_edits", &json!({"scope": "current_turn"}))
+            .execute(
+                "session",
+                &json!({"action": "rollback_edits", "scope": "current_turn"}),
+            )
             .await;
         let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
         assert_eq!(
@@ -4378,15 +4391,15 @@ esac
         std::fs::write(&target, "restore me").unwrap();
 
         let deleted = exec
-            .execute("delete_file", &json!({"path": "gone.txt"}))
+            .execute("write_file", &json!({"path": "gone.txt", "delete": true}))
             .await;
         assert!(deleted.contains("Successfully deleted"));
         assert!(!target.exists());
 
         let rollback = exec
             .execute(
-                "rollback_file_edits",
-                &json!({"scope": "file", "path": "gone.txt"}),
+                "session",
+                &json!({"action": "rollback_edits", "scope": "file", "path": "gone.txt"}),
             )
             .await;
         let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
@@ -4631,7 +4644,9 @@ esac
     async fn sleep_is_available_in_server_mode() {
         let (exec, _dir) = test_executor();
         let start = std::time::Instant::now();
-        let result = exec.execute("sleep", &json!({"duration_ms": 20})).await;
+        let result = exec
+            .execute("session", &json!({"action": "sleep", "duration_ms": 20}))
+            .await;
         assert!(result.contains("Slept"), "{result}");
         assert!(start.elapsed().as_millis() >= 15);
         assert!(!result.contains("not available in server-side execution mode"));
@@ -5286,7 +5301,7 @@ esac
 
         // ── Phase 2: exit_plan_mode(approved=true) unblocks ──────────────
         let exit_result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
+            .execute("session", &json!({"action": "exit_plan", "approved": true}))
             .await;
         assert!(
             exit_result.contains("unlocked"),
