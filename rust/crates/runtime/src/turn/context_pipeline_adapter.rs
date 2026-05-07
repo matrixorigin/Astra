@@ -196,7 +196,8 @@ pub(crate) fn build_external_sources(
 
         profile_desc,
         effort_hint,
-        learned_context: None,
+        // learned_context intentionally flows through extra_dynamic_sections
+        // (volatile lane) rather than ExternalSources.
         system_override,
         plan_context,
         tool_guidance,

@@ -32,6 +32,12 @@ pub fn anthropic_ephemeral_cache_control() -> Value {
 /// win, and the caller is expected to log a warning at the call-site.
 ///
 /// No-op when `tool_schemas` is empty.
+/// Annotates tool schemas with `cache_control` on the last pinned tool. See
+/// module-level docs for cache-key rationale.
+///
+/// Fallback: if no pinned tools are present in the input slice, falls back to
+/// marking the final tool to preserve cache-boundary behavior and emits a
+/// `warn!` log (observability for the degraded case).
 pub fn annotate_pinned_tool_schema(
     tool_schemas: &mut [Value],
     pinned_names: &std::collections::HashSet<String>,
@@ -39,8 +45,22 @@ pub fn annotate_pinned_tool_schema(
     if tool_schemas.is_empty() {
         return;
     }
-    let marker_idx =
-        last_pinned_tool_index(tool_schemas, pinned_names).unwrap_or(tool_schemas.len() - 1);
+    let marker_idx = match last_pinned_tool_index(tool_schemas, pinned_names) {
+        Some(idx) => idx,
+        None => {
+            // Degraded path: no pinned tools present. Fall back to the last
+            // tool to preserve the cache-boundary contract, but emit a warn!
+            // so this shows up in observability (L3 remediation).
+            tracing::warn!(
+                target: "astra::cache",
+                tool_count = tool_schemas.len(),
+                pinned_count = pinned_names.len(),
+                "annotate_pinned_tool_schema: no pinned tools found — \
+                 falling back to final tool for cache_control marker"
+            );
+            tool_schemas.len() - 1
+        }
+    };
     tool_schemas[marker_idx]["cache_control"] = anthropic_ephemeral_cache_control();
 }
 
@@ -147,15 +167,55 @@ fn find_cache_breakpoint_target(messages: &[Value]) -> Option<usize> {
 /// For `user`/`assistant` messages with string content: upgrades to a
 /// content-block array with one `{type: "text", cache_control: …}` entry.
 /// For messages with array content: attaches to the last block.
-/// For `tool` messages (which must keep string content for downstream
-/// compatibility): places `cache_control` at the **message level** instead
-/// of inside content — Anthropic's API supports both forms.
+/// For `tool` messages: upgrade string content to a `tool_result` content
+/// block carrying `cache_control` inside content. Anthropic's API does
+/// **not** accept message-level `cache_control` on tool messages, so we
+/// always lift the marker into the content block.
 fn apply_cache_control_to_message(msg: &mut Value) {
     let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
     if role == "tool" {
-        // Tool messages: top-level cache_control (keeps content as string).
-        msg["cache_control"] = anthropic_ephemeral_cache_control();
-    } else if msg.get("content").is_some_and(Value::is_string) {
+        // Tool messages: wrap string content into a tool_result block with
+        // content-level cache_control. If content is already an array, just
+        // attach cache_control to the last block.
+        //
+        // Array path (content is already `[{type: "tool_result", ...}]`) is
+        // safe unconditionally — we only touch `cache_control` on the last
+        // block, never synthesize a `tool_use_id`.
+        if let Some(arr) = msg.get_mut("content").and_then(Value::as_array_mut) {
+            if let Some(last_block) = arr.last_mut() {
+                last_block["cache_control"] = anthropic_ephemeral_cache_control();
+            }
+            return;
+        }
+        // String path: we must synthesize a tool_result block, which requires
+        // a non-empty `tool_use_id`. If the upstream message lacks one, skip
+        // annotation rather than emit an invalid request (Anthropic rejects
+        // `tool_use_id: ""` with 400). Losing the cache marker here is
+        // strictly preferable to breaking the request.
+        if msg.get("content").is_some_and(Value::is_string) {
+            let tool_call_id = msg
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if tool_call_id.is_empty() {
+                tracing::warn!(
+                    target: "astra::cache",
+                    "apply_cache_control_to_message: tool message missing tool_call_id — \
+                     skipping cache_control to avoid invalid tool_use_id"
+                );
+                return;
+            }
+            let text = msg["content"].as_str().unwrap_or_default().to_string();
+            msg["content"] = json!([{
+                "type": "tool_result",
+                "tool_use_id": tool_call_id,
+                "content": text,
+                "cache_control": anthropic_ephemeral_cache_control(),
+            }]);
+        }
+        return;
+    }
+    if msg.get("content").is_some_and(Value::is_string) {
         let text = msg["content"].as_str().unwrap_or_default().to_string();
         msg["content"] = json!([{
             "type": "text",

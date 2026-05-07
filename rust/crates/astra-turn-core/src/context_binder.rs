@@ -247,9 +247,6 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     if let Some(ref text) = ext.profile_desc {
         parts.push(text.clone());
     }
-    if let Some(ref text) = ext.learned_context {
-        parts.push(text.clone());
-    }
     if let Some(ref text) = ext.system_override {
         parts.push(text.clone());
     }

@@ -260,7 +260,6 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
 
         profile_desc,
         effort_hint: None,
-        learned_context: None,
         system_override: None,
         plan_context: None,
         tool_guidance,
