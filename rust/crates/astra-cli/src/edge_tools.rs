@@ -1454,11 +1454,18 @@ impl ToolExecutor {
                         "set_goal" => self.set_goal(args),
                         "compact" => self.compress_context(args),
                         "enter_plan" => {
-                            // Plan mode not implemented in CLI edge executor
-                            "Plan mode entered. Write tools are now blocked until exit_plan.".to_string()
+                            // Plan mode is NOT wired through the CLI edge executor.
+                            // Returning a success string would make the model believe
+                            // write tools are blocked when they are not — a correctness
+                            // hazard. Fail explicitly so the caller can fall back.
+                            "Error: session.enter_plan is not implemented in the CLI edge executor. \
+                             Plan mode is only available when running under the full runtime."
+                                .to_string()
                         }
                         "exit_plan" => {
-                            "Plan mode exited. Write tools are now unlocked.".to_string()
+                            "Error: session.exit_plan is not implemented in the CLI edge executor. \
+                             Plan mode is only available when running under the full runtime."
+                                .to_string()
                         }
                         "rollback_edits" => self.rollback_file_edits(args),
                         "ask_user" => self.ask_user(args),
