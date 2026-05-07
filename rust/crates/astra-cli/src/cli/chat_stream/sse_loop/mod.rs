@@ -948,10 +948,10 @@ mod tests {
             &astra_config::runtime_config::ToolSelectionConfig::default(),
         );
 
-        assert_eq!(cfg.stall_threshold, 3);
+        assert_eq!(cfg.stall_threshold, 6);
         assert_eq!(cfg.repetition_threshold, 3);
         assert_eq!(cfg.read_only_stall_threshold, 12);
-        // `0` in user config means "use default (3)", NOT the BreakerConfig sentinel "unbounded".
+        // `0` in user config means "use default", NOT the BreakerConfig sentinel "unbounded".
         assert_eq!(cfg.max_introspect_emissions, 3);
         assert_eq!(cfg.half_open_patience, 2);
         assert_eq!(cfg.absolute_max_rounds, 200);
@@ -972,12 +972,16 @@ mod tests {
 
         let cfg = circuit_breaker_config_from_tool_selection(&tool_selection);
 
-        assert_eq!(cfg.stall_threshold, 2);
+        // stall: resolve(1, 6, 3) = max(1, 3) = 3 (floored)
+        assert_eq!(cfg.stall_threshold, 3);
+        // repetition: resolve(7, 3, 2) = max(7, 2) = 7
         assert_eq!(cfg.repetition_threshold, 7);
+        // read_only: resolve(2, 12, 4) = max(2, 4) = 4 (floored)
         assert_eq!(cfg.read_only_stall_threshold, 4);
-        // user=0 means "use default" → 3, never unbounded (BreakerConfig.0 sentinel)
+        // introspect: resolve(0, 3, 1) = 3 (default)
         assert_eq!(cfg.max_introspect_emissions, 3);
         assert_eq!(cfg.half_open_patience, 5);
+        // absolute: resolve(10, 200, 20) = max(10, 20) = 20 (floored)
         assert_eq!(cfg.absolute_max_rounds, 20);
     }
 
@@ -1109,7 +1113,10 @@ hooks:
     }
 
     #[test]
-    fn blocked_patterns_seed_initial_restrictions_from_observability_hub() {
+    fn blocked_patterns_do_not_restrict_pinned_tools() {
+        // All tools are pinned after consolidation, so pattern-library
+        // blocks have no effect on tool restrictions. Only non-pinned
+        // (dynamic) tools can be blocked.
         let pattern_library = Arc::new(Mutex::new(PatternLibrary::new()));
         {
             let mut lib = pattern_library.lock().unwrap();
@@ -1124,7 +1131,8 @@ hooks:
         let mut restricted = HashSet::new();
         extend_restricted_with_blocked_tools(&mut restricted, Some(&hub));
 
-        assert!(restricted.contains("grep"));
+        // grep is pinned → not restricted even when blocked
+        assert!(!restricted.contains("grep"));
     }
 
     // ── G3: spawn_agent visibility gate ──

@@ -993,7 +993,10 @@ mod tests {
         assert!(dir.path().join("turn.txt").exists());
 
         let rollback = server_exec
-            .execute("rollback_file_edits", &json!({"scope": "current_turn"}))
+            .execute(
+                "session",
+                &json!({"action": "rollback_edits", "scope": "current_turn"}),
+            )
             .await;
         let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
         assert_eq!(
