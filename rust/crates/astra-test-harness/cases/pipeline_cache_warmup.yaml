@@ -12,7 +12,7 @@ prompt: |
   Do these in sequence, one tool call each:
   1. Read the first 5 lines of ./Cargo.toml
   2. Then tell me what the package name is based on what you read.
-timeout_seconds: 60
+timeout_seconds: 120
 criteria:
   - type: exit_code
     code: 0

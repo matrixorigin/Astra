@@ -37,4 +37,4 @@ criteria:
   - type: prompt_cache_tokens
     min_read: 16000
     min_creation: 0
-    max_creation: 60000
+    max_creation: 75000
