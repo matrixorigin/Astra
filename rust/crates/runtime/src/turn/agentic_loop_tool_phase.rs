@@ -1246,6 +1246,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     &visible,
                     open_skill_name,
                 ));
+                if open_skill_name {
+                    host.inject_tool_schema(crate::turn::skill_tool::discover_skills_tool_schema());
+                }
             }
         }
     }
