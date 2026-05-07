@@ -71,9 +71,13 @@ pub fn extract_anchor(first_user_msg: &str, l1: Option<&SessionMemory>) -> Strin
 /// sees in the message stream and therefore should NOT be injected into
 /// the dynamic system prompt.
 ///
-/// Concretely: the anchor is "trivial" when it is in the bootstrap shape
-/// produced by [`extract_anchor`] for a zero-progress, no-facts session
-/// — i.e. `[session-anchor] <task>. Currently: starting. 0/0 steps.` —
+/// The anchor is "trivial" when it is in the bootstrap shape produced on
+/// turn 1 with no facts or progress yet:
+///
+/// - Legacy `extract_anchor`: `[session-anchor] <task>. Currently: starting. 0/0 steps.`
+/// - Facts-based `extract_anchor_from_facts` with zero progress:
+///   `[session-anchor] Goal: <task>. State: starting.`
+///
 /// AND the `<task>` portion is a near-verbatim truncation of the current
 /// user message. On turn 1 of a plain "hi"-type exchange this is almost
 /// always the case, and injecting it just duplicates the user turn.
@@ -85,6 +89,13 @@ pub fn extract_anchor(first_user_msg: &str, l1: Option<&SessionMemory>) -> Strin
 ///   first user message
 /// - anchor task differs substantively from the current user message —
 ///   i.e. the user has drifted, so the anchor is re-anchoring value.
+///
+/// Bug history: this function recognized only the legacy shape for a
+/// while after `extract_anchor_from_facts` landed. The new path emits
+/// `"Goal: <task>. State: starting."` instead of `"Currently: …"`, so
+/// every no-facts turn-1 anchor slipped through the triviality check
+/// and bloated the volatile lane with a near-duplicate of the user
+/// message. Observed in session `69657ca7`.
 #[must_use]
 pub fn is_trivial_anchor(anchor: &str, current_user_msg: &str) -> bool {
     let trimmed = anchor.trim();
@@ -92,7 +103,21 @@ pub fn is_trivial_anchor(anchor: &str, current_user_msg: &str) -> bool {
         Some(rest) => rest.trim_start(),
         None => return false,
     };
-    // Only the bootstrap shape is ever trivial.
+
+    // Facts-based shape: `Goal: <task>. State: starting.` (possibly with
+    // extra constraints appended — those would already be non-trivial).
+    if let Some(rest) = stripped.strip_prefix("Goal: ") {
+        let Some((task, tail)) = rest.split_once(". State: ") else {
+            return false;
+        };
+        // Trivial iff state is exactly "starting." (no extra constraints).
+        if tail.trim_end() != "starting." {
+            return false;
+        }
+        return anchor_task_matches_message(task, current_user_msg);
+    }
+
+    // Legacy shape: `<task>. Currently: starting. 0/0 steps.`
     let Some((task, tail)) = stripped.split_once(". Currently: ") else {
         return false;
     };
@@ -2101,5 +2126,58 @@ mod tests {
         // anchor so the LLM still sees context).
         let anchor = extract_anchor("refactor prompt builder", None);
         assert!(!is_trivial_anchor(&anchor, ""));
+    }
+
+    // ── is_trivial_anchor for facts-based shape ─────────────────────────────
+    // `extract_anchor_from_facts` emits `Goal: <task>. State: starting.` —
+    // *not* the legacy `<task>. Currently: starting. 0/0 steps.` shape. For
+    // a while `is_trivial_anchor` only recognized the legacy form, so every
+    // facts-based turn-1 anchor slipped through and bloated the volatile
+    // lane with a near-duplicate of the user message (observed in session
+    // `69657ca7`).
+
+    #[test]
+    fn trivial_anchor_facts_shape_turn_one_hi() {
+        let anchor = "[session-anchor] Goal: hi. State: starting.";
+        assert!(
+            is_trivial_anchor(anchor, "hi"),
+            "facts-shape bootstrap anchor must be flagged trivial, got: {anchor}"
+        );
+    }
+
+    #[test]
+    fn trivial_anchor_facts_shape_short_task() {
+        let anchor = "[session-anchor] Goal: refactor the prompt builder. State: starting.";
+        assert!(is_trivial_anchor(anchor, "refactor the prompt builder"));
+    }
+
+    #[test]
+    fn non_trivial_anchor_facts_shape_when_state_not_starting() {
+        let anchor = "[session-anchor] Goal: fix bug. State: 2/5 subtasks, current: patch.";
+        assert!(
+            !is_trivial_anchor(anchor, "fix bug"),
+            "facts-based anchor with real state must NOT be trivial, got: {anchor}"
+        );
+    }
+
+    #[test]
+    fn non_trivial_anchor_facts_shape_when_constraints_appended() {
+        // `extract_anchor_from_facts` appends `" Last error: …"` and
+        // `" Avoid: …"` after the `State:` clause. Those carry real signal
+        // and must not be flagged trivial even when base state is starting.
+        let anchor = "[session-anchor] Goal: hi. State: starting. Last error: timeout.";
+        assert!(
+            !is_trivial_anchor(anchor, "hi"),
+            "anchor carrying Last error must NOT be trivial, got: {anchor}"
+        );
+    }
+
+    #[test]
+    fn non_trivial_anchor_facts_shape_when_user_drifted() {
+        let anchor = "[session-anchor] Goal: refactor the prompt builder. State: starting.";
+        assert!(
+            !is_trivial_anchor(anchor, "wait, let's talk about logging"),
+            "facts-shape anchor must re-anchor after user drift, got: {anchor}"
+        );
     }
 }
