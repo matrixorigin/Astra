@@ -1593,27 +1593,26 @@ impl InProcessChatTurnBridge {
                 let _ = std::fs::write(&dump_path, &dump_content);
             }
             llm_messages.push(system_msg);
+            let mut bridge_volatile_text: Option<String> = None;
             if let Some(dyn_msg) = dynamic_msg {
                 // For prefix-only providers the dynamic system block contains
-                // volatile per-turn content. Emitting it as a user/assistant
-                // preamble pair keeps the system message byte-stable so the
-                // provider's prefix cache hits on the unchanged portion.
+                // volatile per-turn content. We prepend it to the last user
+                // message (below, after compacted messages are added) so the
+                // stable prefix (system + history) is byte-identical across
+                // turns for maximum prefix cache hits.
                 // Anthropic never reaches here (dynamic_system is None).
+                debug_assert!(
+                    !crate::turn::llm_client::provider_uses_explicit_cache_control(&provider),
+                    "Anthropic/Bedrock should not produce dynamic_system — \
+                     volatile content goes via pipeline cache_control markers"
+                );
                 let dyn_text = dyn_msg
                     .get("content")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                if !dyn_text.is_empty() {
-                    llm_messages.push(json!({
-                        "role": "user",
-                        "content": format!("<system-reminder>\n{dyn_text}</system-reminder>"),
-                    }));
-                    llm_messages.push(json!({
-                        "role": "assistant",
-                        "content": "Understood.",
-                    }));
-                }
+                // Stash for prepending to last user message after history is added
+                bridge_volatile_text = Some(dyn_text);
             }
 
             // Merge tool results into messages (handle continuation turns)
@@ -1672,6 +1671,27 @@ impl InProcessChatTurnBridge {
             // compat; only the most recent assistant reasoning is preserved.
             // Heavy checkpoints and persisted events retain full reasoning.
             astra_turn_core::edge_ledger::strip_stale_reasoning(&mut llm_messages, &provider, &model_name);
+
+            // Prepend volatile content to the last user message (same strategy
+            // as wire_assembly::assemble_llm_messages) so the stable prefix
+            // (system + history) stays byte-identical for prefix cache hits.
+            if let Some(vol_text) = bridge_volatile_text.take() {
+                if !vol_text.is_empty() {
+                    if let Some(last_user) = llm_messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                    {
+                        let existing = last_user
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        last_user["content"] = Value::String(format!(
+                            "<system-reminder>\n{vol_text}</system-reminder>\n\n{existing}"
+                        ));
+                    }
+                }
+            }
 
             // Cloud loop: every tool round waits on §5.5 ledger (`POST /tools/result`) then continues LLM.
             let merged_tool_results: Vec<Value> = tool_results.clone();

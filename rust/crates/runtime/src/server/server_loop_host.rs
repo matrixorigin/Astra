@@ -34,7 +34,7 @@ use crate::turn::bridge_llm_stream::rate_limit_cooldown;
 use crate::turn::llm_client::{
     LlmCallResult, LlmCancel, call_llm_and_collect_with_request_overrides,
     call_llm_nonstream_fallback_with_request_overrides, llm_connect_timeout, llm_fallback_timeout,
-    provider_uses_anthropic_messages, provider_uses_bedrock_converse, sleep_ms_or_llm_cancel,
+    sleep_ms_or_llm_cancel,
 };
 #[cfg(feature = "bridge-e2e-hooks")]
 use crate::turn::prompt_cache::apply_anthropic_cache_metadata;
@@ -1862,10 +1862,10 @@ impl ServerAgenticLoopHost {
         //
         // Routes through `provider_uses_anthropic_messages` / `provider_uses_bedrock_converse`
         // (which in turn delegate to `llm_provider_protocol`) so the classification
-        // lives in exactly one place — `llm_client::llm_provider_protocol`. A future
-        // provider added there is automatically picked up here.
-        let is_anthropic =
-            provider_uses_anthropic_messages(provider) || provider_uses_bedrock_converse(provider);
+        // Single source of truth for cache protocol classification — lives in
+        // `llm_client::provider_uses_explicit_cache_control`. A future provider
+        // added there is automatically picked up here.
+        let is_anthropic = crate::turn::llm_client::provider_uses_explicit_cache_control(provider);
 
         let (system_messages, volatile_preamble) = if is_anthropic {
             // Anthropic/Bedrock: all blocks in system message with cache_control.
