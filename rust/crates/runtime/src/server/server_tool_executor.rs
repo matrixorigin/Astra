@@ -822,7 +822,18 @@ fn persist_manual_compression(
 
 fn supports_server_tool_name(tool: &str) -> bool {
     astra_tools::schemas::SERVER_EXECUTOR_TOOL_NAMES.contains(&tool)
-        || matches!(tool, "enter_plan_mode" | "exit_plan_mode")
+        // Legacy tool names still accepted for backward compat dispatch
+        || matches!(
+            tool,
+            "enter_plan_mode"
+                | "exit_plan_mode"
+                | "multi_edit"
+                | "delete_file"
+                | "rollback_file_edits"
+                | "ask_user"
+                | "sleep"
+                | "tool_search"
+        )
 }
 
 /// Tools that mutate the world outside the session. Blocked while plan mode
@@ -1338,19 +1349,39 @@ impl ServerToolExecutor {
                     astra_tools::ToolResult::text(output)
                 }
             }
-            "ask_user" => self.server_ask_user(args).await,
-            // ── Plan-mode lifecycle tools ──────────────────────────────
+            // ── Legacy plan-mode lifecycle tools (kept for backward compat) ──
             "enter_plan_mode" => {
                 astra_tools::ToolResult::text(self.tool_enter_plan_mode(args).await)
             }
             "exit_plan_mode" => astra_tools::ToolResult::text(self.tool_exit_plan_mode(args).await),
+            // ── Legacy ask_user (kept for backward compat) ────────────
+            "ask_user" => self.server_ask_user(args).await,
             // ── File operations ─────────────────────────────────────────
             // Write operations use server-specific journal recording.
             // Read-only operations delegate to DefaultToolExecutor.
             "web_fetch" => self.default_executor.execute("web_fetch", args).await,
             "read_file" => self.default_executor.execute("read_file", args).await,
-            "write_file" => tool_result_from_output(self.server_write_file(args)),
-            "str_replace" => tool_result_from_output(self.server_str_replace(args)),
+            "write_file" => {
+                // delete=true routes to delete_file handler
+                if args
+                    .get("delete")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    tool_result_from_output(self.server_delete_file(args))
+                } else {
+                    tool_result_from_output(self.server_write_file(args))
+                }
+            }
+            "str_replace" => {
+                // edits array routes to multi_edit handler
+                if args.get("edits").and_then(|v| v.as_array()).is_some() {
+                    tool_result_from_output(self.server_multi_edit(args))
+                } else {
+                    tool_result_from_output(self.server_str_replace(args))
+                }
+            }
+            // Legacy individual names (backward compat for existing sessions)
             "multi_edit" => tool_result_from_output(self.server_multi_edit(args)),
             "delete_file" => tool_result_from_output(self.server_delete_file(args)),
             "rollback_file_edits" => tool_result_from_output(self.rollback_file_edits(args)),
@@ -1362,9 +1393,22 @@ impl ServerToolExecutor {
                     "config" => tool_result_from_output(self.adjust_config(args)),
                     "prioritize" => tool_result_from_output(self.prioritize_tool(args)),
                     "deprioritize" => tool_result_from_output(self.deprioritize_tool(args)),
-                    "session" => tool_result_from_output(self.set_goal(args)),
+                    "set_goal" => tool_result_from_output(self.set_goal(args)),
                     "compact" => tool_result_from_output(self.compress_context(args)),
-                    "" => tool_result_from_output("Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact".to_string()),
+                    "enter_plan" => {
+                        astra_tools::ToolResult::text(self.tool_enter_plan_mode(args).await)
+                    }
+                    "exit_plan" => {
+                        astra_tools::ToolResult::text(self.tool_exit_plan_mode(args).await)
+                    }
+                    "rollback_edits" => tool_result_from_output(self.rollback_file_edits(args)),
+                    "ask_user" => self.server_ask_user(args).await,
+                    "sleep" => self.default_executor.execute("sleep", args).await,
+                    "tool_search" => tool_result_from_output(astra_tools::tool_search::tool_search(
+                        &astra_tools::schemas::server_executor_tool_schemas(),
+                        args,
+                    )),
+                    "" => tool_result_from_output("Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep, tool_search".to_string()),
                     other => tool_result_from_output(format!("Unknown session action: '{other}'")),
                 }
             }
@@ -1379,6 +1423,7 @@ impl ServerToolExecutor {
             "task_get" => tool_result_from_output(self.task_get(args)),
             "task_update" => tool_result_from_output(self.task_update(args)),
             "task_stop" => tool_result_from_output(self.task_stop(args)),
+            // Legacy individual names (backward compat for existing sessions)
             "sleep" => self.default_executor.execute("sleep", args).await,
             "tool_search" => tool_result_from_output(astra_tools::tool_search::tool_search(
                 &astra_tools::schemas::server_executor_tool_schemas(),

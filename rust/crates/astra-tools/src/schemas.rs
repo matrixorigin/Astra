@@ -10,7 +10,6 @@ pub const DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "read_file",
     "write_file",
     "str_replace",
-    "delete_file",
     "list_dir",
     "grep",
     "glob",
@@ -25,9 +24,6 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "read_file",
     "write_file",
     "str_replace",
-    "multi_edit",
-    "delete_file",
-    "rollback_file_edits",
     "list_dir",
     "grep",
     "glob",
@@ -41,13 +37,8 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "lsp",
     "web_fetch",
     "web_search",
-    "ask_user",
-    "sleep",
-    "tool_search",
     "symbols",
     "run_script",
-    "enter_plan_mode",
-    "exit_plan_mode",
 ];
 
 fn filter_tool_schemas_by_name(allowed_names: &[&str]) -> Vec<Value> {
@@ -88,6 +79,21 @@ pub fn all_tool_schemas_with_env<F: Fn(&str) -> Option<String>>(env: F) -> Vec<V
     {
         schemas.push(run_script_schema_default());
     }
+    schemas.push(json!({
+        "type": "function",
+        "function": {
+            "name": "powershell",
+            "description": "Execute a PowerShell command. Use for Windows shell tasks, pwsh scripts, and cross-platform automation when PowerShell syntax is preferred over bash.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "PowerShell command to run"},
+                    "timeout": {"type": "number", "description": "Timeout in seconds (default 30)"}
+                },
+                "required": ["command"]
+            }
+        }
+    }));
     schemas
 }
 
@@ -116,26 +122,11 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a shell command in the project root. Use for builds, tests, installs, and other CLI tasks. Avoid bash for operations with dedicated tools: read files → read_file (NOT cat/head/tail), search content → grep (NOT bash grep/rg), find files → glob (NOT bash find), list dirs → list_dir (NOT ls), edit files → str_replace/multi_edit (NOT sed/awk). FORBIDDEN for git inspection — NEVER use bash for `git status`, `git diff`, `git log`, `git show`, or similar git commands. Use git_status, git_diff, git_log, git_show tools instead. Non-read-only bash does not participate in rollback journals; inside rollback-on-failure boundaries such as plan subtasks, run_chain, or explicit rollback-on-failure batch transactions, keep bash read-only and prefer structured tools such as write_file, git_*, or run_build_test. Can run curl, GitHub API, etc. Timeout varies (5-30s); override with timeout. On timeout or cancellation, returns any partial captured output plus a boundary note. Non-zero exits are returned as tool errors with stderr and exit code.",
+                "description": "Execute a shell command in the project root. Use for builds, tests, installs, and other CLI tasks. Avoid bash for operations with dedicated tools: read files → read_file (NOT cat/head/tail), search content → grep (NOT bash grep/rg), find files → glob (NOT bash find), list dirs → list_dir (NOT ls), edit files → str_replace (NOT sed/awk). FORBIDDEN for git inspection — NEVER use bash for `git status`, `git diff`, `git log`, `git show`, or similar git commands. Use git tool instead. Non-read-only bash does not participate in rollback journals; inside rollback-on-failure boundaries such as plan subtasks, run_chain, or explicit rollback-on-failure batch transactions, keep bash read-only and prefer structured tools such as write_file, git, or run_build_test. Can run curl, GitHub API, etc. Timeout varies (5-30s); override with timeout. On timeout or cancellation, returns any partial captured output plus a boundary note. Non-zero exits are returned as tool errors with stderr and exit code.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run"},
-                        "timeout": {"type": "number", "description": "Timeout in seconds (default 30)"}
-                    },
-                    "required": ["command"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "powershell",
-                "description": "Execute a PowerShell command in the project root. Use for Windows-oriented shell tasks, pwsh scripts, and cross-platform automation when PowerShell syntax is more appropriate than bash. Prefer git_* tools for git inspection instead of shelling out.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string", "description": "PowerShell command to run"},
                         "timeout": {"type": "number", "description": "Timeout in seconds (default 30)"}
                     },
                     "required": ["command"]
@@ -165,48 +156,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create or overwrite a file. Use str_replace to edit existing files.",
+                "description": "Create or overwrite a file. Use str_replace to edit existing files. Set delete=true to delete the file instead of writing.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "content": {"type": "string", "description": "File content"},
-                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
-                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
-                    },
-                    "required": ["path", "content"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "str_replace",
-                "description": "Replace a string in a file. Tries an exact match first, then a unique quote/whitespace-aware fuzzy match when old_str differs slightly. On mismatch, shows closest matches with line numbers so you can fix and retry. Set dry_run=true to preview the diff without applying.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "File path relative to project root"},
-                        "old_str": {"type": "string", "description": "Exact string to replace"},
-                        "new_str": {"type": "string", "description": "Replacement string"},
-                        "dry_run": {"type": "boolean", "description": "If true, show unified diff without applying changes (default: false)"},
-                        "replace_all": {"type": "boolean", "description": "If true, replace ALL occurrences of old_str (default: false, requires unique match)"},
-                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
-                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
-                    },
-                    "required": ["path", "old_str", "new_str"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "delete_file",
-                "description": "Delete a file. Refuses to delete directories, .git/ contents, or paths outside the project root.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "File path relative to project root"},
+                        "content": {"type": "string", "description": "File content (not required when delete=true)"},
+                        "delete": {"type": "boolean", "description": "If true, delete the file at path instead of writing. Refuses to delete directories, .git/ contents, or paths outside the project root."},
                         "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
                         "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
                     },
@@ -217,15 +173,17 @@ fn all_tool_schemas_core() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
-                "name": "multi_edit",
-                "description": "Apply multiple str_replace edits to a single file atomically. All edits must match; if any fails, none are applied. More token-efficient than sequential str_replace calls.",
+                "name": "str_replace",
+                "description": "Replace a string in a file. Tries an exact match first, then a unique quote/whitespace-aware fuzzy match when old_str differs slightly. On mismatch, shows closest matches with line numbers so you can fix and retry. Set dry_run=true to preview the diff without applying. For multiple edits to the same file, use 'edits' array instead of old_str/new_str — all edits apply atomically (all-or-nothing).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
+                        "old_str": {"type": "string", "description": "Exact string to replace (single-edit mode)"},
+                        "new_str": {"type": "string", "description": "Replacement string (single-edit mode)"},
                         "edits": {
                             "type": "array",
-                            "description": "Array of {old_str, new_str} pairs to apply in order",
+                            "description": "Array of {old_str, new_str} pairs to apply atomically in order. If any fails, none are applied. More token-efficient than sequential calls. Mutually exclusive with old_str/new_str.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -235,38 +193,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "required": ["old_str", "new_str"]
                             }
                         },
-                        "dry_run": {"type": "boolean", "description": "If true, show unified diff without applying (default: false)"},
+                        "dry_run": {"type": "boolean", "description": "If true, show unified diff without applying changes (default: false)"},
+                        "replace_all": {"type": "boolean", "description": "If true, replace ALL occurrences of old_str (default: false, requires unique match)"},
                         "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
                         "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
                     },
-                    "required": ["path", "edits"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "rollback_file_edits",
-                "description": "Revert file edits previously recorded in the undo journal. Use as the compensation action for recent write_file, str_replace, multi_edit, or workspace-edit changes. Can revert the current turn, a specific turn, the latest edit for one file, or list recorded edit entries.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "scope": {
-                            "type": "string",
-                            "enum": ["current_turn", "turn", "file", "list"],
-                            "description": "Rollback scope. Defaults to current_turn. Use file to revert the latest recorded edit for one path, turn to revert a specific turn_index, or list to inspect journal entries."
-                        },
-                        "path": {
-                            "type": "string",
-                            "description": "File path relative to project root. Required when scope=file."
-                        },
-                        "turn_index": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "description": "Specific turn index to roll back. Required when scope=turn."
-                        }
-                    },
-                    "required": []
+                    "required": ["path"]
                 }
             }
         }),
@@ -367,80 +299,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "max_links": {"type": "integer", "description": "Max navigation links to extract (default 25)"}
                     },
                     "required": ["url"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "ask_user",
-                "description": "Ask the user a question and wait for their response. Use when you need clarification, user preferences, or decisions during execution. Supports both multiple choice and free-form questions. The user can always provide custom text even for multiple choice questions.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "The question to ask the user. Be clear and specific."
-                        },
-                        "choices": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Optional list of choices for multiple choice (2-9 options). User can always provide custom text. Omit for free-form questions."
-                        },
-                        "default": {
-                            "type": "string",
-                            "description": "Optional default answer if user presses Enter without input."
-                        },
-                        "context": {
-                            "type": "string",
-                            "description": "Optional brief context about why you're asking this question."
-                        }
-                    },
-                    "required": ["question"]
-                }
-            }
-        }),
-        // ─── Task management tools ────────────────────────────────────────────
-        json!({
-            "type": "function",
-            "function": {
-                "name": "sleep",
-                "description": "Wait for a specified duration. Use when waiting for external events, when the user asks you to pause, or when you have nothing to do. Prefer this over `bash(sleep ...)` as it doesn't hold a shell process.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "duration_ms": {
-                            "type": "integer",
-                            "description": "Duration to sleep in milliseconds (1000 = 1 second). Max 300000 (5 minutes)."
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Optional reason for sleeping (for logging)"
-                        }
-                    },
-                    "required": ["duration_ms"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "tool_search",
-                "description": "Search available tools by name or description keywords. Use to discover tools when unsure which one to use. Returns matching tool names with brief descriptions. Supports direct selection with 'select:tool_name' or keyword search.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search query: 'select:tool_name' for exact match, or keywords to search tool names/descriptions. E.g. 'git', 'file read', 'select:str_replace'"
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "description": "Maximum number of results to return (default: 5, max: 20)",
-                            "default": 5
-                        }
-                    },
-                    "required": ["query"]
                 }
             }
         }),
@@ -583,44 +441,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 }
             }
         }),
-        // ── Env tool: environment variable management ──────────────────────────────
-        json!({
-            "type": "function",
-            "function": {
-                "name": "enter_plan_mode",
-                "description": "Enter plan authoring mode for an ambitious task. Creates or re-links a plan to the current session; subsequent write tools (bash, write_file, str_replace, multi_edit, delete_file, git_commit, mo_query, …) are blocked until `exit_plan_mode` is called with an approved plan. Read-only exploration tools (read_file, grep, glob, git_status, task_*, memory_*) stay available so you can keep investigating while drafting. Use this before multi-file refactors, new feature implementations, architectural changes, or any task where you'd want user sign-off on the approach before writing code.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "goal": {
-                            "type": "string",
-                            "description": "One-sentence description of what the plan should accomplish. Becomes the plan's goal string."
-                        },
-                        "plan_id": {
-                            "type": "string",
-                            "description": "Optional existing plan to re-link to this session (for resume flows). Omit to create a fresh plan."
-                        }
-                    },
-                    "required": ["goal"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "exit_plan_mode",
-                "description": "Exit plan authoring mode. Passing `approved=true` (default) unlocks write tools for the current session; the approved plan remains linked and can drive execution via /plans/{id}/execute. Passing `approved=false` keeps the plan pending for another authoring pass and leaves write tools blocked. Emits a `plan_approved`/`plan_rejected` journal event for session audit.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "approved": {
-                            "type": "boolean",
-                            "description": "Whether the plan is approved for execution. Default true."
-                        }
-                    }
-                }
-            }
-        }),
         json!({
             "type": "function",
             "function": {
@@ -679,15 +499,28 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session state operations. Actions: config, prioritize, deprioritize, set_goal, compact.",
+                "description": "Session state and lifecycle operations. Actions: config, prioritize, deprioritize, set_goal, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep, tool_search.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact"], "description": "Session operation"},
+                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","enter_plan","exit_plan","rollback_edits","ask_user","sleep","tool_search"], "description": "Session operation"},
                         "key": {"type": "string", "description": "Config key (for config)"},
                         "value": {"type": "string", "description": "Config value"},
                         "tool": {"type": "string", "description": "Tool name (for prioritize/deprioritize)"},
-                        "goal": {"type": "string", "description": "Goal text (for set_goal)"}
+                        "goal": {"type": "string", "description": "Goal or plan goal text (for set_goal, enter_plan)"},
+                        "plan_id": {"type": "string", "description": "Existing plan to re-link (for enter_plan resume flows)"},
+                        "approved": {"type": "boolean", "description": "Whether plan is approved (for exit_plan, default true)"},
+                        "scope": {"type": "string", "enum": ["current_turn","turn","file","list"], "description": "Rollback scope (for rollback_edits)"},
+                        "path": {"type": "string", "description": "File path (for rollback_edits scope=file)"},
+                        "turn_index": {"type": "integer", "description": "Turn index (for rollback_edits scope=turn)"},
+                        "question": {"type": "string", "description": "Question text (for ask_user)"},
+                        "choices": {"type": "array", "items": {"type": "string"}, "description": "Multiple choice options 2-9 (for ask_user)"},
+                        "default": {"type": "string", "description": "Default answer (for ask_user)"},
+                        "context": {"type": "string", "description": "Brief context (for ask_user)"},
+                        "duration_ms": {"type": "integer", "description": "Sleep duration in ms, max 300000 (for sleep)"},
+                        "reason": {"type": "string", "description": "Reason for sleeping (for sleep)"},
+                        "query": {"type": "string", "description": "Search query (for tool_search)"},
+                        "max_results": {"type": "integer", "description": "Max results (for tool_search, default 5)"}
                     },
                     "required": ["action"]
                 }

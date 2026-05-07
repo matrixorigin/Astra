@@ -980,8 +980,8 @@ mod tests {
         assert!(names.contains(&"write_file"), "must include write_file");
         assert!(names.contains(&"read_file"), "must include read_file");
         assert!(
-            names.len() > 20,
-            "expected >20 tool schemas, got {}",
+            names.len() > 15,
+            "expected >15 tool schemas, got {}",
             names.len()
         );
     }

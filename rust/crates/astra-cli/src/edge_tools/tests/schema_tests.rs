@@ -46,6 +46,8 @@ fn tool_schemas_include_core_tools() {
                 .map(String::from)
         })
         .collect();
+    // Consolidated tools: git, github, memory, session, mo, agent cover
+    // the legacy individual tools (git_status, github_ci_status, etc.)
     for expected in &[
         "bash",
         "read_file",
@@ -54,27 +56,17 @@ fn tool_schemas_include_core_tools() {
         "list_dir",
         "grep",
         "glob",
-        "git_status",
-        "git_blame",
-        "git_file_history",
-        "git_contributors",
-        "git_log_search",
-        "mo_query",
-        "mo_snapshot",
-        "mo_branch",
-        "rollback_file_edits",
-        "rollback_database_snapshots",
-        "rollback_turn_actions",
-        "github_ci_status",
-        "github_repo_stats",
-        "memory_store",
-        "adjust_config",
-        "prioritize_tool",
-        "deprioritize_tool",
-        "set_goal",
-        "compress_context",
-        "reflect",
-        "run_chain",
+        "git",
+        "github",
+        "memory",
+        "session",
+        "mo",
+        "agent",
+        "introspect",
+        "lsp",
+        "web_fetch",
+        "web_search",
+        "symbols",
     ] {
         assert!(
             names.contains(&expected.to_string()),

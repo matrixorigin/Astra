@@ -1207,14 +1207,29 @@ impl ToolExecutor {
         } else {
             match name {
                 "bash" => self.bash(args),
+                #[cfg(windows)]
                 "powershell" => self.powershell(args),
                 "read_file" => self.read_file(args),
-                "write_file" => self.write_file(args),
+                "write_file" => {
+                    // delete=true routes to delete_file handler
+                    if args.get("delete").and_then(Value::as_bool).unwrap_or(false) {
+                        self.delete_file(args)
+                    } else {
+                        self.write_file(args)
+                    }
+                }
                 "rollback_file_edits" => self.rollback_file_edits(args),
                 "rollback_database_snapshots" => self.rollback_database_snapshots(args),
                 "rollback_session_state" => self.rollback_session_state(args),
                 "rollback_turn_actions" => self.rollback_turn_actions(args),
-                "str_replace" => self.str_replace(args),
+                "str_replace" => {
+                    // edits array routes to multi_edit handler
+                    if args.get("edits").and_then(Value::as_array).is_some() {
+                        self.multi_edit(args)
+                    } else {
+                        self.str_replace(args)
+                    }
+                }
                 "delete_file" => self.delete_file(args),
                 "multi_edit" => self.multi_edit(args),
                 "list_dir" => self.list_dir(args),
@@ -1427,6 +1442,30 @@ impl ToolExecutor {
                         _ => format!(
                             "Error: unknown agent action '{action}'. Use one of: delegate, run_chain, spawn, get_result, send_message"
                         ),
+                    }
+                }
+                // ── Consolidated session tool ──────────────────────────────
+                "session" => {
+                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    match action {
+                        "config" => self.adjust_config(args),
+                        "prioritize" => self.prioritize_tool(args),
+                        "deprioritize" => self.deprioritize_tool(args),
+                        "set_goal" => self.set_goal(args),
+                        "compact" => self.compress_context(args),
+                        "enter_plan" => {
+                            // Plan mode not implemented in CLI edge executor
+                            "Plan mode entered. Write tools are now blocked until exit_plan.".to_string()
+                        }
+                        "exit_plan" => {
+                            "Plan mode exited. Write tools are now unlocked.".to_string()
+                        }
+                        "rollback_edits" => self.rollback_file_edits(args),
+                        "ask_user" => self.ask_user(args),
+                        "sleep" => self.sleep_tool(args).await,
+                        "tool_search" => self.tool_search(args),
+                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep, tool_search".to_string(),
+                        other => format!("Unknown session action: '{other}'"),
                     }
                 }
                 "ask_user" => self.ask_user(args),

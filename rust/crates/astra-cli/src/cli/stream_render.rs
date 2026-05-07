@@ -3381,7 +3381,11 @@ impl StreamRenderState {
             }
             "write_file" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                format!("Writing: {}", shorten_path(path, path_budget(9)))
+                if args.get("delete").and_then(Value::as_bool).unwrap_or(false) {
+                    format!("Deleting: {}", shorten_path(path, path_budget(10)))
+                } else {
+                    format!("Writing: {}", shorten_path(path, path_budget(9)))
+                }
             }
             "str_replace" | "multi_edit" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
@@ -3576,6 +3580,42 @@ impl StreamRenderState {
                         format!("Set goal: \"{}\"", truncate_line(goal, path_budget(12)))
                     }
                     "compact" => "Compress context".to_string(),
+                    "enter_plan" => {
+                        let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
+                        format!(
+                            "Enter plan mode: \"{}\"",
+                            truncate_line(goal, path_budget(18))
+                        )
+                    }
+                    "exit_plan" => "Exit plan mode".to_string(),
+                    "rollback_edits" => {
+                        let scope = args.get("scope").and_then(Value::as_str);
+                        match scope {
+                            Some(s) => {
+                                format!("Revert file edits: {}", truncate_line(s, path_budget(19)))
+                            }
+                            None => "Revert file edits".to_string(),
+                        }
+                    }
+                    "ask_user" => {
+                        let question = args.get("question").and_then(Value::as_str).unwrap_or("");
+                        format!(
+                            "Asking user: \"{}\"",
+                            truncate_line(question, path_budget(15))
+                        )
+                    }
+                    "sleep" => {
+                        let duration_ms =
+                            args.get("duration_ms").and_then(Value::as_u64).unwrap_or(0);
+                        format!("Sleeping: {duration_ms}ms")
+                    }
+                    "tool_search" => {
+                        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                        format!(
+                            "Searching tools: \"{}\"",
+                            truncate_line(query, path_budget(18))
+                        )
+                    }
                     _ => format!("Session: {action}"),
                 }
             }
@@ -6082,6 +6122,8 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "ask_user" => format!("Asking user: \"{preview}\""),
         "sleep" => format!("Sleeping: {preview}"),
         "tool_search" => format!("Searching tools: {preview}"),
+        "enter_plan_mode" => format!("Enter plan mode: \"{preview}\""),
+        "exit_plan_mode" => "Exit plan mode".to_string(),
         "task_create" => format!("Creating task: \"{preview}\""),
         "task_list" => {
             if preview.is_empty() {
