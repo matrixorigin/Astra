@@ -183,10 +183,7 @@ pub fn is_action_prompt_worthy(action: &str) -> bool {
     if collapsed.is_empty() {
         return false;
     }
-    if SCRATCHPAD_LOWERCASE_PHRASES
-        .iter()
-        .any(|p| collapsed == *p)
-    {
+    if SCRATCHPAD_LOWERCASE_PHRASES.iter().any(|p| collapsed == *p) {
         return false;
     }
     let non_ws_chars = action.chars().filter(|c| !c.is_whitespace()).count();
@@ -436,10 +433,8 @@ mod tests {
     #[test]
     fn real_advice_accepted() {
         assert!(
-            hint_with_action(
-                "Always run `cargo test` before committing code changes to main."
-            )
-            .is_prompt_worthy()
+            hint_with_action("Always run `cargo test` before committing code changes to main.")
+                .is_prompt_worthy()
         );
     }
 
@@ -484,7 +479,10 @@ mod tests {
 
     #[test]
     fn collapse_whitespace_lower_normalizes() {
-        assert_eq!(collapse_whitespace_lower("  Memoria   TEST  "), "memoria test");
+        assert_eq!(
+            collapse_whitespace_lower("  Memoria   TEST  "),
+            "memoria test"
+        );
         assert_eq!(collapse_whitespace_lower("hello\nworld"), "hello world");
     }
 

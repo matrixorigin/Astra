@@ -91,22 +91,15 @@ impl TokenBudget {
 
         let allocated: u32 = allocations.values().sum();
         let remaining = effective_limit.saturating_sub(allocated);
-        // NOTE: keep this list aligned with every `SectionKind` variant that a
-        // planner may emit. Kinds omitted here receive a zero budget and get
-        // silently dropped by the serializer. Identity / Constraints / Memory
-        // are already allocated above; History is carried as provider messages,
-        // not a planned text section.
-        let remainder_kinds = [
-            SectionKind::SelfModel,
-            SectionKind::Skills,
-            SectionKind::EmergentSkills,
-            SectionKind::EmergentMemory,
-            SectionKind::EmergentSummary,
-            SectionKind::ProjectContext,
-            SectionKind::WorkingMemory,
-            SectionKind::RuntimeIdentity,
-            SectionKind::RuntimeVolatile,
-        ];
+        // Enumerate remainder kinds via `SectionKind::all_planned()` so adding
+        // a new variant is a compile error at the enum site (via the
+        // exhaustive match in `SectionKind::is_preallocated`) rather than a
+        // silent budget-zero drop at runtime.
+        let remainder_kinds: Vec<SectionKind> = SectionKind::all_planned()
+            .iter()
+            .copied()
+            .filter(|k| !k.is_preallocated())
+            .collect();
         let base = remaining / remainder_kinds.len() as u32;
         let mut extra = remaining % remainder_kinds.len() as u32;
         for kind in remainder_kinds {

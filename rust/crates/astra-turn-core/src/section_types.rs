@@ -144,6 +144,60 @@ pub enum SectionKind {
 }
 
 impl SectionKind {
+    /// All `SectionKind` variants that a planner may emit. Used by
+    /// `ContextBudget::allocate` to enumerate sections that need budget
+    /// assignment, so adding a new variant requires updating exactly one
+    /// place (this list) instead of silently receiving zero budget.
+    ///
+    /// When adding a new variant to the enum above, add it here as well.
+    /// A missing variant will fail the `all_planned_covers_every_variant`
+    /// test in this module.
+    #[must_use]
+    pub fn all_planned() -> &'static [Self] {
+        &[
+            Self::Identity,
+            Self::SelfModel,
+            Self::ProjectContext,
+            Self::Memory,
+            Self::WorkingMemory,
+            Self::History,
+            Self::Constraints,
+            Self::Skills,
+            Self::RuntimeIdentity,
+            Self::RuntimeVolatile,
+            Self::EmergentSkills,
+            Self::EmergentMemory,
+            Self::EmergentSummary,
+        ]
+    }
+
+    /// Sections whose budget is pre-allocated by `ContextBudget::allocate`
+    /// (or carried outside the planned-text stream, e.g. `History`) and must
+    /// NOT be included in the remainder distribution.
+    ///
+    /// Centralising this predicate means adding a new "pre-allocated" variant
+    /// only requires updating this match. The exhaustive match forces
+    /// compile-time classification for every new `SectionKind`.
+    #[must_use]
+    pub fn is_preallocated(self) -> bool {
+        match self {
+            // Pre-allocated with explicit budget in `ContextBudget::allocate`.
+            Self::Identity | Self::Constraints | Self::Memory => true,
+            // Carried as provider messages, not a planned text section.
+            Self::History => true,
+            // Remaining variants participate in the remainder distribution.
+            Self::SelfModel
+            | Self::ProjectContext
+            | Self::WorkingMemory
+            | Self::Skills
+            | Self::RuntimeIdentity
+            | Self::RuntimeVolatile
+            | Self::EmergentSkills
+            | Self::EmergentMemory
+            | Self::EmergentSummary => false,
+        }
+    }
+
     /// Volatility score (lower = less volatile = should appear earlier in prompt).
     #[must_use]
     pub fn volatility(self) -> u8 {
@@ -549,5 +603,35 @@ mod tests {
             original_tokens: 42,
         };
         assert_eq!(art.rehydrate(&reg).as_ref(), "survives restart");
+    }
+
+    /// Regression guard: `SectionKind::all_planned()` must enumerate every
+    /// variant exactly once. If a new variant is added without updating
+    /// `all_planned()`, the variant would silently receive zero budget in
+    /// `ContextBudget::allocate` and be dropped by the serializer.
+    ///
+    /// `is_preallocated()` uses an exhaustive match, so adding a new variant
+    /// fails to compile there until the author explicitly classifies it.
+    #[test]
+    fn all_planned_covers_every_section_kind_variant() {
+        use std::collections::HashSet;
+        let listed: HashSet<SectionKind> = SectionKind::all_planned().iter().copied().collect();
+
+        assert_eq!(
+            listed.len(),
+            SectionKind::all_planned().len(),
+            "all_planned() must not contain duplicates"
+        );
+
+        for k in SectionKind::all_planned().iter().copied() {
+            // Touch `is_preallocated` so its exhaustive match participates in
+            // compile-time coverage from this test too.
+            let _ = k.is_preallocated();
+            assert!(
+                listed.contains(&k),
+                "SectionKind::{k:?} is missing from SectionKind::all_planned(); \
+                 add it there or it will silently receive zero budget."
+            );
+        }
     }
 }

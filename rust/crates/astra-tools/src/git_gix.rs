@@ -677,6 +677,17 @@ pub fn git_log(project_root: &Path, args: &Value) -> String {
 
 // ─── git_show ───────────────────────────────────────────────────────────────
 
+/// Show a single commit.
+///
+/// Accepts `commit` (preferred) or `ref` (legacy alias). When neither is
+/// provided, defaults to `HEAD` — this is intentional UX for interactive
+/// callers ("show me the last commit"). Callers that require the caller
+/// to always pass an explicit ref must validate the args themselves
+/// *before* reaching this function; `git_show` treats missing ref as a
+/// successful request for `HEAD`, not as an error.
+///
+/// Range syntax (`A..B`) is rejected with a helpful error suggesting
+/// `git_diff` instead.
 pub fn git_show(
     project_root: &Path,
     args: &Value,

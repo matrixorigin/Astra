@@ -648,8 +648,8 @@ pub(crate) static CACHE_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::CACHE_ENV_MUTEX;
+    use super::*;
 
     /// Safe wrapper for `std::env::set_var` in single-threaded tests guarded by `CACHE_ENV_MUTEX`.
     fn set_test_env(key: &str, val: &str) {

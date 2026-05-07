@@ -1230,7 +1230,7 @@ impl InProcessChatTurnBridge {
             // Now routed through the volatile lane alongside other per-turn
             // dynamic sections.
             let skill_listing_hint = edge_profile
-                .get("skill_listing_text")
+                .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_SKILL_LISTING_TEXT)
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(|text| format!("\n\n{text}"))

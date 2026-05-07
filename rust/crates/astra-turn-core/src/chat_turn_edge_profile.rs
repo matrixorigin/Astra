@@ -2,6 +2,12 @@
 
 use serde_json::{Value, json};
 
+/// Protocol key for skill-listing text routed through `edge_profile` from
+/// the CLI to the runtime bridge (volatile lane). Shared between writer
+/// (`astra-cli` agentic loop) and reader (`runtime` bridge_inprocess) so a
+/// typo on either side is a compile error rather than a silent regression.
+pub const EDGE_PROFILE_KEY_SKILL_LISTING_TEXT: &str = "skill_listing_text";
+
 /// `git rev-parse --abbrev-ref HEAD` for edge_profile (best-effort).
 pub fn read_git_branch_abbrev() -> Option<String> {
     std::process::Command::new("git")

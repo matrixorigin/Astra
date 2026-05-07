@@ -271,7 +271,10 @@ mod tests {
         ];
         let out = render_digest(&hits).expect("digest");
         let bullet_count = out.lines().filter(|l| l.starts_with("- ")).count();
-        assert_eq!(bullet_count, 1, "case drift should still dedupe, got:\n{out}");
+        assert_eq!(
+            bullet_count, 1,
+            "case drift should still dedupe, got:\n{out}"
+        );
     }
 
     #[test]

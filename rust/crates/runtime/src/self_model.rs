@@ -31,6 +31,14 @@ use astra_turn_core::tool_health::ToolHealthTracker;
 ///
 /// Populated by composing data from existing runtime components.
 /// Cheap to construct (no I/O, no LLM calls).
+///
+/// INVARIANT: when adding a new field here, also update
+/// [`SelfModel::has_meaningful_self_awareness`] to consider it — otherwise
+/// the gate will return `false` for SelfModels that carry only the new
+/// field, and the self-awareness section will be silently dropped from
+/// the system prompt. See the unit tests in this file's `tests` module
+/// (`has_meaningful_self_awareness_*`) for coverage of every existing
+/// field — add a matching test alongside every new field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelfModel {
     /// What tools and capabilities are available.

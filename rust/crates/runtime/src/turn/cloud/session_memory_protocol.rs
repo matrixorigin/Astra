@@ -2037,10 +2037,7 @@ mod tests {
     #[test]
     fn trivial_anchor_turn_one_short_task() {
         let anchor = extract_anchor("refactor the prompt builder", None);
-        assert!(is_trivial_anchor(
-            &anchor,
-            "refactor the prompt builder"
-        ));
+        assert!(is_trivial_anchor(&anchor, "refactor the prompt builder"));
     }
 
     #[test]

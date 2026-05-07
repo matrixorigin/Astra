@@ -370,7 +370,11 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             && let Some(ep) = root.get_mut("edge_profile")
             && let Some(ep_obj) = ep.as_object_mut()
         {
-            ep_obj.insert("skill_listing_text".to_string(), json!(content));
+            ep_obj.insert(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_SKILL_LISTING_TEXT
+                    .to_string(),
+                json!(content),
+            );
         }
     }
     let active_skills = detect_active_system_skills_in_message(ctx.message);
