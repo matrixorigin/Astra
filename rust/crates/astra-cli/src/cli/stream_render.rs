@@ -8145,7 +8145,6 @@ diff --git a/src/a.rs b/src/a.rs\n\
     }
 
     #[tokio::test]
-    #[ignore = "delete_file dispatch moved: standalone tool name now routes to DefaultToolExecutor which lacks journal integration"]
     async fn transactional_batch_restores_deleted_file_on_failure() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -8189,9 +8188,10 @@ diff --git a/src/a.rs b/src/a.rs\n\
             .execute_tools_batch(vec![
                 ToolBatchRequest {
                     request_id: "tr-1".to_string(),
-                    tool: "delete_file".to_string(),
+                    tool: "write_file".to_string(),
                     args: serde_json::json!({
                         "path": "txn.txt",
+                        "delete": true,
                         "transaction_id": "tx-del",
                         "rollback_on_failure": true,
                     }),
