@@ -214,10 +214,13 @@ fn bind_working_memory(sources: &ContextSources<'_>) -> String {
 
 /// Bind the **session-stable** runtime identity fragments.
 ///
-/// Includes model/cwd/branch header + fragments that only change at
-/// session boundaries: `profile_desc`, `learned_context`, `system_override`.
-/// Tool-dependent/self-awareness fragments should be routed through
-/// `RuntimeVolatile`, because modern tool selection can vary every turn.
+/// Includes typed Model/CWD/Branch header plus fragments that only
+/// change at session boundaries: `system_override` and opt-in
+/// `extra_stable_sections` (environment_static from the bridge / adapter
+/// edge_profile, output style, etc.). Turn-volatile content —
+/// learned_context, self-awareness, tool-dependent guidance — routes
+/// through `RuntimeVolatile` (`bind_runtime_volatile`) so it sits after
+/// the Session→None cache marker and doesn't invalidate the prefix.
 /// These stable pieces sit in `CacheScope::Session` so Anthropic's
 /// per-session cache captures them behind the 2nd cache marker.
 ///

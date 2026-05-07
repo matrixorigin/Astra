@@ -1180,15 +1180,21 @@ impl SelfModel {
         // Goal signal: explicit `plan_goal` always counts (an ActionPlan
         // is actively steering), but `session_goal` / `tracked_goal` are
         // auto-seeded from the first user message in
-        // `ObservabilitySession::record_query_at`, so their mere
-        // presence means "user said anything" — not a real signal. They
-        // only count once the tracker has observed progress or
-        // milestones, or the last reflection produced a strategy diff.
+        // `ObservabilitySession::record_query_at`, and `progress` is
+        // always populated alongside them (the tracker returns a zero
+        // `GoalProgress` even with zero milestones). Neither presence is
+        // a signal — only observed progress or recorded milestones are.
         if self.goals.plan_goal.is_some() {
             return true;
         }
-        if (self.goals.session_goal.is_some() || self.goals.tracked_goal.is_some())
-            && (self.goals.progress.is_some() || !self.goals.recent_milestones.is_empty())
+        if !self.goals.recent_milestones.is_empty() {
+            return true;
+        }
+        if self
+            .goals
+            .progress
+            .as_ref()
+            .is_some_and(|p| p.milestone_count > 0 || p.completion_score > 0.05)
         {
             return true;
         }
@@ -2514,7 +2520,7 @@ mod tests {
 
     #[test]
     fn meaningful_when_session_goal_with_progress() {
-        // session_goal + tracker progress = real goal-tracking signal.
+        // session_goal + tracker progress with real completion = signal.
         let mut model = minimal_model();
         model.goals.session_goal = Some("hi".into());
         model.goals.progress = Some(GoalProgress {
@@ -2524,6 +2530,28 @@ mod tests {
             summary: "half done".into(),
         });
         assert!(model.has_meaningful_self_awareness());
+    }
+
+    #[test]
+    fn not_meaningful_when_progress_is_zero_placeholder() {
+        // `GoalTracker::progress()` returns a zero-filled GoalProgress even
+        // when no milestone has been recorded. Production always calls
+        // `goal_tracker.progress()` → `Some(...)`, so the `progress.is_some()`
+        // check alone would trip on turn 1 before any real work happens.
+        // Only positive completion_score or non-zero milestone_count counts.
+        let mut model = minimal_model();
+        model.goals.session_goal = Some("hi".into());
+        model.goals.progress = Some(GoalProgress {
+            completion_score: 0.0,
+            momentum: 0.0,
+            milestone_count: 0,
+            summary: "No milestones recorded yet.".into(),
+        });
+        assert!(
+            !model.has_meaningful_self_awareness(),
+            "zero-placeholder progress must not count — otherwise turn 1 \
+             bootstrap would always trip the gate"
+        );
     }
 
     #[test]
