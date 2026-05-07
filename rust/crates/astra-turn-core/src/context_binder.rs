@@ -247,9 +247,6 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     // `bind_runtime_identity` emission order for byte stability across
     // refactors.
 
-    if let Some(ref text) = ext.profile_desc {
-        parts.push(text.clone());
-    }
     if let Some(ref text) = ext.system_override {
         parts.push(text.clone());
     }

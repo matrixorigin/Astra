@@ -65,7 +65,9 @@ impl Default for PromptCacheConfig {
 // ── Section Cache ────────────────────────────────────────────────────────────
 // Two-level cache for static/dynamic prompt boundary:
 // - Global+Session sections are cached by (tool_names, task_type, confidence) — stable within a session
-// - Per-turn profile_desc is NOT cached (changes every turn with skills/memory/environment)
+// - Per-turn volatile content (environment_volatile, memoria recall, …) is
+//   bound into RuntimeVolatile post-cache-marker so it re-sends each turn
+//   without invalidating the cached prefix.
 
 /// Full pipeline output a bridge caller needs, in one place.
 ///
@@ -242,9 +244,6 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         spill_dir: None,
         spill_backend: None,
 
-        // cwd / git_branch are already carried by SessionContext and
-        // emitted as typed `CWD: / Branch:` lines in bind_runtime_identity.
-        profile_desc: None,
         effort_hint: None,
         system_override: None,
         plan_context: None,

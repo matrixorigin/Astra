@@ -213,10 +213,6 @@ pub(crate) fn build_external_sources(
         spill_dir: None,
         spill_backend,
 
-        // profile_desc was a Markdown duplicate of cwd/git_branch already
-        // emitted as typed `CWD:` / `Branch:` lines by bind_runtime_identity.
-        // Environment info now flows via the typed lanes below.
-        profile_desc: None,
         effort_hint,
         // learned_context intentionally flows through extra_dynamic_sections
         // (volatile lane) rather than ExternalSources.
@@ -871,7 +867,8 @@ mod tests {
     #[test]
     fn composite_adapter_runtime_identity_sits_in_session_scope() {
         // The cache-locality contract: dynamic-but-session-stable content
-        // (cwd, git_branch, profile_desc, self_model_text, tool_conditional)
+        // Session-stable signals (cwd/git_branch typed fields,
+        // environment_static via extra_stable_sections, system_override)
         // must land in CacheScope::Session. The adapter packs these into
         // ExternalSources; the binder stitches them into RuntimeIdentity.
         // If adapter output drifts back to CacheScope::None, the 2nd cache

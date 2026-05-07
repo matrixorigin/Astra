@@ -197,8 +197,6 @@ pub struct ExternalSources {
     /// Skill effort/agent_type hint ("effort: high", "agent: reviewer").
     pub effort_hint: Option<String>,
 
-    /// Project profile description (cwd, git_branch, project facts).
-    pub profile_desc: Option<String>,
     /// **Session-stable** pre-built sections — bridge-composed content
     /// that persists across turns (skill hint, accumulated feedback rules,
     /// self-awareness hint, any caller-composed static snippet).

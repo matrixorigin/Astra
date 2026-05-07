@@ -1097,8 +1097,9 @@ impl InProcessChatTurnBridge {
 
             // Build LLM messages: system prompt + history + current messages + tool results
             let mut llm_messages: Vec<Value> = Vec::new();
-            // Memory is prefetched and injected into profile_desc.
-            // These track telemetry for the explain block.
+            // Memory is prefetched + routed through the typed Memory binder
+            // (extra_stable / extra_dynamic sections). Counters below track
+            // telemetry for the explain block.
             let mut memory_fetch_ms: i64 = 0;
             let mut memory_items: usize = 0;
             let mut memory_preview: Vec<String> = Vec::new();
@@ -1384,8 +1385,8 @@ impl InProcessChatTurnBridge {
             //   feedback_rules_hint (accumulates on each user correction),
             //   skill_hint (active skill/tool selection),
             //   self_awareness_hint (turn/token/outcome signals),
-            //   typed memory_entries (per-turn retrieval — was baked into
-            //     profile_desc, now routed through the Memory section),
+            //   typed memory_entries (per-turn retrieval, routed through the
+            //     Memory section),
             //   implicit_feedback_hint (per-turn correction signal based on
             //     user message content),
             //   memoria_insights_hint (per-turn retrieval),

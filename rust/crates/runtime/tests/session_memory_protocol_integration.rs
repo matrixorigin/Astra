@@ -868,9 +868,10 @@ fn l1_injection_respects_budget_cap() {
 #[test]
 fn anchor_does_not_break_cached_prefix() {
     // Verified in bridge_inprocess.rs unit tests (p1_anchor_injected_into_openai_dynamic_message).
-    // The anchor is passed via profile_desc (dynamic), not in the stable cached prefix.
-    // OpenAI: primary message is identical with/without anchor.
-    // Anthropic: anchor is in a non-cache-controlled block.
+    // The anchor is routed through `extra_dynamic_sections` (RuntimeVolatile,
+    // None scope), not the stable cached prefix. OpenAI: primary message is
+    // identical with/without anchor. Anthropic: anchor is in a
+    // non-cache-controlled block.
     //
     // This test just confirms the anchor doesn't accidentally end up in stable sections.
     let anchor = extract_anchor("Build rate limiter", None);
