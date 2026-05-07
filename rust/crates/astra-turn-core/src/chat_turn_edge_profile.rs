@@ -36,9 +36,15 @@ pub fn build_base_edge_profile_value(
     let (memoria_url, memoria_key) = memoria_env_for_edge_profile();
     let retrieval_top_k = retrieval_top_k_from_env();
 
-    // Collect environment context for the LLM
-    let env_context =
-        crate::edge_prompt_context::build_environment_context(std::path::Path::new(cwd));
+    // Environment context split into two lanes for prompt caching:
+    //   * `environment_static`  → Platform/Shell/CWD/Home (stable for
+    //     the session, safe to sit inside the cached Session prefix).
+    //   * `environment_volatile` → Git branch dirty state, staged /
+    //     unstaged diff stats, recent commits. Churns every edit/commit
+    //     and MUST stay out of the cached prefix.
+    let project_root = std::path::Path::new(cwd);
+    let env_static = crate::edge_prompt_context::build_static_environment_context(project_root);
+    let env_volatile = crate::edge_prompt_context::build_volatile_environment_context(project_root);
 
     json!({
         "cwd": cwd,
@@ -47,7 +53,8 @@ pub fn build_base_edge_profile_value(
         "memoria_key": memoria_key,
         "retrieval_top_k": retrieval_top_k,
         "workspace": workspace,
-        "environment_context": env_context,
+        "environment_static": env_static,
+        "environment_volatile": env_volatile,
     })
 }
 
@@ -85,16 +92,22 @@ mod tests {
         assert!(v.get("memoria_url").is_some());
         assert!(v.get("memoria_key").is_some());
         assert_eq!(v["workspace"]["k"], 1);
-        // Environment context is now included
+        // Static environment (cache-safe) and volatile environment
+        // (post-cache) are exposed as separate fields so the bridge can
+        // route them to the correct cache scope without having to re-
+        // parse a single blob.
+        let env_static = v["environment_static"].as_str().unwrap();
         assert!(
-            v.get("environment_context").is_some(),
-            "should include environment_context"
+            env_static.contains("## Environment"),
+            "environment_static should carry the ## Environment header"
         );
-        let env_ctx = v["environment_context"].as_str().unwrap();
         assert!(
-            env_ctx.contains("## Environment"),
-            "environment_context should have section header"
+            !env_static.contains("- Git branch:"),
+            "environment_static must not contain git branch (would break cache)"
         );
+        // environment_volatile may be empty outside a git repo but must
+        // be present as a typed field so downstream can always read it.
+        assert!(v.get("environment_volatile").is_some());
         // retrieval_top_k is included (default 5 unless ASTRA_RETRIEVAL_TOP_K set)
         assert!(
             v.get("retrieval_top_k").is_some(),

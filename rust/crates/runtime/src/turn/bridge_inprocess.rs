@@ -1107,46 +1107,33 @@ impl InProcessChatTurnBridge {
             let tool_names: Vec<&str> = edge_tools.iter()
                 .filter_map(|t| t.get("function").and_then(|f| f.get("name")).and_then(Value::as_str))
                 .collect();
-            // Split `profile_desc` into two cache-aligned parts:
+            // Environment context is split by cache volatility:
             //
-            // * `profile_desc` (STABLE) — cwd + git_branch + env_section.
-            //   Derived from edge_profile only; byte-stable within a session.
-            //   Routes to RuntimeIdentity (Session scope) via the pipeline's
-            //   typed `profile_desc` field → cached behind the 2nd marker.
+            // * `environment_static`  (Platform, Shell, CWD, Home) →
+            //   stable for the session, safe inside the Session cache.
+            //   Routed through `extra_stable_sections` → binder's
+            //   `RuntimeIdentity` → behind the 2nd cache marker.
             //
-            // * memoria prefetch entries (VOLATILE) — typed MemoryEntry items
-            //   produced by `prefetch_memories`. The retrieval query uses the
-            //   latest user message, so results drift turn-to-turn. They route
-            //   through the pipeline's Memory section (None scope) where rank,
-            //   dedup, and budget trimming are applied.
+            // * `environment_volatile` (Git branch dirty state, staged /
+            //   unstaged diff stats, recent commits) → changes on every
+            //   edit/commit. Routed through `extra_dynamic_sections` →
+            //   binder's `RuntimeVolatile` (None scope, post-marker) so
+            //   it never invalidates the cached prefix.
             //
-            // Previously both were concatenated into one `profile_desc`
-            // string and routed to volatile, dragging ~3-4 kB of stable
-            // cwd/branch/env content out of the cached prefix every turn.
-            let profile_desc = {
-                let mut parts = Vec::new();
-                if let Some(cwd) = edge_profile.get("cwd").and_then(Value::as_str) {
-                    parts.push(format!("cwd: {cwd}"));
-                }
-                if let Some(branch) = edge_profile.get("git_branch").and_then(Value::as_str) {
-                    parts.push(format!("git_branch: {branch}"));
-                }
-                let env_section = edge_profile
-                    .get("environment_context")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                if parts.is_empty() && env_section.is_empty() {
-                    String::new()
-                } else {
-                    let base = if parts.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n\n# Project Profile\n{}", parts.join("\n"))
-                    };
-                    format!("{base}{env_section}")
-                }
-            };
+            // The `# Project Profile` wrapper with cwd/git_branch is
+            // dropped: `bind_runtime_identity` already emits typed
+            // `Model: / CWD: / Branch:` lines from `SessionContext`, so
+            // repeating them as a Markdown block was pure duplicate.
+            let env_static = edge_profile
+                .get("environment_static")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let env_volatile = edge_profile
+                .get("environment_volatile")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
 
             // Memoria prefetch lives on its own. `section` is the
             // "## User Memories\n..." block — the piece that actually drifts.
@@ -1389,9 +1376,10 @@ impl InProcessChatTurnBridge {
             // (RuntimeVolatile scope → re-sent per turn).
             //
             // STABLE (change only when session state changes, if at all):
-            //   profile_desc (cwd/branch/env — Memoria split out)
+            //   environment_static (Platform/Shell/CWD/Home)
             //
             // VOLATILE (change each turn by design):
+            //   environment_volatile (git branch dirty/diff/recent commits),
             //   learned_context_hint (EMA tracker — byte-level changes break prefix cache),
             //   feedback_rules_hint (accumulates on each user correction),
             //   skill_hint (active skill/tool selection),
@@ -1406,9 +1394,15 @@ impl InProcessChatTurnBridge {
             //   tool_round_guidance (per-turn messages count)
             let mut stable_sections = Vec::new();
             let mut dynamic_sections = Vec::new();
-            if !profile_desc.is_empty() {
+            if let Some(ref text) = env_static {
                 stable_sections.push(prompts::PromptSection::dynamic(
-                    profile_desc.clone(),
+                    text.clone(),
+                    prompts::PromptTokenBucket::Environment,
+                ));
+            }
+            if let Some(ref text) = env_volatile {
+                dynamic_sections.push(prompts::PromptSection::dynamic(
+                    text.clone(),
                     prompts::PromptTokenBucket::Environment,
                 ));
             }

@@ -58,22 +58,23 @@ pub(crate) fn build_external_sources(
         if text.is_empty() { None } else { Some(text) }
     };
 
-    // 3. Profile description
-    let mut profile_parts = Vec::new();
-    if let Some(cwd) = edge_profile.get("cwd").and_then(Value::as_str) {
-        profile_parts.push(format!("cwd: {cwd}"));
-    }
-    if let Some(branch) = edge_profile.get("git_branch").and_then(Value::as_str) {
-        profile_parts.push(format!("git_branch: {branch}"));
-    }
-    let profile_desc = if profile_parts.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "\n\n# Project Profile\n{}",
-            profile_parts.join("\n")
-        ))
-    };
+    // 3. Environment context — routed split by cache volatility.
+    //    Static (Platform/Shell/CWD/Home) → RuntimeIdentity (Session cache).
+    //    Volatile (git branch dirty / diff / commits) → RuntimeVolatile.
+    //    The legacy `# Project Profile\ncwd:/git_branch:` Markdown block
+    //    has been dropped: bind_runtime_identity already emits typed
+    //    `Model: / CWD: / Branch:` lines from SessionContext, so
+    //    re-emitting cwd/branch as a second header was pure duplicate.
+    let env_static = edge_profile
+        .get("environment_static")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let env_volatile = edge_profile
+        .get("environment_volatile")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     // 4. Effort/agent_type hint
     let effort_hint = {
@@ -189,26 +190,45 @@ pub(crate) fn build_external_sources(
             })
     });
 
+    // Environment context — the static half sits in the Session cache,
+    // the volatile half (git state) rides the None-scope lane.
+    let extra_stable_sections: Vec<crate::prompts::PromptSection> = env_static
+        .into_iter()
+        .map(|text| {
+            crate::prompts::PromptSection::dynamic(
+                text,
+                crate::prompts::PromptTokenBucket::Environment,
+            )
+        })
+        .collect();
+    if let Some(text) = env_volatile {
+        extra_dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+            text,
+            crate::prompts::PromptTokenBucket::Environment,
+        ));
+    }
+
     ExternalSources {
         memory_entries,
         spill_dir: None,
         spill_backend,
 
-        profile_desc,
+        // profile_desc was a Markdown duplicate of cwd/git_branch already
+        // emitted as typed `CWD:` / `Branch:` lines by bind_runtime_identity.
+        // Environment info now flows via the typed lanes below.
+        profile_desc: None,
         effort_hint,
         // learned_context intentionally flows through extra_dynamic_sections
         // (volatile lane) rather than ExternalSources.
         system_override,
         plan_context,
         tool_guidance,
-        // Adapter path (ServerAgenticLoopHost) doesn't use the bridge's
-        // stable-lane escape hatch — session-stable signals have typed
-        // fields above.
-        extra_stable_sections: Vec::new(),
-        // Volatile lane: the per-turn skill-listing shortlist. Turn-varying
-        // by design (content depends on current user message). Kept in
-        // None scope via RuntimeVolatile so it doesn't invalidate the
-        // cached prefix.
+        // Adapter path (ServerAgenticLoopHost) puts environment_static
+        // here so it lands in the cached Session prefix.
+        extra_stable_sections,
+        // Volatile lane: environment_volatile (git state), learned
+        // context, skill listing. None-scope so churn doesn't invalidate
+        // the cached prefix.
         extra_dynamic_sections: {
             extra_dynamic_sections.extend(learned_context_section);
             extra_dynamic_sections.extend(skill_listing_extra);

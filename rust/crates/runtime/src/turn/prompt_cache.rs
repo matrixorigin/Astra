@@ -207,22 +207,6 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         if text.is_empty() { None } else { Some(text) }
     };
     let tool_guidance = prompts::low_confidence_tool_selection_section(confidence);
-    let mut profile_parts = Vec::new();
-    if let Some(cwd) = edge_profile_cwd {
-        profile_parts.push(format!("cwd: {cwd}"));
-    }
-    if let Some(branch) = edge_profile_git_branch {
-        profile_parts.push(format!("git_branch: {branch}"));
-    }
-    let profile_desc = if profile_parts.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "\n\n# Project Profile\n{}",
-            profile_parts.join("\n")
-        ))
-    };
-
     // ASTRA_OUTPUT_STYLE is a user preference — stable within a session
     // (user doesn't toggle styles mid-session). Route to stable lane.
     let mut stable = extra_stable_sections.to_vec();
@@ -258,7 +242,9 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         spill_dir: None,
         spill_backend: None,
 
-        profile_desc,
+        // cwd / git_branch are already carried by SessionContext and
+        // emitted as typed `CWD: / Branch:` lines in bind_runtime_identity.
+        profile_desc: None,
         effort_hint: None,
         system_override: None,
         plan_context: None,
