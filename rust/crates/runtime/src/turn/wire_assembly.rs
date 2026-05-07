@@ -294,16 +294,16 @@ fn is_completion_signal(content: &str) -> bool {
 /// Order (matches the legacy server + bridge inline paths byte-for-byte):
 ///
 /// 1. `system_messages` (from the context pipeline).
-/// 2. `volatile_preamble` (prefix-only providers: volatile content moved
-///    out of the system message into a synthetic user/assistant pair so
-///    the system message stays byte-stable across turns for cache hits).
-/// 3. `compacted_messages` (from Memoria).
-/// 4. `strip_stale_reasoning` is applied in place (reduces input tokens
-///    without changing the visible conversation for thinking-model APIs).
-/// 5. Invoked-skill attachments (server path only — bridge leaves empty).
+/// 2. `compacted_messages` (conversation history from Memoria).
+/// 3. `volatile_preamble` content is **prepended to the last user message**
+///    (not inserted as a separate message pair). This maximizes prefix
+///    cache hits for prefix-only providers: the entire stable prefix
+///    (system + conversation history) remains byte-identical across turns,
+///    and only the final user message changes.
+/// 4. `strip_stale_reasoning` is applied in place.
+/// 5. Invoked-skill attachments (server path only).
 /// 6. Recent-file attachments (server path only).
-/// 7. `apply_anthropic_cache_metadata` (cache_edits block + tool-result
-///    cache_reference markers; last-message breakpoint).
+/// 7. `apply_anthropic_cache_metadata` (Anthropic path only).
 pub(crate) fn assemble_llm_messages(
     system_messages: Vec<Value>,
     volatile_preamble: Vec<Value>,
@@ -315,8 +315,37 @@ pub(crate) fn assemble_llm_messages(
     cache_cfg: &PromptCacheConfig,
 ) -> Vec<Value> {
     let mut llm_messages = system_messages;
-    llm_messages.extend(volatile_preamble);
     llm_messages.extend(compacted_messages);
+
+    // Prepend volatile content to the last user message so the stable
+    // prefix (system + history) stays byte-identical for prefix caching.
+    if !volatile_preamble.is_empty() {
+        let volatile_text: String = volatile_preamble
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !volatile_text.is_empty() {
+            // Find last user message and prepend volatile content
+            if let Some(last_user) = llm_messages
+                .iter_mut()
+                .rev()
+                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            {
+                let existing = last_user
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                last_user["content"] = Value::String(format!("{volatile_text}\n\n{existing}"));
+            } else {
+                // No user message yet — insert as a standalone pair (fallback)
+                llm_messages.push(serde_json::json!({"role": "user", "content": volatile_text}));
+                llm_messages
+                    .push(serde_json::json!({"role": "assistant", "content": "Understood."}));
+            }
+        }
+    }
     astra_turn_core::edge_ledger::strip_stale_reasoning(&mut llm_messages, provider, model_name);
 
     if !attachments.invoked_skills.is_empty() {
@@ -747,18 +776,22 @@ mod tests {
     }
 
     /// Regression lock: for prefix-only providers, volatile content MUST NOT
-    /// appear in the system message. If it does, prefix cache hit rates drop
-    /// from ~80% to ~20% because byte-level prefix matching breaks at the
-    /// first volatile byte. This test catches any future refactor that
-    /// accidentally routes volatile content back into the system message.
+    /// appear in the system message OR as a separate early message pair.
+    /// It must be prepended to the LAST user message so the entire stable
+    /// prefix (system + history) remains byte-identical across turns.
+    /// Cache hit drops from ~80% to ~20% if this invariant is violated.
     #[test]
-    fn prefix_provider_system_message_contains_no_volatile_content() {
+    fn prefix_provider_volatile_prepended_to_last_user_message() {
         let stable_sys = vec![json!({"role": "system", "content": "stable core rules only"})];
         let volatile_preamble = vec![
             json!({"role": "user", "content": "<system-reminder>\nTurn: 5 | Tokens: 12000\n</system-reminder>"}),
             json!({"role": "assistant", "content": "Understood."}),
         ];
-        let history = vec![json!({"role": "user", "content": "hello"})];
+        let history = vec![
+            json!({"role": "user", "content": "first question"}),
+            json!({"role": "assistant", "content": "first answer"}),
+            json!({"role": "user", "content": "second question"}),
+        ];
 
         let msgs = assemble_llm_messages(
             stable_sys,
@@ -771,26 +804,38 @@ mod tests {
             &cache_cfg(),
         );
 
-        // System message must be purely stable — no turn counters, no tokens,
-        // no per-turn signals.
-        let sys_content = msgs[0]["content"].as_str().unwrap();
-        assert_eq!(sys_content, "stable core rules only");
+        // System message is stable
+        assert_eq!(msgs[0]["content"], "stable core rules only");
+
+        // History is intact in original order (no preamble pair between them)
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "first question");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], "first answer");
+
+        // Last user message has volatile prepended to its content
+        assert_eq!(msgs[3]["role"], "user");
+        let last_user = msgs[3]["content"].as_str().unwrap();
         assert!(
-            !sys_content.contains("Turn:"),
-            "system message must not contain volatile turn counter"
+            last_user.contains("Turn: 5"),
+            "volatile must be prepended to last user message"
         );
         assert!(
-            !sys_content.contains("Tokens:"),
-            "system message must not contain volatile token stats"
+            last_user.contains("second question"),
+            "original user content must be preserved"
+        );
+        assert!(
+            last_user.starts_with("<system-reminder>"),
+            "volatile must come BEFORE user content"
         );
 
-        // Volatile content must be in the preamble (position 1-2), not system.
-        assert_eq!(msgs[1]["role"], "user");
-        assert!(msgs[1]["content"].as_str().unwrap().contains("Turn: 5"));
+        // Total message count: system + 2 history + 1 combined last = 4
+        // (NOT 6 which would indicate a separate preamble pair)
+        assert_eq!(msgs.len(), 4, "no extra preamble pair should be inserted");
     }
 
     #[test]
-    fn volatile_preamble_inserted_between_system_and_compacted() {
+    fn volatile_preamble_prepended_to_last_user_not_inserted_as_pair() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let preamble = vec![
             json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
@@ -807,13 +852,12 @@ mod tests {
             "gpt-4",
             &cache_cfg(),
         );
-        assert_eq!(msgs.len(), 4);
+        // 2 messages: system + combined last user (volatile prepended to "hi")
+        assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[1]["role"], "user");
-        assert!(msgs[1]["content"].as_str().unwrap().contains("volatile"));
-        assert_eq!(msgs[2]["role"], "assistant");
-        assert_eq!(msgs[2]["content"], "Understood.");
-        assert_eq!(msgs[3]["role"], "user");
-        assert_eq!(msgs[3]["content"], "hi");
+        let user_content = msgs[1]["content"].as_str().unwrap();
+        assert!(user_content.contains("volatile"), "volatile prepended");
+        assert!(user_content.contains("hi"), "original content preserved");
     }
 }

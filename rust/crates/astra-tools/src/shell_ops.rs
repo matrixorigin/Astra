@@ -113,6 +113,7 @@ struct SearchIgnoreRule {
 ///    sandbox/permissions elsewhere). All other sandbox risks (e.g. [`CommandRisk::Eval`],
 ///    [`CommandRisk::ProcessSubstitution`]) fail closed so we never return Ok when the sandbox
 ///    flags a higher-severity pattern only in AST.
+///
 /// Returns true if any of `tokens` appears in `lower_cmd` as a standalone
 /// shell command token (not as a substring of another identifier).
 ///
