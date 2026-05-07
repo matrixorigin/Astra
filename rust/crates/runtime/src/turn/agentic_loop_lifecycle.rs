@@ -333,13 +333,12 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
         }
     }
 
-    if state.delegation_engine.is_some() {
-        host.inject_tool_schema(delegate_tool_schema());
-    }
-
-    if state.messaging.mailbox.is_some() {
-        host.inject_tool_schema(astra_messaging::send_tool::send_message_tool_schema());
-    }
+    // NOTE: delegate, send_message, and discover_skills schemas are NO
+    // LONGER injected here. Their functionality is consolidated into the
+    // `agent` tool (actions: delegate, send_message, spawn, get_result)
+    // and `skill` tool (actions: run, discover) which are already in
+    // all_tool_schemas(). Injecting legacy schemas here was adding ~600
+    // tokens of redundant tool definitions per turn.
 
     if let Some(resolver) = &state.skills.resolver {
         let full = resolver.available_skills();
@@ -358,9 +357,6 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
                 &visible,
                 open_skill_name,
             ));
-            if open_skill_name {
-                host.inject_tool_schema(crate::turn::skill_tool::discover_skills_tool_schema());
-            }
         }
     }
 
