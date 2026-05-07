@@ -278,13 +278,16 @@ fn bind_runtime_volatile(sources: &ContextSources<'_>) -> String {
     let ext = &sources.external;
     let mut parts = Vec::new();
 
-    // Session UUID lives here (None scope) so it doesn't break cross-session
-    // prefix sharing. The LLM still sees it, but it sits AFTER the Session
-    // cache marker — meaning two different sessions with the same
-    // model/cwd/tools share the same cached prefix.
-    if !sources.session.session_id.is_empty() {
-        parts.push(format!("Session: {}", sources.session.session_id));
-    }
+    // Session UUID is *not* emitted to the prompt. It used to ride the
+    // volatile lane ("Session: <uuid>\n" = ~45c/turn) so it wouldn't
+    // invalidate the cached session prefix, but no prompt fragment
+    // instructs the model to read or cite the UUID — it was pure
+    // operator decoration for LLM-side logs. We already journal
+    // session_id at the transport layer; paying ~45c every turn for a
+    // value the model never references is net loss. If a downstream
+    // audit mechanism ever needs it visible to the model, reintroduce
+    // here (keep volatile-only, never stable).
+    let _session_id_unused = &sources.session.session_id;
 
     if let Some(ref text) = ext.effort_hint {
         parts.push(text.clone());
@@ -560,6 +563,32 @@ mod tests {
         assert!(
             !stable.contains("Session Anchor"),
             "extras must stay out of session-stable identity — would break cache"
+        );
+    }
+
+    /// The session UUID must NOT appear anywhere in either scope — it
+    /// used to lead the volatile block ("Session: <uuid>") and cost
+    /// ~45c every turn with no prompt fragment ever instructing the
+    /// model to read or cite it. If this test fails because someone
+    /// re-added it, confirm there is an actual prompt rule that
+    /// references the UUID before reverting.
+    #[test]
+    fn bind_runtime_volatile_does_not_emit_session_id() {
+        let fixture = test_sources();
+        let sources = fixture.context();
+        let volatile = bind_runtime_volatile(&sources);
+        let stable = bind_runtime_identity(&sources);
+        assert!(
+            !volatile.contains(sources.session.session_id.as_str()),
+            "session UUID must not appear in volatile prompt: {volatile}"
+        );
+        assert!(
+            !stable.contains(sources.session.session_id.as_str()),
+            "session UUID must not appear in stable prompt either: {stable}"
+        );
+        assert!(
+            !volatile.starts_with("Session:"),
+            "legacy 'Session: ...' line must be gone from volatile: {volatile}"
         );
     }
 
