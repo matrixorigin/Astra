@@ -240,7 +240,12 @@ pub fn build_volatile_environment_context(project_root: &Path) -> String {
         }
     }
 
-    if let Some(log) = git_recent_commits(project_root, 5) {
+    // 3 commits is the sweet spot: enough for the model to orient on
+    // recent work ("what did I just do?") without spending ~160c/turn on
+    // ancient history that git_log/git_show can fetch on demand. The cap
+    // was 5; observed volatile-block sessions (69657ca7) showed commits
+    // 4-5 were always just context noise the model never cited.
+    if let Some(log) = git_recent_commits(project_root, 3) {
         if !log.is_empty() {
             lines.push(format!("- Recent commits:\n{log}"));
         }
@@ -538,6 +543,27 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let ctx = build_volatile_environment_context(&cwd);
         assert!(ctx.contains("- Recent commits:"));
+    }
+
+    /// Pin the recent-commit cap at ≤3 so the Git State section stays lean.
+    /// The volatile lane runs on every turn; each extra commit adds ~80c.
+    /// Trim from 5→3 saved ~160c per session (observed in 69657ca7) and
+    /// 3 has consistently been the "what did I just do?" sweet spot for
+    /// the model — anything older is better fetched via git_log on demand.
+    #[test]
+    fn volatile_context_caps_recent_commits_at_three() {
+        let cwd = std::env::current_dir().unwrap();
+        let ctx = build_volatile_environment_context(&cwd);
+        let start = ctx.find("- Recent commits:\n").expect("has commits section");
+        let after = &ctx[start + "- Recent commits:\n".len()..];
+        let commit_lines = after
+            .lines()
+            .take_while(|l| !l.is_empty() && !l.starts_with("- "))
+            .count();
+        assert!(
+            commit_lines <= 3,
+            "volatile Git State should cap recent commits at 3, got {commit_lines}:\n{ctx}"
+        );
     }
 
     #[test]
