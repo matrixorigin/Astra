@@ -584,8 +584,21 @@ fn build_working_memory_content(messages: &[Value], max_chars: usize) -> String 
     let mut parts = Vec::new();
     let mut total_chars = 0;
 
-    // Extract key information from recent messages
-    for msg in messages.iter().rev().take(10) {
+    // Extract key information from recent messages.
+    //
+    // Scaffolding messages (runtime-injected nudges, attention manifests,
+    // correction headers, verification directives, tool-rollups) are
+    // filtered *before* counting toward the 10-message budget. Without
+    // this filter, the stored working memory becomes a replay of the
+    // runtime's own injections — which Memoria then retrieves on the
+    // next turn as "memories", polluting the volatile lane. Single
+    // source of truth: `astra_turn_types::is_runtime_scaffolding_message`.
+    for msg in messages
+        .iter()
+        .rev()
+        .filter(|m| !astra_turn_types::is_runtime_scaffolding_message(m))
+        .take(10)
+    {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("unknown");
         let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
 
@@ -2242,6 +2255,115 @@ mod tests {
         let r = build_working_memory_content(&msgs, 100);
         // Should be capped and not include all content
         assert!(r.len() <= 500); // generous but capped
+    }
+
+    // ── Scaffolding filter (closes runtime→Memoria feedback loop) ─────
+    // The volatile block was being polluted by Memoria retrieving back
+    // the runtime's own scaffolding messages from prior turns. Root
+    // cause was `build_working_memory_content` walking messages[] and
+    // emitting every user/assistant role line into the stored working-
+    // memory blob. When a later turn's retrieval matched any of those
+    // lines, they returned as `**Context:** …` memories. Fix: filter
+    // `is_runtime_scaffolding_message` before storing. The retrieval-
+    // time filter is defense-in-depth; the real cut is here, at the
+    // write path.
+
+    #[test]
+    fn working_memory_skips_parallel_feedback_nudge() {
+        let msgs = vec![
+            user("review the latest commits"),
+            assistant("✓ Previous round: 2 tools executed in parallel — excellent."),
+            assistant("Here are the three commits…"),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(
+            !r.contains("Previous round"),
+            "parallel-feedback nudge must not reach Memoria: {r}"
+        );
+        assert!(r.contains("review the latest commits"));
+        assert!(r.contains("three commits"));
+    }
+
+    #[test]
+    fn working_memory_skips_runtime_correction_headers() {
+        let msgs = vec![
+            user("continue"),
+            assistant("## ⤴ Execution Escalation Runtime correction: ten read-only calls"),
+            assistant("## ⚠ Sequential Tool Calls Detected. Last 4 rounds each ran one tool."),
+            user("fix it"),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(!r.contains("⤴"), "correction header leaked: {r}");
+        assert!(!r.contains("Sequential Tool Calls Detected"), "leaked: {r}");
+        assert!(r.contains("User: continue"));
+        assert!(r.contains("User: fix it"));
+    }
+
+    #[test]
+    fn working_memory_skips_attention_manifest() {
+        use astra_turn_types::continuity::ATTENTION_PREFIX;
+        let attention = format!("{ATTENTION_PREFIX}\nGoal: fix bug");
+        let msgs = vec![
+            user(&attention),
+            user("actually review the branch"),
+            assistant("Reviewing now."),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(!r.contains(ATTENTION_PREFIX), "attention manifest leaked: {r}");
+        assert!(r.contains("review the branch"));
+    }
+
+    #[test]
+    fn working_memory_skips_verification_and_error_budget() {
+        let msgs = vec![
+            user("⚠️ VERIFICATION REQUIRED: Before you finish"),
+            user("🔄 ERROR BUDGET EXHAUSTED: hit 3 errors"),
+            user("just fix it"),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(!r.contains("VERIFICATION REQUIRED"), "leaked: {r}");
+        assert!(!r.contains("ERROR BUDGET"), "leaked: {r}");
+        assert!(r.contains("just fix it"));
+    }
+
+    #[test]
+    fn working_memory_skips_tools_used_rollup() {
+        let msgs = vec![
+            user("explore the repo"),
+            assistant("Tools used: bash, grep, read_file"),
+            assistant("Found three relevant files."),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(!r.contains("Tools used:"), "rollup leaked: {r}");
+        assert!(r.contains("three relevant files"));
+    }
+
+    #[test]
+    fn working_memory_skips_system_role_even_if_it_somehow_appears() {
+        // Defensive: system messages should never reach compaction, but
+        // if they do, they are scaffolding by definition.
+        let sys = json!({"role": "system", "content": "runtime injected guidance"});
+        let msgs = vec![sys, user("real question")];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(!r.contains("runtime injected"), "system leaked: {r}");
+        assert!(r.contains("real question"));
+    }
+
+    #[test]
+    fn working_memory_pure_scaffolding_produces_empty_output() {
+        // When every message is scaffolding, nothing should be stored —
+        // Memoria must not receive a `[session:…] Recent conversation:\n`
+        // wrapper with no body, which would just be noise in the index.
+        let msgs = vec![
+            user("## ⤴ Runtime correction: ten calls"),
+            assistant("Tools used: bash"),
+            user("✓ Previous round: 2 tools in parallel"),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(
+            r.is_empty(),
+            "pure-scaffolding input must yield empty working memory: {r:?}"
+        );
     }
 
     // ──────────────────────────────────────────────────────────
