@@ -265,7 +265,13 @@ impl PipelineSession {
                 .record_section_fingerprints(&output.optimized.sections);
         }
 
-        self.turns_completed += 1;
+        // Do not advance `turns_completed` on the abort path. A truncated
+        // response that trips the unrecoverable-error streak is not a
+        // successful turn — counting it inflates goal/milestone tracking and
+        // pressure-tier denominators.
+        if !self.recovery.should_abort() {
+            self.turns_completed += 1;
+        }
     }
 
     /// Record a prompt-too-long error (no successful response).

@@ -91,9 +91,17 @@ impl TokenBudget {
 
         let allocated: u32 = allocations.values().sum();
         let remaining = effective_limit.saturating_sub(allocated);
+        // NOTE: keep this list aligned with every `SectionKind` variant that a
+        // planner may emit. Kinds omitted here receive a zero budget and get
+        // silently dropped by the serializer. Identity / Constraints / Memory
+        // are already allocated above; History is carried as provider messages,
+        // not a planned text section.
         let remainder_kinds = [
             SectionKind::SelfModel,
             SectionKind::Skills,
+            SectionKind::EmergentSkills,
+            SectionKind::EmergentMemory,
+            SectionKind::EmergentSummary,
             SectionKind::ProjectContext,
             SectionKind::WorkingMemory,
             SectionKind::RuntimeIdentity,

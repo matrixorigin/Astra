@@ -275,7 +275,13 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         session_id: session_id.to_string(),
         run_id: String::new(),
         model_id: model_id.to_string(),
-        model_limit: 200_000, // generous — bridge doesn't track per-model limits here
+        // Resolve the true per-model context window via the shared
+        // `budget_for_model` table. Previously hardcoded to 200_000, which
+        // severely under-reported budget pressure on 32K/8K-window models
+        // and delayed compaction until the provider returned a
+        // context-length error.
+        model_limit: u32::try_from(crate::prompts::budget_for_model(Some(model_id)).model_limit)
+            .unwrap_or(u32::MAX),
         provider_policy: provider_policy.clone(),
         provider_strategy: ProviderCacheStrategy::default(),
         project_context: project_context.unwrap_or("").to_string(),
