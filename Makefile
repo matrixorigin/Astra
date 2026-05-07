@@ -36,17 +36,6 @@ help:
 	@echo "  make test-contract      - Run contract tests (http/admin/config)"
 	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; offline in test-offline; remote E2E opt-in on test-online)"
 	@echo ""
-	@echo "Gateway (Chat Platform Bridge):"
-	@echo "  make gateway            - Build + start gateway (release)"
-	@echo "  make gateway-debug      - Build + start gateway (debug, fast)"
-	@echo "  make gateway-stop       - Stop gateway"
-	@echo "  make gateway-restart    - Restart gateway (release)"
-	@echo "  make gateway-restart-debug - Restart gateway (debug, fast)"
-	@echo "  make gateway-status     - Show gateway status"
-	@echo "  make gateway-logs       - Tail gateway logs"
-	@echo "  make gateway-login      - WeChat QR login"
-	@echo "  make gateway-test       - Gateway unit tests"
-	@echo ""
 	@echo "Code Quality:"
 	@echo "  make check              - Run all static checks (lint + format + type)"
 	@echo "  make ci                 - Run CI checks (check + test)"
@@ -478,55 +467,6 @@ build-server-debug:
 	@echo "Binary: $(RUST_DEBUG_BIN_DIR)/$(API_SERVER_BIN)"
 
 # ============================================================================
-# Gateway
-# ============================================================================
-
-# Gateway targets delegate to the gateway crate's own Makefile.
-# For full gateway dev workflow: cd rust/crates/astra-gateway && make help
-.PHONY: gateway gateway-debug gateway-stop gateway-restart gateway-restart-debug gateway-status gateway-logs gateway-build gateway-login gateway-setup gateway-test gateway-lint gateway-docker
-
-GATEWAY_DIR = rust/crates/astra-gateway
-
-gateway:
-	@cd $(GATEWAY_DIR) && make start
-
-gateway-debug:
-	@cd $(GATEWAY_DIR) && make start-debug
-
-gateway-stop:
-	@cd $(GATEWAY_DIR) && make stop
-
-gateway-restart:
-	@cd $(GATEWAY_DIR) && make restart
-
-gateway-restart-debug:
-	@cd $(GATEWAY_DIR) && make restart-debug
-
-gateway-status:
-	@cd $(GATEWAY_DIR) && make status
-
-gateway-logs:
-	@cd $(GATEWAY_DIR) && make logs
-
-gateway-build:
-	@cd $(GATEWAY_DIR) && make build
-
-gateway-login:
-	@cd $(GATEWAY_DIR) && make login-weixin
-
-gateway-setup:
-	@cd $(GATEWAY_DIR) && make setup
-
-gateway-test:
-	@cd $(GATEWAY_DIR) && make test
-
-gateway-lint:
-	@cd $(GATEWAY_DIR) && make lint
-
-gateway-docker:
-	@cd $(GATEWAY_DIR) && make docker
-
-# ============================================================================
 # Cleanup
 # ============================================================================
 
@@ -605,14 +545,7 @@ test-dashboard: ## Build astra-test and launch live dashboard
 	./rust/target/release/astra-test --live-dashboard
 
 .PHONY: test-offline
-test-offline: sweep test-workspace test-runtime-bridge-hooks test-sdk-offline test-gateway
-
-.PHONY: test-gateway
-test-gateway:
-	@echo "Running gateway unit tests..."
-	@$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-gateway --lib
-	@echo "Running gateway offline fixture tests..."
-	@$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-gateway --test offline_cli_bridge
+test-offline: sweep test-workspace test-runtime-bridge-hooks test-sdk-offline
 
 .PHONY: test-workspace
 test-workspace: sweep
@@ -724,27 +657,6 @@ test-live-llm:
 	@echo "Running live-LLM token usage tests (reads .models.yaml; one model per provider)..."
 	@ASTRA_LIVE_LLM=1 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 		--test live_token_usage_e2e -- --ignored --nocapture
-
-# Gateway live e2e — real CLI invocations (astra + claude)
-# Requires: astra binary built, .models.yaml configured, claude CLI installed
-.PHONY: test-gateway-live
-test-gateway-live:
-	@echo "Running gateway live e2e tests (real LLM: astra + claude)..."
-	@$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-gateway \
-		--test e2e_cli_bridge -- --ignored --test-threads=1 --nocapture
-
-# Gateway harness YAML tests — real LLM via astra-test-harness
-.PHONY: test-gateway-harness
-test-gateway-harness:
-	@echo "Running gateway harness YAML tests with $${MODELS:-MiniMax-M2.7}..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-test-harness --release
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --release
-	@MODELS="$${MODELS:-MiniMax-M2.7}"; \
-	./rust/target/release/astra-test \
-		--suite rust/crates/astra-test-harness/cases \
-		--force-model "$$MODELS" \
-		--filter "harness_*" \
-		--no-judger --parallel 1 --runs 1
 
 # @astra/sdk — no real HTTP API (Mode A in-process runs via ASTRA_SDK_E2E=1 in test:coverage)
 .PHONY: test-sdk-offline
