@@ -67,6 +67,61 @@ pub fn extract_anchor(first_user_msg: &str, l1: Option<&SessionMemory>) -> Strin
     }
 }
 
+/// True when the anchor adds no information beyond what the LLM already
+/// sees in the message stream and therefore should NOT be injected into
+/// the dynamic system prompt.
+///
+/// Concretely: the anchor is "trivial" when it is in the bootstrap shape
+/// produced by [`extract_anchor`] for a zero-progress, no-facts session
+/// — i.e. `[session-anchor] <task>. Currently: starting. 0/0 steps.` —
+/// AND the `<task>` portion is a near-verbatim truncation of the current
+/// user message. On turn 1 of a plain "hi"-type exchange this is almost
+/// always the case, and injecting it just duplicates the user turn.
+///
+/// Non-trivial cases (return `false`):
+/// - any facts- or L1-derived state beyond `"starting"`
+/// - progress counter ≥ 1/…
+/// - a narrative task spec (L1 "Task Specification") distinct from the
+///   first user message
+/// - anchor task differs substantively from the current user message —
+///   i.e. the user has drifted, so the anchor is re-anchoring value.
+#[must_use]
+pub fn is_trivial_anchor(anchor: &str, current_user_msg: &str) -> bool {
+    let trimmed = anchor.trim();
+    let stripped = match trimmed.strip_prefix("[session-anchor]") {
+        Some(rest) => rest.trim_start(),
+        None => return false,
+    };
+    // Only the bootstrap shape is ever trivial.
+    let Some((task, tail)) = stripped.split_once(". Currently: ") else {
+        return false;
+    };
+    if !tail.trim_end().ends_with("starting. 0/0 steps.") {
+        return false;
+    }
+    anchor_task_matches_message(task, current_user_msg)
+}
+
+fn anchor_task_matches_message(anchor_task: &str, current_user_msg: &str) -> bool {
+    let a = anchor_task.split_whitespace().collect::<Vec<_>>().join(" ");
+    let u = current_user_msg
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if a.is_empty() || u.is_empty() {
+        return false;
+    }
+    // `anchor_task` is the word-bounded truncation of the first user
+    // message at MAX_TASK_WORDS. We consider it trivial when the current
+    // user message starts with the same prefix (case-insensitive) — i.e.
+    // nothing meaningful diverged. Short messages like "hi" will match
+    // directly; longer first messages on turn 1 will also match because
+    // current_user_msg == first_user_msg.
+    let a_lower = a.to_lowercase();
+    let u_lower = u.to_lowercase();
+    u_lower == a_lower || u_lower.starts_with(&a_lower)
+}
+
 fn first_sentence(text: &str) -> &str {
     let text = text.trim();
     let sentence = text
@@ -1964,5 +2019,90 @@ mod tests {
             let result = persist_l1(&PurgeFailMock, "L1", "s").await;
             assert!(result.is_ok(), "purge failure should not prevent store");
         }
+    }
+
+    // ── is_trivial_anchor ────────────────────────────────────────────────
+
+    #[test]
+    fn trivial_anchor_turn_one_hi() {
+        // User: "hi" → anchor "[session-anchor] hi. Currently: starting. 0/0 steps."
+        // On turn 1 the current user message is the same — trivial.
+        let anchor = extract_anchor("hi", None);
+        assert!(
+            is_trivial_anchor(&anchor, "hi"),
+            "bootstrap anchor echoing the user msg must be flagged trivial, got: {anchor}"
+        );
+    }
+
+    #[test]
+    fn trivial_anchor_turn_one_short_task() {
+        let anchor = extract_anchor("refactor the prompt builder", None);
+        assert!(is_trivial_anchor(
+            &anchor,
+            "refactor the prompt builder"
+        ));
+    }
+
+    #[test]
+    fn non_trivial_anchor_when_l1_present() {
+        // L1 narrative → anchor carries real state, not trivial.
+        let l1 = SessionMemory::parse(sample_l1()).expect("sample_l1 parses");
+        let anchor = extract_anchor("fix OAuth", Some(&l1));
+        assert!(
+            !is_trivial_anchor(&anchor, "fix OAuth"),
+            "anchor enriched by L1 must not be flagged trivial, got: {anchor}"
+        );
+    }
+
+    #[test]
+    fn non_trivial_anchor_when_user_drifted() {
+        // Same bootstrap shape, but current user msg diverges from the
+        // anchored task — anchor restores "what we were actually doing".
+        let anchor = extract_anchor("refactor the prompt builder", None);
+        assert!(
+            !is_trivial_anchor(&anchor, "wait, let's talk about logging"),
+            "when user drifts, anchor should be kept, got: {anchor}"
+        );
+    }
+
+    #[test]
+    fn non_trivial_anchor_when_progress_nonzero() {
+        // Manually construct an anchor with non-zero progress.
+        let anchor = "[session-anchor] fix bug. Currently: patching module. 2/3 steps.";
+        assert!(!is_trivial_anchor(anchor, "fix bug"));
+    }
+
+    #[test]
+    fn non_trivial_anchor_when_prefix_missing() {
+        // Guard: arbitrary string without the prefix should not be
+        // misclassified.
+        assert!(!is_trivial_anchor("something else", "something else"));
+    }
+
+    #[test]
+    fn trivial_anchor_case_insensitive_match() {
+        let anchor = extract_anchor("Fix Timeout Bug", None);
+        assert!(is_trivial_anchor(&anchor, "fix timeout bug"));
+    }
+
+    #[test]
+    fn trivial_anchor_long_user_message_matching_prefix() {
+        // First message longer than MAX_TASK_WORDS → anchor truncates.
+        // Current user msg is still the same string → starts-with match
+        // still holds, so trivial.
+        let long = "refactor the prompt builder to use the volatile lane and drop the ancient typed field which has been unused for months";
+        let anchor = extract_anchor(long, None);
+        assert!(
+            is_trivial_anchor(&anchor, long),
+            "same long message echoes anchor prefix → trivial, got: {anchor}"
+        );
+    }
+
+    #[test]
+    fn non_trivial_anchor_empty_user_msg() {
+        // Defensive: empty current message → treat as non-trivial (keep
+        // anchor so the LLM still sees context).
+        let anchor = extract_anchor("refactor prompt builder", None);
+        assert!(!is_trivial_anchor(&anchor, ""));
     }
 }

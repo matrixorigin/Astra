@@ -29,12 +29,18 @@ pub fn render_digest(contents: &[String]) -> Option<String> {
         if cleaned.len() < MIN_CONTENT_LEN {
             continue;
         }
-        let key = cleaned.to_lowercase();
+        // Decode business type prefix for categorized display.
+        let (cat, body) = astra_prompts::memory_types::decode(&cleaned);
+        // Dedup on the decoded body (category-agnostic, case-insensitive,
+        // trailing-punctuation-insensitive). Memoria often surfaces the
+        // same underlying memory twice — once via the full-message query,
+        // once via the entity-keyword query — sometimes with a different
+        // category prefix or punctuation drift. Hashing on `cleaned`
+        // alone (the previous behaviour) let those slip through.
+        let key = dedup_key(body);
         if !seen.insert(key) {
             continue;
         }
-        // Decode business type prefix for categorized display.
-        let (cat, body) = astra_prompts::memory_types::decode(&cleaned);
         let label = match cat {
             Some(c) => format!(
                 "[{}] ",
@@ -76,6 +82,21 @@ fn compact_one_line(s: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// Build the dedup key for a digest bullet.
+///
+/// Normalizes:
+/// - Unicode case (to_lowercase) so "RS256" == "rs256".
+/// - Trailing punctuation commonly drifted across imports (`.`, `!`, `?`,
+///   `;`, `:`, `,`).
+/// - Surrounding whitespace (the body has already been whitespace-
+///   collapsed by `compact_one_line`, but `decode` may leave a leading
+///   space after stripping the prefix).
+fn dedup_key(body: &str) -> String {
+    body.trim()
+        .trim_end_matches(['.', '!', '?', ';', ':', ','])
+        .to_lowercase()
 }
 
 fn truncate_with_ellipsis(s: &str, max: usize) -> String {
@@ -186,5 +207,104 @@ mod tests {
             "should not double the prefix"
         );
         assert!(out.contains("[project] merge freeze"));
+    }
+
+    // ── Semantic dedup: same body surfaced under different shapes should
+    //    collapse to a single bullet. Memoria's retrieval can return the
+    //    same underlying memory twice when hybrid queries (full message +
+    //    entity keywords) both hit it with different stored category
+    //    prefixes or punctuation.
+
+    #[test]
+    fn dedup_same_body_different_category_prefix() {
+        // Same body body stored once as `[feedback]`, once as `[user]`.
+        let hits = vec![
+            "[feedback] OceanBase is a distributed HTAP database".to_string(),
+            "[user] OceanBase is a distributed HTAP database".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        let bullet_count = out.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(
+            bullet_count, 1,
+            "expected same body under different prefixes to dedupe, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dedup_same_body_prefixed_vs_legacy() {
+        // Same body once with a typed prefix, once unprefixed (legacy import).
+        let hits = vec![
+            "[lesson] Always run `cargo test` before commit".to_string(),
+            "Always run `cargo test` before commit".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        let bullet_count = out.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(
+            bullet_count, 1,
+            "expected prefixed vs legacy with same body to dedupe, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dedup_same_body_trailing_punctuation() {
+        // Same body with and without trailing period.
+        let hits = vec![
+            "OceanBase is a distributed HTAP database.".to_string(),
+            "OceanBase is a distributed HTAP database".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        let bullet_count = out.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(
+            bullet_count, 1,
+            "expected trailing-punctuation variants to dedupe, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dedup_case_insensitive_after_prefix_strip() {
+        // Same body with case drift — already handled pre-fix because of
+        // to_lowercase(), but pin the behaviour so a future refactor
+        // doesn't regress it.
+        let hits = vec![
+            "[feedback] Use RS256 for JWT".to_string(),
+            "[feedback] use rs256 for jwt".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        let bullet_count = out.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(bullet_count, 1, "case drift should still dedupe, got:\n{out}");
+    }
+
+    #[test]
+    fn dedup_preserves_first_seen_prefix() {
+        // When two variants collapse, keep the first (higher-ranked) one.
+        let hits = vec![
+            "[feedback] OceanBase is a distributed HTAP database".to_string(),
+            "[user] OceanBase is a distributed HTAP database".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        assert!(
+            out.contains("[feedback]"),
+            "first-seen category label should win, got:\n{out}"
+        );
+        assert!(
+            !out.contains("[user]"),
+            "losing category label should not appear, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn distinct_bodies_not_collapsed() {
+        // Guardrail against over-collapsing: different content should stay
+        // separate even if they share a prefix.
+        let hits = vec![
+            "[feedback] Use RS256 for JWT".to_string(),
+            "[feedback] Use HS512 for JWT".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        let bullet_count = out.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(
+            bullet_count, 2,
+            "distinct bodies must not collapse, got:\n{out}"
+        );
     }
 }

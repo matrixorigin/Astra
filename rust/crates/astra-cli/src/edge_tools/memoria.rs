@@ -375,29 +375,7 @@ pub async fn memoria_retrieve_lessons(
     };
     memories
         .iter()
-        .filter_map(|m| {
-            let content = m.get("content")?.as_str()?;
-            let memory_type = m.get("memory_type")?.as_str()?;
-            if !matches!(memory_type, "semantic" | "procedural") {
-                return None;
-            }
-            let kind = astra_services::LessonKind::PromptShape;
-            let action = astra_services::sanitize_for_prompt(content);
-            let compact = if action.len() > 80 {
-                action
-                    .split_once(['.', '—', ';'])
-                    .map(|(s, _)| s.trim().to_string())
-            } else {
-                None
-            };
-            Some(astra_runtime::self_model::LessonHint {
-                kind,
-                trigger_signal: "memoria".into(),
-                action,
-                compact,
-                workload_tag: None,
-            })
-        })
+        .filter_map(astra_services::memory_value_to_lesson_hint)
         .collect()
 }
 

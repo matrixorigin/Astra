@@ -1319,10 +1319,14 @@ impl InProcessChatTurnBridge {
             // Derive anchor from current conversation state. On turn 1, falls back to
             // first user message. On subsequent turns, builds a lightweight L1 from
             // messages to show current state + progress — zero network calls.
+            //
+            // Skip emission when the anchor is trivial (bootstrap shape that
+            // just echoes the current user message) — injecting it in that
+            // case duplicates the user turn for ~100 tokens of no signal.
             let session_anchor = {
                 use crate::turn::cloud::session_memory_protocol::{
                     extract_anchor, extract_anchor_from_facts, extract_message_text,
-                    build_l1_from_messages, SessionMemory,
+                    is_trivial_anchor, build_l1_from_messages, SessionMemory,
                 };
                 let first_user_text = messages
                     .iter()
@@ -1363,7 +1367,11 @@ impl InProcessChatTurnBridge {
                         };
                         extract_anchor(&first_user_text, l1.as_ref())
                     };
-                    format!("\n\n{anchor}")
+                    if is_trivial_anchor(&anchor, user_content_for_signal) {
+                        String::new()
+                    } else {
+                        format!("\n\n{anchor}")
+                    }
                 }
             };
 

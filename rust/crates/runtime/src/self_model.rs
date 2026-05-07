@@ -1152,6 +1152,102 @@ impl SelfModel {
 
         s
     }
+
+    /// True when the self-model has at least one *substantive* signal
+    /// worth injecting into the system prompt.
+    ///
+    /// A bare `Turn: N | Tokens: X/Y` header carries no actionable
+    /// information for the LLM and still renders several hundred bytes,
+    /// so this gate excludes it. Callers should skip emission when this
+    /// returns `false` instead of using a fragile `text.len() > 30`
+    /// heuristic (`Turn: 1\n` passed that bar).
+    ///
+    /// "Substantive" means any of:
+    /// - an active goal / plan / tracked goal
+    /// - outcome memory, deprioritized / boosted / low-confidence tools
+    /// - strategy diff from the last reflection
+    /// - guardrail auto-tuner with a measured fail rate
+    /// - session denial pressure > 0
+    /// - recent failing tests / rejections / correction excerpts
+    /// - per-tool outcome bias entries
+    /// - unmet postconditions from the last plan
+    /// - an attached auto-invoke skill diagnosis
+    /// - non-empty lessons
+    /// - token budget under pressure (> 0.7) or already compressed
+    /// - recorded recent feedback signals
+    #[must_use]
+    pub fn has_meaningful_self_awareness(&self) -> bool {
+        // Goal signal: explicit `plan_goal` always counts (an ActionPlan
+        // is actively steering), but `session_goal` / `tracked_goal` are
+        // auto-seeded from the first user message in
+        // `ObservabilitySession::record_query_at`, so their mere
+        // presence means "user said anything" — not a real signal. They
+        // only count once the tracker has observed progress or
+        // milestones, or the last reflection produced a strategy diff.
+        if self.goals.plan_goal.is_some() {
+            return true;
+        }
+        if (self.goals.session_goal.is_some() || self.goals.tracked_goal.is_some())
+            && (self.goals.progress.is_some() || !self.goals.recent_milestones.is_empty())
+        {
+            return true;
+        }
+        if !self.capabilities.outcome_memory.is_empty()
+            || !self.capabilities.deprioritized_tools.is_empty()
+            || !self.capabilities.boosted_tools.is_empty()
+            || self.capabilities.widen_selection_pending
+        {
+            return true;
+        }
+        if self.skill_diff.is_some() {
+            return true;
+        }
+        if self
+            .guardrail
+            .as_ref()
+            .and_then(|g| g.recent_fail_rate)
+            .is_some()
+        {
+            return true;
+        }
+        if self
+            .denial_pressure
+            .as_ref()
+            .is_some_and(|dp| dp.total_denials > 0)
+        {
+            return true;
+        }
+        if !self.recent_failing_tests.is_empty()
+            || !self.recent_rejections.is_empty()
+            || !self.recent_correction_excerpts.is_empty()
+        {
+            return true;
+        }
+        if !self.outcome_bias.is_empty() {
+            return true;
+        }
+        if !self.low_confidence_tools.is_empty() {
+            return true;
+        }
+        if !self.unmet_postconditions.is_empty() {
+            return true;
+        }
+        if self.skill_diagnosis.is_some() {
+            return true;
+        }
+        if !self.lessons.is_empty() {
+            return true;
+        }
+        if let Some(ref b) = self.state.token_budget
+            && (b.pressure > 0.7 || b.compression_triggered)
+        {
+            return true;
+        }
+        if !self.recent_signals.is_empty() {
+            return true;
+        }
+        false
+    }
 }
 
 /// Extract the tool name from a trigger_signal like "tool_failures:grep".
@@ -2339,5 +2435,239 @@ mod tests {
             !rendered.contains("high-failure"),
             "should not render section when empty"
         );
+    }
+
+    // ── has_meaningful_self_awareness gate ────────────────────────────
+
+    #[test]
+    fn bare_turn_counter_is_not_meaningful() {
+        let model = minimal_model();
+        // Turn number alone never justifies injecting the block.
+        assert!(
+            !model.has_meaningful_self_awareness(),
+            "minimal model (only turn counter) must be gated out"
+        );
+    }
+
+    #[test]
+    fn not_meaningful_when_only_session_goal_set() {
+        // `session_goal` is auto-seeded from the first user message, so
+        // its presence alone is not a signal — otherwise every turn
+        // after turn 1 would pass the gate, regressing the whole
+        // purpose of this method.
+        let config = RuntimeConfig::default();
+        let model = SelfModel::snapshot(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            None,
+            1,
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            Some("hi"),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+        );
+        assert!(
+            !model.has_meaningful_self_awareness(),
+            "bare session_goal echoing the first user message is not a real signal"
+        );
+    }
+
+    #[test]
+    fn meaningful_when_plan_goal_set() {
+        // Explicit plan_goal (set by ActionPlan execution) is a real
+        // commitment — counts on its own.
+        let config = RuntimeConfig::default();
+        let model = SelfModel::snapshot(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            None,
+            1,
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            None,
+            Some("refactor auth middleware"),
+            None,
+            None,
+            None,
+            &[],
+            &config,
+        );
+        assert!(model.has_meaningful_self_awareness());
+    }
+
+    #[test]
+    fn meaningful_when_session_goal_with_progress() {
+        // session_goal + tracker progress = real goal-tracking signal.
+        let mut model = minimal_model();
+        model.goals.session_goal = Some("hi".into());
+        model.goals.progress = Some(GoalProgress {
+            completion_score: 0.5,
+            momentum: 0.1,
+            milestone_count: 1,
+            summary: "half done".into(),
+        });
+        assert!(model.has_meaningful_self_awareness());
+    }
+
+    #[test]
+    fn meaningful_when_session_goal_with_milestones() {
+        use astra_turn_core::goal_tracker::{Milestone, MilestoneSignal};
+        let mut model = minimal_model();
+        model.goals.session_goal = Some("hi".into());
+        model.goals.recent_milestones.push(Milestone {
+            turn: 2,
+            signal: MilestoneSignal::BuildSuccess,
+            relevance: 1.0,
+        });
+        assert!(model.has_meaningful_self_awareness());
+    }
+
+    #[test]
+    fn meaningful_when_denial_pressure_nonzero() {
+        let model = minimal_model().with_denial_pressure(DenialPressureView {
+            total_denials: 1,
+            max_total: 20,
+        });
+        assert!(model.has_meaningful_self_awareness());
+    }
+
+    #[test]
+    fn denial_pressure_zero_is_not_meaningful() {
+        let model = minimal_model().with_denial_pressure(DenialPressureView {
+            total_denials: 0,
+            max_total: 20,
+        });
+        assert!(
+            !model.has_meaningful_self_awareness(),
+            "zero denials carries no signal"
+        );
+    }
+
+    #[test]
+    fn meaningful_when_recent_failing_tests() {
+        let model = minimal_model().with_recent_failing_tests(vec!["t1".into()]);
+        assert!(model.has_meaningful_self_awareness());
+    }
+
+    #[test]
+    fn meaningful_when_recent_rejections() {
+        let model = minimal_model().with_recent_rejections(vec![RejectionSummary {
+            tool: "bash".into(),
+            reason: "sandbox denied".into(),
+        }]);
+        assert!(model.has_meaningful_self_awareness());
+    }
+
+    #[test]
+    fn meaningful_when_recent_corrections_captured() {
+        let model = minimal_model().with_recent_correction_excerpts(vec!["no, use X".into()]);
+        assert!(model.has_meaningful_self_awareness());
+    }
+
+    #[test]
+    fn meaningful_when_unmet_postcondition() {
+        let model = minimal_model().with_unmet_postconditions(vec![UnmetPostCondition {
+            action_index: 0,
+            kind: "tool_call_succeeded".into(),
+        }]);
+        assert!(model.has_meaningful_self_awareness());
+    }
+
+    #[test]
+    fn meaningful_when_low_confidence_tools() {
+        let model = minimal_model().with_low_confidence_tools(vec![LowConfidenceTool {
+            name: "bash".into(),
+            fail_rate: 0.6,
+            samples: 10,
+        }]);
+        assert!(model.has_meaningful_self_awareness());
+    }
+
+    #[test]
+    fn meaningful_when_lessons_attached() {
+        let model = minimal_model().with_lessons(vec![LessonHint {
+            kind: astra_services::LessonKind::PromptShape,
+            trigger_signal: "memoria".into(),
+            action: "Always run cargo test before commit".into(),
+            compact: None,
+            workload_tag: None,
+        }]);
+        assert!(model.has_meaningful_self_awareness());
+    }
+
+    #[test]
+    fn meaningful_when_token_pressure_high() {
+        let mut model = minimal_model();
+        model.state.token_budget = Some(TokenBudgetSnapshot {
+            max_tokens: 100_000,
+            total_used: 90_000,
+            remaining: 10_000,
+            pressure: 0.9,
+            compression_triggered: false,
+        });
+        assert!(model.has_meaningful_self_awareness());
+    }
+
+    #[test]
+    fn not_meaningful_when_token_pressure_low() {
+        let mut model = minimal_model();
+        model.state.token_budget = Some(TokenBudgetSnapshot {
+            max_tokens: 100_000,
+            total_used: 10_000,
+            remaining: 90_000,
+            pressure: 0.10,
+            compression_triggered: false,
+        });
+        assert!(
+            !model.has_meaningful_self_awareness(),
+            "low pressure token budget alone is not meaningful"
+        );
+    }
+
+    #[test]
+    fn meaningful_when_compression_triggered() {
+        let mut model = minimal_model();
+        model.state.token_budget = Some(TokenBudgetSnapshot {
+            max_tokens: 100_000,
+            total_used: 50_000,
+            remaining: 50_000,
+            pressure: 0.5,
+            compression_triggered: true,
+        });
+        assert!(
+            model.has_meaningful_self_awareness(),
+            "compression event is a real signal even at moderate pressure"
+        );
+    }
+
+    #[test]
+    fn meaningful_when_outcome_bias_populated() {
+        let mut model = minimal_model();
+        model.outcome_bias.insert("bash".into(), -0.3);
+        assert!(model.has_meaningful_self_awareness());
+    }
+
+    #[test]
+    fn meaningful_when_deprioritized_tools_present() {
+        let mut model = minimal_model();
+        model.capabilities.deprioritized_tools.push("grep".into());
+        assert!(model.has_meaningful_self_awareness());
     }
 }

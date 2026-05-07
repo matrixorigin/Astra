@@ -755,9 +755,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         }
     }
     if let Some(self_model) = ctx.executor.build_self_model_snapshot() {
-        let text = self_model.to_system_prompt_section();
-        if text.len() > 30 {
-            if let Some(root) = payload.as_object_mut()
+        // Gate on signal content, not raw length. A bare `Turn: N\nTokens: …`
+        // header easily passes a length threshold but carries no actionable
+        // signal for the LLM — emitting it every turn wastes ~500 tokens
+        // (and the tokens are in the volatile lane, so they never cache).
+        if self_model.has_meaningful_self_awareness() {
+            let text = self_model.to_system_prompt_section();
+            if !text.trim().is_empty()
+                && let Some(root) = payload.as_object_mut()
                 && let Some(ep) = root.get_mut("edge_profile")
                 && let Some(ep_obj) = ep.as_object_mut()
             {
