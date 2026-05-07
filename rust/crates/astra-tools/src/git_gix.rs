@@ -694,14 +694,11 @@ pub fn git_show(
         Err(e) => return e,
     };
 
-    let commit_ref = match args
+    let commit_ref = args
         .get("commit")
         .or_else(|| args.get("ref"))
         .and_then(Value::as_str)
-    {
-        Some(c) => c,
-        None => return "Error: missing 'commit' (SHA, branch, or tag)".to_string(),
-    };
+        .unwrap_or("HEAD");
 
     // Reject range syntax — git_show is for a single commit, suggest git diff
     if commit_ref.contains("..") {
@@ -2638,10 +2635,14 @@ mod tests {
     }
 
     #[test]
-    fn git_show_missing_commit() {
+    fn git_show_missing_commit_defaults_to_head() {
         let root = repo_root();
         let result = git_show(&root, &json!({}), 0.0, 0);
-        assert!(result.contains("Error: missing"));
+        // Without explicit commit/ref, defaults to HEAD (same as `git show`)
+        assert!(
+            result.contains("commit ") || result.contains("Author:"),
+            "empty args should default to HEAD, got: {result}"
+        );
     }
 
     #[test]
@@ -3887,6 +3888,35 @@ mod tests {
         assert!(
             result.contains("Unknown git action"),
             "unknown action must produce error: {result}"
+        );
+    }
+
+    #[test]
+    fn consolidated_git_show_without_ref_defaults_to_head() {
+        // Regression: LLM calls `git(action="show")` without ref param.
+        // Before fix: "Error: missing 'commit' (SHA, branch, or tag)"
+        // After fix: shows HEAD commit (same as CLI `git show`).
+        let root = repo_root();
+        let result = super::git_dispatch(&root, &json!({"action": "show"}));
+        assert!(
+            result.contains("commit ") && result.contains("Author:"),
+            "git show without ref must default to HEAD, got: {result}"
+        );
+        // Must not START with "Error:" — commit message body may
+        // contain the word "Error" but that's not a tool failure.
+        assert!(
+            !result.starts_with("Error:"),
+            "must not return error when ref omitted, got: {result}"
+        );
+    }
+
+    #[test]
+    fn consolidated_git_show_with_ref_works() {
+        let root = repo_root();
+        let result = super::git_dispatch(&root, &json!({"action": "show", "ref": "HEAD"}));
+        assert!(
+            result.contains("commit ") && result.contains("Author:"),
+            "git show with ref=HEAD must work, got: {result}"
         );
     }
 

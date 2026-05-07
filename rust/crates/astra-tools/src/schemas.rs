@@ -362,7 +362,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "properties": {
                         "action": {"type": "string", "enum": ["status","diff","log","show","blame","file_history","log_search","contributors","commit","revert_commit","stash","checkout_file","worktree"], "description": "Git operation to perform"},
                         "file": {"type": "string", "description": "File path (for blame, file_history)"},
-                        "ref": {"type": "string", "description": "Git ref (for show, diff)"},
+                        "ref": {"type": "string", "description": "Git ref — commit SHA, branch, or tag (for show, diff). Defaults to HEAD if omitted."},
                         "n": {"type": "integer", "description": "Number of entries (for log)"},
                         "query": {"type": "string", "description": "Search query (for log_search)"},
                         "message": {"type": "string", "description": "Commit message (for commit)"}
