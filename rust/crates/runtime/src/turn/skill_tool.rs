@@ -719,17 +719,16 @@ pub fn skill_listing_system_message(
         ""
     };
 
+    // Compact preamble: the verbose "BLOCKING REQUIREMENT" variant rode
+    // the volatile `<system-reminder>` every turn at ~700c / ~175 tok.
+    // The two essentials are (1) when a skill matches, call `skill` first
+    // (not other tools); (2) `<skill-loaded>` in a tool result means
+    // follow its instructions directly. Everything else (reasons,
+    // re-invocation warnings) is derivable from tool descriptions.
     let content = format!(
-        "You have access to specialized skills via the `skill` tool. \
-         This is a BLOCKING REQUIREMENT: when a user's request matches a skill, \
-         invoke the skill tool BEFORE generating any other response about the task. \
-         Do NOT call any other tools in the same response as a skill invocation — \
-         the skill must be loaded first so you can follow its instructions. \
-         Do not attempt to manually replicate what a skill does — skills encode \
-         domain-specific workflows that outperform ad-hoc tool calls.\n\n\
-         When you see a `<skill-loaded name=\"...\"/>` tag in a tool result, the skill \
-         has already executed and its instructions are in that result. Follow those \
-         instructions directly — do NOT invoke any other tools or call the skill again.\n\n{}{}",
+        "When a user request matches an available skill, call the `skill` tool FIRST \
+         (before any other tool). On seeing `<skill-loaded name=\"...\"/>` in a tool \
+         result, follow that skill's instructions — do not re-invoke it.\n\n{}{}",
         lines.join("\n"),
         discover_note
     );
