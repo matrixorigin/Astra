@@ -1286,7 +1286,16 @@ pub(crate) fn build_provider_request_body(
                 body["stream_options"] = json!({"include_usage": true});
             }
             if let Some(max_out) = max_output_tokens {
-                body["max_completion_tokens"] = json!(max_out);
+                // When thinking is active, providers like DeepSeek allocate a
+                // thinking_budget that must be LESS than max_completion_tokens.
+                // If max_out is too small, the request will 400. Bump to at
+                // least 2× the typical thinking budget (32K) to leave headroom.
+                let effective_max = if !thinking.is_off() {
+                    max_out.max(65536)
+                } else {
+                    max_out
+                };
+                body["max_completion_tokens"] = json!(effective_max);
             }
             if let Some(temp) = temperature {
                 body["temperature"] = json!(temp);
