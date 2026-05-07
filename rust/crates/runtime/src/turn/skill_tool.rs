@@ -167,12 +167,22 @@ pub const DISCOVER_SKILLS_TOOL_NAME: &str = "discover_skills";
 /// Max skills returned from a single `discover_skills` call.
 const DISCOVER_SKILLS_MAX_RESULTS: usize = 8;
 
-/// Character budget for the skill listing section (1% of 200k tokens × 4 chars/token).
-const DEFAULT_SKILL_LISTING_BUDGET: usize = 8_000;
+/// Character budget for the skill listing section.
+///
+/// The listing rides the volatile `<system-reminder>` every turn, so
+/// tokens here are paid per-turn (not once-per-session like the cached
+/// system prefix). 2,500c fits ~15 compact entries at the 120-char cap
+/// below; anything more is noise — the LLM picks relevant skills from
+/// the shortlist, full details come from `skill`/`discover_skills`.
+///
+/// Trimmed from 8,000 (observed 2.3K-char skill blocks in production
+/// consuming ~575 tokens/turn on default skill sets).
+const DEFAULT_SKILL_LISTING_BUDGET: usize = 2_500;
 
 /// Per-entry description cap. Listing is for discovery only — the full content
-/// is loaded when a skill is actually invoked.
-const MAX_LISTING_DESC_CHARS: usize = 250;
+/// is loaded when a skill is actually invoked. Trimmed from 250 to 120:
+/// the first meaningful sentence is enough for the LLM to decide relevance.
+const MAX_LISTING_DESC_CHARS: usize = 120;
 
 /// Truncate a string at a byte budget, respecting UTF-8 char boundaries.
 fn truncate_desc(s: &str, max_bytes: usize) -> String {
@@ -3832,6 +3842,37 @@ mod tests {
             "entry should be shorter than raw description"
         );
         assert!(entries[0].contains('…'), "should have truncation marker");
+    }
+
+    #[test]
+    fn per_entry_description_cap_stays_tight() {
+        // Pin the per-entry cap at ≤150 chars so skill listings remain
+        // compact in the volatile `<system-reminder>`. Pre-tightening the
+        // cap was 250, contributing ~2.3K chars of skill descriptions
+        // every turn (observed in session 2f4706d1). If this test needs
+        // to grow, check whether the volatile block is still growing in
+        // proportion — a 250-char cap on 7 skills burns ~210 tok/turn.
+        let long_desc = "Sentence one. ".repeat(40); // ~560 chars
+        let skills = vec![SkillToolInfo {
+            name: "long".into(),
+            description: long_desc,
+            when_to_use: None,
+            source: SkillSourceKind::Local,
+            aliases: Vec::new(),
+            category: None,
+            tags: Vec::new(),
+            triggers: Vec::new(),
+        }];
+        let (entries, _) = format_skills_within_budget(&skills, 10_000, None, None);
+        // Entry = "- **name**: <desc>" — strip the prefix to measure desc only.
+        let desc_only = entries[0]
+            .strip_prefix("- **long**: ")
+            .expect("entry format");
+        assert!(
+            desc_only.chars().count() <= 150,
+            "description cap must stay ≤150 chars, got {} chars: {desc_only:?}",
+            desc_only.chars().count()
+        );
     }
 
     #[test]
