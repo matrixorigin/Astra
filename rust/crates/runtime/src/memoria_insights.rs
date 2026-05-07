@@ -29,6 +29,14 @@ pub fn render_digest(contents: &[String]) -> Option<String> {
         if cleaned.len() < MIN_CONTENT_LEN {
             continue;
         }
+        // Drop L1-protocol and session-replay fragments that Memoria
+        // sometimes surfaces from indexed session-memory docs. Mirrors the
+        // filter in `turn::memory_prefetch::is_memory_worthy` so the CLI-
+        // generated `## Memoria Recall` and the bridge-generated
+        // `## User Memories` both reject the same noise.
+        if !is_digest_worthy(&cleaned) {
+            continue;
+        }
         // Decode business type prefix for categorized display.
         let (cat, body) = astra_prompts::memory_types::decode(&cleaned);
         // Dedup on the decoded body (category-agnostic, case-insensitive,
@@ -65,6 +73,32 @@ pub fn render_digest(contents: &[String]) -> Option<String> {
         out.push('\n');
     }
     Some(out.trim_end().to_string())
+}
+
+/// Reject low-signal fragments before adding them to the Memoria Recall
+/// digest. Same intent as `turn::memory_prefetch::is_memory_worthy`; kept as a
+/// second copy because the two surfaces live in different crates and the
+/// filter is intentionally lenient (Recall has a hard `MAX_BULLETS=4` cap, so
+/// the cost of letting noise through is an entire useful bullet).
+fn is_digest_worthy(line: &str) -> bool {
+    // Structured tagged entries (`[@ns/type] body`) always pass — the
+    // namespace already asserts meaning.
+    if line.starts_with("[@") && line.contains('/') && line.contains(']') {
+        return true;
+    }
+    // L1 session-memory / attention protocol markers: these are replayed
+    // verbatim from `[session-memory:v1] # Session Title hi # Task …`
+    // indexed per-line and burn a whole bullet on scaffolding.
+    if line.starts_with("[session-memory:") || line.starts_with("[attention:") {
+        return false;
+    }
+    // Session-replay lines like `[session:abc] Recent conversation: …`
+    // carry inline transcript dumps that bloat the bullet and repeat the
+    // conversation history the model already has.
+    if line.starts_with("[session:") {
+        return false;
+    }
+    true
 }
 
 fn compact_one_line(s: &str) -> String {
@@ -308,6 +342,63 @@ mod tests {
         assert_eq!(
             bullet_count, 2,
             "distinct bodies must not collapse, got:\n{out}"
+        );
+    }
+
+    // ── Noise rejection: L1 protocol markers and session-replay fragments
+    //    burn a whole bullet (MAX_BULLETS=4) on scaffolding. Pinned after
+    //    session `69657ca7` showed `[session-memory:v1] # Session Title hi`
+    //    and `[session:…] Recent conversation: Assistant: Step 15 done…`
+    //    eating 2 of 4 bullets with no useful signal.
+
+    #[test]
+    fn rejects_session_memory_v1_marker() {
+        let hits = vec![
+            "[session-memory:v1] # Session Title hi # Task Specification hi".to_string(),
+            "User prefers Rust for CLI work.".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        assert!(
+            !out.contains("session-memory:v1"),
+            "L1 session-memory marker must be filtered, got:\n{out}"
+        );
+        assert!(out.contains("User prefers Rust"));
+    }
+
+    #[test]
+    fn rejects_attention_v1_marker() {
+        let hits = vec![
+            "[attention:v1] turn budget 2k".to_string(),
+            "Real insight worth surfacing here.".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        assert!(!out.contains("attention:v1"), "got:\n{out}");
+    }
+
+    #[test]
+    fn rejects_session_replay_lines() {
+        let hits = vec![
+            "[session:abc123] Recent conversation: Assistant: Step 15 done.".to_string(),
+            "Real fact that should survive.".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        assert!(
+            !out.contains("[session:"),
+            "session-replay line must be filtered, got:\n{out}"
+        );
+        assert!(out.contains("Real fact"));
+    }
+
+    #[test]
+    fn keeps_structured_tagged_entries() {
+        // `[@ns/type] body` is semantically distinct from `[session:…]`
+        // and must always pass — it's the canonical shape for typed
+        // context-source memories.
+        let hits = vec!["[@swap/archived] Turns 1-1 swapped out: hi → response".to_string()];
+        let out = render_digest(&hits).expect("digest");
+        assert!(
+            out.contains("[@swap/archived]"),
+            "structured-tagged entries must pass filter, got:\n{out}"
         );
     }
 }
