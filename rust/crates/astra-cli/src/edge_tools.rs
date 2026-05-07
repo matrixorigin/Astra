@@ -1218,7 +1218,6 @@ impl ToolExecutor {
                         self.write_file(args)
                     }
                 }
-                "rollback_file_edits" => self.rollback_file_edits(args),
                 "rollback_database_snapshots" => self.rollback_database_snapshots(args),
                 "rollback_session_state" => self.rollback_session_state(args),
                 "rollback_turn_actions" => self.rollback_turn_actions(args),
@@ -1230,8 +1229,6 @@ impl ToolExecutor {
                         self.str_replace(args)
                     }
                 }
-                "delete_file" => self.delete_file(args),
-                "multi_edit" => self.multi_edit(args),
                 "list_dir" => self.list_dir(args),
                 "grep" => self.grep(args),
                 "glob" => self.glob(args),
@@ -1475,15 +1472,12 @@ impl ToolExecutor {
                         other => format!("Unknown session action: '{other}'"),
                     }
                 }
-                "ask_user" => self.ask_user(args),
                 // Task management tools
                 "task_create" => self.task_create(args).await,
                 "task_list" => self.task_list(args).await,
                 "task_get" => self.task_get(args).await,
                 "task_update" => self.task_update(args).await,
                 "task_stop" => self.task_stop(args).await,
-                "sleep" => self.sleep_tool(args).await,
-                "tool_search" => self.tool_search(args),
                 "web_search" => self.web_search(args),
                 "share_context" => self.share_context(args),
                 "query_context" => self.query_context(args),
