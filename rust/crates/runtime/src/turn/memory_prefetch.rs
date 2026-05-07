@@ -201,6 +201,31 @@ fn is_memory_worthy(trimmed: &str) -> bool {
         return false;
     }
 
+    // Reject runtime scaffolding that leaked into conversation history
+    // and was then indexed by Memoria. These lines are synthesized by the
+    // runtime itself (nudges, corrections, verification directives,
+    // attention-manifest echoes) and have zero cross-session semantic
+    // value — retrieving them as "memories" just replays runtime
+    // injections back into the prompt. Observed in session 6676c7b5,
+    // turn 4: 78 such `**Context:**` entries filled a 6,397c block.
+    const SCAFFOLDING_PREFIXES: &[&str] = &[
+        "Tools used:",                     // per-turn tool-call roll-up
+        "[Active task attachment]",        // attention manifest
+        "[Self-check",                     // runtime self-check directive
+        "✓ Previous round:",              // parallel-feedback nudge
+        "♻ Duplicate calls detected",      // dedup nudge
+        "⚠️ VERIFICATION REQUIRED",        // runtime verification directive
+        "## ⤴",                           // runtime correction headers (escalation, batching force, repeated-cache)
+        "## ⚠",                           // runtime warning headers (sequential, cascade)
+        "🔄 ERROR BUDGET",                // error-budget exhaustion directive
+        "Runtime correction:",             // inline correction prefix
+    ];
+    for prefix in SCAFFOLDING_PREFIXES {
+        if trimmed.starts_with(prefix) {
+            return false;
+        }
+    }
+
     // Reject short status/emoji-prefixed fragments.
     if trimmed.starts_with("Turn ")
         || trimmed.starts_with("✅ ")
@@ -585,6 +610,99 @@ mod tests {
         ];
         let entries = build_memory_entries(&lines);
         assert_eq!(entries.len(), 1, "near-duplicates should collapse");
+    }
+
+    // ── Runtime-scaffolding echo filter (session 6676c7b5 feedback loop)
+    // Memoria indexes conversation history, which includes runtime-
+    // injected nudges/corrections/directives. When retrieved they are
+    // unstructured text (no `[@ns/type]` tag, no `[session:…]` prefix)
+    // and slip through every prior filter. Session 6676c7b5 turn 4 saw
+    // a 6,397c `## User Memories` block with 78 such entries, crowding
+    // out real memories and tripling the volatile lane.
+
+    #[test]
+    fn build_memory_entries_drops_runtime_tool_roll_up() {
+        let lines = vec![
+            "Tools used: read_file, bash, glob".to_string(),
+            "Tools used: memory, skill".to_string(),
+            "Real memory: prefer RS256 for JWT signing.".to_string(),
+        ];
+        let entries = build_memory_entries(&lines);
+        assert_eq!(entries.len(), 1, "only real memory survives");
+        assert!(entries[0].content.contains("RS256"));
+    }
+
+    #[test]
+    fn build_memory_entries_drops_parallel_feedback_nudge() {
+        let lines = vec![
+            "✓ Previous round: 2 tools executed in parallel — excellent. Keep batching independent operations.".to_string(),
+            "User values parallel tool execution for speed.".to_string(),
+        ];
+        let entries = build_memory_entries(&lines);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].content.contains("parallel tool execution for speed"));
+    }
+
+    #[test]
+    fn build_memory_entries_drops_runtime_correction_headers() {
+        let lines = vec![
+            "## ⤴ Execution Escalation Runtime correction: you have made 10 read-only tool calls".to_string(),
+            "## ⤴ Parallel Batching Force Runtime correction: your last 3 rounds each ran".to_string(),
+            "## ⤴ Repeated Cached Tool Calls Detected".to_string(),
+            "## ⚠ Sequential Tool Calls Detected".to_string(),
+            "Project uses Cargo workspaces for build organization.".to_string(),
+        ];
+        let entries = build_memory_entries(&lines);
+        assert_eq!(
+            entries.len(), 1,
+            "runtime correction headers must be filtered out, keeping only real memory"
+        );
+        assert!(entries[0].content.contains("Cargo workspaces"));
+    }
+
+    #[test]
+    fn build_memory_entries_drops_attention_manifest_echo() {
+        let lines = vec![
+            "[Active task attachment] Resume the active task/thread below unless the user explicitly changes topic.".to_string(),
+            "[Self-check — round 12] You have been reading/exploring for 12 consecutive rounds".to_string(),
+            "User confirmed the decision to merge branch X into main.".to_string(),
+        ];
+        let entries = build_memory_entries(&lines);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].content.contains("confirmed the decision"));
+    }
+
+    #[test]
+    fn build_memory_entries_drops_verification_and_error_budget_directives() {
+        let lines = vec![
+            "⚠️ VERIFICATION REQUIRED: Before you finish, run these checks using the bash tool".to_string(),
+            "🔄 ERROR BUDGET EXHAUSTED: You've hit Unknown errors 3 turns in a row.".to_string(),
+            "♻ Duplicate calls detected: [read_file (3x)]. You've made identical calls".to_string(),
+            "Real insight: parallelize independent read_file calls when exploring repo".to_string(),
+        ];
+        let entries = build_memory_entries(&lines);
+        assert_eq!(
+            entries.len(), 1,
+            "only the legit insight should survive, got {entries:?}"
+        );
+        assert!(entries[0].content.contains("Real insight"));
+    }
+
+    #[test]
+    fn build_memory_section_drops_all_scaffolding_returns_none() {
+        // A whole session's worth of scaffolding echoes should collapse
+        // to no section at all, rather than produce an empty-body
+        // `## User Memories\n` header.
+        let lines = vec![
+            "Tools used: bash, grep, read_file".to_string(),
+            "✓ Previous round: 3 tools executed in parallel — excellent.".to_string(),
+            "## ⤴ Execution Escalation Runtime correction:".to_string(),
+            "[Active task attachment] Resume the active task/thread below".to_string(),
+        ];
+        assert!(
+            build_memory_section(&lines).is_none(),
+            "pure-scaffolding input must not produce a `## User Memories` section"
+        );
     }
 
     #[test]

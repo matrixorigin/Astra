@@ -98,6 +98,29 @@ fn is_digest_worthy(line: &str) -> bool {
     if line.starts_with("[session:") {
         return false;
     }
+    // Runtime scaffolding that leaked into conversation history and was
+    // then indexed by Memoria. Mirrors
+    // `turn::memory_prefetch::is_memory_worthy` scaffolding list — see
+    // that function for rationale. Pinned after observing the
+    // feedback loop in session 6676c7b5 where 78 runtime-correction
+    // echoes filled a 6,397c `## User Memories` block.
+    const SCAFFOLDING_PREFIXES: &[&str] = &[
+        "Tools used:",
+        "[Active task attachment]",
+        "[Self-check",
+        "✓ Previous round:",
+        "♻ Duplicate calls detected",
+        "⚠️ VERIFICATION REQUIRED",
+        "## ⤴",
+        "## ⚠",
+        "🔄 ERROR BUDGET",
+        "Runtime correction:",
+    ];
+    for prefix in SCAFFOLDING_PREFIXES {
+        if line.starts_with(prefix) {
+            return false;
+        }
+    }
     true
 }
 
