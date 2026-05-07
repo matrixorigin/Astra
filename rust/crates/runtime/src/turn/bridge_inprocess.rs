@@ -1224,6 +1224,18 @@ impl InProcessChatTurnBridge {
                 .map(|text| format!("\n\n{text}"))
                 .unwrap_or_default();
 
+            // ── Skill listing (injected by CLI via edge_profile) ──
+            // Previously injected as a leading role:system message (broke
+            // prefix cache on every turn because the skill selector re-ranks).
+            // Now routed through the volatile lane alongside other per-turn
+            // dynamic sections.
+            let skill_listing_hint = edge_profile
+                .get("skill_listing_text")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(|text| format!("\n\n{text}"))
+                .unwrap_or_default();
+
             // Memory storage decisions are now fully LLM-driven via system
             // prompt rules. detect_store_signal keyword matching was removed.
 
@@ -1499,6 +1511,14 @@ impl InProcessChatTurnBridge {
                 dynamic_sections.push(
                     prompts::PromptSection::dynamic(
                         recent_arg_hints_hint.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    ),
+                );
+            }
+            if !skill_listing_hint.is_empty() {
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        skill_listing_hint.clone(),
                         prompts::PromptTokenBucket::Environment,
                     ),
                 );

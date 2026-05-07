@@ -357,10 +357,20 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         thinking: thinking_config,
     });
 
-    // Inject ephemeral prefix (e.g., skill listing) at the start of messages.
+    // Route skill listing through edge_profile → bridge volatile lane, so
+    // it lands in RuntimeVolatile (post-cache-marker) rather than becoming a
+    // leading role:system message that breaks the prefix cache on
+    // prefix-only providers (DeepSeek, GLM, Qwen). The skill selector
+    // re-ranks each turn, so the content changes — it must not live in the
+    // system prefix or it invalidates the cache every turn.
     if let Some(prefix) = ctx.ephemeral_prefix {
-        if let Some(arr) = payload.get_mut("messages").and_then(Value::as_array_mut) {
-            arr.insert(0, prefix.clone());
+        if let Some(content) = prefix.get("content").and_then(serde_json::Value::as_str)
+            && !content.is_empty()
+            && let Some(root) = payload.as_object_mut()
+            && let Some(ep) = root.get_mut("edge_profile")
+            && let Some(ep_obj) = ep.as_object_mut()
+        {
+            ep_obj.insert("skill_listing_text".to_string(), json!(content));
         }
     }
     let active_skills = detect_active_system_skills_in_message(ctx.message);
