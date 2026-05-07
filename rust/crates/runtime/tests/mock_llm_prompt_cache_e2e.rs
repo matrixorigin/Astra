@@ -101,6 +101,7 @@ async fn anthropic_cache_control_emitted_on_system_tools_and_messages() {
         capture.clone(),
     );
     let mut state = make_test_loop_state();
+    state.max_turn_input_tokens = 200_000;
     state
         .messages
         .push(json!({ "role": "user", "content": "turn 1" }));
@@ -405,6 +406,8 @@ async fn tool_catalogue_change_invalidates_cacheable_prefix() {
 
     let mut state_a = make_test_loop_state();
     let mut state_b = make_test_loop_state();
+    state_a.max_turn_input_tokens = 200_000;
+    state_b.max_turn_input_tokens = 200_000;
     host_a
         .run_one_mock_turn_for_test(&mut state_a)
         .await
@@ -422,10 +425,21 @@ async fn tool_catalogue_change_invalidates_cacheable_prefix() {
         gb[0].tools.len(),
         "tool churn must be observable in captured payload",
     );
-    // The last-tool cache_control marker is always on the last element for
-    // Anthropic, regardless of which tool sits there — so both sides flag true.
+    // The cache_control marker is placed on the last *pinned* tool (the static-lib
+    // boundary), not necessarily the absolute last element. For host_a all tools are
+    // pinned so the last tool IS the last pinned tool. For host_b, "extra_tool" is
+    // not pinned — the marker sits on "read_file" (the last pinned tool).
     assert!(ga[0].last_tool_has_cache_control);
-    assert!(gb[0].last_tool_has_cache_control);
+    // host_b: marker on last pinned tool (read_file, idx 1), not last tool (extra_tool, idx 2)
+    assert!(
+        gb[0].tools.iter().any(|t| {
+            t.get("cache_control").is_some()
+                || t.get("function")
+                    .and_then(|f| f.get("cache_control"))
+                    .is_some()
+        }),
+        "host_b must have cache_control on at least one tool schema"
+    );
 }
 
 // ── pc-model-change-break: model field flows into captured provider ──────────

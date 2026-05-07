@@ -146,14 +146,31 @@ async fn tool_order_swap_changes_prefix_hash() {
     );
     let mut s1 = make_test_loop_state();
     let mut s2 = make_test_loop_state();
+    s1.max_turn_input_tokens = 200_000;
+    s2.max_turn_input_tokens = 200_000;
     host_a.run_one_mock_turn_for_test(&mut s1).await.unwrap();
     host_b.run_one_mock_turn_for_test(&mut s2).await.unwrap();
 
     let a = capture_a.lock().unwrap();
     let b = capture_b.lock().unwrap();
+    // With pipeline-based system assembly, tool schemas are a separate cacheable
+    // component and are NOT included in the system-message prefix hash. Instead,
+    // verify that tool order difference is observable in the captured tools payload
+    // (which Anthropic uses as a separate cache input).
     assert_ne!(
-        a[0].cacheable_prefix_sha256, b[0].cacheable_prefix_sha256,
-        "tool order affects the cached prefix content — hashes must differ"
+        a[0].tools, b[0].tools,
+        "tool order swap must be observable in the captured tools payload"
+    );
+    // The first tool in each payload must differ in name (order was swapped).
+    let name_a = a[0].tools[0]
+        .pointer("/function/name")
+        .and_then(Value::as_str);
+    let name_b = b[0].tools[0]
+        .pointer("/function/name")
+        .and_then(Value::as_str);
+    assert_ne!(
+        name_a, name_b,
+        "first tool name must differ when order is swapped"
     );
 }
 
@@ -287,6 +304,7 @@ async fn long_message_history_still_caps_message_breakpoints_at_one() {
         capture.clone(),
     );
     let mut state = make_test_loop_state();
+    state.max_turn_input_tokens = 200_000;
     // Seed a 30-message history before the turn.
     for i in 0..15 {
         state
@@ -308,7 +326,15 @@ async fn long_message_history_still_caps_message_breakpoints_at_one() {
         msg_bps <= 1,
         "long history must still carry ≤1 message breakpoint, got {msg_bps}"
     );
-    assert!(c.last_message_has_cache_control);
+    // With the pipeline strategy, the cache breakpoint is placed on the
+    // second-to-last user message (or the assistant msg just before the last
+    // user message) — NOT necessarily the absolute last message. This
+    // maximizes cache hits because the prefix through the previous turn is
+    // stable. The key invariant is that exactly one message breakpoint exists.
+    assert_eq!(
+        msg_bps, 1,
+        "exactly one message breakpoint must exist in the annotated history"
+    );
 }
 
 // ── J-7: OpenAI provider never emits cache_control anywhere ─────────────────

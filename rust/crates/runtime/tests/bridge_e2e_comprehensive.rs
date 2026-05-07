@@ -9699,11 +9699,11 @@ async fn d3_semantic_dedup_pre_check_returns_cached() {
 
     let mut dedup = SemanticDedup::new(0.75);
 
-    // Record a call
+    // Record a call (output must be >= 20 chars to be considered meaningful by pre_check_block)
     dedup.check_and_record(
         "read_file",
         &json!({"path": "Cargo.toml"}),
-        "package name = foo",
+        "[package]\nname = \"foo\"\nversion = \"0.1.0\"",
         0,
     );
 
@@ -9716,7 +9716,7 @@ async fn d3_semantic_dedup_pre_check_returns_cached() {
     let (prev_turn, cached_output) = blocked.unwrap();
     assert_eq!(prev_turn, 0);
     assert!(
-        cached_output.contains("package name"),
+        cached_output.contains("name = \"foo\""),
         "should return cached output"
     );
 }
