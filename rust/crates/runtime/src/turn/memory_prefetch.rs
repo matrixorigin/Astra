@@ -92,14 +92,33 @@ pub(crate) fn build_memory_section(merged_lines: &[String]) -> Option<String> {
 }
 
 /// Build typed memory catalog entries from ranked Memoria retrieval lines.
+///
+/// Applies a quality filter to skip low-signal fragments that Memoria
+/// sometimes returns when it indexes L1 session-memory docs per-line:
+/// bare markdown headers, single-word echoes, and near-duplicates of
+/// higher-ranked entries. Without this filter the `## User Memories`
+/// block was observed to bloat to ~1,200 tokens with `**Context:** hi`,
+/// `**Context:** # Task Specification` etc. (session `ec35c711`).
 pub(crate) fn build_memory_entries(merged_lines: &[String]) -> Vec<ContextMemoryEntry> {
     let total = merged_lines.len();
+    let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     merged_lines
         .iter()
         .enumerate()
         .filter_map(|(idx, line)| {
             let trimmed = line.trim();
             if trimmed.is_empty() {
+                return None;
+            }
+            if !is_memory_worthy(trimmed) {
+                return None;
+            }
+            // Dedup key: case-folded, trailing-punctuation stripped.
+            // Tagged entries (`[@ns/type] body`) dedup on the full line
+            // so two entries with different tags but same body still
+            // both appear (they carry different semantics).
+            let key = memory_dedup_key(trimmed);
+            if !seen_keys.insert(key) {
                 return None;
             }
             let formatted = astra_prompts::memory_proto::format_for_llm(&[trimmed]);
@@ -114,6 +133,89 @@ pub(crate) fn build_memory_entries(merged_lines: &[String]) -> Vec<ContextMemory
             )
         })
         .collect()
+}
+
+/// Is this line signal-bearing enough to keep as a memory?
+///
+/// Rejects patterns observed in real Memoria retrieval noise:
+/// - lone markdown headers (`# …`, `## …`, `### …`) — section titles
+///   stored per-line from L1 doc fragmentation
+/// - L1 protocol markers (`[session-memory:v1]`, `[attention:v1]`)
+/// - short generic status fragments (`None`, `Tools used: none`,
+///   `Turn 1`, `Turn 1, active`, `🔄 In progress`, `✅ …`, `⚠ …`)
+/// - single-word user echoes (`hi`, `ok`, `yes`)
+///
+/// Tagged entries (`[@namespace/type] body`) always pass even if short —
+/// the namespace already asserts the entry carries structured meaning.
+fn is_memory_worthy(trimmed: &str) -> bool {
+    // Always keep structured-tagged entries.
+    if trimmed.starts_with("[@") && trimmed.contains("/") && trimmed.contains("]") {
+        return true;
+    }
+
+    // Reject lone markdown headers (up to 6 levels of `#`).
+    if let Some(rest) = trimmed.strip_prefix('#') {
+        let stripped = rest.trim_start_matches('#').trim_start();
+        // If the line is just a header with short body (common for fragmented docs), drop.
+        if stripped.is_empty() || stripped.chars().count() <= 30 {
+            return false;
+        }
+    }
+
+    // Reject L1 protocol markers.
+    if trimmed.starts_with("[session-memory:") || trimmed.starts_with("[attention:") {
+        return false;
+    }
+
+    // Reject well-known low-signal fragments.
+    const NOISE_EXACT: &[&str] = &[
+        "None",
+        "(none)",
+        "Tools used: none",
+        "🔄 In progress",
+    ];
+    if NOISE_EXACT.contains(&trimmed) {
+        return false;
+    }
+
+    // Reject short status/emoji-prefixed fragments.
+    if trimmed.starts_with("Turn ")
+        || trimmed.starts_with("✅ ")
+        || trimmed.starts_with("🔄 ")
+        || trimmed.starts_with("⏳ ")
+        || trimmed.starts_with("⚠ ")
+        || trimmed.starts_with("⚠️")
+    {
+        // These are short status ticks. Only allow if body is long enough
+        // to contain real information (>50 chars after the prefix).
+        if trimmed.chars().count() <= 40 {
+            return false;
+        }
+    }
+
+    // Reject bare single-token user echoes (`hi`, `ok`, `yes`, emoji-only).
+    let word_count = trimmed
+        .split(|c: char| c.is_whitespace() || "，。！？,.!?".contains(c))
+        .filter(|w| !w.is_empty())
+        .count();
+    if word_count < 3 && trimmed.chars().count() < 20 {
+        return false;
+    }
+
+    true
+}
+
+/// Normalize a memory line for dedup: case-fold + strip trailing
+/// punctuation + collapse whitespace. Matches the `memoria_insights`
+/// dedup key so behaviour is consistent across the two surfaces.
+fn memory_dedup_key(trimmed: &str) -> String {
+    let collapsed: String = trimmed
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    collapsed
+        .trim_end_matches(['.', '!', '?', ';', ':', ','])
+        .to_lowercase()
 }
 
 /// Extract non-CJK, non-punctuation tokens from a message for keyword-based retrieval.
@@ -330,6 +432,71 @@ mod tests {
         );
         assert!(entries[0].content.contains("Preferences"));
         assert_eq!(entries[0].source.as_deref(), Some("memoria.prefetch"));
+    }
+
+    // ── Low-signal fragment filter ────────────────────────────────────
+    // Memoria sometimes indexes L1 session-memory documents per-line,
+    // so retrieval can return markdown headers / empty section labels
+    // as individual "memories". These are noise — they bloat the
+    // volatile block (observed 4.7K chars / 1,183 tok in session
+    // ec35c711) without carrying retrievable signal. Drop them at ingress.
+
+    #[test]
+    fn build_memory_entries_drops_lone_markdown_headers() {
+        let lines = vec![
+            "# Session Title".to_string(),
+            "## Task Specification".to_string(),
+            "### Current State".to_string(),
+            "User prefers Rust for CLI work".to_string(),
+        ];
+        let entries = build_memory_entries(&lines);
+        let contents: Vec<&str> = entries.iter().map(|e| e.content.as_str()).collect();
+        assert_eq!(entries.len(), 1, "only the real memory should survive: {contents:?}");
+        assert!(entries[0].content.contains("prefers Rust"));
+    }
+
+    #[test]
+    fn build_memory_entries_drops_fragmented_l1_wrappers() {
+        // These appear when Memoria chunks an L1 session-memory doc.
+        let lines = vec![
+            "[session-memory:v1]".to_string(),
+            "None".to_string(),
+            "🔄 In progress".to_string(),
+            "Tools used: none".to_string(),
+            "Turn 1".to_string(),
+            "Turn 1, active".to_string(),
+            "Turn 1, ~0K tokens".to_string(),
+            "hi".to_string(), // single-word user echoes
+            "ok".to_string(),
+            "真实的 memory fragment with actual content we want to keep".to_string(),
+        ];
+        let entries = build_memory_entries(&lines);
+        assert_eq!(entries.len(), 1, "only the substantive entry should survive");
+        assert!(entries[0].content.contains("真实"));
+    }
+
+    #[test]
+    fn build_memory_entries_keeps_short_but_meaningful_tagged_entries() {
+        // Tagged entries with [@ns/type] prefix are structured — keep even if short.
+        let lines = vec![
+            "[@pref/active] dark mode".to_string(),
+            "[@fact/semantic] astra = CLI tool".to_string(),
+        ];
+        let entries = build_memory_entries(&lines);
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn build_memory_entries_drops_near_duplicates_after_normalization() {
+        // Different surface but same signal — we already had trailing-
+        // punctuation dedup in memoria_insights.rs, apply the same here.
+        let lines = vec![
+            "OceanBase is a distributed HTAP database".to_string(),
+            "OceanBase is a distributed HTAP database.".to_string(), // trailing dot
+            "oceanbase IS a DISTRIBUTED HTAP database".to_string(), // case-varied
+        ];
+        let entries = build_memory_entries(&lines);
+        assert_eq!(entries.len(), 1, "near-duplicates should collapse");
     }
 
     #[test]
