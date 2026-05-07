@@ -18,6 +18,10 @@ use crate::{ToolResult, per_tool_output_limit, truncate_output};
 const READ_FILE_SIZE_LIMIT: usize = 80 * 1024;
 /// Hard ceiling: files above this size are never read into memory for preview.
 const READ_FILE_HARD_LIMIT: usize = 10 * 1024 * 1024;
+/// Format file size in MB with one decimal place, avoiding integer division truncation.
+fn format_file_size_mb(size_bytes: u64) -> String {
+    format!("{:.1} MB", size_bytes as f64 / (1024.0 * 1024.0))
+}
 const IMAGE_READ_SIZE_LIMIT: u64 = 10 * 1024 * 1024;
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
 const BINARY_EXTS: &[&str] = &[
@@ -179,8 +183,8 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         if IMAGE_EXTS.contains(&ext_lower.as_str()) {
             if metadata.len() > IMAGE_READ_SIZE_LIMIT {
                 return ToolResult::error(format!(
-                    "Error: image file too large ({} MB). Maximum supported: 10MB.",
-                    metadata.len() / (1024 * 1024)
+                    "Error: image file too large ({}). Maximum supported: 10MB.",
+                    format_file_size_mb(metadata.len())
                 ));
             }
             let bytes = match std::fs::read(&path) {
@@ -1398,6 +1402,20 @@ fn unified_diff_simple(old_content: &str, new_content: &str, filename: &str) -> 
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn format_file_size_mb_shows_fractional_for_small_files() {
+        // 500 KB → should show "0.5 MB", NOT "0 MB" (integer division bug)
+        assert_eq!(format_file_size_mb(500 * 1024), "0.5 MB");
+        // 1 byte over 10MB → should show "10.0 MB", NOT "10 MB"
+        assert_eq!(format_file_size_mb(10 * 1024 * 1024 + 1), "10.0 MB");
+        // exactly 10MB
+        assert_eq!(format_file_size_mb(10 * 1024 * 1024), "10.0 MB");
+        // 0 bytes
+        assert_eq!(format_file_size_mb(0), "0.0 MB");
+        // 15.3 MB
+        assert_eq!(format_file_size_mb(15 * 1024 * 1024 + 307_200), "15.3 MB");
+    }
 
     #[test]
     fn read_file_basic() {
