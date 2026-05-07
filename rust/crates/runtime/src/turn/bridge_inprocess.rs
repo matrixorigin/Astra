@@ -1594,7 +1594,26 @@ impl InProcessChatTurnBridge {
             }
             llm_messages.push(system_msg);
             if let Some(dyn_msg) = dynamic_msg {
-                llm_messages.push(dyn_msg);
+                // For prefix-only providers the dynamic system block contains
+                // volatile per-turn content. Emitting it as a user/assistant
+                // preamble pair keeps the system message byte-stable so the
+                // provider's prefix cache hits on the unchanged portion.
+                // Anthropic never reaches here (dynamic_system is None).
+                let dyn_text = dyn_msg
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if !dyn_text.is_empty() {
+                    llm_messages.push(json!({
+                        "role": "user",
+                        "content": format!("<system-reminder>\n{dyn_text}</system-reminder>"),
+                    }));
+                    llm_messages.push(json!({
+                        "role": "assistant",
+                        "content": "Understood.",
+                    }));
+                }
             }
 
             // Merge tool results into messages (handle continuation turns)

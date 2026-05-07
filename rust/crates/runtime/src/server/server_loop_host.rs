@@ -247,6 +247,12 @@ struct ResolvedTurnLlmConfig {
 struct PipelineTurnOutcome {
     /// Rendered system message(s), ready to prepend to the LLM request.
     system_messages: Vec<Value>,
+    /// For prefix-only providers (DeepSeek, GLM, Qwen): volatile content
+    /// (CacheScope::None blocks) moved out of the system message into a
+    /// synthetic user/assistant pair so the system message stays byte-stable
+    /// across turns, maximizing prefix cache hit rates.
+    /// Empty for Anthropic/Bedrock providers (they use cache_control markers).
+    volatile_preamble: Vec<Value>,
     /// Flattened plain-text system prompt, for trace + cache-estimate consumers.
     system_plain: String,
     /// Per-section token breakdown for observability.
@@ -1106,6 +1112,7 @@ impl ServerAgenticLoopHost {
             &state.message,
         );
         let system_msgs = mock_pipeline.system_messages;
+        let volatile_preamble = mock_pipeline.volatile_preamble;
         self.emit_context_meta(&mock_pipeline.breakdown);
 
         // Replicate the real-path tool + message annotations so captured
@@ -1120,6 +1127,7 @@ impl ServerAgenticLoopHost {
             .clone()
             .unwrap_or_else(|| ("openai".to_string(), "server-loop-mock".to_string()));
         let mut capture_messages = system_msgs.clone();
+        capture_messages.extend(volatile_preamble);
         capture_messages.extend(annotated_messages.clone());
 
         // Record the captured request before tool delivery (so assertions see
@@ -1829,6 +1837,7 @@ impl ServerAgenticLoopHost {
                         "role": "system",
                         "content": [{"type": "text", "text": emergency}],
                     })],
+                    volatile_preamble: Vec::new(),
                     system_plain: emergency.to_string(),
                     breakdown,
                     tier: CompactionTier::Normal,
@@ -1837,7 +1846,6 @@ impl ServerAgenticLoopHost {
             }
         };
 
-        let content = system_blocks_to_anthropic_content(&pipeline_output.serialized);
         let plain = astra_turn_core::context_serializer::flatten_serialized_system_blocks(
             &pipeline_output.serialized,
         );
@@ -1845,8 +1853,54 @@ impl ServerAgenticLoopHost {
             total_tokens: pipeline_output.metrics.sections,
             ..Default::default()
         };
+
+        // Determine cache protocol: Anthropic uses explicit cache_control markers
+        // on system blocks, so all blocks stay in the system message. Prefix-only
+        // providers (DeepSeek, GLM, Qwen, OpenAI) cache based on byte-identical
+        // prefix — volatile blocks (CacheScope::None) must be moved out of the
+        // system message so it remains stable across turns.
+        let is_anthropic = matches!(provider, "anthropic" | "bedrock");
+
+        let (system_messages, volatile_preamble) = if is_anthropic {
+            // Anthropic/Bedrock: all blocks in system message with cache_control.
+            let content = system_blocks_to_anthropic_content(&pipeline_output.serialized);
+            (
+                vec![json!({"role": "system", "content": content})],
+                Vec::new(),
+            )
+        } else {
+            // Prefix-only: split blocks by scope.
+            use astra_turn_core::section_types::CacheScope;
+            let mut stable_text = String::new();
+            let mut volatile_text = String::new();
+            for block in &pipeline_output.serialized.system_blocks {
+                if block.scope == CacheScope::None {
+                    volatile_text.push_str(&block.text);
+                } else {
+                    stable_text.push_str(&block.text);
+                }
+            }
+            let system_msgs = vec![json!({"role": "system", "content": stable_text})];
+            let preamble = if volatile_text.is_empty() {
+                Vec::new()
+            } else {
+                vec![
+                    json!({
+                        "role": "user",
+                        "content": format!("<system-reminder>\n{volatile_text}</system-reminder>"),
+                    }),
+                    json!({
+                        "role": "assistant",
+                        "content": "Understood.",
+                    }),
+                ]
+            };
+            (system_msgs, preamble)
+        };
+
         PipelineTurnOutcome {
-            system_messages: vec![json!({"role": "system", "content": content})],
+            system_messages,
+            volatile_preamble,
             system_plain: plain,
             breakdown,
             tier: pipeline_output.plan.compact_tier,
@@ -1904,6 +1958,7 @@ impl ServerAgenticLoopHost {
     fn assemble_llm_messages(
         &self,
         system_messages: Vec<Value>,
+        volatile_preamble: Vec<Value>,
         compacted_messages: Vec<Value>,
         state: &AgenticLoopState,
         llm_cfg: &ResolvedTurnLlmConfig,
@@ -1933,6 +1988,7 @@ impl ServerAgenticLoopHost {
 
         crate::turn::wire_assembly::assemble_llm_messages(
             system_messages,
+            volatile_preamble,
             compacted_messages,
             &attachments,
             &self.session_id,
@@ -2185,6 +2241,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         );
         let PipelineTurnOutcome {
             system_messages,
+            volatile_preamble,
             system_plain: system_prompt_plain,
             breakdown: system_prompt_breakdown,
             tier,
@@ -2218,6 +2275,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         );
         let llm_messages = self.assemble_llm_messages(
             system_messages,
+            volatile_preamble,
             compacted_messages,
             state,
             &llm_cfg,
@@ -3656,6 +3714,7 @@ mod tests {
         };
         let msgs = host.assemble_llm_messages(
             vec![json!({"role": "system", "content": "system prompt text"})],
+            Vec::new(),
             state.messages.clone(),
             &state,
             &llm_cfg,

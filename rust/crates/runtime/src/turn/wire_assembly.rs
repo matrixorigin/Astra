@@ -294,15 +294,19 @@ fn is_completion_signal(content: &str) -> bool {
 /// Order (matches the legacy server + bridge inline paths byte-for-byte):
 ///
 /// 1. `system_messages` (from the context pipeline).
-/// 2. `compacted_messages` (from Memoria).
-/// 3. `strip_stale_reasoning` is applied in place (reduces input tokens
+/// 2. `volatile_preamble` (prefix-only providers: volatile content moved
+///    out of the system message into a synthetic user/assistant pair so
+///    the system message stays byte-stable across turns for cache hits).
+/// 3. `compacted_messages` (from Memoria).
+/// 4. `strip_stale_reasoning` is applied in place (reduces input tokens
 ///    without changing the visible conversation for thinking-model APIs).
-/// 4. Invoked-skill attachments (server path only — bridge leaves empty).
-/// 5. Recent-file attachments (server path only).
-/// 6. `apply_anthropic_cache_metadata` (cache_edits block + tool-result
+/// 5. Invoked-skill attachments (server path only — bridge leaves empty).
+/// 6. Recent-file attachments (server path only).
+/// 7. `apply_anthropic_cache_metadata` (cache_edits block + tool-result
 ///    cache_reference markers; last-message breakpoint).
 pub(crate) fn assemble_llm_messages(
     system_messages: Vec<Value>,
+    volatile_preamble: Vec<Value>,
     compacted_messages: Vec<Value>,
     attachments: &PostCompactAttachments<'_>,
     session_id: &str,
@@ -311,6 +315,7 @@ pub(crate) fn assemble_llm_messages(
     cache_cfg: &PromptCacheConfig,
 ) -> Vec<Value> {
     let mut llm_messages = system_messages;
+    llm_messages.extend(volatile_preamble);
     llm_messages.extend(compacted_messages);
     astra_turn_core::edge_ledger::strip_stale_reasoning(&mut llm_messages, provider, model_name);
 
@@ -393,6 +398,7 @@ mod tests {
         let compacted = vec![json!({"role": "user", "content": "hi"})];
         let msgs = assemble_llm_messages(
             system.clone(),
+            Vec::new(),
             compacted.clone(),
             &PostCompactAttachments::default(),
             "s1",
@@ -413,6 +419,7 @@ mod tests {
         let compacted = vec![json!({"role": "user", "content": "hi"})];
         let msgs = assemble_llm_messages(
             system,
+            Vec::new(),
             compacted,
             &PostCompactAttachments {
                 invoked_skills: vec![InvokedSkillRef {
@@ -558,6 +565,7 @@ mod tests {
         ];
         let bridge_msgs = assemble_llm_messages(
             system.clone(),
+            Vec::new(),
             compacted.clone(),
             &PostCompactAttachments::default(),
             "sid",
@@ -567,6 +575,7 @@ mod tests {
         );
         let server_msgs = assemble_llm_messages(
             system,
+            Vec::new(),
             compacted,
             &PostCompactAttachments {
                 invoked_skills: Vec::new(),
@@ -590,7 +599,7 @@ mod tests {
         // The server + bridge call sequence is:
         //   1. memoria.compact() → CompactResult
         //   2. maybe_append_continuation_prompt(&mut result.messages, hit)
-        //   3. assemble_llm_messages(system, result.messages, ...)
+        //   3. assemble_llm_messages(system, preamble, result.messages, ...)
         //
         // Running the same sequence twice on equal inputs must produce
         // byte-identical outputs — no hidden state, no call-count side effects.
@@ -606,6 +615,7 @@ mod tests {
         maybe_append_continuation_prompt(&mut first, true);
         let first_out = assemble_llm_messages(
             system.clone(),
+            Vec::new(),
             first,
             &PostCompactAttachments::default(),
             "sid",
@@ -618,6 +628,7 @@ mod tests {
         maybe_append_continuation_prompt(&mut second, true);
         let second_out = assemble_llm_messages(
             system,
+            Vec::new(),
             second,
             &PostCompactAttachments::default(),
             "sid",
@@ -646,6 +657,7 @@ mod tests {
         ];
         let bridge_out = assemble_llm_messages(
             system.clone(),
+            Vec::new(),
             compacted.clone(),
             &PostCompactAttachments::default(),
             "sid",
@@ -655,6 +667,7 @@ mod tests {
         );
         let server_out = assemble_llm_messages(
             system,
+            Vec::new(),
             compacted,
             &PostCompactAttachments {
                 invoked_skills: vec![InvokedSkillRef {
@@ -698,6 +711,7 @@ mod tests {
 
         let bridge_out = assemble_llm_messages(
             system.clone(),
+            Vec::new(),
             compacted.clone(),
             &PostCompactAttachments::default(),
             "sid",
@@ -707,6 +721,7 @@ mod tests {
         );
         let server_out = assemble_llm_messages(
             system,
+            Vec::new(),
             compacted,
             &PostCompactAttachments {
                 invoked_skills: vec![InvokedSkillRef {
@@ -729,5 +744,33 @@ mod tests {
         // structure.
         assert!(bridge_out.last().unwrap().get("role").is_some());
         assert!(server_out.last().unwrap().get("role").is_some());
+    }
+
+    #[test]
+    fn volatile_preamble_inserted_between_system_and_compacted() {
+        let system = vec![json!({"role": "system", "content": "sys"})];
+        let preamble = vec![
+            json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
+            json!({"role": "assistant", "content": "Understood."}),
+        ];
+        let compacted = vec![json!({"role": "user", "content": "hi"})];
+        let msgs = assemble_llm_messages(
+            system,
+            preamble,
+            compacted,
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "gpt-4",
+            &cache_cfg(),
+        );
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user");
+        assert!(msgs[1]["content"].as_str().unwrap().contains("volatile"));
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], "Understood.");
+        assert_eq!(msgs[3]["role"], "user");
+        assert_eq!(msgs[3]["content"], "hi");
     }
 }
