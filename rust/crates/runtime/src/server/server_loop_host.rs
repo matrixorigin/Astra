@@ -1104,12 +1104,13 @@ impl ServerAgenticLoopHost {
             Some((p, m)) => (p.clone(), m.clone()),
             None => ("openai".to_string(), "server-loop-mock".to_string()),
         };
+        let user_content = state.message.clone();
         let mock_pipeline = self.run_turn_pipeline(
             state,
             &edge_tools_snapshot,
             &provider_name,
             &model_name_for_pipeline,
-            &state.message,
+            &user_content,
         );
         let system_msgs = mock_pipeline.system_messages;
         let volatile_preamble = mock_pipeline.volatile_preamble;
@@ -1142,7 +1143,7 @@ impl ServerAgenticLoopHost {
                 &system_msgs,
                 &annotated_tools,
                 &annotated_messages,
-                &system_prompt_breakdown,
+                &mock_pipeline.breakdown,
             );
             if let Ok(mut guard) = cap.lock() {
                 guard.push(captured);
@@ -1192,8 +1193,8 @@ impl ServerAgenticLoopHost {
             if error.kind == astra_core::ErrorKind::ContextWindow {
                 let accum = ChatTurnSseAccum {
                     error_message: Some(error.message.clone()),
-                    system_prompt_tokens: Some(system_prompt_breakdown.total_tokens),
-                    system_prompt_breakdown: serde_json::to_value(&system_prompt_breakdown).ok(),
+                    system_prompt_tokens: Some(mock_pipeline.breakdown.total_tokens),
+                    system_prompt_breakdown: serde_json::to_value(&mock_pipeline.breakdown).ok(),
                     ..Default::default()
                 };
                 return Ok(HostTurnResult {
@@ -1301,8 +1302,8 @@ impl ServerAgenticLoopHost {
             cache_read_tokens: u.cached_input_tokens,
             cache_creation_tokens: u.cache_creation_tokens,
             has_usage: true,
-            system_prompt_tokens: Some(system_prompt_breakdown.total_tokens),
-            system_prompt_breakdown: serde_json::to_value(&system_prompt_breakdown).ok(),
+            system_prompt_tokens: Some(mock_pipeline.breakdown.total_tokens),
+            system_prompt_breakdown: serde_json::to_value(&mock_pipeline.breakdown).ok(),
             ..Default::default()
         };
 

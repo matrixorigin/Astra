@@ -3483,6 +3483,7 @@ mod tests {
     };
     use astra_turn_core::turn_guard::TurnGuard;
     use async_trait::async_trait;
+    use http_body_util::BodyExt;
     use std::sync::Mutex;
 
     /// RAII guard that restores an environment variable on drop (panic-safe).
