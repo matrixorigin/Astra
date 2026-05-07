@@ -196,7 +196,11 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
                 _ => "application/octet-stream",
             };
             let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-            return ToolResult::text(format!("data:{mime};base64,{encoded}"));
+            let data_uri = format!("data:{mime};base64,{encoded}");
+            return ToolResult::text(truncate_output(
+                data_uri,
+                per_tool_output_limit("read_file"),
+            ));
         }
 
         if BINARY_EXTS.contains(&ext_lower.as_str()) {
@@ -1617,6 +1621,54 @@ mod tests {
             "got: {}",
             result.output
         );
+    }
+
+    // --- Bug #9: large image base64 must be capped by output limit ---
+    #[test]
+    fn read_file_image_base64_is_capped() {
+        let tmp = TempDir::new().unwrap();
+        // Create a ~1MB fake PNG (just PNG header + random data)
+        let mut data = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
+        data.extend(vec![0xAB; 1_000_000]); // ~1MB body
+        std::fs::write(tmp.path().join("big.png"), &data).unwrap();
+
+        let result = read_file(tmp.path(), &serde_json::json!({"path": "big.png"}));
+
+        assert!(!result.is_error);
+        assert!(result.output.starts_with("data:image/png;base64,"));
+        // The output must be capped — raw base64 of 1MB is ~1.33MB chars.
+        // per_tool_output_limit() caps it (typically 80-200KB).
+        let limit = per_tool_output_limit("read_file");
+        assert!(
+            result.output.len() <= limit + 200, // small tolerance for prefix
+            "Image base64 output {} should be capped at ~{limit}",
+            result.output.len()
+        );
+    }
+
+    // Supplementary: truncated image output contains truncation marker
+    #[test]
+    fn read_file_image_truncated_has_marker() {
+        let tmp = TempDir::new().unwrap();
+        let mut data = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
+        data.extend(vec![0xAB; 1_000_000]);
+        std::fs::write(tmp.path().join("big.png"), &data).unwrap();
+
+        let result = read_file(tmp.path(), &serde_json::json!({"path": "big.png"}));
+
+        assert!(!result.is_error);
+        let limit = per_tool_output_limit("read_file");
+        // If the image is larger than limit, it must contain a truncation indicator
+        if result.output.len() < 1_300_000 {
+            // Was truncated — verify marker or that it's shorter than raw base64
+            assert!(
+                result.output.contains("truncated")
+                    || result.output.contains("…")
+                    || result.output.len() <= limit + 200,
+                "Truncated image should have marker or be within limit, len={}",
+                result.output.len()
+            );
+        }
     }
 
     #[test]

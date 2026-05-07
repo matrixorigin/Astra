@@ -703,6 +703,11 @@ pub fn git_show(
         None => return "Error: missing 'commit' (SHA, branch, or tag)".to_string(),
     };
 
+    // Reject range syntax — git_show is for a single commit, suggest git diff
+    if commit_ref.contains("..") {
+        return "Error: git show expects a single commit reference, not a range. Use git diff for 'A..B' ranges.".to_string();
+    }
+
     // Allow valid git ref characters including reflog (@{}) and tree-object (:)
     if commit_ref.contains(|c: char| {
         !c.is_alphanumeric()
@@ -1185,6 +1190,16 @@ pub fn git_diff(
     if let Some(ref_str) = git_ref {
         // Handle "A..B" range syntax (e.g. "HEAD~8..HEAD") via CLI
         if ref_str.contains("..") {
+            // Validate each part of the range against shell injection
+            let separator = if ref_str.contains("...") { "..." } else { ".." };
+            if let Some((base, tip)) = ref_str.split_once(separator) {
+                if let Err(e) = reject_shell_meta(base) {
+                    return format!("Error: invalid base ref in range: {e}");
+                }
+                if let Err(e) = reject_shell_meta(tip) {
+                    return format!("Error: invalid tip ref in range: {e}");
+                }
+            }
             let mut cli_args = vec!["diff", ref_str, "--no-ext-diff", "--no-color"];
             if let Some(p) = path_filter {
                 cli_args.push("--");
@@ -2862,6 +2877,73 @@ mod tests {
         assert!(
             result.contains("disallowed"),
             "shell meta in base_ref should be rejected: {result}"
+        );
+    }
+
+    // --- Bug #3: git_show should reject range syntax with helpful message ---
+    #[test]
+    fn git_show_rejects_range_syntax() {
+        let dir = init_temp_repo();
+        // Create a second commit so HEAD~1 exists
+        std::fs::write(dir.path().join("second.txt"), "2").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "second"]);
+
+        let result = git_show(dir.path(), &json!({"ref": "HEAD~1..HEAD"}), 0.0, 0);
+        assert!(
+            result.contains("single commit") || result.contains("git diff"),
+            "Should suggest using git diff for ranges, got: {result}"
+        );
+    }
+
+    // --- Bug #5: git_diff .. branch must validate with reject_shell_meta ---
+    #[test]
+    fn git_diff_range_rejects_shell_meta() {
+        let dir = init_temp_repo();
+
+        let result = git_diff(dir.path(), &json!({"ref": "HEAD;echo pwned..HEAD"}), 0.0, 0);
+        assert!(
+            result.contains("Error") || result.contains("invalid"),
+            "Should reject shell meta in range ref, got: {result}"
+        );
+
+        let result2 = git_diff(dir.path(), &json!({"ref": "$(whoami)..HEAD"}), 0.0, 0);
+        assert!(
+            result2.contains("Error") || result2.contains("invalid"),
+            "Should reject shell meta in range ref, got: {result2}"
+        );
+    }
+
+    // Supplementary: tip contains shell meta (not just base)
+    #[test]
+    fn git_diff_range_rejects_shell_meta_in_tip() {
+        let dir = init_temp_repo();
+
+        let result = git_diff(dir.path(), &json!({"ref": "HEAD..$(whoami)"}), 0.0, 0);
+        assert!(
+            result.contains("Error") || result.contains("invalid"),
+            "Should reject shell meta in tip, got: {result}"
+        );
+
+        let result2 = git_diff(dir.path(), &json!({"ref": "HEAD..HEAD|cat"}), 0.0, 0);
+        assert!(
+            result2.contains("Error") || result2.contains("invalid"),
+            "Should reject shell meta in tip, got: {result2}"
+        );
+    }
+
+    // Supplementary: triple-dot range works
+    #[test]
+    fn git_diff_triple_dot_range_works() {
+        let dir = init_temp_repo();
+        std::fs::write(dir.path().join("b.txt"), "new content").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "second commit"]);
+
+        let result = git_diff(dir.path(), &json!({"ref": "HEAD~1...HEAD"}), 0.0, 0);
+        assert!(
+            !result.contains("Error") && !result.contains("cannot resolve"),
+            "Triple-dot range should work, got: {result}"
         );
     }
 
