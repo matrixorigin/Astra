@@ -1183,6 +1183,16 @@ pub fn git_diff(
 
     // If a ref is given, do a tree-to-tree diff (HEAD vs ref)
     if let Some(ref_str) = git_ref {
+        // Handle "A..B" range syntax (e.g. "HEAD~8..HEAD") via CLI
+        if ref_str.contains("..") {
+            let mut cli_args = vec!["diff", ref_str, "--no-ext-diff", "--no-color"];
+            if let Some(p) = path_filter {
+                cli_args.push("--");
+                cli_args.push(p);
+            }
+            return diff_via_git_cli(project_root, &cli_args, limit)
+                .unwrap_or_else(|| "No changes".to_string());
+        }
         // With path filter, use CLI for tree-to-tree as well
         if let Some(p) = path_filter
             && let Some(result) = diff_via_git_cli(
@@ -2737,6 +2747,22 @@ mod tests {
                 || result.contains("No changes")
                 || result.contains("Error: cannot resolve"),
             "ref diff should produce diff output or error: {result}"
+        );
+    }
+
+    #[test]
+    fn git_diff_ref_range_with_dotdot() {
+        let root = repo_root();
+        // "HEAD~2..HEAD" range syntax in ref param must not error
+        let result = git_diff(&root, &json!({"ref": "HEAD~2..HEAD"}), 0.0, 0);
+        assert!(
+            !result.starts_with("Error:"),
+            "ref with range A..B should not error: {result}"
+        );
+        // Should produce diff output or "No changes"
+        assert!(
+            result.contains("diff --git") || result.contains("No changes"),
+            "ref range should produce diff output: {result}"
         );
     }
 

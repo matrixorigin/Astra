@@ -746,6 +746,49 @@ mod tests {
         assert!(server_out.last().unwrap().get("role").is_some());
     }
 
+    /// Regression lock: for prefix-only providers, volatile content MUST NOT
+    /// appear in the system message. If it does, prefix cache hit rates drop
+    /// from ~80% to ~20% because byte-level prefix matching breaks at the
+    /// first volatile byte. This test catches any future refactor that
+    /// accidentally routes volatile content back into the system message.
+    #[test]
+    fn prefix_provider_system_message_contains_no_volatile_content() {
+        let stable_sys = vec![json!({"role": "system", "content": "stable core rules only"})];
+        let volatile_preamble = vec![
+            json!({"role": "user", "content": "<system-reminder>\nTurn: 5 | Tokens: 12000\n</system-reminder>"}),
+            json!({"role": "assistant", "content": "Understood."}),
+        ];
+        let history = vec![json!({"role": "user", "content": "hello"})];
+
+        let msgs = assemble_llm_messages(
+            stable_sys,
+            volatile_preamble,
+            history,
+            &PostCompactAttachments::default(),
+            "sid",
+            "deepseek",
+            "deepseek-v4-pro",
+            &cache_cfg(),
+        );
+
+        // System message must be purely stable — no turn counters, no tokens,
+        // no per-turn signals.
+        let sys_content = msgs[0]["content"].as_str().unwrap();
+        assert_eq!(sys_content, "stable core rules only");
+        assert!(
+            !sys_content.contains("Turn:"),
+            "system message must not contain volatile turn counter"
+        );
+        assert!(
+            !sys_content.contains("Tokens:"),
+            "system message must not contain volatile token stats"
+        );
+
+        // Volatile content must be in the preamble (position 1-2), not system.
+        assert_eq!(msgs[1]["role"], "user");
+        assert!(msgs[1]["content"].as_str().unwrap().contains("Turn: 5"));
+    }
+
     #[test]
     fn volatile_preamble_inserted_between_system_and_compacted() {
         let system = vec![json!({"role": "system", "content": "sys"})];

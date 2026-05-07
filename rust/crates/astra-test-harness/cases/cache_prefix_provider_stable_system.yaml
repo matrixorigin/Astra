@@ -1,0 +1,35 @@
+name: cache_prefix_provider_stable_system
+description: |
+  **What**: 4-turn session verifying that prefix-only providers (DeepSeek, GLM,
+  Qwen) achieve high cache hit rates because the system message is 100% stable.
+  **Tests**: Volatile content (self_awareness, session_anchor, tool_guidance)
+  is NOT in the system message — it's in a user/assistant preamble pair.
+  **Why**: Commit b70ced03 moved volatile content out of system message for
+  prefix providers. If someone reverts this or leaks volatile content back,
+  cache hits drop from ~10K+ to ~2.4K.
+  **Pass means**: cache_read >= 8000 (system prompt ~7K + tool schemas cached).
+  Previously this was ~2400 when volatile content broke the prefix.
+  **Fail means**: volatile content leaked back into system message, breaking
+  prefix cache. Investigate `context_assembly_trace.system_prompt.environment_tokens`
+  — if it changes between turns, something volatile is in the system message.
+prompt: |
+  Reply with the single word ACK. Do not call any tools.
+models:
+  - deepseek-v4-pro
+capability: custom:cache
+difficulty: 2
+weight: 1.0
+timeout_seconds: 60
+steps:
+  - prompt: 'Reply with the single word ACK. Do not call any tools.'
+  - prompt: 'Reply with the single word ACK. Do not call any tools.'
+  - prompt: 'Reply with the single word ACK. Do not call any tools.'
+criteria:
+  - type: exit_code
+    code: 0
+  - type: all_of
+    criteria:
+      - type: prompt_cache_tokens
+        min_read: 8000
+        min_creation: 0
+        max_creation: 25000
