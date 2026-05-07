@@ -68,6 +68,25 @@ use astra_turn_core::tool_schema_prune::prune_tool_schemas;
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 const ROOT_TURN_JOURNAL_HEADER: &str = "x-mo-root-turn-journal";
 
+/// Decide whether the bridge should run its own `prefetch_memories` call.
+///
+/// Returns `false` (= skip) when the CLI has already injected
+/// `memoria_insights_text`. Both the CLI's `memory_boost_search` +
+/// `render_digest` path and the bridge's `prefetch_memories` + `bind_memory`
+/// path hit the same Memoria backend with overlapping queries and `top_k=5`.
+/// Running both produces two differently-formatted memory sections
+/// (`## Memoria Recall` + `## User Memories`) whose contents substantially
+/// overlap — observed +~700 tok of duplicate content per turn in production
+/// sessions. The CLI digest is authoritative; when present, the bridge
+/// path is redundant.
+pub(crate) fn bridge_should_run_memoria_prefetch(edge_profile: &Map<String, Value>) -> bool {
+    let cli_has_insights = edge_profile
+        .get("memoria_insights_text")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    !cli_has_insights
+}
+
 fn self_awareness_volatile_section(text: &str) -> Option<prompts::PromptSection> {
     (!text.is_empty()).then(|| {
         prompts::PromptSection::dynamic(text.to_string(), prompts::PromptTokenBucket::Environment)
@@ -1138,8 +1157,19 @@ impl InProcessChatTurnBridge {
 
             // Memoria prefetch lives on its own. `section` is the
             // "## User Memories\n..." block — the piece that actually drifts.
+            //
+            // Skip when the CLI has already injected `memoria_insights_text`
+            // (rendered as `## Memoria Recall` via the bridge's volatile
+            // lane). Both paths query the same Memoria backend with
+            // overlapping queries + top_k=5; running both duplicates
+            // ~700 tokens of memory content per turn into two
+            // differently-formatted sections (`## Memoria Recall` +
+            // `## User Memories`). When present, the CLI digest is
+            // authoritative. See `bridge_should_run_memoria_prefetch`.
             let mut memoria_prefetch_entries = Vec::new();
-            let memoria_prefetch_section = if let (Some(mem_url), Some(mem_key)) = (
+            let memoria_prefetch_section = if !bridge_should_run_memoria_prefetch(&edge_profile) {
+                None
+            } else if let (Some(mem_url), Some(mem_key)) = (
                 edge_profile.get("memoria_url").and_then(Value::as_str),
                 edge_profile.get("memoria_key").and_then(Value::as_str),
             ) {
@@ -6187,5 +6217,62 @@ mod tests {
                 "{context} should persist a remote llm_capture artifact for mid-stream failures"
             );
         }
+    }
+
+    // ── bridge_should_run_memoria_prefetch gate ────────────────────────
+
+    #[test]
+    fn prefetch_gate_runs_when_cli_insights_absent() {
+        let ep: Map<String, Value> = Map::new();
+        assert!(
+            bridge_should_run_memoria_prefetch(&ep),
+            "empty edge_profile = CLI didn't run memory_boost_search; bridge must fetch"
+        );
+    }
+
+    #[test]
+    fn prefetch_gate_runs_when_cli_insights_empty_string() {
+        let mut ep: Map<String, Value> = Map::new();
+        ep.insert(
+            "memoria_insights_text".to_string(),
+            Value::String(String::new()),
+        );
+        assert!(
+            bridge_should_run_memoria_prefetch(&ep),
+            "empty string insights should not count as CLI-produced content"
+        );
+    }
+
+    #[test]
+    fn prefetch_gate_skips_when_cli_insights_present() {
+        // Regression: bridge used to double-fetch Memoria even when CLI
+        // already rendered `## Memoria Recall`, producing ~700 tokens of
+        // duplicate memory content as a second `## User Memories` block.
+        let mut ep: Map<String, Value> = Map::new();
+        ep.insert(
+            "memoria_insights_text".to_string(),
+            Value::String(
+                "## Memoria Recall\n- User prefers Rust for CLI work.".to_string(),
+            ),
+        );
+        assert!(
+            !bridge_should_run_memoria_prefetch(&ep),
+            "CLI-rendered digest already covers the memory retrieval — skip bridge prefetch"
+        );
+    }
+
+    #[test]
+    fn prefetch_gate_runs_when_insights_key_not_a_string() {
+        // Defensive: if edge_profile carries malformed insights (non-string),
+        // fall back to running the bridge fetch rather than silently
+        // producing an empty memory section.
+        let mut ep: Map<String, Value> = Map::new();
+        ep.insert("memoria_insights_text".to_string(), Value::Null);
+        assert!(bridge_should_run_memoria_prefetch(&ep));
+        ep.insert(
+            "memoria_insights_text".to_string(),
+            Value::Number(42.into()),
+        );
+        assert!(bridge_should_run_memoria_prefetch(&ep));
     }
 }
