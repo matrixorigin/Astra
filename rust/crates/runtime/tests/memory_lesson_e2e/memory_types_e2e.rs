@@ -173,14 +173,16 @@ fn extraction_to_batch_payload_full_pipeline() {
 
 // ── 4. System prompt type taxonomy contract ──────────────────────────────
 
+// The memory taxonomy / memory-rules block used to be inlined into the
+// system prompt by `tool_conditional_section`; commit a1187f76 emptied
+// that emitter (tool descriptions already carry per-tool guidance) so
+// these tests now pin `memory_types::build_memory_prompt` directly,
+// which remains the single source of truth for the block and is still
+// reachable by any caller that wants to inject the taxonomy explicitly.
+
 #[test]
-fn system_prompt_full_mode_exercises_all_business_types() {
-    let prompt = astra_runtime::prompts::build_main_system_prompt(
-        &["memory_store", "memory_retrieve", "memory_correct"],
-        "",
-        1.0,
-        None,
-    );
+fn full_mode_prompt_exercises_all_business_types() {
+    let prompt = memory_types::build_memory_prompt(MemoryPromptMode::Full);
 
     // All 4 user-facing types present in taxonomy
     assert!(prompt.contains("<name>user</name>"));
@@ -208,8 +210,8 @@ fn system_prompt_full_mode_exercises_all_business_types() {
 }
 
 #[test]
-fn system_prompt_minimal_mode_omits_taxonomy() {
-    let prompt = astra_runtime::prompts::build_main_system_prompt(&["memory_store"], "", 1.0, None);
+fn minimal_mode_prompt_omits_taxonomy() {
+    let prompt = memory_types::build_memory_prompt(MemoryPromptMode::Minimal);
 
     assert!(prompt.contains("Memory Rules"));
     assert!(!prompt.contains("<types>"));
@@ -217,12 +219,9 @@ fn system_prompt_minimal_mode_omits_taxonomy() {
 }
 
 #[test]
-fn system_prompt_no_memory_tools_omits_everything() {
-    let prompt =
-        astra_runtime::prompts::build_main_system_prompt(&["bash", "read_file"], "", 1.0, None);
-
-    assert!(!prompt.contains("Memory Rules"));
-    assert!(!prompt.contains("<types>"));
+fn none_mode_prompt_is_empty() {
+    let prompt = memory_types::build_memory_prompt(MemoryPromptMode::None);
+    assert!(prompt.is_empty());
 }
 
 // ── 5. Quality gate integration ──────────────────────────────────────────
@@ -287,18 +286,6 @@ fn system_prompt_without_lessons_has_no_lessons_header() {
         !prompt.contains("📚 Lessons"),
         "prompt without lesson injection should not render Lessons header"
     );
-}
-
-#[test]
-fn system_prompt_with_mixed_tools_includes_memory() {
-    let prompt = astra_runtime::prompts::build_main_system_prompt(
-        &["bash", "read_file", "memory_store", "memory_retrieve"],
-        "",
-        1.0,
-        None,
-    );
-    assert!(prompt.contains("Memory Rules"));
-    assert!(prompt.contains("<types>"));
 }
 
 #[test]
