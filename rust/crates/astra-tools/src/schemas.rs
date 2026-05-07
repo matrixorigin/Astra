@@ -122,7 +122,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a shell command in the project root. Use for builds, tests, installs, and other CLI tasks. Avoid bash for operations with dedicated tools: read files → read_file (NOT cat/head/tail), search content → grep (NOT bash grep/rg), find files → glob (NOT bash find), list dirs → list_dir (NOT ls), edit files → str_replace (NOT sed/awk). FORBIDDEN for git inspection — NEVER use bash for `git status`, `git diff`, `git log`, `git show`, or similar git commands. Use git tool instead. Non-read-only bash does not participate in rollback journals; inside rollback-on-failure boundaries such as plan subtasks, run_chain, or explicit rollback-on-failure batch transactions, keep bash read-only and prefer structured tools such as write_file, git, or run_build_test. Can run curl, GitHub API, etc. Timeout varies (5-30s); override with timeout. On timeout or cancellation, returns any partial captured output plus a boundary note. Non-zero exits are returned as tool errors with stderr and exit code.",
+                "description": "Execute a shell command in the project root. For builds, tests, installs, and CLI tasks. Use dedicated tools for: file reading (read_file), search (grep), file finding (glob), editing (str_replace), git operations (git).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -137,16 +137,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents with optional line range. Verify uncertain paths with list_dir/glob first. Large files (>80KB) require start_line/end_line or outline=true for signatures only. Output includes line numbers; pass content without line numbers to str_replace. Common images return a data URI; binary files are refused.",
+                "description": "Read file contents. Use start_line/end_line for large files. Set outline=true for function/class signatures only.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "start_line": {"type": "integer", "minimum": 1, "description": "First line to read (1-based, optional)"},
-                        "end_line": {"type": "integer", "minimum": 1, "description": "Last line to read (inclusive, optional)"},
-                        "outline": {"type": "boolean", "description": "If true, return only function/class/struct/trait signatures with line numbers instead of full content. Ideal for understanding file structure."},
-                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
-                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
+                        "start_line": {"type": "integer", "minimum": 1, "description": "First line to read (1-based)"},
+                        "end_line": {"type": "integer", "minimum": 1, "description": "Last line to read (inclusive)"},
+                        "outline": {"type": "boolean", "description": "Return only function/class/struct signatures with line numbers"}
                     },
                     "required": ["path"]
                 }
@@ -156,15 +154,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create or overwrite a file. Use str_replace to edit existing files. Set delete=true to delete the file instead of writing.",
+                "description": "Create or overwrite a file. Set delete=true to delete instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
                         "content": {"type": "string", "description": "File content (not required when delete=true)"},
-                        "delete": {"type": "boolean", "description": "If true, delete the file at path instead of writing. Refuses to delete directories, .git/ contents, or paths outside the project root."},
-                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
-                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
+                        "delete": {"type": "boolean", "description": "If true, delete the file instead of writing"}
                     },
                     "required": ["path"]
                 }
@@ -174,7 +170,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "str_replace",
-                "description": "Replace a string in a file. Tries an exact match first, then a unique quote/whitespace-aware fuzzy match when old_str differs slightly. On mismatch, shows closest matches with line numbers so you can fix and retry. Set dry_run=true to preview the diff without applying. For multiple edits to the same file, use 'edits' array instead of old_str/new_str — all edits apply atomically (all-or-nothing).",
+                "description": "Replace text in a file. Exact match with fuzzy fallback. Use edits array for batch replacements.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -183,20 +179,18 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "new_str": {"type": "string", "description": "Replacement string (single-edit mode)"},
                         "edits": {
                             "type": "array",
-                            "description": "Array of {old_str, new_str} pairs to apply atomically in order. If any fails, none are applied. More token-efficient than sequential calls. Mutually exclusive with old_str/new_str.",
+                            "description": "Array of {old_str, new_str} pairs applied atomically. Mutually exclusive with old_str/new_str.",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "old_str": {"type": "string", "description": "Exact string to replace"},
-                                    "new_str": {"type": "string", "description": "Replacement string"}
+                                    "old_str": {"type": "string"},
+                                    "new_str": {"type": "string"}
                                 },
                                 "required": ["old_str", "new_str"]
                             }
                         },
-                        "dry_run": {"type": "boolean", "description": "If true, show unified diff without applying changes (default: false)"},
-                        "replace_all": {"type": "boolean", "description": "If true, replace ALL occurrences of old_str (default: false, requires unique match)"},
-                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
-                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
+                        "dry_run": {"type": "boolean", "description": "Preview diff without applying (default: false)"},
+                        "replace_all": {"type": "boolean", "description": "Replace ALL occurrences (default: false)"}
                     },
                     "required": ["path"]
                 }
@@ -221,28 +215,17 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search for a pattern in files. Returns matching lines with file:line context (output truncated to ~10KB, 100 lines max by default). Supports content/files_with_matches/count modes, pagination via offset, optional scope_context annotations, and respects .gitignore/.astraignore when present. For large codebases, narrow path or pattern for complete results.",
+                "description": "Search for a regex pattern in files. Returns matching lines with file:line format. Respects .gitignore.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "pattern": {"type": "string", "description": "Regex pattern to search for"},
                         "path": {"type": "string", "description": "Directory or file to search (default: project root)"},
                         "include": {"type": "string", "description": "File glob filter e.g. '*.rs'"},
-                        "glob": {"type": "string", "description": "Alias of include using ripgrep-style glob syntax, e.g. '**/*.rs'"},
-                        "type": {"type": "string", "description": "Common file type filter, e.g. rust, python, typescript, tsx, javascript, jsx, go, java, c, cpp, ruby, shell, json, yaml, toml, markdown"},
                         "case_sensitive": {"type": "boolean", "description": "Case sensitive (default false)"},
-                        "fixed_strings": {"type": "boolean", "description": "Treat pattern as a literal string instead of a regex (like grep -F / rg -F)."},
-                        "word_match": {"type": "boolean", "description": "Require whole-word matches only (like grep -w / rg -w)."},
-                        "context_lines": {"type": "integer", "description": "Lines of context before and after each match (like grep -C)"},
-                        "before_context_lines": {"type": "integer", "description": "Lines of context before each match (like grep -B). Overrides the 'before' side of context_lines when provided."},
-                        "after_context_lines": {"type": "integer", "description": "Lines of context after each match (like grep -A). Overrides the 'after' side of context_lines when provided."},
-                        "max_matches": {"type": "integer", "description": "Max matches per file (limits output, saves tokens)"},
-                        "multiline": {"type": "boolean", "description": "Allow regex matches to span newlines within a file. Useful for block patterns and multi-line structures."},
-                        "scope_context": {"type": "boolean", "description": "Annotate each match with its containing function/class name (tree-sitter)"},
-                        "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Output mode: 'content' (default, matching lines), 'files_with_matches' (file paths only), 'count' (match counts per file)"},
-                        "sort_by": {"type": "string", "enum": ["mtime", "path"], "description": "Sort matching files by newest modified time first (default 'mtime') or alphabetically by path."},
-                        "offset": {"type": "integer", "minimum": 0, "description": "Skip first N result lines (for pagination)"},
-                        "head_limit": {"type": "integer", "minimum": 0, "description": "Max result lines to return after offset. Defaults to 100; set 0 for unlimited."}
+                        "fixed_strings": {"type": "boolean", "description": "Treat pattern as literal string (like grep -F)"},
+                        "max_matches": {"type": "integer", "description": "Max matches per file"},
+                        "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Output: content (default), files_with_matches, or count"}
                     },
                     "required": ["pattern"]
                 }
@@ -335,7 +318,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "lsp",
-                "description": "Language Server Protocol operations. Requires a running LSP server for the target language. Operations: goto_definition, find_references, rename (symbol across files), hover (type info), call_hierarchy/incoming_calls/outgoing_calls, supertypes/subtypes (type hierarchy), implementation, declaration, type_definition, document_symbols, workspace_symbols, code_actions (quick fixes, refactors), completions, signature_help, diagnostics, format_document/format_range/format_on_type, code_lenses, prepare_rename, document_highlight, document_links, inlay_hints, folding_ranges, semantic_tokens, selection_ranges, linked_editing_range, document_colors/color_presentations. Use action_index for code_actions apply, item_index for completions/code_lenses resolve/execute, dry_run=false to apply writes. Without a file, diagnostics reports backend availability.",
+                "description": "Language Server Protocol operations. Set dry_run=false to apply writes (rename, format, code_action).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -350,23 +333,20 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "document_colors","color_presentations","semantic_tokens","code_lenses",
                                 "selection_ranges","linked_editing_range",
                                 "format_document","format_range","format_on_type","diagnostics"
-                            ],
-                            "description": "LSP operation to perform"
+                            ]
                         },
-                        "file": {"type": "string", "description": "File path (required for most operations)"},
-                        "line": {"type": "integer", "description": "1-based line number (position-based ops)"},
-                        "column": {"type": "integer", "description": "1-based column (position-based ops)"},
-                        "end_line": {"type": "integer", "description": "End line (range ops like format_range)"},
+                        "file": {"type": "string", "description": "File path"},
+                        "line": {"type": "integer", "description": "1-based line number"},
+                        "column": {"type": "integer", "description": "1-based column"},
+                        "end_line": {"type": "integer", "description": "End line (range ops)"},
                         "end_column": {"type": "integer", "description": "End column (range ops)"},
-                        "trigger_character": {"type": "string", "description": "Trigger char (format_on_type)"},
                         "symbol": {"type": "string", "description": "Symbol name (alternative to line/column)"},
-                        "query": {"type": "string", "description": "Query for workspace_symbols"},
-                        "new_name": {"type": "string", "description": "New name for rename"},
-                        "dry_run": {"type": "boolean", "description": "Preview mode (default true). Set false to apply rename/format/code_action/completion/code_lens."},
-                        "action_index": {"type": "integer", "minimum": 0, "description": "Code action index to apply (default 0)"},
-                        "item_index": {"type": "integer", "minimum": 0, "description": "Item index for completions/code_lenses resolve or execute"},
-                        "scope": {"type": "string", "enum": ["file", "project"], "description": "Operation scope (default: file)"},
-                        "include_body": {"type": "boolean", "description": "Include function bodies (default false)"}
+                        "query": {"type": "string", "description": "Query (workspace_symbols)"},
+                        "new_name": {"type": "string", "description": "New name (rename)"},
+                        "dry_run": {"type": "boolean", "description": "Preview mode (default true)"},
+                        "action_index": {"type": "integer", "minimum": 0, "description": "Code action index (default 0)"},
+                        "item_index": {"type": "integer", "minimum": 0, "description": "Item index (completions/code_lenses)"},
+                        "scope": {"type": "string", "enum": ["file", "project"]}
                     },
                     "required": ["operation"]
                 }
@@ -430,26 +410,26 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session state and lifecycle operations. Actions: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, tool_search.",
+                "description": "Session lifecycle. Actions: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, tool_search.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","rollback_edits","ask_user","sleep","tool_search"], "description": "Session operation"},
-                        "key": {"type": "string", "description": "Config key (for config)"},
+                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","rollback_edits","ask_user","sleep","tool_search"]},
+                        "key": {"type": "string", "description": "Config key"},
                         "value": {"type": "string", "description": "Config value"},
-                        "tool": {"type": "string", "description": "Tool name (for prioritize/deprioritize)"},
-                        "goal": {"type": "string", "description": "Goal text (for set_goal)"},
-                        "scope": {"type": "string", "enum": ["current_turn","turn","file","list"], "description": "Rollback scope (for rollback_edits)"},
-                        "path": {"type": "string", "description": "File path (for rollback_edits scope=file)"},
-                        "turn_index": {"type": "integer", "description": "Turn index (for rollback_edits scope=turn)"},
-                        "question": {"type": "string", "description": "Question text (for ask_user)"},
-                        "choices": {"type": "array", "items": {"type": "string"}, "description": "Multiple choice options 2-9 (for ask_user)"},
-                        "default": {"type": "string", "description": "Default answer (for ask_user)"},
-                        "context": {"type": "string", "description": "Brief context (for ask_user)"},
-                        "duration_ms": {"type": "integer", "description": "Sleep duration in ms, max 300000 (for sleep)"},
-                        "reason": {"type": "string", "description": "Reason for sleeping (for sleep)"},
-                        "query": {"type": "string", "description": "Search query (for tool_search)"},
-                        "max_results": {"type": "integer", "description": "Max results (for tool_search, default 5)"}
+                        "tool": {"type": "string", "description": "Tool name (prioritize/deprioritize)"},
+                        "goal": {"type": "string", "description": "Goal text"},
+                        "scope": {"type": "string", "enum": ["current_turn","turn","file","list"], "description": "Rollback scope"},
+                        "path": {"type": "string", "description": "File path (rollback scope=file)"},
+                        "turn_index": {"type": "integer", "description": "Turn index (rollback scope=turn)"},
+                        "question": {"type": "string", "description": "Question (ask_user)"},
+                        "choices": {"type": "array", "items": {"type": "string"}, "description": "Choices 2-9 (ask_user)"},
+                        "default": {"type": "string", "description": "Default answer (ask_user)"},
+                        "context": {"type": "string", "description": "Brief context (ask_user)"},
+                        "duration_ms": {"type": "integer", "description": "Sleep ms, max 300000"},
+                        "reason": {"type": "string", "description": "Reason (sleep)"},
+                        "query": {"type": "string", "description": "Query (tool_search)"},
+                        "max_results": {"type": "integer", "description": "Max results (tool_search, default 5)"}
                     },
                     "required": ["action"]
                 }
@@ -479,27 +459,23 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["delegate","run_chain","spawn","get_result","send_message"], "description": "Agent operation"},
-                        "task": {"type": "string", "description": "Task description (for delegate)"},
-                        "steps": {"type": "array", "description": "Chain steps (for run_chain)"},
-                        "description": {"type": "string", "description": "Short task description (for spawn)"},
-                        "prompt": {"type": "string", "description": "Detailed task prompt (for spawn)"},
-                        "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Agent type (for spawn)"},
-                        "model": {"type": "string", "description": "Optional model override (for spawn)"},
-                        "background": {"type": "boolean", "description": "Return immediately with agent_id (for spawn, default false)"},
-                        "name": {"type": "string", "description": "Addressable name for messaging (for spawn)"},
-                        "max_turns": {"type": "integer", "description": "Max turns (for spawn)"},
-                        "isolated": {"type": "boolean", "description": "Use isolated git worktree (for spawn)"},
-                        "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (for spawn)"},
-                        "max_output_tokens": {"type": "integer", "description": "Max output tokens (for spawn)"},
-                        "inherit_prefix": {"type": "object", "description": "Inherit parent prompt-cache prefix (for spawn)"},
-                        "agent_id": {"type": "string", "description": "Agent ID (for get_result)"},
-                        "to": {"type": "string", "description": "Recipient agent_id or '*' (for send_message)"},
-                        "message": {"description": "Message content (for send_message)"},
-                        "summary": {"type": "string", "description": "Short preview of message (for send_message)"},
-                        "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"], "description": "Message type (for send_message)"},
-                        "priority": {"type": "string", "enum": ["low","normal","high"], "description": "Message priority (for send_message)"},
-                        "request_id": {"type": "string", "description": "Correlation ID (for send_message)"}
+                        "action": {"type": "string", "enum": ["delegate","run_chain","spawn","get_result","send_message"]},
+                        "task": {"type": "string", "description": "Task description (delegate)"},
+                        "steps": {"type": "array", "description": "Chain steps (run_chain)"},
+                        "description": {"type": "string", "description": "Short task description (spawn)"},
+                        "prompt": {"type": "string", "description": "Detailed prompt (spawn)"},
+                        "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"]},
+                        "model": {"type": "string", "description": "Model override (spawn)"},
+                        "background": {"type": "boolean", "description": "Return immediately with agent_id (spawn)"},
+                        "name": {"type": "string", "description": "Addressable name (spawn)"},
+                        "max_turns": {"type": "integer", "description": "Max turns (spawn)"},
+                        "isolated": {"type": "boolean", "description": "Use isolated worktree (spawn)"},
+                        "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
+                        "agent_id": {"type": "string", "description": "Agent ID (get_result)"},
+                        "to": {"type": "string", "description": "Recipient agent_id or '*' (send_message)"},
+                        "message": {"description": "Message content (send_message)"},
+                        "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
+                        "priority": {"type": "string", "enum": ["low","normal","high"]}
                     },
                     "required": ["action"]
                 }
