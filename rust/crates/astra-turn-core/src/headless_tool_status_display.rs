@@ -533,6 +533,59 @@ fn fmt_utility_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
             .get("agent_id")
             .and_then(|v| v.as_str())
             .map(|id| truncate_str(id, 50)),
+        // Consolidated agent tool
+        "agent" => {
+            let action = obj.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            match action {
+                "spawn" => {
+                    let description = obj.get("description").and_then(|v| v.as_str());
+                    let agent_type = obj.get("agent_type").and_then(|v| v.as_str());
+                    match (description, agent_type) {
+                        (Some(desc), Some(at)) => Some(format!(
+                            "spawn {} ({})",
+                            truncate_str(desc, 28),
+                            truncate_str(at, 12)
+                        )),
+                        (Some(desc), None) => Some(format!("spawn {}", truncate_str(desc, 40))),
+                        (None, Some(at)) => Some(format!("spawn ({})", truncate_str(at, 20))),
+                        _ => Some("spawn".to_string()),
+                    }
+                }
+                "get_result" => obj
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .map(|id| format!("get_result {}", truncate_str(id, 36))),
+                "send_message" => {
+                    let to = obj.get("to").and_then(|v| v.as_str());
+                    let summary = obj.get("summary").and_then(|v| v.as_str());
+                    let message = obj.get("message").and_then(|v| v.as_str());
+                    match (to, summary, message) {
+                        (Some(to), Some(summary), _) => Some(format!(
+                            "send {}: {}",
+                            truncate_str(to, 14),
+                            truncate_str(summary, 24)
+                        )),
+                        (Some(to), None, Some(message)) => Some(format!(
+                            "send {}: {}",
+                            truncate_str(to, 14),
+                            truncate_str(message, 24)
+                        )),
+                        (Some(to), None, None) => Some(format!("send {}", truncate_str(to, 36))),
+                        _ => None,
+                    }
+                }
+                "delegate" => obj
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .map(|t| format!("delegate: {}", truncate_str(t, 36))),
+                "run_chain" => obj
+                    .get("name")
+                    .or_else(|| obj.get("description"))
+                    .and_then(|v| v.as_str())
+                    .map(|n| format!("chain: {}", truncate_str(n, 36))),
+                _ => Some(action.to_string()),
+            }
+        }
         "diagnose" => {
             let category = obj.get("category").and_then(|v| v.as_str());
             let verbose = obj.get("verbose").and_then(|v| v.as_bool());

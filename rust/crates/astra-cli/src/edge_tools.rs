@@ -1368,26 +1368,65 @@ impl ToolExecutor {
                     }).to_string()
                     }
                 }
-                "run_chain" => {
-                    match serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(
-                        args.clone(),
-                    ) {
-                        Ok(chain) => {
-                            // Validate chain steps reference known tools
-                            let known: Vec<&str> = astra_runtime::tool_registry::TOOL_CATALOG
-                                .iter()
-                                .map(|t| t.name)
-                                .collect();
-                            if let Err(errors) = chain.validate(&known) {
-                                return format!("Error: Invalid chain: {}", errors.join("; "));
-                            }
-                            let input = args
-                                .get("input")
-                                .cloned()
-                                .unwrap_or_else(|| serde_json::json!({}));
-                            self.execute_chain(&chain, input).await
+                // ── Consolidated agent tool ──────────────────────────────────
+                "agent" => {
+                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    match action {
+                        "delegate" => {
+                            "Delegation request acknowledged. The delegation engine will execute \
+                             this request and provide results in the next round."
+                                .to_string()
                         }
-                        Err(e) => format!("Error: Invalid chain format: {e}"),
+                        "run_chain" => {
+                            match serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(
+                                args.clone(),
+                            ) {
+                                Ok(chain) => {
+                                    let known: Vec<&str> =
+                                        astra_runtime::tool_registry::TOOL_CATALOG
+                                            .iter()
+                                            .map(|t| t.name)
+                                            .collect();
+                                    if let Err(errors) = chain.validate(&known) {
+                                        return format!(
+                                            "Error: Invalid chain: {}",
+                                            errors.join("; ")
+                                        );
+                                    }
+                                    let input = args
+                                        .get("input")
+                                        .cloned()
+                                        .unwrap_or_else(|| serde_json::json!({}));
+                                    self.execute_chain(&chain, input).await
+                                }
+                                Err(e) => format!("Error: Invalid chain format: {e}"),
+                            }
+                        }
+                        "spawn" => {
+                            agent_spawning::handle_spawn_agent_tool(
+                                args,
+                                self.spawn_context.as_ref(),
+                            )
+                            .await
+                        }
+                        "get_result" => {
+                            agent_spawning::handle_get_agent_result_tool(
+                                args,
+                                self.spawn_context.as_ref(),
+                            )
+                            .await
+                        }
+                        "send_message" => {
+                            let ctx = self
+                                .send_message_context
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.clone());
+                            agent_messaging::handle_send_message_tool(args, ctx.as_ref()).await
+                        }
+                        _ => format!(
+                            "Error: unknown agent action '{action}'. Use one of: delegate, run_chain, spawn, get_result, send_message"
+                        ),
                     }
                 }
                 "ask_user" => self.ask_user(args),
@@ -1400,21 +1439,6 @@ impl ToolExecutor {
                 "sleep" => self.sleep_tool(args).await,
                 "tool_search" => self.tool_search(args),
                 "web_search" => self.web_search(args),
-                "send_message" => {
-                    let ctx = self
-                        .send_message_context
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.clone());
-                    agent_messaging::handle_send_message_tool(args, ctx.as_ref()).await
-                }
-                "spawn_agent" => {
-                    agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()).await
-                }
-                "get_agent_result" => {
-                    agent_spawning::handle_get_agent_result_tool(args, self.spawn_context.as_ref())
-                        .await
-                }
                 "share_context" => self.share_context(args),
                 "query_context" => self.query_context(args),
                 astra_runtime::turn::agentic_loop_host::DELEGATE_TOOL_NAME => {

@@ -37,6 +37,7 @@ fn friendly_tool_name(tool_name: &str) -> &str {
         "glob" => "Globbing",
         "ask_user" => "Asking user",
         "sleep" => "Sleeping",
+        "agent" => "Agent operation",
         "send_message" => "Sending message",
         "spawn_agent" => "Spawning agent",
         "get_agent_result" => "Getting agent result",

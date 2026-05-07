@@ -3608,6 +3608,51 @@ impl StreamRenderState {
                         let chain = args.get("chain_name").and_then(Value::as_str).unwrap_or("");
                         format!("Running chain: {}", truncate_line(chain, path_budget(15)))
                     }
+                    "spawn" => {
+                        let description = args.get("description").and_then(Value::as_str);
+                        let agent_type = args.get("agent_type").and_then(Value::as_str);
+                        match (description, agent_type) {
+                            (Some(desc), Some(at)) => format!(
+                                "Spawn agent: {} ({})",
+                                truncate_line(desc, path_budget(13)),
+                                truncate_line(at, path_budget(8))
+                            ),
+                            (Some(desc), None) => {
+                                format!("Spawn agent: {}", truncate_line(desc, path_budget(13)))
+                            }
+                            (None, Some(at)) => {
+                                format!("Spawn agent: {}", truncate_line(at, path_budget(13)))
+                            }
+                            _ => "Spawn agent".to_string(),
+                        }
+                    }
+                    "get_result" => {
+                        let agent_id = args.get("agent_id").and_then(Value::as_str).unwrap_or("");
+                        format!(
+                            "Get agent result: {}",
+                            truncate_line(agent_id, path_budget(19))
+                        )
+                    }
+                    "send_message" => {
+                        let to = args.get("to").and_then(Value::as_str).unwrap_or("");
+                        let summary = args.get("summary").and_then(Value::as_str);
+                        let message = args.get("message").and_then(Value::as_str);
+                        match (summary, message) {
+                            (Some(s), _) => format!(
+                                "Send message: {}: {}",
+                                truncate_line(to, path_budget(12)),
+                                truncate_line(s, path_budget(16))
+                            ),
+                            (None, Some(m)) => format!(
+                                "Send message: {}: {}",
+                                truncate_line(to, path_budget(12)),
+                                truncate_line(m, path_budget(16))
+                            ),
+                            (None, None) => {
+                                format!("Send message: {}", truncate_line(to, path_budget(14)))
+                            }
+                        }
+                    }
                     _ => format!("Agent: {action}"),
                 }
             }
@@ -3975,20 +4020,6 @@ impl StreamRenderState {
                     _ => "Context analysis".to_string(),
                 }
             }
-            "run_chain" => {
-                let name = args.get("name").and_then(Value::as_str);
-                let description = args.get("description").and_then(Value::as_str);
-                match (name, description) {
-                    (Some(name), _) => {
-                        format!("Running chain: {}", truncate_line(name, path_budget(15)))
-                    }
-                    (None, Some(description)) => format!(
-                        "Running chain: {}",
-                        truncate_line(description, path_budget(15))
-                    ),
-                    (None, None) => "Running chain".to_string(),
-                }
-            }
             "rollback_file_edits" => {
                 let scope = args.get("scope").and_then(Value::as_str);
                 let turn_index = args.get("turn_index").and_then(Value::as_i64);
@@ -4039,48 +4070,6 @@ impl StreamRenderState {
                         truncate_line(scope, path_budget(24))
                     ),
                     _ => "Rollback turn actions".to_string(),
-                }
-            }
-            "send_message" => {
-                let to = args.get("to").and_then(Value::as_str).unwrap_or("");
-                let summary = args.get("summary").and_then(Value::as_str);
-                let message = args.get("message").and_then(Value::as_str);
-                match (summary, message) {
-                    (Some(summary), _) => format!(
-                        "Send message: {}: {}",
-                        truncate_line(to, path_budget(12)),
-                        truncate_line(summary, path_budget(16))
-                    ),
-                    (None, Some(message)) => format!(
-                        "Send message: {}: {}",
-                        truncate_line(to, path_budget(12)),
-                        truncate_line(message, path_budget(16))
-                    ),
-                    (None, None) => {
-                        format!("Send message: {}", truncate_line(to, path_budget(14)))
-                    }
-                }
-            }
-            "spawn_agent" => {
-                let description = args.get("description").and_then(Value::as_str);
-                let agent_type = args.get("agent_type").and_then(Value::as_str);
-                match (description, agent_type) {
-                    (Some(description), Some(agent_type)) => format!(
-                        "Spawn agent: {} ({})",
-                        truncate_line(description, path_budget(13)),
-                        truncate_line(agent_type, path_budget(8))
-                    ),
-                    (Some(description), None) => format!(
-                        "Spawn agent: {}",
-                        truncate_line(description, path_budget(13))
-                    ),
-                    (None, Some(agent_type)) => {
-                        format!(
-                            "Spawn agent: {}",
-                            truncate_line(agent_type, path_budget(13))
-                        )
-                    }
-                    _ => "Spawn agent".to_string(),
                 }
             }
             "diagnose" => {
@@ -4363,16 +4352,31 @@ impl StreamRenderState {
                 }
             }
             "memory_profile" => "Checking profile".to_string(),
-            // Skill tool — show specific skill name
+            // Skill tool — show specific skill name or discover query
             "skill" => {
-                let skill_name = args
-                    .get("skill_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                format!(
-                    "Running skill: {}",
-                    truncate_line(skill_name, path_budget(16))
-                )
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("run");
+                match action {
+                    "discover" => {
+                        let query = args
+                            .get("query")
+                            .and_then(Value::as_str)
+                            .unwrap_or("skills");
+                        format!(
+                            "Discovering skills: \"{}\"",
+                            truncate_line(query, path_budget(22))
+                        )
+                    }
+                    _ => {
+                        let skill_name = args
+                            .get("skill_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        format!(
+                            "Running skill: {}",
+                            truncate_line(skill_name, path_budget(16))
+                        )
+                    }
+                }
             }
             other if other.starts_with("mcp_") => {
                 let rest = &other[4..];
@@ -6099,6 +6103,7 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "memory_correct" => format!("Correcting memory: {preview}"),
         "memory_profile" => "Checking profile".to_string(),
         "skill" => format!("Running skill: {preview}"),
+        "discover_skills" => format!("Discovering skills: \"{preview}\""),
         other if other.starts_with("mcp_") => {
             let rest = &other[4..];
             if let Some(sep) = rest.find('_') {

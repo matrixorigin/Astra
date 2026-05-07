@@ -713,13 +713,31 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agent",
-                "description": "Multi-agent operations. Actions: delegate, run_chain.",
+                "description": "Multi-agent operations. Actions: delegate, run_chain, spawn, get_result, send_message.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["delegate","run_chain"], "description": "Agent operation"},
+                        "action": {"type": "string", "enum": ["delegate","run_chain","spawn","get_result","send_message"], "description": "Agent operation"},
                         "task": {"type": "string", "description": "Task description (for delegate)"},
-                        "steps": {"type": "array", "description": "Chain steps (for run_chain)"}
+                        "steps": {"type": "array", "description": "Chain steps (for run_chain)"},
+                        "description": {"type": "string", "description": "Short task description (for spawn)"},
+                        "prompt": {"type": "string", "description": "Detailed task prompt (for spawn)"},
+                        "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Agent type (for spawn)"},
+                        "model": {"type": "string", "description": "Optional model override (for spawn)"},
+                        "background": {"type": "boolean", "description": "Return immediately with agent_id (for spawn, default false)"},
+                        "name": {"type": "string", "description": "Addressable name for messaging (for spawn)"},
+                        "max_turns": {"type": "integer", "description": "Max turns (for spawn)"},
+                        "isolated": {"type": "boolean", "description": "Use isolated git worktree (for spawn)"},
+                        "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (for spawn)"},
+                        "max_output_tokens": {"type": "integer", "description": "Max output tokens (for spawn)"},
+                        "inherit_prefix": {"type": "object", "description": "Inherit parent prompt-cache prefix (for spawn)"},
+                        "agent_id": {"type": "string", "description": "Agent ID (for get_result)"},
+                        "to": {"type": "string", "description": "Recipient agent_id or '*' (for send_message)"},
+                        "message": {"description": "Message content (for send_message)"},
+                        "summary": {"type": "string", "description": "Short preview of message (for send_message)"},
+                        "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"], "description": "Message type (for send_message)"},
+                        "priority": {"type": "string", "enum": ["low","normal","high"], "description": "Message priority (for send_message)"},
+                        "request_id": {"type": "string", "description": "Correlation ID (for send_message)"}
                     },
                     "required": ["action"]
                 }

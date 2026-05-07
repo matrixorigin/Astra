@@ -270,6 +270,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     // ── Mutating — code intelligence writes ──────────────────────────
     tool("rename_symbol", MU, ToolFlags::CODE_INTEL),
     // ── Mutating — orchestration ─────────────────────────────────────
+    tool("agent", MU, OR),
     tool("send_message", MU, OR),
     tool("spawn_agent", MU, OR),
     tool("get_agent_result", RO, OR),

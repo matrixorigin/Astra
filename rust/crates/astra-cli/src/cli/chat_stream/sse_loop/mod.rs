@@ -921,12 +921,10 @@ fn load_turn_messages(
 /// which defaults to pinned. Models then see spawn_agent every turn
 /// exactly when it's callable (spawner present) and never when it's
 /// not — no dead schema, no wasted tokens.
-fn maybe_pin_spawn_agent_schema(registry: &mut ToolRegistry, spawner_wired: bool) {
-    if !spawner_wired {
-        return;
-    }
-    registry.upsert_schema(astra_runtime::orchestration::spawn_agent_schema());
-    registry.upsert_schema(crate::edge_tools::agent_spawning::get_agent_result_schema());
+fn maybe_pin_spawn_agent_schema(_registry: &mut ToolRegistry, _spawner_wired: bool) {
+    // No-op: spawn/get_result/send_message are now actions within the
+    // consolidated `agent` schema (in all_tool_schemas). No separate
+    // schema injection needed.
 }
 
 #[cfg(test)]
