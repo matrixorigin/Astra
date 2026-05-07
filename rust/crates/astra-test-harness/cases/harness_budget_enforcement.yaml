@@ -22,7 +22,7 @@ criteria:
         max: 6
       - type: tools_count_between
         min: 1
-        max: 8
+        max: 12
       - type: duration_between
         min_ms: 1
         max_ms: 60000

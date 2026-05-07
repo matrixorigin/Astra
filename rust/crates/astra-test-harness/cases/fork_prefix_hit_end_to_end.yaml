@@ -21,7 +21,7 @@ criteria:
   - type: exit_code
     code: 0
   - type: tool_called
-    name: spawn_agent
+    name: agent
   - type: tools_count_between
     min: 1
     max: 6

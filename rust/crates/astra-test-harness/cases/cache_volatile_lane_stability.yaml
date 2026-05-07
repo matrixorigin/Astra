@@ -31,4 +31,9 @@ criteria:
       - type: prompt_cache_tokens
         min_read: 10000
         min_creation: 0
-        max_creation: 35000
+        # Bumped from 35K→45K after commit 4ab4f522 split environment
+        # context: git-state (branch dirty/diff/log) now writes to the
+        # volatile lane each turn (~300-600 chars/turn overhead). The
+        # important invariant is the *stable prefix doesn't break* — a
+        # non-zero but bounded creation is fine.
+        max_creation: 45000

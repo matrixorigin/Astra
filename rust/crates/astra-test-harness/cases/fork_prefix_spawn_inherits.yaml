@@ -19,7 +19,7 @@ criteria:
   - type: exit_code
     code: 0
   - type: tool_called
-    name: spawn_agent
+    name: agent
   - type: text_contains
     needle: "delegate-G2-ok"
     # Direct structural check (mirrors judger question). Both check the same
