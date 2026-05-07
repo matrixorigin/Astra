@@ -233,6 +233,43 @@ fn semantic_bash_git_key(args: &Value) -> Option<String> {
 /// Returns 0.0-1.0. Outputs shorter than MIN_OUTPUT_LEN are not compared.
 const MIN_OUTPUT_LEN: usize = 30;
 
+/// Conservative read-only allowlist used to decide whether a short cached
+/// output can be safely re-executed. Anything not on this list is treated as
+/// potentially side-effectful — we'd rather return a short cached body than
+/// re-run a mutation.
+///
+/// NOTE: the consolidated `git` / `github` entry-point tools are deliberately
+/// excluded — they dispatch on an `action` arg that can be read or write
+/// (e.g. `git(action="commit")`, `github(action="create_pr")`), so treating
+/// them as read-only here would allow a mutation to be silently replayed.
+/// Legacy per-action names (`git_status`, `github_list_prs`, …) are still
+/// listed because those remain statically read-only.
+fn is_read_only_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file"
+            | "list_dir"
+            | "grep"
+            | "glob"
+            | "symbols"
+            | "git_status"
+            | "git_diff"
+            | "git_log"
+            | "git_show"
+            | "git_blame"
+            | "git_file_history"
+            | "github_list_prs"
+            | "github_list_issues"
+            | "github_get_pr"
+            | "github_get_issue"
+            | "github_ci_status"
+            | "github_repo_stats"
+            | "find_definition"
+            | "find_references"
+            | "lsp"
+    )
+}
+
 pub fn output_similarity(output1: &str, output2: &str) -> f64 {
     // Too-short outputs aren't meaningful for similarity comparison
     if output1.len() < MIN_OUTPUT_LEN || output2.len() < MIN_OUTPUT_LEN {
@@ -326,13 +363,19 @@ impl SemanticDedup {
         // returning "[Cleared]" or a short placeholder instead of real content
         // would leave the caller with nothing useful, forcing them to re-fetch
         // anyway. In that case, allow the tool to re-execute.
+        //
+        // The short-output bypass is gated to read-only tools: a write/mutation
+        // tool that happens to return a short "OK" / "Done" body must NOT be
+        // re-executed — the side-effect already happened. For write tools we
+        // return the cached short output as-is so the caller short-circuits.
+        let tool_is_read_only = is_read_only_tool(tool_name);
         for (prev_tool, _out_turn, prev_output) in self.output_log.iter().rev() {
             if prev_tool == tool_name {
-                if prev_output.starts_with("[Cleared")
-                    || prev_output.starts_with("(cached")
-                    || prev_output.len() < 20
-                {
+                if prev_output.starts_with("[Cleared") || prev_output.starts_with("(cached") {
                     return None; // Force re-execution — cached content is gone
+                }
+                if tool_is_read_only && prev_output.len() < 20 {
+                    return None; // Read-only + trivial output → cheap to re-run
                 }
                 return Some((*prev_turn, prev_output.clone()));
             }

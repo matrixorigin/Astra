@@ -1,6 +1,6 @@
 //! Contract: a `SkillDiagnosis` must be recoverable from the free-form
 //! markdown response of an auto-invoked diagnostic skill
-//! (`analyze_session`, `analyze_session`, `optimize_prompt`).
+//! (`analyze_session`, `optimize_prompt`).
 //!
 //! The skills themselves are LLM-authored and produce human-readable
 //! markdown. The auto-invoke pipeline only needs the structured slice of
@@ -268,7 +268,7 @@ fn skill_md_example_blocks_are_parseable() {
         .nth(3)
         .expect("walk up to repo root");
 
-    for skill_name in ["analyze_session", "analyze_session", "optimize_prompt"] {
+    for skill_name in ["analyze_session", "optimize_prompt"] {
         let path = repo_root.join("skills").join(skill_name).join("SKILL.md");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));

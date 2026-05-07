@@ -1199,6 +1199,13 @@ pub fn git_diff(
                 if let Err(e) = reject_shell_meta(tip) {
                     return format!("Error: invalid tip ref in range: {e}");
                 }
+            } else {
+                // Defensive: contains("..") was true but split_once failed.
+                // Should be unreachable, but must not silently pass a malformed
+                // ref to the CLI (defence-in-depth for shell-injection guard).
+                return format!(
+                    "Error: malformed range ref '{ref_str}' — expected 'A..B' or 'A...B'"
+                );
             }
             let mut cli_args = vec!["diff", ref_str, "--no-ext-diff", "--no-color"];
             if let Some(p) = path_filter {

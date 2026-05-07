@@ -120,46 +120,66 @@ impl AutoInvokeGate {
     /// the gate's cooldown for its cause.
     ///
     /// `now` is injected to keep the state machine deterministic under test.
+    ///
+    /// Per-turn de-duplication: if multiple triggers map to the same skill
+    /// (e.g. `SessionStalls` + `RepeatedCorrections` both → `analyze_session`),
+    /// only the first firing in the returned vec is kept. The losing trigger
+    /// still records its cooldown so it doesn't keep trying next turn.
     #[must_use]
     pub fn evaluate(&mut self, signals: &SessionSignals, now: Instant) -> Vec<AutoInvokeRequest> {
-        let mut out = Vec::new();
+        let mut out: Vec<AutoInvokeRequest> = Vec::new();
+
+        let push_if_new = |out: &mut Vec<AutoInvokeRequest>, req: AutoInvokeRequest| {
+            if !out.iter().any(|existing| existing.skill == req.skill) {
+                out.push(req);
+            }
+        };
 
         if signals.session_stalls >= STALL_TRIGGER_COUNT
             && Self::cooldown_elapsed(self.last_stall_fire, now, STALL_COOLDOWN)
         {
-            out.push(AutoInvokeRequest {
-                skill: "analyze_session",
-                focus: "stalls",
-                cause: AutoInvokeCause::SessionStalls {
-                    count: signals.session_stalls,
+            push_if_new(
+                &mut out,
+                AutoInvokeRequest {
+                    skill: "analyze_session",
+                    focus: "stalls",
+                    cause: AutoInvokeCause::SessionStalls {
+                        count: signals.session_stalls,
+                    },
                 },
-            });
+            );
             self.last_stall_fire = Some(now);
         }
 
         if signals.budget_pressure > PRESSURE_TRIGGER_LEVEL
             && Self::cooldown_elapsed(self.last_pressure_fire, now, PRESSURE_COOLDOWN)
         {
-            out.push(AutoInvokeRequest {
-                skill: "optimize_prompt",
-                focus: "budget",
-                cause: AutoInvokeCause::BudgetPressure {
-                    level: signals.budget_pressure,
+            push_if_new(
+                &mut out,
+                AutoInvokeRequest {
+                    skill: "optimize_prompt",
+                    focus: "budget",
+                    cause: AutoInvokeCause::BudgetPressure {
+                        level: signals.budget_pressure,
+                    },
                 },
-            });
+            );
             self.last_pressure_fire = Some(now);
         }
 
         if signals.recent_corrections >= CORRECTION_TRIGGER_COUNT
             && Self::cooldown_elapsed(self.last_correction_fire, now, CORRECTION_COOLDOWN)
         {
-            out.push(AutoInvokeRequest {
-                skill: "analyze_session",
-                focus: "corrections",
-                cause: AutoInvokeCause::RepeatedCorrections {
-                    count: signals.recent_corrections,
+            push_if_new(
+                &mut out,
+                AutoInvokeRequest {
+                    skill: "analyze_session",
+                    focus: "corrections",
+                    cause: AutoInvokeCause::RepeatedCorrections {
+                        count: signals.recent_corrections,
+                    },
                 },
-            });
+            );
             self.last_correction_fire = Some(now);
         }
 
@@ -648,14 +668,14 @@ mod tests {
 
     #[test]
     fn all_three_triggers_fire_in_one_evaluation() {
+        // Stalls + corrections both map to analyze_session; the gate
+        // dedupes so only the first is emitted. Budget pressure stays
+        // distinct.
         let mut gate = AutoInvokeGate::new();
         let now = Instant::now();
         let out = gate.evaluate(&signals(5, 0.95, 5), now);
         let names: Vec<&str> = out.iter().map(|r| r.skill).collect();
-        assert_eq!(
-            names,
-            vec!["analyze_session", "optimize_prompt", "analyze_session"]
-        );
+        assert_eq!(names, vec!["analyze_session", "optimize_prompt"]);
     }
 
     #[test]
