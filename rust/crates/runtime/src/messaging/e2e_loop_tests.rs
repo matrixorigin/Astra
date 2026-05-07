@@ -269,8 +269,10 @@ mod tests {
 
     // ── Tests ───────────────────────────────────────────────────────────────
 
+    // send_message is now an action in the consolidated `agent` tool.
+    // No separate schema injection is needed — the agent schema is always present.
     #[tokio::test]
-    async fn preamble_injects_send_message_schema_when_mailbox_present() {
+    async fn preamble_no_longer_injects_send_message_schema() {
         let (_router, _parent, child_mb, _dt) = setup_two_agents().await;
 
         let mut host = MockHost::new(vec![text_result("done")]);
@@ -280,17 +282,17 @@ mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
-        // Preamble should have injected send_message schema.
+        // send_message is no longer a separate injected schema — it's an
+        // action in the always-present `agent` tool.
         let has_send_msg = host.injected_schemas.iter().any(|s| {
             s.get("function")
                 .and_then(|f| f.get("name"))
                 .and_then(Value::as_str)
                 == Some("send_message")
         });
-        assert!(has_send_msg, "send_message schema should be injected");
         assert!(
-            host.valid_tools.contains("send_message"),
-            "send_message should be in valid_tools"
+            !has_send_msg,
+            "send_message should NOT be separately injected (it's an agent action now)"
         );
     }
 

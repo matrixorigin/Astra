@@ -3027,7 +3027,7 @@ pub(crate) mod tests {
             ),
         ];
 
-        let mut host = MockHost::new(turns);
+        let mut host = MockHost::new(turns).with_valid_tools(&["delegate"]);
         host.quiet = false;
         let mut state = make_state();
         state.messages.push(
@@ -3136,7 +3136,7 @@ pub(crate) mod tests {
             text_result("Mixed delegation + tool complete.", 60, 20, None),
         ];
 
-        let mut host = MockHost::new(turns).with_valid_tools(&["bash"]);
+        let mut host = MockHost::new(turns).with_valid_tools(&["bash", "delegate"]);
         let mut state = make_state();
         state
             .messages
@@ -3167,7 +3167,7 @@ pub(crate) mod tests {
             text_result("Recovered after bad delegation.", 60, 20, None),
         ];
 
-        let mut host = MockHost::new(turns);
+        let mut host = MockHost::new(turns).with_valid_tools(&["delegate"]);
         let mut state = make_state();
         state
             .messages
@@ -3204,7 +3204,7 @@ pub(crate) mod tests {
             text_result("Fan-out complete.", 60, 20, None),
         ];
 
-        let mut host = MockHost::new(turns);
+        let mut host = MockHost::new(turns).with_valid_tools(&["delegate"]);
         let mut state = make_state();
         state
             .messages
@@ -3276,7 +3276,7 @@ pub(crate) mod tests {
             text_result("Adversarial review complete.", 80, 40, None),
         ];
 
-        let mut host = MockHost::new(turns);
+        let mut host = MockHost::new(turns).with_valid_tools(&["delegate"]);
         let mut state = make_state();
         state
             .messages
@@ -3292,9 +3292,9 @@ pub(crate) mod tests {
     // ── Auto-injection tests ────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn auto_inject_only_once_across_loop() {
-        // Even with multiple turns, injection should happen only once (in preamble).
-        // Use a delegate call followed by final text — two turns total.
+    async fn no_schema_injection_without_skill_resolver() {
+        // With no skill resolver configured, no schemas should be injected.
+        // Delegation is now handled via the always-present `agent` tool.
         let mut host = MockHost::new(vec![
             text_result("still going", 100, 50, Some(10)),
             text_result("done", 50, 20, None),
@@ -3307,8 +3307,9 @@ pub(crate) mod tests {
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        // Only one injection, not one per turn
-        assert_eq!(host.injected_schemas.len(), 1);
+        // No injection: delegation is handled by the consolidated agent tool,
+        // and no skill resolver is configured in make_state().
+        assert_eq!(host.injected_schemas.len(), 0);
     }
 
     // ── is_valid_model_string tests ──────────────────────────────────────

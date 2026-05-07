@@ -52,9 +52,10 @@ fn tool_search_keyword_finds_git_tools() {
     let dir = tempfile::tempdir().unwrap();
     let exe = ToolExecutor::new(dir.path());
     let result = exe.tool_search(&json!({"query": "git", "max_results": 10}));
-    // Should find multiple git-related tools
+    // Should find the consolidated git tool
     assert!(
-        result.contains("git_status") || result.contains("git_diff") || result.contains("git_log")
+        result.contains("\"git\"") || result.contains("\"name\":\"git\""),
+        "should find consolidated git tool: {result}"
     );
 }
 

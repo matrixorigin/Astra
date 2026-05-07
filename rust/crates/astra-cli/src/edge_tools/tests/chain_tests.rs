@@ -263,12 +263,13 @@ async fn chain_skip_condition_end_to_end() {
 }
 
 #[tokio::test]
-async fn chain_via_run_chain_tool() {
+async fn chain_via_agent_run_chain_tool() {
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
 
-    // Invoke run_chain as a tool (like LLM would)
+    // Invoke run_chain through the consolidated agent tool (like LLM would)
     let chain_args = json!({
+        "action": "run_chain",
         "name": "list_and_count",
         "description": "List dir then count",
         "steps": [
@@ -285,7 +286,7 @@ async fn chain_via_run_chain_tool() {
         "input": {}
     });
 
-    let result = executor.execute("run_chain", &chain_args).await;
+    let result = executor.execute("agent", &chain_args).await;
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
     assert_eq!(parsed["chain"], "list_and_count");
@@ -307,7 +308,10 @@ async fn chain_via_run_chain_tool() {
 async fn run_chain_invalid_format_returns_error() {
     let executor = test_executor();
     let result = executor
-        .execute("run_chain", &json!({"invalid": "no steps field"}))
+        .execute(
+            "agent",
+            &json!({"action": "run_chain", "invalid": "no steps field"}),
+        )
         .await;
     assert!(
         result.contains("Error"),
@@ -318,10 +322,13 @@ async fn run_chain_invalid_format_returns_error() {
 #[tokio::test]
 async fn run_chain_blocks_recursive_child_chain() {
     let executor = test_executor();
+    // `run_chain` as a step tool is no longer in TOOL_CATALOG (it's the `agent`
+    // tool's action), so validation rejects it before recursion detection kicks in.
     let result = executor
         .execute(
-            "run_chain",
+            "agent",
             &json!({
+                "action": "run_chain",
                 "name": "outer",
                 "description": "outer",
                 "steps": [
@@ -334,14 +341,10 @@ async fn run_chain_blocks_recursive_child_chain() {
             }),
         )
         .await;
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-    assert_eq!(parsed["steps_executed"], 0);
+    // Chain validation rejects unknown tool names (run_chain is not in TOOL_CATALOG)
     assert!(
-        parsed["final_output"]
-            .as_str()
-            .unwrap()
-            .contains("recursive run_chain"),
-        "unexpected result: {result}"
+        result.contains("Error"),
+        "should return error for recursive/unknown tool chain: {result}"
     );
 }
 
@@ -350,8 +353,9 @@ async fn run_chain_blocks_repeated_identical_steps() {
     let executor = test_executor();
     let result = executor
         .execute(
-            "run_chain",
+            "agent",
             &json!({
+                "action": "run_chain",
                 "name": "stall",
                 "description": "stall",
                 "steps": [

@@ -142,33 +142,9 @@ async fn call_graph_symbol_not_found() {
     );
 }
 
-#[test]
-fn schemas_include_call_graph_and_coding_tools() {
-    let schemas = all_tool_schemas();
-    let names: Vec<&str> = schemas
-        .iter()
-        .filter_map(|s| {
-            s.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-        })
-        .collect();
-    assert!(
-        names.contains(&"call_graph"),
-        "should have call_graph: {:?}",
-        names
-    );
-    assert!(
-        names.contains(&"delete_file"),
-        "should have delete_file: {:?}",
-        names
-    );
-    assert!(
-        names.contains(&"multi_edit"),
-        "should have multi_edit: {:?}",
-        names
-    );
-}
+// call_graph, delete_file, multi_edit are no longer in the advertised schema set.
+// call_graph/run_build_test are internal tools still executable but not LLM-facing.
+// delete_file and multi_edit are subsumed by the write_file and str_replace schemas.
 
 #[tokio::test]
 async fn run_build_test_iteration_tracking() {
@@ -280,24 +256,4 @@ async fn run_build_test_auto_fix_creates_report() {
     );
 }
 
-#[test]
-fn schema_includes_auto_fix_param() {
-    let schemas = all_tool_schemas();
-    let build = schemas
-        .iter()
-        .find(|s| {
-            s.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                == Some("run_build_test")
-        })
-        .expect("run_build_test schema should exist");
-    let props = build["function"]["parameters"]["properties"]
-        .as_object()
-        .unwrap();
-    assert!(
-        props.contains_key("auto_fix"),
-        "schema should have auto_fix param"
-    );
-    assert_eq!(props["auto_fix"]["type"], "boolean");
-}
+// run_build_test is no longer in the advertised schema set (internal tool only).

@@ -68,13 +68,13 @@ mod tests {
     // ── Catalog invariants ──
 
     #[test]
-    fn catalog_has_16_tools() {
-        assert_eq!(TOOL_CATALOG.len(), 16);
+    fn catalog_has_expected_tools() {
+        assert_eq!(TOOL_CATALOG.len(), 19);
     }
 
     #[test]
     fn all_tools_are_pinned() {
-        assert_eq!(ToolRegistry::pinned_count(), 16);
+        assert_eq!(ToolRegistry::pinned_count(), 19);
     }
 
     #[test]

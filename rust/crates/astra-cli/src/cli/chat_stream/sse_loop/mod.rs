@@ -1135,39 +1135,10 @@ hooks:
     // visible iff the spawner is wired, so the model sees it exactly
     // when calls would succeed.
 
+    // spawn_agent is now subsumed into the consolidated `agent` tool.
+    // maybe_pin_spawn_agent_schema is a no-op — no separate schema injection needed.
     #[test]
-    fn maybe_pin_spawn_agent_schema_adds_pinned_entry_when_spawner_wired() {
-        use super::maybe_pin_spawn_agent_schema;
-        use crate::edge_tools;
-        use astra_runtime::tool_registry::ToolRegistry;
-
-        let mut registry = ToolRegistry::new(edge_tools::all_tool_schemas());
-        let initial_pinned: std::collections::HashSet<String> = registry
-            .pinned_schemas()
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-        // spawn_agent is in all_schemas but not pinned by default —
-        // that's the bug G3 fixes.
-        assert!(
-            !initial_pinned.contains("spawn_agent"),
-            "pre-fix invariant: spawn_agent starts NOT pinned; if this fails the catalog changed"
-        );
-
-        maybe_pin_spawn_agent_schema(&mut registry, true);
-        let after_pinned: std::collections::HashSet<String> = registry
-            .pinned_schemas()
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-        assert!(
-            after_pinned.contains("spawn_agent"),
-            "spawn_agent must be pinned after helper runs with spawner wired"
-        );
-    }
-
-    #[test]
-    fn maybe_pin_spawn_agent_schema_is_noop_without_spawner() {
+    fn maybe_pin_spawn_agent_schema_is_noop_always() {
         use super::maybe_pin_spawn_agent_schema;
         use crate::edge_tools;
         use astra_runtime::tool_registry::ToolRegistry;
@@ -1179,7 +1150,7 @@ hooks:
             .map(|(n, _)| n.clone())
             .collect();
 
-        maybe_pin_spawn_agent_schema(&mut registry, false);
+        maybe_pin_spawn_agent_schema(&mut registry, true);
         let after: std::collections::HashSet<String> = registry
             .pinned_schemas()
             .iter()
@@ -1188,12 +1159,7 @@ hooks:
 
         assert_eq!(
             before, after,
-            "no-spawner branch must leave the pinned set unchanged — \
-             pinning a dead schema would waste tokens and mislead the LLM"
-        );
-        assert!(
-            !after.contains("spawn_agent"),
-            "spawn_agent must NOT become visible without a spawner"
+            "maybe_pin_spawn_agent_schema is now a no-op (spawn is an agent action)"
         );
     }
 }

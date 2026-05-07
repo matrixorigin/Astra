@@ -224,37 +224,19 @@ fn schemas_include_new_params() {
         "symbols should have 'calls' param"
     );
 
-    let call_graph_schema = schemas
+    // call_graph and find_references are no longer in all_tool_schemas()
+    // (subsumed by the consolidated lsp tool). Verify lsp schema exists instead.
+    let lsp_schema = schemas
         .iter()
         .find(|s| {
             s.get("function")
                 .and_then(|f| f.get("name"))
                 .and_then(|n| n.as_str())
-                == Some("call_graph")
+                == Some("lsp")
         })
-        .expect("call_graph schema should exist");
-    let cg_props = &call_graph_schema["function"]["parameters"]["properties"];
+        .expect("lsp schema should exist");
     assert!(
-        cg_props.get("callers").is_some(),
-        "call_graph should have 'callers' param"
-    );
-    assert!(
-        cg_props.get("scope").is_some(),
-        "call_graph should have 'scope' param"
-    );
-
-    let ref_schema = schemas
-        .iter()
-        .find(|s| {
-            s.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                == Some("find_references")
-        })
-        .expect("find_references schema should exist");
-    let ref_props = &ref_schema["function"]["parameters"]["properties"];
-    assert!(
-        ref_props.get("kind").is_some(),
-        "find_references should have 'kind' param"
+        lsp_schema["function"]["parameters"]["properties"].is_object(),
+        "lsp schema should have properties"
     );
 }

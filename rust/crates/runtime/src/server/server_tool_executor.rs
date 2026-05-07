@@ -4615,13 +4615,14 @@ esac
     }
 
     #[tokio::test]
-    async fn multi_edit_is_available_in_server_mode() {
+    async fn str_replace_multi_edit_is_available_in_server_mode() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("edit.txt"), "foo bar baz").unwrap();
 
+        // multi_edit is now accessed via str_replace with an `edits` array
         let result = exec
             .execute(
-                "multi_edit",
+                "str_replace",
                 &json!({
                     "path": "edit.txt",
                     "edits": [
