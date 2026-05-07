@@ -95,6 +95,37 @@ impl PromptSection {
         }
     }
 
+    /// **DANGEROUS** — construct a volatile (cache-busting) section. Use only
+    /// when content genuinely changes every turn and cannot live in the
+    /// stable prefix. The `_reason` argument is not read at runtime; it
+    /// exists purely to force the caller to document, in source, *why* this
+    /// section is worth invalidating the prompt-cache prefix.
+    ///
+    /// Guidance:
+    /// - Prefer [`PromptSection::stable`] whenever the content is
+    ///   session-stable (model id, cwd, git branch, tool list, skills).
+    /// - Prefer [`PromptSection::dynamic`] (plain `CacheScope::None` with no
+    ///   social-engineering red flag) for ordinary per-turn environment
+    ///   context that already lives post-boundary.
+    /// - Reach for this constructor only when you need an **explicit audit
+    ///   trail** for a content source that *must* mutate per-turn and would
+    ///   otherwise silently destroy prefix cache hit-rate.
+    ///
+    /// Behaves identically to [`PromptSection::dynamic`] at runtime.
+    #[must_use]
+    pub fn dangerous_volatile(
+        text: impl Into<String>,
+        token_bucket: PromptTokenBucket,
+        _reason: &'static str,
+    ) -> Self {
+        debug_assert!(
+            !_reason.trim().is_empty(),
+            "PromptSection::dangerous_volatile requires a non-empty reason; \
+             document in source why this content cannot live in the stable prefix"
+        );
+        Self::dynamic(text, token_bucket)
+    }
+
     pub fn with_trace_signals(mut self, trace_signals: PromptTraceSignals) -> Self {
         self.trace_signals = trace_signals;
         self
@@ -212,6 +243,42 @@ impl SectionKind {
             Self::WorkingMemory | Self::EmergentSkills | Self::EmergentSummary => 6,
             Self::History => 7,
             Self::RuntimeVolatile => 8, // turn-volatile; latest in the prompt
+        }
+    }
+
+    /// Compile-time binary classification: does this section belong AFTER the
+    /// prompt-cache dynamic boundary?
+    ///
+    /// `true`  → content changes every turn; section must sit in the volatile
+    ///           lane (`CacheScope::None`, post-boundary). Placing a `true`
+    ///           section before the boundary will invalidate the cached
+    ///           prefix on every request.
+    /// `false` → content is session-stable or global; section may sit in the
+    ///           cacheable prefix.
+    ///
+    /// The `match` is exhaustive on purpose: adding a new `SectionKind`
+    /// variant forces explicit classification here at compile time, so it is
+    /// impossible to add a variant that silently defaults to the wrong side
+    /// of the boundary (which is exactly the bug `b64223c9` had to fix at
+    /// runtime).
+    #[must_use]
+    pub fn is_volatile(self) -> bool {
+        match self {
+            // Stable / session-stable — cache-safe prefix.
+            Self::Identity
+            | Self::Constraints
+            | Self::SelfModel
+            | Self::ProjectContext
+            | Self::Skills
+            | Self::RuntimeIdentity => false,
+            // Mutate per-turn — must sit post-boundary.
+            Self::Memory
+            | Self::WorkingMemory
+            | Self::History
+            | Self::RuntimeVolatile
+            | Self::EmergentSkills
+            | Self::EmergentMemory
+            | Self::EmergentSummary => true,
         }
     }
 }
@@ -625,14 +692,56 @@ mod tests {
         );
 
         for k in SectionKind::all_planned().iter().copied() {
-            // Touch `is_preallocated` so its exhaustive match participates in
-            // compile-time coverage from this test too.
+            // Touch `is_preallocated` + `is_volatile` so their exhaustive
+            // matches participate in compile-time coverage from this test.
             let _ = k.is_preallocated();
+            let _ = k.is_volatile();
             assert!(
                 listed.contains(&k),
                 "SectionKind::{k:?} is missing from SectionKind::all_planned(); \
                  add it there or it will silently receive zero budget."
             );
         }
+    }
+
+    /// Compile-time volatility classification must agree with the historical
+    /// volatility score ranking: every kind the numerical `volatility()` puts
+    /// at or above `RuntimeIdentity` (≥ 4) must also be `is_volatile() == true`,
+    /// and every kind below that threshold must be `is_volatile() == false`.
+    ///
+    /// `RuntimeIdentity` itself is the boundary — it is session-stable
+    /// (not volatile), which matches its documented role in `SectionKind`.
+    #[test]
+    fn is_volatile_agrees_with_volatility_score() {
+        for k in SectionKind::all_planned().iter().copied() {
+            let by_score = k.volatility() > SectionKind::RuntimeIdentity.volatility();
+            assert_eq!(
+                k.is_volatile(),
+                by_score,
+                "SectionKind::{k:?} disagrees: is_volatile()={} but volatility()={} \
+                 (threshold: RuntimeIdentity.volatility()={})",
+                k.is_volatile(),
+                k.volatility(),
+                SectionKind::RuntimeIdentity.volatility(),
+            );
+        }
+    }
+
+    #[test]
+    fn dangerous_volatile_behaves_like_dynamic() {
+        let s = PromptSection::dangerous_volatile(
+            "latest turn delta",
+            PromptTokenBucket::Environment,
+            "per-turn delta cannot live in cached prefix",
+        );
+        assert_eq!(s.scope, CacheScope::None);
+        assert_eq!(s.token_bucket, PromptTokenBucket::Environment);
+        assert_eq!(s.text, "latest turn delta");
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty reason")]
+    fn dangerous_volatile_rejects_empty_reason_in_debug() {
+        let _ = PromptSection::dangerous_volatile("x", PromptTokenBucket::Environment, "   ");
     }
 }

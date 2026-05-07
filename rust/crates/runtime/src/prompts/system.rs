@@ -57,6 +57,104 @@ pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.3;
 // (prompt builders) without a circular dependency.
 pub use astra_turn_core::section_types::{CacheScope, PromptSection, PromptTokenBucket};
 
+/// Marker text inserted between the **cacheable prefix** (global/session-stable
+/// sections) and the **volatile tail** (per-turn sections) in the flattened
+/// system prompt. Providers that support prefix-cache breakpoints can use this
+/// marker as an inspection anchor; it is also asserted in tests so that
+/// reordering bugs (a volatile section accidentally placed before the boundary)
+/// are caught immediately.
+///
+/// The exact string is an implementation detail; do **not** match on it from
+/// production code — use [`SystemPromptBuilder`] instead.
+pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str =
+    "\n<!-- astra:system-prompt:dynamic-boundary -->\n";
+
+/// Builder that enforces the **static-before-dynamic** invariant at the API
+/// level, so callers cannot silently push a volatile section into the cached
+/// prefix (the class of regression fixed by commit `b64223c9`).
+///
+/// Usage:
+/// ```ignore
+/// let mut b = SystemPromptBuilder::new();
+/// b.push_stable(PromptSection::stable(rules, CacheScope::Global));
+/// b.push_stable(PromptSection::stable(planning, CacheScope::Global));
+/// b.push_volatile(PromptSection::dynamic(per_turn, Environment));
+/// let sections = b.finish(); // stable first, boundary marker, then volatile
+/// ```
+///
+/// `push_stable` rejects anything with `CacheScope::None`; `push_volatile`
+/// rejects anything *without* `CacheScope::None`. This makes it impossible
+/// for a caller to silently invert the order and wreck the prefix cache.
+#[derive(Debug, Default)]
+pub struct SystemPromptBuilder {
+    stable: Vec<PromptSection>,
+    volatile: Vec<PromptSection>,
+}
+
+impl SystemPromptBuilder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a cacheable section (scope: `Global` or `Session`).
+    ///
+    /// # Panics
+    /// Panics in debug builds if the section has `CacheScope::None`; in
+    /// release builds the section is silently demoted to the volatile tail
+    /// to avoid a cache-busting prefix at runtime.
+    pub fn push_stable(&mut self, section: PromptSection) {
+        debug_assert!(
+            section.scope != CacheScope::None,
+            "push_stable requires CacheScope::Global or ::Session; use push_volatile for dynamic content"
+        );
+        if section.scope == CacheScope::None {
+            self.volatile.push(section);
+        } else {
+            self.stable.push(section);
+        }
+    }
+
+    /// Append a volatile section (scope: `None`).
+    ///
+    /// # Panics
+    /// Panics in debug builds if the section is not `CacheScope::None`; in
+    /// release builds the section is promoted to the stable prefix so its
+    /// content still reaches the model.
+    pub fn push_volatile(&mut self, section: PromptSection) {
+        debug_assert!(
+            section.scope == CacheScope::None,
+            "push_volatile requires CacheScope::None; use push_stable for cacheable content"
+        );
+        if section.scope == CacheScope::None {
+            self.volatile.push(section);
+        } else {
+            self.stable.push(section);
+        }
+    }
+
+    /// Finalise into `[stable..., boundary_marker, volatile...]`.
+    ///
+    /// The boundary marker is emitted only when both lanes are non-empty;
+    /// an all-stable or all-volatile prompt keeps its original shape so
+    /// existing byte-level assertions in tests remain valid.
+    #[must_use]
+    pub fn finish(self) -> Vec<PromptSection> {
+        let Self {
+            mut stable,
+            mut volatile,
+        } = self;
+        if !stable.is_empty() && !volatile.is_empty() {
+            stable.push(PromptSection::dynamic(
+                SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+                PromptTokenBucket::BasePersona,
+            ));
+        }
+        stable.append(&mut volatile);
+        stable
+    }
+}
+
 /// Build the static sections for the context pipeline.
 /// These are the Global-scope sections that never change between turns.
 /// Compile once at session start and pass to PipelineSession's TurnInput.
@@ -140,22 +238,21 @@ fn core_rules_section() -> String {
     )
 }
 
-/// Planning protocol + context strategy. Pure static.
+/// Planning + batching + efficiency. Single consolidated section.
+/// Replaces the former Planning Protocol / Context Strategy / Think-Before-Act /
+/// Parallel Tool Calls / Batching / Token Efficiency / Exploration Guard / Build-Test
+/// stack (~60 lines of repetition) with a tight 18-line contract.
 fn planning_section() -> &'static str {
-    "\n## Planning Protocol\n\
-     For tasks that need 3+ tool calls, plan in a <think> block FIRST:\n\
-     <think>\n\
-     Goal: [what the user wants]\n\
-     Plan: [numbered steps — what to read/check/change/verify]\n\
-     </think>\n\
-     After each tool result, reflect: <reflect>[what I learned] [adjust plan or proceed]</reflect>\n\
-     This prevents exploration spirals.\n\n\
-     ## Context Strategy\n\
-     Before acting, identify WHAT context you need:\n\
-     1. **Plan context needs**: What files/functions/tests must I understand first?\n\
-      2. **Batch the fetch**: Call all needed reads/greps in ONE turn (parallel).\n\
-      3. **Check inventory**: If context was already fetched, use it — don't re-fetch.\n\
-      4. **Then act**: Only after understanding, make your changes.\n"
+    "\n## Plan, Batch, Execute\n\
+     1. **Plan first** (3+ tool calls): state goal + numbered steps in a <think> block, then act.\n\
+     2. **Batch independent reads** into ONE turn (≤5 parallel). Only serialize when one result feeds the next call's args.\n\
+     3. **Reuse history**: if context was already fetched this session, reference it — don't re-fetch.\n\
+     4. **Discover before reading**: use list_dir/glob to confirm paths. Never guess.\n\
+     5. **Targeted reads**: prefer line ranges + outline=true over full files. Use glob before grep.\n\
+     6. **Never batch writes**: write_file / str_replace / bash / git execute sequentially.\n\
+     7. **Build/test only AFTER your writes** — not for exploration, review, or Q&A.\n\
+     8. **Open-ended loops** (\"keep going\", \"as many as you can\"): do one useful pass, then stop.\n\
+     9. **Exploration cap**: ≤2 dir listings + ≤2 full-file reads unless user names a concrete target.\n"
 }
 
 /// Discovery + coding discipline. Pure static.
@@ -188,39 +285,10 @@ fn turn_discipline_section() -> &'static str {
      - **Match depth to task**: a one-line question gets a one-line answer, not a structured report.\n"
 }
 
-/// Parallel tool calls + token efficiency + build/test warning. Pure static.
+/// DEPRECATED: merged into `planning_section`. Returns empty string so call sites
+/// still compile during transition; will be removed once call sites are cleaned up.
 fn parallel_and_efficiency_section() -> &'static str {
-    "\n## Think-Before-Act\n\
-     Before your FIRST tool call in any task:\n\
-     1. Identify ALL the information you need.\n\
-     2. Plan which tools to call and in what order.\n\
-     3. Batch all independent calls into ONE turn.\n\
-     4. Only make sequential calls when one result determines the next call's arguments.\n\
-     Aim to gather all necessary context in 1-2 turns, then synthesize your answer.\n\n\
-     ## Parallel Tool Calls\n\
-      Call multiple independent tools in ONE turn (e.g., several reads, git_status+git_diff, glob+grep, git_log+git_show).\n\
-      Do NOT parallelize when one result determines the next call's arguments.\n\
-       **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
-       **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\
-       **Anti-pattern**: Don't call one tool, wait for results, then call the next independent tool — batch them.\n\n\
-       ## Batching read-only tool calls\n\
-       Return all independent read-only tool calls in one assistant message. Only serialize when the next call depends on the previous result.\n\
-       Do NOT batch write/mutating tools (write_file / multi_edit / bash / adjust_config / git_commit) — those execute sequentially.\n\n\
-      ## Token Efficiency\n\
-     - Prefer targeted reads (line ranges) over full-file reads.\n\
-     - Use glob to narrow candidates before grep.\n\
-     - Request only the data you need — avoid fetching entire files when a section suffices.\n\
-     - Summarize findings concisely. Show relevant code, not the whole file.\n\
-      - If you've already fetched something, reference it from history — don't re-fetch.\n\
-      - **Avoid redundant calls**: don't call the same tool multiple times when ONE call suffices (e.g., git_diff once covers all files).\n\n\
-      ## Runaway Exploration Guard\n\
-      - For open-ended loops (\"keep going\", \"as many as you can\", repeated list/read), do one useful pass, then stop and say more would be busywork/a busy-loop.\n\n\
-      - Hard cap open-ended file exploration at 2 directory listings and 2 file reads unless the user names a concrete target.\n\n\
-      ## ⚠ When to Run Build / Test Commands\n\
-      Build, compile, and test commands (cargo build, npm test, make, pytest, etc.) are EXPENSIVE.\n\
-      - **Run them ONLY to verify YOUR changes** — after you edited or created files.\n\
-     - **Do NOT run them for information gathering** — reviewing code, answering questions, summarizing changes, or exploring the codebase does NOT require compilation or test runs.\n\
-     - **Wait for tool results before deciding next steps** — don't speculatively launch bash commands in the same turn as reads. Read first, then decide if bash is needed.\n"
+    ""
 }
 
 /// Plan execution guidance. Pure static.
@@ -1603,9 +1671,8 @@ mod tests {
     #[test]
     fn prompt_includes_planning_protocol() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
-        assert!(p.contains("Planning Protocol"));
+        assert!(p.contains("Plan, Batch, Execute"));
         assert!(p.contains("<think>"));
-        assert!(p.contains("<reflect>"));
     }
 
     #[test]
@@ -1621,28 +1688,23 @@ mod tests {
     #[test]
     fn prompt_includes_parallel_tool_calls() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
-        assert!(p.contains("Parallel Tool Calls"));
+        assert!(p.contains("Batch independent reads"));
         assert!(p.contains("ONE turn"));
     }
 
     #[test]
     fn prompt_includes_token_efficiency() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
-        assert!(p.contains("Token Efficiency"));
-        assert!(p.contains("targeted reads"));
+        assert!(p.contains("Targeted reads"));
+        assert!(p.contains("line ranges"));
     }
 
     #[test]
     fn prompt_includes_build_test_guidance() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
-        assert!(p.contains("When to Run Build / Test"));
         assert!(
-            p.contains("ONLY to verify YOUR changes"),
+            p.contains("Build/test only AFTER your writes"),
             "should restrict build/test to post-edit verification"
-        );
-        assert!(
-            p.contains("Do NOT run them for information gathering"),
-            "should discourage speculative build/test"
         );
     }
 
@@ -1676,10 +1738,9 @@ mod tests {
     #[test]
     fn prompt_bounds_runaway_file_exploration() {
         let p = build_main_system_prompt(&["bash", "read_file", "list_dir"], "", 0.5, None);
-        assert!(p.contains("Runaway Exploration Guard"));
+        assert!(p.contains("Open-ended loops"));
         assert!(p.contains("\"as many as you can\""));
-        assert!(p.contains("2 directory listings and 2 file reads"));
-        assert!(p.contains("busy-loop"));
+        assert!(p.contains("≤2 dir listings"));
     }
 
     #[test]
@@ -1964,12 +2025,12 @@ mod tests {
             "should contain core rules"
         );
         assert!(
-            global_text.contains("Planning Protocol"),
+            global_text.contains("Plan, Batch, Execute"),
             "should contain planning"
         );
         assert!(
-            global_text.contains("Context Strategy"),
-            "should contain context strategy"
+            global_text.contains("Reuse history"),
+            "should contain context reuse rule"
         );
         assert!(
             global_text.contains("Claude Code skills"),
@@ -2271,7 +2332,7 @@ mod tests {
         assert_eq!(sections[0].text, "Custom core rules content");
         assert_eq!(sections[0].scope, CacheScope::Global);
         // Other sections should be unchanged
-        assert!(sections[1].text.contains("Planning Protocol"));
+        assert!(sections[1].text.contains("Plan, Batch, Execute"));
     }
 
     #[test]
@@ -2755,5 +2816,85 @@ mod tests {
         assert!(!signals.round_budget_warning);
         // Single-tool last round → no positive parallel_feedback either.
         assert!(!signals.parallel_feedback);
+    }
+
+    // ── SystemPromptBuilder invariants ─────────────────────────────────
+
+    #[test]
+    fn system_prompt_builder_emits_stable_then_boundary_then_volatile() {
+        let mut b = SystemPromptBuilder::new();
+        b.push_stable(PromptSection::stable("RULES", CacheScope::Global));
+        b.push_stable(PromptSection::stable("SESSION", CacheScope::Session));
+        b.push_volatile(PromptSection::dynamic(
+            "ENV",
+            PromptTokenBucket::Environment,
+        ));
+        let out = b.finish();
+
+        assert_eq!(out.len(), 4, "expected 2 stable + boundary + 1 volatile");
+        assert_eq!(out[0].text, "RULES");
+        assert_eq!(out[0].scope, CacheScope::Global);
+        assert_eq!(out[1].text, "SESSION");
+        assert_eq!(out[1].scope, CacheScope::Session);
+        // Boundary marker — scope None so it sits on the dynamic side
+        assert_eq!(out[2].text, SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
+        assert_eq!(out[2].scope, CacheScope::None);
+        assert_eq!(out[3].text, "ENV");
+        assert_eq!(out[3].scope, CacheScope::None);
+
+        // Rendered text: stable prefix must come before the marker, and
+        // the marker must come before any volatile content.
+        let rendered = sections_to_string(&out);
+        let rules_pos = rendered.find("RULES").unwrap();
+        let marker_pos = rendered.find(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).unwrap();
+        let env_pos = rendered.find("ENV").unwrap();
+        assert!(
+            rules_pos < marker_pos && marker_pos < env_pos,
+            "order must be stable → boundary → volatile; got rules={rules_pos} marker={marker_pos} env={env_pos}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_builder_omits_boundary_when_all_stable() {
+        let mut b = SystemPromptBuilder::new();
+        b.push_stable(PromptSection::stable("RULES", CacheScope::Global));
+        let out = b.finish();
+        assert_eq!(out.len(), 1);
+        assert!(
+            !out.iter().any(|s| s.text == SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+            "no boundary marker when volatile lane is empty"
+        );
+    }
+
+    #[test]
+    fn system_prompt_builder_omits_boundary_when_all_volatile() {
+        let mut b = SystemPromptBuilder::new();
+        b.push_volatile(PromptSection::dynamic(
+            "ENV",
+            PromptTokenBucket::Environment,
+        ));
+        let out = b.finish();
+        assert_eq!(out.len(), 1);
+        assert!(
+            !out.iter().any(|s| s.text == SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+            "no boundary marker when stable lane is empty"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "push_stable requires")]
+    fn system_prompt_builder_rejects_volatile_in_stable_lane() {
+        let mut b = SystemPromptBuilder::new();
+        b.push_stable(PromptSection::dynamic(
+            "oops",
+            PromptTokenBucket::Environment,
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "push_volatile requires")]
+    fn system_prompt_builder_rejects_stable_in_volatile_lane() {
+        let mut b = SystemPromptBuilder::new();
+        b.push_volatile(PromptSection::stable("oops", CacheScope::Global));
     }
 }
