@@ -13,8 +13,8 @@ use serde_json::Value;
 use crate::context_planner::ContextPlan;
 use crate::context_sources::ContextSources;
 use crate::section_types::{
-    estimate_text_tokens, BoundSection, PlannedSection, SectionArtifact, SectionKind,
-    BYTES_PER_TOKEN_ESTIMATE,
+    BYTES_PER_TOKEN_ESTIMATE, BoundSection, PlannedSection, SectionArtifact, SectionKind,
+    estimate_text_tokens,
 };
 use crate::working_memory::WorkingMemoryState;
 

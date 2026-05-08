@@ -2309,7 +2309,10 @@ mod tests {
             assistant("Reviewing now."),
         ];
         let r = build_working_memory_content(&msgs, 10000);
-        assert!(!r.contains(ATTENTION_PREFIX), "attention manifest leaked: {r}");
+        assert!(
+            !r.contains(ATTENTION_PREFIX),
+            "attention manifest leaked: {r}"
+        );
         assert!(r.contains("review the branch"));
     }
 

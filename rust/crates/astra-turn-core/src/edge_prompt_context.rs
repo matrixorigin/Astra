@@ -554,7 +554,9 @@ mod tests {
     fn volatile_context_caps_recent_commits_at_three() {
         let cwd = std::env::current_dir().unwrap();
         let ctx = build_volatile_environment_context(&cwd);
-        let start = ctx.find("- Recent commits:\n").expect("has commits section");
+        let start = ctx
+            .find("- Recent commits:\n")
+            .expect("has commits section");
         let after = &ctx[start + "- Recent commits:\n".len()..];
         let commit_lines = after
             .lines()

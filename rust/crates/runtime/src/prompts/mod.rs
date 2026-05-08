@@ -72,7 +72,10 @@ mod tests {
             p.contains("check history"),
             "should include history awareness"
         );
-        assert!(p.contains("Plan, Batch, Execute"), "should include protocol");
+        assert!(
+            p.contains("Plan, Batch, Execute"),
+            "should include protocol"
+        );
     }
 
     #[test]

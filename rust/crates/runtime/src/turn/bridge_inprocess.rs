@@ -6251,9 +6251,7 @@ mod tests {
         let mut ep: Map<String, Value> = Map::new();
         ep.insert(
             "memoria_insights_text".to_string(),
-            Value::String(
-                "## Memoria Recall\n- User prefers Rust for CLI work.".to_string(),
-            ),
+            Value::String("## Memoria Recall\n- User prefers Rust for CLI work.".to_string()),
         );
         assert!(
             !bridge_should_run_memoria_prefetch(&ep),
