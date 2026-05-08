@@ -90,7 +90,18 @@ pub fn format_knowledge_for_storage(
         return None; // Nothing worth persisting
     }
 
-    let mut out = format!("[session-knowledge:{session_id}]\n");
+    // `[@knowledge/curated]` structural envelope so the L2 write-time
+    // gate accepts the write. `knowledge` is the memory_proto namespace
+    // for "curated cross-session facts/lessons"; `curated` marks the
+    // source as session-end governance (higher trust than auto-compaction
+    // summaries which use `[@episode/compaction]`).
+    //
+    // Legacy format was `[session-knowledge:sid]` with `## User Corrections`
+    // / `## Learnings` / `## Decisions` markdown sections. That had no
+    // namespace — the L2 gate would reject it. We embed the session id
+    // inline as `session=…` so it's still discoverable in the indexed
+    // body, while the prefix satisfies the structural contract.
+    let mut out = format!("[@knowledge/curated] session={session_id}\n");
 
     if !knowledge.corrections.is_empty() {
         out.push_str("## User Corrections\n");
@@ -127,20 +138,30 @@ pub async fn run_session_end_governance(
         working_purged: 0,
     };
 
-    // Store knowledge as semantic memory (cross-session)
+    // Store knowledge as semantic memory (cross-session). Route through
+    // the L2 structural gate so a malformed envelope (empty body,
+    // missing `[@ns/type]` prefix) fails fast at write rather than
+    // polluting retrieval on future sessions.
     if let Some(content) = format_knowledge_for_storage(&knowledge, session_id) {
         let items =
             knowledge.corrections.len() + knowledge.learnings.len() + knowledge.decisions.len();
-        match client
-            .store(&content, "semantic", Some(session_id), Some("T2"))
-            .await
-        {
-            Ok(_) => {
-                report.learnings_stored = items;
-                eprintln!("[session-end] Stored {items} knowledge items for session {session_id}");
-            }
-            Err(e) => {
-                eprintln!("[session-end] Failed to store knowledge: {e}");
+        match astra_turn_types::should_store_persistent_memory(&content, "semantic") {
+            Ok(()) => match client
+                .store(&content, "semantic", Some(session_id), Some("T2"))
+                .await
+            {
+                Ok(_) => {
+                    report.learnings_stored = items;
+                    eprintln!(
+                        "[session-end] Stored {items} knowledge items for session {session_id}"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[session-end] Failed to store knowledge: {e}");
+                }
+            },
+            Err(reason) => {
+                eprintln!("[session-end] L2 rejected knowledge write: {reason}");
             }
         }
     }
@@ -258,11 +279,21 @@ mod tests {
             error_patterns: vec![],
         };
         let formatted = format_knowledge_for_storage(&knowledge, "sess1").unwrap();
-        assert!(formatted.starts_with("[session-knowledge:sess1]"));
+        // L2 structural envelope — replaces legacy `[session-knowledge:sid]`
+        // prefix so the write-time gate in `should_store_persistent_memory`
+        // accepts the content. `@knowledge/curated` matches memory_proto's
+        // NS_KNOWLEDGE; `curated` marks it as session-end (higher trust).
+        assert!(formatted.starts_with("[@knowledge/curated]"));
+        assert!(formatted.contains("session=sess1"));
         assert!(formatted.contains("## User Corrections"));
         assert!(formatted.contains("- Use RS256"));
         assert!(formatted.contains("## Learnings"));
         assert!(formatted.contains("## Decisions"));
+        // The L2 gate must accept what this formatter produces.
+        assert!(
+            astra_turn_types::should_store_persistent_memory(&formatted, "semantic").is_ok(),
+            "formatted knowledge must pass L2 gate"
+        );
     }
 
     #[test]
@@ -344,7 +375,11 @@ mod tests {
         let stored = stored.lock().unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].1, "semantic");
-        assert!(stored[0].0.contains("[session-knowledge:sess1]"));
+        // L2 structural envelope; session id is embedded inline
+        // (`session=…`) rather than as a legacy `[session-knowledge:…]`
+        // prefix, so the write-time gate accepts the memory.
+        assert!(stored[0].0.starts_with("[@knowledge/curated]"));
+        assert!(stored[0].0.contains("session=sess1"));
         assert!(stored[0].0.contains("RS256"));
 
         let purged = purged.lock().unwrap();

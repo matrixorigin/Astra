@@ -5,6 +5,7 @@
 
 pub mod continuity;
 mod implicit_feedback;
+mod memory_structure;
 mod memory_writability;
 mod result_quality;
 mod runtime_scaffolding;
@@ -14,6 +15,10 @@ mod tool_idempotency;
 pub use implicit_feedback::{
     ImplicitSignal, StructuredFeedback, detect_implicit_feedback_signal,
     implicit_feedback_context_injection, implicit_feedback_rating,
+};
+pub use memory_structure::{
+    PERSISTENT_MEMORY_TYPES, PersistentStoreRejection, is_persistent_memory_type,
+    should_store_persistent_memory, validate_persistent_memory_content,
 };
 pub use memory_writability::should_store_in_memory;
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};

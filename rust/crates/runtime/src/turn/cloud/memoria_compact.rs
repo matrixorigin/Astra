@@ -1039,25 +1039,41 @@ pub async fn compact_with_memoria(
                 );
 
                 // Step 6b: Store compaction summary as semantic memory for cross-session retrieval.
-                // The LLM summary is already generated (zero additional LLM cost);
-                // storing it as "semantic" makes it persist beyond session working memory cleanup.
-                // Prefix includes a stable session tag so re-compaction can be identified.
-                // NOTE: Memoria has no delete-by-id API, so prior compaction summaries for
-                // the same session will accumulate. Dedup relies on Memoria's natural vector
-                // similarity detection (high similarity scores for same-session entries).
+                // Wrapped in the `[@episode/compaction]` structural envelope
+                // so the L2 write-time gate accepts it: episode is the
+                // memory_proto namespace for "summary of past activity",
+                // compaction is the source tag. Pre-L2 code stored this as
+                // `[compaction:sid] <prose>` which lacked any namespace and
+                // was the main pollution source observed in session
+                // c6e18730 — unstructured summaries cross-surfacing on
+                // unrelated future queries.
                 if config.store_on_compact {
-                    let tag = format!("[compaction:{}]", sid);
-                    let semantic_content = format!("{} {}", tag, summary);
-                    if let Err(e) = client
-                        .store(
-                            &semantic_content,
-                            "semantic",
-                            Some(sid),
-                            Some(astra_prompts::memory_proto::TIER_INFERRED),
-                        )
-                        .await
-                    {
-                        eprintln!("[compact] Failed to store compaction summary as semantic: {e}");
+                    let semantic_content =
+                        format!("[@episode/compaction] session={sid} {summary}");
+                    match astra_turn_types::should_store_persistent_memory(
+                        &semantic_content,
+                        "semantic",
+                    ) {
+                        Ok(()) => {
+                            if let Err(e) = client
+                                .store(
+                                    &semantic_content,
+                                    "semantic",
+                                    Some(sid),
+                                    Some(astra_prompts::memory_proto::TIER_INFERRED),
+                                )
+                                .await
+                            {
+                                eprintln!(
+                                    "[compact] Failed to store compaction summary as semantic: {e}"
+                                );
+                            }
+                        }
+                        Err(reason) => {
+                            eprintln!(
+                                "[compact] L2 rejected compaction summary write: {reason}"
+                            );
+                        }
                     }
                 }
             }
@@ -2707,12 +2723,28 @@ mod tests {
             semantic_entries.len()
         );
         let (content, _) = &semantic_entries[0];
+        // L2 structural envelope: `[@episode/compaction]` replaces the
+        // legacy `[compaction:sid]` prefix so the write-time gate in
+        // `should_store_persistent_memory` accepts the entry. Session
+        // id is embedded inline as `session=…` rather than as a bracket
+        // prefix.
         assert!(
-            content.starts_with("[compaction:sess-test-42]"),
-            "should have session tag prefix, got: {}",
+            content.starts_with("[@episode/compaction]"),
+            "should have L2 structural envelope, got: {}",
             &content[..50.min(content.len())]
         );
+        assert!(
+            content.contains("session=sess-test-42"),
+            "should embed session id in body"
+        );
         assert!(content.contains("JWT"), "should contain the summary text");
+        // The stored content must pass the L2 gate by construction;
+        // if a future refactor weakens the envelope this assertion
+        // catches it immediately.
+        assert!(
+            astra_turn_types::should_store_persistent_memory(content, "semantic").is_ok(),
+            "auto-stored compaction summary must satisfy L2 gate"
+        );
     }
 
     #[tokio::test]
