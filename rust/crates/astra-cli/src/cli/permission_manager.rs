@@ -594,12 +594,15 @@ impl PermissionManager {
             return match Self::prompt_approval(ApprovalPromptKind::ConfirmOnce) {
                 'y' => ApprovalDecision::Allow,
                 '!' => {
+                    let was_auto = matches!(self.mode, PermissionMode::Auto);
                     self.set_mode(PermissionMode::Auto);
-                    eprintln!(
-                        "  {}",
-                        "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
-                            .yellow()
-                    );
+                    if !was_auto {
+                        eprintln!(
+                            "  {}",
+                            "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
+                                .yellow()
+                        );
+                    }
                     ApprovalDecision::Allow
                 }
                 _ => ApprovalDecision::Deny,
@@ -678,12 +681,15 @@ impl PermissionManager {
             return match ch {
                 'y' => ApprovalDecision::Allow,
                 '!' => {
+                    let was_auto = matches!(self.mode, PermissionMode::Auto);
                     self.set_mode(PermissionMode::Auto);
-                    eprintln!(
-                        "  {}",
-                        "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
-                            .yellow()
-                    );
+                    if !was_auto {
+                        eprintln!(
+                            "  {}",
+                            "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
+                                .yellow()
+                        );
+                    }
                     ApprovalDecision::Allow
                 }
                 _ => ApprovalDecision::Deny,

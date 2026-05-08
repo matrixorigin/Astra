@@ -510,18 +510,28 @@ async fn run_chat_repl(
                             };
                             let _ = tx.send(response);
                             if autorun {
+                                let was_auto = matches!(
+                                    state.perm_manager.mode(),
+                                    permission_manager::PermissionMode::Auto
+                                );
                                 state
                                     .perm_manager
                                     .set_mode(permission_manager::PermissionMode::Auto);
-                                eprintln!(
-                                    "  {} {} All tools auto-approved for this session.",
-                                    "⚡".yellow(),
-                                    "Auto-run enabled!".bold().yellow()
-                                );
-                                eprintln!(
-                                    "  {}",
-                                    "  Use /allow prompt to restore confirmation prompts.".dim()
-                                );
+                                if !was_auto {
+                                    // Transition-only banner — repeat '!' while
+                                    // already in Auto is a no-op so the user
+                                    // doesn't see the banner fire twice
+                                    // (observed in session c6e18730).
+                                    eprintln!(
+                                        "  {} {} All tools auto-approved for this session.",
+                                        "⚡".yellow(),
+                                        "Auto-run enabled!".bold().yellow()
+                                    );
+                                    eprintln!(
+                                        "  {}",
+                                        "  Use /allow prompt to restore confirmation prompts.".dim()
+                                    );
+                                }
                             } else if approved {
                                 eprintln!("  {} Approved", theme::icon_ok());
                             } else {

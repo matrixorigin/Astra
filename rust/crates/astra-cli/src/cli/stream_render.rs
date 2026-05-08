@@ -1909,12 +1909,21 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             pm.record_approval(&t, Some(args), true);
                         }
                         if ch == '!' {
-                            pm.set_mode(crate::permission_manager::PermissionMode::Auto);
-                            eprintln!(
-                                "  {}",
-                                "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
-                                    .yellow()
+                            let was_auto = matches!(
+                                pm.mode(),
+                                crate::permission_manager::PermissionMode::Auto
                             );
+                            pm.set_mode(crate::permission_manager::PermissionMode::Auto);
+                            if !was_auto {
+                                // Banner only on actual transition Prompt/Deny → Auto.
+                                // Repeat '!' while already in Auto is a no-op — avoid
+                                // the double-banner the user saw in session c6e18730.
+                                eprintln!(
+                                    "  {}",
+                                    "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
+                                        .yellow()
+                                );
+                            }
                         }
                         if ch == 'a' {
                             let rule =
@@ -2098,15 +2107,23 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         pm.record_approval(&sandbox_tool_key, Some(args), true);
                                     }
                                     if ch == '!' {
+                                        let was_auto = matches!(
+                                            pm.mode(),
+                                            crate::permission_manager::PermissionMode::Auto
+                                        );
                                         pm.set_mode(
                                             crate::permission_manager::PermissionMode::Auto,
                                         );
-                                        use crossterm::style::Stylize;
-                                        eprintln!(
-                                            "  {}",
-                                            "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
-                                            .yellow()
-                                        );
+                                        if !was_auto {
+                                            // Transition-only banner. Repeat '!'
+                                            // while already in Auto is a no-op.
+                                            use crossterm::style::Stylize;
+                                            eprintln!(
+                                                "  {}",
+                                                "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
+                                                .yellow()
+                                            );
+                                        }
                                     }
                                     if ch == 's' {
                                         pm.record_approval(&sandbox_tool_key, Some(args), false);

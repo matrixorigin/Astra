@@ -101,13 +101,45 @@ fn derive_turn_interaction_mode(
     render_is_silent: bool,
     stdin_is_terminal: bool,
 ) -> TurnInteractionMode {
-    if is_plan_subtask || has_approval_request_tx || render_is_silent || !stdin_is_terminal {
+    // Plan subtasks are a structural override: a delegated subtask has
+    // no user-facing session, so Auto/Prompt/Deny all collapse to
+    // NonInteractive. Nothing the subtask does should depend on the
+    // parent user's mode.
+    if is_plan_subtask {
         return TurnInteractionMode::NonInteractive;
     }
+
     match permission_mode {
-        PermissionMode::Prompt => TurnInteractionMode::Prompt,
+        // Auto is the user's explicit opt-in to "run uninterrupted" —
+        // it stays Auto regardless of stdin/approval-channel/silent
+        // render. All of those signals only matter for Prompt (which
+        // needs stdin to ask the user), and Auto already short-circuits
+        // prompts anyway. Regression for session c6e18730 where piped
+        // or silent contexts silently demoted Auto → NonInteractive,
+        // which in turn disabled the nudge-suppression gate the user
+        // opted into.
         PermissionMode::Auto => TurnInteractionMode::Auto,
-        PermissionMode::Deny => TurnInteractionMode::Deny,
+        // Prompt requires user interaction; if we can't actually prompt
+        // (no tty, alternate approval channel, silenced UI), fall back
+        // to NonInteractive so callers don't block on a human.
+        PermissionMode::Prompt => {
+            if has_approval_request_tx || render_is_silent || !stdin_is_terminal {
+                TurnInteractionMode::NonInteractive
+            } else {
+                TurnInteractionMode::Prompt
+            }
+        }
+        // Deny under non-interactive contexts also collapses to
+        // NonInteractive: there's nothing to refuse interactively and
+        // Deny's deterministic-denial behaviour is already what
+        // NonInteractive callers expect.
+        PermissionMode::Deny => {
+            if has_approval_request_tx || render_is_silent || !stdin_is_terminal {
+                TurnInteractionMode::NonInteractive
+            } else {
+                TurnInteractionMode::Deny
+            }
+        }
     }
 }
 
@@ -627,6 +659,76 @@ mod tests {
         );
         assert_eq!(
             derive_turn_interaction_mode(PermissionMode::Prompt, false, true, false, true),
+            TurnInteractionMode::NonInteractive
+        );
+    }
+
+    // ── Auto mode preservation under non-interactive contexts ─────────
+    //
+    // The user's Auto-mode intent is "don't interrupt me, trust the
+    // model". This must NOT be silently demoted to NonInteractive just
+    // because the turn is happening in a piped-stdin / silent-render /
+    // approval-channel context — those only matter for Prompt mode (no
+    // stdin to prompt on → fall back to NonInteractive so nothing
+    // blocks on a human). In Auto, there's nothing to prompt anyway,
+    // so the structural non-interactivity is orthogonal.
+    //
+    // Regression for session c6e18730: Auto-mode user saw `## ⚠
+    // Sequential Tool Calls Detected` nudges injected into message
+    // history because `suppresses_loop_nudges` in agentic_loop_execution_phase
+    // gates on `TurnInteractionMode::Auto`, but derive_turn_interaction_mode
+    // was collapsing Auto → NonInteractive for any structural reason,
+    // so `suppress_nudges` evaluated false and nudges fired.
+
+    #[test]
+    fn derive_turn_interaction_mode_preserves_auto_without_tty() {
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Auto, false, false, false, false),
+            TurnInteractionMode::Auto,
+            "Auto must NOT be demoted to NonInteractive just because stdin is piped — \
+             user's opt-in to uninterrupted execution still applies"
+        );
+    }
+
+    #[test]
+    fn derive_turn_interaction_mode_preserves_auto_with_silent_render() {
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Auto, false, false, true, true),
+            TurnInteractionMode::Auto,
+            "silent render (e.g. --quiet or harness) must not override Auto intent"
+        );
+    }
+
+    #[test]
+    fn derive_turn_interaction_mode_preserves_auto_with_approval_channel() {
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Auto, false, true, false, true),
+            TurnInteractionMode::Auto,
+            "approval-tx (e.g. web-approval flow) is irrelevant to Auto — Auto short-\
+             circuits approvals anyway"
+        );
+    }
+
+    #[test]
+    fn derive_turn_interaction_mode_demotes_auto_only_for_plan_subtask() {
+        // Plan subtasks are structurally non-interactive: the subtask
+        // agent has no user-facing session, and injected nudges land
+        // in a throwaway context. Auto→NonInteractive here is OK.
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Auto, true, false, false, true),
+            TurnInteractionMode::NonInteractive,
+            "plan subtasks have no user-facing mode distinction — NonInteractive"
+        );
+    }
+
+    #[test]
+    fn derive_turn_interaction_mode_demotes_deny_like_prompt() {
+        // Deny mode under non-interactive also falls back to
+        // NonInteractive (no opportunity to refuse anything
+        // interactively — and Deny's behaviour is already deterministic
+        // denial, same as NonInteractive's restrictive default).
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Deny, false, false, false, false),
             TurnInteractionMode::NonInteractive
         );
     }
