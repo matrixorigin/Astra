@@ -5,6 +5,7 @@
 
 pub mod continuity;
 mod implicit_feedback;
+mod memory_ranking;
 mod memory_structure;
 mod memory_writability;
 mod result_quality;
@@ -15,6 +16,10 @@ mod tool_idempotency;
 pub use implicit_feedback::{
     ImplicitSignal, StructuredFeedback, detect_implicit_feedback_signal,
     implicit_feedback_context_injection, implicit_feedback_rating,
+};
+pub use memory_ranking::{
+    PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE, composite_score,
+    is_persistent_type, partition_by_scope, sort_memories, tier_weight,
 };
 pub use memory_structure::{
     PERSISTENT_MEMORY_TYPES, PersistentStoreRejection, is_persistent_memory_type,

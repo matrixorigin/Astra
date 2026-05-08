@@ -3,10 +3,18 @@
 //! Provides hybrid retrieval (full message + entity-keyword) from Memoria HTTP API,
 //! merging and deduplicating results into a structured section for injection into
 //! the system prompt.
+//!
+//! Ranking (L3): retrieved memories are re-ordered by composite score
+//! (`raw_retrieval_score × tier_weight`) before the content is flattened
+//! into the `## User Memories` section. A T1 VERIFIED user preference
+//! outranks a T3 INFERRED auto-compaction summary even if the summary
+//! has a higher raw vector score — see
+//! [`astra_turn_types::composite_score`].
 
 use std::time::Instant;
 
 use astra_turn_core::context_sources::MemoryEntry as ContextMemoryEntry;
+use astra_turn_types::RankableMemory;
 
 /// Result of a memory prefetch operation.
 #[derive(Debug, Default)]
@@ -35,18 +43,35 @@ pub async fn prefetch_memories(
     let trimmed_msg = user_msg.trim();
 
     // Parallel fetch: full message retrieval + entity-keyword retrieval via tokio::join!
+    // Each fetch returns structured memories (content + memory_type +
+    // retrieval_score + trust_tier) so the merge step can re-rank by
+    // composite score instead of flat vector similarity.
     let do_entity = !entity_query.is_empty() && entity_query != trimmed_msg;
     let (full_result, entity_result) = tokio::join!(
-        fetch_memories(mem_url, mem_key, trimmed_msg, user_id, top_k),
+        fetch_memories_structured(mem_url, mem_key, trimmed_msg, user_id, top_k),
         async {
             if do_entity {
-                fetch_memories(mem_url, mem_key, &entity_query, user_id, top_k).await
+                fetch_memories_structured(mem_url, mem_key, &entity_query, user_id, top_k).await
             } else {
-                String::new()
+                Vec::new()
             }
         }
     );
-    let merged = merge_memory_results(&[&full_result, &entity_result]);
+    // Merge by memory_id (dedup across the two parallel queries), then
+    // re-rank by composite score, then cap at top_k*2 (heuristic: we
+    // want enough to pick from downstream but not 100s).
+    let mut merged_records = merge_structured_results(full_result, entity_result);
+    astra_turn_types::sort_memories(&mut merged_records);
+    let ranked_cap = (top_k as usize).saturating_mul(2).max(top_k as usize);
+    merged_records.truncate(ranked_cap);
+
+    // Legacy downstream code still takes `Vec<String>` — flatten
+    // post-ranking so higher-trust entries land at the top of the
+    // `## User Memories` section.
+    let merged: Vec<String> = merged_records
+        .iter()
+        .map(|m| m.content.clone())
+        .collect();
     let fetch_ms = started.elapsed().as_millis() as i64;
     let preview = merged.iter().take(3).map(|l| l.to_string()).collect();
     let items = merged.len();
@@ -61,7 +86,29 @@ pub async fn prefetch_memories(
     }
 }
 
+/// Merge two structured-retrieval results, deduplicating by
+/// `memory_id`. The first occurrence of a given id wins — the full
+/// message query is passed first so its hits take priority on ties.
+pub(crate) fn merge_structured_results(
+    full: Vec<RankableMemory>,
+    entity: Vec<RankableMemory>,
+) -> Vec<RankableMemory> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(full.len() + entity.len());
+    for m in full.into_iter().chain(entity) {
+        if seen.insert(m.memory_id.clone()) {
+            out.push(m);
+        }
+    }
+    out
+}
+
 /// Merge and deduplicate memory results from multiple retrieval queries.
+///
+/// Retained for the test-suite which exercises the string-flat API.
+/// Production code goes through `merge_structured_results` which
+/// preserves tier / memory_type so ranking can apply.
+#[cfg(test)]
 pub(crate) fn merge_memory_results(results: &[&str]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut merged = Vec::new();
@@ -293,6 +340,7 @@ fn fetch_memories_timeouts() -> (std::time::Duration, std::time::Duration) {
 }
 
 /// Fetch memories from Memoria HTTP API. Returns joined content string.
+#[cfg(test)]
 async fn fetch_memories(
     base_url: &str,
     api_key: &str,
@@ -300,6 +348,31 @@ async fn fetch_memories(
     user_id: &str,
     top_k: u32,
 ) -> String {
+    // Legacy string-flat API, kept for tests that exercise only the
+    // content path. Production goes through `fetch_memories_structured`.
+    fetch_memories_structured(base_url, api_key, query, user_id, top_k)
+        .await
+        .into_iter()
+        .map(|m| m.content)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Hit the Memoria retrieve endpoint and deserialize responses into
+/// `RankableMemory` records that preserve `memory_type`, `trust_tier`,
+/// and `retrieval_score`. These fields are needed for composite-score
+/// ranking (L3); the legacy string-flat path threw them away.
+///
+/// Returns an empty vector on any failure (network, HTTP, parse) so
+/// the caller can treat recall as purely additive — a failed fetch
+/// never breaks the turn.
+async fn fetch_memories_structured(
+    base_url: &str,
+    api_key: &str,
+    query: &str,
+    user_id: &str,
+    top_k: u32,
+) -> Vec<RankableMemory> {
     let (connect_timeout, request_timeout) = fetch_memories_timeouts();
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -322,20 +395,60 @@ async fn fetch_memories(
         Ok(r) => r,
         Err(e) => {
             astra_core::agent_error!("memory", "fetch error: {e:#}");
-            return String::new();
+            return Vec::new();
         }
     };
     if !resp.status().is_success() {
-        return String::new();
+        return Vec::new();
     }
     let arr = match resp.json::<Vec<serde_json::Value>>().await {
         Ok(a) => a,
-        Err(_) => return String::new(),
+        Err(_) => return Vec::new(),
     };
-    arr.iter()
-        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
-        .collect::<Vec<_>>()
-        .join("\n")
+    arr.into_iter().filter_map(parse_rankable).collect()
+}
+
+/// Parse one Memoria retrieve-response entry into a `RankableMemory`.
+/// Requires `content` and `memory_id`; everything else is optional
+/// and filled with reasonable defaults. Returns `None` when the
+/// required fields are missing (Memoria server bug, don't crash).
+fn parse_rankable(value: serde_json::Value) -> Option<RankableMemory> {
+    let content = value.get("content")?.as_str()?.to_string();
+    if content.is_empty() {
+        return None;
+    }
+    // memory_id may be absent in some legacy responses; fall back to
+    // a hash of the content so dedup still functions.
+    let memory_id = value
+        .get("memory_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            content.hash(&mut h);
+            format!("anon-{:x}", h.finish())
+        });
+    let memory_type = value
+        .get("memory_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let retrieval_score = value
+        .get("retrieval_score")
+        .and_then(serde_json::Value::as_f64);
+    let trust_tier = value
+        .get("trust_tier")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    Some(RankableMemory {
+        memory_id,
+        content,
+        memory_type,
+        retrieval_score,
+        trust_tier,
+    })
 }
 
 #[cfg(test)]
@@ -418,6 +531,151 @@ mod tests {
     fn merge_empty_inputs() {
         assert!(merge_memory_results(&["", ""]).is_empty());
         assert!(merge_memory_results(&[]).is_empty());
+    }
+
+    // ── L3: parse_rankable preserves ranking metadata ──────────────────
+
+    #[test]
+    fn parse_rankable_extracts_full_metadata() {
+        let json = serde_json::json!({
+            "memory_id": "m-42",
+            "content": "[@pref/active] senior Rust engineer",
+            "memory_type": "profile",
+            "retrieval_score": 0.72,
+            "trust_tier": "T1",
+        });
+        let m = parse_rankable(json).expect("valid entry");
+        assert_eq!(m.memory_id, "m-42");
+        assert_eq!(m.content, "[@pref/active] senior Rust engineer");
+        assert_eq!(m.memory_type, "profile");
+        assert_eq!(m.retrieval_score, Some(0.72));
+        assert_eq!(m.trust_tier.as_deref(), Some("T1"));
+    }
+
+    #[test]
+    fn parse_rankable_fills_memory_id_from_content_hash_when_absent() {
+        // Some legacy Memoria responses omit memory_id. parse_rankable
+        // falls back to a deterministic content-hash id so dedup in
+        // merge_structured_results still works.
+        let json = serde_json::json!({
+            "content": "some legacy memory",
+            "memory_type": "semantic",
+        });
+        let m = parse_rankable(json).expect("must parse with fallback id");
+        assert!(
+            m.memory_id.starts_with("anon-"),
+            "fallback id missing: {}",
+            m.memory_id
+        );
+        // Same content → same fallback id (so dedup works).
+        let json2 = serde_json::json!({
+            "content": "some legacy memory",
+            "memory_type": "working",
+        });
+        let m2 = parse_rankable(json2).unwrap();
+        assert_eq!(m.memory_id, m2.memory_id);
+    }
+
+    #[test]
+    fn parse_rankable_rejects_empty_content() {
+        let json = serde_json::json!({
+            "memory_id": "m-1",
+            "content": "",
+        });
+        assert!(parse_rankable(json).is_none());
+    }
+
+    #[test]
+    fn parse_rankable_rejects_missing_content() {
+        let json = serde_json::json!({"memory_id": "m-1"});
+        assert!(parse_rankable(json).is_none());
+    }
+
+    // ── L3: merge_structured_results dedups and preserves order ────────
+
+    #[test]
+    fn merge_structured_dedupes_by_memory_id() {
+        use astra_turn_types::RankableMemory;
+        let full = vec![
+            RankableMemory {
+                memory_id: "shared".into(),
+                content: "from full query".into(),
+                memory_type: "semantic".into(),
+                retrieval_score: Some(0.9),
+                trust_tier: Some("T1".into()),
+            },
+            RankableMemory {
+                memory_id: "full-only".into(),
+                content: "full unique".into(),
+                memory_type: "semantic".into(),
+                retrieval_score: Some(0.7),
+                trust_tier: Some("T2".into()),
+            },
+        ];
+        let entity = vec![
+            // Same memory_id as the full query hit — must be dedupped.
+            RankableMemory {
+                memory_id: "shared".into(),
+                content: "from entity query".into(),
+                memory_type: "semantic".into(),
+                retrieval_score: Some(0.6),
+                trust_tier: Some("T1".into()),
+            },
+            RankableMemory {
+                memory_id: "entity-only".into(),
+                content: "entity unique".into(),
+                memory_type: "episodic".into(),
+                retrieval_score: Some(0.8),
+                trust_tier: Some("T3".into()),
+            },
+        ];
+        let merged = merge_structured_results(full, entity);
+        let ids: Vec<&str> = merged.iter().map(|m| m.memory_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["shared", "full-only", "entity-only"],
+            "first occurrence wins; full query goes before entity query"
+        );
+        // The "shared" entry must be the one from the full query
+        // (dedup kept the first occurrence).
+        assert_eq!(merged[0].content, "from full query");
+    }
+
+    // ── L3: end-to-end ranking through prefetch output ─────────────────
+    //
+    // Can't drive prefetch_memories with a real HTTP server here, but
+    // we can assert the observable invariant: when rank-eligible data
+    // reaches `sort_memories`, higher-trust entries land at the front.
+    // The c6e18730 reproduction test lives in astra-turn-types and
+    // covers that logic end-to-end; here we just confirm merge+rank
+    // composes correctly.
+
+    #[test]
+    fn merge_then_rank_puts_curated_fact_before_inferred_summary() {
+        use astra_turn_types::RankableMemory;
+        let full = vec![
+            RankableMemory {
+                memory_id: "compact-blob".into(),
+                content: "[@episode/compaction] session=abc auto-summary".into(),
+                memory_type: "episodic".into(),
+                retrieval_score: Some(0.82),
+                trust_tier: Some("T3".into()),
+            },
+        ];
+        let entity = vec![RankableMemory {
+            memory_id: "user-pref".into(),
+            content: "[@pref/active] prefers terse answers".into(),
+            memory_type: "profile".into(),
+            retrieval_score: Some(0.65),
+            trust_tier: Some("T1".into()),
+        }];
+        let mut merged = merge_structured_results(full, entity);
+        astra_turn_types::sort_memories(&mut merged);
+        assert_eq!(
+            merged[0].memory_id, "user-pref",
+            "T1@0.65 ({}) must beat T3@0.82 ({})",
+            0.65, 0.82 * 0.55
+        );
     }
 
     #[test]
