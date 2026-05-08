@@ -981,9 +981,10 @@ impl InProcessChatTurnBridge {
             // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
             // Also capture fallback_chain for rate-limit-triggered fallback.
             let pool_ref = shared_pool.as_ref().map(SharedPool::get);
-            let (mut model_name, mut api_key, mut base_url, mut provider, fallback_chain) = if use_e2e_llm {
+            let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, fallback_chain) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
+                    None::<String>,
                     "unused".to_string(),
                     "http://127.0.0.1:1".to_string(),
                     "openai".to_string(),
@@ -998,7 +999,14 @@ impl InProcessChatTurnBridge {
                 )
                 .await
                 {
-                    Ok(m) => (m.model_name, m.api_key, m.base_url, m.provider, m.fallback_chain),
+                    Ok(m) => (
+                        m.model_name,
+                        m.wire_model_name,
+                        m.api_key,
+                        m.base_url,
+                        m.provider,
+                        m.fallback_chain,
+                    ),
                     Err(e) => {
                         yield render_sse_map(&build_stream_error_event(&e, "MODEL_NOT_AVAILABLE", false));
                         mark_disconnect_capture_finalized(&disconnect_capture_state);
@@ -1058,6 +1066,7 @@ impl InProcessChatTurnBridge {
                     {
                         FallbackOutcome::Resolved(fb) => {
                             model_name = fb.model_name;
+                            wire_model_name = fb.wire_model_name;
                             api_key = fb.api_key;
                             base_url = fb.base_url;
                             provider = fb.provider;
@@ -1961,6 +1970,7 @@ impl InProcessChatTurnBridge {
                             &llm_messages,
                             &pruned_tools,
                             &model_name,
+                            wire_model_name.as_deref(),
                             &api_key,
                             &base_url,
                             &provider,
@@ -2087,6 +2097,7 @@ impl InProcessChatTurnBridge {
                                 &llm_messages,
                                 &pruned_tools,
                                 &model_name,
+                                wire_model_name.as_deref(),
                                 &api_key,
                                 &base_url,
                                 &provider,

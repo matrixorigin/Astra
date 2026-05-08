@@ -233,6 +233,9 @@ fn mock_round_partial_text(error: &astra_core::ClassifiedError) -> Option<String
 #[derive(Debug, Clone)]
 struct ResolvedTurnLlmConfig {
     model_name: String,
+    /// Upstream literal name to put in the request body's `model` field.
+    /// `None` → send `model_name`. See `ResolvedActiveLlmModel::upstream_model_name`.
+    wire_model_name: Option<String>,
     api_key: String,
     base_url: String,
     provider: String,
@@ -338,6 +341,7 @@ async fn resolve_llm_model_for_turn(
         return Ok(ResolvedTurnLlmConfig {
             model_name: normalize_request_model(preferred_model)
                 .unwrap_or_else(|| "gpt-4o-mini".to_string()),
+            wire_model_name: None,
             api_key: String::new(),
             base_url: "https://api.openai.com/v1".to_string(),
             provider: "openai".to_string(),
@@ -352,6 +356,7 @@ async fn resolve_llm_model_for_turn(
             .await?;
     Ok(ResolvedTurnLlmConfig {
         model_name: resolved.model_name,
+        wire_model_name: resolved.wire_model_name,
         api_key: resolved.api_key,
         base_url: resolved.base_url,
         provider: resolved.provider,
@@ -2410,6 +2415,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_messages,
                 &final_tools,
                 &llm_cfg.model_name,
+                llm_cfg.wire_model_name.as_deref(),
                 &llm_cfg.api_key,
                 &llm_cfg.base_url,
                 &llm_cfg.provider,
@@ -2807,6 +2813,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &reflection_messages,
             &[],
             &llm_cfg.model_name,
+            llm_cfg.wire_model_name.as_deref(),
             &llm_cfg.api_key,
             &llm_cfg.base_url,
             &llm_cfg.provider,
@@ -3798,6 +3805,7 @@ mod tests {
         // list is equivalent to the real runtime path here.
         let llm_cfg = ResolvedTurnLlmConfig {
             model_name: "gpt-4".into(),
+            wire_model_name: None,
             api_key: String::new(),
             base_url: String::new(),
             provider: "openai".into(),

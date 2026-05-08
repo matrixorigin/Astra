@@ -43,6 +43,22 @@ pub struct QuirksData {
     /// rate limits or becomes unavailable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_chain: Vec<String>,
+    /// Upstream model name sent in the `model` field of the LLM request.
+    ///
+    /// When the local registry needs to track the same upstream model under
+    /// multiple local rows (different providers, base URLs, or credentials —
+    /// e.g. `deepseek-v4-pro` wired as `provider=openai` on
+    /// `api.deepseek.com`, plus a second row `deepseek-v4-pro-anthropic`
+    /// wired as `provider=anthropic` on `api.deepseek.com/anthropic`), the
+    /// two rows must have different local `model_name`s (UNIQUE constraint
+    /// on the DB column) while still sending the SAME literal name to the
+    /// upstream API. `wire_model_name` is that literal upstream name;
+    /// when `None`, the local `model_name` is used as-is.
+    ///
+    /// Lives inside `QuirksData` — stored as JSON in the `quirks_json`
+    /// column — so adding it required no DB migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_model_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -180,7 +196,16 @@ pub struct ModelListItem {
 /// Decrypted credentials for the active (or preferred) row in `infra_llm_models`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedActiveLlmModel {
+    /// Local model name used for routing, telemetry, fallback_chain lookups,
+    /// and capture-file labels. Unique per row.
     pub model_name: String,
+    /// Optional literal name to send in the upstream LLM `model` field.
+    /// `None` means the upstream receives `model_name` verbatim.
+    ///
+    /// Callers building an outbound request MUST read this via
+    /// [`ResolvedActiveLlmModel::upstream_model_name`] so the alias
+    /// contract is honored.
+    pub wire_model_name: Option<String>,
     pub api_key: String,
     pub base_url: String,
     pub provider: String,
@@ -188,6 +213,18 @@ pub struct ResolvedActiveLlmModel {
     pub tags: Vec<String>,
     /// Probe-determined thinking capability. NULL if unprobed.
     pub thinking_capability: Option<ThinkingCapability>,
+}
+
+impl ResolvedActiveLlmModel {
+    /// Name to put in the `model` field of the outbound LLM request.
+    ///
+    /// Returns `wire_model_name` when set (for alias rows that want to
+    /// send a different upstream name than their local `model_name`),
+    /// otherwise the local `model_name` unchanged.
+    #[must_use]
+    pub fn upstream_model_name(&self) -> &str {
+        self.wire_model_name.as_deref().unwrap_or(&self.model_name)
+    }
 }
 
 fn build_resolved_active_llm_from_row(
@@ -237,9 +274,11 @@ fn build_resolved_active_llm_from_row(
     let thinking_capability = ThinkingCapability::from_db(thinking_cap_str.as_deref());
 
     let fallback_chain = quirks.fallback_chain;
+    let wire_model_name = quirks.wire_model_name;
 
     Ok(ResolvedActiveLlmModel {
         model_name,
+        wire_model_name,
         api_key,
         base_url,
         provider,
@@ -937,9 +976,18 @@ impl ModelService for DatabaseModelService {
             .base_url
             .or_else(|| resolve_provider_base_url(&request.provider));
 
+        // Prefer the wire-level name for connectivity + thinking probes so
+        // alias rows (name=deepseek-v4-pro-anthropic, wire=deepseek-v4-pro)
+        // probe with a valid upstream id. Falls back to the local name when
+        // no alias is configured.
+        let probe_name = request
+            .quirks
+            .as_ref()
+            .and_then(|q| q.wire_model_name.as_deref())
+            .unwrap_or(&request.name);
         let conn_result = validate_connectivity(
             &request.provider,
-            &request.name,
+            probe_name,
             &request.api_key,
             base_url.as_deref(),
         )
@@ -1079,12 +1127,15 @@ impl ModelService for DatabaseModelService {
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let existing =
-            query("SELECT model_id, base_url, provider FROM infra_llm_models WHERE model_name = ?")
-                .bind(&model_name)
-                .fetch_optional(&pool)
-                .await
-                .map_err(internal_error)?;
+        let existing = query(
+            "SELECT model_id, base_url, provider, \
+                    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json \
+             FROM infra_llm_models WHERE model_name = ?",
+        )
+        .bind(&model_name)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?;
         let existing = existing.ok_or_else(|| {
             error_response(
                 StatusCode::NOT_FOUND,
@@ -1100,6 +1151,22 @@ impl ModelService for DatabaseModelService {
             });
         let effective_provider = request.provider.as_deref().unwrap_or(&stored_provider);
 
+        // Compute the upstream probe name: request's incoming quirks
+        // (when re-sync supplies a new wire_model_name) takes precedence;
+        // otherwise fall back to the stored quirks from DB; otherwise the
+        // local row name.
+        let stored_quirks_json: String = existing
+            .try_get("quirks_json")
+            .unwrap_or_else(|_| "{}".to_string());
+        let stored_quirks: QuirksData =
+            serde_json::from_str(&stored_quirks_json).unwrap_or_default();
+        let probe_name: String = request
+            .quirks
+            .as_ref()
+            .and_then(|q| q.wire_model_name.clone())
+            .or(stored_quirks.wire_model_name)
+            .unwrap_or_else(|| model_name.clone());
+
         let mut conn_result: Option<String> = None;
 
         if let Some(api_key) = &request.api_key {
@@ -1110,7 +1177,7 @@ impl ModelService for DatabaseModelService {
                 .or_else(|| existing.try_get("base_url").ok());
             let check = validate_connectivity(
                 effective_provider,
-                &model_name,
+                &probe_name,
                 api_key,
                 base_url.as_deref(),
             )
@@ -1236,12 +1303,25 @@ impl ModelService for DatabaseModelService {
         let encrypted: String = row.try_get("api_key_encrypted").map_err(internal_error)?;
         let provider: String = row.try_get("provider").map_err(internal_error)?;
         let base_url: Option<String> = row.try_get("base_url").ok();
+        let quirks_json: String = row
+            .try_get("quirks_json")
+            .unwrap_or_else(|_| "{}".to_string());
+        let quirks: QuirksData = serde_json::from_str(&quirks_json).unwrap_or_default();
+        // For probes we send the UPSTREAM name (wire_model_name override)
+        // rather than the local row name, so the probe actually reaches a
+        // valid upstream model id. Without this, alias rows like
+        // `deepseek-v4-pro-anthropic` fail connectivity with 400 "unknown
+        // model" even though the upstream is reachable.
+        let probe_name: String = quirks
+            .wire_model_name
+            .clone()
+            .unwrap_or_else(|| model_name.clone());
 
         let api_key = self.encryptor.decrypt(&encrypted).map_err(internal_error)?;
 
         // Phase 1: connectivity probe
         let check =
-            validate_connectivity(&provider, &model_name, &api_key, base_url.as_deref()).await;
+            validate_connectivity(&provider, &probe_name, &api_key, base_url.as_deref()).await;
 
         let is_active: i16 = if check.is_none() { 1 } else { 0 };
         query("UPDATE infra_llm_models SET is_active = ?, updated_at = NOW() WHERE model_name = ?")
@@ -1254,7 +1334,7 @@ impl ModelService for DatabaseModelService {
         // Phase 2: two-phase thinking behavior probe (only when connected)
         let thinking_probe = if check.is_none() {
             let result =
-                probe_thinking_behavior(&provider, &model_name, &api_key, base_url.as_deref())
+                probe_thinking_behavior(&provider, &probe_name, &api_key, base_url.as_deref())
                     .await;
             // Persist probe result to DB.
             // Only write capability when the probe succeeded (no error).
@@ -2411,6 +2491,64 @@ mod tests {
         assert!(p.prompt < 0.0);
     }
 
+    // -- wire_model_name alias --
+
+    #[test]
+    fn resolved_upstream_name_prefers_wire_model_name_when_set() {
+        let r = ResolvedActiveLlmModel {
+            model_name: "deepseek-v4-pro-anthropic".into(),
+            wire_model_name: Some("deepseek-v4-pro".into()),
+            api_key: "k".into(),
+            base_url: "https://api.deepseek.com/anthropic".into(),
+            provider: "anthropic".into(),
+            fallback_chain: vec![],
+            tags: vec![],
+            thinking_capability: None,
+        };
+        assert_eq!(r.upstream_model_name(), "deepseek-v4-pro");
+        // The local name is still reachable for routing / metrics.
+        assert_eq!(r.model_name, "deepseek-v4-pro-anthropic");
+    }
+
+    #[test]
+    fn resolved_upstream_name_falls_back_to_local_name_when_unset() {
+        let r = ResolvedActiveLlmModel {
+            model_name: "claude-sonnet-4-6".into(),
+            wire_model_name: None,
+            api_key: "k".into(),
+            base_url: "https://api.anthropic.com".into(),
+            provider: "anthropic".into(),
+            fallback_chain: vec![],
+            tags: vec![],
+            thinking_capability: None,
+        };
+        assert_eq!(r.upstream_model_name(), "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn quirks_wire_model_name_round_trips_through_json() {
+        let q = QuirksData {
+            wire_model_name: Some("deepseek-v4-pro".into()),
+            ..QuirksData::default()
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        assert!(json.contains("wire_model_name"));
+        let back: QuirksData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.wire_model_name.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn quirks_wire_model_name_omitted_when_none() {
+        // `skip_serializing_if = "Option::is_none"` keeps legacy rows that
+        // never carry a wire name from bloating their quirks_json payload.
+        let q = QuirksData::default();
+        let json = serde_json::to_string(&q).unwrap();
+        assert!(
+            !json.contains("wire_model_name"),
+            "unset wire_model_name must not appear in serialized quirks, got: {json}"
+        );
+    }
+
     // -- QuirksData --
 
     #[test]
@@ -2462,6 +2600,7 @@ mod tests {
             no_system_message: false,
             system_as_user_prefix: true,
             fallback_chain: vec!["claude-haiku".into(), "gpt-4o-mini".into()],
+            wire_model_name: Some("deepseek-v4-pro".into()),
         };
         let json = serde_json::to_string(&q).unwrap();
         let restored: QuirksData = serde_json::from_str(&json).unwrap();
