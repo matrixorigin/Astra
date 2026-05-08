@@ -34,6 +34,7 @@ mod slash_menu;
 mod state;
 mod status_line;
 mod table_view;
+mod theme;
 mod timeline;
 mod view_stack;
 mod worktrees;
