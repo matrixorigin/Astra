@@ -390,6 +390,11 @@ pub static COMMANDS: &[CommandMeta] = &[
         "List git worktrees for this repo with per-worktree session counts",
         CommandGroup::Core,
     ),
+    CommandMeta::new(
+        "/panels",
+        "Cheat sheet of all TUI-native panels",
+        CommandGroup::Core,
+    ),
     CommandMeta::new("/exit", "Exit the REPL", CommandGroup::Core),
     CommandMeta::new(
         "/quit",

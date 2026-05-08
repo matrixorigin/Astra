@@ -333,6 +333,16 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
+        // ── Panels cheat sheet ──────────────────────────────────────
+        "/panels" => {
+            use crate::tui::bottom_pane::info_view::InfoView;
+            let body = build_panels_cheat_sheet_lines();
+            ctx.bottom_pane.push_view(Box::new(
+                InfoView::from_plain("TUI panels", body).with_reopen("/panels"),
+            ));
+            SlashResult::Handled
+        }
+
         // ── Worktrees (TUI-native) ──────────────────────────────────
         "/worktrees" => {
             use crate::tui::bottom_pane::worktrees_view::WorktreesView;
@@ -615,6 +625,56 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         // ── Everything else → with_restored fallback ────────────────
         _ => SlashResult::Fallback,
     }
+}
+
+/// Cheat sheet content for `/panels`. Pure — separate from the
+/// dispatch wiring so it can be snapshot-tested.
+pub(crate) fn build_panels_cheat_sheet_lines() -> Vec<String> {
+    // (command, one-line purpose, key hint)
+    const PANELS: &[(&str, &str, &str)] = &[
+        (
+            "/resume",
+            "pick and restore a recent session",
+            "↑↓ navigate · type to filter · Enter resume · Esc close",
+        ),
+        (
+            "/context",
+            "visualise the current turn's token budget",
+            "Enter / q / Esc close",
+        ),
+        (
+            "/timeline",
+            "browse this session's turn-by-turn journal",
+            "↑↓ navigate · PgUp/PgDn page · q / Esc close",
+        ),
+        (
+            "/table <sql>",
+            "run a SQL query and render a navigable table",
+            "↑↓ rows · ←→ cols · Home/End jump · q / Esc close",
+        ),
+        (
+            "/worktrees",
+            "list git worktrees with per-worktree session counts",
+            "↑↓ navigate · q / Esc close",
+        ),
+        (
+            "/help",
+            "list every slash command grouped by category",
+            "↑↓ browse · Esc close",
+        ),
+    ];
+    let mut out = Vec::with_capacity(PANELS.len() * 3);
+    for (cmd, desc, hint) in PANELS {
+        out.push(format!("  {cmd}"));
+        out.push(format!("      {desc}"));
+        out.push(format!("      {hint}"));
+        out.push(String::new());
+    }
+    // Trim trailing blank so InfoView scrolls cleanly.
+    while out.last().is_some_and(|s| s.trim().is_empty()) {
+        out.pop();
+    }
+    out
 }
 
 /// Detect the conventional "sess_<…>" / uuid-like session id shape.
@@ -1084,5 +1144,42 @@ fn parse_slash(text: &str) -> (&str, &str) {
     match text.find(' ') {
         Some(pos) => (&text[..pos], text[pos..].trim()),
         None => (text, ""),
+    }
+}
+
+#[cfg(test)]
+mod panels_tests {
+    use super::build_panels_cheat_sheet_lines;
+
+    #[test]
+    fn cheat_sheet_lists_every_tui_native_panel() {
+        let text = build_panels_cheat_sheet_lines().join("\n");
+        for cmd in [
+            "/resume",
+            "/context",
+            "/timeline",
+            "/table",
+            "/worktrees",
+        ] {
+            assert!(
+                text.contains(cmd),
+                "cheat sheet missing {cmd}; got: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn cheat_sheet_shows_key_hints() {
+        let text = build_panels_cheat_sheet_lines().join("\n");
+        assert!(text.contains("↑"));
+        assert!(text.contains("Esc"));
+    }
+
+    #[test]
+    fn cheat_sheet_has_stable_snapshot() {
+        insta::assert_snapshot!(
+            "panels_cheat_sheet",
+            build_panels_cheat_sheet_lines().join("\n")
+        );
     }
 }
