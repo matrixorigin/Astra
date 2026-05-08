@@ -3303,8 +3303,34 @@ fn llm_capture_error_response(error: &astra_core::ClassifiedError) -> Value {
 fn normalize_usage_to_canonical(
     raw: &serde_json::Map<String, Value>,
 ) -> serde_json::Map<String, Value> {
-    // Pass-through when already canonical: presence of either `input_tokens`
-    // or `output_tokens` means the producer already normalized.
+    // Pass-through when already canonical: presence of `cached_input_tokens`
+    // (the canonical cache key; `input_tokens`/`output_tokens` are ambiguous
+    // because Anthropic also uses those names) means the producer already
+    // normalized. Anthropic-dialect detection below takes priority when only
+    // `input_tokens`/`output_tokens` are present alongside the anthropic
+    // cache keys.
+    let looks_anthropic = raw.contains_key("cache_read_input_tokens")
+        || raw.contains_key("cache_creation_input_tokens");
+    if !looks_anthropic
+        && (raw.contains_key("cached_input_tokens")
+            || raw.contains_key("cache_creation_tokens"))
+    {
+        return raw.clone();
+    }
+    // Anthropic dialect (Messages API, deepseek `/anthropic` endpoint, …):
+    // `input_tokens`/`output_tokens` plus separate `cache_read_input_tokens`
+    // and `cache_creation_input_tokens`. Must be checked BEFORE the generic
+    // `input_tokens` canonical fast-path above would match, otherwise the
+    // cache fields would leak through verbatim.
+    if looks_anthropic {
+        if let Some(canonical) = crate::turn::token_usage::extract_usage(
+            crate::turn::token_usage::UsageDialect::AnthropicMessages,
+            raw,
+        ) {
+            return canonical.to_json_map();
+        }
+    }
+    // Canonical fast-path for non-anthropic already-normalized shapes.
     if raw.contains_key("input_tokens") || raw.contains_key("output_tokens") {
         return raw.clone();
     }
@@ -3545,6 +3571,71 @@ mod tests {
         assert_eq!(response["usage"]["cached_input_tokens"].as_i64(), Some(2));
         assert_eq!(response["usage"]["cache_creation_tokens"].as_i64(), Some(1));
         assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(4));
+    }
+
+    #[test]
+    fn llm_capture_error_response_normalizes_anthropic_usage_to_canonical() {
+        // Anthropic-dialect usage (e.g. deepseek `/anthropic` endpoint, direct
+        // Anthropic Messages API) arrives with `input_tokens`/`output_tokens`
+        // at the top level AND separate `cache_read_input_tokens` /
+        // `cache_creation_input_tokens` keys. These must be folded into the
+        // canonical `cached_input_tokens` / `cache_creation_tokens` schema so
+        // downstream cache-rate math sees the hits instead of zeros.
+        let error =
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "boom")
+                .with_details_json(
+                    json!({
+                        "usage": {
+                            "input_tokens": 25,
+                            "output_tokens": 7,
+                            "cache_read_input_tokens": 4864,
+                            "cache_creation_input_tokens": 120
+                        }
+                    })
+                    .to_string(),
+                );
+        let response = llm_capture_error_response(&error);
+        assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(25));
+        assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(7));
+        assert_eq!(
+            response["usage"]["cached_input_tokens"].as_i64(),
+            Some(4864),
+            "anthropic `cache_read_input_tokens` must be folded into canonical `cached_input_tokens`",
+        );
+        assert_eq!(
+            response["usage"]["cache_creation_tokens"].as_i64(),
+            Some(120),
+            "anthropic `cache_creation_input_tokens` must be folded into canonical `cache_creation_tokens`",
+        );
+        assert!(
+            response["usage"].get("cache_read_input_tokens").is_none(),
+            "anthropic-dialect key must not leak through after normalization",
+        );
+    }
+
+    #[test]
+    fn llm_capture_error_response_detects_anthropic_dialect_from_cache_keys_only() {
+        // Edge case: an error artifact that only carries cache fields (no
+        // top-level input/output tokens) — still unambiguously anthropic. We
+        // must recognize the dialect from `cache_read_input_tokens` alone,
+        // otherwise the pass-through branch (triggered by presence of
+        // `input_tokens`) never fires and we silently drop the cache signal.
+        let error =
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "boom")
+                .with_details_json(
+                    json!({
+                        "usage": {
+                            "cache_read_input_tokens": 2048,
+                            "cache_creation_input_tokens": 0
+                        }
+                    })
+                    .to_string(),
+                );
+        let response = llm_capture_error_response(&error);
+        assert_eq!(
+            response["usage"]["cached_input_tokens"].as_i64(),
+            Some(2048),
+        );
     }
 
     #[test]
