@@ -1464,6 +1464,18 @@ impl PermissionManager {
         name: &str,
         args: &serde_json::Value,
     ) -> PermissionDecision {
+        /// Strip the trailing "Ask the user for permission..." instruction
+        /// from sandbox-denied tool output before handing it to the UI.
+        fn trim_sandbox_reason_for_ui(raw: &str) -> String {
+            const INSTRUCTION: &str =
+                "Ask the user for permission before accessing files outside the project.";
+            raw.trim()
+                .trim_end_matches(INSTRUCTION)
+                .trim()
+                .trim_end_matches('.')
+                .to_string()
+                + "."
+        }
         // Sandbox expansion requests always require explicit user approval,
         // regardless of permission mode (except Auto which trusts everything).
         if let Some(inner_tool) = name.strip_prefix("sandbox_expand:") {
@@ -1489,9 +1501,15 @@ impl PermissionManager {
                 }
                 PermissionMode::Prompt => PermissionDecision::NeedApproval {
                     tool: name.to_string(),
-                    header: format!("Sandbox: {inner_tool} needs access outside project"),
-                    detail: Some(reason.to_string()),
-                    reason: "Path is outside the project sandbox boundary".to_string(),
+                    header: format!("{inner_tool} wants to read outside the project"),
+                    // `reason` carries the authoritative message from the
+                    // underlying fs/shell tool (with path + project root);
+                    // leave `detail` empty so it isn't repeated verbatim
+                    // right below the header. Strip the trailing
+                    // "Ask the user for permission..." instruction — it's
+                    // meant for the model, not the human.
+                    detail: None,
+                    reason: trim_sandbox_reason_for_ui(reason),
                 },
             };
         }
@@ -2581,6 +2599,35 @@ mod tests {
             PermissionDecision::NeedApproval { tool, header, .. } => {
                 assert_eq!(tool, "sandbox_expand:bash");
                 assert!(header.contains("bash"));
+            }
+            other => panic!("expected NeedApproval, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_expand_prompt_does_not_echo_reason_into_detail() {
+        // Regression: the UI used to show the same sandbox message in
+        // header, detail, and reason because both stream_render and
+        // permission_manager appended their own copy. The approval now
+        // carries detail=None and a trimmed reason (no "Ask the user…").
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let raw_fs_msg = "Path '/home/x/outside' is outside the project directory '/home/x/inside'. \
+                          Ask the user for permission before accessing files outside the project.";
+        let args = serde_json::json!({"reason": raw_fs_msg});
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        match decision {
+            PermissionDecision::NeedApproval { header, detail, reason, .. } => {
+                assert_eq!(header, "read_file wants to read outside the project");
+                assert_eq!(detail, None, "detail must be empty — it would echo reason");
+                assert!(
+                    !reason.contains("Ask the user"),
+                    "model-facing instruction should be trimmed from UI reason; got: {reason:?}"
+                );
+                assert!(
+                    reason.contains("/home/x/outside"),
+                    "reason keeps the path + project root; got: {reason:?}"
+                );
             }
             other => panic!("expected NeedApproval, got: {other:?}"),
         }

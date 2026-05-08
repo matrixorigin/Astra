@@ -2037,6 +2037,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             crate::permission_manager::PermissionDecision::Allow => true,
                             crate::permission_manager::PermissionDecision::Deny(_) => false,
                             crate::permission_manager::PermissionDecision::NeedApproval {
+                                header,
                                 detail,
                                 reason,
                                 ..
@@ -2044,9 +2045,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 if let Some(tx) = &self.approval_request_tx {
                                     use super::chat_stream::ApprovalResponse;
                                     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                                    // `🔒 ` prefix visually marks sandbox-escape
+                                    // prompts; header/detail/reason otherwise
+                                    // come straight from the permission manager
+                                    // so we don't echo the same text thrice.
                                     let _ = tx.send(super::chat_stream::ApprovalRequest {
                                         tool: sandbox_tool_key.clone(),
-                                        header: format!("🔒 {sandbox_msg}"),
+                                        header: format!("🔒 {header}"),
                                         detail,
                                         reason,
                                         response_tx: resp_tx,
