@@ -86,12 +86,13 @@ pub(crate) fn render(table: &MysqlTable, nav: &TableNav, area: Rect, buf: &mut B
     let mut state = TableState::default();
     state.select(Some(nav.row));
 
+    let theme = crate::tui::theme::current();
     let table_widget = Table::new(body, widths)
         .header(header)
         .row_highlight_style(
             Style::default()
-                .bg(Color::Cyan)
-                .fg(Color::Black)
+                .bg(theme.accent)
+                .fg(theme.selected_fg)
                 .add_modifier(Modifier::BOLD),
         );
 

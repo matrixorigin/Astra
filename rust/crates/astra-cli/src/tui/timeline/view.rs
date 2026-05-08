@@ -89,17 +89,22 @@ fn render_list(tl: &Timeline, area: Rect, buf: &mut Buffer) {
         let absolute = start + idx;
         let is_sel = absolute == selected;
 
+        let theme = crate::tui::theme::current();
         let gutter = if is_sel {
-            Span::styled("▌ ", Style::default().fg(Color::Cyan))
+            Span::styled("▌ ", Style::default().fg(theme.gutter))
         } else {
             Span::raw("  ")
         };
+        // Previously used `Color::White` for non-selected rows, which
+        // made them invisible on light terminals. `theme.fg` resolves
+        // to `Color::Reset` under both presets, letting the terminal
+        // supply whichever is legible for its background.
         let row_color = if t.is_error() {
-            Color::Red
+            theme.error
         } else if is_sel {
-            Color::Cyan
+            theme.accent
         } else {
-            Color::White
+            theme.fg
         };
         let name_style = if is_sel {
             Style::default().fg(row_color).add_modifier(Modifier::BOLD)

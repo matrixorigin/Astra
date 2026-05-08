@@ -160,11 +160,14 @@ impl ApprovalChatCell {
 
             let is_focused = self.focused && i == self.buttons.focus();
             if is_focused {
-                // Cursor-style reversed-cyan pill: "▸ Accept" with
-                // cyan bg + black text + bold.
+                // Cursor-style reversed pill. Colours come from the
+                // active theme so the button remains readable on both
+                // dark and light terminals (the old `bg(Cyan).fg(Black)`
+                // pair collapsed to invisible on light backgrounds).
+                let theme = crate::tui::theme::current();
                 let sel_style = Style::default()
-                    .bg(Color::Cyan)
-                    .fg(Color::Black)
+                    .bg(theme.accent)
+                    .fg(theme.selected_fg)
                     .add_modifier(Modifier::BOLD);
                 spans.push(Span::styled(format!("▸ {} ", btn.label), sel_style));
             } else {
