@@ -29,6 +29,7 @@ mod shimmer;
 mod slash_dispatch;
 mod slash_menu;
 mod state;
+mod status_line;
 mod view_stack;
 mod stream_bridge;
 mod streaming;
@@ -116,6 +117,15 @@ fn finalize_stream(
         ]);
         transcript.push(ratatui::text::Line::default());
     }
+}
+
+/// One-shot lookup of the current git branch name via `gix`. Returns
+/// `None` when the cwd isn't a git repo, detached HEAD, or errors.
+fn detect_git_branch() -> Option<String> {
+    let repo = gix::discover(std::env::current_dir().ok()?).ok()?;
+    let head = repo.head().ok()?;
+    let name = head.referent_name()?;
+    Some(name.shorten().to_string())
 }
 
 /// Check if the terminal supports TUI mode.
@@ -224,6 +234,13 @@ pub(crate) async fn run_tui_repl(
     if let Ok(cwd) = std::env::current_dir() {
         bottom_pane
             .set_file_provider(std::sync::Arc::new(mention_menu::provider::FsFileProvider::new(cwd)));
+    }
+
+    // Seed the current git branch into the status line. One-shot read at
+    // startup — branch changes rarely mid-session; refresh happens on
+    // next launch. Missing/non-git dir is silently ignored.
+    if let Some(branch) = detect_git_branch() {
+        bottom_pane.footer.git_branch = Some(branch);
     }
 
     let mut active_cell: Option<Box<dyn ChatCell>> = None;
@@ -460,6 +477,11 @@ pub(crate) async fn run_tui_repl(
                                     if let Some(ref s) = state.session_id { bottom_pane.footer.session_id = Some(s[..8.min(s.len())].to_string()); }
                                     bottom_pane.footer.token_usage = Some(format!("{}↑ {}↓", state.total_prompt_tokens, state.total_completion_tokens));
                                     bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
+                                    bottom_pane.footer.cost_usd = Some(state.total_session_cost);
+                                    // Token budget for the status chip. Context window defaults
+                                    // to 200k (Opus/Sonnet 4.x) until wired to a per-model value.
+                                    let used = state.total_prompt_tokens + state.total_completion_tokens;
+                                    bottom_pane.footer.token_budget = Some((used, 200_000));
 
                                     // Turn summary separator
                                     {
