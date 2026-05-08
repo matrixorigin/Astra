@@ -47,6 +47,18 @@ pub struct RoundSnapshot {
     /// marker — the message-level rolling breakpoint positions.
     /// Empty for non-Anthropic providers.
     pub message_cc_indices: Vec<u32>,
+    /// Indices of messages whose content contains known volatile
+    /// patterns (`## Self-Awareness`, live turn/token counters, session
+    /// anchors). Populated by the capture parser. Used by
+    /// `rule_volatile_in_cached_prefix` to detect volatile bytes in
+    /// positions the provider's cache can't tolerate.
+    #[serde(default)]
+    pub volatile_msg_indices: Vec<u32>,
+    /// Total number of messages — needed when reasoning about "is the
+    /// volatile message at the tail?" independently of which indices
+    /// happen to be populated.
+    #[serde(default)]
+    pub message_count: u32,
 }
 
 /// Severity of a diagnostic finding.
@@ -135,9 +147,9 @@ pub fn snapshot_from_capture_json(v: &serde_json::Value) -> RoundSnapshot {
             })
         });
 
-    let message_cc_indices = req
-        .and_then(|r| r.get("messages"))
-        .and_then(Value::as_array)
+    let msgs_arr = req.and_then(|r| r.get("messages")).and_then(Value::as_array);
+    let message_count = msgs_arr.map(|a| a.len() as u32).unwrap_or(0);
+    let message_cc_indices = msgs_arr
         .map(|arr| {
             arr.iter()
                 .enumerate()
@@ -157,6 +169,35 @@ pub fn snapshot_from_capture_json(v: &serde_json::Value) -> RoundSnapshot {
         })
         .unwrap_or_default();
 
+    // Volatile-content detection: scan every message's flattened text
+    // for known volatile patterns. The list is deliberately conservative
+    // — each pattern here has been observed in production astra traffic
+    // to carry per-round values that defeat prefix caching:
+    //   - `## Self-Awareness`  — the block rendered by SelfModel, carries
+    //     live `Turn: N` and `Tokens: M/K` counters (session 986a553e).
+    //   - `[session-memory:`   — the session-memory manifest, re-rendered
+    //     per turn with updated working-set state.
+    //   - `[attention:v1]`     — user-attention manifest, per-turn.
+    //
+    // Detection is substring-based to keep the parser dependency-free;
+    // the rule code consuming these indices treats presence as a signal,
+    // never as a definitive identification of "what" the volatile is.
+    let message_volatile_indices = msgs_arr
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .filter_map(|(i, m)| {
+                    let text = flatten_message_text_for_scan(m);
+                    if contains_volatile_pattern(&text) {
+                        Some(i as u32)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<u32>>()
+        })
+        .unwrap_or_default();
+
     RoundSnapshot {
         turn,
         round,
@@ -167,7 +208,42 @@ pub fn snapshot_from_capture_json(v: &serde_json::Value) -> RoundSnapshot {
         tool_count,
         tool_cc_index,
         message_cc_indices,
+        volatile_msg_indices: message_volatile_indices,
+        message_count,
     }
+}
+
+/// Flatten a message's content into a single string suitable for
+/// substring scanning. Handles both `content: "str"` and
+/// `content: [{type:"text", text:"…"}, …]` shapes. Non-text blocks are
+/// dropped (tool_use, tool_result payload JSON doesn't carry the
+/// volatile patterns we look for).
+fn flatten_message_text_for_scan(m: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match m.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => {
+            let mut out = String::new();
+            for p in parts {
+                if let Some(t) = p.get("text").and_then(Value::as_str) {
+                    out.push_str(t);
+                    out.push('\n');
+                }
+            }
+            out
+        }
+        _ => String::new(),
+    }
+}
+
+fn contains_volatile_pattern(text: &str) -> bool {
+    // Ordered by observed frequency in astra traffic. First match wins.
+    const PATTERNS: &[&str] = &[
+        "## Self-Awareness",
+        "[session-memory:",
+        "[attention:v1]",
+    ];
+    PATTERNS.iter().any(|p| text.contains(p))
 }
 
 /// Scan a session directory for `llm_capture_t{N}_r{M}_*.json` files
@@ -268,6 +344,9 @@ pub fn evaluate_all(rounds: &[RoundSnapshot]) -> Vec<CacheFinding> {
         out.push(f);
     }
     if let Some(f) = rule_cache_creation_waste(rounds) {
+        out.push(f);
+    }
+    if let Some(f) = rule_volatile_in_cached_prefix(rounds) {
         out.push(f);
     }
     out.sort_by_key(|f| f.rule_id);
@@ -483,6 +562,130 @@ fn rule_cache_creation_waste(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
     None
 }
 
+/// **Rule 5 — volatile_in_cached_prefix.**
+///
+/// Each round the runtime injects "volatile" content (Self-Awareness
+/// block, session-memory manifest, attention manifest) somewhere in
+/// the request. Where that content may safely live depends on the
+/// provider's prompt-cache semantics (see [`crate::cache_placement`]):
+///
+/// - `MarkerIsolated` providers (Anthropic / Bedrock): volatile content
+///   must sit AFTER the last `cache_control` marker. Before the marker
+///   is still in the cached prefix and every round's new bytes poison
+///   the cache.
+/// - `TailSuffix` providers (OpenAI auto-prefix): volatile content
+///   must be in the LAST message only. Earlier positions are inside
+///   the auto-prefix and break on every change.
+/// - `CurrentUserOnly` providers (MiniMax strict history): volatile
+///   content may only appear on round 0 of a visible turn. Session
+///   986a553e observed volatile bytes at msg[7] in every tool-loop
+///   round, causing cache_read to collapse from 7680 to 0 for six
+///   consecutive rounds.
+/// - `Free` / unknown: not enforced.
+///
+/// Signal is provider+model aware; wrong-placement gets Critical,
+/// matching-placement is silent. If `volatile_msg_indices` is empty,
+/// the rule has nothing to check → silent.
+#[must_use]
+fn rule_volatile_in_cached_prefix(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
+    use crate::cache_placement::{CacheCapability, VolatilePlacement};
+    // Take the most recent round with any volatile signal — that's the
+    // one the LLM cares about right now.
+    let sample = rounds
+        .iter()
+        .rev()
+        .find(|r| !r.volatile_msg_indices.is_empty())?;
+    let cap = CacheCapability::for_provider_and_model(&sample.provider, &sample.model);
+    let vol_idx = *sample.volatile_msg_indices.last()?;
+    let count = sample.message_count;
+    if count == 0 {
+        return None;
+    }
+    let tail_idx = count - 1;
+
+    match cap.volatile_placement {
+        VolatilePlacement::MarkerIsolated => {
+            // For anthropic-protocol providers the volatile content must
+            // sit after every cache_control marker. If any cc marker
+            // index is >= the volatile index, the volatile bytes are
+            // inside the cached prefix.
+            let offenders: Vec<u32> = sample
+                .message_cc_indices
+                .iter()
+                .copied()
+                .filter(|&cc| cc >= vol_idx)
+                .collect();
+            if offenders.is_empty() {
+                return None;
+            }
+            Some(CacheFinding {
+                rule_id: "volatile_in_cached_prefix",
+                severity: Severity::Critical,
+                narrative: format!(
+                    "volatile content at msg[{vol_idx}] is inside the cached \
+                     prefix: cache_control markers at {offenders:?} sit on or \
+                     after it, so per-round changes invalidate the cache.",
+                ),
+                actionable_fix:
+                    "Move the volatile block AFTER the last cache_control \
+                     marker, or emit it as a new content block after the \
+                     final marker in the system message."
+                        .into(),
+                triggered_on: vec![(sample.turn, sample.round)],
+            })
+        }
+        VolatilePlacement::TailSuffix => {
+            // Last message must carry all volatile content; anything
+            // before is inside the auto-prefix.
+            if vol_idx == tail_idx {
+                return None;
+            }
+            Some(CacheFinding {
+                rule_id: "volatile_in_cached_prefix",
+                severity: Severity::Critical,
+                narrative: format!(
+                    "volatile content at msg[{vol_idx}] of {count} is inside \
+                     the OpenAI auto-prefix range — anything before the last \
+                     message (msg[{tail_idx}]) breaks cache on every change.",
+                ),
+                actionable_fix:
+                    "Append volatile content to the final user message's body \
+                     rather than a mid-history synthetic preamble."
+                        .into(),
+                triggered_on: vec![(sample.turn, sample.round)],
+            })
+        }
+        VolatilePlacement::CurrentUserOnly => {
+            // MiniMax-style strict history: volatile injection must be
+            // skipped entirely on tool-loop rounds. Any non-zero-round
+            // sample with volatile content is a violation.
+            if sample.round == 0 {
+                return None;
+            }
+            Some(CacheFinding {
+                rule_id: "volatile_in_cached_prefix",
+                severity: Severity::Critical,
+                narrative: format!(
+                    "{prov} ({model}) uses strict-history prompt cache; \
+                     volatile content at msg[{vol_idx}] on round {round} \
+                     (not round 0) invalidates the whole turn's cache every \
+                     tool-loop continuation.",
+                    prov = sample.provider,
+                    model = sample.model,
+                    round = sample.round,
+                ),
+                actionable_fix:
+                    "Skip volatile-content injection on rounds > 0 within a \
+                     visible turn for this provider. See \
+                     `CacheCapability::should_inject_volatile_on_round`."
+                        .into(),
+                triggered_on: vec![(sample.turn, sample.round)],
+            })
+        }
+        VolatilePlacement::Free => None,
+    }
+}
+
 /// Render findings + round-level aggregates as markdown suitable for
 /// returning to the LLM from `introspect(subtopic="cache")`. Designed
 /// to be informative but compact (~30-60 lines depending on the
@@ -584,6 +787,33 @@ mod tests {
             tool_count,
             tool_cc_index: tool_cc,
             message_cc_indices: msg_cc.to_vec(),
+            volatile_msg_indices: Vec::new(),
+            message_count: 0,
+        }
+    }
+
+    /// Extended test helper for the volatile-in-cached-prefix rule.
+    fn snap_with_volatile(
+        turn: u32,
+        round: u32,
+        provider: &str,
+        model: &str,
+        msg_cc: &[u32],
+        volatile_indices: &[u32],
+        message_count: u32,
+    ) -> RoundSnapshot {
+        RoundSnapshot {
+            turn,
+            round,
+            provider: provider.into(),
+            model: model.into(),
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            tool_count: 0,
+            tool_cc_index: None,
+            message_cc_indices: msg_cc.to_vec(),
+            volatile_msg_indices: volatile_indices.to_vec(),
+            message_count,
         }
     }
 
@@ -946,6 +1176,210 @@ mod tests {
             out.contains("rolling breakpoint") || out.contains("Rolling"),
             "fix text should mention rolling: {out}",
         );
+    }
+
+    // ── Rule 5: volatile_in_cached_prefix ──────────────────────────────
+
+    #[test]
+    fn volatile_rule_fires_on_minimax_tool_loop_round() {
+        // Session 986a553e fingerprint: MiniMax tool-loop round 1+ with
+        // `## Self-Awareness` injected at a mid-history user message.
+        let rs = vec![snap_with_volatile(
+            4,
+            1,
+            "openai",
+            "MiniMax-M2.7",
+            /* msg_cc */ &[],
+            /* volatile */ &[7],
+            /* message_count */ 11,
+        )];
+        let findings = evaluate_all(&rs);
+        let f = findings
+            .iter()
+            .find(|f| f.rule_id == "volatile_in_cached_prefix")
+            .expect("rule must fire on MiniMax tool-loop round >0");
+        assert_eq!(f.severity, Severity::Critical);
+        assert!(
+            f.narrative.contains("strict-history"),
+            "narrative must explain why: {}",
+            f.narrative,
+        );
+    }
+
+    #[test]
+    fn volatile_rule_silent_on_minimax_round_zero() {
+        // Round 0 is the "safe" injection point for CurrentUserOnly.
+        let rs = vec![snap_with_volatile(
+            4,
+            0,
+            "openai",
+            "MiniMax-M2.7",
+            &[],
+            &[7],
+            8,
+        )];
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "volatile_in_cached_prefix"),
+        );
+    }
+
+    #[test]
+    fn volatile_rule_fires_on_anthropic_when_volatile_inside_cached_prefix() {
+        // Anthropic: cc_indices=[0, 10] (system marker + tail marker);
+        // volatile at msg[8] sits BEFORE the tail marker → inside
+        // the cached prefix → rule fires.
+        let rs = vec![snap_with_volatile(
+            6,
+            0,
+            "anthropic",
+            "claude-sonnet-4",
+            &[0, 10],
+            &[8],
+            12,
+        )];
+        let findings = evaluate_all(&rs);
+        let f = findings
+            .iter()
+            .find(|f| f.rule_id == "volatile_in_cached_prefix")
+            .expect("rule must fire when volatile < cc");
+        assert_eq!(f.severity, Severity::Critical);
+        assert!(f.narrative.contains("cache_control"), "got: {}", f.narrative);
+    }
+
+    #[test]
+    fn volatile_rule_silent_on_anthropic_when_volatile_after_last_cc() {
+        // Volatile at msg[11] AFTER the last cc at msg[10] → healthy.
+        let rs = vec![snap_with_volatile(
+            6,
+            0,
+            "anthropic",
+            "claude-sonnet-4",
+            &[0, 10],
+            &[11],
+            12,
+        )];
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "volatile_in_cached_prefix"),
+        );
+    }
+
+    #[test]
+    fn volatile_rule_fires_on_openai_when_volatile_mid_history() {
+        // OpenAI TailSuffix: volatile must be on the LAST message
+        // (msg[count-1]). msg[5] of 8 is mid-history → fires.
+        let rs = vec![snap_with_volatile(
+            2,
+            0,
+            "openai",
+            "gpt-4o",
+            /* msg_cc */ &[],
+            /* volatile */ &[5],
+            /* count */ 8,
+        )];
+        let findings = evaluate_all(&rs);
+        let f = findings
+            .iter()
+            .find(|f| f.rule_id == "volatile_in_cached_prefix")
+            .expect("rule must fire when volatile < tail for OpenAI");
+        assert_eq!(f.severity, Severity::Critical);
+        assert!(
+            f.narrative.contains("auto-prefix"),
+            "narrative explains OpenAI mechanism: {}",
+            f.narrative,
+        );
+    }
+
+    #[test]
+    fn volatile_rule_silent_on_openai_when_volatile_on_tail() {
+        let rs = vec![snap_with_volatile(
+            2,
+            0,
+            "openai",
+            "gpt-4o",
+            &[],
+            &[7],
+            8,
+        )];
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "volatile_in_cached_prefix"),
+        );
+    }
+
+    #[test]
+    fn volatile_rule_silent_when_no_volatile_content_tracked() {
+        // Empty volatile_msg_indices → nothing to evaluate.
+        let rs = vec![snap(6, 2, "openai", 1000, 0, &[], 21, None)];
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "volatile_in_cached_prefix"),
+        );
+    }
+
+    #[test]
+    fn volatile_rule_silent_on_unknown_provider() {
+        // Unknown provider → VolatilePlacement::Free → rule doesn't apply.
+        let rs = vec![snap_with_volatile(
+            1,
+            3,
+            "some-new-vendor",
+            "model-xyz",
+            &[],
+            &[5],
+            10,
+        )];
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "volatile_in_cached_prefix"),
+        );
+    }
+
+    // ── content-pattern detection (parser layer) ───────────────────────
+
+    #[test]
+    fn contains_volatile_pattern_catches_known_markers() {
+        assert!(contains_volatile_pattern("## Self-Awareness\nTurn: 5"));
+        assert!(contains_volatile_pattern("<system-reminder>\n[session-memory:v1]\ngoal: foo"));
+        assert!(contains_volatile_pattern("[attention:v1]\ngoal: hi"));
+    }
+
+    #[test]
+    fn contains_volatile_pattern_ignores_unrelated_text() {
+        assert!(!contains_volatile_pattern("Hi, what's up?"));
+        assert!(!contains_volatile_pattern("```\nlet x = 1;\n```"));
+        // Similar but NOT exact matches — avoid false positives on
+        // well-meaning user content that happens to mention these.
+        assert!(!contains_volatile_pattern("I'm using self-awareness techniques"));
+    }
+
+    #[test]
+    fn snapshot_from_capture_detects_volatile_in_user_preamble() {
+        // Mimic the 986a553e msg[7] shape.
+        let v = serde_json::json!({
+            "turn": 4,
+            "round": 1,
+            "provider": "openai",
+            "model": "MiniMax-M2.7",
+            "request": {
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "ok"},
+                    {"role": "user", "content": "<system-reminder>\n\n\n## Self-Awareness\nTurn: 4 | Tokens: 13433/80000"}
+                ],
+                "tools": []
+            },
+            "response": {"usage": {"cached_input_tokens": 0}}
+        });
+        let snap = snapshot_from_capture_json(&v);
+        assert_eq!(snap.volatile_msg_indices, vec![2]);
+        assert_eq!(snap.message_count, 3);
     }
 
     #[test]
