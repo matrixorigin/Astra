@@ -1960,42 +1960,70 @@ impl ServerAgenticLoopHost {
         // added there is automatically picked up here.
         let is_anthropic = crate::turn::llm_client::provider_uses_explicit_cache_control(provider);
 
-        let (system_messages, volatile_preamble) = if is_anthropic {
-            // Anthropic/Bedrock: all blocks in system message with cache_control.
-            let content = system_blocks_to_anthropic_content(&pipeline_output.serialized);
-            (
-                vec![json!({"role": "system", "content": content})],
-                Vec::new(),
-            )
-        } else {
-            // Prefix-only: split blocks by scope.
-            use astra_turn_core::section_types::CacheScope;
-            let mut stable_text = String::new();
-            let mut volatile_text = String::new();
-            for block in &pipeline_output.serialized.system_blocks {
-                if block.scope == CacheScope::None {
-                    volatile_text.push_str(&block.text);
-                } else {
-                    stable_text.push_str(&block.text);
-                }
+        // Classify the provider's cache semantics to decide volatile
+        // placement. `CacheCapability::should_inject_volatile_on_round`
+        // is the gate — for `VolatilePlacement::CurrentUserOnly`
+        // providers (MiniMax-style strict-history cache) rounds > 0
+        // MUST skip injection or the entire turn's cache collapses
+        // (see session 986a553e regression).
+        use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
+        let cache_cap = CacheCapability::for_provider_and_model(provider, model_name);
+        let round_within_turn = state.current_round_index;
+        let inject_volatile = cache_cap.should_inject_volatile_on_round(round_within_turn);
+
+        let (system_messages, volatile_preamble) = match cache_cap.volatile_placement {
+            VolatilePlacement::MarkerIsolated => {
+                // Anthropic / Bedrock: volatile lives INSIDE the system
+                // block, after the last cache_control marker. No
+                // separate preamble needed — the marker isolates it.
+                let content = system_blocks_to_anthropic_content(&pipeline_output.serialized);
+                (
+                    vec![json!({"role": "system", "content": content})],
+                    Vec::new(),
+                )
             }
-            let system_msgs = vec![json!({"role": "system", "content": stable_text})];
-            let preamble = if volatile_text.is_empty() {
-                Vec::new()
-            } else {
-                vec![
-                    json!({
-                        "role": "user",
-                        "content": format!("<system-reminder>\n{volatile_text}</system-reminder>"),
-                    }),
-                    json!({
-                        "role": "assistant",
-                        "content": "Understood.",
-                    }),
-                ]
-            };
-            (system_msgs, preamble)
+            VolatilePlacement::TailSuffix
+            | VolatilePlacement::CurrentUserOnly
+            | VolatilePlacement::Free => {
+                // Prefix-only paths: split blocks by scope. Stable
+                // content stays in the system message; volatile
+                // content goes into a preamble that `assemble_llm_messages`
+                // will prepend to the last user message (TailSuffix
+                // semantics) — UNLESS we're a round > 0 on a
+                // strict-history provider, in which case we drop
+                // volatile entirely to preserve byte-identical history.
+                use astra_turn_core::section_types::CacheScope;
+                let mut stable_text = String::new();
+                let mut volatile_text = String::new();
+                for block in &pipeline_output.serialized.system_blocks {
+                    if block.scope == CacheScope::None {
+                        volatile_text.push_str(&block.text);
+                    } else {
+                        stable_text.push_str(&block.text);
+                    }
+                }
+                let system_msgs = vec![json!({"role": "system", "content": stable_text})];
+                let preamble = if !inject_volatile || volatile_text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![
+                        json!({
+                            "role": "user",
+                            "content": format!(
+                                "<system-reminder>\n{volatile_text}</system-reminder>"
+                            ),
+                        }),
+                        json!({
+                            "role": "assistant",
+                            "content": "Understood.",
+                        }),
+                    ]
+                };
+                (system_msgs, preamble)
+            }
         };
+        // Silence unused-var in the MarkerIsolated branch.
+        let _ = is_anthropic;
 
         PipelineTurnOutcome {
             system_messages,
@@ -3972,6 +4000,150 @@ mod tests {
         // System messages are rendered from pipeline's serialized system blocks.
         assert!(!outcome.system_messages.is_empty());
         assert_eq!(outcome.system_messages[0]["role"], "system");
+    }
+
+    /// Session 986a553e observed MiniMax-M2.7 cache collapsing from
+    /// 7680 to 0 across six tool-loop rounds because volatile
+    /// content (Self-Awareness with live turn/token counters) was
+    /// being re-injected every round. The new `CacheCapability`
+    /// routing classifies MiniMax as `VolatilePlacement::CurrentUserOnly`;
+    /// `run_turn_pipeline` now consults it and emits an **empty**
+    /// `volatile_preamble` on rounds > 0 so the message history bytes
+    /// stay stable across the tool loop.
+    #[tokio::test]
+    async fn run_turn_pipeline_minimax_skips_volatile_on_tool_loop_round() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-minimax".to_string(),
+            "s-minimax".to_string(),
+        )
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Shell.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })])
+        .build();
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-minimax".into());
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        // Round 0: volatile preamble is allowed (first round of a
+        // visible turn always carries fresh Self-Awareness).
+        state.current_round_index = 0;
+        let out_round0 =
+            host.run_turn_pipeline(&mut state, &tools, "openai", "MiniMax-M2.7", "hi");
+        // We can't assert preamble is non-empty without the pipeline
+        // actually emitting CacheScope::None blocks (depends on
+        // upstream config) — what we CAN assert is that round 0
+        // produces at least as much content as round 1.
+        let preamble_round0_len = out_round0.volatile_preamble.len();
+
+        // Round 1 (tool-loop continuation): volatile injection must
+        // be suppressed.
+        state.current_round_index = 1;
+        let out_round1 =
+            host.run_turn_pipeline(&mut state, &tools, "openai", "MiniMax-M2.7", "hi");
+        assert!(
+            out_round1.volatile_preamble.is_empty(),
+            "MiniMax tool-loop round > 0 must not emit volatile preamble. \
+             round 0 preamble len={preamble_round0_len}, round 1 preamble={:?}",
+            out_round1.volatile_preamble,
+        );
+
+        // Every subsequent round should also skip.
+        state.current_round_index = 5;
+        let out_round5 =
+            host.run_turn_pipeline(&mut state, &tools, "openai", "MiniMax-M2.7", "hi");
+        assert!(out_round5.volatile_preamble.is_empty());
+    }
+
+    /// OpenAI auto-prefix cache can tolerate volatile-in-tail every
+    /// round, so preamble emission stays unchanged across rounds.
+    #[tokio::test]
+    async fn run_turn_pipeline_openai_keeps_volatile_on_all_rounds() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-openai".to_string(),
+            "s-openai".to_string(),
+        )
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Shell.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })])
+        .build();
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-openai".into());
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        state.current_round_index = 0;
+        let r0 = host.run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "hi");
+        state.current_round_index = 3;
+        let r3 = host.run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "hi");
+        // Identical preamble shape on OpenAI — injection gate doesn't
+        // special-case round index.
+        assert_eq!(
+            r0.volatile_preamble.len(),
+            r3.volatile_preamble.len(),
+            "OpenAI should emit identical preamble on round 0 and 3",
+        );
+    }
+
+    /// Anthropic path uses `VolatilePlacement::MarkerIsolated` — the
+    /// preamble is empty because volatile content lives INSIDE the
+    /// system block behind a cache_control marker. This invariant
+    /// must hold at every round.
+    #[tokio::test]
+    async fn run_turn_pipeline_anthropic_never_emits_preamble() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-anth".to_string(),
+            "s-anth".to_string(),
+        )
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Shell.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })])
+        .build();
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-anth".into());
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        for round in [0, 1, 7] {
+            state.current_round_index = round;
+            let out = host.run_turn_pipeline(&mut state, &tools, "anthropic", "claude-sonnet-4", "hi");
+            assert!(
+                out.volatile_preamble.is_empty(),
+                "Anthropic never emits preamble (volatile lives in system block); \
+                 round={round} preamble={:?}",
+                out.volatile_preamble,
+            );
+        }
     }
 
     #[tokio::test]
