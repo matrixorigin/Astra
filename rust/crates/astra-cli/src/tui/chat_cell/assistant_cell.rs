@@ -36,7 +36,7 @@ impl AssistantChatCell {
     }
 
     pub fn from_source(markdown: String, width: u16) -> Self {
-        let text = render_markdown_text_with_width(&markdown, Some(width as usize));
+        let text = render_markdown_text_with_width(&markdown, Some((width as usize).saturating_sub(2).max(20)));
         let lines: Vec<Line<'static>> = text.lines.iter().map(line_to_static).collect();
         Self {
             rendered_lines: lines,

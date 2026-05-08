@@ -24,15 +24,23 @@ pub(crate) struct StreamController {
     header_emitted: bool,
 }
 
+/// Width reserved for the `• ` / `  ` mini-cell prefix that
+/// `AgentMessageCell` later prepends during `display_lines`. The raw
+/// markdown renderer needs to know about this budget so that wide
+/// blocks (tables, rules, code) don't overflow and trigger terminal
+/// line-wrap on `│` / `─` characters.
+pub(crate) const MINI_CELL_PREFIX_COLS: usize = 2;
+
 impl StreamController {
     pub fn new(width: Option<usize>) -> Self {
+        let adj = width.map(adjust_width);
         Self {
-            state: StreamState::new(width),
+            state: StreamState::new(adj),
             raw_source: String::new(),
             rendered_lines: Vec::new(),
             enqueued_len: 0,
             emitted_len: 0,
-            width,
+            width: adj,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             header_emitted: false,
         }
@@ -120,8 +128,9 @@ impl StreamController {
     }
 
     pub fn set_width(&mut self, new_width: usize) {
-        self.width = Some(new_width);
-        self.state.collector.set_width(Some(new_width));
+        let adj = adjust_width(new_width);
+        self.width = Some(adj);
+        self.state.collector.set_width(Some(adj));
 
         if self.raw_source.is_empty() {
             return;
@@ -159,4 +168,10 @@ impl StreamController {
             self.enqueued_len = target_len;
         }
     }
+}
+
+/// Clamp down the raw terminal width by the mini-cell prefix budget,
+/// floored at 20 columns so tiny/resizing terminals don't go negative.
+fn adjust_width(raw: usize) -> usize {
+    raw.saturating_sub(MINI_CELL_PREFIX_COLS).max(20)
 }
