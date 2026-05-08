@@ -488,7 +488,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 }
 
 /// Detect the conventional "sess_<…>" / uuid-like session id shape.
-fn looks_like_session_id(s: &str) -> bool {
+pub(crate) fn looks_like_session_id(s: &str) -> bool {
     if s.starts_with("sess_") {
         return true;
     }
@@ -505,14 +505,10 @@ pub(crate) fn handle_view_result(
 ) {
     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
 
-    // Session picker result → queue `/resume <id>` for auto-dispatch
-    // via the normal fallback path. Session IDs are prefixed with
-    // `sess_` or are UUIDs; we recognise them heuristically and let
-    // anything else fall through to the older menu dispatch.
+    // Session picker result is handled by the outer event loop (it
+    // needs to run the async resume pipeline); this sync fn just
+    // lets it pass through — see `is_session_id` below.
     if looks_like_session_id(name) {
-        bottom_pane.queued_messages.push(format!("/resume {name}"));
-        let msg = SystemChatCell::info(format!("Resuming session {name}…"));
-        guard.queue_history_lines(msg.display_lines(w));
         return;
     }
 

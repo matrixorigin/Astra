@@ -521,9 +521,45 @@ pub(crate) async fn run_tui_repl(
                             BottomPaneAction::SubmitInput(_) => {}
                             BottomPaneAction::ViewCompleted { result, reopen } => {
                                 if let Some(name) = result {
-                                    slash_dispatch::handle_view_result(
-                                        &name, &mut state, &mut guard, &mut bottom_pane,
-                                    );
+                                    // Session picker result → run the async
+                                    // `/resume <id>` pipeline via the usual
+                                    // slash fallback path. This is the same
+                                    // code the user-typed `/resume <id>` runs
+                                    // through, so the full restore logic is
+                                    // exercised identically.
+                                    if slash_dispatch::looks_like_session_id(&name) {
+                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                        let info = SystemChatCell::info(format!("Resuming session {name}…"));
+                                        guard.queue_history_lines(info.display_lines(w));
+                                        let slash_text = format!("/resume {name}");
+                                        let slash_result = guard.with_restored(|| async {
+                                            let token = crate::repl_runtime::current_access_token(profile);
+                                            crate::slash_router::handle_slash_command(
+                                                &slash_text, api, profile, &mut state,
+                                                token.as_deref(), &*startup.selector,
+                                            ).await
+                                        }).await;
+                                        match slash_result {
+                                            Ok(Ok(true)) => { break 'main Ok(()); }
+                                            Ok(Ok(false)) => {}
+                                            Ok(Err(e)) => {
+                                                let err = SystemChatCell::error(e);
+                                                guard.queue_history_lines(err.display_lines(w));
+                                            }
+                                            Err(e) => {
+                                                let err = SystemChatCell::error(format!("Terminal restore failed: {e}"));
+                                                guard.queue_history_lines(err.display_lines(w));
+                                            }
+                                        }
+                                        bottom_pane.footer.session_id = state
+                                            .session_id
+                                            .as_ref()
+                                            .map(|s| s[..8.min(s.len())].to_string());
+                                    } else {
+                                        slash_dispatch::handle_view_result(
+                                            &name, &mut state, &mut guard, &mut bottom_pane,
+                                        );
+                                    }
                                     bottom_pane.sync_popups();
                                     // Update footer after view actions (model/permission may change)
                                     if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
