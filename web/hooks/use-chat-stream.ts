@@ -143,6 +143,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
       setFollowupSuggestion(null);
       setContextSummary({ usedTokens: 0, budgetTokens: 7300, droppedCount: 0, zones: [] });
       setAskUserPrompt(null);
+      assistantIdRef.current = '';
       accumulatedTextRef.current = '';
       accumulatedThinkingRef.current = '';
       lastUserMessageRef.current = '';
@@ -169,6 +170,28 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
       sseClientRef.current?.close();
       sseClientRef.current = null;
     };
+  }, []);
+
+  const ensureStreamingAssistantMessage = useCallback(() => {
+    if (assistantIdRef.current) {
+      return assistantIdRef.current;
+    }
+    const id = uid();
+    assistantIdRef.current = id;
+    setMessages((prev) => {
+      if (prev.some((message) => message.id === id)) return prev;
+      return [
+        ...prev,
+        {
+          id,
+          role: 'assistant',
+          content: '',
+          timestamp: Date.now(),
+          streaming: true,
+        },
+      ];
+    });
+    return id;
   }, []);
 
   const processEvent = useCallback(
@@ -229,19 +252,31 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
         }
 
         case 'text_delta': {
+          const id = ensureStreamingAssistantMessage();
           accumulatedTextRef.current += event.content;
           const text = accumulatedTextRef.current;
-          const id = assistantIdRef.current;
           setMessages((prev) =>
             prev.map((m) => (m.id === id ? { ...m, content: text } : m)),
           );
           break;
         }
 
+        case 'text_done': {
+          const id = ensureStreamingAssistantMessage();
+          const fullText = (event as StreamEvent & { full_text?: string }).full_text ?? '';
+          if (fullText.trim()) {
+            accumulatedTextRef.current = fullText;
+            setMessages((prev) =>
+              prev.map((m) => (m.id === id ? { ...m, content: fullText } : m)),
+            );
+          }
+          break;
+        }
+
         case 'reasoning_delta': {
+          const id = ensureStreamingAssistantMessage();
           accumulatedThinkingRef.current += event.content;
           const thinking = accumulatedThinkingRef.current;
-          const id = assistantIdRef.current;
           setMessages((prev) =>
             prev.map((m) =>
               m.id === id
@@ -249,6 +284,24 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
                 : m,
             ),
           );
+          break;
+        }
+
+        case 'run_started': {
+          setIsStreaming(true);
+          setConnectionState('streaming');
+          break;
+        }
+
+        case 'run_finished': {
+          const id = assistantIdRef.current;
+          setMessages((prev) =>
+            prev.map((m) => (m.id === id ? { ...m, streaming: false } : m)),
+          );
+          setIsStreaming(false);
+          if (!sawErrorEventRef.current) {
+            setConnectionState('idle');
+          }
           break;
         }
 
@@ -469,7 +522,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
         );
       }
     },
-    [],
+    [ensureStreamingAssistantMessage],
   );
 
   useEffect(() => {
@@ -495,13 +548,24 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
         await applyTranscriptItemsTransaction(hydratedSessionId, transcript.items);
         setMessages(transcriptItemsToMessages(transcript.items));
       }
-      if (state.run_event_replay_required && state.active_run) {
+      if (state.active_run) {
         const activeRunId = state.active_run.run_id;
         setRunId(activeRunId);
         runIdRef.current = activeRunId;
-        runEventLastOkIdxRef.current = state.active_run.replay_start_event_idx - 1;
+        const localLastOkIdx = watermark?.runEventHighWatermark ?? runEventLastOkIdxRef.current;
+        const replayFromIndex = state.run_event_replay_required
+          ? Math.max(0, state.active_run.replay_start_event_idx)
+          : Math.max(0, localLastOkIdx + 1);
+        runEventLastOkIdxRef.current = replayFromIndex - 1;
+        sawErrorEventRef.current = false;
+        accumulatedTextRef.current = '';
+        accumulatedThinkingRef.current = '';
+        toolCallMapRef.current.clear();
+        ensureStreamingAssistantMessage();
+        setIsStreaming(true);
+        setConnectionState('streaming');
         const replayClient = new SSEClient({
-          url: `/api/backend/chat/runs/${activeRunId}/stream?last_index=0`,
+          url: `/api/backend/chat/runs/${activeRunId}/stream?last_index=${replayFromIndex}`,
           onEvent: processEvent,
           onStateChange: (nextState) => {
             if (nextState === 'error') {
@@ -530,7 +594,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
     return () => {
       cancelled = true;
     };
-  }, [config.sessionId, processEvent]);
+  }, [config.sessionId, ensureStreamingAssistantMessage, processEvent]);
 
   const stop = useCallback(() => {
     const activeRunId = runIdRef.current;
@@ -665,6 +729,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
     setAgentEvents([]);
     setFollowupSuggestion(null);
     setContextSummary({ usedTokens: 0, budgetTokens: 7300, droppedCount: 0, zones: [] });
+    assistantIdRef.current = '';
     accumulatedTextRef.current = '';
     accumulatedThinkingRef.current = '';
     lastUserMessageRef.current = '';

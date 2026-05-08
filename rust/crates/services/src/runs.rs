@@ -46,6 +46,21 @@ pub trait RunLifecycleService: Send + Sync {
         last_index: u32,
     ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)>;
 
+    async fn stream_run_live(
+        &self,
+        run_id: String,
+        user_id: String,
+        last_index: u32,
+    ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+        let events = self.stream_run(run_id.clone(), user_id, last_index).await?;
+        Ok(ChatStreamRecord {
+            session_id: String::new(),
+            run_id,
+            events,
+            event_rx: None,
+        })
+    }
+
     async fn cancel_run(
         &self,
         run_id: String,

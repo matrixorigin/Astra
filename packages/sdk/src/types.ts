@@ -9,6 +9,7 @@ export type StreamEventType =
   | 'run_finished'
   | 'run_cancelled'
   | 'text_delta'
+  | 'text_done'
   | 'reasoning_delta'
   | 'reasoning_done'
   | 'tool_call_start'
@@ -71,6 +72,11 @@ export type RunCancelledEvent = {
 export type TextDeltaEvent = {
   type: 'text_delta';
   content: string;
+};
+
+export type TextDoneEvent = {
+  type: 'text_done';
+  full_text: string;
 };
 
 export type ThinkingDeltaEvent = {
@@ -253,6 +259,7 @@ export type StreamEvent = (
   | RunFinishedEvent
   | RunCancelledEvent
   | TextDeltaEvent
+  | TextDoneEvent
   | ThinkingDeltaEvent
   | ThinkingDoneEvent
   | ToolCallStartEvent

@@ -147,10 +147,19 @@ pub(super) async fn stream_run_handler(
 
     match state
         .run_lifecycle_service
-        .stream_run(run_id.clone(), user.user_id, query.last_index)
+        .stream_run_live(run_id.clone(), user.user_id, query.last_index)
         .await
     {
-        Ok(events) => sse_json_response(transform_stream_run_events_for_client(&run_id, events)),
+        Ok(mut stream) => {
+            if let Some(event_rx) = stream.event_rx.take() {
+                sse_streaming_response(stream.session_id, stream.run_id, event_rx)
+            } else {
+                sse_json_response(transform_stream_run_events_for_client(
+                    &run_id,
+                    stream.events,
+                ))
+            }
+        }
         Err((status, error)) => sse_error_response(status, error.0.detail),
     }
 }

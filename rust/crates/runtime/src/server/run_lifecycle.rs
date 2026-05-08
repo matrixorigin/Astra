@@ -17,7 +17,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc};
+use tokio::sync::{Mutex as TokioMutex, RwLock, broadcast, mpsc};
 
 use astra_server_types::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
@@ -1170,10 +1170,25 @@ async fn persist_session_transcript_items_inner(
     .bind(session_id)
     .fetch_one(&mut *tx)
     .await?;
-    let next_seq = row.try_get::<i64, _>("next_seq")?;
+    let mut next_seq = row.try_get::<i64, _>("next_seq")?;
 
-    for (offset, item) in items.iter().enumerate() {
-        let item_seq = next_seq + offset as i64;
+    for item in items {
+        let existing = sqlx::query(
+            "SELECT COUNT(*) AS count
+             FROM session_transcript_items
+             WHERE session_id = ? AND run_id = ? AND role = ?",
+        )
+        .bind(session_id)
+        .bind(&item.run_id)
+        .bind(item.role)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get::<i64, _>("count")?;
+        if existing > 0 {
+            continue;
+        }
+
+        let item_seq = next_seq;
         sqlx::query(
             "INSERT INTO session_transcript_items
              (session_id, item_seq, user_id, run_id, role, content,
@@ -1190,6 +1205,7 @@ async fn persist_session_transcript_items_inner(
         .bind(transcript_content_hash(item.role, &item.content))
         .execute(&mut *tx)
         .await?;
+        next_seq += 1;
     }
 
     tx.commit().await
@@ -1637,6 +1653,8 @@ struct RunState {
     pause_flag: Arc<AtomicBool>,
     /// Cancelled together with `cancel_flag` on `cancel_run` for low-latency LLM abort.
     llm_cancel_token: Arc<CancellationToken>,
+    /// Live fanout for clients that reattach to an active run after navigating away.
+    live_tx: Option<broadcast::Sender<Value>>,
     #[allow(dead_code)]
     started_at: Instant,
     waiting_for: Option<String>,
@@ -2055,6 +2073,7 @@ impl AgenticRunLifecycleService {
             cancel_flag: cancel_flag.clone(),
             pause_flag: pause_flag.clone(),
             llm_cancel_token: llm_cancel_token.clone(),
+            live_tx: None,
             started_at: Instant::now(),
             waiting_for: None,
         };
@@ -3378,10 +3397,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // turn; hitting the limit means the client cannot keep up, so we treat
         // channel-full the same as client disconnect (cancel the loop).
         const SSE_CHANNEL_CAPACITY: usize = 512;
-        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
+        let (client_event_tx, event_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
+        let (event_tx, mut fanout_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
+        let (live_tx, _) = broadcast::channel::<Value>(SSE_CHANNEL_CAPACITY);
+        let live_tx_for_fanout = live_tx.clone();
+        tokio::spawn(async move {
+            while let Some(event) = fanout_rx.recv().await {
+                let _ = live_tx_for_fanout.send(event.clone());
+                let _ = client_event_tx.send(event).await;
+            }
+        });
 
-        let (run_state, cancel_flag, pause_flag, llm_cancel_token) =
+        let (mut run_state, cancel_flag, pause_flag, llm_cancel_token) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
+        run_state.live_tx = Some(live_tx.clone());
 
         let mut state = self.build_initial_state(
             &request,
@@ -3459,6 +3488,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
         self.persist_run_start_if_configured(&run_id, &user_id, &session_id)
             .await;
+        if let Some(pool) = &self.shared_pool {
+            let user_transcript = TranscriptPersistItem {
+                run_id: run_id.clone(),
+                role: "user",
+                content: request.message.clone(),
+                source_event_id: format!("run:{run_id}:user"),
+            };
+            persist_session_transcript_items(pool, &user_id, &session_id, &[user_transcript]).await;
+        }
 
         // Record session creation for resource tracking.
         if let Some(ref gov) = self.resource_governor {
@@ -3725,6 +3763,64 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
+    }
+
+    async fn stream_run_live(
+        &self,
+        run_id: String,
+        user_id: String,
+        last_index: u32,
+    ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+        {
+            let runs = self.runs.read().await;
+            if let Some(run) = runs.get(&run_id) {
+                if run.user_id != user_id {
+                    return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
+                }
+                if let Some(live_tx) = &run.live_tx {
+                    let offset = last_index as usize;
+                    let replay_events = if offset < run.events.len() {
+                        Self::format_run_events(&run.events[offset..], offset)
+                    } else {
+                        Vec::new()
+                    };
+                    let mut live_rx = live_tx.subscribe();
+                    let (event_tx, event_rx) = mpsc::channel(512);
+                    tokio::spawn(async move {
+                        for event in replay_events {
+                            if event_tx.send(event).await.is_err() {
+                                return;
+                            }
+                        }
+                        loop {
+                            match live_rx.recv().await {
+                                Ok(event) => {
+                                    if event_tx.send(event).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(broadcast::error::RecvError::Closed) => return,
+                            }
+                        }
+                    });
+                    return Ok(ChatStreamRecord {
+                        session_id: run.session_id.clone(),
+                        run_id,
+                        events: Vec::new(),
+                        event_rx: Some(event_rx),
+                    });
+                }
+            }
+        }
+
+        let events = self.stream_run(run_id.clone(), user_id, last_index).await?;
+        Ok(ChatStreamRecord {
+            session_id: String::new(),
+            run_id,
+            events,
+            event_rx: None,
+        })
     }
 
     async fn drain_approval_requests(&self, run_id: &str) -> Vec<serde_json::Value> {
@@ -5335,6 +5431,7 @@ mod tests {
             cancel_flag,
             pause_flag: Arc::new(AtomicBool::new(false)),
             llm_cancel_token: cancel_token,
+            live_tx: None,
             started_at: Instant::now(),
             waiting_for: None,
         };

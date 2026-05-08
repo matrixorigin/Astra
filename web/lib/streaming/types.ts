@@ -8,6 +8,7 @@ export type {
   RunFinishedEvent,
   RunCancelledEvent,
   TextDeltaEvent,
+  TextDoneEvent,
   ThinkingDeltaEvent,
   ThinkingDoneEvent,
   ToolCallStartEvent,
