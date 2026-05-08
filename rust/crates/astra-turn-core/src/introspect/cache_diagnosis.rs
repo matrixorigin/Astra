@@ -155,7 +155,9 @@ pub fn snapshot_from_capture_json(v: &serde_json::Value) -> RoundSnapshot {
             })
         });
 
-    let msgs_arr = req.and_then(|r| r.get("messages")).and_then(Value::as_array);
+    let msgs_arr = req
+        .and_then(|r| r.get("messages"))
+        .and_then(Value::as_array);
     let message_count = msgs_arr.map(|a| a.len() as u32).unwrap_or(0);
     let message_roles: Vec<String> = msgs_arr
         .map(|arr| {
@@ -175,14 +177,12 @@ pub fn snapshot_from_capture_json(v: &serde_json::Value) -> RoundSnapshot {
                 .enumerate()
                 .filter_map(|(i, m)| {
                     let at_msg = m.get("cache_control").is_some();
-                    let in_content = m
-                        .get("content")
-                        .and_then(Value::as_array)
-                        .is_some_and(|blocks| {
-                            blocks
-                                .iter()
-                                .any(|b| b.get("cache_control").is_some())
-                        });
+                    let in_content =
+                        m.get("content")
+                            .and_then(Value::as_array)
+                            .is_some_and(|blocks| {
+                                blocks.iter().any(|b| b.get("cache_control").is_some())
+                            });
                     (at_msg || in_content).then_some(i as u32)
                 })
                 .collect::<Vec<u32>>()
@@ -304,9 +304,7 @@ fn contains_volatile_pattern(text: &str) -> bool {
 /// Missing / unreadable / malformed files are skipped with a log
 /// warning rather than failing — one bad capture shouldn't hide the
 /// rest of the session from diagnosis.
-pub fn load_session_captures(
-    session_dir: &std::path::Path,
-) -> std::io::Result<Vec<RoundSnapshot>> {
+pub fn load_session_captures(session_dir: &std::path::Path) -> std::io::Result<Vec<RoundSnapshot>> {
     let entries = match std::fs::read_dir(session_dir) {
         Ok(it) => it,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -328,16 +326,14 @@ pub fn load_session_captures(
         let Some((t_tok, after_t)) = rest.split_once('_') else {
             continue;
         };
-        let Some(t_num) = t_tok.strip_prefix('t').and_then(|s| s.parse::<u32>().ok())
-        else {
+        let Some(t_num) = t_tok.strip_prefix('t').and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
         let Some((r_tok, _rest)) = after_t.split_once('_').or_else(|| after_t.split_once('.'))
         else {
             continue;
         };
-        let Some(r_num) = r_tok.strip_prefix('r').and_then(|s| s.parse::<u32>().ok())
-        else {
+        let Some(r_num) = r_tok.strip_prefix('r').and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
         rows.push((t_num, r_num, path));
@@ -393,9 +389,6 @@ pub fn evaluate_all(rounds: &[RoundSnapshot]) -> Vec<CacheFinding> {
         out.push(f);
     }
     if let Some(f) = rule_volatile_in_cached_prefix(rounds) {
-        out.push(f);
-    }
-    if let Some(f) = rule_deepseek_anthropic_tools_not_cached(rounds) {
         out.push(f);
     }
     out.sort_by_key(|f| f.rule_id);
@@ -498,10 +491,9 @@ fn rule_tool_marker_not_on_tail(rounds: &[RoundSnapshot]) -> Option<CacheFinding
             total = sample.tool_count,
             s = if gap == 1 { "" } else { "s" },
         ),
-        actionable_fix:
-            "Audit `default_pinned_tool_names()` — any runtime tool that ships with \
+        actionable_fix: "Audit `default_pinned_tool_names()` — any runtime tool that ships with \
              every session should be pinned so the marker reaches the real tail."
-                .into(),
+            .into(),
         triggered_on: vec![(sample.turn, sample.round)],
     })
 }
@@ -552,12 +544,11 @@ fn rule_cache_read_collapsed(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
                     prev_r = prev.cache_read_tokens,
                     curr_r = curr.cache_read_tokens,
                 ),
-                actionable_fix:
-                    "Diff messages[0..=prev_tail_cc] bytes between rounds. Common \
+                actionable_fix: "Diff messages[0..=prev_tail_cc] bytes between rounds. Common \
                      causes: volatile content (Self-Awareness, turn counter) leaked \
                      into the system block, or a historical cache_control got \
                      silently stripped between rounds."
-                        .into(),
+                    .into(),
                 triggered_on: vec![(prev.turn, prev.round), (curr.turn, curr.round)],
             });
         }
@@ -616,8 +607,7 @@ fn rule_cache_creation_waste(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
         let ratio = creations as f64 / reads as f64;
         if ratio > 0.3 {
             let pct = (ratio * 100.0).round() as u32;
-            let trigs: Vec<(u32, u32)> =
-                amortized.iter().map(|r| (r.turn, r.round)).collect();
+            let trigs: Vec<(u32, u32)> = amortized.iter().map(|r| (r.turn, r.round)).collect();
             return Some(CacheFinding {
                 rule_id: "cache_creation_waste",
                 severity: Severity::Warn,
@@ -629,11 +619,10 @@ fn rule_cache_creation_waste(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
                      fill cost.)",
                     n = trigs.len(),
                 ),
-                actionable_fix:
-                    "Common causes: rolling breakpoint not advancing (check \
+                actionable_fix: "Common causes: rolling breakpoint not advancing (check \
                      cc_marker_frozen first), mid-prefix volatile content, or \
                      tool-schema drift between rounds."
-                        .into(),
+                    .into(),
                 triggered_on: trigs,
             });
         }
@@ -715,11 +704,10 @@ fn rule_volatile_in_cached_prefix(rounds: &[RoundSnapshot]) -> Option<CacheFindi
                      prefix: cache_control markers at {offenders:?} sit on or \
                      after it, so per-round changes invalidate the cache.",
                 ),
-                actionable_fix:
-                    "Move the volatile block AFTER the last cache_control \
+                actionable_fix: "Move the volatile block AFTER the last cache_control \
                      marker, or emit it as a new content block after the \
                      final marker in the system message."
-                        .into(),
+                    .into(),
                 triggered_on: vec![(sample.turn, sample.round)],
             })
         }
@@ -737,10 +725,9 @@ fn rule_volatile_in_cached_prefix(rounds: &[RoundSnapshot]) -> Option<CacheFindi
                      the OpenAI auto-prefix range — anything before the last \
                      message (msg[{tail_idx}]) breaks cache on every change.",
                 ),
-                actionable_fix:
-                    "Append volatile content to the final user message's body \
+                actionable_fix: "Append volatile content to the final user message's body \
                      rather than a mid-history synthetic preamble."
-                        .into(),
+                    .into(),
                 triggered_on: vec![(sample.turn, sample.round)],
             })
         }
@@ -763,11 +750,10 @@ fn rule_volatile_in_cached_prefix(rounds: &[RoundSnapshot]) -> Option<CacheFindi
                     model = sample.model,
                     round = sample.round,
                 ),
-                actionable_fix:
-                    "Suppress volatile-content injection entirely for this \
+                actionable_fix: "Suppress volatile-content injection entirely for this \
                      provider. See \
                      `CacheCapability::should_inject_volatile_on_round`."
-                        .into(),
+                    .into(),
                 triggered_on: vec![(sample.turn, sample.round)],
             })
         }
@@ -775,99 +761,18 @@ fn rule_volatile_in_cached_prefix(rounds: &[RoundSnapshot]) -> Option<CacheFindi
     }
 }
 
-/// **Rule 6 — deepseek_anthropic_tools_not_cached.**
-///
-/// DeepSeek's Anthropic-compatible endpoint (`/anthropic`) accepts
-/// `cache_control` on system-block content, but in observed traffic
-/// it **does not** create a cache entry for the tool-schema prefix
-/// — the tool-level marker is silently ignored. Session bc5764b6
-/// t7 showed `cache_read` pinned at 2432 tokens (= system prefix
-/// alone, ~2553 tokens by char/token ratio) across four rounds
-/// while the expected upper bound was ~7500 tokens (system +
-/// ~5000 tokens of tool schemas).
-///
-/// This is a provider-level limitation, not an astra bug: native
-/// Anthropic and Bedrock both honor tool-level markers, but
-/// DeepSeek's proxy does not. Surface as Info severity so operators
-/// investigating cache-rate gaps can distinguish "provider quirk
-/// — expected" from "our bug — fixable."
-///
-/// Trigger: at least 2 rounds on `provider=anthropic` with a model
-/// id matching `deepseek-*-anthropic`, tool_cc_index is set (marker
-/// was emitted), but cache_read stayed below 4000 across the
-/// window. The 4000 floor is conservative: a typical astra system
-/// prefix is ~2500–3000 tokens, so 4000 = "system cached and then
-/// some, but clearly not reaching the ~7500 we'd see if tools were
-/// also cached."
-#[must_use]
-fn rule_deepseek_anthropic_tools_not_cached(
-    rounds: &[RoundSnapshot],
-) -> Option<CacheFinding> {
-    let relevant: Vec<&RoundSnapshot> = rounds
-        .iter()
-        .filter(|r| {
-            r.provider == "anthropic"
-                && r.model.to_ascii_lowercase().starts_with("deepseek")
-                && r.model.to_ascii_lowercase().contains("anthropic")
-        })
-        .collect();
-    if relevant.len() < 2 {
-        return None;
-    }
-    // Tool marker was emitted — confirms astra did its part.
-    if !relevant.iter().any(|r| r.tool_cc_index.is_some()) {
-        return None;
-    }
-    // Cache_read is stuck below the "system-only" ceiling for every
-    // observed round.
-    let all_below_tools_ceiling = relevant
-        .iter()
-        .all(|r| r.cache_read_tokens > 0 && r.cache_read_tokens < 4_000);
-    if !all_below_tools_ceiling {
-        return None;
-    }
-    let min = relevant
-        .iter()
-        .map(|r| r.cache_read_tokens)
-        .min()
-        .unwrap_or(0);
-    let max = relevant
-        .iter()
-        .map(|r| r.cache_read_tokens)
-        .max()
-        .unwrap_or(0);
-    // If min==max across all rounds, cache_read is suspiciously flat —
-    // the classic "system cached once, tools never joined" shape.
-    if min != max {
-        return None;
-    }
-    let first = relevant[0];
-    let trigs: Vec<(u32, u32)> = relevant.iter().map(|r| (r.turn, r.round)).collect();
-    Some(CacheFinding {
-        rule_id: "deepseek_anthropic_tools_not_cached",
-        severity: Severity::Info,
-        narrative: format!(
-            "{model} via {prov}: cache_read held flat at {min} tokens across \
-             {n} rounds even though the tool cache_control marker was set \
-             (tool_cc_index={tcc:?}). DeepSeek's Anthropic-compatible \
-             endpoint caches the system prefix but does NOT honor \
-             tool-level markers — the ~5000 tokens of tool schemas get \
-             re-tokenized every request.",
-            model = first.model,
-            prov = first.provider,
-            n = relevant.len(),
-            tcc = first.tool_cc_index,
-        ),
-        actionable_fix:
-            "Provider-level limitation, not astra code. If tool-schema \
-             caching matters for this workload, route it through native \
-             Anthropic or Bedrock instead of deepseek-*-anthropic. \
-             Otherwise accept the ~5K tokens/request overhead as a \
-             provider cost."
-                .into(),
-        triggered_on: trigs,
-    })
-}
+// NOTE: `rule_deepseek_anthropic_tools_not_cached` was removed after
+// the original "provider silently ignores tool-level cache_control"
+// claim was falsified by controlled probes. With 21 tools + astra's
+// 4-block system payload + tool-level cc marker on the last tool,
+// DeepSeek's `/anthropic` endpoint cached 9088 of 9116 input tokens
+// (99%) on the warm call — and kept caching even with no tool-level
+// marker at all (auto-prefix over the tools array). The 2432-flat
+// pattern seen in production sessions therefore has an astra-side
+// cause (something in the per-round wire payload varies); keep the
+// telemetry but stop diagnosing the endpoint. See
+// `tests/fixtures/deepseek_anthropic_cache_probe.py` for the
+// reproduction.
 
 /// Render findings + round-level aggregates as markdown suitable for
 /// returning to the LLM from `introspect(subtopic="cache")`. Designed
@@ -912,8 +817,13 @@ pub fn render_findings_markdown(rounds: &[RoundSnapshot], findings: &[CacheFindi
         };
         out.push_str(&format!(
             "| {:>4} | {:>5} | {:<9} | {:>10} | {:>14} | {} | {} |\n",
-            r.turn, r.round, r.provider, r.cache_read_tokens, r.cache_creation_tokens,
-            msg_cc_str, tool_cc_str,
+            r.turn,
+            r.round,
+            r.provider,
+            r.cache_read_tokens,
+            r.cache_creation_tokens,
+            msg_cc_str,
+            tool_cc_str,
         ));
     }
     out.push('\n');
@@ -1000,16 +910,6 @@ mod tests {
             message_count,
             &vec!["user"; message_count as usize],
         )
-    }
-
-    /// Convenience: override the default `model: "test-model"` on a
-    /// snap(). Used by deepseek-anthropic tests that rely on model-id
-    /// substring matching.
-    impl RoundSnapshot {
-        fn with_model(mut self, m: &str) -> Self {
-            self.model = m.into();
-            self
-        }
     }
 
     fn snap_with_volatile_and_roles(
@@ -1102,16 +1002,7 @@ mod tests {
     fn tool_marker_not_on_tail_fires_when_marker_before_last() {
         // Session d0640d3d t3: 21 tools, marker on idx 19 (skill),
         // last idx is 20 (web_search).
-        let rs = vec![snap(
-            3,
-            0,
-            "anthropic",
-            2432,
-            0,
-            &[0, 2, 4],
-            21,
-            Some(19),
-        )];
+        let rs = vec![snap(3, 0, "anthropic", 2432, 0, &[0, 2, 4], 21, Some(19))];
         let findings = evaluate_all(&rs);
         let f = findings
             .iter()
@@ -1128,16 +1019,7 @@ mod tests {
     #[test]
     fn tool_marker_not_on_tail_silent_when_marker_on_last() {
         // Healthy: 21 tools, cc on idx 20.
-        let rs = vec![snap(
-            3,
-            0,
-            "anthropic",
-            2432,
-            0,
-            &[0, 2, 4],
-            21,
-            Some(20),
-        )];
+        let rs = vec![snap(3, 0, "anthropic", 2432, 0, &[0, 2, 4], 21, Some(20))];
         assert!(
             !evaluate_all(&rs)
                 .iter()
@@ -1300,97 +1182,6 @@ mod tests {
                 .any(|f| f.rule_id == "cache_creation_waste"),
             "rule requires 3+ rounds after the updated threshold (need >=2 \
              post-first rounds to establish a trend)",
-        );
-    }
-
-    // ── Rule 6: deepseek_anthropic_tools_not_cached ─────────────────────
-
-    #[test]
-    fn deepseek_anthropic_tools_not_cached_fires_on_flat_system_only_cache() {
-        // Session bc5764b6 t7-t8 shape: 4 rounds, cache_read stuck at
-        // 2432 (≈ system prefix), tool_cc_index set.
-        let rs = vec![
-            snap(7, 0, "anthropic", 2432, 0, &[0, 10, 12], 21, Some(20))
-                .with_model("deepseek-v4-pro-anthropic"),
-            snap(7, 1, "anthropic", 2432, 0, &[0, 16], 21, Some(20))
-                .with_model("deepseek-v4-pro-anthropic"),
-            snap(8, 0, "anthropic", 2432, 0, &[0, 12, 14], 21, Some(20))
-                .with_model("deepseek-v4-pro-anthropic"),
-        ];
-        let findings = evaluate_all(&rs);
-        let f = findings
-            .iter()
-            .find(|f| f.rule_id == "deepseek_anthropic_tools_not_cached")
-            .expect("rule must fire on flat system-only cache pattern");
-        assert_eq!(f.severity, Severity::Info);
-        assert!(
-            f.narrative.contains("deepseek"),
-            "narrative must name the provider: {}",
-            f.narrative,
-        );
-    }
-
-    #[test]
-    fn deepseek_anthropic_tools_not_cached_silent_when_cache_grows() {
-        // Cache grows across rounds → tools are being cached, no finding.
-        let rs = vec![
-            snap(7, 0, "anthropic", 2432, 0, &[0, 10], 21, Some(20))
-                .with_model("deepseek-v4-pro-anthropic"),
-            snap(7, 1, "anthropic", 7500, 0, &[0, 12], 21, Some(20))
-                .with_model("deepseek-v4-pro-anthropic"),
-        ];
-        assert!(
-            !evaluate_all(&rs)
-                .iter()
-                .any(|f| f.rule_id == "deepseek_anthropic_tools_not_cached"),
-        );
-    }
-
-    #[test]
-    fn deepseek_anthropic_tools_not_cached_silent_on_native_anthropic() {
-        // Model isn't deepseek — rule skips. Native Anthropic / Bedrock
-        // are known to honor tool markers; this rule is deepseek-specific.
-        let rs = vec![
-            snap(7, 0, "anthropic", 2432, 0, &[0, 10, 12], 21, Some(20))
-                .with_model("claude-sonnet-4"),
-            snap(7, 1, "anthropic", 2432, 0, &[0, 16], 21, Some(20))
-                .with_model("claude-sonnet-4"),
-        ];
-        assert!(
-            !evaluate_all(&rs)
-                .iter()
-                .any(|f| f.rule_id == "deepseek_anthropic_tools_not_cached"),
-        );
-    }
-
-    #[test]
-    fn deepseek_anthropic_tools_not_cached_silent_on_single_round() {
-        // Need >=2 rounds to detect a flat pattern.
-        let rs = vec![
-            snap(7, 0, "anthropic", 2432, 0, &[0, 10, 12], 21, Some(20))
-                .with_model("deepseek-v4-pro-anthropic"),
-        ];
-        assert!(
-            !evaluate_all(&rs)
-                .iter()
-                .any(|f| f.rule_id == "deepseek_anthropic_tools_not_cached"),
-        );
-    }
-
-    #[test]
-    fn deepseek_anthropic_tools_not_cached_silent_without_tool_marker() {
-        // If tool_cc_index is None, astra didn't emit a marker — the
-        // provider can't be blamed. Rule skips.
-        let rs = vec![
-            snap(7, 0, "anthropic", 2432, 0, &[0, 10, 12], 21, None)
-                .with_model("deepseek-v4-pro-anthropic"),
-            snap(7, 1, "anthropic", 2432, 0, &[0, 16], 21, None)
-                .with_model("deepseek-v4-pro-anthropic"),
-        ];
-        assert!(
-            !evaluate_all(&rs)
-                .iter()
-                .any(|f| f.rule_id == "deepseek_anthropic_tools_not_cached"),
         );
     }
 
@@ -1585,7 +1376,9 @@ mod tests {
         )];
         let findings = evaluate_all(&rs);
         assert!(
-            findings.iter().any(|f| f.rule_id == "volatile_in_cached_prefix"),
+            findings
+                .iter()
+                .any(|f| f.rule_id == "volatile_in_cached_prefix"),
             "rule must fire even on round 0 for strict-history providers; got {findings:?}",
         );
     }
@@ -1610,7 +1403,11 @@ mod tests {
             .find(|f| f.rule_id == "volatile_in_cached_prefix")
             .expect("rule must fire when volatile < cc");
         assert_eq!(f.severity, Severity::Critical);
-        assert!(f.narrative.contains("cache_control"), "got: {}", f.narrative);
+        assert!(
+            f.narrative.contains("cache_control"),
+            "got: {}",
+            f.narrative
+        );
     }
 
     #[test]
@@ -1660,15 +1457,7 @@ mod tests {
 
     #[test]
     fn volatile_rule_silent_on_openai_when_volatile_on_tail() {
-        let rs = vec![snap_with_volatile(
-            2,
-            0,
-            "openai",
-            "gpt-4o",
-            &[],
-            &[7],
-            8,
-        )];
+        let rs = vec![snap_with_volatile(2, 0, "openai", "gpt-4o", &[], &[7], 8)];
         assert!(
             !evaluate_all(&rs)
                 .iter()
@@ -1732,8 +1521,19 @@ mod tests {
             /* msg_cc */ &[0, 10],
             /* volatile at user msg[8] */ &[8],
             /* count */ 11,
-            &["system", "user", "assistant", "user", "assistant", "user",
-              "assistant", "user", "user", "assistant", "user"],
+            &[
+                "system",
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+                "user",
+                "user",
+                "assistant",
+                "user",
+            ],
         )];
         let findings = evaluate_all(&rs);
         assert!(
@@ -1846,10 +1646,7 @@ mod tests {
         // Production files look like `llm_capture_t3_r0_bridge_inprocess_success_12345.json`,
         // scrubbed fixture files look like `llm_capture_t3_r0.json` OR even `t3_r0.json`.
         // The loader must recognize the production style at minimum.
-        let tmp = std::env::temp_dir().join(format!(
-            "astra-cache-test-{}",
-            std::process::id(),
-        ));
+        let tmp = std::env::temp_dir().join(format!("astra-cache-test-{}", std::process::id(),));
         std::fs::create_dir_all(&tmp).unwrap();
         // Clean up any prior run in this pid (serial_test isn't wired here).
         for e in std::fs::read_dir(&tmp).unwrap().flatten() {
@@ -1858,10 +1655,7 @@ mod tests {
         let prod_style = tmp.join("llm_capture_t1_r0_bridge_inprocess_success_42.json");
         let scrubbed_style = tmp.join("llm_capture_t2_r5_other.json");
         let unrelated = tmp.join("not_a_capture.json");
-        for (p, turn, round) in [
-            (&prod_style, 1, 0),
-            (&scrubbed_style, 2, 5),
-        ] {
+        for (p, turn, round) in [(&prod_style, 1, 0), (&scrubbed_style, 2, 5)] {
             let body = serde_json::json!({
                 "turn": turn,
                 "round": round,
@@ -1873,8 +1667,7 @@ mod tests {
         std::fs::write(&unrelated, "{}").unwrap();
 
         let rows = load_session_captures(&tmp).unwrap();
-        let mut positions: Vec<(u32, u32)> =
-            rows.iter().map(|r| (r.turn, r.round)).collect();
+        let mut positions: Vec<(u32, u32)> = rows.iter().map(|r| (r.turn, r.round)).collect();
         positions.sort();
         assert_eq!(
             positions,

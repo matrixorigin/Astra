@@ -42,8 +42,6 @@ findings. Specifically silent:
 - `volatile_in_cached_prefix` — volatile lives AFTER the last
   cache_control marker inside the system block (MarkerIsolated
   placement on Bedrock)
-- `deepseek_anthropic_tools_not_cached` — provider is bedrock, not
-  deepseek-*-anthropic
 
 ## Do NOT edit by hand
 
