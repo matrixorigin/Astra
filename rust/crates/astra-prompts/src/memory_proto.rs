@@ -172,6 +172,8 @@ pub const NS_PREF: &str = "pref";
 pub const NS_SWAP: &str = "swap";
 pub const NS_INSIGHT: &str = "insight";
 pub const NS_KNOWLEDGE: &str = "knowledge";
+pub const NS_LESSON: &str = "lesson";
+pub const NS_FEEDBACK: &str = "feedback";
 
 // ── Status values ────────────────────────────────────────────────
 pub const ST_PENDING: &str = "pending";
@@ -193,6 +195,8 @@ pub fn ns_to_memory_type(ns: &str) -> &'static str {
         NS_SWAP => "working",
         NS_INSIGHT => "semantic",
         NS_KNOWLEDGE => memory_ns::to_memory_type(memory_ns::KNOWLEDGE),
+        NS_LESSON => "semantic",
+        NS_FEEDBACK => "semantic",
         _ => "semantic",
     }
 }
@@ -681,6 +685,8 @@ mod tests {
         assert_eq!(ns_to_memory_type(NS_SWAP), "working");
         assert_eq!(ns_to_memory_type(NS_INSIGHT), "semantic");
         assert_eq!(ns_to_memory_type(NS_KNOWLEDGE), "semantic");
+        assert_eq!(ns_to_memory_type(NS_LESSON), "semantic");
+        assert_eq!(ns_to_memory_type(NS_FEEDBACK), "semantic");
     }
 
     #[test]

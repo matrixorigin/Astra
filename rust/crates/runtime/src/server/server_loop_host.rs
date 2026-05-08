@@ -593,8 +593,8 @@ fn build_captured_llm_request(
         .iter()
         .map(|m| {
             let normalized = normalize_message_for_cache_hash(m);
-            let canonical = serde_json::to_string(&normalized)
-                .unwrap_or_else(|_| "<unserializable>".into());
+            let canonical =
+                serde_json::to_string(&normalized).unwrap_or_else(|_| "<unserializable>".into());
             sha256_hex(&canonical)
         })
         .collect();
@@ -3399,8 +3399,7 @@ fn normalize_usage_to_canonical(
     let looks_anthropic = raw.contains_key("cache_read_input_tokens")
         || raw.contains_key("cache_creation_input_tokens");
     if !looks_anthropic
-        && (raw.contains_key("cached_input_tokens")
-            || raw.contains_key("cache_creation_tokens"))
+        && (raw.contains_key("cached_input_tokens") || raw.contains_key("cache_creation_tokens"))
     {
         return raw.clone();
     }

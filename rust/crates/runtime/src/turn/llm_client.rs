@@ -1652,10 +1652,7 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
                         continue;
                     };
                     if !obj.contains_key("tool_use_id") {
-                        obj.insert(
-                            "tool_use_id".into(),
-                            Value::String(tool_use_id.to_string()),
-                        );
+                        obj.insert("tool_use_id".into(), Value::String(tool_use_id.to_string()));
                     }
                 }
                 let mut out = json!({

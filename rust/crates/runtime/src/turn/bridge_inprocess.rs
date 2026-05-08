@@ -3862,8 +3862,7 @@ mod tests {
         // OpenAI auto-prefix (TailSuffix): safe to inject every round
         // since volatile lives at the tail of the last user message.
         let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
-            "openai",
-            "gpt-4o",
+            "openai", "gpt-4o",
         );
         let dyn_sections = sample_volatile_sections();
         for round in [0u32, 1, 5] {
@@ -3936,9 +3935,7 @@ mod tests {
             "bridge path must skip volatile on round 0 for MiniMax (strict-history)",
         );
         // And stays empty through the typical tool-loop length.
-        assert!(
-            effective_volatile_sections_for_round(cap, 6, &dyn_sections).is_empty(),
-        );
+        assert!(effective_volatile_sections_for_round(cap, 6, &dyn_sections).is_empty(),);
     }
 
     #[test]
@@ -3952,10 +3949,9 @@ mod tests {
             ("anthropic", "claude-sonnet-4"),
             ("bedrock", "us.anthropic.claude-sonnet-4-6"),
         ] {
-            let cap =
-                astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
-                    prov, model,
-                );
+            let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+                prov, model,
+            );
             assert!(
                 effective_volatile_sections_for_round(cap, 0, &empty).is_empty(),
                 "empty input must yield empty output for {prov}/{model}",

@@ -1001,10 +1001,15 @@ impl ToolExecutor {
                 return cache_diagnosis::render_findings_markdown(&[], &[]);
             }
         };
-        let session_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-            .join(".astra")
-            .join("sessions")
-            .join(&session_id);
+        let session_dir = std::path::PathBuf::from(
+            std::env::var("HOME")
+                .ok()
+                .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| ".".to_string()),
+        )
+        .join(".astra")
+        .join("sessions")
+        .join(&session_id);
         let rounds = match cache_diagnosis::load_session_captures(&session_dir) {
             Ok(rs) => rs,
             Err(e) => {

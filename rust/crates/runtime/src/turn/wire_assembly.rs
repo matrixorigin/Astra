@@ -317,6 +317,23 @@ pub(crate) fn assemble_llm_messages(
     let mut llm_messages = system_messages;
     llm_messages.extend(compacted_messages);
 
+    // Consolidate mid-history volatile injections into `volatile_preamble`
+    // before we prepend it to the last user message. See
+    // `consolidate_mid_history_volatile_injections` for what we strip and
+    // why — TL;DR: sessions like 05e63cac showed 12+ tool_health warnings
+    // + working-set + already-fetched + coaching pings scattered mid-
+    // history, each rewritten per-round. DeepSeek's Anthropic-compat cache
+    // sees that byte churn as "new payload" every round and never warms
+    // past the system prefix.
+    let mut volatile_preamble = volatile_preamble;
+    let harvested = consolidate_mid_history_volatile_injections(&mut llm_messages);
+    if !harvested.is_empty() {
+        volatile_preamble.push(serde_json::json!({
+            "role": "user",
+            "content": harvested,
+        }));
+    }
+
     // Prepend volatile content to the last user message so the stable
     // prefix (system + history) stays byte-identical for prefix caching.
     if !volatile_preamble.is_empty() {
@@ -370,6 +387,124 @@ pub(crate) fn assemble_llm_messages(
 
     apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, session_id);
     llm_messages
+}
+
+/// Remove mid-history volatile-style injections from `messages` and return
+/// the consolidated text so the caller can fold it into `volatile_preamble`.
+///
+/// Context: during a tool-loop turn the runtime scatters nudges into the
+/// message history — TurnGuard's "⚠ tools have failed …" warnings
+/// (once every 2-3 rounds), the `[working-set:v1]` and
+/// `## Already Fetched` system blocks (appended at turn boundaries),
+/// parallel-batching-force / execution-escalation user corrective
+/// messages, the "✓ 2 tools executed in parallel" coaching pings.
+///
+/// Each of those injections looks volatile to the provider's prefix
+/// cache: its CONTENT evolves across rounds (avoid_tools list grows,
+/// working_set recent_tools adds entries), and its POSITION in history
+/// shifts as tool-result pairs get appended ahead of it. DeepSeek's
+/// `/anthropic` endpoint treats every such mid-history byte delta as
+/// "new payload" and restarts warm-up, which caps cache_read at the
+/// system-prefix size (~2432 in session 05e63cac).
+///
+/// We keep only the FINAL occurrence of each known pattern (the most
+/// recent round's state is always the authoritative one) and return
+/// their concatenated text so [`assemble_llm_messages`] can prepend it
+/// to the last user message. Stripping them out of history removes the
+/// mid-history byte churn; the agent still sees the same up-to-date
+/// nudges in the tail.
+///
+/// This is strictly a wire-layer pass. Session persistence (the
+/// `conversation_log` snapshot, event journal) is untouched.
+pub(crate) fn consolidate_mid_history_volatile_injections(messages: &mut Vec<Value>) -> String {
+    // Classifier: given a message (role + content), return Some(kind) if
+    // it's a known volatile injection we want to consolidate, None otherwise.
+    fn classify(msg: &Value) -> Option<&'static str> {
+        let role = msg.get("role").and_then(Value::as_str)?;
+        let content = msg.get("content").and_then(Value::as_str)?;
+        match role {
+            "user" => {
+                if content.starts_with("⚠ The following tools have failed") {
+                    Some("tool_health_warning")
+                } else if content.starts_with("⚠ You have been") {
+                    Some("stall_nudge")
+                } else if content.contains("consecutive single-tool rounds")
+                    && content.contains("parallel")
+                {
+                    Some("parallel_batching_force")
+                } else if content.contains("accumulated")
+                    && content.contains("read-only tool calls")
+                {
+                    Some("execution_escalation")
+                } else {
+                    None
+                }
+            }
+            "system" => {
+                if content.starts_with("[working-set:v1]") {
+                    Some("working_set")
+                } else if content.starts_with("## Already Fetched") {
+                    Some("already_fetched")
+                } else if content.starts_with("✓ ") {
+                    Some("tool_batch_coaching")
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    // Walk backwards: remember the first (most recent) occurrence of each
+    // kind, mark the rest for removal. The index of the FINAL occurrence
+    // of each kind survives — we also strip that one from history and
+    // keep only the text for the preamble.
+    use std::collections::HashMap;
+    let mut kept_kinds: HashMap<&'static str, String> = HashMap::new();
+    let mut to_remove: Vec<usize> = Vec::new();
+    for (idx, msg) in messages.iter().enumerate().rev() {
+        let Some(kind) = classify(msg) else {
+            continue;
+        };
+        if kept_kinds.contains_key(kind) {
+            // Older duplicate — drop unconditionally.
+            to_remove.push(idx);
+            continue;
+        }
+        // First (most recent) occurrence — capture text, then strip.
+        if let Some(text) = msg.get("content").and_then(Value::as_str) {
+            kept_kinds.insert(kind, text.to_string());
+        }
+        to_remove.push(idx);
+    }
+
+    // Remove in descending order so indices stay valid.
+    to_remove.sort_unstable_by(|a, b| b.cmp(a));
+    for idx in to_remove {
+        messages.remove(idx);
+    }
+
+    // Assemble preamble in stable order so the text is byte-deterministic
+    // across calls with the same inputs.
+    const ORDER: &[&str] = &[
+        "tool_health_warning",
+        "stall_nudge",
+        "parallel_batching_force",
+        "execution_escalation",
+        "tool_batch_coaching",
+        "working_set",
+        "already_fetched",
+    ];
+    let mut out = String::new();
+    for kind in ORDER {
+        if let Some(text) = kept_kinds.remove(kind) {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&text);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -859,5 +994,142 @@ mod tests {
         let user_content = msgs[1]["content"].as_str().unwrap();
         assert!(user_content.contains("volatile"), "volatile prepended");
         assert!(user_content.contains("hi"), "original content preserved");
+    }
+
+    // ── consolidate_mid_history_volatile_injections regressions ─────────
+    //
+    // Session 05e63cac t5 had 12 `tool_health_warning` user msgs scattered
+    // mid-history every 2-3 rounds, plus `[working-set:v1]` and
+    // `## Already Fetched` trailing system msgs, plus a "✓ 2 tools executed
+    // in parallel" coaching ping. DeepSeek's /anthropic cache plateaued at
+    // 2432 tokens (system-only) instead of the probe-measured 88% upper
+    // bound because every round rewrote those mid-history bytes.
+
+    #[test]
+    fn consolidate_strips_duplicate_tool_health_warnings_keeping_final() {
+        let mut msgs = vec![
+            json!({"role": "system", "content": "stable sys"}),
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": "a1"}),
+            json!({"role": "user", "content": "⚠ The following tools have failed 3 or more times consecutively: [str_replace]. [iteration 1]"}),
+            json!({"role": "assistant", "content": "a2"}),
+            json!({"role": "user", "content": "⚠ The following tools have failed 3 or more times consecutively: [str_replace, read_file]. [iteration 2]"}),
+            json!({"role": "assistant", "content": "a3"}),
+            json!({"role": "user", "content": "⚠ The following tools have failed 3 or more times consecutively: [str_replace, read_file, grep]. [iteration 3]"}),
+            json!({"role": "user", "content": "latest user turn"}),
+        ];
+        let preamble = consolidate_mid_history_volatile_injections(&mut msgs);
+        // Only the FINAL iteration should survive in preamble.
+        assert!(
+            preamble.contains("[iteration 3]"),
+            "final warning must be preserved: preamble={preamble:?}",
+        );
+        assert!(
+            !preamble.contains("[iteration 1]") && !preamble.contains("[iteration 2]"),
+            "older iterations must be dropped: preamble={preamble:?}",
+        );
+        // Mid-history user-warning slots all stripped; only real conversational
+        // turns remain.
+        assert_eq!(msgs.len(), 6); // system + q1/a1/a2/a3 + latest user
+        for m in &msgs {
+            let Some(c) = m.get("content").and_then(Value::as_str) else { continue };
+            assert!(
+                !c.starts_with("⚠ The following tools have failed"),
+                "no tool_health_warning msg may remain in-place: {c}",
+            );
+        }
+    }
+
+    #[test]
+    fn consolidate_strips_working_set_and_already_fetched_trailing_system() {
+        let mut msgs = vec![
+            json!({"role": "system", "content": "stable sys"}),
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": "a1"}),
+            json!({"role": "user", "content": "q2"}),
+            // trailing system msgs injected by runtime
+            json!({"role": "system", "content": "[working-set:v1]\ngoal: ship it\nrecent_tools:\n- git [ok t3]"}),
+            json!({"role": "system", "content": "## Already Fetched (do NOT re-read/re-grep these)\nsrc/main.rs"}),
+        ];
+        let preamble = consolidate_mid_history_volatile_injections(&mut msgs);
+        assert!(preamble.contains("[working-set:v1]"), "working-set preserved");
+        assert!(preamble.contains("## Already Fetched"), "already-fetched preserved");
+        // Trailing system msgs gone.
+        assert_eq!(msgs.len(), 4);
+        for m in &msgs {
+            let Some(c) = m.get("content").and_then(Value::as_str) else { continue };
+            assert!(
+                !c.starts_with("[working-set:v1]") && !c.starts_with("## Already Fetched"),
+                "runtime-injected system msgs must be stripped: {c}",
+            );
+        }
+    }
+
+    #[test]
+    fn consolidate_strips_coaching_ping_and_nudge_patterns() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q"}),
+            json!({"role": "system", "content": "✓ 2 tools executed in parallel — excellent. Keep batching."}),
+            json!({"role": "user", "content": "⚠ You have been exploring for multiple rounds. STOP."}),
+            json!({"role": "user", "content": "next"}),
+        ];
+        let preamble = consolidate_mid_history_volatile_injections(&mut msgs);
+        assert!(preamble.contains("✓ 2 tools executed"), "coaching preserved");
+        assert!(preamble.contains("⚠ You have been"), "stall nudge preserved");
+        assert_eq!(msgs.len(), 2); // q + next
+    }
+
+    #[test]
+    fn consolidate_keeps_real_conversation_user_msgs_intact() {
+        // Ordinary user messages (not runtime injections) must survive.
+        let mut msgs = vec![
+            json!({"role": "user", "content": "write me some code"}),
+            json!({"role": "assistant", "content": "ok"}),
+            json!({"role": "user", "content": "review the uncommitted changes"}),
+            json!({"role": "assistant", "content": "done"}),
+            json!({"role": "user", "content": "double check"}),
+        ];
+        let preamble = consolidate_mid_history_volatile_injections(&mut msgs);
+        assert!(preamble.is_empty(), "no volatile injections → empty preamble");
+        assert_eq!(msgs.len(), 5, "real conversation msgs preserved verbatim");
+    }
+
+    /// End-to-end regression: two synthetic rounds where only the tail
+    /// grows (one tool-result pair appended), with runtime injections
+    /// added each round. After consolidation, the prefix up to the added
+    /// pair must be byte-identical across both rounds.
+    #[test]
+    fn consolidate_makes_history_byte_stable_across_rounds() {
+        let round_1 = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "user", "content": "⚠ The following tools have failed 3 or more times consecutively: [str_replace]."}),
+            json!({"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "bash"}}]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "result1"}),
+            json!({"role": "system", "content": "[working-set:v1]\ngoal: fix\nrecent_tools:\n- bash [ok t1]"}),
+        ];
+        let round_2 = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "user", "content": "⚠ The following tools have failed 3 or more times consecutively: [str_replace, read_file]."}),
+            json!({"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "bash"}}]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "result1"}),
+            json!({"role": "assistant", "tool_calls": [{"id": "c2", "function": {"name": "bash"}}]}),
+            json!({"role": "tool", "tool_call_id": "c2", "content": "result2"}),
+            json!({"role": "system", "content": "[working-set:v1]\ngoal: fix\nrecent_tools:\n- bash [ok t1]\n- bash [ok t2]"}),
+        ];
+        let mut m1 = round_1;
+        let mut m2 = round_2;
+        let _ = consolidate_mid_history_volatile_injections(&mut m1);
+        let _ = consolidate_mid_history_volatile_injections(&mut m2);
+        // Round 1: [user q1, assistant_tc, tool] = 3 msgs (warning + working-set stripped).
+        // Round 2: Round 1 + [assistant_tc2, tool2]  = 5 msgs.
+        assert_eq!(m1.len(), 3, "round 1 post-consolidate: {:#?}", m1);
+        assert_eq!(m2.len(), 5, "round 2 post-consolidate: {:#?}", m2);
+        // All 3 msgs of round 1 must appear verbatim as the first 3 of round 2.
+        for i in 0..m1.len() {
+            assert_eq!(
+                m1[i], m2[i],
+                "msg[{i}] must be byte-identical across rounds after consolidation",
+            );
+        }
     }
 }

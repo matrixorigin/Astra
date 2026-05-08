@@ -17,8 +17,8 @@
 //!
 //! where `ns` is one of the namespaces declared in
 //! `astra_prompts::memory_proto` (pref / fact / plan / episode / insight /
-//! knowledge / task / swap). `type` is a free status token (`active`,
-//! `archived`, etc.). Body must carry enough content to be worth
+//! knowledge / task / swap / lesson / feedback). `type` is a free status
+//! token (`active`, `archived`, etc.). Body must carry enough content to be worth
 //! retrieving — short blurbs get rejected, forcing the caller to either
 //! summarize more durably or skip the write.
 //!
@@ -41,7 +41,8 @@
 // constants guarantees zero drift at compile time; the previous
 // mirror was only guarded by a single drift-detection test.
 use astra_prompts::memory_proto::{
-    ABSTRACT_MAX_CHARS, ABSTRACT_MIN_CHARS, LAYER_SEP_DETAIL, LAYER_SEP_OVERVIEW,
+    ABSTRACT_MAX_CHARS, ABSTRACT_MIN_CHARS, LAYER_SEP_DETAIL, LAYER_SEP_OVERVIEW, NS_EPISODE,
+    NS_FACT, NS_FEEDBACK, NS_INSIGHT, NS_KNOWLEDGE, NS_LESSON, NS_PLAN, NS_PREF, NS_SWAP, NS_TASK,
 };
 
 /// Memory types that Memoria persists across sessions. Writes with
@@ -115,21 +116,19 @@ impl std::fmt::Display for PersistentStoreRejection {
 
 /// Registered memory-protocol namespaces.
 ///
-/// Kept here (not imported from `astra-prompts`) so this crate has no
-/// dependency on prompts. The list is a tiny enum that rarely changes;
-/// if `astra-prompts::memory_proto` adds a namespace, a single test
-/// here will fail loudly.
+/// Kept as a local allow-list, but populated from the canonical protocol
+/// constants so namespace drift fails at compile time.
 const KNOWN_NAMESPACES: &[&str] = &[
-    "pref",
-    "fact",
-    "plan",
-    "episode",
-    "insight",
-    "knowledge",
-    "task",
-    "swap",
-    "lesson",
-    "feedback",
+    NS_PREF,
+    NS_FACT,
+    NS_PLAN,
+    NS_EPISODE,
+    NS_INSIGHT,
+    NS_KNOWLEDGE,
+    NS_TASK,
+    NS_SWAP,
+    NS_LESSON,
+    NS_FEEDBACK,
 ];
 
 /// Validate content for a persistent-type memory store.

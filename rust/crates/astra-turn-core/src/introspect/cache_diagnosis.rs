@@ -860,6 +860,7 @@ pub fn render_findings_markdown(rounds: &[RoundSnapshot], findings: &[CacheFindi
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn snap(
         turn: u32,
         round: u32,
@@ -912,6 +913,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn snap_with_volatile_and_roles(
         turn: u32,
         round: u32,

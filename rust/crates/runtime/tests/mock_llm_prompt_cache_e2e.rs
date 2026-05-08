@@ -875,12 +875,10 @@ async fn rolling_breakpoint_historical_marker_matches_previous_tail() {
 
     // Round 3 → Round 4: round 3's tail must equal round 4's historical.
     assert_eq!(
-        g[2].message_cache_control_indices[1],
-        g[3].message_cache_control_indices[0],
+        g[2].message_cache_control_indices[1], g[3].message_cache_control_indices[0],
         "round 4's historical marker must sit at the same index as round 3's \
          tail marker (r3 indices {:?}, r4 indices {:?})",
-        g[2].message_cache_control_indices,
-        g[3].message_cache_control_indices,
+        g[2].message_cache_control_indices, g[3].message_cache_control_indices,
     );
 }
 
@@ -938,8 +936,7 @@ async fn rolling_breakpoint_historical_prefix_bytes_stable_across_rounds() {
             g[1].message_sha256[i], g[2].message_sha256[i],
             "round 3 message[{i}] bytes must equal round 2 — \
              cache_control dropped? r2={:?}, r3={:?}",
-            g[1].message_cache_control_indices,
-            g[2].message_cache_control_indices,
+            g[1].message_cache_control_indices, g[2].message_cache_control_indices,
         );
     }
 
@@ -952,8 +949,7 @@ async fn rolling_breakpoint_historical_prefix_bytes_stable_across_rounds() {
             g[2].message_sha256[i], g[3].message_sha256[i],
             "round 4 message[{i}] bytes must equal round 3 — \
              cache_control dropped? r3={:?}, r4={:?}",
-            g[2].message_cache_control_indices,
-            g[3].message_cache_control_indices,
+            g[2].message_cache_control_indices, g[3].message_cache_control_indices,
         );
     }
 }

@@ -209,10 +209,8 @@ mod tests {
 
     #[test]
     fn bedrock_provider_gets_bedrock_cachepoint() {
-        let c = CacheCapability::for_provider_and_model(
-            "bedrock",
-            "us.anthropic.claude-sonnet-4-6",
-        );
+        let c =
+            CacheCapability::for_provider_and_model("bedrock", "us.anthropic.claude-sonnet-4-6");
         assert_eq!(c.protocol, CacheProtocol::BedrockCachePoint);
         assert_eq!(c.volatile_placement, VolatilePlacement::MarkerIsolated);
     }

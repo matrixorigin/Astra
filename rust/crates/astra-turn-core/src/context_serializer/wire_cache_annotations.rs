@@ -218,8 +218,8 @@ fn find_cache_breakpoint_targets(messages: &[Value]) -> Vec<usize> {
             // or before the last user we'd break the normal-turn invariant,
             // so fall through to just `[tail]`.
             let historical_candidate = tail.checked_sub(2);
-            let historical = historical_candidate
-                .filter(|&h| h > last_user && is_non_system(h) && h != tail);
+            let historical =
+                historical_candidate.filter(|&h| h > last_user && is_non_system(h) && h != tail);
             return match historical {
                 Some(h) => vec![h, tail],
                 None => vec![tail],
@@ -245,9 +245,7 @@ fn find_cache_breakpoint_targets(messages: &[Value]) -> Vec<usize> {
             // message — we never place message-level markers on system
             // (system blocks carry their own `cache_control` metadata via
             // `apply_cache_policy_to_blocks`).
-            let historical = penult_user
-                .checked_sub(1)
-                .filter(|&idx| is_non_system(idx));
+            let historical = penult_user.checked_sub(1).filter(|&idx| is_non_system(idx));
 
             match historical {
                 None => vec![tail],
@@ -489,7 +487,11 @@ mod tests {
         let t2 = marker_indices(&turn2);
         // Penult user at idx 1, last user at idx 3. historical would be
         // idx 0 (system) — filtered out — so we get only the tail at idx 2.
-        assert_eq!(t2, vec![2], "turn 2 emits tail only (historical = system filtered)");
+        assert_eq!(
+            t2,
+            vec![2],
+            "turn 2 emits tail only (historical = system filtered)"
+        );
 
         let mut turn3 = vec![
             json!({"role": "system", "content": "sys"}),

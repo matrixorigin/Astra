@@ -17,7 +17,7 @@
 //! Two rules should surface:
 //!   - `cache_read_collapsed`        — 7680 → 0 drop is >50%
 //!   - `volatile_in_cached_prefix`   — MiniMax tool-loop round >0 with
-//!                                     Self-Awareness in history
+//!     Self-Awareness in history
 //!
 //! ## What must stay silent
 //!
@@ -68,10 +68,9 @@ fn load_fixture_rounds() -> Vec<RoundSnapshot> {
     entries
         .into_iter()
         .map(|(_, _, p)| {
-            let text = std::fs::read_to_string(&p)
-                .unwrap_or_else(|e| panic!("read {p:?}: {e}"));
-            let v: Value = serde_json::from_str(&text)
-                .unwrap_or_else(|e| panic!("parse {p:?}: {e}"));
+            let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
+            let v: Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {p:?}: {e}"));
             snapshot_from_capture_json(&v)
         })
         .collect()

@@ -688,7 +688,10 @@ mod tests {
             "reasoning_signature must survive the strip pass",
         );
         // Latest also keeps its signature + content.
-        assert_eq!(msgs[4]["reasoning_content"].as_str(), Some("deep thought 2"));
+        assert_eq!(
+            msgs[4]["reasoning_content"].as_str(),
+            Some("deep thought 2")
+        );
         assert_eq!(msgs[4]["reasoning_signature"].as_str(), Some("sig-xyz-456"));
     }
 
@@ -721,9 +724,15 @@ mod tests {
             }),
         ];
         strip_stale_reasoning(&mut msgs, "anthropic", "claude-sonnet-4");
-        assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("signed thought"));
+        assert_eq!(
+            msgs[1]["reasoning_content"].as_str(),
+            Some("signed thought")
+        );
         assert_eq!(msgs[1]["reasoning_signature"].as_str(), Some("sig-keep-me"));
-        assert_eq!(msgs[4]["reasoning_content"].as_str(), Some("latest unsigned thought"));
+        assert_eq!(
+            msgs[4]["reasoning_content"].as_str(),
+            Some("latest unsigned thought")
+        );
     }
 
     /// Mixed history: some older assistants have signatures, some don't.

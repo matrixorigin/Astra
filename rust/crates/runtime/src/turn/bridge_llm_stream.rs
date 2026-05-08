@@ -20,8 +20,8 @@ use crate::turn::bridge_sse_helpers::render_sse;
 use crate::turn::llm_client::{
     LLM_MAX_RETRIES, LlmCancel, apply_provider_auth, build_provider_request_body,
     consolidate_system_messages, llm_request_url_for_provider, llm_retry_base_ms,
-    parse_openai_sse_json_stream, provider_uses_anthropic_messages,
-    provider_uses_bedrock_converse, sleep_ms_or_llm_cancel,
+    parse_openai_sse_json_stream, provider_uses_anthropic_messages, provider_uses_bedrock_converse,
+    sleep_ms_or_llm_cancel,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
     PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
@@ -614,10 +614,7 @@ fn apply_anthropic_event(
             if let Some(block) = chunk.get("content_block").and_then(Value::as_object)
                 && block.get("type").and_then(Value::as_str) == Some("tool_use")
             {
-                let index = chunk
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as usize;
+                let index = chunk.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
                 let name = block
                     .get("name")
@@ -688,18 +685,14 @@ fn apply_anthropic_event(
                     }
                 }
                 Some("input_json_delta") => {
-                    if let Some(partial) =
-                        delta.get("partial_json").and_then(Value::as_str)
+                    if let Some(partial) = delta.get("partial_json").and_then(Value::as_str)
                         && !partial.is_empty()
                     {
-                        let index = chunk
-                            .get("index")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0) as usize;
+                        let index =
+                            chunk.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                         if let Some(entry) = tool_calls_map.get_mut(&index)
-                            && let Some(f) = entry
-                                .get_mut("function")
-                                .and_then(Value::as_object_mut)
+                            && let Some(f) =
+                                entry.get_mut("function").and_then(Value::as_object_mut)
                             && let Some(args) = f.get_mut("arguments")
                         {
                             if let Value::String(s) = args {

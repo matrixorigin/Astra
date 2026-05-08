@@ -687,7 +687,11 @@ mod tests {
             "skill",
             "web_search",
         ];
-        let missing: Vec<&str> = expected.iter().copied().filter(|n| !pinned.contains(*n)).collect();
+        let missing: Vec<&str> = expected
+            .iter()
+            .copied()
+            .filter(|n| !pinned.contains(*n))
+            .collect();
         assert!(
             missing.is_empty(),
             "these runtime tools are NOT pinned — marker will fall short of the last \
