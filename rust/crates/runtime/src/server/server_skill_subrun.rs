@@ -342,6 +342,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             tool_results: Vec::new(),
             current_session_id: Some(self.session_id.clone()),
             current_run_id: None,
+            context_manifest_pool: None,
+            context_manifest_user_id: None,
+            context_manifest_model_name: None,
             recursion_depth: child_recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,
@@ -475,6 +478,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             .with_cancel_token(self.cancel_token.clone());
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
+            }
+            if let Some(pool) = &self.shared_pool {
+                executor.set_context_manifest_pool(pool.clone());
             }
             state.server_tool_executor = Some(std::sync::Arc::new(executor));
         }

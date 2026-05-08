@@ -36,6 +36,10 @@ export function WorkspaceShell({
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   const displaySessionId = chat.sessionId ?? activeConfig.sessionId ?? null;
+  const contextPercent =
+    chat.contextSummary.budgetTokens > 0
+      ? Math.min(100, Math.round((chat.contextSummary.usedTokens / chat.contextSummary.budgetTokens) * 100))
+      : 0;
 
   const handleSelectSession = useCallback(
     (sessionId: string) => {
@@ -94,6 +98,23 @@ export function WorkspaceShell({
             <EdgeConnectionBadge edges={edge.edges} hasEdge={edge.hasEdge} />
           </div>
           <div className="flex items-center gap-3 text-xs text-slate-500">
+            <button
+              type="button"
+              onClick={() => setSidePanel('context')}
+              className="min-w-32 rounded-md border border-slate-800 px-2 py-1 text-left hover:border-slate-700"
+              title={`${chat.contextSummary.usedTokens}/${chat.contextSummary.budgetTokens} context tokens`}
+            >
+              <span className="block text-[10px] uppercase text-slate-500">Context</span>
+              <span className="block text-slate-300">
+                {chat.contextSummary.usedTokens}/{chat.contextSummary.budgetTokens} tokens
+              </span>
+              <span className="mt-1 block h-1 overflow-hidden rounded bg-slate-800">
+                <span
+                  className="block h-full bg-sky-500"
+                  style={{ width: `${contextPercent}%` }}
+                />
+              </span>
+            </button>
             {displaySessionId ? (
               <span className="max-w-[120px] truncate" title={displaySessionId}>
                 {displaySessionId.slice(0, 8)}…
@@ -127,6 +148,23 @@ export function WorkspaceShell({
             {chat.error}
           </div>
         ) : null}
+        {chat.askUserPrompt ? (
+          <div className="border-b border-amber-800/50 bg-amber-950/30 px-4 py-3">
+            <p className="text-sm text-amber-100">{chat.askUserPrompt.question}</p>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {chat.askUserPrompt.choices.map((choice) => (
+                <button
+                  key={choice}
+                  type="button"
+                  onClick={() => chat.answerAskUser(choice)}
+                  className="rounded-md border border-amber-700/60 px-2 py-1 text-xs text-amber-100 hover:bg-amber-900/40"
+                >
+                  {choice}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
 
         {/* Chat thread */}
         <ChatThread messages={chat.messages} />
@@ -156,8 +194,8 @@ export function WorkspaceShell({
           {(
             [
               { key: 'tools' as const, label: 'Tools', count: chat.toolCalls.length },
-              { key: 'plan' as const, label: 'Plan', count: chat.plan?.subtasks.length ?? 0 },
-              { key: 'agents' as const, label: 'Agents', count: chat.agentEvents.filter((e) => e.type === 'agent_spawned').length },
+              { key: 'plan' as const, label: 'Plan/Todos', count: chat.plan?.subtasks.length ?? 0 },
+              { key: 'agents' as const, label: 'Children', count: chat.agentEvents.filter((e) => e.type === 'agent_spawned').length },
               { key: 'events' as const, label: 'Events', count: events?.length ?? 0 },
               { key: 'context' as const, label: 'Context' },
             ]
@@ -191,9 +229,9 @@ export function WorkspaceShell({
               <PlanProgressPanel plan={chat.plan} />
             ) : (
               <div className="flex flex-col items-center justify-center p-6 text-center">
-                <p className="text-xs text-slate-500">
-                  No active plan. Plans will appear when the agent creates one.
-                </p>
+                  <p className="text-xs text-slate-500">
+                    No active plan or todos. Items will appear when the agent creates them.
+                  </p>
               </div>
             )
           ) : effectiveSidePanel === 'agents' ? (
@@ -203,7 +241,7 @@ export function WorkspaceShell({
               ) : (
                 <div className="flex flex-col items-center justify-center p-6 text-center">
                   <p className="text-xs text-slate-500">
-                    No agents spawned yet. Multi-agent activity will appear here.
+                    No child runs yet. Delegation activity will appear here.
                   </p>
                 </div>
               )}
@@ -218,6 +256,27 @@ export function WorkspaceShell({
             </div>
           ) : (
             <div className="space-y-4 p-4">
+              <div className="rounded-xl border border-slate-800 p-3">
+                <p className="text-xs uppercase tracking-wide text-slate-500">Manifest summary</p>
+                <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-400">
+                  <span>Used: {chat.contextSummary.usedTokens}</span>
+                  <span>Budget: {chat.contextSummary.budgetTokens}</span>
+                  <span>Dropped: {chat.contextSummary.droppedCount}</span>
+                  <span>Zones: {chat.contextSummary.zones.length}</span>
+                </div>
+                {chat.contextSummary.zones.length > 0 ? (
+                  <div className="mt-3 space-y-2">
+                    {chat.contextSummary.zones.map((zone) => (
+                      <div key={zone.zone} className="flex items-center justify-between text-xs">
+                        <span className="text-slate-300">{zone.zone}</span>
+                        <span className="text-slate-500">
+                          {zone.usedTokens}/{zone.budgetTokens}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
               {session ? (
                 <div className="rounded-xl border border-slate-800 p-3">
                   <p className="text-xs uppercase tracking-wide text-slate-500">Session</p>

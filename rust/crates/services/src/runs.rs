@@ -1,9 +1,18 @@
-use astra_core::{ErrorResponse, error_response, error_response_coded};
+use astra_core::{ErrorResponse, SharedPool, error_response, error_response_coded};
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sqlx::Row;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
+use thiserror::Error;
+use uuid::Uuid;
 
 pub const RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE: &str = "run_lifecycle_unconfigured";
+pub const SSE_HEARTBEAT_INTERVAL_SECS: u64 = 15;
 
 pub fn is_run_lifecycle_unconfigured_error(status: StatusCode, error: &ErrorResponse) -> bool {
     status == StatusCode::NOT_IMPLEMENTED
@@ -71,6 +80,18 @@ pub trait RunLifecycleService: Send + Sync {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Resume not supported",
+        ))
+    }
+
+    async fn submit_run_input(
+        &self,
+        _run_id: String,
+        _user_id: String,
+        _input: RunInputData,
+    ) -> Result<RunInputRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Run input not supported",
         ))
     }
 
@@ -260,6 +281,19 @@ pub struct RunMutationRecord {
     pub previous_status: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunInputData {
+    pub idempotency_key: String,
+    pub input: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunInputRecord {
+    pub run_id: String,
+    pub accepted: bool,
+    pub duplicate: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunListRecord {
     pub runs: Vec<RunStatusRecord>,
@@ -278,15 +312,29 @@ pub struct DurableRunRecord {
     pub session_id: String,
     /// Parent run ID for delegation sub-runs.
     pub parent_run_id: Option<String>,
+    /// Root run ID for a delegated run tree.
+    pub root_run_id: Option<String>,
+    /// Slash-delimited ancestor path, for deterministic subtree queries.
+    pub ancestor_path: Option<String>,
+    /// Depth from root run. Root run depth is 0.
+    pub depth: u32,
     /// Delegation ID this run belongs to.
     pub delegation_id: Option<String>,
     /// Agent profile ID executing this run.
     pub agent_id: Option<String>,
     /// If this run is a verification-gate retry, links to the original run.
     pub retry_of: Option<String>,
+    /// Retry blast radius: node, subtree, or siblings.
+    pub retry_scope: Option<String>,
     pub status: String,
     pub waiting_for: Option<String>,
+    pub owner_pod_id: Option<String>,
+    pub owner_lease_expires_at: Option<String>,
+    pub run_generation: u64,
+    pub last_event_idx: i64,
+    pub checkpoint_version: Option<String>,
     pub checkpoint_json: Option<String>,
+    pub error_code: Option<String>,
     pub error_message: Option<String>,
     /// Number of verification-gate retry attempts.
     pub retry_count: u32,
@@ -302,7 +350,7 @@ pub struct DurableRunRecord {
 ///
 /// Implementations:
 /// - `InMemoryRunStateStore` — for tests and single-process deployments
-/// - (future) `DatabaseRunStateStore` — MatrixOne-backed persistence
+/// - `DatabaseRunStateStore` — MatrixOne-backed persistence
 #[async_trait]
 pub trait RunStateStore: Send + Sync {
     /// Insert a new run record.
@@ -526,6 +574,979 @@ impl RunStateStore for InMemoryRunStateStore {
             Ok(false)
         }
     }
+}
+
+// ─── MatrixOne-backed run state store ───────────────────────────────────────
+
+const DEFAULT_RETRY_SCOPE: &str = "node";
+const MAX_TOOL_OUTPUT_BATCH_ROWS: usize = 500;
+const MAX_TOOL_OUTPUT_BATCH_BYTES: usize = 16 * 1024 * 1024;
+const FALLBACK_PREVIEW_BYTES: usize = 400;
+
+#[derive(Clone, Debug)]
+struct ToolPreviewContract {
+    max_preview_bytes: usize,
+    normalize_version: String,
+    found: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ToolOutputPreviewRow {
+    payload: String,
+    preview_text: String,
+    preview_status: String,
+    artifact_ref: Option<String>,
+    content_hash: String,
+    normalize_version: String,
+    parent_output_id: Option<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum DatabaseRunStateStoreError {
+    #[error("database operation failed: operation={operation}, entity={entity}, source={source}")]
+    Database {
+        operation: &'static str,
+        entity: String,
+        #[source]
+        source: sqlx::Error,
+    },
+    #[error("invalid retry_scope for run {run_id}: {retry_scope}")]
+    InvalidRetryScope { run_id: String, retry_scope: String },
+    #[error("invalid checkpoint_v1 for run {run_id}: {reason}")]
+    InvalidCheckpoint { run_id: String, reason: String },
+    #[error("tool output batch too large: run_id={run_id}, rows={rows}, bytes={bytes}")]
+    ToolOutputBatchTooLarge {
+        run_id: String,
+        rows: usize,
+        bytes: usize,
+    },
+    #[error("JSON serialization failed: operation={operation}, entity={entity}, source={source}")]
+    Json {
+        operation: &'static str,
+        entity: String,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+type DbStoreResult<T> = Result<T, DatabaseRunStateStoreError>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutputBatchItem {
+    pub output_id: String,
+    pub tool_call_id: Option<String>,
+    pub tool_name: String,
+    pub output_json: serde_json::Value,
+}
+
+/// MatrixOne durable run store.
+///
+/// Events are append-only in `agent_run_events`; `run_counters` owns event_idx
+/// allocation so reconnect and replay never scan `MAX(event_idx)`.
+#[derive(Clone)]
+pub struct DatabaseRunStateStore {
+    pool: SharedPool,
+    owner_pod_id: String,
+    lease_ttl: Duration,
+}
+
+impl DatabaseRunStateStore {
+    pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(45);
+
+    pub fn new(pool: SharedPool) -> Self {
+        Self {
+            pool,
+            owner_pod_id: default_owner_pod_id(),
+            lease_ttl: Self::DEFAULT_LEASE_TTL,
+        }
+    }
+
+    pub fn with_owner_pod_id(mut self, owner_pod_id: impl Into<String>) -> Self {
+        self.owner_pod_id = owner_pod_id.into();
+        self
+    }
+
+    pub fn with_lease_ttl(mut self, lease_ttl: Duration) -> Self {
+        self.lease_ttl = lease_ttl;
+        self
+    }
+
+    pub fn owner_pod_id(&self) -> &str {
+        &self.owner_pod_id
+    }
+
+    async fn load_tool_preview_contracts(
+        &self,
+        items: &[ToolOutputBatchItem],
+    ) -> DbStoreResult<HashMap<String, ToolPreviewContract>> {
+        let tool_names = items
+            .iter()
+            .map(|item| item.tool_name.clone())
+            .collect::<HashSet<_>>();
+        let mut contracts = tool_names
+            .iter()
+            .map(|tool_name| {
+                (
+                    tool_name.clone(),
+                    ToolPreviewContract {
+                        max_preview_bytes: FALLBACK_PREVIEW_BYTES,
+                        normalize_version: "raw_v1".to_string(),
+                        found: false,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        if tool_names.is_empty() {
+            return Ok(contracts);
+        }
+
+        let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "SELECT tool_name, max_preview_bytes, normalize_version
+             FROM preview_template_registry
+             WHERE status = 'active' AND tool_name IN (",
+        );
+        let mut separated = builder.separated(", ");
+        for tool_name in &tool_names {
+            separated.push_bind(tool_name);
+        }
+        separated.push_unseparated(")");
+        let rows = builder
+            .build()
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("load_tool_preview_contracts", "preview_templates", source)
+            })?;
+        for row in rows {
+            let tool_name = row.try_get::<String, _>("tool_name").unwrap_or_default();
+            let max_preview_bytes = row
+                .try_get::<i64, _>("max_preview_bytes")
+                .unwrap_or(FALLBACK_PREVIEW_BYTES as i64)
+                .max(1) as usize;
+            let normalize_version = row
+                .try_get::<String, _>("normalize_version")
+                .unwrap_or_else(|_| "raw_v1".to_string());
+            contracts.insert(
+                tool_name,
+                ToolPreviewContract {
+                    max_preview_bytes,
+                    normalize_version,
+                    found: true,
+                },
+            );
+        }
+        Ok(contracts)
+    }
+
+    async fn record_preview_template_missing_for_tools(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        user_id: &str,
+        contracts: &HashMap<String, ToolPreviewContract>,
+    ) -> DbStoreResult<()> {
+        let missing = contracts
+            .iter()
+            .filter_map(|(tool_name, contract)| (!contract.found).then_some(tool_name.clone()))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "INSERT INTO agent_events
+             (event_id, session_id, user_id, event_type, content, metadata, meta_tool_name, created_at) ",
+        );
+        builder.push_values(missing.iter(), |mut row, tool_name| {
+            row.push_bind(Uuid::new_v4().to_string())
+                .push_bind(session_id)
+                .push_bind(user_id)
+                .push_bind("preview_template_missing")
+                .push_bind(tool_name)
+                .push_bind(
+                    serde_json::json!({
+                        "run_id": run_id,
+                        "tool_name": tool_name,
+                        "fallback_max_preview_bytes": FALLBACK_PREVIEW_BYTES,
+                    })
+                    .to_string(),
+                )
+                .push_bind(tool_name)
+                .push("NOW(6)");
+        });
+        builder
+            .build()
+            .execute(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("record_preview_template_missing_for_tools", run_id, source)
+            })?;
+        Ok(())
+    }
+
+    pub async fn acquire_owner_lease(
+        &self,
+        run_id: &str,
+        owner_pod_id: &str,
+        ttl: Duration,
+    ) -> DbStoreResult<bool> {
+        let lease_expires_at = chrono::Utc::now()
+            + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(45));
+        let result = sqlx::query(
+            "UPDATE run_counters
+             SET owner_pod_id = ?,
+                 owner_lease_expires_at = ?,
+                 run_generation = run_generation + 1,
+                 updated_at = NOW(6)
+             WHERE run_id = ?
+               AND (owner_pod_id IS NULL OR owner_pod_id = ? OR owner_lease_expires_at < NOW(6))",
+        )
+        .bind(owner_pod_id)
+        .bind(lease_expires_at.naive_utc())
+        .bind(run_id)
+        .bind(owner_pod_id)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("acquire_owner_lease", run_id, source))?;
+
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+
+        sqlx::query(
+            "UPDATE agent_runs
+             SET owner_pod_id = ?,
+                 owner_lease_expires_at = ?,
+                 run_generation = run_generation + 1,
+                 updated_at = NOW(6)
+             WHERE run_id = ?",
+        )
+        .bind(owner_pod_id)
+        .bind(lease_expires_at.naive_utc())
+        .bind(run_id)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("sync_owner_lease_to_run", run_id, source))?;
+
+        Ok(true)
+    }
+
+    pub async fn insert_tool_output_batch(
+        &self,
+        batch_id: &str,
+        session_id: &str,
+        run_id: &str,
+        user_id: &str,
+        items: &[ToolOutputBatchItem],
+    ) -> DbStoreResult<()> {
+        let payloads = items
+            .iter()
+            .map(|item| {
+                serde_json::to_string(&item.output_json).map_err(|source| {
+                    DatabaseRunStateStoreError::Json {
+                        operation: "serialize_tool_output",
+                        entity: item.output_id.clone(),
+                        source,
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let payload_bytes = payloads.iter().map(String::len).sum::<usize>();
+        if items.len() > MAX_TOOL_OUTPUT_BATCH_ROWS || payload_bytes > MAX_TOOL_OUTPUT_BATCH_BYTES {
+            return Err(DatabaseRunStateStoreError::ToolOutputBatchTooLarge {
+                run_id: run_id.to_string(),
+                rows: items.len(),
+                bytes: payload_bytes,
+            });
+        }
+        let preview_contracts = self.load_tool_preview_contracts(items).await?;
+        self.record_preview_template_missing_for_tools(
+            session_id,
+            run_id,
+            user_id,
+            &preview_contracts,
+        )
+        .await?;
+        let preview_rows = items
+            .iter()
+            .zip(payloads.iter())
+            .map(|(item, payload)| {
+                let contract = preview_contracts.get(&item.tool_name).cloned().unwrap_or(
+                    ToolPreviewContract {
+                        max_preview_bytes: FALLBACK_PREVIEW_BYTES,
+                        normalize_version: "raw_v1".to_string(),
+                        found: false,
+                    },
+                );
+                build_tool_output_preview_row(session_id, item, payload, &contract)
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(|source| db_error("begin_tool_output_batch", run_id, source))?;
+
+        sqlx::query(
+            "INSERT INTO session_tool_output_batches
+             (batch_id, session_id, run_id, user_id, output_count, payload_bytes, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'committed', NOW(6))
+             ON DUPLICATE KEY UPDATE output_count = output_count",
+        )
+        .bind(batch_id)
+        .bind(session_id)
+        .bind(run_id)
+        .bind(user_id)
+        .bind(items.len() as i64)
+        .bind(payload_bytes as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| db_error("insert_tool_output_batch", batch_id, source))?;
+
+        if !items.is_empty() {
+            let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "INSERT INTO session_tool_outputs
+                 (output_id, batch_id, session_id, run_id, user_id, output_idx,
+                  parent_output_id, tool_call_id, tool_name, output_json, payload_bytes,
+                  preview_text, preview_status, artifact_ref, content_hash, normalize_version,
+                  created_at) ",
+            );
+            builder.push_values(
+                items.iter().zip(preview_rows.iter()).enumerate(),
+                |mut row, (idx, (item, preview))| {
+                    row.push_bind(&item.output_id)
+                        .push_bind(batch_id)
+                        .push_bind(session_id)
+                        .push_bind(run_id)
+                        .push_bind(user_id)
+                        .push_bind(idx as i64)
+                        .push_bind(&preview.parent_output_id)
+                        .push_bind(&item.tool_call_id)
+                        .push_bind(&item.tool_name)
+                        .push_bind(&preview.payload)
+                        .push_bind(preview.payload.len() as i64)
+                        .push_bind(&preview.preview_text)
+                        .push_bind(&preview.preview_status)
+                        .push_bind(&preview.artifact_ref)
+                        .push_bind(&preview.content_hash)
+                        .push_bind(&preview.normalize_version)
+                        .push("NOW(6)");
+                },
+            );
+            builder.push(" ON DUPLICATE KEY UPDATE payload_bytes = payload_bytes");
+            builder
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|source| db_error("insert_tool_outputs_batch_rows", batch_id, source))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|source| db_error("commit_tool_output_batch", batch_id, source))?;
+        Ok(())
+    }
+
+    async fn append_event_inner(
+        &self,
+        run_id: &str,
+        event: serde_json::Value,
+    ) -> DbStoreResult<()> {
+        let idempotency_key = extract_optional_string(&event, "idempotency_key");
+        if let Some(key) = idempotency_key.as_deref() {
+            let existing = sqlx::query(
+                "SELECT id FROM agent_run_events WHERE run_id = ? AND idempotency_key = ? LIMIT 1",
+            )
+            .bind(run_id)
+            .bind(key)
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|source| db_error("lookup_run_event_idempotency", run_id, source))?;
+            if existing.is_some() {
+                return Ok(());
+            }
+        }
+
+        let run = self
+            .load_run_metadata(run_id)
+            .await?
+            .ok_or_else(|| db_error("load_run_for_append", run_id, sqlx::Error::RowNotFound))?;
+        let payload_json =
+            serde_json::to_string(&event).map_err(|source| DatabaseRunStateStoreError::Json {
+                operation: "serialize_run_event",
+                entity: run_id.to_string(),
+                source,
+            })?;
+        let event_type = extract_event_type(&event);
+        let event_id = extract_optional_string(&event, "event_id")
+            .or_else(|| extract_optional_string(&event, "id"))
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let event_hash = sha256_hex(payload_json.as_bytes());
+
+        let event_idx = self.allocate_event_idx(run_id).await?;
+
+        let insert = sqlx::query(
+            "INSERT INTO agent_run_events
+             (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id,
+              idempotency_key, event_hash, producer_pod_id, payload_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(run_id)
+        .bind(event_idx)
+        .bind(&run.user_id)
+        .bind(&run.session_id)
+        .bind(event_type)
+        .bind(event_id)
+        .bind(&run.agent_id)
+        .bind(idempotency_key)
+        .bind(event_hash)
+        .bind(&self.owner_pod_id)
+        .bind(payload_json)
+        .execute(self.pool.get())
+        .await;
+
+        if let Err(source) = insert {
+            let msg = source.to_string();
+            if msg.contains("uq_run_event_idempotency") || msg.contains("Duplicate") {
+                return Ok(());
+            }
+            return Err(db_error("insert_run_event", run_id, source));
+        }
+
+        sqlx::query(
+            "UPDATE agent_runs SET last_event_idx = ?, updated_at = NOW(6) WHERE run_id = ?",
+        )
+        .bind(event_idx)
+        .bind(run_id)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("update_run_last_event_idx", run_id, source))?;
+
+        Ok(())
+    }
+
+    async fn load_run_metadata(&self, run_id: &str) -> DbStoreResult<Option<DurableRunRecord>> {
+        let row = sqlx::query("SELECT * FROM agent_runs WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|source| db_error("load_run_metadata", run_id, source))?;
+        row.map(run_record_from_row).transpose()
+    }
+
+    async fn allocate_event_idx(&self, run_id: &str) -> DbStoreResult<i64> {
+        for _ in 0..32 {
+            let row = sqlx::query("SELECT next_event_idx FROM run_counters WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(self.pool.get())
+                .await
+                .map_err(|source| db_error("select_run_counter", run_id, source))?;
+            let next = row.try_get::<i64, _>("next_event_idx").unwrap_or(0);
+            let result = sqlx::query(
+                "UPDATE run_counters
+                 SET next_event_idx = next_event_idx + 1, updated_at = NOW(6)
+                 WHERE run_id = ? AND next_event_idx = ?",
+            )
+            .bind(run_id)
+            .bind(next)
+            .execute(self.pool.get())
+            .await
+            .map_err(|source| db_error("cas_increment_run_counter", run_id, source))?;
+            if result.rows_affected() == 1 {
+                return Ok(next);
+            }
+            tokio::task::yield_now().await;
+        }
+        Err(db_error(
+            "allocate_event_idx",
+            run_id,
+            sqlx::Error::Protocol("run counter CAS exhausted".to_string()),
+        ))
+    }
+}
+
+#[async_trait]
+impl RunStateStore for DatabaseRunStateStore {
+    async fn insert_run(&self, mut record: DurableRunRecord) -> Result<(), String> {
+        if (record.root_run_id.is_none() || record.ancestor_path.is_none())
+            && let Some(parent_run_id) = record.parent_run_id.as_deref()
+            && let Some(parent) = self
+                .load_run_metadata(parent_run_id)
+                .await
+                .map_err(|e| e.to_string())?
+        {
+            let parent_root = parent.root_run_id.unwrap_or(parent.run_id.clone());
+            let parent_path = parent.ancestor_path.unwrap_or(parent.run_id);
+            record.root_run_id.get_or_insert(parent_root);
+            record
+                .ancestor_path
+                .get_or_insert_with(|| format!("{parent_path}/{}", record.run_id));
+            if record.depth == 0 {
+                record.depth = parent.depth.saturating_add(1);
+            }
+        }
+        record
+            .root_run_id
+            .get_or_insert_with(|| record.run_id.clone());
+        record
+            .ancestor_path
+            .get_or_insert_with(|| record.run_id.clone());
+        let retry_scope = record
+            .retry_scope
+            .as_deref()
+            .unwrap_or(DEFAULT_RETRY_SCOPE)
+            .to_string();
+        validate_retry_scope(&record.run_id, &retry_scope).map_err(|e| e.to_string())?;
+
+        let lease_expires_at = chrono::Utc::now()
+            + chrono::Duration::from_std(self.lease_ttl)
+                .unwrap_or_else(|_| chrono::Duration::seconds(45));
+        let events = std::mem::take(&mut record.events);
+
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
+              delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
+              owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
+              checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
+              total_prompt_tokens, total_completion_tokens, total_tool_calls, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
+             ON DUPLICATE KEY UPDATE updated_at = NOW(6)",
+        )
+        .bind(&record.run_id)
+        .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(&record.parent_run_id)
+        .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
+        .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
+        .bind(record.depth as i64)
+        .bind(&record.delegation_id)
+        .bind(&record.agent_id)
+        .bind(&record.retry_of)
+        .bind(retry_scope)
+        .bind(&record.status)
+        .bind(&record.waiting_for)
+        .bind(&self.owner_pod_id)
+        .bind(lease_expires_at.naive_utc())
+        .bind(record.run_generation as i64)
+        .bind(record.last_event_idx)
+        .bind(&record.checkpoint_version)
+        .bind(&record.checkpoint_json)
+        .bind(&record.error_code)
+        .bind(&record.error_message)
+        .bind(record.retry_count as i64)
+        .bind(record.total_prompt_tokens as i64)
+        .bind(record.total_completion_tokens as i64)
+        .bind(record.total_tool_calls as i64)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("insert_run", &record.run_id, source).to_string())?;
+
+        sqlx::query(
+            "INSERT INTO run_counters
+             (run_id, next_event_idx, owner_pod_id, owner_lease_expires_at, run_generation, created_at, updated_at)
+             VALUES (?, 0, ?, ?, ?, NOW(6), NOW(6))
+             ON DUPLICATE KEY UPDATE updated_at = NOW(6)",
+        )
+        .bind(&record.run_id)
+        .bind(&self.owner_pod_id)
+        .bind(lease_expires_at.naive_utc())
+        .bind(record.run_generation as i64)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("insert_run_counter", &record.run_id, source).to_string())?;
+
+        for event in events {
+            self.append_event_inner(&record.run_id, event)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn load_run(&self, run_id: &str) -> Result<Option<DurableRunRecord>, String> {
+        let Some(mut run) = self
+            .load_run_metadata(run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+
+        let rows = sqlx::query(
+            "SELECT payload_json, event_idx FROM agent_run_events WHERE run_id = ? ORDER BY event_idx ASC",
+        )
+        .bind(run_id)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| db_error("load_run_events", run_id, source).to_string())?;
+
+        run.events = rows
+            .into_iter()
+            .filter_map(|row| {
+                let payload = row.try_get::<String, _>("payload_json").ok()?;
+                let mut value = serde_json::from_str::<serde_json::Value>(&payload).ok()?;
+                if let Some(obj) = value.as_object_mut()
+                    && !obj.contains_key("index")
+                    && let Ok(event_idx) = row.try_get::<i64, _>("event_idx")
+                {
+                    obj.insert("index".to_string(), serde_json::json!(event_idx));
+                }
+                Some(value)
+            })
+            .collect();
+        Ok(Some(run))
+    }
+
+    async fn update_run_status(
+        &self,
+        run_id: &str,
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<bool, String> {
+        let result = sqlx::query(
+            "UPDATE agent_runs
+             SET status = ?, waiting_for = ?, error_message = COALESCE(?, error_message), updated_at = NOW(6)
+             WHERE run_id = ?",
+        )
+        .bind(status)
+        .bind(waiting_for)
+        .bind(error_message)
+        .bind(run_id)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("update_run_status", run_id, source).to_string())?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn update_run_usage(
+        &self,
+        run_id: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        tool_calls: u32,
+    ) -> Result<bool, String> {
+        let result = sqlx::query(
+            "UPDATE agent_runs
+             SET total_prompt_tokens = ?, total_completion_tokens = ?, total_tool_calls = ?, updated_at = NOW(6)
+             WHERE run_id = ?",
+        )
+        .bind(prompt_tokens as i64)
+        .bind(completion_tokens as i64)
+        .bind(tool_calls as i64)
+        .bind(run_id)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("update_run_usage", run_id, source).to_string())?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn save_checkpoint(&self, run_id: &str, checkpoint_json: &str) -> Result<bool, String> {
+        validate_checkpoint_v1(run_id, checkpoint_json).map_err(|e| e.to_string())?;
+        let result = sqlx::query(
+            "UPDATE agent_runs
+             SET checkpoint_version = 'checkpoint_v1', checkpoint_json = ?, updated_at = NOW(6)
+             WHERE run_id = ?",
+        )
+        .bind(checkpoint_json)
+        .bind(run_id)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("save_checkpoint", run_id, source).to_string())?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
+        self.append_event_inner(run_id, event)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn list_user_runs(
+        &self,
+        user_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<DurableRunRecord>, i64), String> {
+        let total_row = sqlx::query("SELECT COUNT(*) AS total FROM agent_runs WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(self.pool.get())
+            .await
+            .map_err(|source| db_error("count_user_runs", user_id, source).to_string())?;
+        let total = total_row.try_get::<i64, _>("total").unwrap_or(0);
+        let rows = sqlx::query(
+            "SELECT * FROM agent_runs WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+        )
+        .bind(user_id)
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| db_error("list_user_runs", user_id, source).to_string())?;
+        let runs = rows
+            .into_iter()
+            .map(run_record_from_row)
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|e| e.to_string())?;
+        Ok((runs, total))
+    }
+
+    async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+        self.find_runs_by_status("waiting").await
+    }
+
+    async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+        self.find_runs_by_status("running").await
+    }
+
+    async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String> {
+        let rows = sqlx::query(
+            "SELECT * FROM agent_runs WHERE delegation_id = ? ORDER BY depth ASC, created_at ASC",
+        )
+        .bind(delegation_id)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| db_error("find_sub_runs", delegation_id, source).to_string())?;
+        rows.into_iter()
+            .map(run_record_from_row)
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|e| e.to_string())
+    }
+
+    async fn update_retry_count(&self, run_id: &str, retry_count: u32) -> Result<bool, String> {
+        let result = sqlx::query(
+            "UPDATE agent_runs SET retry_count = ?, updated_at = NOW(6) WHERE run_id = ?",
+        )
+        .bind(retry_count as i64)
+        .bind(run_id)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("update_retry_count", run_id, source).to_string())?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+impl DatabaseRunStateStore {
+    async fn find_runs_by_status(&self, status: &str) -> Result<Vec<DurableRunRecord>, String> {
+        let rows = sqlx::query("SELECT * FROM agent_runs WHERE status = ? ORDER BY updated_at ASC")
+            .bind(status)
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| db_error("find_runs_by_status", status, source).to_string())?;
+        rows.into_iter()
+            .map(run_record_from_row)
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn db_error(
+    operation: &'static str,
+    entity: impl Into<String>,
+    source: sqlx::Error,
+) -> DatabaseRunStateStoreError {
+    DatabaseRunStateStoreError::Database {
+        operation,
+        entity: entity.into(),
+        source,
+    }
+}
+
+fn default_owner_pod_id() -> String {
+    std::env::var("ASTRA_POD_ID")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| format!("astra-runtime-{}", Uuid::new_v4()))
+}
+
+fn validate_retry_scope(run_id: &str, retry_scope: &str) -> DbStoreResult<()> {
+    match retry_scope {
+        "node" | "subtree" | "siblings" => Ok(()),
+        other => Err(DatabaseRunStateStoreError::InvalidRetryScope {
+            run_id: run_id.to_string(),
+            retry_scope: other.to_string(),
+        }),
+    }
+}
+
+fn validate_checkpoint_v1(run_id: &str, checkpoint_json: &str) -> DbStoreResult<()> {
+    let value: serde_json::Value = serde_json::from_str(checkpoint_json).map_err(|source| {
+        DatabaseRunStateStoreError::Json {
+            operation: "parse_checkpoint",
+            entity: run_id.to_string(),
+            source,
+        }
+    })?;
+    let object =
+        value
+            .as_object()
+            .ok_or_else(|| DatabaseRunStateStoreError::InvalidCheckpoint {
+                run_id: run_id.to_string(),
+                reason: "checkpoint root must be an object".to_string(),
+            })?;
+    if object.get("version").and_then(serde_json::Value::as_str) != Some("checkpoint_v1") {
+        return Err(DatabaseRunStateStoreError::InvalidCheckpoint {
+            run_id: run_id.to_string(),
+            reason: "version must be checkpoint_v1".to_string(),
+        });
+    }
+    if !matches!(object.get("graceful"), Some(serde_json::Value::Bool(_))) {
+        return Err(DatabaseRunStateStoreError::InvalidCheckpoint {
+            run_id: run_id.to_string(),
+            reason: "graceful must be boolean".to_string(),
+        });
+    }
+    if object
+        .get("last_batch_id")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
+        return Err(DatabaseRunStateStoreError::InvalidCheckpoint {
+            run_id: run_id.to_string(),
+            reason: "last_batch_id must be string".to_string(),
+        });
+    }
+    let extra = object.get("extra").and_then(serde_json::Value::as_object);
+    if extra.is_none() {
+        return Err(DatabaseRunStateStoreError::InvalidCheckpoint {
+            run_id: run_id.to_string(),
+            reason: "extra must be object".to_string(),
+        });
+    }
+    if let Some(partial) = extra
+        .and_then(|m| m.get("partial_progress"))
+        .and_then(serde_json::Value::as_object)
+    {
+        for key in ["step_index", "total_steps", "resumable_marker"] {
+            if !partial.contains_key(key) {
+                return Err(DatabaseRunStateStoreError::InvalidCheckpoint {
+                    run_id: run_id.to_string(),
+                    reason: format!("extra.partial_progress.{key} is required"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_tool_output_preview_row(
+    session_id: &str,
+    item: &ToolOutputBatchItem,
+    payload: &str,
+    contract: &ToolPreviewContract,
+) -> ToolOutputPreviewRow {
+    let content_hash = format!("sha256:{}", sha256_hex(payload.as_bytes()));
+    let preview_text = truncate_utf8_bytes(payload, contract.max_preview_bytes);
+    let explicit_artifact_ref = extract_optional_string(&item.output_json, "artifact_ref")
+        .or_else(|| extract_optional_string(&item.output_json, "artifact_uri"));
+    let large_payload_ref = (payload.len() > contract.max_preview_bytes).then(|| {
+        format!(
+            "tool_output://{session_id}/{}@{}",
+            item.output_id, content_hash
+        )
+    });
+    let preview_status = if !contract.found {
+        "fallback"
+    } else if payload.len() > contract.max_preview_bytes {
+        "truncated"
+    } else {
+        "template"
+    }
+    .to_string();
+    ToolOutputPreviewRow {
+        payload: payload.to_string(),
+        preview_text,
+        preview_status,
+        artifact_ref: explicit_artifact_ref.or(large_payload_ref),
+        content_hash,
+        normalize_version: contract.normalize_version.clone(),
+        parent_output_id: extract_optional_string(&item.output_json, "parent_output_id"),
+    }
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes.min(value.len());
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value[..end].to_string()
+}
+
+fn run_record_from_row(row: sqlx::mysql::MySqlRow) -> DbStoreResult<DurableRunRecord> {
+    let run_id = row
+        .try_get::<String, _>("run_id")
+        .map_err(|source| db_error("decode_run_row.run_id", "agent_runs".to_string(), source))?;
+    Ok(DurableRunRecord {
+        user_id: row.try_get("user_id").unwrap_or_default(),
+        session_id: row.try_get("session_id").unwrap_or_default(),
+        parent_run_id: row.try_get("parent_run_id").ok(),
+        root_run_id: row.try_get("root_run_id").ok(),
+        ancestor_path: row.try_get("ancestor_path").ok(),
+        depth: row.try_get::<i64, _>("depth").unwrap_or(0).max(0) as u32,
+        delegation_id: row.try_get("delegation_id").ok(),
+        agent_id: row.try_get("agent_id").ok(),
+        retry_of: row.try_get("retry_of").ok(),
+        retry_scope: row.try_get("retry_scope").ok(),
+        status: row.try_get("status").unwrap_or_default(),
+        waiting_for: row.try_get("waiting_for").ok(),
+        owner_pod_id: row.try_get("owner_pod_id").ok(),
+        owner_lease_expires_at: datetime_string(&row, "owner_lease_expires_at"),
+        run_generation: row.try_get::<i64, _>("run_generation").unwrap_or(0).max(0) as u64,
+        last_event_idx: row.try_get::<i64, _>("last_event_idx").unwrap_or(-1),
+        checkpoint_version: row.try_get("checkpoint_version").ok(),
+        checkpoint_json: row.try_get("checkpoint_json").ok(),
+        error_code: row.try_get("error_code").ok(),
+        error_message: row.try_get("error_message").ok(),
+        retry_count: row.try_get::<i64, _>("retry_count").unwrap_or(0).max(0) as u32,
+        total_prompt_tokens: row
+            .try_get::<i64, _>("total_prompt_tokens")
+            .unwrap_or(0)
+            .max(0) as u64,
+        total_completion_tokens: row
+            .try_get::<i64, _>("total_completion_tokens")
+            .unwrap_or(0)
+            .max(0) as u64,
+        total_tool_calls: row
+            .try_get::<i64, _>("total_tool_calls")
+            .unwrap_or(0)
+            .max(0) as u32,
+        events: Vec::new(),
+        created_at: datetime_string(&row, "created_at").unwrap_or_default(),
+        updated_at: datetime_string(&row, "updated_at").unwrap_or_default(),
+        run_id,
+    })
+}
+
+fn datetime_string(row: &sqlx::mysql::MySqlRow, column: &str) -> Option<String> {
+    row.try_get::<chrono::NaiveDateTime, _>(column)
+        .ok()
+        .map(|dt| dt.to_string())
+        .or_else(|| row.try_get::<String, _>(column).ok())
+}
+
+fn extract_event_type(event: &serde_json::Value) -> String {
+    extract_optional_string(event, "event_type")
+        .or_else(|| extract_optional_string(event, "type"))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn extract_optional_string(event: &serde_json::Value, key: &str) -> Option<String> {
+    event
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("{digest:x}")
 }
 
 pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::Value {
@@ -1040,11 +2061,21 @@ mod tests {
                 user_id: "u1".into(),
                 status: "completed".into(),
                 parent_run_id: None,
+                root_run_id: None,
+                ancestor_path: None,
+                depth: 0,
                 delegation_id: None,
                 agent_id: None,
                 retry_of: None,
+                retry_scope: None,
                 waiting_for: None,
+                owner_pod_id: None,
+                owner_lease_expires_at: None,
+                run_generation: 0,
+                last_event_idx: -1,
+                checkpoint_version: None,
                 checkpoint_json: None,
+                error_code: None,
                 error_message: None,
                 retry_count: 0,
                 total_prompt_tokens: 0,

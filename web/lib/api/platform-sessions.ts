@@ -16,6 +16,25 @@ import type {
 } from './platform-types';
 import { normalizeSession, normalizeEvent } from './platform-types';
 
+export type SessionArtifact = {
+  artifact_id: string;
+  session_id: string;
+  artifact_kind: string;
+  retention_policy?: string | null;
+  retention_until?: string | null;
+  status?: string | null;
+  referenced_by_manifest_count?: number;
+  referenced_by_state_items_count?: number;
+  referenced_by_citation_count?: number;
+  created_at?: string | null;
+};
+
+export type SessionArtifactList = {
+  session_id: string;
+  artifacts: SessionArtifact[];
+  limit: number;
+};
+
 export async function getSessions(limit = 50): Promise<SessionSummary[]> {
   if ((await getWebDataMode()) === 'demo') {
     return mockPlatformSnapshot.sessions;
@@ -83,6 +102,20 @@ export async function closeSession(sessionId: string): Promise<SessionSummary> {
   return normalizeSession(response);
 }
 
+export {
+  cancelRun,
+  getSessionDevices,
+  getSessionState,
+  getSessionTranscript,
+  revokeSessionDevice,
+  trustSessionDevice,
+  type DeviceLease,
+  type DeviceLeaseEndedEvent,
+  type SessionStateResponse,
+  type TranscriptItem,
+  type TranscriptResponse,
+} from './session-client';
+
 // ── Session activity audit ──────────────────────────────────────────────────
 
 function normalizeActivityEntry(entry: ApiSessionActivityEntry): SessionActivityEntry {
@@ -113,4 +146,17 @@ export async function getSessionActivity(
     activities: response.activities.map(normalizeActivityEntry),
     total: response.total,
   };
+}
+
+export async function getSessionArtifacts(
+  sessionId: string,
+  limit = 50,
+): Promise<SessionArtifactList> {
+  if ((await getWebDataMode()) === 'demo') {
+    return { session_id: sessionId, artifacts: [], limit };
+  }
+  const response = await tryApiFetch<SessionArtifactList>(
+    `/sessions/${sessionId}/artifacts?limit=${limit}`,
+  );
+  return response ?? { session_id: sessionId, artifacts: [], limit };
 }

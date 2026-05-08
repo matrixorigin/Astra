@@ -476,7 +476,7 @@ export default function PlansManagePage() {
             </h2>
             <p className="mt-2 text-sm text-slate-300">
               <code className="rounded bg-slate-800 px-1">{confirmDelete}</code> will be removed
-              along with its step-run history. This can't be undone.
+              along with its step-run history. This can&apos;t be undone.
             </p>
             <div className="mt-5 flex justify-end gap-2">
               <button

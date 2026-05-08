@@ -3,6 +3,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { SSEClient } from '@/lib/streaming/sse-client';
 import type { ConnectionState, StreamEvent } from '@/lib/streaming/types';
+import {
+  applyRunEventsTransaction,
+  SSE_CLIENT_DEAD_TIMEOUT_MS,
+  subscribeWatermarks,
+} from '@/lib/session-cache/indexeddb';
 
 const MAX_EVENTS = 500;
 
@@ -15,7 +20,7 @@ type UseRunStreamOptions = {
 };
 
 type UseRunStreamReturn = {
-  events: StreamEvent[];
+  events: Array<StreamEvent & { content?: string }>;
   connectionState: ConnectionState;
   connect: () => void;
   disconnect: () => void;
@@ -27,10 +32,13 @@ export function useRunStream({
   lastIndex = 0,
   autoConnect = true,
 }: UseRunStreamOptions): UseRunStreamReturn {
-  const [events, setEvents] = useState<StreamEvent[]>([]);
+  const [events, setEvents] = useState<Array<StreamEvent & { content?: string }>>([]);
   const [connectionState, setConnectionState] = useState<ConnectionState>('disconnected');
   const clientRef = useRef<SSEClient | null>(null);
   const resumeIndexRef = useRef(lastIndex);
+  const lastOkIdxRef = useRef(lastIndex - 1);
+  const connectRef = useRef<() => void>(() => {});
+  const streamKeyRef = useRef(`${runId}:${lastIndex}`);
 
   const handleEvent = useCallback((event: StreamEvent) => {
     if (typeof event.index === 'number') {
@@ -43,10 +51,30 @@ export function useRunStream({
       const next = [...prev, event];
       return next.length > MAX_EVENTS ? next.slice(-MAX_EVENTS) : next;
     });
-  }, []);
+
+    const sessionId =
+      event.type === 'session_info' ? event.session_id : `run-session-${runId}`;
+    if (typeof event.index === 'number') {
+      void applyRunEventsTransaction(sessionId, runId, [event], lastOkIdxRef.current).then(
+        (result) => {
+          lastOkIdxRef.current = result.lastOkIdx;
+          if (result.gapDetected) {
+            resumeIndexRef.current = result.reconnectLastIndex;
+            clientRef.current?.close();
+            setTimeout(() => connectRef.current(), 0);
+          }
+        },
+      );
+    }
+  }, [runId]);
 
   useEffect(() => {
-    resumeIndexRef.current = lastIndex;
+    const key = `${runId}:${lastIndex}`;
+    if (streamKeyRef.current !== key) {
+      streamKeyRef.current = key;
+      resumeIndexRef.current = lastIndex;
+      lastOkIdxRef.current = lastIndex - 1;
+    }
   }, [runId, lastIndex]);
 
   const connect = useCallback(() => {
@@ -61,11 +89,16 @@ export function useRunStream({
       url: url.toString(),
       onEvent: handleEvent,
       onStateChange: setConnectionState,
-    });
+      heartbeatTimeoutMs: SSE_CLIENT_DEAD_TIMEOUT_MS,
+    } as ConstructorParameters<typeof SSEClient>[0] & { heartbeatTimeoutMs: number });
 
     clientRef.current = client;
     void client.connect();
   }, [runId, lastIndex, handleEvent]);
+
+  useEffect(() => {
+    connectRef.current = connect;
+  }, [connect]);
 
   const disconnect = useCallback(() => {
     clientRef.current?.close();
@@ -87,6 +120,17 @@ export function useRunStream({
       clientRef.current = null;
     };
   }, [autoConnect, connect]);
+
+  useEffect(() => {
+    return subscribeWatermarks((message) => {
+      if (message.sessionId === `run-session-${runId}`) {
+        lastOkIdxRef.current = Math.max(
+          lastOkIdxRef.current,
+          message.runEventHighWatermark,
+        );
+      }
+    });
+  }, [runId]);
 
   return { events, connectionState, connect, disconnect, clearEvents };
 }

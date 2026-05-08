@@ -1,6 +1,11 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
+import {
+  getSessionDevices,
+  revokeSessionDevice,
+  type DeviceLease,
+} from '@/lib/api/session-client';
 
 type RuntimeConfigResponse = {
   mode: 'live' | 'demo' | 'unconfigured';
@@ -21,8 +26,27 @@ type AuthUser = {
 };
 
 type ConnectionStatus = 'untested' | 'testing' | 'ok' | 'error';
+type SettingsTab = 'runtime' | 'personal-skills';
+
+type UserSkillSource = {
+  source_id: string;
+  skill_name: string;
+  visibility: string;
+  status: string;
+};
+
+type UserSkillVersion = {
+  version_id: string;
+  skill_name: string;
+  version: string;
+  content_hash: string;
+  normalize_version: string;
+  status: string;
+  token_estimate: number;
+};
 
 export function RuntimeSettingsPanel() {
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('runtime');
   const [config, setConfig] = useState<RuntimeConfigResponse | null>(null);
   const [user, setUser] = useState<AuthUser | null>(null);
   const [apiUrl, setApiUrl] = useState('');
@@ -33,6 +57,15 @@ export function RuntimeSettingsPanel() {
   const [status, setStatus] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
   const [busy, setBusy] = useState(false);
   const [connStatus, setConnStatus] = useState<ConnectionStatus>('untested');
+  const [deviceSessionId, setDeviceSessionId] = useState('');
+  const [devices, setDevices] = useState<DeviceLease[]>([]);
+  const [personalSkills, setPersonalSkills] = useState<UserSkillSource[]>([]);
+  const [skillVersionsByName, setSkillVersionsByName] = useState<Record<string, UserSkillVersion[]>>({});
+  const [newSkillName, setNewSkillName] = useState('');
+  const [newSkillVersion, setNewSkillVersion] = useState('v1');
+  const [newSkillContent, setNewSkillContent] = useState('## Instructions\n\n');
+  const [skillSessionId, setSkillSessionId] = useState('');
+  const isAuthenticated = Boolean(config?.hasAccessToken && user);
 
   const loadConfig = useCallback(async () => {
     const response = await fetch('/api/runtime-config', { cache: 'no-store' });
@@ -59,6 +92,44 @@ export function RuntimeSettingsPanel() {
     void loadConfig();
     void loadUser();
   }, [loadConfig, loadUser]);
+
+  const loadPersonalSkills = useCallback(async () => {
+    if (!config?.hasAccessToken) return;
+    setBusy(true);
+    setStatus(null);
+    try {
+      const response = await fetch('/api/backend/skills/user', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`Failed to load skills (${response.status})`);
+      const skills = (await response.json()) as UserSkillSource[];
+      const versions: Record<string, UserSkillVersion[]> = {};
+      await Promise.all(
+        skills.map(async (skill) => {
+          const versionResponse = await fetch(
+            `/api/backend/skills/user/${encodeURIComponent(skill.skill_name)}/versions`,
+            { cache: 'no-store' },
+          );
+          versions[skill.skill_name] = versionResponse.ok
+            ? ((await versionResponse.json()) as UserSkillVersion[])
+            : [];
+        }),
+      );
+      setPersonalSkills(skills);
+      setSkillVersionsByName(versions);
+    } catch (err) {
+      setStatus({
+        text: err instanceof Error ? err.message : 'Failed to load personal skills.',
+        type: 'error',
+      });
+    } finally {
+      setBusy(false);
+    }
+  }, [config?.hasAccessToken]);
+
+  useEffect(() => {
+    if (settingsTab === 'personal-skills' && isAuthenticated) {
+      void loadPersonalSkills();
+    }
+  }, [settingsTab, isAuthenticated, loadPersonalSkills]);
 
   async function testConnection() {
     setConnStatus('testing');
@@ -172,10 +243,150 @@ export function RuntimeSettingsPanel() {
     await loadConfig();
   }
 
-  const isAuthenticated = config?.hasAccessToken && user;
+  async function loadDevices() {
+    if (!deviceSessionId.trim()) {
+      setStatus({ text: 'Enter a session id first.', type: 'error' });
+      return;
+    }
+    setBusy(true);
+    setStatus(null);
+    try {
+      setDevices(await getSessionDevices(deviceSessionId.trim()));
+      setStatus({ text: 'Loaded session devices.', type: 'success' });
+    } catch (err) {
+      setStatus({
+        text: err instanceof Error ? err.message : 'Failed to load devices.',
+        type: 'error',
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revokeDevice(device: DeviceLease) {
+    setBusy(true);
+    setStatus(null);
+    try {
+      await revokeSessionDevice(device.session_id, {
+        leaseId: device.lease_id,
+        expectedLastMonotonicId: device.last_monotonic_id,
+      });
+      setDevices((prev) =>
+        prev.map((item) =>
+          item.lease_id === device.lease_id ? { ...item, status: 'revoked' } : item,
+        ),
+      );
+      setStatus({ text: 'Device lease revoked.', type: 'success' });
+    } catch (err) {
+      setStatus({
+        text: err instanceof Error ? err.message : 'Failed to revoke device.',
+        type: 'error',
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitPersonalSkill() {
+    const skillName = newSkillName.trim();
+    if (!skillName) {
+      setStatus({ text: 'Enter a skill name first.', type: 'error' });
+      return;
+    }
+    setBusy(true);
+    setStatus(null);
+    try {
+      const sourceResponse = await fetch('/api/backend/skills/user', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ skill_name: skillName, visibility: 'private' }),
+      });
+      if (!sourceResponse.ok) throw new Error(`Create skill failed (${sourceResponse.status})`);
+      const versionResponse = await fetch(
+        `/api/backend/skills/user/${encodeURIComponent(skillName)}/versions`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            version: newSkillVersion.trim() || 'v1',
+            manifest_json: { name: skillName },
+            content_markdown: newSkillContent,
+            status: 'draft',
+          }),
+        },
+      );
+      if (!versionResponse.ok) throw new Error(`Submit version failed (${versionResponse.status})`);
+      setStatus({ text: 'Personal skill version saved.', type: 'success' });
+      await loadPersonalSkills();
+    } catch (err) {
+      setStatus({
+        text: err instanceof Error ? err.message : 'Failed to save personal skill.',
+        type: 'error',
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function activateSkill(skillName: string) {
+    const sessionId = skillSessionId.trim();
+    if (!sessionId) {
+      setStatus({ text: 'Enter a session id before activating a skill.', type: 'error' });
+      return;
+    }
+    const versions = skillVersionsByName[skillName] ?? [];
+    const version = [...versions].reverse().find((item) => item.status !== 'quarantined');
+    if (!version) {
+      setStatus({ text: 'No activatable version found.', type: 'error' });
+      return;
+    }
+    setBusy(true);
+    setStatus(null);
+    try {
+      const response = await fetch(
+        `/api/backend/skills/user/${encodeURIComponent(skillName)}/activate`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sessionId, version_id: version.version_id }),
+        },
+      );
+      if (!response.ok) throw new Error(`Activate failed (${response.status})`);
+      setStatus({ text: `Activated ${skillName}@${version.version}.`, type: 'success' });
+    } catch (err) {
+      setStatus({
+        text: err instanceof Error ? err.message : 'Failed to activate skill.',
+        type: 'error',
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <div className="space-y-6">
+      <div className="flex gap-2 rounded-2xl border border-slate-800 bg-slate-950/70 p-1">
+        {[
+          ['runtime', 'Runtime'] as const,
+          ['personal-skills', 'Personal Skills'] as const,
+        ].map(([key, label]) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() => setSettingsTab(key)}
+            className={`rounded-xl px-4 py-2 text-sm ${
+              settingsTab === key
+                ? 'bg-slate-800 text-white'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {settingsTab === 'runtime' ? (
+        <>
       {/* ── Auth status banner ── */}
       <div className={`rounded-2xl border p-4 ${
         isAuthenticated
@@ -193,9 +404,9 @@ export function RuntimeSettingsPanel() {
               {isAuthenticated ? (
                 <>
                   <p className="text-sm font-medium text-green-300">
-                    Authenticated as {user.display_name ?? user.username}
+                    Authenticated as {user?.display_name ?? user?.username ?? 'user'}
                   </p>
-                  <p className="text-xs text-slate-400">{user.email}</p>
+                  <p className="text-xs text-slate-400">{user?.email ?? ''}</p>
                 </>
               ) : config?.hasAccessToken ? (
                 <p className="text-sm font-medium text-yellow-300">
@@ -366,6 +577,165 @@ export function RuntimeSettingsPanel() {
               Create account
             </a>
           </div>
+        </section>
+      )}
+
+      {isAuthenticated ? (
+        <section className="rounded-3xl border border-slate-800 bg-slate-900/50 p-6">
+          <h2 className="text-lg font-semibold text-white">Session Devices</h2>
+          <div className="mt-4 flex gap-2">
+            <input
+              value={deviceSessionId}
+              onChange={(event) => setDeviceSessionId(event.target.value)}
+              placeholder="Session id"
+              className="min-w-0 flex-1 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-500"
+            />
+            <button
+              type="button"
+              onClick={loadDevices}
+              disabled={busy || !deviceSessionId.trim()}
+              className="rounded-2xl border border-slate-700 px-4 py-3 text-sm text-slate-300 hover:border-slate-500 disabled:opacity-50"
+            >
+              Load
+            </button>
+          </div>
+          <div className="mt-4 space-y-2">
+            {devices.map((device) => (
+              <div
+                key={device.lease_id}
+                className="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-3"
+              >
+                <div className="min-w-0">
+                  <p className="truncate text-sm text-white">{device.device_id}</p>
+                  <p className="text-xs text-slate-500">
+                    {device.trust_level} · {device.status} · expires {device.expires_at}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => revokeDevice(device)}
+                  disabled={busy || device.status !== 'active'}
+                  className="rounded-xl border border-red-800/50 px-3 py-2 text-xs text-red-300 hover:border-red-600 disabled:opacity-40"
+                >
+                  Revoke
+                </button>
+              </div>
+            ))}
+            {devices.length === 0 ? (
+              <p className="text-sm text-slate-500">No devices loaded.</p>
+            ) : null}
+          </div>
+        </section>
+      ) : null}
+        </>
+      ) : (
+        <section className="rounded-3xl border border-slate-800 bg-slate-900/50 p-6">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="text-lg font-semibold text-white">Personal Skills</h2>
+              <p className="mt-1 text-sm text-slate-400">
+                Private skill sources and append-only versions stored in MatrixOne.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={loadPersonalSkills}
+              disabled={busy || !isAuthenticated}
+              className="rounded-2xl border border-slate-700 px-4 py-2 text-sm text-slate-300 hover:border-slate-500 disabled:opacity-50"
+            >
+              Refresh
+            </button>
+          </div>
+
+          {!isAuthenticated ? (
+            <p className="mt-4 text-sm text-slate-500">Log in to manage personal skills.</p>
+          ) : (
+            <>
+              <div className="mt-5 grid gap-3 lg:grid-cols-[1fr_8rem]">
+                <input
+                  value={newSkillName}
+                  onChange={(event) => setNewSkillName(event.target.value)}
+                  placeholder="skill name"
+                  className="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-500"
+                />
+                <input
+                  value={newSkillVersion}
+                  onChange={(event) => setNewSkillVersion(event.target.value)}
+                  placeholder="version"
+                  className="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-500"
+                />
+              </div>
+              <textarea
+                value={newSkillContent}
+                onChange={(event) => setNewSkillContent(event.target.value)}
+                rows={5}
+                className="mt-3 w-full rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 font-mono text-sm text-white outline-none"
+              />
+              <div className="mt-3 flex flex-col gap-3 sm:flex-row">
+                <input
+                  value={skillSessionId}
+                  onChange={(event) => setSkillSessionId(event.target.value)}
+                  placeholder="session id for activation"
+                  className="min-w-0 flex-1 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-500"
+                />
+                <button
+                  type="button"
+                  onClick={submitPersonalSkill}
+                  disabled={busy || !newSkillName.trim()}
+                  className="rounded-2xl bg-sky-500 px-5 py-3 text-sm font-medium text-slate-950 hover:bg-sky-400 disabled:opacity-50"
+                >
+                  Save version
+                </button>
+              </div>
+
+              <div className="mt-6 overflow-hidden rounded-2xl border border-slate-800">
+                <table className="min-w-full divide-y divide-slate-800 text-left text-sm">
+                  <thead className="bg-slate-950/80 text-xs uppercase text-slate-500">
+                    <tr>
+                      <th className="px-4 py-3">Skill</th>
+                      <th className="px-4 py-3">Versions</th>
+                      <th className="px-4 py-3">Latest</th>
+                      <th className="px-4 py-3">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800">
+                    {personalSkills.map((skill) => {
+                      const versions = skillVersionsByName[skill.skill_name] ?? [];
+                      const latest = versions[versions.length - 1];
+                      return (
+                        <tr key={skill.source_id} className="bg-slate-900/30">
+                          <td className="px-4 py-3 text-white">{skill.skill_name}</td>
+                          <td className="px-4 py-3 text-slate-300">{versions.length}</td>
+                          <td className="px-4 py-3 text-slate-400">
+                            {latest
+                              ? `${latest.version} · ${latest.status} · ${latest.normalize_version}`
+                              : 'none'}
+                          </td>
+                          <td className="px-4 py-3">
+                            <button
+                              type="button"
+                              onClick={() => activateSkill(skill.skill_name)}
+                              disabled={busy || !latest}
+                              className="rounded-xl border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:border-slate-500 disabled:opacity-40"
+                            >
+                              Activate
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {personalSkills.length === 0 ? (
+                      <tr>
+                        <td className="px-4 py-4 text-slate-500" colSpan={4}>
+                          No personal skills yet.
+                        </td>
+                      </tr>
+                    ) : null}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
         </section>
       )}
 

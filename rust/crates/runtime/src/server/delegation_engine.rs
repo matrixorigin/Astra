@@ -24,11 +24,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use astra_services::LlmTokenServiceConfig;
 use astra_services::coordination::{
     AgentProfile, AgentProfileRegistry, AgentResult, AggregationStrategy, CoordinationPattern,
     DelegationRequest, DelegationResult, aggregate_results,
 };
+use astra_services::{BubbleUpTarget, DatabaseStateProjectionStore, LlmTokenServiceConfig};
 
 pub use astra_core::SubRunState;
 use astra_core::{
@@ -69,6 +69,68 @@ fn parse_request_allowlist_from_context(
         normalized.insert(normalize_context_allowlist_entry(raw, key)?);
     }
     Ok(Some(normalized))
+}
+
+fn critical_finding_summary_from_agent_result(result: &AgentResult) -> Option<String> {
+    let text = [result.output.as_deref(), result.error.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("critical finding") || lower.contains("critical") || lower.contains("blocker")
+    {
+        Some(text.chars().take(1_000).collect())
+    } else {
+        None
+    }
+}
+
+async fn bubble_up_critical_finding_from_tracker(
+    projection_store: Arc<DatabaseStateProjectionStore>,
+    tracker: Arc<DelegationTracker>,
+    user_id: String,
+    session_id: String,
+    run_id: String,
+    summary: String,
+) {
+    let source_depth = tracker.get_depth(&run_id).await.unwrap_or(0);
+    let mut targets = vec![BubbleUpTarget {
+        session_id: session_id.clone(),
+        run_id: run_id.clone(),
+        depth: source_depth,
+    }];
+    for (idx, parent_run_id) in tracker
+        .get_ancestry(&run_id)
+        .await
+        .into_iter()
+        .take(4)
+        .enumerate()
+    {
+        targets.push(BubbleUpTarget {
+            session_id: session_id.clone(),
+            run_id: parent_run_id,
+            depth: source_depth.saturating_sub((idx as u32) + 1),
+        });
+    }
+    if let Err(error) = projection_store
+        .bubble_up_finding(
+            &user_id,
+            &run_id,
+            &format!("finding-{run_id}"),
+            "critical",
+            &summary,
+            &targets,
+        )
+        .await
+    {
+        tracing::warn!(
+            target: "astra_runtime::delegation",
+            run_id,
+            error = %error,
+            "failed to bubble up critical delegated finding"
+        );
+    }
 }
 
 // ─── Sub-run Executor Trait ─────────────────────────────────────────────────
@@ -1151,6 +1213,9 @@ pub struct DelegationEngine {
     /// behaves as pre-fork-prefix — `inherited_prefix` stays None
     /// and the child runs fresh.
     prefix_store: Option<Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
+    /// Durable state projection store used to surface delegated findings and
+    /// keep child run state queryable by the web agent.
+    projection_store: Option<Arc<DatabaseStateProjectionStore>>,
 }
 
 impl DelegationEngine {
@@ -1171,6 +1236,7 @@ impl DelegationEngine {
             gate: None,
             mailbox_router: None,
             prefix_store: None,
+            projection_store: None,
         }
     }
 
@@ -1189,6 +1255,7 @@ impl DelegationEngine {
             gate: None,
             mailbox_router: None,
             prefix_store: None,
+            projection_store: None,
         }
     }
 
@@ -1214,6 +1281,11 @@ impl DelegationEngine {
         store: Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>,
     ) -> Self {
         self.prefix_store = Some(store);
+        self
+    }
+
+    pub fn with_projection_store(mut self, store: Arc<DatabaseStateProjectionStore>) -> Self {
+        self.projection_store = Some(store);
         self
     }
 
@@ -1275,6 +1347,30 @@ impl DelegationEngine {
         self.tracker.progress_broadcaster()
     }
 
+    async fn bubble_up_critical_agent_results(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        results: &[AgentResult],
+    ) {
+        let Some(projection_store) = self.projection_store.clone() else {
+            return;
+        };
+        for result in results {
+            if let Some(summary) = critical_finding_summary_from_agent_result(result) {
+                bubble_up_critical_finding_from_tracker(
+                    projection_store.clone(),
+                    self.tracker.clone(),
+                    user_id.to_string(),
+                    session_id.to_string(),
+                    result.run_id.clone(),
+                    summary,
+                )
+                .await;
+            }
+        }
+    }
+
     /// Dynamically set the verification gate (e.g., per-subtask criteria during plan execution).
     ///
     /// Unlike [`with_gate`] (builder pattern), this mutates the engine in place so callers
@@ -1296,6 +1392,7 @@ impl DelegationEngine {
             gate: Some(gate),
             mailbox_router: self.mailbox_router.clone(),
             prefix_store: self.prefix_store.clone(),
+            projection_store: self.projection_store.clone(),
         }
     }
     /// Validate a delegation request without executing it.
@@ -1825,6 +1922,8 @@ impl DelegationEngine {
 
         // Journal: delegation completed
         if let Ok(ref dr) = result {
+            self.bubble_up_critical_agent_results(&request.user_id, session_id, &dr.agent_results)
+                .await;
             let succeeded = dr.agent_results.iter().filter(|r| r.is_success()).count();
             let failed = dr.agent_results.len() - succeeded;
             Self::write_journal_event(
@@ -5315,12 +5414,22 @@ mod tests {
                 user_id: "u1".into(),
                 session_id: "s1".into(),
                 parent_run_id: Some("parent-1".into()),
+                root_run_id: Some("parent-1".into()),
+                ancestor_path: Some("parent-1/sub-1".into()),
+                depth: 1,
                 delegation_id: Some("del-1".into()),
                 agent_id: Some("coder".into()),
                 retry_of: None,
+                retry_scope: Some("node".into()),
                 status: "completed".into(),
                 waiting_for: None,
+                owner_pod_id: None,
+                owner_lease_expires_at: None,
+                run_generation: 0,
+                last_event_idx: -1,
+                checkpoint_version: None,
                 checkpoint_json: None,
+                error_code: None,
                 error_message: None,
                 retry_count: 0,
                 total_prompt_tokens: 0,
@@ -5335,12 +5444,22 @@ mod tests {
                 user_id: "u1".into(),
                 session_id: "s1".into(),
                 parent_run_id: Some("parent-1".into()),
+                root_run_id: Some("parent-1".into()),
+                ancestor_path: Some("parent-1/sub-2".into()),
+                depth: 1,
                 delegation_id: Some("del-1".into()),
                 agent_id: Some("reviewer".into()),
                 retry_of: Some("sub-1".into()),
+                retry_scope: Some("node".into()),
                 status: "paused".into(),
                 waiting_for: None,
+                owner_pod_id: None,
+                owner_lease_expires_at: None,
+                run_generation: 0,
+                last_event_idx: -1,
+                checkpoint_version: None,
                 checkpoint_json: None,
+                error_code: None,
                 error_message: None,
                 retry_count: 1,
                 total_prompt_tokens: 0,
@@ -5356,12 +5475,22 @@ mod tests {
                 user_id: "u1".into(),
                 session_id: "s1".into(),
                 parent_run_id: None,
+                root_run_id: Some("root-run".into()),
+                ancestor_path: Some("root-run".into()),
+                depth: 0,
                 delegation_id: None,
                 agent_id: None,
                 retry_of: None,
+                retry_scope: Some("node".into()),
                 status: "completed".into(),
                 waiting_for: None,
+                owner_pod_id: None,
+                owner_lease_expires_at: None,
+                run_generation: 0,
+                last_event_idx: -1,
+                checkpoint_version: None,
                 checkpoint_json: None,
+                error_code: None,
                 error_message: None,
                 retry_count: 0,
                 total_prompt_tokens: 0,

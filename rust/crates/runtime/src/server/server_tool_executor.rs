@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{Value, json};
 
+use astra_core::SharedPool;
 use astra_tools::executor::DefaultToolExecutor;
 use astra_tools::{AskUserDecision, AskUserGate, ToolExecutor};
 use async_trait::async_trait;
@@ -1019,6 +1020,8 @@ pub struct ServerToolExecutor {
     default_executor: DefaultToolExecutor,
     /// Optional remote workspace artifact store for publishing workspace metadata.
     workspace_artifact_store: Option<astra_services::DatabaseSessionArtifactStore>,
+    /// Optional shared pool for context-manifest side events.
+    context_manifest_pool: Option<SharedPool>,
     /// Plan repository for plan-mode gating and Enter/ExitPlanMode tools.
     /// `None` leaves plan-mode unconditionally off (back-compat for tests /
     /// constructor call sites that haven't been updated).
@@ -1106,6 +1109,7 @@ impl ServerToolExecutor {
             self_mod_deprioritized_tools: Mutex::new(deprioritized_tools),
             self_mod_mutation_counter: Mutex::new((0, 0)),
             workspace_artifact_store: None,
+            context_manifest_pool: None,
             plan_repo: None,
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
@@ -1155,6 +1159,29 @@ impl ServerToolExecutor {
     ) -> Self {
         self.workspace_artifact_store = Some(store);
         self
+    }
+
+    pub fn set_context_manifest_pool(&mut self, pool: SharedPool) {
+        self.context_manifest_pool = Some(pool);
+    }
+
+    async fn record_preview_template_missing(&self, tool_name: &str) {
+        let Some(pool) = &self.context_manifest_pool else {
+            return;
+        };
+        let store = astra_services::DatabaseContextManifestStore::new(pool.clone());
+        if let Err(error) = store
+            .preview_template_budget_or_fallback(&self.user_id, &self.session_id, None, tool_name)
+            .await
+        {
+            tracing::warn!(
+                target: "astra_runtime::tool_preview",
+                session_id = %self.session_id,
+                tool_name,
+                error = %error,
+                "failed to persist preview_template_missing event"
+            );
+        }
     }
 
     fn publish_current_workspace(&self, source: &str) -> Result<(), String> {
@@ -1420,8 +1447,10 @@ impl ServerToolExecutor {
                     .to_string(),
             ),
             // ── Unknown tool fallback ──────────────────────────────────
-            _ => astra_tools::ToolResult::error(format!(
-                "Error: Tool '{name}' is not available in server-side execution mode. \
+            _ => {
+                self.record_preview_template_missing(name).await;
+                astra_tools::ToolResult::error(format!(
+                    "Error: Tool '{name}' is not available in server-side execution mode. \
                      Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
                      multi_edit, list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
                      rollback_session_state, task_*, sleep, tool_search, mo_query, rollback_database_snapshots, \
@@ -1429,7 +1458,8 @@ impl ServerToolExecutor {
                      git_show, git_blame, symbols, git_commit, git_stash, git_revert_commit, github_list_prs, github_get_pr, \
                      github_ci_status, github_list_issues, github_get_issue, github_repo_stats, github_create_issue, memory_*, web_fetch, \
                      web_search, ask_user, get_agent_info"
-            )),
+                ))
+            }
         };
 
         result.output = astra_tools::normalize_empty_output(result.output, name);

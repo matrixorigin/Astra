@@ -9,12 +9,17 @@ use super::agentic_loop_lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_state_summary, session_turn_number,
     tool_record_is_workspace_mutation,
 };
+use astra_services::{
+    ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore,
+    budget_for_turn_intent,
+};
 use astra_turn_core::agentic_turn_ingest::{
     AgenticIngestIterationControl, AgenticTurnIngestMut, AgenticTurnIngestOutcome,
     agentic_turn_stream_snapshot_with_kind, ingest_agentic_turn_stream,
     map_ingest_outcome_to_iteration_control,
 };
 use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
+use uuid::Uuid;
 
 /// Record an `llm_round` event for an early-exit path (no tool calls).
 fn record_early_exit_llm_round(
@@ -75,6 +80,232 @@ fn inject_runtime_attention_manifest(state: &mut AgenticLoopState) {
         );
     } else {
         astra_turn_types::continuity::strip_attention_manifest_messages(&mut state.messages);
+    }
+}
+
+fn estimate_json_tokens(value: &serde_json::Value) -> u32 {
+    (value.to_string().len() as u32 / 4).saturating_add(1)
+}
+
+fn manifest_reason_for_llm_call(state: &AgenticLoopState) -> &'static str {
+    let has_compaction_marker = state.messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|content| content.to_ascii_lowercase().contains("compaction"))
+    });
+    if has_compaction_marker {
+        "post_compaction"
+    } else {
+        "normal_turn"
+    }
+}
+
+fn infer_turn_intent_for_llm_call(
+    state: &AgenticLoopState,
+    pre_llm_messages: &[serde_json::Value],
+) -> String {
+    let combined = pre_llm_messages
+        .iter()
+        .rev()
+        .take(8)
+        .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
+    if combined.contains("benchmark")
+        && (combined.contains("compare")
+            || combined.contains("comparison")
+            || combined.contains("对比")
+            || combined.contains("比较"))
+    {
+        return "benchmark_comparison".to_string();
+    }
+    if state.task_profile.mutates_workspace {
+        "implementation".to_string()
+    } else if state.task_profile.exploratory_task {
+        "exploration".to_string()
+    } else {
+        "normal".to_string()
+    }
+}
+
+async fn persist_context_manifest_for_llm_call(
+    state: &AgenticLoopState,
+    turn_index: usize,
+    llm_attempt_index: u32,
+    pre_llm_messages: &[serde_json::Value],
+    turn_result: Option<&HostTurnResult>,
+) {
+    let (Some(pool), Some(user_id), Some(session_id), Some(run_id)) = (
+        state.context_manifest_pool.clone(),
+        state.context_manifest_user_id.as_deref(),
+        state.current_session_id.as_deref(),
+        state.current_run_id.as_deref(),
+    ) else {
+        return;
+    };
+    let turn_intent = infer_turn_intent_for_llm_call(state, pre_llm_messages);
+    let budget_allocation = budget_for_turn_intent(Some(&turn_intent));
+    let budget = budget_allocation.budget.clone();
+    let message_tokens = pre_llm_messages
+        .iter()
+        .map(estimate_json_tokens)
+        .fold(0_u32, u32::saturating_add);
+    let tool_result_tokens = state
+        .tool_results
+        .iter()
+        .map(estimate_json_tokens)
+        .fold(0_u32, u32::saturating_add);
+    let schema_tokens = state.pinned_tool_schema_tokens.min(u64::from(u32::MAX)) as u32;
+    let result_prompt_tokens = turn_result
+        .map(|result| {
+            result
+                .accum
+                .prompt_tokens
+                .saturating_add(result.accum.cache_read_tokens)
+        })
+        .unwrap_or(u64::from(
+            message_tokens
+                .saturating_add(tool_result_tokens)
+                .saturating_add(schema_tokens),
+        ))
+        .min(u64::from(u32::MAX)) as u32;
+    let manifest_id = format!("manifest-{}", Uuid::new_v4());
+    let turn_id = format!("{run_id}:llm:{llm_attempt_index}");
+    let reason = manifest_reason_for_llm_call(state);
+
+    let mut items = vec![
+        ContextManifestItemWrite {
+            session_id: session_id.to_string(),
+            item_order: 0,
+            zone: "session_anchor".to_string(),
+            source_table: "agent_runs".to_string(),
+            source_id: run_id.to_string(),
+            source_hash: None,
+            included: true,
+            token_estimate: 0,
+            budget_tokens: budget.anchor,
+            reason: reason.to_string(),
+            render_mode: "reference_only".to_string(),
+            raw_ref: None,
+        },
+        ContextManifestItemWrite {
+            session_id: session_id.to_string(),
+            item_order: 1,
+            zone: "recent_tail".to_string(),
+            source_table: "runtime_messages".to_string(),
+            source_id: format!("{run_id}:turn:{turn_index}:messages"),
+            source_hash: None,
+            included: true,
+            token_estimate: message_tokens.min(budget.recent_tail),
+            budget_tokens: budget.recent_tail,
+            reason: reason.to_string(),
+            render_mode: "markdown".to_string(),
+            raw_ref: Some(format!(
+                "conversation_log://{session_id}/{turn_index}@runtime"
+            )),
+        },
+        ContextManifestItemWrite {
+            session_id: session_id.to_string(),
+            item_order: 2,
+            zone: "system_tool_schemas".to_string(),
+            source_table: "tool_runner_registry".to_string(),
+            source_id: "visible_tools".to_string(),
+            source_hash: None,
+            included: true,
+            token_estimate: schema_tokens.min(budget.system_tool_schemas),
+            budget_tokens: budget.system_tool_schemas,
+            reason: reason.to_string(),
+            render_mode: "reference_only".to_string(),
+            raw_ref: None,
+        },
+    ];
+    if tool_result_tokens > 0 {
+        items.push(ContextManifestItemWrite {
+            session_id: session_id.to_string(),
+            item_order: 3,
+            zone: "tool_previews".to_string(),
+            source_table: "tool_results".to_string(),
+            source_id: format!("{run_id}:turn:{turn_index}:tool_results"),
+            source_hash: None,
+            included: true,
+            token_estimate: tool_result_tokens.min(budget.tool_previews),
+            budget_tokens: budget.tool_previews,
+            reason: "large_tool_output_gated".to_string(),
+            render_mode: "tool_preview".to_string(),
+            raw_ref: None,
+        });
+    }
+    let estimated_input = message_tokens
+        .saturating_add(tool_result_tokens)
+        .saturating_add(schema_tokens);
+    if estimated_input > budget.input_context_cap() {
+        items.push(ContextManifestItemWrite {
+            session_id: session_id.to_string(),
+            item_order: 90,
+            zone: "recent_tail".to_string(),
+            source_table: "runtime_messages".to_string(),
+            source_id: format!("{run_id}:turn:{turn_index}:overflow"),
+            source_hash: None,
+            included: false,
+            token_estimate: estimated_input.saturating_sub(budget.input_context_cap()),
+            budget_tokens: 0,
+            reason: "progressive_loading".to_string(),
+            render_mode: "summary".to_string(),
+            raw_ref: Some(format!(
+                "conversation_log://{session_id}/{turn_index}@overflow"
+            )),
+        });
+    }
+
+    let manifest = ContextManifestWrite {
+        manifest_id: manifest_id.clone(),
+        user_id: user_id.to_string(),
+        session_id: session_id.to_string(),
+        run_id: Some(run_id.to_string()),
+        turn_id,
+        model_provider: "runtime".to_string(),
+        model_name: state
+            .context_manifest_model_name
+            .clone()
+            .unwrap_or_else(|| "default".to_string()),
+        context_window_tokens: 8_000,
+        max_output_tokens: budget.reserved_output,
+        total_estimated_tokens: result_prompt_tokens,
+        policy_version: "context_manifest_v1".to_string(),
+        tokenizer_id: Some("estimated_v1".to_string()),
+        budget_template_id: Some("budget_v1_8k".to_string()),
+        turn_intent: Some(turn_intent.clone()),
+        reason: reason.to_string(),
+        manifest_json: serde_json::json!({
+            "source": "agentic_loop_execution_phase",
+            "llm_attempt_index": llm_attempt_index,
+            "turn_index": turn_index,
+            "turn_intent": turn_intent,
+            "budget_template_id": "budget_v1_8k",
+            "budget_flex": {
+                "flex_applied": budget_allocation.flex_applied,
+                "borrowed_from_recent_tail": budget_allocation.borrowed_from_recent_tail
+            },
+            "zones": {
+                "session_anchor": {"budget_tokens": budget.anchor, "used_tokens": 0},
+                "recent_tail": {"budget_tokens": budget.recent_tail, "used_tokens": message_tokens.min(budget.recent_tail)},
+                "tool_previews": {"budget_tokens": budget.tool_previews, "used_tokens": tool_result_tokens.min(budget.tool_previews)},
+                "system_tool_schemas": {"budget_tokens": budget.system_tool_schemas, "used_tokens": schema_tokens.min(budget.system_tool_schemas)}
+            }
+        }),
+    };
+    let store = DatabaseContextManifestStore::new(pool);
+    if let Err(error) = store.save_manifest(manifest, items).await {
+        tracing::warn!(
+            target: "astra_runtime::context_manifest",
+            run_id,
+            session_id,
+            manifest_id,
+            error = %error,
+            "failed to persist per-llm-call context manifest"
+        );
     }
 }
 
@@ -500,11 +731,35 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     );
 
     let llm_wall_start = Instant::now();
+    let pre_llm_messages = state.messages.clone();
+    let llm_attempt_index = state.llm_rounds_completed;
     // Increment the LLM-round counter regardless of outcome so retry/error
     // paths don't see a stale count (the counter tracks *attempted* LLM
     // calls for guidance-threshold purposes, not just successful ones).
     let turn_result = host.execute_turn(state).await;
     state.llm_rounds_completed += 1;
+    match &turn_result {
+        Ok(result) => {
+            persist_context_manifest_for_llm_call(
+                state,
+                turn_index,
+                llm_attempt_index,
+                &pre_llm_messages,
+                Some(result),
+            )
+            .await;
+        }
+        Err(_) => {
+            persist_context_manifest_for_llm_call(
+                state,
+                turn_index,
+                llm_attempt_index,
+                &pre_llm_messages,
+                None,
+            )
+            .await;
+        }
+    }
     let turn_result = turn_result?;
     state.rate_limit_cooldown.record_success();
     if let Some(ref emitter) = state.messaging.progress_emitter {

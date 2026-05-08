@@ -3,7 +3,7 @@ use crate::auth::session::SessionRecord;
 use astra_core::{ErrorResponse, MatrixOneSettings, connect_matrixone, internal_error};
 use axum::{Json, http::StatusCode};
 use fs2::FileExt;
-use sqlx::{Executor, MySql, QueryBuilder, Row, query};
+use sqlx::{Executor, MySql, Pool, QueryBuilder, Row, query};
 use std::collections::HashSet;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::OpenOptions;
@@ -269,6 +269,87 @@ async fn ensure_matrixone_database_exists(
     Ok(())
 }
 
+async fn column_exists(
+    pool: &Pool<MySql>,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> Result<bool, sqlx::Error> {
+    let row = query(
+        "SELECT COUNT(*) AS count FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+    )
+    .bind(schema)
+    .bind(table)
+    .bind(column)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get::<i64, _>("count").unwrap_or(0) > 0)
+}
+
+async fn index_exists(
+    pool: &Pool<MySql>,
+    schema: &str,
+    table: &str,
+    index: &str,
+) -> Result<bool, sqlx::Error> {
+    let row = query(
+        "SELECT COUNT(*) AS count FROM INFORMATION_SCHEMA.STATISTICS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ?",
+    )
+    .bind(schema)
+    .bind(table)
+    .bind(index)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get::<i64, _>("count").unwrap_or(0) > 0)
+}
+
+async fn check_clause_contains(
+    pool: &Pool<MySql>,
+    schema: &str,
+    needle: &str,
+) -> Result<bool, sqlx::Error> {
+    let rows = query(
+        "SELECT CHECK_CLAUSE FROM INFORMATION_SCHEMA.CHECK_CONSTRAINTS
+         WHERE CONSTRAINT_SCHEMA = ?",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().any(|row| {
+        row.try_get::<String, _>("CHECK_CLAUSE")
+            .map(|clause| clause.contains(needle))
+            .unwrap_or(false)
+    }))
+}
+
+async fn add_column_if_missing(
+    pool: &Pool<MySql>,
+    schema: &str,
+    table: &str,
+    column: &str,
+    ddl: &str,
+) -> Result<(), sqlx::Error> {
+    if !column_exists(pool, schema, table, column).await? {
+        query(ddl).execute(pool).await?;
+    }
+    Ok(())
+}
+
+async fn add_index_if_missing(
+    pool: &Pool<MySql>,
+    schema: &str,
+    table: &str,
+    index: &str,
+    ddl: &str,
+) -> Result<(), sqlx::Error> {
+    if !index_exists(pool, schema, table, index).await? {
+        query(ddl).execute(pool).await?;
+    }
+    Ok(())
+}
+
 pub async fn ensure_core_schema(
     settings: &MatrixOneSettings,
     bootstrap_catalog: &str,
@@ -446,6 +527,738 @@ pub async fn ensure_core_schema(
             INDEX idx_agent_events_skill_created (skill_name, created_at),
             INDEX idx_agent_events_created_at (created_at),
             INDEX idx_agent_events_tool_name (meta_tool_name)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Durable web-agent run state (Phase 1 / G15 + G19) ────────────────
+    query(
+        "CREATE TABLE IF NOT EXISTS agent_runs (
+            run_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            parent_run_id VARCHAR(64) NULL,
+            root_run_id VARCHAR(64) NOT NULL,
+            ancestor_path VARCHAR(2048) NOT NULL,
+            depth INT NOT NULL DEFAULT 0,
+            delegation_id VARCHAR(64) NULL,
+            agent_id VARCHAR(128) NULL,
+            retry_of VARCHAR(64) NULL,
+            retry_scope VARCHAR(16) NOT NULL DEFAULT 'node',
+            status VARCHAR(32) NOT NULL,
+            execution_mode VARCHAR(32) NOT NULL DEFAULT 'web_agent',
+            trigger_type VARCHAR(64) NULL,
+            trigger_event_id VARCHAR(64) NULL,
+            waiting_for VARCHAR(64) NULL,
+            owner_pod_id VARCHAR(128) NULL,
+            owner_lease_expires_at DATETIME(6) NULL,
+            run_generation BIGINT NOT NULL DEFAULT 0,
+            last_event_idx BIGINT NOT NULL DEFAULT -1,
+            checkpoint_version VARCHAR(32) NULL,
+            checkpoint_json LONGTEXT NULL,
+            error_code VARCHAR(128) NULL,
+            error_message TEXT NULL,
+            retry_count INT NOT NULL DEFAULT 0,
+            total_prompt_tokens BIGINT NOT NULL DEFAULT 0,
+            total_completion_tokens BIGINT NOT NULL DEFAULT 0,
+            total_tool_calls BIGINT NOT NULL DEFAULT 0,
+            request_id VARCHAR(64) NULL,
+            trace_id VARCHAR(64) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            CONSTRAINT chk_agent_runs_retry_scope CHECK (retry_scope IN ('node', 'subtree', 'siblings')),
+            INDEX idx_agent_runs_user_updated (user_id, updated_at),
+            INDEX idx_agent_runs_session_updated (session_id, updated_at),
+            INDEX idx_agent_runs_root_depth (root_run_id, depth, created_at),
+            INDEX idx_agent_runs_parent (parent_run_id, created_at),
+            INDEX idx_agent_runs_retry_of (retry_of),
+            INDEX idx_agent_runs_status_lease (status, owner_lease_expires_at),
+            INDEX idx_agent_runs_owner_lease (owner_pod_id, owner_lease_expires_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS run_counters (
+            run_id VARCHAR(64) PRIMARY KEY,
+            next_event_idx BIGINT NOT NULL DEFAULT 0,
+            owner_pod_id VARCHAR(128) NULL,
+            owner_lease_expires_at DATETIME(6) NULL,
+            run_generation BIGINT NOT NULL DEFAULT 0,
+            request_id VARCHAR(64) NULL,
+            trace_id VARCHAR(64) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_run_counters_owner_lease (owner_pod_id, owner_lease_expires_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS agent_run_events (
+            id VARCHAR(64) PRIMARY KEY,
+            run_id VARCHAR(64) NOT NULL,
+            event_idx BIGINT NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            event_type VARCHAR(64) NOT NULL,
+            event_id VARCHAR(128) NOT NULL,
+            agent_id VARCHAR(128) NULL,
+            idempotency_key VARCHAR(128) NULL,
+            event_hash VARCHAR(64) NOT NULL,
+            producer_pod_id VARCHAR(128) NULL,
+            payload_json LONGTEXT NOT NULL,
+            request_id VARCHAR(64) NULL,
+            trace_id VARCHAR(64) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_run_event_idx (run_id, event_idx),
+            UNIQUE KEY uq_run_event_idempotency (run_id, idempotency_key),
+            INDEX idx_agent_run_events_run_created (run_id, created_at),
+            INDEX idx_agent_run_events_session_created (session_id, created_at),
+            INDEX idx_agent_run_events_user_created (user_id, created_at),
+            INDEX idx_agent_run_events_event_id (event_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS session_tool_output_batches (
+            batch_id VARCHAR(64) PRIMARY KEY,
+            session_id VARCHAR(64) NOT NULL,
+            run_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            output_count INT NOT NULL,
+            payload_bytes BIGINT NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'committed',
+            request_id VARCHAR(64) NULL,
+            trace_id VARCHAR(64) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_tool_output_batches_run_created (run_id, created_at),
+            INDEX idx_tool_output_batches_session_created (session_id, created_at),
+            INDEX idx_tool_output_batches_user_created (user_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS session_tool_outputs (
+            output_id VARCHAR(64) PRIMARY KEY,
+            batch_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            run_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            output_idx INT NOT NULL,
+            parent_output_id VARCHAR(64) NULL,
+            tool_call_id VARCHAR(128) NULL,
+            tool_name VARCHAR(128) NOT NULL,
+            output_json LONGTEXT NOT NULL,
+            payload_bytes BIGINT NOT NULL,
+            preview_text LONGTEXT NULL,
+            preview_status VARCHAR(32) NOT NULL DEFAULT 'template',
+            artifact_ref VARCHAR(255) NULL,
+            content_hash VARCHAR(128) NULL,
+            normalize_version VARCHAR(32) NOT NULL DEFAULT 'raw_v1',
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_tool_outputs_batch_idx (batch_id, output_idx),
+            INDEX idx_tool_outputs_run_created (run_id, created_at),
+            INDEX idx_tool_outputs_session_created (session_id, created_at),
+            INDEX idx_tool_outputs_parent (parent_output_id),
+            INDEX idx_tool_outputs_artifact_ref (artifact_ref)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    for (table, column, ddl) in [
+        (
+            "session_tool_outputs",
+            "parent_output_id",
+            "ALTER TABLE session_tool_outputs ADD COLUMN parent_output_id VARCHAR(64) NULL",
+        ),
+        (
+            "session_tool_outputs",
+            "preview_text",
+            "ALTER TABLE session_tool_outputs ADD COLUMN preview_text LONGTEXT NULL",
+        ),
+        (
+            "session_tool_outputs",
+            "preview_status",
+            "ALTER TABLE session_tool_outputs ADD COLUMN preview_status VARCHAR(32) NOT NULL DEFAULT 'template'",
+        ),
+        (
+            "session_tool_outputs",
+            "artifact_ref",
+            "ALTER TABLE session_tool_outputs ADD COLUMN artifact_ref VARCHAR(255) NULL",
+        ),
+        (
+            "session_tool_outputs",
+            "content_hash",
+            "ALTER TABLE session_tool_outputs ADD COLUMN content_hash VARCHAR(128) NULL",
+        ),
+        (
+            "session_tool_outputs",
+            "normalize_version",
+            "ALTER TABLE session_tool_outputs ADD COLUMN normalize_version VARCHAR(32) NOT NULL DEFAULT 'raw_v1'",
+        ),
+    ] {
+        if let Err(e) = add_column_if_missing(&pool, &settings.database, table, column, ddl).await {
+            tracing::warn!(
+                target: "astra_services::storage",
+                table,
+                column,
+                error = %e,
+                "failed to migrate session_tool_outputs Phase 6 column"
+            );
+        }
+    }
+    for (table, index, ddl) in [
+        (
+            "session_tool_outputs",
+            "idx_tool_outputs_parent",
+            "ALTER TABLE session_tool_outputs ADD INDEX idx_tool_outputs_parent (parent_output_id)",
+        ),
+        (
+            "session_tool_outputs",
+            "idx_tool_outputs_artifact_ref",
+            "ALTER TABLE session_tool_outputs ADD INDEX idx_tool_outputs_artifact_ref (artifact_ref)",
+        ),
+    ] {
+        if let Err(e) = add_index_if_missing(&pool, &settings.database, table, index, ddl).await {
+            tracing::warn!(
+                target: "astra_services::storage",
+                table,
+                index,
+                error = %e,
+                "failed to migrate session_tool_outputs Phase 6 index"
+            );
+        }
+    }
+
+    // ── Web transcript hydration + device lease state (Phase 2 / G13+G19+G25) ──
+    query(
+        "CREATE TABLE IF NOT EXISTS session_transcript_items (
+            session_id VARCHAR(64) NOT NULL,
+            item_seq BIGINT NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            run_id VARCHAR(64) NULL,
+            role VARCHAR(32) NOT NULL,
+            content LONGTEXT NOT NULL,
+            source_event_id VARCHAR(128) NULL,
+            source_event_idx BIGINT NULL,
+            content_hash VARCHAR(64) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (session_id, item_seq),
+            INDEX idx_transcript_user_session_seq (user_id, session_id, item_seq),
+            INDEX idx_transcript_run_event (run_id, source_event_idx)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS session_state_revisions (
+            session_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
+            monotonic_id BIGINT NOT NULL DEFAULT 0,
+            revision_hash VARCHAR(96) NOT NULL,
+            device_fingerprint VARCHAR(128) NOT NULL,
+            transcript_high_watermark BIGINT NOT NULL DEFAULT 0,
+            run_event_high_watermark BIGINT NOT NULL DEFAULT 0,
+            state_projection_hash VARCHAR(96) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_state_revisions_user_updated (user_id, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS session_device_leases (
+            lease_id VARCHAR(128) PRIMARY KEY,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            device_id VARCHAR(128) NOT NULL,
+            device_fingerprint VARCHAR(128) NOT NULL,
+            trust_level VARCHAR(32) NOT NULL DEFAULT 'new_device',
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
+            last_monotonic_id BIGINT NOT NULL DEFAULT 0,
+            expires_at DATETIME(6) NOT NULL,
+            revoked_at DATETIME(6) NULL,
+            request_id VARCHAR(128) NULL,
+            trace_id VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_session_device (session_id, device_id),
+            INDEX idx_device_leases_user_session (user_id, session_id, status, updated_at),
+            INDEX idx_device_leases_fingerprint (user_id, device_fingerprint, status),
+            INDEX idx_device_leases_expiry (status, expires_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS session_device_lease_events (
+            lease_event_id VARCHAR(128) PRIMARY KEY,
+            lease_id VARCHAR(128) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            device_id VARCHAR(128) NOT NULL,
+            device_fingerprint VARCHAR(128) NOT NULL,
+            event_type VARCHAR(64) NOT NULL,
+            reason VARCHAR(64) NOT NULL,
+            ended_at_server DATETIME(6) NOT NULL,
+            request_id VARCHAR(128) NULL,
+            trace_id VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_lease_events_user_created (user_id, created_at),
+            INDEX idx_lease_events_session_device (session_id, device_id, created_at),
+            INDEX idx_lease_events_type_created (event_type, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Context manifest v1 (Phase 3 / G1+G3+G10+G26+G27) ───────────────
+    query(
+        "CREATE TABLE IF NOT EXISTS context_manifest_reason_types (
+            reason VARCHAR(64) PRIMARY KEY,
+            reason_class VARCHAR(64) NOT NULL,
+            description TEXT NOT NULL,
+            default_zone VARCHAR(64) NULL,
+            is_active SMALLINT NOT NULL DEFAULT 1,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_ctx_reason_class (reason_class, reason)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS context_manifests (
+            manifest_id VARCHAR(128) PRIMARY KEY,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            run_id VARCHAR(128) NULL,
+            turn_id VARCHAR(128) NOT NULL,
+            model_provider VARCHAR(64) NOT NULL,
+            model_name VARCHAR(128) NOT NULL,
+            context_window_tokens INT NOT NULL,
+            max_output_tokens INT NOT NULL,
+            total_estimated_tokens INT NOT NULL,
+            stable_prefix_hash VARCHAR(128) NULL,
+            prompt_cache_key VARCHAR(255) NULL,
+            compaction_version VARCHAR(64) NULL,
+            policy_version VARCHAR(64) NOT NULL,
+            tokenizer_id VARCHAR(128) NULL,
+            budget_template_id VARCHAR(64) NULL,
+            turn_intent VARCHAR(64) NULL,
+            reason VARCHAR(64) NOT NULL,
+            dropped_count INT NOT NULL DEFAULT 0,
+            manifest_json LONGTEXT NOT NULL,
+            request_id VARCHAR(128) NULL,
+            trace_id VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_ctx_manifest_session_turn (session_id, turn_id),
+            INDEX idx_ctx_manifest_run (run_id),
+            INDEX idx_ctx_manifest_user_created (user_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS context_manifest_items (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            manifest_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            item_order INT NOT NULL,
+            zone VARCHAR(64) NOT NULL,
+            source_table VARCHAR(64) NOT NULL,
+            source_id VARCHAR(128) NOT NULL,
+            source_hash VARCHAR(128) NULL,
+            included SMALLINT NOT NULL,
+            token_estimate INT NOT NULL DEFAULT 0,
+            budget_tokens INT NOT NULL DEFAULT 0,
+            reason VARCHAR(128) NOT NULL,
+            render_mode VARCHAR(64) NOT NULL,
+            raw_ref VARCHAR(255) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_manifest_item_order (manifest_id, item_order),
+            INDEX idx_manifest_items_source (source_table, source_id),
+            INDEX idx_manifest_items_session_zone (session_id, zone, included),
+            INDEX idx_manifest_items_raw_ref (raw_ref)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS preview_template_registry (
+            tool_name VARCHAR(128) NOT NULL,
+            version VARCHAR(64) NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
+            max_preview_bytes INT NOT NULL DEFAULT 400,
+            default_chunk_type VARCHAR(64) NOT NULL DEFAULT 'tool_output_preview',
+            first_class_columns_json LONGTEXT NOT NULL,
+            fts_field_weights_json LONGTEXT NOT NULL,
+            normalize_version VARCHAR(32) NOT NULL DEFAULT 'v1',
+            schema_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (tool_name, version),
+            INDEX idx_preview_templates_status (tool_name, status, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS tool_runner_registry (
+            tool_name VARCHAR(128) PRIMARY KEY,
+            runner_version VARCHAR(64) NOT NULL,
+            preview_template_version VARCHAR(64) NOT NULL,
+            normalize_version VARCHAR(32) NOT NULL DEFAULT 'raw_v1',
+            default_raw_ref_scheme VARCHAR(64) NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_tool_runner_status (status, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS raw_ref_scheme_registry (
+            scheme VARCHAR(64) PRIMARY KEY,
+            resolver_name VARCHAR(128) NOT NULL,
+            backing_store VARCHAR(64) NOT NULL,
+            access_check VARCHAR(64) NOT NULL,
+            canonical_example VARCHAR(255) NOT NULL,
+            is_active SMALLINT NOT NULL DEFAULT 1,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    for (reason, reason_class, default_zone) in crate::context_manifest::CONTEXT_MANIFEST_REASONS {
+        query(
+            "INSERT IGNORE INTO context_manifest_reason_types
+             (reason, reason_class, description, default_zone, is_active, created_at)
+             VALUES (?, ?, ?, ?, 1, NOW(6))",
+        )
+        .bind(reason)
+        .bind(reason_class)
+        .bind(format!("Seeded context manifest reason: {reason}"))
+        .bind(*default_zone)
+        .execute(&pool)
+        .await?;
+    }
+
+    for (scheme, resolver, backing, access_check, example) in [
+        (
+            "artifact",
+            "artifact_resolver",
+            "matrixone",
+            "session_artifact_acl",
+            "artifact://session/artifact_id@sha256:...",
+        ),
+        (
+            "s3",
+            "s3_resolver",
+            "object_store",
+            "presigned_url_acl",
+            "s3://bucket/key@sha256:...",
+        ),
+        (
+            "conversation_log",
+            "conversation_log_resolver",
+            "matrixone",
+            "session_owner",
+            "conversation_log://session/item_seq@sha256:...",
+        ),
+        (
+            "object_store",
+            "object_store_resolver",
+            "object_store",
+            "object_acl",
+            "object_store://namespace/key@sha256:...",
+        ),
+        (
+            "cold_storage",
+            "cold_storage_resolver",
+            "cold_storage",
+            "archive_acl",
+            "cold_storage://archive/key@sha256:...",
+        ),
+        (
+            "blob",
+            "blob_resolver",
+            "matrixone",
+            "blob_acl",
+            "blob://table/blob_id@sha256:...",
+        ),
+        (
+            "tool_output",
+            "tool_output_resolver",
+            "matrixone",
+            "session_owner",
+            "tool_output://session/output_id@sha256:...",
+        ),
+        (
+            "chunk",
+            "history_chunk_resolver",
+            "matrixone",
+            "session_or_user_scope",
+            "chunk://session/chunk_id@sha256:...",
+        ),
+        (
+            "state_item",
+            "state_item_resolver",
+            "matrixone",
+            "session_or_user_scope",
+            "state_item://session/item_id@sha256:...",
+        ),
+    ] {
+        query(
+            "INSERT IGNORE INTO raw_ref_scheme_registry
+             (scheme, resolver_name, backing_store, access_check, canonical_example, is_active, created_at)
+             VALUES (?, ?, ?, ?, ?, 1, NOW(6))",
+        )
+        .bind(scheme)
+        .bind(resolver)
+        .bind(backing)
+        .bind(access_check)
+        .bind(example)
+        .execute(&pool)
+        .await?;
+    }
+
+    for (tool_name, max_preview_bytes, normalize_version) in
+        crate::context_manifest::BASELINE_PREVIEW_TEMPLATES
+    {
+        let fts_field_weights =
+            crate::context_manifest::preview_template_fts_field_weights(normalize_version);
+        query(
+            "INSERT IGNORE INTO preview_template_registry
+             (tool_name, version, status, max_preview_bytes, default_chunk_type,
+              first_class_columns_json, fts_field_weights_json, normalize_version, schema_json,
+              created_at, updated_at)
+             VALUES (?, 'v1', 'active', ?, 'tool_output_preview', '[]', ?, ?, '{}', NOW(6), NOW(6))",
+        )
+        .bind(tool_name)
+        .bind(i64::from(*max_preview_bytes))
+        .bind(fts_field_weights)
+        .bind(normalize_version)
+        .execute(&pool)
+        .await?;
+
+        query(
+            "UPDATE preview_template_registry
+             SET fts_field_weights_json = ?, updated_at = NOW(6)
+             WHERE tool_name = ? AND version = 'v1' AND fts_field_weights_json = '{}'",
+        )
+        .bind(fts_field_weights)
+        .bind(tool_name)
+        .execute(&pool)
+        .await?;
+
+        query(
+            "INSERT IGNORE INTO tool_runner_registry
+             (tool_name, runner_version, preview_template_version, normalize_version,
+              default_raw_ref_scheme, status, created_at, updated_at)
+             VALUES (?, 'v1', 'v1', ?, 'artifact', 'active', NOW(6), NOW(6))",
+        )
+        .bind(tool_name)
+        .bind(normalize_version)
+        .execute(&pool)
+        .await?;
+    }
+
+    // ── State projection v1 (Phase 4 / G2+G4+G5+G6+G14+G16+G20) ────────
+    query(
+        "CREATE TABLE IF NOT EXISTS session_state_items (
+            item_id VARCHAR(128) PRIMARY KEY,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            scope VARCHAR(32) NOT NULL DEFAULT 'session',
+            category VARCHAR(64) NOT NULL,
+            item_key VARCHAR(255) NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
+            priority INT NOT NULL DEFAULT 0,
+            source VARCHAR(64) NOT NULL,
+            provenance_event_id VARCHAR(128) NULL,
+            run_id VARCHAR(128) NULL,
+            title VARCHAR(255) NULL,
+            summary_text TEXT NULL,
+            payload_json LONGTEXT NULL,
+            payload_hash VARCHAR(128) NULL,
+            token_estimate INT NOT NULL DEFAULT 0,
+            version BIGINT NOT NULL DEFAULT 1,
+            origin_session_id VARCHAR(128) NULL,
+            origin_chunk_id VARCHAR(128) NULL,
+            origin_state_item_id VARCHAR(128) NULL,
+            expires_at DATETIME(6) NULL,
+            request_id VARCHAR(128) NULL,
+            trace_id VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            CONSTRAINT chk_session_state_items_scope CHECK (scope IN ('session', 'user', 'project', 'workspace')),
+            UNIQUE KEY uq_state_current (session_id, scope, category, item_key),
+            INDEX idx_state_session_category (session_id, category, status, priority),
+            INDEX idx_state_user_category (user_id, category, status, updated_at),
+            INDEX idx_state_user_scope_category (user_id, scope, category, status, priority),
+            INDEX idx_state_origin_session (origin_session_id, category, status),
+            INDEX idx_state_expires (expires_at),
+            INDEX idx_state_provenance (provenance_event_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS session_state_item_events (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            item_id VARCHAR(128) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            category VARCHAR(64) NOT NULL,
+            item_key VARCHAR(255) NOT NULL,
+            mutation VARCHAR(32) NOT NULL,
+            previous_hash VARCHAR(128) NULL,
+            next_hash VARCHAR(128) NULL,
+            previous_version BIGINT NULL,
+            next_version BIGINT NULL,
+            payload_json LONGTEXT NULL,
+            provenance_event_id VARCHAR(128) NULL,
+            request_id VARCHAR(128) NULL,
+            trace_id VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            CONSTRAINT chk_state_item_event_mutation CHECK (mutation IN ('insert', 'update', 'replace', 'archive', 'delete', 'bubble_up', 'apply_suggestion', 'activate')),
+            INDEX idx_state_events_item_created (item_id, created_at, id),
+            INDEX idx_state_events_session_created (session_id, created_at, id),
+            INDEX idx_state_events_category_created (category, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS session_delegations (
+            delegation_id VARCHAR(128) PRIMARY KEY,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            parent_run_id VARCHAR(128) NOT NULL,
+            child_run_id VARCHAR(128) NOT NULL,
+            root_run_id VARCHAR(128) NOT NULL,
+            ancestor_path VARCHAR(2048) NOT NULL,
+            depth INT NOT NULL DEFAULT 0,
+            agent_id VARCHAR(128) NULL,
+            title VARCHAR(255) NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'running',
+            retry_of VARCHAR(128) NULL,
+            retry_scope VARCHAR(32) NOT NULL DEFAULT 'node',
+            last_summary_ref VARCHAR(255) NULL,
+            last_summary_text TEXT NULL,
+            sibling_exposed_artifacts_json LONGTEXT NULL,
+            request_id VARCHAR(128) NULL,
+            trace_id VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            CONSTRAINT chk_session_delegations_retry_scope CHECK (retry_scope IN ('node', 'subtree', 'siblings')),
+            UNIQUE KEY uq_session_delegations_child (child_run_id),
+            INDEX idx_delegations_root_depth (root_run_id, depth, created_at),
+            INDEX idx_delegations_parent (parent_run_id, created_at),
+            INDEX idx_delegations_session_status (session_id, status, updated_at),
+            INDEX idx_delegations_retry_of (retry_of)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS session_todos (
+            todo_id VARCHAR(128) PRIMARY KEY,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            plan_id VARCHAR(128) NULL,
+            parent_todo_id VARCHAR(128) NULL,
+            backlog_pool_id VARCHAR(128) NULL,
+            title VARCHAR(255) NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
+            priority INT NOT NULL DEFAULT 0,
+            depth INT NOT NULL DEFAULT 0,
+            token_estimate INT NOT NULL DEFAULT 0,
+            payload_json LONGTEXT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_session_todos_active (session_id, status, priority, updated_at),
+            INDEX idx_session_todos_pool (user_id, backlog_pool_id, status, updated_at),
+            INDEX idx_session_todos_tree (session_id, parent_todo_id, priority)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS session_history_chunks (
+            chunk_id VARCHAR(128) PRIMARY KEY,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            source_session_id VARCHAR(128) NULL,
+            seq_start BIGINT NOT NULL DEFAULT 0,
+            seq_end BIGINT NOT NULL DEFAULT 0,
+            item_seq_start BIGINT NULL,
+            item_seq_end BIGINT NULL,
+            turn_start BIGINT NULL,
+            turn_end BIGINT NULL,
+            chunk_type VARCHAR(64) NOT NULL,
+            source_table VARCHAR(64) NOT NULL,
+            source_id VARCHAR(128) NOT NULL,
+            content_text LONGTEXT NOT NULL,
+            content_hash VARCHAR(128) NOT NULL,
+            token_estimate INT NOT NULL DEFAULT 0,
+            provenance_json LONGTEXT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_history_user_chunk_created (user_id, chunk_type, created_at),
+            INDEX idx_history_session_seq (session_id, seq_start, seq_end),
+            INDEX idx_history_source_session (source_session_id, chunk_type, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query("DROP TABLE IF EXISTS session_artifact_grants")
+        .execute(&pool)
+        .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS session_artifacts_grants (
+            grant_id VARCHAR(128) PRIMARY KEY,
+            artifact_id VARCHAR(128) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            root_run_id VARCHAR(128) NOT NULL,
+            source_run_id VARCHAR(128) NOT NULL,
+            target_run_id VARCHAR(128) NULL,
+            target_delegation_id VARCHAR(128) NULL,
+            grant_scope VARCHAR(32) NOT NULL,
+            granted_by VARCHAR(128) NOT NULL,
+            reason VARCHAR(128) NULL,
+            expires_at DATETIME(6) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_artifacts_grant_target (artifact_id, grant_scope, target_run_id, target_delegation_id),
+            INDEX idx_artifacts_grants_root (root_run_id, grant_scope, created_at),
+            INDEX idx_artifacts_grants_target (target_run_id, target_delegation_id, created_at)
         )",
     )
     .execute(&pool)
@@ -972,20 +1785,182 @@ pub async fn ensure_core_schema(
             artifact_id VARCHAR(64) PRIMARY KEY,
             session_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(64) NOT NULL,
+            project_id VARCHAR(128) NULL,
+            owner_run_id VARCHAR(128) NULL,
+            owner_delegation_id VARCHAR(128) NULL,
+            root_run_id VARCHAR(128) NULL,
             artifact_kind VARCHAR(64) NOT NULL,
             source VARCHAR(64) NULL,
             turn INT NULL,
             round INT NULL,
             content_json LONGTEXT NOT NULL,
             metadata JSON NULL,
+            access_scope VARCHAR(32) NOT NULL DEFAULT 'delegation',
+            retention_policy VARCHAR(32) NOT NULL DEFAULT 'default',
+            retention_until DATETIME(6) NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
+            normalize_version VARCHAR(16) NULL,
+            cold_storage_ref VARCHAR(255) NULL,
+            derived_from_artifact_id VARCHAR(128) NULL,
+            referenced_by_manifest_count INT NOT NULL DEFAULT 0,
+            referenced_by_state_items_count INT NOT NULL DEFAULT 0,
+            referenced_by_citation_count INT NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            CONSTRAINT chk_session_artifacts_access_scope CHECK (access_scope IN ('private', 'delegation', 'delegation_direct', 'same_root_tree', 'user')),
+            CONSTRAINT chk_session_artifacts_status CHECK (status IN ('active', 'expiring', 'expired')),
             INDEX idx_session_artifacts_session_kind_created (session_id, artifact_kind, created_at),
             INDEX idx_session_artifacts_session_source_created (session_id, source, created_at),
-            INDEX idx_session_artifacts_user_created (user_id, created_at)
+            INDEX idx_session_artifacts_user_created (user_id, created_at),
+            INDEX idx_artifacts_root_scope (root_run_id, access_scope, status, updated_at),
+            INDEX idx_artifacts_owner_run (owner_run_id, status, updated_at),
+            INDEX idx_artifacts_retention (status, retention_until, retention_policy),
+            INDEX idx_artifacts_project (project_id, status, retention_until),
+            INDEX idx_artifacts_derived (derived_from_artifact_id)
         )",
     )
     .execute(&pool)
     .await?;
+
+    for (table, column, ddl) in [
+        (
+            "session_artifacts",
+            "project_id",
+            "ALTER TABLE session_artifacts ADD COLUMN project_id VARCHAR(128) NULL",
+        ),
+        (
+            "session_artifacts",
+            "owner_run_id",
+            "ALTER TABLE session_artifacts ADD COLUMN owner_run_id VARCHAR(128) NULL",
+        ),
+        (
+            "session_artifacts",
+            "owner_delegation_id",
+            "ALTER TABLE session_artifacts ADD COLUMN owner_delegation_id VARCHAR(128) NULL",
+        ),
+        (
+            "session_artifacts",
+            "root_run_id",
+            "ALTER TABLE session_artifacts ADD COLUMN root_run_id VARCHAR(128) NULL",
+        ),
+        (
+            "session_artifacts",
+            "access_scope",
+            "ALTER TABLE session_artifacts ADD COLUMN access_scope VARCHAR(32) NOT NULL DEFAULT 'delegation'",
+        ),
+        (
+            "session_artifacts",
+            "retention_policy",
+            "ALTER TABLE session_artifacts ADD COLUMN retention_policy VARCHAR(32) NOT NULL DEFAULT 'default'",
+        ),
+        (
+            "session_artifacts",
+            "retention_until",
+            "ALTER TABLE session_artifacts ADD COLUMN retention_until DATETIME(6) NULL",
+        ),
+        (
+            "session_artifacts",
+            "status",
+            "ALTER TABLE session_artifacts ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'active'",
+        ),
+        (
+            "session_artifacts",
+            "normalize_version",
+            "ALTER TABLE session_artifacts ADD COLUMN normalize_version VARCHAR(16) NULL",
+        ),
+        (
+            "session_artifacts",
+            "cold_storage_ref",
+            "ALTER TABLE session_artifacts ADD COLUMN cold_storage_ref VARCHAR(255) NULL",
+        ),
+        (
+            "session_artifacts",
+            "derived_from_artifact_id",
+            "ALTER TABLE session_artifacts ADD COLUMN derived_from_artifact_id VARCHAR(128) NULL",
+        ),
+        (
+            "session_artifacts",
+            "referenced_by_manifest_count",
+            "ALTER TABLE session_artifacts ADD COLUMN referenced_by_manifest_count INT NOT NULL DEFAULT 0",
+        ),
+        (
+            "session_artifacts",
+            "referenced_by_state_items_count",
+            "ALTER TABLE session_artifacts ADD COLUMN referenced_by_state_items_count INT NOT NULL DEFAULT 0",
+        ),
+        (
+            "session_artifacts",
+            "referenced_by_citation_count",
+            "ALTER TABLE session_artifacts ADD COLUMN referenced_by_citation_count INT NOT NULL DEFAULT 0",
+        ),
+        (
+            "session_artifacts",
+            "updated_at",
+            "ALTER TABLE session_artifacts ADD COLUMN updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
+        ),
+        (
+            "agent_sessions",
+            "project_id",
+            "ALTER TABLE agent_sessions ADD COLUMN project_id VARCHAR(128) NULL",
+        ),
+        (
+            "agent_sessions",
+            "project_retention_policy",
+            "ALTER TABLE agent_sessions ADD COLUMN project_retention_policy VARCHAR(32) NOT NULL DEFAULT 'session'",
+        ),
+    ] {
+        if let Err(e) = add_column_if_missing(&pool, &settings.database, table, column, ddl).await {
+            tracing::warn!("phase4 additive column migration skipped: {table}.{column}: {e}");
+        }
+    }
+
+    for (table, index, ddl) in [
+        (
+            "session_artifacts",
+            "idx_artifacts_root_scope",
+            "ALTER TABLE session_artifacts ADD INDEX idx_artifacts_root_scope (root_run_id, access_scope, status, updated_at)",
+        ),
+        (
+            "session_artifacts",
+            "idx_artifacts_owner_run",
+            "ALTER TABLE session_artifacts ADD INDEX idx_artifacts_owner_run (owner_run_id, status, updated_at)",
+        ),
+        (
+            "session_artifacts",
+            "idx_artifacts_retention",
+            "ALTER TABLE session_artifacts ADD INDEX idx_artifacts_retention (status, retention_until, retention_policy)",
+        ),
+        (
+            "session_artifacts",
+            "idx_artifacts_project",
+            "ALTER TABLE session_artifacts ADD INDEX idx_artifacts_project (project_id, status, retention_until)",
+        ),
+        (
+            "session_artifacts",
+            "idx_artifacts_derived",
+            "ALTER TABLE session_artifacts ADD INDEX idx_artifacts_derived (derived_from_artifact_id)",
+        ),
+        (
+            "agent_sessions",
+            "idx_sessions_project",
+            "ALTER TABLE agent_sessions ADD INDEX idx_sessions_project (user_id, project_id, updated_at)",
+        ),
+    ] {
+        if let Err(e) = add_index_if_missing(&pool, &settings.database, table, index, ddl).await {
+            tracing::debug!("phase4 additive index migration skipped: {table}.{index}: {e}");
+        }
+    }
+    if !check_clause_contains(&pool, &settings.database, "access_scope")
+        .await
+        .unwrap_or(false)
+        && let Err(e) = query(
+            "ALTER TABLE session_artifacts ADD CONSTRAINT chk_session_artifacts_access_scope CHECK (access_scope IN ('private', 'delegation', 'delegation_direct', 'same_root_tree', 'user'))",
+        )
+        .execute(&pool)
+        .await
+    {
+        tracing::debug!("phase4 access_scope constraint migration skipped: {e}");
+    }
 
     // Step Protocol idempotency cache
     query(
@@ -1056,6 +2031,70 @@ pub async fn ensure_core_schema(
     // ─── Skill management tables ─────────────────────────────────────────────────
 
     query(
+        "CREATE TABLE IF NOT EXISTS user_skill_sources (
+            source_id VARCHAR(128) PRIMARY KEY,
+            owner_user_id VARCHAR(128) NOT NULL,
+            skill_name VARCHAR(128) NOT NULL,
+            visibility VARCHAR(32) NOT NULL DEFAULT 'private',
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
+            description TEXT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            CONSTRAINT chk_user_skill_sources_visibility CHECK (visibility IN ('private', 'workspace', 'public')),
+            CONSTRAINT chk_user_skill_sources_status CHECK (status IN ('active', 'archived')),
+            UNIQUE KEY uq_user_skill_source_name (owner_user_id, skill_name),
+            INDEX idx_user_skill_owner_name (owner_user_id, skill_name),
+            INDEX idx_user_skill_status_updated (owner_user_id, status, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS user_skill_versions (
+            version_id VARCHAR(128) PRIMARY KEY,
+            source_id VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            skill_name VARCHAR(128) NOT NULL,
+            version VARCHAR(64) NOT NULL,
+            manifest_json LONGTEXT NOT NULL,
+            content_markdown LONGTEXT NOT NULL,
+            content_hash VARCHAR(128) NOT NULL,
+            normalize_version VARCHAR(32) NOT NULL DEFAULT 'skill_md_v1',
+            token_estimate INT NOT NULL DEFAULT 0,
+            status VARCHAR(32) NOT NULL DEFAULT 'draft',
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            CONSTRAINT chk_user_skill_versions_status CHECK (status IN ('draft', 'published', 'superseded', 'quarantined')),
+            UNIQUE KEY uq_user_skill_source_version (source_id, version),
+            INDEX idx_user_skill_versions_owner_name (owner_user_id, skill_name, status, created_at),
+            INDEX idx_user_skill_versions_source (source_id, created_at),
+            INDEX idx_user_skill_versions_hash (content_hash)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS user_skill_evaluations (
+            evaluation_id VARCHAR(128) PRIMARY KEY,
+            source_id VARCHAR(128) NOT NULL,
+            version_id VARCHAR(128) NOT NULL,
+            run_id VARCHAR(128) NULL,
+            hits BIGINT NOT NULL DEFAULT 0,
+            suspects BIGINT NOT NULL DEFAULT 0,
+            false_positives BIGINT NOT NULL DEFAULT 0,
+            payload_json LONGTEXT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_user_skill_eval_source_created (source_id, created_at),
+            INDEX idx_user_skill_eval_version_created (version_id, created_at),
+            INDEX idx_user_skill_eval_run (run_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
         "CREATE TABLE IF NOT EXISTS skill_installations (
             installation_id  VARCHAR(36) PRIMARY KEY,
             user_id          VARCHAR(36) NOT NULL,
@@ -1071,6 +2110,61 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
+
+    for (table, column, ddl) in [
+        (
+            "skill_installations",
+            "scope",
+            "ALTER TABLE skill_installations ADD COLUMN scope VARCHAR(32) NOT NULL DEFAULT 'user'",
+        ),
+        (
+            "skill_installations",
+            "session_id",
+            "ALTER TABLE skill_installations ADD COLUMN session_id VARCHAR(128) NULL",
+        ),
+        (
+            "skill_installations",
+            "workspace_id",
+            "ALTER TABLE skill_installations ADD COLUMN workspace_id VARCHAR(128) NULL",
+        ),
+        (
+            "skill_installations",
+            "auto_activate_on_topic_match",
+            "ALTER TABLE skill_installations ADD COLUMN auto_activate_on_topic_match SMALLINT NOT NULL DEFAULT 0",
+        ),
+    ] {
+        if let Err(e) = add_column_if_missing(&pool, &settings.database, table, column, ddl).await {
+            tracing::warn!(
+                target: "astra_services::storage",
+                table,
+                column,
+                error = %e,
+                "failed to migrate skill_installations column"
+            );
+        }
+    }
+    for (table, index, ddl) in [
+        (
+            "skill_installations",
+            "idx_si_scope_target",
+            "ALTER TABLE skill_installations ADD INDEX idx_si_scope_target (user_id, scope, session_id, workspace_id, skill_name)",
+        ),
+        (
+            "skill_installations",
+            "idx_si_auto_activate",
+            "ALTER TABLE skill_installations ADD INDEX idx_si_auto_activate (user_id, auto_activate_on_topic_match, status)",
+        ),
+    ] {
+        if let Err(e) = add_index_if_missing(&pool, &settings.database, table, index, ddl).await {
+            tracing::warn!(
+                target: "astra_services::storage",
+                table,
+                index,
+                error = %e,
+                "failed to migrate skill_installations index"
+            );
+        }
+    }
 
     query(
         "CREATE TABLE IF NOT EXISTS skill_settings (

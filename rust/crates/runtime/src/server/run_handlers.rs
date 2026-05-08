@@ -207,6 +207,45 @@ pub(super) async fn resume_run_handler(
     Ok(Json(RunMutationResponse::from(result)))
 }
 
+#[derive(serde::Deserialize)]
+pub(super) struct RunInputRequest {
+    pub idempotency_key: String,
+    #[serde(default)]
+    pub input: serde_json::Value,
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct RunInputResponse {
+    pub run_id: String,
+    pub accepted: bool,
+    pub duplicate: bool,
+}
+
+pub(super) async fn submit_run_input_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<RunInputRequest>,
+) -> Result<Json<RunInputResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let result = state
+        .run_lifecycle_service
+        .submit_run_input(
+            run_id,
+            user.user_id,
+            astra_services::runs::RunInputData {
+                idempotency_key: request.idempotency_key,
+                input: request.input,
+            },
+        )
+        .await?;
+    Ok(Json(RunInputResponse {
+        run_id: result.run_id,
+        accepted: result.accepted,
+        duplicate: result.duplicate,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};

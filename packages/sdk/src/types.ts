@@ -27,6 +27,9 @@ export type StreamEventType =
   | 'agent_progress'
   | 'agent_completed'
   | 'tool_approval_request'
+  | 'ping'
+  | 'device_revoked'
+  | 'device_lease_expired'
   | 'tool_execution_started'
   | 'tool_output_delta'
   | 'tool_execution_completed';
@@ -208,6 +211,22 @@ export type ToolApprovalRequestEvent = {
   args: Record<string, unknown>;
 };
 
+export type PingEvent = {
+  type: 'ping';
+  run_id?: string;
+  heartbeat_interval_ms?: number;
+};
+
+export type DeviceLeaseEndedEvent = {
+  type: 'device_revoked' | 'device_lease_expired';
+  lease_id: string;
+  session_id: string;
+  device_id: string;
+  device_fingerprint: string;
+  reason: string;
+  ended_at_server: string;
+};
+
 export type ToolExecutionStartedEvent = {
   type: 'tool_execution_started';
   call_id: string;
@@ -252,6 +271,8 @@ export type StreamEvent = (
   | AgentProgressEvent
   | AgentCompletedEvent
   | ToolApprovalRequestEvent
+  | PingEvent
+  | DeviceLeaseEndedEvent
   | ToolExecutionStartedEvent
   | ToolOutputDeltaEvent
   | ToolExecutionCompletedEvent) & { index?: number };
@@ -330,6 +351,8 @@ export type SkillSearchSettings = {
 };
 
 export type ChatConfig = {
+  /** Optional runtime URL used by tests and direct clients; the Web UI proxies requests. */
+  apiUrl?: string;
   sessionId?: string;
   agentId?: string;
   model?: string;
@@ -366,6 +389,8 @@ export type SSEClientOptions = {
   onRawLine?: (line: string) => void;
   maxRetries?: number;
   retryDelayMs?: number;
+  /** Abort the stream when no SSE event arrives within this window. Defaults to disabled. */
+  heartbeatTimeoutMs?: number;
   signal?: AbortSignal;
   /** HTTP method. Defaults to 'GET'. Use 'POST' for streaming chat endpoints. */
   method?: 'GET' | 'POST';

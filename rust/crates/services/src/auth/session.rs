@@ -244,7 +244,7 @@ impl SessionService for DatabaseSessionService {
             list_query.push(" AND status = ");
             list_query.push_bind(status);
         }
-        list_query.push(" ORDER BY created_at DESC LIMIT ");
+        list_query.push(" ORDER BY updated_at DESC LIMIT ");
         list_query.push_bind(i64::from(filter.limit));
         list_query.push(" OFFSET ");
         list_query.push_bind(i64::from(filter.offset));

@@ -2,9 +2,11 @@ pub mod admin;
 pub mod admin_config;
 pub mod agent_lessons;
 pub mod agents;
+pub mod artifact_policy;
 pub mod auth;
 pub mod branches;
 pub mod context;
+pub mod context_manifest;
 pub mod contract_generator;
 pub mod coordination;
 pub mod data_versioning;
@@ -25,6 +27,7 @@ pub mod models;
 pub mod multi_agent;
 pub mod mutation_scoreboard;
 pub mod pagination;
+pub mod personal_skills;
 pub mod reflect;
 pub mod replay;
 pub mod resource_governor;
@@ -43,6 +46,7 @@ pub mod session_workspace;
 pub mod skill_config;
 pub mod skills;
 pub mod snapshot_sql;
+pub mod state_projection;
 pub mod state_sync;
 pub mod storage;
 pub mod sync_engine;
@@ -68,6 +72,9 @@ pub use agents::{
     AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
     AgentUpdateRequestData, DatabaseAgentService, InMemoryAgentService, UnconfiguredAgentService,
 };
+pub use artifact_policy::{
+    PresignedArtifactDownload, artifact_download_signature, build_presigned_artifact_download,
+};
 pub use astra_core::composite_snapshot::{
     CompositeSnapshot, CompositeSnapshotIndex, DataSnapshotRef, MemorySnapshotRef, SnapshotRef,
     SnapshotSpec,
@@ -84,6 +91,17 @@ pub use branches::{BranchService, DatabaseBranchService, UnconfiguredBranchServi
 pub use context::{
     ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
     SnapshotListItem, SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
+};
+pub use context_manifest::{
+    BASELINE_PREVIEW_TEMPLATES, BENCHMARK_TOOL_PREVIEW_BUDGET, BUDGET_V1_8K_PROMPT_CAP,
+    BUDGET_V1_8K_TOTAL_CAP, BudgetV1_8k, CONTEXT_MANIFEST_REASONS, ConfidenceAction,
+    ContextManifestError, ContextManifestItemWrite, ContextManifestWrite,
+    DELEGATION_BLOCKER_ZONE_CAP, DELEGATION_ZONE_CAP, DatabaseContextManifestStore,
+    DelegationBudget, DelegationBudgetAllocation, RECENT_TAIL_BENCHMARK_FLOOR, RenderMode,
+    RetrievalStage, TurnIntentBudgetAllocation, artifact_id_from_raw_ref, budget_for_turn_intent,
+    content_hash_with_normalize_version, cross_session_retrieval_requires_user_filter,
+    delegation_budget, delegation_budget_allocation, expired_artifact_placeholder,
+    next_action_confidence_action, suggested_next_action_expires_at,
 };
 pub use contract_generator::{
     ContractGenerator, ProjectDetection, acceptance_checks_to_criteria, detect_build_command,
@@ -162,14 +180,21 @@ pub use pagination::{
     MAX_MARKETPLACE_SEARCH_OFFSET, clamp_admin_audit_limit, clamp_api_list_pagination,
     clamp_marketplace_search_offset,
 };
+pub use personal_skills::{
+    ActivateUserSkillVersion, CreateUserSkillSource, DatabasePersonalSkillStore, InstallUserSkill,
+    PersonalSkillError, RAW_SKILL_NORMALIZE_VERSION, RecordUserSkillEvaluation,
+    SKILL_MD_NORMALIZE_VERSION, SubmitUserSkillVersion, UserSkillEvaluationRecord,
+    UserSkillSourceRecord, UserSkillVersionRecord, normalize_skill_md, normalize_version_or_legacy,
+    skill_md_content_hash,
+};
 pub use reflect::{
     DatabaseReflectService, Diagnosis, ReflectReport, ReflectService, UnconfiguredReflectService,
 };
 pub use replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService};
 pub use runs::{
-    CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunRecord,
-    InMemoryRunStateStore, LlmTokenServiceConfig, LlmTokenServiceRequest, RunLifecycleService,
-    RunListRecord, RunMutationRecord, RunStateStore, RunStatusRecord,
+    CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DatabaseRunStateStore,
+    DurableRunRecord, InMemoryRunStateStore, LlmTokenServiceConfig, LlmTokenServiceRequest,
+    RunLifecycleService, RunListRecord, RunMutationRecord, RunStateStore, RunStatusRecord,
     UnconfiguredRunLifecycleService, transform_run_event_for_client,
 };
 pub use sandbox::{
@@ -196,6 +221,11 @@ pub use skill_config::{
 pub use skills::{
     DatabaseSkillService, SkillPublishRequestData, SkillRecord, SkillRegisterRequestData,
     SkillService, UnconfiguredSkillService,
+};
+pub use state_projection::{
+    BubbleUpTarget, COMPACTION_INVARIANT_SQL, CompactionInvariant, DatabaseStateProjectionStore,
+    DelegationProjectionUpsert, PROTECTED_COMPACTION_CATEGORIES, SkillActivationLlmProbe,
+    StateItemUpsert, StateProjectionError, UserAnchorMemoryItem, validate_state_mutation,
 };
 pub use state_sync::{
     LocalOnlySyncService, MatrixOneSyncService, PlanTemplateSyncRow, StateSyncService,

@@ -37,6 +37,7 @@ function getToolMeta(tool: string) {
 function ToolCallRow({ toolCall }: { toolCall: ToolCall }) {
   const [expanded, setExpanded] = useState(false);
   const meta = getToolMeta(toolCall.tool);
+  const artifactRef = extractArtifactRef(toolCall.result);
 
   const duration =
     toolCall.finishedAt && toolCall.startedAt
@@ -95,9 +96,21 @@ function ToolCallRow({ toolCall }: { toolCall: ToolCall }) {
           ) : null}
           {toolCall.result ? (
             <div>
-              <p className="mb-1 text-[10px] font-medium uppercase tracking-wide text-slate-500">
-                Result
-              </p>
+              <div className="mb-1 flex items-center justify-between gap-2">
+                <p className="text-[10px] font-medium uppercase tracking-wide text-slate-500">
+                  Result
+                </p>
+                {artifactRef ? (
+                  <a
+                    href={artifactRef}
+                    className="text-[10px] font-medium text-sky-400 hover:text-sky-300"
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    View full artifact
+                  </a>
+                ) : null}
+              </div>
               <pre className="max-h-56 overflow-auto rounded-lg bg-slate-900/50 p-2 whitespace-pre-wrap text-slate-300">
                 {toolCall.result.length > 3000
                   ? toolCall.result.slice(0, 3000) + '\n… (truncated)'
@@ -119,6 +132,12 @@ function formatJSON(text: string): string {
   } catch {
     return text;
   }
+}
+
+function extractArtifactRef(result?: string): string | null {
+  if (!result) return null;
+  const match = result.match(/\b(?:artifact|tool_output):\/\/[^\s"'<>]+/);
+  return match?.[0] ?? null;
 }
 
 export function ToolTimeline({ toolCalls }: { toolCalls: ToolCall[] }) {

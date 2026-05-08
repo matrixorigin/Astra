@@ -15,10 +15,12 @@ type AgentNode = {
   runId: string;
   parentRunId: string;
   agentType: string;
+  title: string;
   description: string;
   status: 'running' | 'completed' | 'failed' | 'cancelled';
   children: AgentNode[];
   lastActivity?: string;
+  lastSummary?: string;
   timestamp?: number;
 };
 
@@ -45,9 +47,11 @@ type AgentState = {
   runId: string;
   parentRunId: string;
   agentType: string;
+  title: string;
   description: string;
   status: 'running' | 'completed' | 'failed' | 'cancelled';
   lastActivity?: string;
+  lastSummary?: string;
   timestamp?: number;
 };
 
@@ -58,13 +62,24 @@ function buildTree(events: StreamEvent[]): AgentNode[] {
     switch (event.type) {
       case 'agent_spawned': {
         const e = event as AgentSpawnedEvent;
+        const raw = e as AgentSpawnedEvent & Record<string, unknown>;
         agents.set(e.run_id, {
           agentId: e.agent_id,
           runId: e.run_id,
           parentRunId: e.parent_run_id,
           agentType: e.agent_type,
+          title:
+            typeof raw.title === 'string' && raw.title.trim()
+              ? raw.title
+              : e.description,
           description: e.description,
           status: 'running',
+          lastSummary:
+            typeof raw.last_summary === 'string'
+              ? raw.last_summary
+              : typeof raw.lastSummary === 'string'
+                ? raw.lastSummary
+                : undefined,
           timestamp: e.timestamp,
         });
         break;
@@ -75,6 +90,7 @@ function buildTree(events: StreamEvent[]): AgentNode[] {
         for (const agent of agents.values()) {
           if (agent.agentId === e.agent_id) {
             agent.lastActivity = e.status;
+            agent.lastSummary = e.description ?? agent.lastSummary;
             break;
           }
         }
@@ -85,6 +101,7 @@ function buildTree(events: StreamEvent[]): AgentNode[] {
         for (const agent of agents.values()) {
           if (agent.agentId === e.agent_id) {
             agent.status = e.status;
+            agent.lastSummary = e.result_summary ?? e.error ?? e.reason ?? agent.lastSummary;
             break;
           }
         }
@@ -125,13 +142,18 @@ function AgentTreeNode({ node, depth = 0 }: { node: AgentNode; depth?: number })
     <div className={depth > 0 ? 'ml-4 border-l border-slate-700 pl-3' : ''}>
       <div className="flex items-center gap-2 py-1">
         <span className={`text-sm font-mono ${color}`}>{icon}</span>
-        <span className="text-sm font-medium text-white">{node.agentId}</span>
+        <span className="min-w-0 flex-1 truncate text-sm font-medium text-white" title={node.title}>
+          {node.title}
+        </span>
         <span className="text-xs text-slate-500">({node.agentType})</span>
         {node.lastActivity && (
           <span className="text-xs text-slate-400">· {node.lastActivity}</span>
         )}
       </div>
-      <p className="text-xs text-slate-400 ml-6 mb-1">{node.description}</p>
+      <p className="ml-6 mb-1 truncate text-xs text-slate-500" title={node.runId}>
+        run: {node.runId}
+      </p>
+      <p className="ml-6 mb-1 text-xs text-slate-400">{node.lastSummary ?? node.description}</p>
       {node.children.map((child) => (
         <AgentTreeNode key={child.runId} node={child} depth={depth + 1} />
       ))}
@@ -157,8 +179,7 @@ export function AgentTree({ events }: { events: StreamEvent[] }) {
     <div className="rounded-2xl border border-slate-800 bg-slate-950/70">
       <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
         <div className="flex items-center gap-2">
-          <span className="text-sm">🌲</span>
-          <h3 className="text-sm font-medium text-white">Agent Tree</h3>
+          <h3 className="text-sm font-medium text-white">Children</h3>
         </div>
         <span className="text-xs text-slate-500">
           {completedAgents}/{totalAgents} completed

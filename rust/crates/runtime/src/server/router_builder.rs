@@ -70,6 +70,14 @@ pub(super) fn build_router(state: AppState) -> Router {
             post(run_handlers::resume_run_handler),
         )
         .route(
+            "/chat/runs/{run_id}/cancel",
+            post(run_handlers::cancel_run_handler),
+        )
+        .route(
+            "/chat/runs/{run_id}/input",
+            post(run_handlers::submit_run_input_handler),
+        )
+        .route(
             "/chat/runs/{run_id}/delegate",
             post(delegation_handlers::delegate_run_handler),
         )
@@ -129,6 +137,30 @@ pub(super) fn build_router(state: AppState) -> Router {
             get(session_handlers::get_session_handler)
                 .put(session_handlers::update_session_handler)
                 .delete(session_handlers::delete_session_handler),
+        )
+        .route(
+            "/sessions/{session_id}/state",
+            get(session_handlers::get_session_state_handler),
+        )
+        .route(
+            "/sessions/{session_id}/transcript",
+            get(session_handlers::get_session_transcript_handler),
+        )
+        .route(
+            "/sessions/{session_id}/devices",
+            get(session_handlers::list_session_devices_handler),
+        )
+        .route(
+            "/sessions/{session_id}/device/revoke",
+            post(session_handlers::revoke_session_device_handler),
+        )
+        .route(
+            "/sessions/{session_id}/device/trust",
+            post(session_handlers::trust_session_device_handler),
+        )
+        .route(
+            "/sessions/{session_id}/device/events",
+            get(session_handlers::session_device_events_handler),
         )
         .route(
             "/sessions/{session_id}/close",
@@ -366,6 +398,28 @@ pub(super) fn build_router(state: AppState) -> Router {
         )
         .route("/skills/status", get(skills::get_skill_status_handler))
         .route("/skills/publish", post(skills::publish_skill_handler))
+        .route(
+            "/skills/user",
+            get(user_skill_handlers::list_user_skills_handler)
+                .post(user_skill_handlers::create_user_skill_handler),
+        )
+        .route(
+            "/skills/user/{skill_name}/versions",
+            get(user_skill_handlers::list_user_skill_versions_handler)
+                .post(user_skill_handlers::submit_user_skill_version_handler),
+        )
+        .route(
+            "/skills/user/{skill_name}/evaluations",
+            post(user_skill_handlers::record_user_skill_evaluation_handler),
+        )
+        .route(
+            "/skills/user/{skill_name}/activate",
+            post(user_skill_handlers::activate_user_skill_handler),
+        )
+        .route(
+            "/skills/user/{skill_name}/install",
+            post(user_skill_handlers::install_user_skill_handler),
+        )
         .route(
             "/skills/{skill_name}/info",
             get(skills::get_skill_info_handler),

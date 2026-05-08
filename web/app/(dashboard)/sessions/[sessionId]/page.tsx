@@ -5,6 +5,7 @@ import {
   getSessionActivity,
   getDecisionTrace,
   getMemoryIntrospection,
+  getSessionArtifacts,
 } from '@/lib/api/platform';
 import { SectionCard } from '@/components/dashboard/section-card';
 import { StatusCallout } from '@/components/dashboard/status-callout';
@@ -60,10 +61,11 @@ export default async function SessionDetailPage({
     );
   }
 
-  const [activity, decisionTrace, memoryData] = await Promise.all([
+  const [activity, decisionTrace, memoryData, artifacts] = await Promise.all([
     getSessionActivity(sessionId).catch(() => null),
     getDecisionTrace(sessionId).catch(() => null),
     getMemoryIntrospection(sessionId).catch(() => null),
+    getSessionArtifacts(sessionId).catch(() => null),
   ]);
 
   return (
@@ -214,6 +216,55 @@ export default async function SessionDetailPage({
                 );
               })}
             </div>
+          </div>
+        </SectionCard>
+      ) : null}
+
+      {artifacts && artifacts.artifacts.length > 0 ? (
+        <SectionCard
+          title="Artifacts"
+          description={`${artifacts.artifacts.length} retained artifacts for this session.`}
+        >
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-sm">
+              <thead className="text-left text-xs uppercase tracking-wide text-slate-500">
+                <tr>
+                  <th className="px-3 py-2">Kind</th>
+                  <th className="px-3 py-2">Status</th>
+                  <th className="px-3 py-2">Retention</th>
+                  <th className="px-3 py-2">Refs</th>
+                  <th className="px-3 py-2">Artifact</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800 text-slate-300">
+                {artifacts.artifacts.map((artifact) => {
+                  const refCount =
+                    (artifact.referenced_by_manifest_count ?? 0) +
+                    (artifact.referenced_by_state_items_count ?? 0) +
+                    (artifact.referenced_by_citation_count ?? 0);
+                  return (
+                    <tr key={artifact.artifact_id}>
+                      <td className="px-3 py-2 font-mono text-xs text-sky-300">
+                        {artifact.artifact_kind}
+                      </td>
+                      <td className="px-3 py-2">{artifact.status ?? 'active'}</td>
+                      <td className="px-3 py-2">
+                        {artifact.retention_until ?? artifact.retention_policy ?? 'default'}
+                      </td>
+                      <td className="px-3 py-2">{refCount}</td>
+                      <td className="px-3 py-2">
+                        <Link
+                          href={`/api/backend/sessions/${sessionId}/artifacts/${artifact.artifact_id}/download`}
+                          className="text-xs text-sky-400 hover:text-sky-300"
+                        >
+                          View full artifact
+                        </Link>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
         </SectionCard>
       ) : null}
