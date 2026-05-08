@@ -17,6 +17,7 @@ pub mod alert_dispatcher;
 pub mod boost_domain_hints;
 pub mod cache;
 pub mod cache_diagnostics;
+pub mod cache_placement;
 pub mod chat_history_openai;
 pub mod chat_turn_api_error;
 pub mod chat_turn_explain_wire;
