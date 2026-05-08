@@ -7,6 +7,7 @@ pub(crate) mod info_view;
 pub(crate) mod list_selection_view;
 pub(crate) mod session_picker_view;
 pub(crate) mod skill_popup;
+pub(crate) mod table_view;
 pub(crate) mod textarea;
 pub(crate) mod timeline_view;
 pub(crate) mod transcript_view;

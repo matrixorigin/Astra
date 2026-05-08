@@ -1,0 +1,12 @@
+---
+source: crates/astra-cli/src/tui/table_view/view.rs
+expression: "draw(&t, &n, 100, 8)"
+---
+┌ Table · 3 rows × 3 cols · row 2/3────────────────────────────────────────────────────────────────┐
+│id                       name                     email                                           │
+│1                        alice                    a@example.co                                    │
+│2                        bob                      b@example.co                                    │
+│3                        carol                    c@example.co                                    │
+│                                                                                                  │
+│  ↑ ↓ rows · ← → cols · q/Esc close                                                               │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

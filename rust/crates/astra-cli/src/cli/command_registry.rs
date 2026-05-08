@@ -379,6 +379,12 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Browse this session's turn-by-turn journal timeline",
         CommandGroup::Core,
     ),
+    CommandMeta::new(
+        "/table",
+        "Run a SQL query and render the result as a navigable table",
+        CommandGroup::Core,
+    )
+    .with_arg_hint("<sql>"),
     CommandMeta::new("/exit", "Exit the REPL", CommandGroup::Core),
     CommandMeta::new(
         "/quit",

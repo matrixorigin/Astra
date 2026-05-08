@@ -291,6 +291,48 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
+        // ── SQL table view (TUI-native, astra-unique) ───────────────
+        //
+        // Runs a SQL query against MatrixOne via the existing `mo_query`
+        // tool, parses the mysql-client ASCII output, and renders it as
+        // a navigable ratatui table. Read-only-by-default: the safety
+        // guard in mo_query blocks DROP/DELETE/TRUNCATE/ALTER without
+        // an explicit flag, and we don't expose that flag here.
+        "/table" => {
+            if args.trim().is_empty() {
+                ctx.show_info(
+                    "Usage: /table <sql>\nExample: /table SELECT * FROM users LIMIT 20".into(),
+                );
+                return SlashResult::Handled;
+            }
+            // `mo_query` shells out to the mysql client (blocking IO) —
+            // park it on a blocking thread so we don't freeze the async
+            // event loop while the query runs.
+            let sql_text = args.to_string();
+            let output = tokio::task::spawn_blocking(move || {
+                let executor = crate::edge_tools::ToolExecutor::new(
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                );
+                executor.mo_query(&serde_json::json!({ "sql": sql_text }))
+            })
+            .await
+            .unwrap_or_else(|e| format!("Error: SQL execution task failed: {e}"));
+            use crate::tui::bottom_pane::table_view::TablePanelView;
+            use crate::tui::table_view::parse;
+            match parse(&output) {
+                Some(table) => {
+                    ctx.bottom_pane
+                        .push_view(Box::new(TablePanelView::new(table)));
+                }
+                None => {
+                    // Parser rejected — show raw output to scrollback so
+                    // the user can see the error or "OK (no results)".
+                    ctx.show_info(output);
+                }
+            }
+            SlashResult::Handled
+        }
+
         // ── Session timeline (TUI-native) ───────────────────────────
         "/timeline" => {
             use crate::tui::bottom_pane::timeline_view::TimelineView;

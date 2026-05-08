@@ -1,0 +1,7 @@
+---
+source: crates/astra-cli/src/tui/table_view/view.rs
+expression: "draw(&t, &n, 80, 3)"
+---
+┌ Table · 0 rows × 0 cols──────────────────────────────────────────────────────┐
+│  no table data to show                                                       │
+└──────────────────────────────────────────────────────────────────────────────┘
