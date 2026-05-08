@@ -56,4 +56,14 @@ pub(crate) trait BottomPaneView: Send {
     fn hint_keys(&self) -> Option<String> {
         None
     }
+
+    /// Opt in to having `BottomPane`'s status-line footer (model ·
+    /// cost · token budget · permission mode · git branch · pending
+    /// approvals) rendered under this view. `false` keeps the view
+    /// occupying the entire bottom pane area — appropriate for
+    /// dismissable dialogs that should feel like pop-ups, not
+    /// embedded side panels.
+    fn reserve_status_footer(&self) -> bool {
+        false
+    }
 }

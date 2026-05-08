@@ -91,6 +91,10 @@ impl BottomPaneView for TablePanelView {
     fn hint_keys(&self) -> Option<String> {
         Some("↑↓ rows · ←→ cols · Home/End jump · q / Esc close".into())
     }
+
+    fn reserve_status_footer(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

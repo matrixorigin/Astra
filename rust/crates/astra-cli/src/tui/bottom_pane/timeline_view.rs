@@ -84,6 +84,10 @@ impl BottomPaneView for TimelineView {
     fn hint_keys(&self) -> Option<String> {
         Some("↑↓ navigate · PgUp/PgDn page · q / Esc close".into())
     }
+
+    fn reserve_status_footer(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

@@ -72,6 +72,10 @@ impl BottomPaneView for ContextPanelView {
     fn hint_keys(&self) -> Option<String> {
         Some("Enter / q / Esc close".into())
     }
+
+    fn reserve_status_footer(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

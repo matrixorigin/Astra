@@ -74,6 +74,10 @@ impl BottomPaneView for WorktreesView {
     fn hint_keys(&self) -> Option<String> {
         Some("↑↓ navigate · q / Esc close".into())
     }
+
+    fn reserve_status_footer(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

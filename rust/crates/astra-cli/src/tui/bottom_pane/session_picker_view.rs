@@ -144,6 +144,10 @@ impl BottomPaneView for SessionPickerView {
     fn hint_keys(&self) -> Option<String> {
         Some("↑↓ navigate · PgUp/PgDn page · type to filter · Enter resume · Esc close".into())
     }
+
+    fn reserve_status_footer(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

@@ -420,13 +420,17 @@ impl BottomPane {
 
     pub fn desired_height(&self, width: u16) -> u16 {
         if let Some(view) = self.active_view() {
-            let base = view.desired_height(width);
+            let mut h = view.desired_height(width);
             // Reserve a 1-row footer when the view advertises a hint.
-            return if view.hint_keys().is_some() {
-                base.saturating_add(1)
-            } else {
-                base
-            };
+            if view.hint_keys().is_some() {
+                h = h.saturating_add(1);
+            }
+            // …and another row for the status line when the view
+            // opts in (panels that want context preserved).
+            if view.reserve_status_footer() {
+                h = h.saturating_add(1);
+            }
+            return h;
         }
         let content_h = self.composer.desired_height(width);
         let queue_h = self.queue_preview_height();
@@ -744,16 +748,27 @@ impl BottomPane {
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         if let Some(view) = self.active_view() {
-            // If the view advertises a hint, split off a 1-row footer
-            // below it and render a dim hint bar there.
-            if let Some(hint) = view.hint_keys() {
-                if area.height >= 2 {
-                    let view_rect = Rect::new(area.x, area.y, area.width, area.height - 1);
-                    let hint_rect = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
-                    view.render(view_rect, buf);
-                    render_hint_bar(&hint, hint_rect, buf);
-                    return;
+            // Stack optional footers under the view area:
+            //   [view]
+            //   [hint bar]        — when hint_keys() is Some
+            //   [status line]     — when reserve_status_footer()
+            let want_status = view.reserve_status_footer();
+            let hint = view.hint_keys();
+            let footer_rows = u16::from(want_status) + u16::from(hint.is_some());
+            if footer_rows > 0 && area.height > footer_rows {
+                let view_h = area.height - footer_rows;
+                let view_rect = Rect::new(area.x, area.y, area.width, view_h);
+                view.render(view_rect, buf);
+                let mut y = area.y + view_h;
+                if let Some(h) = hint {
+                    render_hint_bar(&h, Rect::new(area.x, y, area.width, 1), buf);
+                    y += 1;
                 }
+                if want_status {
+                    self.footer
+                        .render(Rect::new(area.x, y, area.width, 1), buf);
+                }
+                return;
             }
             view.render(area, buf);
             return;
