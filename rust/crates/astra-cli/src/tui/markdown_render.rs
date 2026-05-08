@@ -47,13 +47,13 @@ pub(crate) fn render_markdown_text_with_width(input: &str, width: Option<usize>)
 
 pub(crate) fn render_markdown_text_with_width_and_cwd(
     input: &str,
-    _width: Option<usize>,
+    width: Option<usize>,
     _cwd: Option<&Path>,
 ) -> Text<'static> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     let parser = Parser::new_ext(input, options);
-    let mut writer = Writer::new();
+    let mut writer = Writer::new(width);
     writer.run(parser);
     writer.into_text()
 }
@@ -69,10 +69,14 @@ struct Writer {
     in_heading: Option<HeadingLevel>,
     in_blockquote: bool,
     link_url: Option<String>,
+    /// Total render width, used for horizontal rules and reserved for
+    /// future wrap-aware tables. `None` means "no hint — fall back to
+    /// a reasonable default".
+    width: Option<usize>,
 }
 
 impl Writer {
-    fn new() -> Self {
+    fn new(width: Option<usize>) -> Self {
         Self {
             styles: MarkdownStyles::default(),
             lines: Vec::new(),
@@ -84,6 +88,7 @@ impl Writer {
             in_heading: None,
             in_blockquote: false,
             link_url: None,
+            width,
         }
     }
 
@@ -105,7 +110,22 @@ impl Writer {
     fn flush_line(&mut self) {
         let spans = std::mem::take(&mut self.current_spans);
         if !spans.is_empty() {
-            self.lines.push(Line::from(spans));
+            // Blockquote lines get a `│ ` gutter in the quote colour
+            // so they scan like a pull-quote rather than plain green
+            // text. Body colour is already the blockquote style
+            // (pushed on start_tag).
+            if self.in_blockquote {
+                let mut with_bar: Vec<Span<'static>> =
+                    Vec::with_capacity(spans.len() + 1);
+                with_bar.push(Span::styled(
+                    "│ ",
+                    self.styles.blockquote,
+                ));
+                with_bar.extend(spans);
+                self.lines.push(Line::from(with_bar));
+            } else {
+                self.lines.push(Line::from(spans));
+            }
         } else {
             self.lines.push(Line::default());
         }
@@ -176,8 +196,12 @@ impl Writer {
                 }
                 Event::Rule => {
                     self.flush_line();
+                    // Width defaults to a reasonable 60 when the caller
+                    // doesn't know; panels that pass a real width get a
+                    // rule that spans their available area.
+                    let w = self.width.unwrap_or(60).max(8);
                     self.lines
-                        .push(Line::styled("─".repeat(40), Style::default().dark_gray()));
+                        .push(Line::styled("─".repeat(w), Style::default().dark_gray()));
                     self.flush_line();
                 }
                 _ => {}
@@ -234,7 +258,16 @@ impl Writer {
                             .push(Span::styled(marker, self.styles.ordered_marker));
                     }
                     _ => {
-                        let marker = format!("{indent}- ");
+                        // Nested unordered lists step through ●→◦→▸→·
+                        // so readers can see the depth without
+                        // counting indents.
+                        let glyph = match depth {
+                            0 => "• ",
+                            1 => "◦ ",
+                            2 => "▸ ",
+                            _ => "· ",
+                        };
+                        let marker = format!("{indent}{glyph}");
                         self.current_spans.push(Span::raw(marker));
                     }
                 }
@@ -315,5 +348,84 @@ impl Writer {
             self.lines.pop();
         }
         Text::from(self.lines)
+    }
+}
+
+#[cfg(test)]
+mod polish_tests {
+    use super::*;
+
+    fn lines(md: &str) -> Vec<String> {
+        render_markdown_text(md)
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect()
+    }
+
+    fn lines_at(md: &str, width: usize) -> Vec<String> {
+        render_markdown_text_with_width(md, Some(width))
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn blockquote_has_vertical_bar_prefix() {
+        let out = lines("> quoted text\n> second line");
+        assert!(
+            out.iter().any(|l| l.starts_with("│ ")),
+            "blockquote should start with a vertical bar; got {out:?}"
+        );
+    }
+
+    #[test]
+    fn nested_unordered_lists_use_tiered_glyphs() {
+        let md = "\
+- outer
+  - middle
+    - inner
+";
+        let out = lines(md);
+        assert!(out.iter().any(|l| l.trim_start().starts_with("• outer")));
+        assert!(out.iter().any(|l| l.trim_start().starts_with("◦ middle")));
+        assert!(out.iter().any(|l| l.trim_start().starts_with("▸ inner")));
+    }
+
+    #[test]
+    fn nested_list_depth_is_indented() {
+        let md = "\
+- outer
+  - middle
+";
+        let out = lines(md);
+        let middle = out
+            .iter()
+            .find(|l| l.contains("middle"))
+            .expect("middle line");
+        // "  " per depth level, depth=1 → 2 spaces before the glyph.
+        assert!(middle.starts_with("  ◦ "), "got: {middle:?}");
+    }
+
+    #[test]
+    fn horizontal_rule_matches_supplied_width() {
+        let out = lines_at("before\n\n---\n\nafter", 30);
+        let rule_line = out
+            .iter()
+            .find(|l| l.chars().all(|c| c == '─') && !l.is_empty())
+            .expect("rule line");
+        assert_eq!(rule_line.chars().count(), 30);
+    }
+
+    #[test]
+    fn horizontal_rule_fallbacks_to_default_when_no_width() {
+        let out = lines("a\n\n---\n\nb");
+        let rule_line = out
+            .iter()
+            .find(|l| l.chars().all(|c| c == '─') && !l.is_empty())
+            .expect("rule line");
+        // Previous implementation was hardcoded to 40 — now it's 60.
+        assert_eq!(rule_line.chars().count(), 60);
     }
 }
