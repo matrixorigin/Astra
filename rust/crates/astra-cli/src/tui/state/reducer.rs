@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use super::{Action, CellSnapshot, ScrollPosition, Severity, State, ToolStatus, TurnStatus};
+use crate::tui::slash_menu::{SlashMenu, is_open_for};
 
 /// Side-effects produced by [`reduce`]. The reducer itself stays pure;
 /// the event loop interprets these afterwards.
@@ -39,6 +40,7 @@ pub(crate) fn reduce(mut state: State, action: Action) -> (State, Vec<Effect>) {
 
         Action::UpdateDraft(draft) => {
             state.input_draft = draft;
+            sync_slash_menu(&mut state);
         }
 
         Action::CancelTurn => {
@@ -216,7 +218,50 @@ pub(crate) fn reduce(mut state: State, action: Action) -> (State, Vec<Effect>) {
         Action::TokenBudgetUpdated(budget) => {
             state.token_budget = Some(budget);
         }
+
+        // ── Slash menu ───────────────────────────────────────────
+        Action::SlashMenuMoveUp => {
+            if let Some(menu) = state.slash_menu.as_mut() {
+                menu.move_up();
+            }
+        }
+
+        Action::SlashMenuMoveDown => {
+            if let Some(menu) = state.slash_menu.as_mut() {
+                menu.move_down();
+            }
+        }
+
+        Action::SlashMenuAccept => {
+            if let Some(menu) = state.slash_menu.as_ref() {
+                if let Some(picked) = menu.selected_item() {
+                    state.input_draft = format!("{} ", picked.name);
+                    state.slash_menu = None;
+                }
+                // Empty matches: leave draft and menu untouched.
+            }
+        }
     }
 
     (state, effects)
+}
+
+/// Reconcile `state.slash_menu` with `state.input_draft`.
+///
+/// - If the draft triggers the menu (leading '/'), open/refresh it using
+///   the injected `slash_items`.
+/// - Otherwise drop any existing menu.
+fn sync_slash_menu(state: &mut State) {
+    if is_open_for(&state.input_draft) {
+        match state.slash_menu.as_mut() {
+            Some(menu) => menu.set_filter(&state.input_draft),
+            None => {
+                let mut menu = SlashMenu::new(state.slash_items.clone());
+                menu.set_filter(&state.input_draft);
+                state.slash_menu = Some(menu);
+            }
+        }
+    } else {
+        state.slash_menu = None;
+    }
 }

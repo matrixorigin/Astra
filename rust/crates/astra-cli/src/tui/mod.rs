@@ -26,6 +26,7 @@ mod markdown_stream;
 mod render;
 mod shimmer;
 mod slash_dispatch;
+mod slash_menu;
 mod state;
 mod view_stack;
 mod stream_bridge;

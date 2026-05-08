@@ -24,6 +24,132 @@ fn default_state_is_empty_and_idle() {
     assert_eq!(s.viewport_scroll, ScrollPosition::Bottom);
     assert_eq!(s.session_id, None);
     assert_eq!(s.token_budget, None);
+    assert!(s.slash_menu.is_none());
+}
+
+// ─── Slash menu integration ───────────────────────────────────────
+//
+// The reducer must keep `state.slash_menu` in sync with `state.input_draft`:
+// - draft starts with '/'         → menu is Some(..)
+// - draft stops starting with '/' → menu reverts to None
+// - draft token changes           → menu re-filters
+// - arrow-up / arrow-down         → navigate
+// - accept                        → replace draft with selected command + space
+
+use crate::tui::slash_menu::SlashItem;
+
+fn items_fixture() -> Vec<SlashItem> {
+    vec![
+        SlashItem {
+            name: "/help",
+            description: "show help",
+        },
+        SlashItem {
+            name: "/model",
+            description: "pick a model",
+        },
+        SlashItem {
+            name: "/resume",
+            description: "resume a session",
+        },
+    ]
+}
+
+#[test]
+fn update_draft_to_slash_opens_menu() {
+    let s = State {
+        slash_menu: None,
+        ..State::default()
+    };
+    // Seed known items via a helper on State.
+    let s = s.with_slash_items(items_fixture());
+
+    let (s, _) = reduce(s, Action::UpdateDraft("/".into()));
+    let menu = s.slash_menu.as_ref().expect("menu open");
+    assert_eq!(menu.len(), 3, "all items visible on '/' alone");
+    assert_eq!(menu.selected_item().map(|i| i.name), Some("/help"));
+}
+
+#[test]
+fn update_draft_to_non_slash_closes_menu() {
+    let s = State::default().with_slash_items(items_fixture());
+    let (s, _) = reduce(s, Action::UpdateDraft("/help".into()));
+    assert!(s.slash_menu.is_some());
+    let (s, _) = reduce(s, Action::UpdateDraft("hello".into()));
+    assert!(s.slash_menu.is_none());
+}
+
+#[test]
+fn update_draft_refilters_open_menu() {
+    let s = State::default().with_slash_items(items_fixture());
+    let (s, _) = reduce(s, Action::UpdateDraft("/".into()));
+    let (s, _) = reduce(s, Action::UpdateDraft("/re".into()));
+    let menu = s.slash_menu.as_ref().expect("still open");
+    let names: Vec<&str> = menu.matches().iter().map(|i| i.name).collect();
+    assert_eq!(
+        names.first().copied(),
+        Some("/resume"),
+        "filter narrows to /resume first; got {names:?}"
+    );
+}
+
+#[test]
+fn slash_menu_navigation_moves_selection() {
+    let s = State::default().with_slash_items(items_fixture());
+    let (s, _) = reduce(s, Action::UpdateDraft("/".into()));
+    let (s, _) = reduce(s, Action::SlashMenuMoveDown);
+    assert_eq!(
+        s.slash_menu
+            .as_ref()
+            .and_then(|m| m.selected_item())
+            .map(|i| i.name),
+        Some("/model")
+    );
+    let (s, _) = reduce(s, Action::SlashMenuMoveUp);
+    assert_eq!(
+        s.slash_menu
+            .as_ref()
+            .and_then(|m| m.selected_item())
+            .map(|i| i.name),
+        Some("/help")
+    );
+}
+
+#[test]
+fn slash_menu_navigation_without_open_menu_is_noop() {
+    let s = State::default();
+    let (s, effects) = reduce(s, Action::SlashMenuMoveDown);
+    assert!(s.slash_menu.is_none());
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn slash_menu_accept_replaces_draft_and_closes_menu() {
+    let s = State::default().with_slash_items(items_fixture());
+    let (s, _) = reduce(s, Action::UpdateDraft("/re".into()));
+    // /resume ranks first.
+    let (s, effects) = reduce(s, Action::SlashMenuAccept);
+
+    assert_eq!(s.input_draft, "/resume ", "draft replaced with name + space");
+    assert!(s.slash_menu.is_none(), "menu closes after accept");
+    assert!(effects.is_empty(), "accept itself performs no side-effect");
+}
+
+#[test]
+fn slash_menu_accept_with_empty_matches_is_noop() {
+    let s = State::default().with_slash_items(items_fixture());
+    let (s, _) = reduce(s, Action::UpdateDraft("/zzzz".into()));
+    let draft_before = s.input_draft.clone();
+    let (s, effects) = reduce(s, Action::SlashMenuAccept);
+    assert_eq!(s.input_draft, draft_before);
+    // Menu remains open (still represents current draft) but empty.
+    assert!(
+        s.slash_menu
+            .as_ref()
+            .map(|m| m.is_empty())
+            .unwrap_or(false)
+    );
+    assert!(effects.is_empty());
 }
 
 #[test]

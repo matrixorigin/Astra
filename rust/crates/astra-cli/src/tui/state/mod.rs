@@ -15,6 +15,8 @@ pub(crate) mod reducer;
 #[allow(unused_imports)]
 pub(crate) use reducer::{Effect, reduce};
 
+use crate::tui::slash_menu::SlashMenu;
+
 #[cfg(test)]
 mod tests;
 
@@ -29,6 +31,23 @@ pub(crate) struct State {
     pub viewport_scroll: ScrollPosition,
     pub session_id: Option<String>,
     pub token_budget: Option<TokenBudget>,
+    /// Inline slash menu, present iff the composer draft triggers it.
+    pub slash_menu: Option<SlashMenu>,
+    /// Items used to populate a fresh [`SlashMenu`] when the draft becomes
+    /// a slash command. Injected at startup from `command_registry::COMMANDS`.
+    pub slash_items: Vec<crate::tui::slash_menu::SlashItem>,
+}
+
+impl State {
+    /// Test helper: seed the known slash items. Callers can build a
+    /// populated [`State`] via `State::default().with_slash_items(...)`.
+    pub fn with_slash_items(
+        mut self,
+        items: Vec<crate::tui::slash_menu::SlashItem>,
+    ) -> Self {
+        self.slash_items = items;
+        self
+    }
 }
 
 /// Data-only view of a single chat cell. Rendering converts these into
@@ -169,6 +188,13 @@ pub(crate) enum Action {
     ModelResponding,
     TurnComplete,
     TurnError(String),
+
+    // ── Slash menu ────────────────────────────────────────────────
+    SlashMenuMoveUp,
+    SlashMenuMoveDown,
+    /// Accept current menu selection, replacing the draft with the picked
+    /// command token and closing the menu.
+    SlashMenuAccept,
 
     // ── Session / system ──────────────────────────────────────────
     SessionLoaded(String),

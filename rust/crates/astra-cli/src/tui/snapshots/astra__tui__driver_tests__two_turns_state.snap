@@ -37,4 +37,6 @@ State {
     viewport_scroll: Bottom,
     session_id: None,
     token_budget: None,
+    slash_menu: None,
+    slash_items: [],
 }
