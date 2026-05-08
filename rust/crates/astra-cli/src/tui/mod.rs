@@ -872,6 +872,13 @@ fn drain_tick(
 
 use ratatui::widgets::Widget;
 
+/// Format a compact, icon-segmented turn-summary line.
+///
+/// Shape: `  ─ ⏱ <elapsed> (ttft <ms>) │ ⚡ <tokens> ↑in ↓out │ 🛠 <n>
+///           │ 💾 <cache%> │ Σ <session-tokens> · $<session-cost> ─`
+///
+/// Segments that don't apply (no tools, no cache, no cost) are
+/// elided entirely so short turns don't carry empty markers.
 #[allow(clippy::too_many_arguments)]
 fn format_turn_summary(
     state: &crate::repl_state::ReplState,
@@ -884,74 +891,115 @@ fn format_turn_summary(
     ttft_ms: Option<u64>,
     tool_count: u32,
 ) -> String {
-    let elapsed_str = if elapsed.as_secs() >= 60 {
+    let elapsed_str = fmt_duration(elapsed);
+    let total_input = prompt_tokens + cache_read_tokens + cache_creation_tokens;
+    let total_tokens = total_input + completion_tokens;
+
+    let mut segments: Vec<String> = Vec::new();
+
+    // ⏱ time: always shown; ttft nested in parens when available.
+    let time_seg = match ttft_ms {
+        Some(ms) if ms > 0 => format!("⏱ {} (ttft {})", elapsed_str, fmt_ms(ms)),
+        _ => format!("⏱ {}", elapsed_str),
+    };
+    segments.push(time_seg);
+
+    // ⚡ tokens: total + ↑in ↓out breakdown.
+    segments.push(format!(
+        "⚡ {} ↑{} ↓{}",
+        fmt_tokens(total_tokens),
+        fmt_tokens(total_input),
+        fmt_tokens(completion_tokens)
+    ));
+
+    if tool_count > 0 {
+        segments.push(format!("🛠 {tool_count}"));
+    }
+
+    if cache_read_tokens > 0 && total_input > 0 {
+        let pct = cache_read_tokens as f64 / total_input as f64 * 100.0;
+        segments.push(format!("💾 {pct:.0}%"));
+    }
+
+    // Σ session totals: cumulative tokens + optional cost. Skip when
+    // both are zero (first-turn / free models).
+    let session_in = state.total_prompt_tokens
+        + state.total_cache_read_tokens
+        + state.total_cache_creation_tokens;
+    let session_tokens = session_in + state.total_completion_tokens;
+    let session_cost = state.total_session_cost;
+    if session_tokens > 0 || session_cost > 0.0 {
+        let mut sigma = format!("Σ {}", fmt_tokens(session_tokens));
+        if session_cost > 0.0 {
+            sigma.push_str(&format!(" · {}", crate::slash_stats::format_cost(session_cost)));
+        } else if turn_cost > 0.0 {
+            // Mid-session with only turn cost available — still useful.
+            sigma.push_str(&format!(" · {}", crate::slash_stats::format_cost(turn_cost)));
+        }
+        segments.push(sigma);
+    }
+
+    format!("  ─ {} ─", segments.join(" │ "))
+}
+
+fn fmt_duration(elapsed: std::time::Duration) -> String {
+    if elapsed.as_secs() >= 60 {
         format!("{}m{:.0}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
     } else {
         format!("{:.1}s", elapsed.as_secs_f64())
-    };
+    }
+}
 
-    let total_input = prompt_tokens + cache_read_tokens + cache_creation_tokens;
-    let total_tokens = total_input + completion_tokens;
-    let tokens_str = if total_tokens > 1000 {
-        format!("{:.1}k", total_tokens as f64 / 1000.0)
+fn fmt_ms(ms: u64) -> String {
+    if ms >= 1000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
     } else {
-        format!("{total_tokens}")
-    };
-    let prompt_short = if total_input > 1000 {
-        format!("{:.1}k", total_input as f64 / 1000.0)
+        format!("{ms}ms")
+    }
+}
+
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
     } else {
-        format!("{total_input}")
-    };
-    let completion_short = if completion_tokens > 1000 {
-        format!("{:.1}k", completion_tokens as f64 / 1000.0)
-    } else {
-        format!("{completion_tokens}")
-    };
+        n.to_string()
+    }
+}
 
-    let mut parts = Vec::new();
+#[cfg(test)]
+mod summary_fmt_tests {
+    use super::*;
 
-    if let Some(ref model) = state.model {
-        parts.push(format!("model:{model}"));
+    #[test]
+    fn tokens_short_scale() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_234), "1.2k");
+        assert_eq!(fmt_tokens(23_456), "23.5k");
+        assert_eq!(fmt_tokens(1_500_000), "1.5M");
     }
 
-    parts.push(format!(
-        "tokens:{tokens_str} (↑{prompt_short} ↓{completion_short})"
-    ));
-
-    if turn_cost > 0.0 {
-        parts.push(crate::slash_stats::format_cost(turn_cost));
+    #[test]
+    fn ms_collapses_to_seconds_over_1s() {
+        assert_eq!(fmt_ms(250), "250ms");
+        assert_eq!(fmt_ms(999), "999ms");
+        assert_eq!(fmt_ms(1_000), "1.0s");
+        assert_eq!(fmt_ms(1_757), "1.8s");
     }
 
-    parts.push(elapsed_str);
-
-    if let Some(ttft) = ttft_ms {
-        if ttft > 0 {
-            parts.push(format!("ttft:{ttft}ms"));
-        }
+    #[test]
+    fn duration_uses_mmss_over_minute() {
+        assert_eq!(
+            fmt_duration(std::time::Duration::from_millis(2_500)),
+            "2.5s"
+        );
+        assert_eq!(
+            fmt_duration(std::time::Duration::from_secs(125)),
+            "2m5s"
+        );
     }
-
-    if tool_count > 0 {
-        parts.push(format!(
-            "{} tool{}",
-            tool_count,
-            if tool_count == 1 { "" } else { "s" }
-        ));
-    }
-
-    if cache_read_tokens > 0 {
-        let cache_pct = cache_read_tokens as f64 / total_input.max(1) as f64 * 100.0;
-        parts.push(format!("cache:{cache_pct:.0}%"));
-    }
-
-    let session_cost = state.total_session_cost;
-    let mut line = format!("  ─ {} ─", parts.join(" │ "));
-    if session_cost > 0.0 && state.turn > 0 {
-        line.push_str(&format!(
-            "  session: {}",
-            crate::slash_stats::format_cost(session_cost)
-        ));
-    }
-    line
 }
 
 struct BottomPaneRenderable<'a>(&'a mut BottomPane);
