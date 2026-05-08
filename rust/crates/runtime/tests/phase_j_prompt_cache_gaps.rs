@@ -291,10 +291,20 @@ async fn adding_assistant_message_keeps_system_prefix_stable() {
     );
 }
 
-// ── J-6: long message history still emits at most one message breakpoint ────
+// ── J-6: long message history emits rolling 2 breakpoints (historical + tail)
+//
+// Earlier versions capped at ≤1 breakpoint. The rolling scheme from
+// `14410ade fix(cache): rolling 2-breakpoint for message history prefix reuse`
+// emits TWO: one on the message just before the penultimate user (the
+// "historical" anchor, stable across turns) and one on the message just
+// before the last user (the "tail" anchor). The cross-round invariant is
+// that today's tail-index equals tomorrow's historical-index, and that's
+// what makes Anthropic's prefix cache hit through the conversation
+// history. 2 markers is the CORRECT answer, and Anthropic's 4-marker
+// budget accommodates it.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
-async fn long_message_history_still_caps_message_breakpoints_at_one() {
+async fn long_message_history_emits_rolling_two_breakpoints() {
     unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
     let capture = Arc::new(Mutex::new(Vec::new()));
     let mut host = build_host_with_tools(
@@ -322,18 +332,11 @@ async fn long_message_history_still_caps_message_breakpoints_at_one() {
     let g = capture.lock().unwrap();
     let c = &g[0];
     let msg_bps: usize = c.messages.iter().map(count_cache_control).sum();
+    // 2 breakpoints is the correct rolling-scheme output; must never exceed
+    // Anthropic's 4-marker total budget (leaving room for tools + system).
     assert!(
-        msg_bps <= 1,
-        "long history must still carry ≤1 message breakpoint, got {msg_bps}"
-    );
-    // With the pipeline strategy, the cache breakpoint is placed on the
-    // second-to-last user message (or the assistant msg just before the last
-    // user message) — NOT necessarily the absolute last message. This
-    // maximizes cache hits because the prefix through the previous turn is
-    // stable. The key invariant is that exactly one message breakpoint exists.
-    assert_eq!(
-        msg_bps, 1,
-        "exactly one message breakpoint must exist in the annotated history"
+        (1..=2).contains(&msg_bps),
+        "rolling scheme emits 1 or 2 message breakpoints, got {msg_bps}"
     );
 }
 

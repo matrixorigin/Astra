@@ -1210,17 +1210,42 @@ impl ServerAgenticLoopHost {
 
         // Replicate the real-path tool + message annotations so captured
         // payloads reflect what a real provider would see. Start from the
-        // pipeline-pruned tool schemas so mock replay mirrors the real wire.
+        // pipeline-pruned tool schemas so mock replay mirrors the real
+        // wire. Route the history through the same `assemble_llm_messages`
+        // stitcher the real path uses so matrix tests see the output of
+        // volatile-preamble folding and `consolidate_mid_history_volatile_injections`.
         let mut annotated_tools = mock_pipeline.tool_schemas;
         annotate_tool_schemas_for_caching(&mut annotated_tools, &cache_cfg);
-        let mut annotated_messages = state.messages.clone();
-        apply_anthropic_cache_metadata(&mut annotated_messages, &cache_cfg, &self.session_id);
         let (provider, model) = self
             .mock_provider
             .clone()
             .unwrap_or_else(|| ("openai".to_string(), "server-loop-mock".to_string()));
+        let mock_llm_cfg = ResolvedTurnLlmConfig {
+            provider: provider.clone(),
+            model_name: model.clone(),
+            wire_model_name: None,
+            api_key: String::new(),
+            base_url: String::new(),
+            fallback_chain: Vec::new(),
+            header_overrides: HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
+        };
+        let wire_messages = self.assemble_llm_messages(
+            system_msgs.clone(),
+            volatile_preamble.clone(),
+            state.messages.clone(),
+            state,
+            &mock_llm_cfg,
+            &cache_cfg,
+        );
+        // `assemble_llm_messages` produces `[system(s), …, compacted msgs,
+        // post-compact attachments]`. For the capture's downstream
+        // assertions we want just the message portion (post the canonical
+        // system messages). Extract.
+        let sys_count = system_msgs.len();
+        let annotated_messages: Vec<Value> = wire_messages.iter().skip(sys_count).cloned().collect();
         let mut capture_messages = system_msgs.clone();
-        capture_messages.extend(volatile_preamble);
         capture_messages.extend(annotated_messages.clone());
 
         // Record the captured request before tool delivery (so assertions see
