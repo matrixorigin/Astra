@@ -87,6 +87,10 @@ impl BottomPaneView for TablePanelView {
     fn prefer_esc_to_handle_key_event(&self) -> bool {
         true
     }
+
+    fn hint_keys(&self) -> Option<String> {
+        Some("↑↓ rows · ←→ cols · Home/End jump · q / Esc close".into())
+    }
 }
 
 #[cfg(test)]

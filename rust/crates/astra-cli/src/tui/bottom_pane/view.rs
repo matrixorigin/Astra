@@ -43,4 +43,17 @@ pub(crate) trait BottomPaneView: Send {
     }
 
     fn pre_draw_tick(&mut self, _now: std::time::Instant) {}
+
+    /// Short key-binding hint rendered as a 1-row footer at the bottom
+    /// of the view. Return `None` to suppress (no hint bar reserved).
+    ///
+    /// The expected style is dim, space-separated, `·` as a separator
+    /// between groups:
+    ///
+    /// ```text
+    /// ↑↓ navigate · Enter resume · Esc close
+    /// ```
+    fn hint_keys(&self) -> Option<String> {
+        None
+    }
 }

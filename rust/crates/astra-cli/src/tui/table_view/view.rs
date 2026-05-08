@@ -44,16 +44,10 @@ pub(crate) fn render(table: &MysqlTable, nav: &TableNav, area: Rect, buf: &mut B
         return;
     }
 
-    // Split into table area + hint line at the bottom.
-    let hint_h = 1u16;
-    let table_h = inner.height.saturating_sub(hint_h);
-    let table_rect = Rect::new(inner.x, inner.y, inner.width, table_h);
-    let hint_rect = Rect::new(
-        inner.x,
-        inner.y + table_h,
-        inner.width,
-        hint_h.min(inner.height),
-    );
+    // The `/table` panel relies on BottomPane's unified hint bar
+    // for keybinding help, so we don't reserve a hint row inside
+    // the bordered box — use the full inner area for the table.
+    let table_rect = inner;
 
     let visible_cols = visible_cols(table, nav, inner.width);
 
@@ -102,13 +96,6 @@ pub(crate) fn render(table: &MysqlTable, nav: &TableNav, area: Rect, buf: &mut B
         );
 
     ratatui::widgets::StatefulWidget::render(table_widget, table_rect, buf, &mut state);
-
-    // Hint row
-    let hint = Line::from(Span::styled(
-        "  ↑ ↓ rows · ← → cols · q/Esc close",
-        Style::default().fg(Color::DarkGray),
-    ));
-    Paragraph::new(hint).render(hint_rect, buf);
 }
 
 fn title_line(table: &MysqlTable, nav: &TableNav) -> Line<'static> {

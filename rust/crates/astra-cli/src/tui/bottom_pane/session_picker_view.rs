@@ -140,6 +140,10 @@ impl BottomPaneView for SessionPickerView {
     fn prefer_esc_to_handle_key_event(&self) -> bool {
         true
     }
+
+    fn hint_keys(&self) -> Option<String> {
+        Some("↑↓ navigate · PgUp/PgDn page · type to filter · Enter resume · Esc close".into())
+    }
 }
 
 #[cfg(test)]

@@ -17,6 +17,8 @@ pub(crate) mod worktrees_view;
 #[cfg(test)]
 mod approval_integration_tests;
 #[cfg(test)]
+mod hint_tests;
+#[cfg(test)]
 mod mention_integration_tests;
 #[cfg(test)]
 mod slash_integration_tests;
@@ -418,7 +420,13 @@ impl BottomPane {
 
     pub fn desired_height(&self, width: u16) -> u16 {
         if let Some(view) = self.active_view() {
-            return view.desired_height(width);
+            let base = view.desired_height(width);
+            // Reserve a 1-row footer when the view advertises a hint.
+            return if view.hint_keys().is_some() {
+                base.saturating_add(1)
+            } else {
+                base
+            };
         }
         let content_h = self.composer.desired_height(width);
         let queue_h = self.queue_preview_height();
@@ -736,6 +744,17 @@ impl BottomPane {
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         if let Some(view) = self.active_view() {
+            // If the view advertises a hint, split off a 1-row footer
+            // below it and render a dim hint bar there.
+            if let Some(hint) = view.hint_keys() {
+                if area.height >= 2 {
+                    let view_rect = Rect::new(area.x, area.y, area.width, area.height - 1);
+                    let hint_rect = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+                    view.render(view_rect, buf);
+                    render_hint_bar(&hint, hint_rect, buf);
+                    return;
+                }
+            }
             view.render(area, buf);
             return;
         }
@@ -808,6 +827,21 @@ impl BottomPane {
 
         self.composer.cursor_position(chunks[0])
     }
+}
+
+/// Render a one-row dim hint bar at the bottom of a view area.
+fn render_hint_bar(hint: &str, area: Rect, buf: &mut Buffer) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Widget;
+    let styled = Line::from(vec![
+        Span::raw("  "),
+        Span::styled(hint.to_string(), Style::default().fg(Color::DarkGray)),
+    ]);
+    Widget::render(styled, area, buf);
 }
 
 /// Summary of what happened when the user activates a button on the

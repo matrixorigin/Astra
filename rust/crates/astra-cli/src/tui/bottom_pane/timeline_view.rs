@@ -80,6 +80,10 @@ impl BottomPaneView for TimelineView {
     fn prefer_esc_to_handle_key_event(&self) -> bool {
         true
     }
+
+    fn hint_keys(&self) -> Option<String> {
+        Some("↑↓ navigate · PgUp/PgDn page · q / Esc close".into())
+    }
 }
 
 #[cfg(test)]

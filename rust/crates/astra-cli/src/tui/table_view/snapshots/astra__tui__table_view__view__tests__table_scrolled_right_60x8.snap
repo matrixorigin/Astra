@@ -8,5 +8,5 @@ expression: "draw(&t, &n, 60, 8)"
 │bob                      b@example.co                     │
 │carol                    c@example.co                     │
 │                                                          │
-│  ↑ ↓ rows · ← → cols · q/Esc close                       │
+│                                                          │
 └──────────────────────────────────────────────────────────┘

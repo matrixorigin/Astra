@@ -68,6 +68,10 @@ impl BottomPaneView for ContextPanelView {
     fn prefer_esc_to_handle_key_event(&self) -> bool {
         true
     }
+
+    fn hint_keys(&self) -> Option<String> {
+        Some("Enter / q / Esc close".into())
+    }
 }
 
 #[cfg(test)]
