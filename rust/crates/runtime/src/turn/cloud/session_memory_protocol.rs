@@ -2,11 +2,13 @@
 //!
 //! Implements the L0/L1 layers from `docs/design/session-memory-protocol.md`.
 
+use std::fmt;
+
 use serde_json::Value;
 
 use astra_turn_types::continuity::{
-    AttentionManifest, ContinuityState, GoalState, TodoItem, TodoState, TodoStatus,
-    narrative_task_contradicts_facts, redact_sensitive,
+    narrative_task_contradicts_facts, redact_sensitive, AttentionManifest, ContinuityState,
+    GoalState, TodoItem, TodoState, TodoStatus,
 };
 
 use astra_turn_types::session_facts::SessionFacts;
@@ -16,13 +18,198 @@ use astra_turn_types::session_facts::SessionFacts;
 const ANCHOR_PREFIX: &str = "[session-anchor] ";
 const MAX_TASK_WORDS: usize = 20;
 
+/// Structured form of the L0 session anchor.
+///
+/// Represented as an enum-of-variants so that the two historical textual
+/// layouts (facts-based vs legacy L1) each carry only the fields they can
+/// actually emit. Illegal combinations — e.g. a `LegacyL1` anchor with
+/// `Plan`/`ActiveFile` progress that only `Facts` can produce — are
+/// structurally unrepresentable, and `Display` / `is_trivial` don't need
+/// any "degrade gracefully" fallback arms.
+///
+/// Adding a new inner state variant is a compile error everywhere that
+/// must react to it — closing the shape-drift hole that caused the
+/// `69657ca7` bug where `is_trivial_anchor` string-parsing only knew the
+/// legacy shape and let every facts-based turn-1 anchor through.
+///
+/// [`Display`] is the **single source of truth** for the wire format. All
+/// tests and production code render through it so any future change flows
+/// through one place and the cached prefix cannot silently drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Anchor {
+    /// Facts-based: `[session-anchor] Goal: <task>. State: <state>.[ Last error: ….][ Avoid: ….]`
+    ///
+    /// Produced by [`extract_anchor_from_facts`] when `SessionFacts` is
+    /// available. Only this variant carries `last_error` / `blocked_tools`
+    /// — those are derived from system facts and have no parallel in the
+    /// L1 narrative path.
+    Facts {
+        task: String,
+        state: FactsState,
+        last_error: Option<String>,
+        blocked_tools: Vec<String>,
+    },
+    /// Legacy L1: `[session-anchor] <task>. Currently: <current>. <done>/<total> steps.`
+    ///
+    /// Produced by [`extract_anchor`] — fresh first-turn anchor or L1
+    /// narrative derived. No constraints fields: the legacy shape pre-dates
+    /// the facts pipeline and never emitted `Last error:` / `Avoid:`.
+    LegacyL1 { task: String, state: LegacyState },
+}
+
+/// State variants that Facts-based anchors can carry.
+///
+/// Compiler-enforced: emitters of this shape cannot emit `Narrative` state,
+/// and the legacy emitter cannot emit `Plan`/`ActiveFile`. The
+/// pre-refactor `Display` had four "degrade gracefully" arms for these
+/// illegal combinations; they disappear when shape is a variant rather
+/// than a runtime flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FactsState {
+    /// Fresh session, no plan / active file. Emits `starting`.
+    ///
+    /// This is the *only* state that can make a Facts anchor trivial, and
+    /// only when no `last_error` / `blocked_tools` are attached. See
+    /// [`Anchor::is_trivial`].
+    Starting,
+    /// Facts-derived plan progress. Emits `<done>/<total> subtasks, current: <subtask>`.
+    Plan {
+        done: u32,
+        total: u32,
+        current: String,
+    },
+    /// Facts-derived last-touched file. Emits `<action> <path> (t<turn>)`.
+    ActiveFile {
+        action: String,
+        path: String,
+        turn: u32,
+    },
+}
+
+/// State variants that Legacy-L1 anchors can carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyState {
+    /// Fresh session, no L1 narrative. Emits `starting` + `0/0 steps.`.
+    Starting,
+    /// L1-narrative derived state with progress counter. Emits
+    /// `<current>` + `<done>/<total> steps.`.
+    Narrative {
+        current: String,
+        done: usize,
+        total: usize,
+    },
+}
+
+impl Anchor {
+    /// Task string shared by both variants.
+    #[must_use]
+    pub fn task(&self) -> &str {
+        match self {
+            Anchor::Facts { task, .. } | Anchor::LegacyL1 { task, .. } => task,
+        }
+    }
+
+    /// True when the anchor adds no information beyond what the LLM already
+    /// sees in the message stream and therefore should NOT be injected into
+    /// the dynamic system prompt.
+    ///
+    /// Trivial iff:
+    ///
+    /// 1. Inner state is the `Starting` variant of whichever shape is in use
+    ///    (no progress, no active file, no narrative).
+    /// 2. No `Facts::last_error` / `Facts::blocked_tools` attached.
+    /// 3. `task` is a near-verbatim truncation of `current_user_msg` — see
+    ///    [`anchor_task_matches_message`].
+    ///
+    /// Any other combination carries real signal and must be emitted.
+    #[must_use]
+    pub fn is_trivial(&self, current_user_msg: &str) -> bool {
+        match self {
+            Anchor::Facts {
+                task,
+                state,
+                last_error,
+                blocked_tools,
+            } => {
+                let state_is_trivial = match state {
+                    FactsState::Starting => true,
+                    FactsState::Plan { .. } | FactsState::ActiveFile { .. } => false,
+                };
+                state_is_trivial
+                    && last_error.is_none()
+                    && blocked_tools.is_empty()
+                    && anchor_task_matches_message(task, current_user_msg)
+            }
+            Anchor::LegacyL1 { task, state } => {
+                let state_is_trivial = match state {
+                    LegacyState::Starting => true,
+                    LegacyState::Narrative { .. } => false,
+                };
+                state_is_trivial && anchor_task_matches_message(task, current_user_msg)
+            }
+        }
+    }
+}
+
+impl fmt::Display for Anchor {
+    /// Emit the wire format. **Must stay byte-exact** with the pre-refactor
+    /// strings — the cached prefix layout depends on it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Anchor::Facts {
+                task,
+                state,
+                last_error,
+                blocked_tools,
+            } => {
+                let state_str = match state {
+                    FactsState::Starting => "starting".to_string(),
+                    FactsState::Plan {
+                        done,
+                        total,
+                        current,
+                    } => format!("{done}/{total} subtasks, current: {current}"),
+                    FactsState::ActiveFile { action, path, turn } => {
+                        format!("{action} {path} (t{turn})")
+                    }
+                };
+                write!(f, "{ANCHOR_PREFIX}Goal: {task}. State: {state_str}.")?;
+                if let Some(err) = last_error {
+                    write!(f, " Last error: {err}.")?;
+                }
+                if !blocked_tools.is_empty() {
+                    write!(f, " Avoid: {}.", blocked_tools.join(", "))?;
+                }
+            }
+            Anchor::LegacyL1 { task, state } => {
+                let (current, done, total) = match state {
+                    LegacyState::Starting => ("starting".to_string(), 0usize, 0usize),
+                    LegacyState::Narrative {
+                        current,
+                        done,
+                        total,
+                    } => (current.clone(), *done, *total),
+                };
+                write!(
+                    f,
+                    "{ANCHOR_PREFIX}{task}. Currently: {current}. {done}/{total} steps."
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Build an L0 anchor from SessionFacts (ground truth) + optional narrative.
 /// Preferred over `extract_anchor` when facts are available.
+///
+/// Returns a structured [`Anchor`]; call [`Anchor::to_string`] /
+/// `format!("{anchor}")` to render the wire form.
 pub fn extract_anchor_from_facts(
     first_user_msg: &str,
     facts: &SessionFacts,
     narrative: Option<&SessionMemory>,
-) -> String {
+) -> Anchor {
     // Task: from narrative if available (LLM good at summarizing), fallback to first user msg
     let task = narrative
         .and_then(|n| n.section("Task Specification"))
@@ -31,100 +218,62 @@ pub fn extract_anchor_from_facts(
 
     // State: from system facts (ground truth)
     let state = if let Some(plan) = &facts.plan_state {
-        let sub = plan.current_subtask.as_deref().unwrap_or("unknown");
-        format!("{}/{} subtasks, current: {sub}", plan.completed, plan.total)
-    } else if let Some(f) = facts.active_files.last() {
-        format!("{} {} (t{})", f.last_action, f.path, f.turn)
-    } else {
-        "starting".to_string()
-    };
-
-    let mut anchor = format!("{ANCHOR_PREFIX}Goal: {task}. State: {state}.");
-
-    // Constraints from system facts
-    if let Some(err) = &facts.error_state.last_error {
-        let short = truncate_words(err, 10);
-        anchor.push_str(&format!(" Last error: {short}."));
-    }
-    if !facts.blocked_tools.is_empty() {
-        anchor.push_str(&format!(" Avoid: {}.", facts.blocked_tools.join(", ")));
-    }
-
-    anchor
-}
-
-/// Build an L0 anchor line from the first user message or from a parsed L1.
-/// Legacy path — used when SessionFacts is not available.
-pub fn extract_anchor(first_user_msg: &str, l1: Option<&SessionMemory>) -> String {
-    if let Some(l1) = l1 {
-        let task = first_sentence(l1.section("Task Specification").unwrap_or(""));
-        let current = first_sentence(l1.section("Current State").unwrap_or(""));
-        let (done, total) = count_progress_markers(l1.section("Progress").unwrap_or(""));
-        format!("{ANCHOR_PREFIX}{task}. Currently: {current}. {done}/{total} steps.")
-    } else {
-        let task = truncate_words(first_user_msg, MAX_TASK_WORDS);
-        format!("{ANCHOR_PREFIX}{task}. Currently: starting. 0/0 steps.")
-    }
-}
-
-/// True when the anchor adds no information beyond what the LLM already
-/// sees in the message stream and therefore should NOT be injected into
-/// the dynamic system prompt.
-///
-/// The anchor is "trivial" when it is in the bootstrap shape produced on
-/// turn 1 with no facts or progress yet:
-///
-/// - Legacy `extract_anchor`: `[session-anchor] <task>. Currently: starting. 0/0 steps.`
-/// - Facts-based `extract_anchor_from_facts` with zero progress:
-///   `[session-anchor] Goal: <task>. State: starting.`
-///
-/// AND the `<task>` portion is a near-verbatim truncation of the current
-/// user message. On turn 1 of a plain "hi"-type exchange this is almost
-/// always the case, and injecting it just duplicates the user turn.
-///
-/// Non-trivial cases (return `false`):
-/// - any facts- or L1-derived state beyond `"starting"`
-/// - progress counter ≥ 1/…
-/// - a narrative task spec (L1 "Task Specification") distinct from the
-///   first user message
-/// - anchor task differs substantively from the current user message —
-///   i.e. the user has drifted, so the anchor is re-anchoring value.
-///
-/// Bug history: this function recognized only the legacy shape for a
-/// while after `extract_anchor_from_facts` landed. The new path emits
-/// `"Goal: <task>. State: starting."` instead of `"Currently: …"`, so
-/// every no-facts turn-1 anchor slipped through the triviality check
-/// and bloated the volatile lane with a near-duplicate of the user
-/// message. Observed in session `69657ca7`.
-#[must_use]
-pub fn is_trivial_anchor(anchor: &str, current_user_msg: &str) -> bool {
-    let trimmed = anchor.trim();
-    let stripped = match trimmed.strip_prefix("[session-anchor]") {
-        Some(rest) => rest.trim_start(),
-        None => return false,
-    };
-
-    // Facts-based shape: `Goal: <task>. State: starting.` (possibly with
-    // extra constraints appended — those would already be non-trivial).
-    if let Some(rest) = stripped.strip_prefix("Goal: ") {
-        let Some((task, tail)) = rest.split_once(". State: ") else {
-            return false;
-        };
-        // Trivial iff state is exactly "starting." (no extra constraints).
-        if tail.trim_end() != "starting." {
-            return false;
+        FactsState::Plan {
+            done: plan.completed,
+            total: plan.total,
+            current: plan
+                .current_subtask
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
         }
-        return anchor_task_matches_message(task, current_user_msg);
-    }
-
-    // Legacy shape: `<task>. Currently: starting. 0/0 steps.`
-    let Some((task, tail)) = stripped.split_once(". Currently: ") else {
-        return false;
+    } else if let Some(f) = facts.active_files.last() {
+        FactsState::ActiveFile {
+            action: f.last_action.clone(),
+            path: f.path.clone(),
+            turn: f.turn,
+        }
+    } else {
+        FactsState::Starting
     };
-    if !tail.trim_end().ends_with("starting. 0/0 steps.") {
-        return false;
+
+    let last_error = facts
+        .error_state
+        .last_error
+        .as_ref()
+        .map(|err| truncate_words(err, 10));
+    let blocked_tools = facts.blocked_tools.clone();
+
+    Anchor::Facts {
+        task,
+        state,
+        last_error,
+        blocked_tools,
     }
-    anchor_task_matches_message(task, current_user_msg)
+}
+
+/// Build an L0 anchor from the first user message or from a parsed L1.
+/// Legacy path — used when SessionFacts is not available.
+///
+/// Returns a structured [`Anchor`] in the legacy shape.
+pub fn extract_anchor(first_user_msg: &str, l1: Option<&SessionMemory>) -> Anchor {
+    if let Some(l1) = l1 {
+        let task = first_sentence(l1.section("Task Specification").unwrap_or("")).to_string();
+        let current = first_sentence(l1.section("Current State").unwrap_or("")).to_string();
+        let (done, total) = count_progress_markers(l1.section("Progress").unwrap_or(""));
+        Anchor::LegacyL1 {
+            task,
+            state: LegacyState::Narrative {
+                current,
+                done,
+                total,
+            },
+        }
+    } else {
+        Anchor::LegacyL1 {
+            task: truncate_words(first_user_msg, MAX_TASK_WORDS),
+            state: LegacyState::Starting,
+        }
+    }
 }
 
 fn anchor_task_matches_message(anchor_task: &str, current_user_msg: &str) -> bool {
@@ -949,20 +1098,40 @@ mod tests {
     #[test]
     fn anchor_from_first_user_message() {
         let anchor = extract_anchor("Add OAuth support to the API with JWT tokens", None);
-        assert!(anchor.starts_with("[session-anchor] "));
-        assert!(anchor.contains("Add OAuth support"));
-        assert!(anchor.contains("Currently: starting"));
-        assert!(anchor.contains("0/0 steps"));
+        let rendered = anchor.to_string();
+        assert!(rendered.starts_with("[session-anchor] "));
+        assert!(rendered.contains("Add OAuth support"));
+        assert!(rendered.contains("Currently: starting"));
+        assert!(rendered.contains("0/0 steps"));
+        assert!(matches!(
+            anchor,
+            Anchor::LegacyL1 {
+                state: LegacyState::Starting,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn anchor_from_l1() {
         let l1 = SessionMemory::parse(sample_l1()).unwrap();
         let anchor = extract_anchor("ignored", Some(&l1));
-        assert!(anchor.starts_with("[session-anchor] "));
-        assert!(anchor.contains("OAuth"));
-        assert!(anchor.contains("token refresh"));
-        assert!(anchor.contains("3/6 steps"));
+        let rendered = anchor.to_string();
+        assert!(rendered.starts_with("[session-anchor] "));
+        assert!(rendered.contains("OAuth"));
+        assert!(rendered.contains("token refresh"));
+        assert!(rendered.contains("3/6 steps"));
+        assert!(matches!(
+            anchor,
+            Anchor::LegacyL1 {
+                state: LegacyState::Narrative {
+                    done: 3,
+                    total: 6,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -972,14 +1141,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let anchor = extract_anchor(&long_msg, None);
-        let words: Vec<&str> = anchor
-            .strip_prefix("[session-anchor] ")
-            .unwrap()
-            .split(". Currently:")
-            .next()
-            .unwrap()
-            .split_whitespace()
-            .collect();
+        let words: Vec<&str> = anchor.task().split_whitespace().collect();
         assert!(words.len() <= MAX_TASK_WORDS);
     }
 
@@ -996,15 +1158,16 @@ mod tests {
             current_subtask: Some("token refresh".to_string()),
         });
         let anchor = extract_anchor_from_facts("Add OAuth support", &facts, None);
+        let rendered = anchor.to_string();
         assert!(
-            anchor.starts_with("[session-anchor] Goal:"),
-            "anchor: {anchor}"
+            rendered.starts_with("[session-anchor] Goal:"),
+            "anchor: {rendered}"
         );
-        assert!(anchor.contains("OAuth"), "anchor: {anchor}");
-        assert!(anchor.contains("3/5 subtasks"), "anchor: {anchor}");
+        assert!(rendered.contains("OAuth"), "anchor: {rendered}");
+        assert!(rendered.contains("3/5 subtasks"), "anchor: {rendered}");
         assert!(
-            anchor.contains("current: token refresh"),
-            "anchor: {anchor}"
+            rendered.contains("current: token refresh"),
+            "anchor: {rendered}"
         );
     }
 
@@ -1018,7 +1181,7 @@ mod tests {
             turn: 7,
         });
         let anchor = extract_anchor_from_facts("Fix auth bug", &facts, None);
-        assert!(anchor.contains("State: write src/auth.rs (t7)"));
+        assert!(anchor.to_string().contains("State: write src/auth.rs (t7)"));
     }
 
     #[test]
@@ -1026,7 +1189,14 @@ mod tests {
         use astra_turn_types::session_facts::SessionFacts;
         let facts = SessionFacts::default();
         let anchor = extract_anchor_from_facts("Build something", &facts, None);
-        assert!(anchor.contains("State: starting"));
+        assert!(anchor.to_string().contains("State: starting"));
+        assert!(matches!(
+            anchor,
+            Anchor::Facts {
+                state: FactsState::Starting,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1039,8 +1209,9 @@ mod tests {
             last_error_turn: Some(5),
         };
         let anchor = extract_anchor_from_facts("Fix DB", &facts, None);
-        assert!(anchor.contains("Last error:"), "anchor: {anchor}");
-        assert!(anchor.contains("sqlx"), "anchor: {anchor}");
+        let rendered = anchor.to_string();
+        assert!(rendered.contains("Last error:"), "anchor: {rendered}");
+        assert!(rendered.contains("sqlx"), "anchor: {rendered}");
     }
 
     #[test]
@@ -1049,7 +1220,7 @@ mod tests {
         let mut facts = SessionFacts::default();
         facts.blocked_tools = vec!["web_fetch".to_string(), "rm".to_string()];
         let anchor = extract_anchor_from_facts("Do stuff", &facts, None);
-        assert!(anchor.contains("Avoid: web_fetch, rm"));
+        assert!(anchor.to_string().contains("Avoid: web_fetch, rm"));
     }
 
     #[test]
@@ -1058,9 +1229,10 @@ mod tests {
         let facts = SessionFacts::default();
         let l1 = SessionMemory::parse(sample_l1()).unwrap();
         let anchor = extract_anchor_from_facts("raw user msg ignored", &facts, Some(&l1));
+        let rendered = anchor.to_string();
         // Should use Task Specification from narrative, not the raw user msg
-        assert!(anchor.contains("OAuth"));
-        assert!(!anchor.contains("raw user msg"));
+        assert!(rendered.contains("OAuth"));
+        assert!(!rendered.contains("raw user msg"));
     }
 
     // ── Facts-First Injection Tests ────────────────────────────────────
@@ -1343,11 +1515,9 @@ mod tests {
     fn validate_empty_required_section() {
         let l1 = SessionMemory::parse(sample_l1_empty_required()).unwrap();
         let errors = l1.validate().unwrap_err();
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("empty section: Task Specification"))
-        );
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("empty section: Task Specification")));
     }
 
     // ── L1 Size Governance Tests ────────────────────────────────────────
@@ -1565,8 +1735,9 @@ mod tests {
     #[test]
     fn anchor_from_empty_message() {
         let anchor = extract_anchor("", None);
-        assert!(anchor.starts_with("[session-anchor] "));
-        assert!(anchor.contains("Currently: starting"));
+        let rendered = anchor.to_string();
+        assert!(rendered.starts_with("[session-anchor] "));
+        assert!(rendered.contains("Currently: starting"));
     }
 
     #[test]
@@ -1614,18 +1785,16 @@ mod tests {
             "should be valid: {:?}",
             l1.validate()
         );
-        assert!(
-            l1.section("Task Specification")
-                .unwrap()
-                .contains("rate limiter")
-        );
+        assert!(l1
+            .section("Task Specification")
+            .unwrap()
+            .contains("rate limiter"));
         assert!(l1.section("Key Files").unwrap().contains("src/main.rs"));
         assert!(l1.section("Decisions").unwrap().contains("read_file"));
-        assert!(
-            l1.section("User Messages")
-                .unwrap()
-                .contains("Redis connection")
-        );
+        assert!(l1
+            .section("User Messages")
+            .unwrap()
+            .contains("Redis connection"));
         assert!(l1.section("Context").unwrap().contains("50K"));
     }
 
@@ -1897,8 +2066,8 @@ mod tests {
     mod persist_l1_tests {
         use super::*;
         use crate::turn::cloud::memoria_compact::{MemoriaClient, MemoriaMemory};
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
         /// Mock that tracks calls and can fail N times before succeeding.
         struct MockMemoria {
@@ -2046,15 +2215,21 @@ mod tests {
         }
     }
 
-    // ── is_trivial_anchor ────────────────────────────────────────────────
+    // ── Anchor::is_trivial ──────────────────────────────────────────────
+    //
+    // Triviality is now a structural property of the `Anchor` enum rather
+    // than a string-parsed check on the rendered form. Each test either
+    // constructs an `Anchor` through the public constructors
+    // (`extract_anchor` / `extract_anchor_from_facts`) or — for explicit
+    // shape coverage — via a small `mk_*` helper below.
 
     #[test]
     fn trivial_anchor_turn_one_hi() {
-        // User: "hi" → anchor "[session-anchor] hi. Currently: starting. 0/0 steps."
-        // On turn 1 the current user message is the same — trivial.
+        // User: "hi" on turn 1 with no facts → legacy Starting shape whose
+        // task is a truncation of the current message → trivial.
         let anchor = extract_anchor("hi", None);
         assert!(
-            is_trivial_anchor(&anchor, "hi"),
+            anchor.is_trivial("hi"),
             "bootstrap anchor echoing the user msg must be flagged trivial, got: {anchor}"
         );
     }
@@ -2062,16 +2237,16 @@ mod tests {
     #[test]
     fn trivial_anchor_turn_one_short_task() {
         let anchor = extract_anchor("refactor the prompt builder", None);
-        assert!(is_trivial_anchor(&anchor, "refactor the prompt builder"));
+        assert!(anchor.is_trivial("refactor the prompt builder"));
     }
 
     #[test]
     fn non_trivial_anchor_when_l1_present() {
-        // L1 narrative → anchor carries real state, not trivial.
+        // L1 narrative → anchor state is Narrative, not Starting.
         let l1 = SessionMemory::parse(sample_l1()).expect("sample_l1 parses");
         let anchor = extract_anchor("fix OAuth", Some(&l1));
         assert!(
-            !is_trivial_anchor(&anchor, "fix OAuth"),
+            !anchor.is_trivial("fix OAuth"),
             "anchor enriched by L1 must not be flagged trivial, got: {anchor}"
         );
     }
@@ -2082,29 +2257,29 @@ mod tests {
         // anchored task — anchor restores "what we were actually doing".
         let anchor = extract_anchor("refactor the prompt builder", None);
         assert!(
-            !is_trivial_anchor(&anchor, "wait, let's talk about logging"),
+            !anchor.is_trivial("wait, let's talk about logging"),
             "when user drifts, anchor should be kept, got: {anchor}"
         );
     }
 
     #[test]
     fn non_trivial_anchor_when_progress_nonzero() {
-        // Manually construct an anchor with non-zero progress.
-        let anchor = "[session-anchor] fix bug. Currently: patching module. 2/3 steps.";
-        assert!(!is_trivial_anchor(anchor, "fix bug"));
-    }
-
-    #[test]
-    fn non_trivial_anchor_when_prefix_missing() {
-        // Guard: arbitrary string without the prefix should not be
-        // misclassified.
-        assert!(!is_trivial_anchor("something else", "something else"));
+        // Narrative state with real progress is structurally non-trivial.
+        let anchor = Anchor::LegacyL1 {
+            task: "fix bug".into(),
+            state: LegacyState::Narrative {
+                current: "patching module".into(),
+                done: 2,
+                total: 3,
+            },
+        };
+        assert!(!anchor.is_trivial("fix bug"));
     }
 
     #[test]
     fn trivial_anchor_case_insensitive_match() {
         let anchor = extract_anchor("Fix Timeout Bug", None);
-        assert!(is_trivial_anchor(&anchor, "fix timeout bug"));
+        assert!(anchor.is_trivial("fix timeout bug"));
     }
 
     #[test]
@@ -2115,7 +2290,7 @@ mod tests {
         let long = "refactor the prompt builder to use the volatile lane and drop the ancient typed field which has been unused for months";
         let anchor = extract_anchor(long, None);
         assert!(
-            is_trivial_anchor(&anchor, long),
+            anchor.is_trivial(long),
             "same long message echoes anchor prefix → trivial, got: {anchor}"
         );
     }
@@ -2125,58 +2300,87 @@ mod tests {
         // Defensive: empty current message → treat as non-trivial (keep
         // anchor so the LLM still sees context).
         let anchor = extract_anchor("refactor prompt builder", None);
-        assert!(!is_trivial_anchor(&anchor, ""));
+        assert!(!anchor.is_trivial(""));
     }
 
-    // ── is_trivial_anchor for facts-based shape ─────────────────────────────
-    // `extract_anchor_from_facts` emits `Goal: <task>. State: starting.` —
-    // *not* the legacy `<task>. Currently: starting. 0/0 steps.` shape. For
-    // a while `is_trivial_anchor` only recognized the legacy form, so every
-    // facts-based turn-1 anchor slipped through and bloated the volatile
-    // lane with a near-duplicate of the user message (observed in session
-    // `69657ca7`).
+    // ── Facts-shape triviality ──────────────────────────────────────────
+    // Structural regression coverage for the `69657ca7` bug: before the
+    // `Anchor` refactor, `is_trivial_anchor` parsed rendered strings and
+    // recognized only the legacy shape. The facts-based turn-1 anchor
+    // slipped through and bloated the volatile lane. The new enum-of-
+    // variants `Anchor` carries per-shape state, and `is_trivial` matches
+    // on each shape's own `Starting` sentinel — so the bug is structurally
+    // impossible to reintroduce.
 
     #[test]
     fn trivial_anchor_facts_shape_turn_one_hi() {
-        let anchor = "[session-anchor] Goal: hi. State: starting.";
+        use astra_turn_types::session_facts::SessionFacts;
+        let anchor = extract_anchor_from_facts("hi", &SessionFacts::default(), None);
+        assert_eq!(
+            anchor.to_string(),
+            "[session-anchor] Goal: hi. State: starting."
+        );
         assert!(
-            is_trivial_anchor(anchor, "hi"),
+            anchor.is_trivial("hi"),
             "facts-shape bootstrap anchor must be flagged trivial, got: {anchor}"
         );
     }
 
     #[test]
     fn trivial_anchor_facts_shape_short_task() {
-        let anchor = "[session-anchor] Goal: refactor the prompt builder. State: starting.";
-        assert!(is_trivial_anchor(anchor, "refactor the prompt builder"));
+        use astra_turn_types::session_facts::SessionFacts;
+        let anchor = extract_anchor_from_facts(
+            "refactor the prompt builder",
+            &SessionFacts::default(),
+            None,
+        );
+        assert!(anchor.is_trivial("refactor the prompt builder"));
     }
 
     #[test]
     fn non_trivial_anchor_facts_shape_when_state_not_starting() {
-        let anchor = "[session-anchor] Goal: fix bug. State: 2/5 subtasks, current: patch.";
+        use astra_turn_types::session_facts::{PlanFact, SessionFacts};
+        let mut facts = SessionFacts::default();
+        facts.plan_state = Some(PlanFact {
+            goal: "Fix bug".into(),
+            completed: 2,
+            total: 5,
+            current_subtask: Some("patch".into()),
+        });
+        let anchor = extract_anchor_from_facts("fix bug", &facts, None);
         assert!(
-            !is_trivial_anchor(anchor, "fix bug"),
+            !anchor.is_trivial("fix bug"),
             "facts-based anchor with real state must NOT be trivial, got: {anchor}"
         );
     }
 
     #[test]
     fn non_trivial_anchor_facts_shape_when_constraints_appended() {
-        // `extract_anchor_from_facts` appends `" Last error: …"` and
-        // `" Avoid: …"` after the `State:` clause. Those carry real signal
-        // and must not be flagged trivial even when base state is starting.
-        let anchor = "[session-anchor] Goal: hi. State: starting. Last error: timeout.";
+        // last_error attached → non-trivial even with Starting state.
+        use astra_turn_types::session_facts::{ErrorFact, SessionFacts};
+        let mut facts = SessionFacts::default();
+        facts.error_state = ErrorFact {
+            total_errors: 1,
+            last_error: Some("timeout".into()),
+            last_error_turn: Some(1),
+        };
+        let anchor = extract_anchor_from_facts("hi", &facts, None);
         assert!(
-            !is_trivial_anchor(anchor, "hi"),
+            !anchor.is_trivial("hi"),
             "anchor carrying Last error must NOT be trivial, got: {anchor}"
         );
     }
 
     #[test]
     fn non_trivial_anchor_facts_shape_when_user_drifted() {
-        let anchor = "[session-anchor] Goal: refactor the prompt builder. State: starting.";
+        use astra_turn_types::session_facts::SessionFacts;
+        let anchor = extract_anchor_from_facts(
+            "refactor the prompt builder",
+            &SessionFacts::default(),
+            None,
+        );
         assert!(
-            !is_trivial_anchor(anchor, "wait, let's talk about logging"),
+            !anchor.is_trivial("wait, let's talk about logging"),
             "facts-shape anchor must re-anchor after user drift, got: {anchor}"
         );
     }

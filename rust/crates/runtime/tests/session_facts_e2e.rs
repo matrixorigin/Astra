@@ -256,7 +256,7 @@ async fn e2e_full_session_lifecycle() {
 
     // ── Phase 3: Generate anchor from facts ──
     let narrative = SessionMemory::parse(&narrative_text).unwrap();
-    let anchor = extract_anchor_from_facts("Add OAuth support", &facts, Some(&narrative));
+    let anchor = extract_anchor_from_facts("Add OAuth support", &facts, Some(&narrative)).to_string();
     assert!(anchor.contains("Goal:"), "anchor: {anchor}");
     assert!(anchor.contains("7/10 subtasks"), "anchor: {anchor}");
     assert!(anchor.contains("token refresh"), "anchor: {anchor}");

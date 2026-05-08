@@ -429,7 +429,7 @@ async fn anchor_from_retrieved_l1() {
     let retrieved = results.first().expect("L1 not found");
 
     let l1 = SessionMemory::parse(&retrieved.content).expect("should parse");
-    let anchor = extract_anchor("ignored", Some(&l1));
+    let anchor = extract_anchor("ignored", Some(&l1)).to_string();
 
     assert!(anchor.starts_with("[session-anchor] "));
     assert!(anchor.contains(&marker));
@@ -773,7 +773,7 @@ async fn tool_heavy_session_preserves_task() {
 
 #[test]
 fn anchor_from_first_user_message() {
-    let anchor = extract_anchor("Build a distributed rate limiter using Redis", None);
+    let anchor = extract_anchor("Build a distributed rate limiter using Redis", None).to_string();
     assert!(anchor.contains("[session-anchor]"));
     assert!(anchor.contains("rate limiter"));
     assert!(anchor.contains("starting"));
@@ -795,7 +795,7 @@ fn anchor_from_l1_overrides_raw_message() {
          # Context\nT2"
     );
     let l1 = SessionMemory::parse(&l1_text).unwrap();
-    let anchor = extract_anchor("original message ignored", Some(&l1));
+    let anchor = extract_anchor("original message ignored", Some(&l1)).to_string();
     assert!(anchor.contains("rate limiter"));
     assert!(anchor.contains("Redis integration done"));
     assert!(anchor.contains("1/3")); // 1 done out of 3 total
@@ -829,7 +829,7 @@ fn anchor_token_cost_under_budget() {
                      window algorithm supporting 10K requests per second per tenant \
                      with automatic failover to local token bucket when Redis cluster \
                      is unreachable and comprehensive metrics export to Prometheus";
-    let anchor = extract_anchor(long_task, None);
+    let anchor = extract_anchor(long_task, None).to_string();
     let estimated_tokens = anchor.len() / 4;
     assert!(
         estimated_tokens <= 60,
@@ -874,7 +874,7 @@ fn anchor_does_not_break_cached_prefix() {
     // non-cache-controlled block.
     //
     // This test just confirms the anchor doesn't accidentally end up in stable sections.
-    let anchor = extract_anchor("Build rate limiter", None);
+    let anchor = extract_anchor("Build rate limiter", None).to_string();
     assert!(anchor.contains("[session-anchor]"));
     // Anchor should NOT contain any cache scope markers
     assert!(!anchor.contains("cache_control"));

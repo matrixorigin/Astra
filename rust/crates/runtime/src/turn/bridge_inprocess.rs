@@ -1356,7 +1356,7 @@ impl InProcessChatTurnBridge {
             let session_anchor = {
                 use crate::turn::cloud::session_memory_protocol::{
                     extract_anchor, extract_anchor_from_facts, extract_message_text,
-                    is_trivial_anchor, build_l1_from_messages, SessionMemory,
+                    build_l1_from_messages, SessionMemory,
                 };
                 let first_user_text = messages
                     .iter()
@@ -1397,7 +1397,7 @@ impl InProcessChatTurnBridge {
                         };
                         extract_anchor(&first_user_text, l1.as_ref())
                     };
-                    if is_trivial_anchor(&anchor, user_content_for_signal) {
+                    if anchor.is_trivial(user_content_for_signal) {
                         String::new()
                     } else {
                         format!("\n\n{anchor}")
@@ -5323,7 +5323,7 @@ mod tests {
             "Should extract text from content blocks"
         );
         let anchor = extract_anchor(&first_user_text.unwrap(), None);
-        assert!(anchor.contains("distributed cache"));
+        assert!(anchor.to_string().contains("distributed cache"));
     }
 
     #[test]
@@ -5719,7 +5719,7 @@ mod tests {
         };
 
         // Without L1 — shows "starting"
-        let anchor_no_l1 = extract_anchor("Build rate limiter", None);
+        let anchor_no_l1 = extract_anchor("Build rate limiter", None).to_string();
         assert!(anchor_no_l1.contains("starting"));
         assert!(anchor_no_l1.contains("0/0"));
 
@@ -5738,7 +5738,7 @@ mod tests {
              # Context\nT5"
         );
         let l1 = SessionMemory::parse(&l1_text).unwrap();
-        let anchor_with_l1 = extract_anchor("Build rate limiter", Some(&l1));
+        let anchor_with_l1 = extract_anchor("Build rate limiter", Some(&l1)).to_string();
 
         assert!(
             !anchor_with_l1.contains("starting"),
@@ -5878,7 +5878,7 @@ mod tests {
 
         let l1_text = build_l1_from_messages(&messages, turn_count, 0);
         let l1 = SessionMemory::parse(&l1_text).unwrap();
-        let anchor = extract_anchor("Build a rate limiter using Redis", Some(&l1));
+        let anchor = extract_anchor("Build a rate limiter using Redis", Some(&l1)).to_string();
 
         assert!(
             !anchor.contains("starting"),
