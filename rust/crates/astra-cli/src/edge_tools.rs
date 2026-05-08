@@ -965,10 +965,11 @@ impl ToolExecutor {
             })
             .clone();
 
-        match snapshot {
-            Some(snap) => astra_turn_core::introspect::render_introspect(&snap, detail),
-            None => "No introspection data available yet (first turn).".to_string(),
-        }
+        // Fall back to a zero-state snapshot on the first turn (before the
+        // host has had a chance to populate one) so the model always gets
+        // structured output instead of an opaque "first turn" string.
+        let snap = snapshot.unwrap_or_default();
+        astra_turn_core::introspect::render_introspect(&snap, detail)
     }
 
     pub fn update_introspect_snapshot(
@@ -2012,6 +2013,57 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         (dir, executor)
+    }
+
+    // ── introspect tool: first-turn behavior (regression guard) ────────
+    //
+    // Regression: `handle_introspect` used to return the string
+    // "No introspection data available yet (first turn)." whenever the
+    // snapshot had not been populated. In the CLI edge path the snapshot
+    // is only updated *after* `turn_result?` unwraps, so the model calling
+    // `introspect` during turn 1 (or mid-turn in any later turn, before
+    // that write lands) always saw the opaque string. The fix: on `None`
+    // render a zero-state snapshot so output is always structured.
+    #[test]
+    fn introspect_returns_structured_output_on_first_turn() {
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({"detail": "summary"}));
+        assert!(
+            out.contains("Session Health"),
+            "expected structured output, got: {out}"
+        );
+        assert!(
+            !out.contains("first turn"),
+            "must not return opaque first-turn placeholder, got: {out}"
+        );
+    }
+
+    #[test]
+    fn introspect_minimal_first_turn_has_metrics_not_placeholder() {
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({"detail": "minimal"}));
+        assert!(
+            out.contains("pressure=") && out.contains("turns="),
+            "expected minimal metrics line, got: {out}"
+        );
+        assert!(!out.contains("first turn"));
+    }
+
+    #[test]
+    fn introspect_reflects_updated_snapshot() {
+        let executor = test_executor();
+        // Populate a non-trivial snapshot.
+        executor.update_introspect_snapshot(astra_turn_core::introspect::IntrospectSnapshot {
+            turns_completed: 5,
+            turns_remaining: 10,
+            total_input_tokens: 12345,
+            total_output_tokens: 678,
+            compaction_tier: "None".to_string(),
+            ..Default::default()
+        });
+        let out = executor.handle_introspect(&serde_json::json!({"detail": "summary"}));
+        assert!(out.contains("Turns: 5/15"), "got: {out}");
+        assert!(out.contains("12345in"), "got: {out}");
     }
 
     #[test]
