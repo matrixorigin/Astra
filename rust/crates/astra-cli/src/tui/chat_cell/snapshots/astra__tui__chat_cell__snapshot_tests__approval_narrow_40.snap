@@ -1,0 +1,9 @@
+---
+source: crates/astra-cli/src/tui/chat_cell/snapshot_tests.rs
+expression: "render_cell(&cell, 40, 6)"
+---
+▌ ⏸ bash wants a command
+    cargo test
+    Reason: runs tests
+    [y] allow  [n] deny  [a] always  [s]
+skip  ·  Tab next

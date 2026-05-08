@@ -40,4 +40,5 @@ State {
     slash_menu: None,
     slash_items: [],
     mention_menu: None,
+    pending_approvals: [],
 }

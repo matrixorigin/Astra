@@ -1,0 +1,5 @@
+---
+source: crates/astra-cli/src/tui/status_line/snapshot_tests.rs
+expression: "render_ctx(&ctx, 80)"
+---
+  / @ $ · Ctrl+O transcript · ⚡ auto · ⏸ 1 pending                  sonnet-4.6

@@ -1,0 +1,6 @@
+---
+source: crates/astra-cli/src/tui/chat_cell/snapshot_tests.rs
+expression: "render_cell(&cell, 80, 3)"
+---
+▌ ⏸ read wants to run
+    [y] allow  [n] deny  [a] always  [s] skip  ·  Tab next

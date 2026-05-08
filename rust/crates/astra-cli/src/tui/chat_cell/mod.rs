@@ -1,4 +1,5 @@
 pub(crate) mod agent_message_cell;
+pub(crate) mod approval_cell;
 pub(crate) mod assistant_cell;
 pub(crate) mod system_cell;
 pub(crate) mod thinking_cell;

@@ -214,3 +214,56 @@ fn empty_context_has_empty_right_side() {
     let s = StatusLine::from_context(&ctx());
     assert!(s.right.is_empty(), "no optional fields → no right content");
 }
+
+// ─── Approval counter ─────────────────────────────────────────────
+
+#[test]
+fn zero_pending_renders_no_approval_chip() {
+    let s = StatusLine::from_context(&ctx());
+    assert!(!s.plain().contains("pending"));
+}
+
+#[test]
+fn one_pending_renders_singular_chip() {
+    let c = StatusContext {
+        pending_approvals: 1,
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        plain.contains("⏸ 1 pending"),
+        "singular chip expected; got {plain:?}"
+    );
+}
+
+#[test]
+fn multi_pending_uses_numeric_count() {
+    let c = StatusContext {
+        pending_approvals: 3,
+        ..ctx()
+    };
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(
+        plain.contains("⏸ 3 pending"),
+        "plural chip expected; got {plain:?}"
+    );
+}
+
+#[test]
+fn pending_chip_is_yellow_bold() {
+    let c = StatusContext {
+        pending_approvals: 2,
+        ..ctx()
+    };
+    let s = StatusLine::from_context(&c);
+    let chip = s
+        .left
+        .iter()
+        .find(|seg| seg.text.contains("pending"))
+        .expect("pending chip");
+    assert_eq!(chip.style.fg, Some(ratatui::style::Color::Yellow));
+    assert!(chip
+        .style
+        .add_modifier
+        .contains(ratatui::style::Modifier::BOLD));
+}

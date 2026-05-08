@@ -235,6 +235,72 @@ fn mention_menu_accept_closes_menu_without_changing_draft() {
     assert!(effects.is_empty());
 }
 
+// ─── Approval queue reducer integration ───────────────────────────
+
+use crate::tui::approval::ApprovalView;
+
+fn approval_view(id: u64, tool: &str) -> ApprovalView {
+    ApprovalView {
+        id,
+        tool: tool.to_string(),
+        header: format!("{tool} needs approval"),
+        detail: None,
+        reason: "risk: unknown".into(),
+    }
+}
+
+#[test]
+fn approval_enqueued_appends_to_state() {
+    let (s, effects) = reduce(State::default(), Action::ApprovalEnqueued(approval_view(1, "bash")));
+    assert_eq!(s.pending_approvals.len(), 1);
+    assert_eq!(s.pending_approvals[0].tool, "bash");
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn approval_enqueued_preserves_fifo_across_multiple_pushes() {
+    let mut s = State::default();
+    for (id, tool) in [(1, "a"), (2, "b"), (3, "c")] {
+        let (next, _) = reduce(s, Action::ApprovalEnqueued(approval_view(id, tool)));
+        s = next;
+    }
+    let tools: Vec<String> = s
+        .pending_approvals
+        .iter()
+        .map(|v| v.tool.clone())
+        .collect();
+    assert_eq!(tools, vec!["a", "b", "c"]);
+}
+
+#[test]
+fn approval_resolved_removes_matching_entry() {
+    let s = State {
+        pending_approvals: vec![
+            approval_view(1, "a"),
+            approval_view(2, "b"),
+            approval_view(3, "c"),
+        ],
+        ..State::default()
+    };
+    let (s, _) = reduce(s, Action::ApprovalResolved(2));
+    let tools: Vec<String> = s
+        .pending_approvals
+        .iter()
+        .map(|v| v.tool.clone())
+        .collect();
+    assert_eq!(tools, vec!["a", "c"]);
+}
+
+#[test]
+fn approval_resolved_with_unknown_id_is_noop() {
+    let s = State {
+        pending_approvals: vec![approval_view(1, "bash")],
+        ..State::default()
+    };
+    let (s, _) = reduce(s, Action::ApprovalResolved(9999));
+    assert_eq!(s.pending_approvals.len(), 1);
+}
+
 #[test]
 fn reduce_is_total_function_for_noop_on_idle() {
     // Sending stream events when idle must not panic and must not corrupt state.

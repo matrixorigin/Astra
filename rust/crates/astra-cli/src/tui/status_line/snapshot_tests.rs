@@ -121,6 +121,25 @@ fn snapshot_narrow_drops_right_segments() {
 }
 
 #[test]
+fn snapshot_pending_approvals_chip() {
+    let ctx = StatusContext {
+        pending_approvals: 3,
+        ..base_ctx()
+    };
+    insta::assert_snapshot!("status_pending_approvals_80", render_ctx(&ctx, 80));
+}
+
+#[test]
+fn snapshot_pending_with_auto_mode() {
+    let ctx = StatusContext {
+        pending_approvals: 1,
+        permission_mode: PermissionMode::Auto,
+        ..base_ctx()
+    };
+    insta::assert_snapshot!("status_pending_and_auto_80", render_ctx(&ctx, 80));
+}
+
+#[test]
 fn snapshot_very_long_cwd_truncates() {
     let ctx = StatusContext {
         cwd: Some(

@@ -1,4 +1,3 @@
-pub(crate) mod approval_overlay;
 pub(crate) mod chat_composer;
 pub(crate) mod footer;
 pub(crate) mod help_view;
@@ -10,6 +9,8 @@ pub(crate) mod textarea;
 pub(crate) mod transcript_view;
 pub(crate) mod view;
 
+#[cfg(test)]
+mod approval_integration_tests;
 #[cfg(test)]
 mod mention_integration_tests;
 #[cfg(test)]
@@ -25,12 +26,15 @@ use ratatui::{
 use skill_popup::SkillPopup;
 use view::{BottomPaneView, CancellationEvent};
 
+use super::approval::{ApprovalQueue, ApprovalView};
 use super::mention_menu::{
     FileProvider, MentionMenu, extract_mention_at, popup as mention_popup_render,
 };
 use super::slash_menu::{SlashItem, SlashMenu, is_open_for, popup as slash_popup_render};
 use super::task_status::TaskStatus;
+use crate::chat_stream::ApprovalResponse;
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 pub(crate) struct BottomPane {
     pub composer: ChatComposer,
@@ -46,6 +50,7 @@ pub(crate) struct BottomPane {
     /// active mention covers, used for splicing on accept.
     mention_range: Option<(usize, usize)>,
     file_provider: Option<Arc<dyn FileProvider>>,
+    approval_queue: ApprovalQueue,
     pub queued_messages: Vec<String>,
 }
 
@@ -63,6 +68,7 @@ impl BottomPane {
             mention_menu: None,
             mention_range: None,
             file_provider: None,
+            approval_queue: ApprovalQueue::new(),
             queued_messages: Vec::new(),
         }
     }
@@ -241,6 +247,76 @@ impl BottomPane {
         self.mention_range = None;
     }
 
+    // ── Approval queue public API ──────────────────────────────
+
+    /// Enqueue a new pending approval. Also bumps the footer counter so
+    /// the status line reflects the change on next draw.
+    pub fn enqueue_approval(
+        &mut self,
+        tool: String,
+        header: String,
+        detail: Option<String>,
+        reason: String,
+        response_tx: oneshot::Sender<ApprovalResponse>,
+    ) -> u64 {
+        let id = self
+            .approval_queue
+            .push(tool, header, detail, reason, response_tx);
+        self.footer.pending_approvals = self.approval_queue.len();
+        id
+    }
+
+    /// Snapshot of pending approvals (safe to pass to rendering code).
+    pub fn approval_views(&self) -> Vec<ApprovalView> {
+        self.approval_queue.views()
+    }
+
+    /// Index of the currently focused approval, if any.
+    pub fn focused_approval_index(&self) -> Option<usize> {
+        self.approval_queue.focus_index()
+    }
+
+    /// True if at least one approval is pending.
+    pub fn has_pending_approvals(&self) -> bool {
+        !self.approval_queue.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_approval_count(&self) -> usize {
+        self.approval_queue.len()
+    }
+
+    /// Resolve the currently focused approval. Returns its id if one was
+    /// resolved — callers pair this with an [`Action::ApprovalResolved`]
+    /// dispatch to update reducer state.
+    pub fn respond_focused_approval(&mut self, response: ApprovalResponse) -> Option<u64> {
+        let focused_id = self.approval_queue.focused().map(|p| p.id);
+        if self.approval_queue.respond_focused(response) {
+            self.footer.pending_approvals = self.approval_queue.len();
+            focused_id
+        } else {
+            None
+        }
+    }
+
+    /// Resolve a specific approval by id. Used when the user clicks or
+    /// otherwise targets a non-focused entry.
+    pub fn respond_approval_by_id(&mut self, id: u64, response: ApprovalResponse) -> bool {
+        let ok = self.approval_queue.respond_by_id(id, response);
+        if ok {
+            self.footer.pending_approvals = self.approval_queue.len();
+        }
+        ok
+    }
+
+    /// Move focus within the pending-approval queue.
+    pub fn move_approval_focus_up(&mut self) {
+        self.approval_queue.move_focus_up();
+    }
+    pub fn move_approval_focus_down(&mut self) {
+        self.approval_queue.move_focus_down();
+    }
+
     /// Splice the selected mention entry into the composer, replacing
     /// the current mention range. Called by Tab/Enter handlers.
     /// Returns whether anything was spliced (selection must exist).
@@ -320,6 +396,33 @@ impl BottomPane {
                 return BottomPaneAction::Quit;
             }
             return BottomPaneAction::Consumed;
+        }
+
+        // ── Approval keys ────────────────────────────────────────
+        //
+        // Ctrl+Y/N/A/S work regardless of composer state so the user
+        // can keep typing and still approve. Bare y/n/a/s only fire
+        // when the composer is empty so mid-sentence letters don't
+        // accidentally resolve an approval.
+        if self.has_pending_approvals() {
+            let mapped = approval_response_for_key(&key, self.composer.is_empty());
+            if let Some(resp) = mapped {
+                if let Some(id) = self.respond_focused_approval(resp) {
+                    return BottomPaneAction::ApprovalResolved { id };
+                }
+                return BottomPaneAction::Consumed;
+            }
+
+            // Tab cycles focus among pending approvals when the composer
+            // is empty (otherwise Tab is the menu-accept key and we must
+            // not steal it).
+            if key.code == KeyCode::Tab && self.composer.is_empty() && self.slash_menu.is_none()
+                && self.mention_menu.is_none()
+                && self.skill_popup.is_none()
+            {
+                self.move_approval_focus_down();
+                return BottomPaneAction::Consumed;
+            }
         }
 
         // Route to active view first (view handles its own Esc)
@@ -569,6 +672,29 @@ impl BottomPane {
     }
 }
 
+/// Map a key event to an `ApprovalResponse` if it should resolve a pending
+/// approval. **Ctrl-chorded only** — bare y/n/a/s are deliberately NOT
+/// mapped because they're too dangerous to fire while the user thinks
+/// they're writing text (you'd lose the first letter of "yes please"
+/// because the composer happens to be empty at that moment).
+fn approval_response_for_key(key: &KeyEvent, _composer_empty: bool) -> Option<ApprovalResponse> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(c) => match c.to_ascii_lowercase() {
+            'y' => Some(ApprovalResponse::AllowOnce),
+            'n' => Some(ApprovalResponse::Deny),
+            // Ctrl+A / Ctrl+S belong to the textarea (beginning-of-line /
+            // save-line) — we intentionally don't shadow them. Users get
+            // "always" and "skip" by first hitting Ctrl+Y/N then using
+            // the slash command to tweak permissions if needed.
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum BottomPaneAction {
     SubmitInput(String),
@@ -580,4 +706,10 @@ pub(crate) enum BottomPaneAction {
     Quit,
     Consumed,
     Escalate(KeyEvent),
+    /// An approval was resolved — the outer event loop should dispatch
+    /// `Action::ApprovalResolved(id)` so `State::pending_approvals` stays
+    /// in sync with the internal queue.
+    ApprovalResolved {
+        id: u64,
+    },
 }

@@ -264,6 +264,15 @@ pub(crate) fn reduce(mut state: State, action: Action) -> (State, Vec<Effect>) {
             // the menu so state reflects the user's intent.
             state.mention_menu = None;
         }
+
+        // ── Approvals ────────────────────────────────────────────
+        Action::ApprovalEnqueued(view) => {
+            state.pending_approvals.push(view);
+        }
+
+        Action::ApprovalResolved(id) => {
+            state.pending_approvals.retain(|v| v.id != id);
+        }
     }
 
     (state, effects)

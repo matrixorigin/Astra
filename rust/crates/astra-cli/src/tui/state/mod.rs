@@ -15,6 +15,7 @@ pub(crate) mod reducer;
 #[allow(unused_imports)]
 pub(crate) use reducer::{Effect, reduce};
 
+use crate::tui::approval::ApprovalView;
 use crate::tui::mention_menu::MentionMenu;
 use crate::tui::slash_menu::SlashMenu;
 
@@ -41,6 +42,10 @@ pub(crate) struct State {
     /// [`FileProvider`], which the reducer doesn't own — callers (e.g.
     /// `BottomPane`) build the menu and push it in via [`Action::MentionMenuSet`].
     pub mention_menu: Option<MentionMenu>,
+    /// View projection of the approval queue. The actual queue (with
+    /// `oneshot::Sender`s) lives in `BottomPane`; this field mirrors
+    /// it so rendering and reducer logic can stay pure.
+    pub pending_approvals: Vec<ApprovalView>,
 }
 
 impl State {
@@ -212,6 +217,13 @@ pub(crate) enum Action {
     /// the picked path into the composer — the reducer only clears the
     /// menu (since draft mutation logic is composer-specific).
     MentionMenuAccept,
+
+    // ── Approvals ─────────────────────────────────────────────────
+    /// Record a new pending approval in the state snapshot (the
+    /// `oneshot::Sender` lives in `BottomPane`'s [`ApprovalQueue`]).
+    ApprovalEnqueued(ApprovalView),
+    /// Remove the approval with the given id after the queue resolved it.
+    ApprovalResolved(u64),
 
     // ── Session / system ──────────────────────────────────────────
     SessionLoaded(String),

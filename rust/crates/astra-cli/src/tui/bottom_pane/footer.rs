@@ -18,6 +18,7 @@ pub(crate) struct Footer {
     pub cost_usd: Option<f64>,
     pub git_branch: Option<String>,
     pub token_budget: Option<(u64, u64)>,
+    pub pending_approvals: usize,
 }
 
 impl Footer {
@@ -41,6 +42,7 @@ impl Footer {
             cost_usd: None,
             git_branch: None,
             token_budget: None,
+            pending_approvals: 0,
         }
     }
 
@@ -63,6 +65,7 @@ impl Footer {
             session_id: self.session_id.clone(),
             cost_usd: self.cost_usd,
             git_branch: self.git_branch.clone(),
+            pending_approvals: self.pending_approvals,
         }
     }
 

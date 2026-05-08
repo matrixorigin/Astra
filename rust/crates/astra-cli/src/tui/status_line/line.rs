@@ -44,6 +44,8 @@ pub(crate) struct StatusContext {
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
     pub git_branch: Option<String>,
+    /// Number of approvals currently awaiting a user decision.
+    pub pending_approvals: usize,
 }
 
 /// A styled text fragment that appears on either side of the line.
@@ -118,6 +120,20 @@ impl StatusLine {
                     Style::default().fg(Color::Red),
                 ));
             }
+        }
+
+        if ctx.pending_approvals > 0 {
+            let text = if ctx.pending_approvals == 1 {
+                "⏸ 1 pending".to_string()
+            } else {
+                format!("⏸ {} pending", ctx.pending_approvals)
+            };
+            out.left.push(Segment::styled(
+                text,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ));
         }
 
         // ── Right: model · branch · cwd · tokens · cost ───────────

@@ -21,6 +21,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use super::ChatCell;
+use super::approval_cell::ApprovalChatCell;
 use super::assistant_cell::AssistantChatCell;
 use super::system_cell::{SystemChatCell, SystemLevel};
 use super::tool_cell::{ToolChatCell, ToolStatus};
@@ -207,6 +208,60 @@ fn tool_success_narrow_40col() {
 }
 
 // ─── Sanity: Rect sizes produce non-empty output ──────────────────
+
+// ─── ApprovalChatCell ─────────────────────────────────────────────
+
+#[test]
+fn approval_focused_80() {
+    let cell = ApprovalChatCell::new(
+        1,
+        "bash".into(),
+        "bash wants to run a command".into(),
+        Some("rm -rf /tmp/scratch".into()),
+        "destructive path outside cwd".into(),
+        true,
+    );
+    insta::assert_snapshot!("approval_focused_80", render_cell(&cell, 80, 6));
+}
+
+#[test]
+fn approval_unfocused_80() {
+    let cell = ApprovalChatCell::new(
+        2,
+        "edit".into(),
+        "edit src/lib.rs".into(),
+        None,
+        "modifies source".into(),
+        false,
+    );
+    insta::assert_snapshot!("approval_unfocused_80", render_cell(&cell, 80, 4));
+}
+
+#[test]
+fn approval_no_detail_no_reason() {
+    let cell = ApprovalChatCell::new(
+        3,
+        "read".into(),
+        "read wants to run".into(),
+        None,
+        String::new(),
+        true,
+    );
+    insta::assert_snapshot!("approval_minimal_80", render_cell(&cell, 80, 3));
+}
+
+#[test]
+fn approval_narrow_40() {
+    let cell = ApprovalChatCell::new(
+        4,
+        "bash".into(),
+        "bash wants a command".into(),
+        Some("cargo test".into()),
+        "runs tests".into(),
+        true,
+    );
+    insta::assert_snapshot!("approval_narrow_40", render_cell(&cell, 40, 6));
+}
 
 #[test]
 fn all_rendered_outputs_are_non_empty() {

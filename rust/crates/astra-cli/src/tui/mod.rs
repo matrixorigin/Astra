@@ -8,6 +8,7 @@ mod testing;
 mod tests;
 
 mod app_event;
+mod approval;
 mod bottom_pane;
 mod chat_cell;
 mod chat_viewport;
@@ -414,15 +415,30 @@ pub(crate) async fn run_tui_repl(
                                                     let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
                                                 }
                                                 Some(req) = approval_rx.recv() => {
-                                                    use bottom_pane::approval_overlay::ApprovalOverlay;
-                                                    let overlay = ApprovalOverlay::new(
+                                                    // Non-blocking: enqueue the request and render an
+                                                    // inline ApprovalChatCell in scrollback. The
+                                                    // composer stays live, the turn keeps streaming.
+                                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                                    let id = bottom_pane.enqueue_approval(
+                                                        req.tool.clone(),
+                                                        req.header.clone(),
+                                                        req.detail.clone(),
+                                                        req.reason.clone(),
+                                                        req.response_tx,
+                                                    );
+                                                    let focused = bottom_pane
+                                                        .focused_approval_index()
+                                                        .map(|i| i == bottom_pane.approval_views().len().saturating_sub(1))
+                                                        .unwrap_or(false);
+                                                    let cell = chat_cell::approval_cell::ApprovalChatCell::new(
+                                                        id,
                                                         req.tool,
                                                         req.header,
                                                         req.detail,
                                                         req.reason,
-                                                        req.response_tx,
+                                                        focused,
                                                     );
-                                                    bottom_pane.push_view(Box::new(overlay));
+                                                    flush_cell_to_scrollback(&mut guard, Box::new(cell), w, &mut transcript);
                                                     frame_requester.schedule_frame();
                                                     let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
                                                 }
@@ -537,6 +553,11 @@ pub(crate) async fn run_tui_repl(
                             BottomPaneAction::Interrupt | BottomPaneAction::Quit => { break 'main Ok(()); }
                             BottomPaneAction::Consumed => {}
                             BottomPaneAction::Escalate(_) => {}
+                            BottomPaneAction::ApprovalResolved { .. } => {
+                                // BottomPane already sent the response via its
+                                // oneshot; nothing else to do at the outer
+                                // event loop yet.
+                            }
                         }
                         frame_requester.schedule_frame();
                     }
