@@ -511,12 +511,20 @@ pub(crate) fn default_pinned_tool_names() -> std::collections::HashSet<String> {
     // agentic_loop_lifecycle.rs). These aren't in TOOL_CATALOG but are
     // structurally part of the static lib — include them so the cache
     // marker sits at the real static-prefix boundary.
+    //
+    // `web_search` is a first-class runtime tool (astra-tools crate) that
+    // ships with every session but is absent from TOOL_CATALOG. Session
+    // d0640d3d observed it as the last of 21 tools; without it in the
+    // pinned set the marker landed on `skill` (idx 19) and web_search
+    // (idx 20) fell outside the cached tool prefix, shaving ~500 tokens
+    // off every cache hit on the deepseek-anthropic path.
     for name in [
         "skill",
         "spawn_agent",
         "get_agent_result",
         "send_message",
         "introspect",
+        "web_search",
     ] {
         out.insert(name.to_string());
     }
@@ -711,6 +719,55 @@ mod tests {
 
         let anthropic_provider = PromptCacheConfig::latch("anthropic", "gpt-4o");
         assert!(anthropic_provider.is_anthropic);
+    }
+
+    // ── pinned-tool audit: session d0640d3d tool order ───────────────────
+    //
+    // Production capture showed 21 tools in this order — all served stably
+    // by the runtime every turn — with only `skill` (idx 19) carrying
+    // cache_control. `web_search` (idx 20) fell OUT of the cached tool
+    // prefix because it wasn't in `default_pinned_tool_names()`:
+    //   [bash, read_file, write_file, str_replace, list_dir, grep, glob,
+    //    introspect, lsp, git, github, web_fetch, memory, session, mo,
+    //    agent, symbols, powershell, run_script, skill, web_search]
+    //
+    // All of these are first-class, runtime-owned tools that appear in
+    // every request. They must be pinned so the cache marker lands on the
+    // LAST one (web_search), not an interior position.
+    #[test]
+    fn default_pinned_tool_names_covers_all_first_class_runtime_tools() {
+        let pinned = super::default_pinned_tool_names();
+        // Full runtime tool catalog as observed in live session d0640d3d.
+        // Any divergence here causes a cache hole at the tool tail.
+        let expected = [
+            "bash",
+            "read_file",
+            "write_file",
+            "str_replace",
+            "list_dir",
+            "grep",
+            "glob",
+            "introspect",
+            "lsp",
+            "git",
+            "github",
+            "web_fetch",
+            "memory",
+            "session",
+            "mo",
+            "agent",
+            "symbols",
+            "powershell",
+            "run_script",
+            "skill",
+            "web_search",
+        ];
+        let missing: Vec<&str> = expected.iter().copied().filter(|n| !pinned.contains(*n)).collect();
+        assert!(
+            missing.is_empty(),
+            "these runtime tools are NOT pinned — marker will fall short of the last \
+             tool and subsequent tools miss cache: {missing:?}",
+        );
     }
 
     #[test]
