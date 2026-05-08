@@ -36,6 +36,7 @@ mod status_line;
 mod table_view;
 mod timeline;
 mod view_stack;
+mod worktrees;
 mod stream_bridge;
 mod streaming;
 mod style;

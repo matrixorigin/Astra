@@ -1,0 +1,11 @@
+---
+source: crates/astra-cli/src/tui/worktrees/view.rs
+expression: "draw(&l, 100, 7)"
+---
+┌ Worktrees (3) ───────────────────────────────────────────────────────────────────────────────────┐
+│  ⎇ main @ 616d4cf             12 sessions                 ⎇ enhance_tui @ c823abc                │
+│▌ ⎇ enhance_tui @ c823abc      3 sessions                                                         │
+│  (detached @ deadbee)         no sessions                 path    /home/xp/astra-wt-a            │
+│                                                           branch  enhance_tui                    │
+│                                                           head    c823abc                        │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

@@ -333,6 +333,49 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
+        // ── Worktrees (TUI-native) ──────────────────────────────────
+        "/worktrees" => {
+            use crate::tui::bottom_pane::worktrees_view::WorktreesView;
+            use crate::tui::worktrees::{WorktreeList, parse};
+
+            // `git worktree list --porcelain` on a blocking thread.
+            let porcelain = tokio::task::spawn_blocking(|| {
+                let cwd = std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let out = std::process::Command::new("git")
+                    .args(["worktree", "list", "--porcelain"])
+                    .current_dir(&cwd)
+                    .output();
+                match out {
+                    Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+                    _ => String::new(),
+                }
+            })
+            .await
+            .unwrap_or_default();
+
+            let mut entries = parse(&porcelain);
+            // Enrich each entry with session count (best-effort; any
+            // errors collapse to zero).
+            for e in entries.iter_mut() {
+                let sessions = astra_services::session_workspace::list_sessions_by_git_root(
+                    &e.path, None, 50,
+                );
+                e.session_count = sessions.len();
+                e.last_session_at = sessions.first().map(|s| s.updated_at.clone());
+            }
+
+            if entries.is_empty() {
+                ctx.show_info(
+                    "No worktrees found (or `git worktree list` failed).".into(),
+                );
+                return SlashResult::Handled;
+            }
+            let list = WorktreeList::new(entries);
+            ctx.bottom_pane.push_view(Box::new(WorktreesView::new(list)));
+            SlashResult::Handled
+        }
+
         // ── Session timeline (TUI-native) ───────────────────────────
         "/timeline" => {
             use crate::tui::bottom_pane::timeline_view::TimelineView;

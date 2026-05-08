@@ -385,6 +385,11 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Core,
     )
     .with_arg_hint("<sql>"),
+    CommandMeta::new(
+        "/worktrees",
+        "List git worktrees for this repo with per-worktree session counts",
+        CommandGroup::Core,
+    ),
     CommandMeta::new("/exit", "Exit the REPL", CommandGroup::Core),
     CommandMeta::new(
         "/quit",

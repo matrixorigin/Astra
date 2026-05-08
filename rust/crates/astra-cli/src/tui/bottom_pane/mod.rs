@@ -12,6 +12,7 @@ pub(crate) mod textarea;
 pub(crate) mod timeline_view;
 pub(crate) mod transcript_view;
 pub(crate) mod view;
+pub(crate) mod worktrees_view;
 
 #[cfg(test)]
 mod approval_integration_tests;

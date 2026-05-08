@@ -1,0 +1,7 @@
+---
+source: crates/astra-cli/src/tui/worktrees/view.rs
+expression: "draw(&l, 80, 3)"
+---
+┌ Worktrees (0) ───────────────────────────────────────────────────────────────┐
+│  no worktrees for this repo                                                  │
+└──────────────────────────────────────────────────────────────────────────────┘
