@@ -264,6 +264,33 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Fallback
         }
 
+        // ── Context panel (TUI-native) ──────────────────────────────
+        //
+        // `/context` with no args pops a live breakdown view built from
+        // the most recent turn's `TokenBudgetTrace`. Subcommands
+        // (`breakdown`, `explain`, `cognition`) fall through to the
+        // existing rustyline-style printer via Fallback.
+        "/context" => {
+            if !args.is_empty() {
+                return SlashResult::Fallback;
+            }
+            use crate::tui::bottom_pane::context_panel_view::ContextPanelView;
+            use crate::tui::context_panel::ContextBreakdown;
+            let breakdown = match ctx.state.observability_session.as_ref() {
+                Some(session) => {
+                    let guard = session.read().unwrap_or_else(|e| e.into_inner());
+                    match guard.context_traces.last() {
+                        Some(trace) => ContextBreakdown::from_trace(&trace.token_budget),
+                        None => ContextBreakdown::empty(),
+                    }
+                }
+                None => ContextBreakdown::empty(),
+            };
+            ctx.bottom_pane
+                .push_view(Box::new(ContextPanelView::new(breakdown)));
+            SlashResult::Handled
+        }
+
         // ── Resume picker (TUI-native) ──────────────────────────────
         "/resume" => {
             if !args.is_empty() {

@@ -10,6 +10,7 @@ mod tests;
 mod app_event;
 mod approval;
 mod bottom_pane;
+mod context_panel;
 mod chat_cell;
 mod chat_viewport;
 mod color;

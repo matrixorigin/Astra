@@ -1,4 +1,5 @@
 pub(crate) mod chat_composer;
+pub(crate) mod context_panel_view;
 pub(crate) mod footer;
 pub(crate) mod help_view;
 pub(crate) mod history_view;
