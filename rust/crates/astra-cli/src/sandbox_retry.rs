@@ -40,13 +40,35 @@ pub fn sandbox_expand_dir_from_args(args: &Value) -> Option<PathBuf> {
     // contract, so a SANDBOX_DENIED on a relative path indicates a
     // different issue (the relative path resolved to outside via `../`
     // traversal etc.) and the conservative move is to NOT auto-widen.
+    //
+    // We also reject paths containing `..` components: `canonicalize()`
+    // isn't safe here because the target file may not yet exist (e.g. a
+    // write tool creating a new file), so we can't resolve traversal
+    // reliably. A token like `/allowed/../etc/passwd` would otherwise
+    // widen to `/allowed` — but Path::parent is purely lexical and the
+    // real parent after `..` resolution is `/etc`. Refusing to expand
+    // keeps the sandbox tight; the user sees the original denial and
+    // can resubmit with a clean absolute path.
     let parent_or_self = |p: &str| -> Option<PathBuf> {
         let path = Path::new(p);
         if !path.is_absolute() {
             return None;
         }
+        // Reject `..` / `.` traversal tokens — see note above.
+        // We check the raw string rather than Path::components because
+        // components() silently drops `.` (so `/./etc` would normalize
+        // to `/etc`) while we want to refuse the whole non-canonical
+        // input rather than guess at the author's intent.
+        for segment in p.split('/') {
+            if segment == ".." || segment == "." {
+                return None;
+            }
+        }
         let parent = path.parent()?;
-        if parent == Path::new("/") {
+        // Defensive: after normalization above, `parent == /` means the
+        // file sits directly under root (e.g. `/passwd`). Expand exactly
+        // the file, never the root directory.
+        if parent == Path::new("/") || parent.as_os_str().is_empty() {
             Some(PathBuf::from(p))
         } else {
             Some(parent.to_path_buf())
@@ -271,6 +293,31 @@ mod tests {
             sandbox_expand_dir_from_args(&args),
             Some(PathBuf::from("/etc"))
         );
+    }
+
+    #[test]
+    fn expand_dir_rejects_parent_traversal_in_path() {
+        // `/allowed/../etc/passwd` lexically has parent `/allowed/..`, which
+        // Path::parent reports as `/allowed` — but after `..` resolution the
+        // real parent is `/etc`. We can't canonicalize unresolved paths
+        // safely (target may not exist yet), so the only correct answer is
+        // to refuse to auto-widen. Pinned as a sandbox-escape guard.
+        let args = json!({"path": "/allowed/../etc/passwd"});
+        assert_eq!(sandbox_expand_dir_from_args(&args), None);
+    }
+
+    #[test]
+    fn expand_dir_rejects_parent_traversal_in_command() {
+        let args = json!({"command": "cat /allowed/../etc/passwd"});
+        assert_eq!(sandbox_expand_dir_from_args(&args), None);
+    }
+
+    #[test]
+    fn expand_dir_rejects_curdir_component() {
+        // `/./etc/hosts` is harmless but non-canonical; rejecting is the
+        // simpler contract than trying to partially-normalize.
+        let args = json!({"path": "/./etc/hosts"});
+        assert_eq!(sandbox_expand_dir_from_args(&args), None);
     }
 
     // ── extract_first_absolute_path ──────────────────────────────────────

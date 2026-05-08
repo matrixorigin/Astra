@@ -1,6 +1,8 @@
 {
   "allow": [
-    "bash"
+    "bash",
+    "str_replace"
   ],
-  "deny": []
+  "deny": [],
+  "allow_sensitive_path_writes": false
 }
