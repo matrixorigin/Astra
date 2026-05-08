@@ -84,44 +84,50 @@ fn last_pinned_tool_index(
     })
 }
 
-/// Place a `cache_control` marker that maximizes prefix cache hits across
-/// turns in a growing conversation.
+/// Place **rolling** `cache_control` markers that maximize prefix cache hits
+/// across turns in a growing conversation.
 ///
-/// **Strategy (Claude Code pattern):** mark the **second-to-last user message**
-/// — i.e. the user message from the *previous* turn. This makes the entire
-/// prefix (system + tools + history up to and including that user turn) stable
-/// across turns: turn N+1 appends new messages *after* the marker, so
-/// Anthropic's prefix-based cache still hits the full prefix from turn N.
+/// **Strategy (rolling two breakpoints):** mark both
+///   - the message just before the **second-to-last** user message (the
+///     *historical* breakpoint — end of turn N-1), and
+///   - the message just before the **last** user message (the *tail*
+///     breakpoint — end of turn N).
 ///
-/// **Fallback:** if there is only one user message (turn 1), the marker goes
-/// on the last non-system message (same as the legacy behaviour), because
-/// there is no "previous turn" yet.
+/// This is the byte-identity invariant that makes Anthropic's prefix cache
+/// work across consecutive LLM calls: turn N's *tail* index equals turn
+/// N+1's *historical* index, so the messages up to that index serialize to
+/// identical bytes in both turns. Rebuilding the marker from scratch every
+/// round without this rolling scheme silently strips the previous round's
+/// `cache_control` from older messages, invalidating the cached prefix
+/// past `system + tools` — the regression captured in
+/// `mock_llm_prompt_cache_e2e::rolling_breakpoint_*` tests.
 ///
-/// If the target message's `content` is a string, it is upgraded to a
-/// content-block array with one `{type: "text", cache_control: …}` entry.
-/// If already an array, the marker is attached to the last block.
+/// **Budget:** Anthropic allows at most 4 `cache_control` breakpoints per
+/// request. This function emits at most 2. The caller is responsible for
+/// keeping the system+tools allocation to ≤ 2 markers so the total stays
+/// within budget.
 ///
-/// No-op when `messages` is empty or contains only system messages.
+/// **Fallbacks:**
+///   - 0 user messages → no-op.
+///   - 1 user message (turn 1) → mark the last non-system message only
+///     (no previous turn to carry forward).
+///   - 2+ user messages but positions collapse (e.g. back-to-back users,
+///     or historical would underflow to 0) → emit a single tail marker.
 pub fn annotate_last_message_cache_breakpoint(messages: &mut [Value]) {
     if messages.is_empty() {
         return;
     }
 
-    // Find the target: second-to-last user message, or last non-system
-    // message if there's only one user message.
-    let target_idx = find_cache_breakpoint_target(messages);
-    let Some(idx) = target_idx else {
-        return;
-    };
-
-    apply_cache_control_to_message(&mut messages[idx]);
+    for idx in find_cache_breakpoint_targets(messages) {
+        apply_cache_control_to_message(&mut messages[idx]);
+    }
 }
 
-/// Determine which message index should receive the cache breakpoint.
+/// Determine which message indices should receive cache breakpoints.
 ///
-/// Returns `None` if there are no non-system messages at all.
-fn find_cache_breakpoint_target(messages: &[Value]) -> Option<usize> {
-    // Collect indices of all user messages (non-system).
+/// Returns up to 2 indices in ascending order: `[historical, tail]` for
+/// multi-turn conversations, `[tail]` for single-turn, empty for none.
+fn find_cache_breakpoint_targets(messages: &[Value]) -> Vec<usize> {
     let user_indices: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -129,26 +135,7 @@ fn find_cache_breakpoint_target(messages: &[Value]) -> Option<usize> {
         .map(|(i, _)| i)
         .collect();
 
-    if user_indices.len() >= 2 {
-        // Mark the second-to-last user message. The entire prefix through
-        // this message (inclusive) is the "stable history" from previous
-        // turns. New messages appended after it won't break the cache.
-        let penultimate_user_idx = user_indices[user_indices.len() - 2];
-        // Actually place the marker on the last message BEFORE the current
-        // turn's user message. That's the assistant response (or tool result)
-        // that sits between the two user messages — the last thing from the
-        // previous turn.
-        let last_user_idx = *user_indices.last().unwrap();
-        // Walk backwards from last_user_idx to find the message just before it
-        // that isn't system.
-        let target = if last_user_idx > 0 {
-            last_user_idx - 1
-        } else {
-            penultimate_user_idx
-        };
-        Some(target)
-    } else {
-        // Only 1 user message (or none): fallback to last non-system message.
+    let last_non_system = || -> Option<usize> {
         messages
             .iter()
             .enumerate()
@@ -159,6 +146,40 @@ fn find_cache_breakpoint_target(messages: &[Value]) -> Option<usize> {
                     .is_some_and(|r| r != "system")
             })
             .map(|(i, _)| i)
+    };
+
+    match user_indices.len() {
+        0 => last_non_system().map(|i| vec![i]).unwrap_or_default(),
+        1 => last_non_system().map(|i| vec![i]).unwrap_or_default(),
+        _ => {
+            let last_user = *user_indices.last().unwrap();
+            let penult_user = user_indices[user_indices.len() - 2];
+
+            // `tail` is the non-user message just before the last user turn
+            // — the final assistant reply / tool result of the previous
+            // turn. Guaranteed stable across the next round (that round
+            // will see the exact same tail as its historical).
+            let tail = last_user.saturating_sub(1);
+
+            // Historical candidate: the message just before the penultimate
+            // user turn. Valid only if it exists and is not a system
+            // message — we never place message-level markers on system
+            // (system blocks carry their own `cache_control` metadata via
+            // `apply_cache_policy_to_blocks`).
+            let historical_candidate = penult_user.checked_sub(1);
+            let historical = historical_candidate.filter(|&idx| {
+                messages
+                    .get(idx)
+                    .and_then(|m| m.get("role").and_then(Value::as_str))
+                    .is_some_and(|r| r != "system")
+            });
+
+            match historical {
+                None => vec![tail],
+                Some(h) if h == tail => vec![tail],
+                Some(h) => vec![h, tail],
+            }
+        }
     }
 }
 
@@ -440,19 +461,26 @@ mod tests {
         assert!(msgs[3]["content"].is_string());
     }
 
+    fn marker_indices(msgs: &[Value]) -> Vec<usize> {
+        msgs.iter()
+            .enumerate()
+            .filter(|(_, m)| message_has_cache_control(m))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     #[test]
-    fn cache_breakpoint_prefix_grows_monotonically_across_turns() {
-        // Simulate 3 turns of a conversation. Each turn should produce a
-        // longer cacheable prefix than the previous — never shrink.
+    fn cache_breakpoint_rolls_forward_across_turns() {
+        // Simulate 3 turns. The tail marker MUST advance each turn, and
+        // from turn 3 onwards both historical and tail markers are
+        // present — with historical equal to the previous turn's tail.
         let mut turn1 = vec![
             json!({"role": "system", "content": "sys"}),
             json!({"role": "user", "content": "q1"}),
         ];
         annotate_last_message_cache_breakpoint(&mut turn1);
-        let marker1_idx = turn1
-            .iter()
-            .position(message_has_cache_control)
-            .expect("turn 1 must have marker");
+        let t1 = marker_indices(&turn1);
+        assert_eq!(t1, vec![1], "turn 1 marks the single user message");
 
         let mut turn2 = vec![
             json!({"role": "system", "content": "sys"}),
@@ -461,10 +489,10 @@ mod tests {
             json!({"role": "user", "content": "q2"}),
         ];
         annotate_last_message_cache_breakpoint(&mut turn2);
-        let marker2_idx = turn2
-            .iter()
-            .position(message_has_cache_control)
-            .expect("turn 2 must have marker");
+        let t2 = marker_indices(&turn2);
+        // Penult user at idx 1, last user at idx 3. historical would be
+        // idx 0 (system) — filtered out — so we get only the tail at idx 2.
+        assert_eq!(t2, vec![2], "turn 2 emits tail only (historical = system filtered)");
 
         let mut turn3 = vec![
             json!({"role": "system", "content": "sys"}),
@@ -475,20 +503,21 @@ mod tests {
             json!({"role": "user", "content": "q3"}),
         ];
         annotate_last_message_cache_breakpoint(&mut turn3);
-        let marker3_idx = turn3
-            .iter()
-            .position(message_has_cache_control)
-            .expect("turn 3 must have marker");
+        let t3 = marker_indices(&turn3);
+        // User indices: 1, 3, 5. penult=3, last=5. tail=4. historical=2.
+        assert_eq!(
+            t3,
+            vec![2, 4],
+            "turn 3 emits both historical and tail markers"
+        );
+        // Rolling invariant: turn 2's tail == turn 3's historical.
+        assert_eq!(
+            t2[0], t3[0],
+            "turn 3's historical marker must sit at the same index as turn 2's tail",
+        );
 
-        // Prefix grows: marker position advances each turn
-        assert!(
-            marker2_idx > marker1_idx,
-            "turn 2 prefix must be larger than turn 1"
-        );
-        assert!(
-            marker3_idx > marker2_idx,
-            "turn 3 prefix must be larger than turn 2"
-        );
+        // Tail strictly advances each turn.
+        assert!(t3[t3.len() - 1] > t2[t2.len() - 1]);
     }
 
     #[test]

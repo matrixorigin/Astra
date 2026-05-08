@@ -169,20 +169,38 @@ fn remap_cache_markers_to_blocks(
         return Vec::new();
     }
 
-    let mut remapped = Vec::new();
+    // Anthropic caps a single request at 4 `cache_control` markers. The
+    // runtime's budget is:
+    //   1 × system  +  1 × tools  +  2 × messages (rolling historical+tail)
+    // Leaving the remaining 2 slots free for the rolling message-history
+    // pair is what gives cross-round prefix reuse — see the rolling
+    // breakpoint tests in `mock_llm_prompt_cache_e2e.rs`. So we collapse
+    // all system-level markers onto a single block (the latest one the
+    // planner requested), matching the single-marker policy applied on
+    // the legacy path in `apply_cache_policy_to_blocks`.
+    let mut chosen_block: Option<usize> = None;
+    let mut chosen_marker: Option<CacheMarker> = None;
     for marker in markers {
         let Some(block_idx) = block_index_for_marker(marker.after_section_index, section_to_block)
         else {
             continue;
         };
-        if let Some(block) = system_blocks.get_mut(block_idx) {
-            block.cache_control = Some(cache_control_for_scope(block.scope, policy));
-            let mut marker = marker.clone();
-            marker.after_section_index = block_idx;
-            remapped.push(marker);
+        // Prefer the marker that lands on the deepest block so the cached
+        // prefix covers as much content as possible.
+        if chosen_block.is_none_or(|cur| block_idx >= cur) {
+            chosen_block = Some(block_idx);
+            let mut m = marker.clone();
+            m.after_section_index = block_idx;
+            chosen_marker = Some(m);
         }
     }
-    remapped
+    if let (Some(idx), Some(marker)) = (chosen_block, chosen_marker) {
+        if let Some(block) = system_blocks.get_mut(idx) {
+            block.cache_control = Some(cache_control_for_scope(block.scope, policy));
+            return vec![marker];
+        }
+    }
+    Vec::new()
 }
 
 fn block_index_for_marker(
@@ -201,8 +219,23 @@ fn block_index_for_marker(
 
 /// Apply cache policy to legacy-path system blocks.
 ///
-/// Places `cache_control` markers on the last Global and last Session block,
-/// matching the production Anthropic cache breakpoint convention.
+/// Places a single `cache_control` marker on the last Session-scoped
+/// block (falling back to the last Global block if no Session block
+/// exists). We intentionally emit at most one marker here to leave the
+/// remaining breakpoint budget for the rolling `[historical, tail]` pair
+/// in `annotate_last_message_cache_breakpoint`, which is what lets
+/// message-history bytes stay stable across rounds. Anthropic caps
+/// requests at 4 `cache_control` entries (1 system + 1 tool + 2 messages
+/// = 4), and the rolling message pair is load-bearing: without it,
+/// `cache_read` collapses to `system + tools` size (~10 K tokens) even
+/// in a 50-round conversation. See the
+/// `mock_llm_prompt_cache_e2e::rolling_breakpoint_*` tests for the
+/// byte-identity invariant we're protecting.
+///
+/// The last Session block is preferred over the last Global block
+/// because it extends the cached prefix further (blocks are emitted in
+/// Global → Session → None order, so Session is further along than
+/// Global in the serialized prefix).
 fn apply_cache_policy_to_blocks(
     system_blocks: &mut [SerializedSystemBlock],
     policy: &ProviderCachePolicy,
@@ -211,35 +244,26 @@ fn apply_cache_policy_to_blocks(
         return Vec::new();
     }
 
-    let mut chosen = Vec::new();
-    if let Some(idx) = system_blocks
+    let chosen = system_blocks
         .iter()
-        .rposition(|block| block.scope == CacheScope::Global)
-    {
-        chosen.push(idx);
-    }
-    if chosen.len() < policy.max_markers as usize
-        && let Some(idx) = system_blocks
-            .iter()
-            .rposition(|block| block.scope == CacheScope::Session)
-        && !chosen.contains(&idx)
-    {
-        chosen.push(idx);
-    }
-
-    let mut markers = Vec::new();
-    for &idx in &chosen {
-        system_blocks[idx].cache_control =
-            Some(cache_control_for_scope(system_blocks[idx].scope, policy));
-        markers.push(CacheMarker {
-            after_section_index: idx,
-            scope: system_blocks[idx].scope,
-            cumulative_tokens: 0, // legacy path doesn't track cumulative tokens
+        .rposition(|block| block.scope == CacheScope::Session)
+        .or_else(|| {
+            system_blocks
+                .iter()
+                .rposition(|block| block.scope == CacheScope::Global)
         });
-    }
-    // Return markers in ascending block order for consistency.
-    markers.sort_by_key(|m| m.after_section_index);
-    markers
+
+    let Some(idx) = chosen else {
+        return Vec::new();
+    };
+
+    system_blocks[idx].cache_control =
+        Some(cache_control_for_scope(system_blocks[idx].scope, policy));
+    vec![CacheMarker {
+        after_section_index: idx,
+        scope: system_blocks[idx].scope,
+        cumulative_tokens: 0,
+    }]
 }
 
 fn cache_control_for_scope(_scope: CacheScope, _policy: &ProviderCachePolicy) -> Value {
@@ -324,14 +348,22 @@ mod tests {
     }
 
     #[test]
-    fn legacy_path_respects_max_markers_limit() {
+    fn legacy_path_emits_single_system_marker_to_preserve_message_budget() {
+        // Anthropic allows at most 4 cache_control entries per request. The
+        // runtime splits the budget as:
+        //   1 × system  +  1 × tools  +  2 × messages (rolling historical+tail)
+        // So the system serializer MUST emit at most 1 marker even when
+        // multiple candidate blocks exist. The message-level pair is the
+        // load-bearing one; dropping a system marker costs ~200 cached
+        // tokens while dropping a message marker costs the entire
+        // conversation-history prefix (thousands of tokens).
         let sections = vec![
             make_section("global 1", CacheScope::Global),
             make_section("global 2", CacheScope::Global),
             make_section("session 1", CacheScope::Session),
             make_section("session 2", CacheScope::Session),
         ];
-        let policy = ProviderCachePolicy::anthropic(); // max_markers = 4
+        let policy = ProviderCachePolicy::anthropic();
         let result = serialize_prompt_sections(&sections, &policy);
 
         let cached_count = result
@@ -339,10 +371,31 @@ mod tests {
             .iter()
             .filter(|b| b.cache_control.is_some())
             .count();
-        assert_eq!(cached_count, 2, "should mark last global and last session");
-        assert_eq!(result.cache_markers.len(), 2);
-        assert!(result.system_blocks[1].cache_control.is_some());
+        assert_eq!(
+            cached_count, 1,
+            "system must emit exactly 1 marker — the remaining budget is \
+             spent on the rolling message-history pair"
+        );
+        assert_eq!(result.cache_markers.len(), 1);
+        // Preference: last Session block (index 3) over last Global (index 1),
+        // because Session sits further along the serialized prefix and its
+        // marker caches strictly more content.
         assert!(result.system_blocks[3].cache_control.is_some());
+        assert!(result.system_blocks[1].cache_control.is_none());
+    }
+
+    #[test]
+    fn legacy_path_falls_back_to_global_when_no_session_block() {
+        // If only Global-scoped blocks exist, the single marker lands on
+        // the last Global block rather than being dropped.
+        let sections = vec![
+            make_section("global 1", CacheScope::Global),
+            make_section("global 2", CacheScope::Global),
+        ];
+        let policy = ProviderCachePolicy::anthropic();
+        let result = serialize_prompt_sections(&sections, &policy);
+        assert_eq!(result.cache_markers.len(), 1);
+        assert!(result.system_blocks[1].cache_control.is_some());
     }
 
     #[test]

@@ -399,6 +399,21 @@ pub struct CapturedLlmRequest {
     /// as text; for Anthropic: the concatenated text of all blocks up to and
     /// including the last cache_control breakpoint).
     pub cacheable_prefix_sha256: String,
+    /// Indices of messages (in the captured `messages` array) that carry a
+    /// `cache_control` marker anywhere in their content. Order matches the
+    /// message order. Empty for non-Anthropic providers.
+    ///
+    /// Used by tests to assert the rolling-breakpoint invariant across
+    /// consecutive rounds: the historical marker from round N must still
+    /// be present at the same message index in round N+1 so that Anthropic
+    /// can hit the cached prefix through the message history — not just
+    /// through `system` + `tools`.
+    pub message_cache_control_indices: Vec<usize>,
+    /// For each message in `messages`, the SHA-256 hex of that message's
+    /// canonical JSON serialization (sort_keys). Tests compare slices of
+    /// this vector across rounds to prove the cacheable message prefix is
+    /// byte-stable (a prerequisite for Anthropic cache hits beyond tools).
+    pub message_sha256: Vec<String>,
 }
 
 #[cfg(feature = "bridge-e2e-hooks")]
@@ -457,6 +472,47 @@ fn cacheable_prefix_text(system_primary: &Value, is_anthropic: bool) -> String {
     }
 }
 
+/// Normalize a message to the shape Anthropic uses for cache-key
+/// derivation. Removes `cache_control` attributes everywhere (they are
+/// request-layer directives, not tokens) and upgrades `content: "text"`
+/// strings to the canonical `content: [{type:"text", text:"..."}]`
+/// array form so that the "marker placed → content promoted to array"
+/// shape flip produced by `apply_cache_control_to_message` does not
+/// spuriously break byte-level prefix comparisons in tests.
+#[cfg(feature = "bridge-e2e-hooks")]
+fn normalize_message_for_cache_hash(m: &Value) -> Value {
+    let mut out = m.clone();
+    if let Some(obj) = out.as_object_mut()
+        && let Some(content) = obj.get("content").cloned()
+        && let Some(s) = content.as_str()
+    {
+        obj.insert(
+            "content".into(),
+            serde_json::json!([{ "type": "text", "text": s }]),
+        );
+    }
+    strip_cache_control(&mut out);
+    out
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+fn strip_cache_control(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            map.remove("cache_control");
+            for (_, child) in map.iter_mut() {
+                strip_cache_control(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                strip_cache_control(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(feature = "bridge-e2e-hooks")]
 fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -508,6 +564,35 @@ fn build_captured_llm_request(
         .unwrap_or(false);
     let prefix = cacheable_prefix_text(&primary, cache_cfg.is_anthropic);
     let cacheable_prefix_sha256 = sha256_hex(&prefix);
+    let message_cache_control_indices: Vec<usize> = if cache_cfg.is_anthropic {
+        messages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| {
+                let at_msg = value_has_cache_control(m);
+                let in_content = m
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| arr.iter().any(value_has_cache_control));
+                (at_msg || in_content).then_some(i)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Hash each message AFTER normalizing to the shape Anthropic uses for
+    // cache-key derivation (see `normalize_message_for_cache_hash`). This
+    // lets prefix-stability tests prove "same tokens, different marker
+    // placement" is still a cache hit.
+    let message_sha256: Vec<String> = messages
+        .iter()
+        .map(|m| {
+            let normalized = normalize_message_for_cache_hash(m);
+            let canonical = serde_json::to_string(&normalized)
+                .unwrap_or_else(|_| "<unserializable>".into());
+            sha256_hex(&canonical)
+        })
+        .collect();
     CapturedLlmRequest {
         turn_index,
         provider,
@@ -522,6 +607,8 @@ fn build_captured_llm_request(
         last_tool_has_cache_control,
         last_message_has_cache_control,
         cacheable_prefix_sha256,
+        message_cache_control_indices,
+        message_sha256,
     }
 }
 

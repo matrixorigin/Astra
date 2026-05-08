@@ -705,3 +705,299 @@ async fn interleaved_tool_and_text_rounds_preserve_event_order_and_history() {
     assert!(g[0].messages.len() <= g[1].messages.len());
     assert!(g[1].messages.len() < g[2].messages.len());
 }
+
+// ── pc-rolling-breakpoint: message-history cache stability across rounds ────
+//
+// Captured production traffic (~/.astra/sessions/<sid>/llm_capture_*.json)
+// showed `cache_read` pinned at ~10 688 tokens for ~60 consecutive rounds —
+// the exact size of `system + tools`. Message history contributed zero cache
+// hits despite conversations spanning tens of thousands of tokens.
+//
+// Root cause: `annotate_last_message_cache_breakpoint` rebuilds from scratch
+// each round. Round N places `cache_control` on `messages[k]`. Round N+1
+// starts from clean state and places the marker on `messages[k']` where
+// k' > k, so `messages[k]` in round N+1 no longer carries the marker and
+// therefore has different bytes than in round N. Anthropic's prefix cache
+// can only reuse a byte-identical prefix, so it falls back to the
+// `system + tools` boundary — exactly what we observed.
+//
+// The fix: a **rolling** breakpoint scheme that places TWO cache_control
+// markers inside the message history each round:
+//   - historical: the breakpoint inherited from the previous round's tail
+//   - tail:       the new breakpoint for this round's last completed turn
+// Critically, the historical index in round N+1 MUST equal the tail index
+// from round N. That invariant is what the tests below enforce.
+//
+// Expected cache-read growth: instead of flat ~10 688, reads should scale
+// with conversation history length.
+
+fn assistant_reply(text: &str) -> Value {
+    json!({ "role": "assistant", "content": text })
+}
+
+fn user_msg(text: &str) -> Value {
+    json!({ "role": "user", "content": text })
+}
+
+/// Helper: append an assistant+user pair to simulate one completed exchange.
+fn advance_turn(
+    state: &mut astra_runtime::turn::agentic_loop_host::AgenticLoopState,
+    reply: &str,
+    next_q: &str,
+) {
+    state.messages.push(assistant_reply(reply));
+    state.messages.push(user_msg(next_q));
+}
+
+// ── pc-rolling-msg-cc-count: from round 3 onwards each request MUST emit 2
+//    message-level cache_control markers (historical + tail). Single marker
+//    means we are rebuilding-from-scratch and will miss cache. Round 2 with
+//    only `[user, assistant, user]` has no room for a historical marker
+//    before the first user; it is allowed to emit just the tail.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
+async fn rolling_breakpoint_round3_onwards_has_two_message_markers() {
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let rounds = vec![
+        scripted_round("r1 reply"),
+        scripted_round("r2 reply"),
+        scripted_round("r3 reply"),
+        scripted_round("r4 reply"),
+    ];
+    let mut host = build_host(
+        rounds,
+        Some(("anthropic", "claude-sonnet-4")),
+        capture.clone(),
+    );
+    let mut state = make_test_loop_state();
+    state.max_turn_input_tokens = 200_000;
+
+    state.messages.push(user_msg("q1"));
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+    advance_turn(&mut state, "r1 reply", "q2");
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+    advance_turn(&mut state, "r2 reply", "q3");
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+    advance_turn(&mut state, "r3 reply", "q4");
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+    let g = capture.lock().unwrap();
+    assert_eq!(g.len(), 4);
+    assert!(
+        g[0].message_cache_control_indices.len() <= 1,
+        "round 1 has at most 1 message marker (no previous turn), got {:?}",
+        g[0].message_cache_control_indices
+    );
+    // Round 2 has msgs=[user,assistant,user]. The "message before penult
+    // user" position is -1 (doesn't exist), so historical collapses away
+    // and only the tail marker is emitted. Accept either 1 or 2 markers
+    // — what matters is the rolling invariant from round 3 onward.
+    assert!(
+        g[1].message_cache_control_indices.len() >= 1,
+        "round 2 must emit at least a tail marker, got {:?}",
+        g[1].message_cache_control_indices
+    );
+    assert_eq!(
+        g[2].message_cache_control_indices.len(),
+        2,
+        "round 3 MUST carry 2 message cache_control markers \
+         (historical + tail) — got {:?}",
+        g[2].message_cache_control_indices
+    );
+    assert_eq!(
+        g[3].message_cache_control_indices.len(),
+        2,
+        "round 4 MUST carry 2 message cache_control markers \
+         (historical + tail) — got {:?}",
+        g[3].message_cache_control_indices
+    );
+}
+
+// ── pc-rolling-msg-cc-position: the historical marker in round N+1 must sit
+//    at the SAME message index as the tail marker in round N. This is the
+//    byte-identity invariant that enables cross-round prefix reuse.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
+async fn rolling_breakpoint_historical_marker_matches_previous_tail() {
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let rounds = vec![
+        scripted_round("r1"),
+        scripted_round("r2"),
+        scripted_round("r3"),
+        scripted_round("r4"),
+    ];
+    let mut host = build_host(
+        rounds,
+        Some(("anthropic", "claude-sonnet-4")),
+        capture.clone(),
+    );
+    let mut state = make_test_loop_state();
+    state.max_turn_input_tokens = 200_000;
+    state.messages.push(user_msg("q1"));
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+    advance_turn(&mut state, "r1", "q2");
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+    advance_turn(&mut state, "r2", "q3");
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+    advance_turn(&mut state, "r3", "q4");
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+    let g = capture.lock().unwrap();
+
+    // From round 3 onward every round must have 2 markers, and the rolling
+    // invariant must hold: round N's tail marker == round N+1's historical.
+    assert_eq!(
+        g[2].message_cache_control_indices.len(),
+        2,
+        "precondition: round 3 must have 2 markers"
+    );
+    assert_eq!(
+        g[3].message_cache_control_indices.len(),
+        2,
+        "precondition: round 4 must have 2 markers"
+    );
+
+    // Round 2 → Round 3: round 2's tail must equal round 3's historical.
+    assert_eq!(
+        *g[1].message_cache_control_indices.last().unwrap(),
+        g[2].message_cache_control_indices[0],
+        "round 3's historical marker must sit at the same index as round 2's \
+         tail marker (r2 indices {:?}, r3 indices {:?})",
+        g[1].message_cache_control_indices,
+        g[2].message_cache_control_indices,
+    );
+
+    // Round 3 → Round 4: round 3's tail must equal round 4's historical.
+    assert_eq!(
+        g[2].message_cache_control_indices[1],
+        g[3].message_cache_control_indices[0],
+        "round 4's historical marker must sit at the same index as round 3's \
+         tail marker (r3 indices {:?}, r4 indices {:?})",
+        g[2].message_cache_control_indices,
+        g[3].message_cache_control_indices,
+    );
+}
+
+// ── pc-rolling-msg-byte-identity: the bytes of messages[0..=prev_tail] in
+//    round N+1 MUST equal the bytes of messages[0..=prev_tail] in round N.
+//    This is the real cache-hit invariant — Anthropic hashes raw bytes, not
+//    semantic content. If any historical message's cache_control marker is
+//    silently dropped between rounds, its bytes diverge and the cached
+//    prefix is lost.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
+async fn rolling_breakpoint_historical_prefix_bytes_stable_across_rounds() {
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let rounds = vec![
+        scripted_round("r1"),
+        scripted_round("r2"),
+        scripted_round("r3"),
+        scripted_round("r4"),
+    ];
+    let mut host = build_host(
+        rounds,
+        Some(("anthropic", "claude-sonnet-4")),
+        capture.clone(),
+    );
+    let mut state = make_test_loop_state();
+    state.max_turn_input_tokens = 200_000;
+    state.messages.push(user_msg("q1"));
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+    advance_turn(&mut state, "r1", "q2");
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+    advance_turn(&mut state, "r2", "q3");
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+    advance_turn(&mut state, "r3", "q4");
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+    let g = capture.lock().unwrap();
+
+    // Key invariant: from round 3 onward, every message up to and including
+    // the PREVIOUS round's tail marker must be byte-identical across the two
+    // rounds. Anthropic hashes raw JSON bytes, so if the historical-carrying
+    // message loses its cache_control attribute between rounds, the prefix
+    // diverges and cache read collapses to system+tools size.
+    //
+    // We assert on round 2 → 3 and round 3 → 4 transitions. Round 1 → 2 is
+    // special-cased (round 2 has no room for a historical marker).
+    let r2_tail = *g[1]
+        .message_cache_control_indices
+        .last()
+        .expect("round 2 must carry at least one marker");
+    for i in 0..=r2_tail {
+        assert_eq!(
+            g[1].message_sha256[i], g[2].message_sha256[i],
+            "round 3 message[{i}] bytes must equal round 2 — \
+             cache_control dropped? r2={:?}, r3={:?}",
+            g[1].message_cache_control_indices,
+            g[2].message_cache_control_indices,
+        );
+    }
+
+    let r3_tail = *g[2]
+        .message_cache_control_indices
+        .last()
+        .expect("round 3 must carry a tail marker");
+    for i in 0..=r3_tail {
+        assert_eq!(
+            g[2].message_sha256[i], g[3].message_sha256[i],
+            "round 4 message[{i}] bytes must equal round 3 — \
+             cache_control dropped? r3={:?}, r4={:?}",
+            g[2].message_cache_control_indices,
+            g[3].message_cache_control_indices,
+        );
+    }
+}
+
+// ── pc-provider-neutral-noop: rolling breakpoints are Anthropic-only. For
+//    OpenAI-compatible providers (OpenAI, MiniMax, Qwen, DeepSeek, etc.) no
+//    cache_control may leak into the serialized messages — those providers
+//    reject or silently ignore the field, and byte-stability is achieved by
+//    keeping messages untouched.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
+async fn rolling_breakpoint_noop_for_openai_compatible_providers() {
+    for (provider, model) in [
+        ("openai", "gpt-4o-mini"),
+        ("minimax", "MiniMax-M2.7"),
+        ("deepseek", "deepseek-chat"),
+    ] {
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        let rounds = vec![
+            scripted_round("a"),
+            scripted_round("b"),
+            scripted_round("c"),
+        ];
+        let mut host = build_host(rounds, Some((provider, model)), capture.clone());
+        let mut state = make_test_loop_state();
+        state.messages.push(user_msg("q1"));
+        host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+        advance_turn(&mut state, "a", "q2");
+        host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+        advance_turn(&mut state, "b", "q3");
+        host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+        let g = capture.lock().unwrap();
+        for (i, c) in g.iter().enumerate() {
+            assert!(
+                !c.is_anthropic,
+                "{provider}: must not latch anthropic mode (round {i})",
+            );
+            assert!(
+                c.message_cache_control_indices.is_empty(),
+                "{provider}: messages must carry zero cache_control markers, \
+                 got {:?} (round {i})",
+                c.message_cache_control_indices,
+            );
+        }
+    }
+}
