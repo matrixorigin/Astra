@@ -862,6 +862,60 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         &mut state.turn_guard,
     );
 
+    // ── Force-stop on consecutive identical signatures ───────────────────
+    // `apply_cli_agentic_stall_preflight` pushes a
+    // `FORCE_STOP_CONSECUTIVE_EVENT` once the streak of identical tool-call
+    // signatures crosses `CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP`. At that
+    // point soft nudges have already fired and been ignored; we terminate
+    // the turn with a clear interruption reason instead of burning rounds
+    // until `token_budget_exceeded`. Session 05e63cac t10 regression:
+    // 4 identical `cargo clippy` calls tripped nudges, LLM ignored them
+    // and continued for ~50 rounds before budget cutoff.
+    let force_stop_fired = state
+        .stall
+        .events
+        .iter()
+        .any(|(name, _)| name == astra_turn_core::agentic_stall_preflight::FORCE_STOP_CONSECUTIVE_EVENT);
+    if force_stop_fired {
+        let last_sig = state
+            .stall
+            .turn_sigs
+            .last()
+            .and_then(|s| s.iter().next().cloned())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        if !prep.quiet {
+            host.emit_headless_line(
+                super::agentic_headless_round::HeadlessStderrStyle::Yellow,
+                format!(
+                    "⚠ Hard-stop: {} consecutive identical tool calls ({}); \
+                     soft nudges were ignored. Terminating turn.",
+                    astra_turn_core::stall::CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP,
+                    last_sig,
+                ),
+            );
+        }
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            super::agentic_loop_lifecycle::interruption_state_summary(
+                state,
+                Some(format!(
+                    "force_stop_consecutive: {} identical tool-call signatures \
+                     in a row; soft nudges had no effect",
+                    astra_turn_core::stall::CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP,
+                )),
+            ),
+        ));
+        observe_turn_end_without_tools(
+            state,
+            turn_index,
+            prep.turn_start_time,
+            turn_result.ttft_ms,
+        );
+        finalize_and_render(host, state).await;
+        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
+    }
+
     let valid_tool_names = host.valid_tool_names().clone();
     let DelegationInterceptionResult {
         effective_tool_calls,
