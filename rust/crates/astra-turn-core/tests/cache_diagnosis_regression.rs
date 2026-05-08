@@ -41,11 +41,11 @@ use astra_turn_core::introspect::cache_diagnosis::{
 };
 use serde_json::Value;
 
-fn fixture_dir() -> PathBuf {
+fn fixture_dir(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
-        .join("cache_diagnosis_d0640d3d")
+        .join(name)
 }
 
 /// Load every `t{N}_r{M}.json` file in the fixture dir, sorted by
@@ -53,10 +53,10 @@ fn fixture_dir() -> PathBuf {
 /// ([`snapshot_from_capture_json`]) so that fixture drift surfaces
 /// here (test) or in prod reads, never silently — they share one
 /// code path.
-fn load_fixture_rounds() -> Vec<RoundSnapshot> {
-    let dir = fixture_dir();
+fn load_fixture_rounds(name: &str) -> Vec<RoundSnapshot> {
+    let dir = fixture_dir(name);
     let mut entries: Vec<(u32, u32, PathBuf)> = std::fs::read_dir(&dir)
-        .expect("fixture dir exists")
+        .unwrap_or_else(|e| panic!("fixture dir {dir:?} readable: {e}"))
         .filter_map(Result::ok)
         .filter_map(|e| {
             let path = e.path();
@@ -85,7 +85,7 @@ fn load_fixture_rounds() -> Vec<RoundSnapshot> {
 /// Sanity: fixture loaded at all.
 #[test]
 fn fixture_loads_19_captures() {
-    let rounds = load_fixture_rounds();
+    let rounds = load_fixture_rounds("cache_diagnosis_d0640d3d");
     assert_eq!(
         rounds.len(),
         19,
@@ -118,7 +118,7 @@ fn fixture_loads_19_captures() {
 /// without an intentional rule change, a real bug is slipping through.
 #[test]
 fn d0640d3d_fixture_triggers_session_specific_rules() {
-    let rounds = load_fixture_rounds();
+    let rounds = load_fixture_rounds("cache_diagnosis_d0640d3d");
     let findings: Vec<CacheFinding> = evaluate_all(&rounds);
     let ids: Vec<&str> = findings.iter().map(|f| f.rule_id).collect();
 
@@ -174,5 +174,50 @@ fn d0640d3d_fixture_triggers_session_specific_rules() {
         tool_tail.narrative.contains("index 19") && tool_tail.narrative.contains("of 21"),
         "tool_marker_not_on_tail narrative should name the gap (19 of 21): got {}",
         tool_tail.narrative,
+    );
+}
+
+/// Gold-standard negative fixture — session `462c485e` (2026-05-08) captured
+/// a clean 5-round Bedrock run where every cache invariant held:
+/// rolling breakpoint advanced round-to-round, tool_cc sat on the last
+/// tool, and cache_read was a flat 8426 tokens across all 5 rounds.
+///
+/// **No rule should fire on this fixture.** It's the negative counterpart
+/// to `d0640d3d_fixture_triggers_session_specific_rules` and
+/// `cache_diagnosis_986a553e`: if a future refactor makes any rule
+/// over-eager on an unambiguously healthy session, this test fails
+/// immediately instead of leaking into production as a false-positive
+/// alert.
+///
+/// See `fixtures/cache_diagnosis_462c485e_healthy/README.md` for the
+/// detailed round table.
+#[test]
+fn healthy_462c485e_fixture_produces_no_findings() {
+    let rounds = load_fixture_rounds("cache_diagnosis_462c485e_healthy");
+    assert_eq!(
+        rounds.len(),
+        5,
+        "462c485e fixture must have 5 captures (t1 r0-r4); got {}",
+        rounds.len(),
+    );
+    // Spot-check structural invariants the README promises so a future
+    // re-scrub that silently drops one of them fails here, not in the
+    // rule loop.
+    for r in &rounds {
+        assert_eq!(r.provider, "bedrock");
+        assert_eq!(r.model, "us.anthropic.claude-sonnet-4-6");
+        assert_eq!(r.cache_read_tokens, 8426);
+        assert_eq!(
+            r.tool_cc_index,
+            Some(20),
+            "tool_cc must sit on the last tool (index 20 of 21)",
+        );
+    }
+
+    let findings: Vec<CacheFinding> = evaluate_all(&rounds);
+    assert!(
+        findings.is_empty(),
+        "healthy 462c485e fixture must produce zero findings — a rule \
+         became over-eager. findings={findings:#?}",
     );
 }
