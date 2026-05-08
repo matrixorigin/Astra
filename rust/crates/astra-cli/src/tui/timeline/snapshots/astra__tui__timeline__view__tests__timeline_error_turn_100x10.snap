@@ -1,0 +1,14 @@
+---
+source: crates/astra-cli/src/tui/timeline/view.rs
+expression: "render_tl(&tl, 100, 10)"
+---
+┌ Timeline · 2 turns · 500 in 200 out ─────────────────────────────────────────────────────────────┐
+│  #1    1.6s  0t     500/200  hi                           turn 2                                 │
+│▌ #2    1.7s  0t         0/0  boom                         started 10:02:00                       │
+│                                                           took    1.7s                           │
+│                                                           tokens  0 / 0                          │
+│                                                           cum in  500                            │
+│                                                           cum out 200                            │
+│                                                           tools   0                              │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

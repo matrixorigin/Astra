@@ -374,6 +374,11 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Core,
     )
     .with_arg_hint("[session_id]"),
+    CommandMeta::new(
+        "/timeline",
+        "Browse this session's turn-by-turn journal timeline",
+        CommandGroup::Core,
+    ),
     CommandMeta::new("/exit", "Exit the REPL", CommandGroup::Core),
     CommandMeta::new(
         "/quit",

@@ -33,6 +33,7 @@ mod slash_dispatch;
 mod slash_menu;
 mod state;
 mod status_line;
+mod timeline;
 mod view_stack;
 mod stream_bridge;
 mod streaming;

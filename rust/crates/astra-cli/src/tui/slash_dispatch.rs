@@ -291,6 +291,24 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
+        // ── Session timeline (TUI-native) ───────────────────────────
+        "/timeline" => {
+            use crate::tui::bottom_pane::timeline_view::TimelineView;
+            use crate::tui::timeline::{JournalTurnSource, Timeline};
+            let Some(sid) = ctx.state.session_id.clone() else {
+                ctx.show_info("No active session — /timeline needs a session id.".into());
+                return SlashResult::Handled;
+            };
+            let timeline = Timeline::new(JournalTurnSource::new(), &sid);
+            if timeline.is_empty() {
+                ctx.show_info(format!("No turns recorded yet for session {sid}."));
+                return SlashResult::Handled;
+            }
+            ctx.bottom_pane
+                .push_view(Box::new(TimelineView::new(timeline)));
+            SlashResult::Handled
+        }
+
         // ── Resume picker (TUI-native) ──────────────────────────────
         "/resume" => {
             if !args.is_empty() {
