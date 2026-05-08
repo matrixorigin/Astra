@@ -354,17 +354,45 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     let pruned_tool_schemas = output.optimized.tool_schemas.clone();
 
     let (primary_system, dynamic_system) = if is_anthropic {
-        // Anthropic multi-block with cache_control. serialize_provider_request
-        // already placed cache markers per the policy.
-        let mut blocks: Vec<Value> = Vec::with_capacity(output.serialized.system_blocks.len());
+        // Anthropic-protocol path: emit STABLE blocks (non-None scope)
+        // as multi-block content with cache_control markers; promote
+        // volatile (CacheScope::None) blocks into the `dynamic_system`
+        // second message so the primary system content stays byte-
+        // stable across rounds.
+        //
+        // The earlier revision kept volatile blocks inline in the
+        // system content array on the theory that the cache_control
+        // marker "isolates" them. Controlled probes against DeepSeek's
+        // `/anthropic` endpoint (see `tests/fixtures/
+        // deepseek_anthropic_cache_probe.py`) proved this leaks
+        // byte churn into DeepSeek's payload-identity check — tools
+        // (~5K tokens) never reach the 2nd-warm cache state. Bedrock
+        // is first-call-complete either way, so moving volatile out
+        // is globally safe. Session 5c5cbf78 t5_r0 diff showed
+        // system.block[3] (Self-Awareness counter) was the sole
+        // per-round delta.
+        use astra_turn_core::section_types::CacheScope;
+        let mut stable_blocks: Vec<Value> =
+            Vec::with_capacity(output.serialized.system_blocks.len());
+        let mut dynamic_text = String::new();
         for block in &output.serialized.system_blocks {
-            let mut b = json!({"type": "text", "text": block.text});
-            if let Some(ref cc) = block.cache_control {
-                b["cache_control"] = cc.clone();
+            if matches!(block.scope, CacheScope::None) {
+                dynamic_text.push_str(&block.text);
+            } else {
+                let mut b = json!({"type": "text", "text": block.text});
+                if let Some(ref cc) = block.cache_control {
+                    b["cache_control"] = cc.clone();
+                }
+                stable_blocks.push(b);
             }
-            blocks.push(b);
         }
-        (json!({"role": "system", "content": blocks}), None)
+        let primary = json!({"role": "system", "content": stable_blocks});
+        let dynamic = if dynamic_text.is_empty() {
+            None
+        } else {
+            Some(json!({"role": "system", "content": dynamic_text}))
+        };
+        (primary, dynamic)
     } else {
         // OpenAI stable+dynamic split: stable = non-None-scoped blocks joined,
         // dynamic = None-scoped joined separately.
@@ -989,7 +1017,7 @@ mod tests {
                 prompts::PromptTokenBucket::Environment,
             ),
         ];
-        let (primary, _dynamic, _) = assemble_system_message_via_pipeline(
+        let (primary, dynamic, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &extra,
             0.8,
@@ -1001,20 +1029,37 @@ mod tests {
             Some("/tmp"),
             None,
         );
-        let all_text: String = primary["content"]
+        // Post-5c5cbf78 contract: volatile (CacheScope::None) sections
+        // are promoted out of the primary system content array and into
+        // the `dynamic` second message, so the primary stays byte-stable
+        // across rounds. Accept the extras from either slot — what
+        // matters for this test is that they're still routed through to
+        // the LLM payload.
+        let primary_text: String = primary["content"]
             .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|b| b.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let dynamic_text = dynamic
+            .as_ref()
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let all_text = format!("{primary_text}\n{dynamic_text}");
         assert!(
             all_text.contains("Session Anchor"),
-            "extra section 1 must reach the final prompt"
+            "extra section 1 must reach the final prompt (primary or dynamic): \
+             primary={primary_text:?} dynamic={dynamic_text:?}",
         );
         assert!(
             all_text.contains("Learned Feedback Rules"),
-            "extra section 2 must reach the final prompt"
+            "extra section 2 must reach the final prompt (primary or dynamic): \
+             primary={primary_text:?} dynamic={dynamic_text:?}",
         );
     }
 

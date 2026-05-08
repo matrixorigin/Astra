@@ -1820,7 +1820,6 @@ impl ServerAgenticLoopHost {
         use crate::turn::context_pipeline_adapter::{
             build_external_sources, build_session_context, build_turn_state,
         };
-        use astra_turn_core::context_serializer::system_blocks_to_anthropic_content;
         use astra_turn_core::context_sources::AgentContext;
         use astra_turn_core::pipeline_session::AdaptiveTurnInput;
 
@@ -1973,14 +1972,74 @@ impl ServerAgenticLoopHost {
 
         let (system_messages, volatile_preamble) = match cache_cap.volatile_placement {
             VolatilePlacement::MarkerIsolated => {
-                // Anthropic / Bedrock: volatile lives INSIDE the system
-                // block, after the last cache_control marker. No
-                // separate preamble needed — the marker isolates it.
-                let content = system_blocks_to_anthropic_content(&pipeline_output.serialized);
-                (
-                    vec![json!({"role": "system", "content": content})],
-                    Vec::new(),
-                )
+                // Anthropic-protocol providers (Anthropic, Bedrock, DeepSeek's
+                // /anthropic endpoint). Earlier design kept volatile blocks
+                // INSIDE the system content array past the last cache_control
+                // marker, on the theory that the marker "isolates" them from
+                // the cached prefix.
+                //
+                // Controlled probes against Bedrock Converse and DeepSeek's
+                // /anthropic endpoint (see
+                // `astra-turn-core/tests/fixtures/deepseek_anthropic_cache_probe.py`
+                // and session 5c5cbf78 analysis) showed this is suboptimal
+                // for DeepSeek: every round's volatile-tail byte change
+                // looks like a fresh payload and the provider's cache-
+                // write/read pipeline never reaches the 2nd-warm state
+                // where tools get cached. Production cache_read stalls at
+                // ~2432 (system-prefix-only) instead of ~10K (system +
+                // tools). Bedrock is unaffected (first-call-complete
+                // caching) but also loses nothing from moving volatile to
+                // the user message.
+                //
+                // New policy: build the system content array from STABLE
+                // blocks only; volatile (CacheScope::None) blocks get
+                // promoted to the same `volatile_preamble` path that
+                // TailSuffix/CurrentUserOnly already use. That keeps the
+                // cache-control marker on the tail of the system content
+                // and makes the full system+tools+history byte-stable
+                // across rounds.
+                use astra_turn_core::section_types::CacheScope;
+                let stable_content: Vec<Value> = pipeline_output
+                    .serialized
+                    .system_blocks
+                    .iter()
+                    .filter(|b| b.scope != CacheScope::None)
+                    .map(|block| {
+                        let mut v = json!({
+                            "type": "text",
+                            "text": block.text,
+                        });
+                        if let Some(ref cc) = block.cache_control {
+                            v["cache_control"] = cc.clone();
+                        }
+                        v
+                    })
+                    .collect();
+                let volatile_text: String = pipeline_output
+                    .serialized
+                    .system_blocks
+                    .iter()
+                    .filter(|b| b.scope == CacheScope::None)
+                    .map(|b| b.text.as_str())
+                    .collect();
+                let system_msgs = vec![json!({"role": "system", "content": stable_content})];
+                let preamble = if !inject_volatile || volatile_text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![
+                        json!({
+                            "role": "user",
+                            "content": format!(
+                                "<system-reminder>\n{volatile_text}</system-reminder>"
+                            ),
+                        }),
+                        json!({
+                            "role": "assistant",
+                            "content": "Understood.",
+                        }),
+                    ]
+                };
+                (system_msgs, preamble)
             }
             VolatilePlacement::TailSuffix
             | VolatilePlacement::CurrentUserOnly
@@ -4092,12 +4151,22 @@ mod tests {
         );
     }
 
-    /// Anthropic path uses `VolatilePlacement::MarkerIsolated` — the
-    /// preamble is empty because volatile content lives INSIDE the
-    /// system block behind a cache_control marker. This invariant
-    /// must hold at every round.
+    /// Anthropic path (MarkerIsolated) — post-fix contract: volatile
+    /// (CacheScope::None) blocks are promoted OUT of the system content
+    /// array and into `volatile_preamble` so the system content stays
+    /// byte-stable across rounds. This unblocks tool-schema caching on
+    /// DeepSeek's `/anthropic` endpoint (see session 5c5cbf78 analysis
+    /// and `tests/fixtures/deepseek_anthropic_cache_probe.py`) and is
+    /// no-op for Bedrock (which cache-writes the full payload on the
+    /// first call regardless).
+    ///
+    /// The preamble existence on a given round depends on whether the
+    /// pipeline generated any `CacheScope::None` blocks in the first
+    /// place; here we just assert the MarkerIsolated branch no longer
+    /// leaves stable and volatile content co-mingled in the system
+    /// content array.
     #[tokio::test]
-    async fn run_turn_pipeline_anthropic_never_emits_preamble() {
+    async fn run_turn_pipeline_anthropic_system_content_stays_byte_stable() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -4121,16 +4190,24 @@ mod tests {
         ));
         let tools = host.edge_tools.clone();
 
-        for round in [0, 1, 7] {
-            state.current_round_index = round;
-            let out = host.run_turn_pipeline(&mut state, &tools, "anthropic", "claude-sonnet-4", "hi");
-            assert!(
-                out.volatile_preamble.is_empty(),
-                "Anthropic never emits preamble (volatile lives in system block); \
-                 round={round} preamble={:?}",
-                out.volatile_preamble,
-            );
-        }
+        // Capture system content on two different rounds and assert the
+        // byte-stable invariant. The old MarkerIsolated branch embedded
+        // the Turn/Tokens counter inside the system content, so
+        // `system_messages[0]["content"]` differed between round 0 and
+        // round 7. Post-fix: the counter rides in `volatile_preamble`
+        // and system content is identical.
+        state.current_round_index = 0;
+        let r0 = host.run_turn_pipeline(&mut state, &tools, "anthropic", "claude-sonnet-4", "hi");
+        state.current_round_index = 7;
+        let r7 = host.run_turn_pipeline(&mut state, &tools, "anthropic", "claude-sonnet-4", "hi");
+
+        assert_eq!(
+            r0.system_messages, r7.system_messages,
+            "system_messages must be byte-identical across rounds — any \
+             drift here reopens the session 5c5cbf78 cache regression. \
+             r0={:#?} r7={:#?}",
+            r0.system_messages, r7.system_messages,
+        );
     }
 
     #[tokio::test]

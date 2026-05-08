@@ -1702,17 +1702,16 @@ impl InProcessChatTurnBridge {
             llm_messages.push(system_msg);
             let mut bridge_volatile_text: Option<String> = None;
             if let Some(dyn_msg) = dynamic_msg {
-                // For prefix-only providers the dynamic system block contains
-                // volatile per-turn content. We prepend it to the last user
-                // message (below, after compacted messages are added) so the
-                // stable prefix (system + history) is byte-identical across
-                // turns for maximum prefix cache hits.
-                // Anthropic never reaches here (dynamic_system is None).
-                debug_assert!(
-                    !crate::turn::llm_client::provider_uses_explicit_cache_control(&provider),
-                    "Anthropic/Bedrock should not produce dynamic_system — \
-                     volatile content goes via pipeline cache_control markers"
-                );
+                // Volatile per-turn content (Self-Awareness counter, session
+                // anchor, etc.) — ALL protocols now route it to the
+                // last user message prefix so the system + tools prefix stays
+                // byte-stable across rounds. Earlier the Anthropic/Bedrock
+                // paths embedded volatile in the system content array past
+                // the cache_control marker; controlled probes (session
+                // 5c5cbf78, see deepseek_anthropic_cache_probe.py) showed
+                // DeepSeek treats the byte change as a fresh payload and
+                // never reaches the 2nd-warm state where tools enter cache.
+                // Bedrock is unaffected either way.
                 let dyn_text = dyn_msg
                     .get("content")
                     .and_then(Value::as_str)
