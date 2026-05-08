@@ -78,7 +78,10 @@ fn flush_cell_to_scrollback(
     if !display.is_empty() {
         let mut hist = Vec::new();
         hist.extend(display);
-        hist.push(ratatui::text::Line::default());
+        // Single trailing blank between cells — Codex uses two, but at
+        // our default font metrics that reads as a full paragraph break
+        // and the transcript starts looking sparse. One blank is still
+        // enough to separate cells visually.
         hist.push(ratatui::text::Line::default());
         guard.queue_history_lines(hist);
     }
@@ -118,10 +121,9 @@ fn finalize_stream(
         if let Some(cell) = final_cell {
             flush_mini_cell(guard, cell, width, transcript);
         }
-        guard.queue_history_lines(vec![
-            ratatui::text::Line::default(),
-            ratatui::text::Line::default(),
-        ]);
+        // One blank after the stream finalizes — matches the single-
+        // blank convention used by `flush_cell_to_scrollback`.
+        guard.queue_history_lines(vec![ratatui::text::Line::default()]);
         transcript.push(ratatui::text::Line::default());
     }
 }
