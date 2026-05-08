@@ -1628,6 +1628,51 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
         }
         "tool" => {
             let tool_use_id = msg.get("tool_call_id").and_then(Value::as_str)?;
+            // The message's `content` may already be a pre-annotated
+            // `[{type: "tool_result", ...}]` block array — this happens
+            // when `annotate_last_message_cache_breakpoint` landed on
+            // this tool message and upgraded its string content to the
+            // content-block shape. In that case we must forward the
+            // already-built tool_result verbatim (so cache_control /
+            // tool_use_id placed by the annotator survives), otherwise
+            // we'd nest `tool_result` inside another `tool_result.content`
+            // — which DeepSeek's anthropic endpoint rejects with
+            // "messages[N]: unknown variant `tool_result`".
+            if let Some(arr) = msg.get("content").and_then(Value::as_array)
+                && arr
+                    .iter()
+                    .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            {
+                let mut blocks = arr.clone();
+                // Defensively stamp `tool_use_id` / `cache_reference` on any
+                // tool_result blocks that lack them (the annotator always
+                // supplies tool_use_id but cache_reference is runtime-level).
+                for block in blocks.iter_mut() {
+                    if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                        continue;
+                    }
+                    let Some(obj) = block.as_object_mut() else {
+                        continue;
+                    };
+                    if !obj.contains_key("tool_use_id") {
+                        obj.insert(
+                            "tool_use_id".into(),
+                            Value::String(tool_use_id.to_string()),
+                        );
+                    }
+                    if !obj.contains_key("cache_reference")
+                        && let Some(cr) = msg.get("cache_reference").cloned()
+                    {
+                        obj.insert("cache_reference".into(), cr);
+                    }
+                }
+                let mut out = json!({
+                    "role": "user",
+                    "content": blocks,
+                });
+                carry_cache_annotations(msg, &mut out);
+                return Some(out);
+            }
             let content = msg
                 .get("content")
                 .and_then(Value::as_str)
@@ -4940,6 +4985,66 @@ mod tests {
         assert_eq!(blocks[0]["type"], "text");
         assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
         assert_eq!(blocks[1]["type"], "cache_edits");
+    }
+
+    // ── pre-annotated tool_result content must not be double-wrapped ────
+    //
+    // After `annotate_last_message_cache_breakpoint` runs, a tool message
+    // like `{role: "tool", tool_call_id: "c1", content: "result"}` is
+    // upgraded in place to `{role: "tool", content: [{type: "tool_result",
+    // tool_use_id: "c1", content: "result", cache_control: {...}}]}`. The
+    // old tool branch of `anthropic_message_from_openai` then wrapped the
+    // already-structured array AGAIN inside a new tool_result block's
+    // `content` field, producing a nested `tool_result → tool_result`
+    // shape. Anthropic/DeepSeek both reject it with
+    // `messages[N].content[0]: unknown variant tool_result, expected one
+    // of text, image, ...`.
+    //
+    // This test locks down the post-fix contract: when the tool message
+    // already carries a tool_result block array, forward it verbatim
+    // under `role: "user"` — no re-wrapping.
+    #[test]
+    fn anthropic_tool_message_preannotated_content_is_forwarded_without_nesting() {
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_abc",
+            "cache_reference": "call_abc",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call_abc",
+                "content": "8a08c39 feat\n14410ad fix",
+                "cache_control": {"type": "ephemeral"},
+            }],
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        assert_eq!(converted["role"], "user");
+        let blocks = converted["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "exactly one content block, not nested");
+        let block = &blocks[0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["tool_use_id"], "call_abc");
+        // `content` must be the string (or original payload) from the
+        // annotator, NOT a nested array containing another tool_result.
+        assert_eq!(block["content"], "8a08c39 feat\n14410ad fix");
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn anthropic_tool_message_string_content_wraps_into_tool_result() {
+        // The other branch: pre-annotation tool message with raw string
+        // content → must still be wrapped in a fresh tool_result block.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_xyz",
+            "content": "hello",
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        assert_eq!(converted["role"], "user");
+        let blocks = converted["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "call_xyz");
+        assert_eq!(blocks[0]["content"], "hello");
     }
 
     #[test]

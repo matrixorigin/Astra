@@ -450,6 +450,7 @@ async fn anthropic_stream_with_retry(
                 // Accumulate state for the final `_inprocess_summary` event.
                 let mut full_text = String::new();
                 let mut reasoning = String::new();
+                let mut reasoning_signature = String::new();
                 let mut tool_calls_map: std::collections::HashMap<usize, Map<String, Value>> =
                     std::collections::HashMap::new();
                 let mut usage = Map::new();
@@ -493,6 +494,7 @@ async fn anthropic_stream_with_retry(
                                 &chunk,
                                 &mut full_text,
                                 &mut reasoning,
+                                &mut reasoning_signature,
                                 &mut tool_calls_map,
                                 &mut usage,
                                 &mut made_progress,
@@ -512,6 +514,7 @@ async fn anthropic_stream_with_retry(
                     "type": "_inprocess_summary",
                     "full_text": full_text,
                     "reasoning": reasoning,
+                    "reasoning_signature": reasoning_signature,
                     "tool_calls": tool_calls,
                     "usage": Value::Object(usage),
                 }));
@@ -558,12 +561,20 @@ async fn anthropic_stream_with_retry(
 /// SSE bytes the bridge's forwarder knows how to handle.
 ///
 /// Updates the caller's accumulator for `full_text` / `reasoning` /
-/// `tool_calls_map` / `usage` so the final `_inprocess_summary` event
-/// has complete state.
+/// `reasoning_signature` / `tool_calls_map` / `usage` so the final
+/// `_inprocess_summary` event has complete state.
+///
+/// `reasoning_signature` is the HMAC-like token Anthropic emits at the
+/// end of every `thinking` content block via a `signature_delta`. When
+/// the caller re-submits the assistant message on the next turn, the
+/// upstream requires the signature to be echoed back — DeepSeek's
+/// anthropic-compatible endpoint surfaces its absence as
+/// `content[].thinking must be passed back` (HTTP 400).
 fn apply_anthropic_event(
     chunk: &Value,
     full_text: &mut String,
     reasoning: &mut String,
+    reasoning_signature: &mut String,
     tool_calls_map: &mut std::collections::HashMap<usize, Map<String, Value>>,
     usage: &mut Map<String, Value>,
     made_progress: &mut bool,
@@ -657,6 +668,22 @@ fn apply_anthropic_event(
                             "type": "reasoning_delta",
                             "content": text,
                         })));
+                        *made_progress = true;
+                    }
+                }
+                Some("signature_delta") => {
+                    // Anthropic emits the HMAC-style signature for the
+                    // preceding thinking block as its own delta. Append
+                    // to accumulator so the final `_inprocess_summary`
+                    // event carries it to the bridge's forwarder, which
+                    // persists it on the assistant message so the NEXT
+                    // turn can echo it back unchanged. DeepSeek's
+                    // anthropic endpoint rejects replays that lose the
+                    // signature.
+                    if let Some(sig) = delta.get("signature").and_then(Value::as_str)
+                        && !sig.is_empty()
+                    {
+                        reasoning_signature.push_str(sig);
                         *made_progress = true;
                     }
                 }
@@ -1658,6 +1685,143 @@ mod tests {
                 .unwrap_or(0)
                 >= 7,
             "output_tokens must reflect message_delta update — got {last_usage}",
+        );
+    }
+
+    // ── anthropic-sse thinking + signature ──────────────────────────────
+    //
+    // Anthropic's extended-thinking protocol sends reasoning as a
+    // `thinking` content block. During streaming the block emits:
+    //   1) `content_block_start` with `content_block.type = "thinking"`
+    //   2) one or more `content_block_delta` with `delta.type = "thinking_delta"`
+    //   3) one `content_block_delta` with `delta.type = "signature_delta"`
+    //      carrying `delta.signature: "<signed_hmac>"`
+    //   4) `content_block_stop`
+    //
+    // The upstream refuses to accept a subsequent assistant message that
+    // echoes thinking content WITHOUT the original signature — DeepSeek's
+    // anthropic-compatible endpoint surfaces this as:
+    //   `content[].thinking in the thinking mode must be passed back to the API`
+    //
+    // Without capturing signature_delta, astra records only the reasoning
+    // text; the next turn's request loses the signature and the upstream
+    // rejects. This test pins the contract that the final
+    // `_inprocess_summary` event carries `reasoning_signature`.
+    #[tokio::test]
+    async fn call_llm_stream_captures_anthropic_thinking_signature() {
+        use axum::{Router, body::Body, extract::State, response::Response, routing::post};
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default, Debug)]
+        struct Hit {
+            got: bool,
+        }
+
+        async fn handler(State(hit): State<Arc<Mutex<Hit>>>) -> Response {
+            hit.lock().expect("hit").got = true;
+            let sse = concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":100,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0}}}\n\n",
+                // Thinking block: start, two thinking deltas, signature delta, stop.
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Let me think\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" about this.\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_abc123\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                // Text block to satisfy Anthropic's rule about a non-thinking
+                // final block.
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            );
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(sse))
+                .expect("response")
+        }
+
+        let hit = Arc::new(Mutex::new(Hit::default()));
+        let app = Router::new()
+            .route("/v1/messages", post(handler))
+            .with_state(hit.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let base = format!("http://{addr}");
+
+        let stream = call_llm_stream(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "claude-test",
+            None,
+            "test-key",
+            &base,
+            "anthropic",
+            Some(50),
+            false,
+            None,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        )
+        .await
+        .expect("stream started");
+
+        let bytes: Vec<Bytes> = stream.collect().await;
+        let raw = bytes
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect::<String>();
+
+        // Walk SSE events and find the _inprocess_summary — it carries the
+        // final `reasoning_signature` the forwarder propagates downstream.
+        let mut summary: Option<Value> = None;
+        for chunk in raw.split("\n\n") {
+            let chunk = chunk.trim();
+            let Some(rest) = chunk.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(rest) else {
+                continue;
+            };
+            if v.get("type").and_then(Value::as_str) == Some("_inprocess_summary") {
+                summary = Some(v);
+                break;
+            }
+        }
+        assert!(hit.lock().expect("hit").got, "upstream was called");
+        let summary = summary.expect("stream must emit a final _inprocess_summary event");
+        assert_eq!(
+            summary
+                .get("reasoning")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "Let me think about this.",
+            "thinking deltas must accumulate into reasoning — got {summary}",
+        );
+        assert_eq!(
+            summary
+                .get("reasoning_signature")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "sig_abc123",
+            "signature_delta must be captured and forwarded so the next \
+             turn can echo it back — got {summary}",
         );
     }
 
