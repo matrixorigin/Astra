@@ -1097,6 +1097,29 @@ pub fn git_blame(project_root: &Path, args: &Value) -> String {
 
 // ─── git_diff ───────────────────────────────────────────────────────────────
 
+/// Check that `path_filter` refers to something git actually tracks or could track.
+/// Returns an explicit error (not empty output) when the path is unknown so callers
+/// can distinguish "path doesn't exist" from "path exists but has no changes".
+fn validate_diff_path_exists(project_root: &Path, path_filter: &str) -> Result<(), String> {
+    let rel = Path::new(path_filter);
+    let joined = project_root.join(rel);
+    if joined.exists() {
+        return Ok(());
+    }
+    // Path may have been deleted but still tracked — ask git's index.
+    if let Some(out) = run_git_with_timeout(
+        project_root,
+        &["ls-files", "--error-unmatch", "--", path_filter],
+    ) && out.status.success()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "Error: path '{path_filter}' does not exist in the working tree or the git index. \
+         Check the spelling (paths are relative to the repo root) or drop the `path` filter."
+    ))
+}
+
 /// `git diff … --stat` via the real `git` CLI (same sources as full diff, no bash).
 fn git_diff_stat_cli(project_root: &Path, args: &Value, limit: usize) -> String {
     let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
@@ -1106,6 +1129,14 @@ fn git_diff_stat_cli(project_root: &Path, args: &Value, limit: usize) -> String 
 
     if staged && git_ref.is_some() {
         return "Error: git_diff: use either staged:true or ref, not both".to_string();
+    }
+    if let Some(p) = path_filter {
+        if let Err(e) = reject_path_traversal(p, project_root) {
+            return e;
+        }
+        if let Err(e) = validate_diff_path_exists(project_root, p) {
+            return e;
+        }
     }
 
     let mut parts: Vec<String> = vec!["diff".into()];
@@ -1169,6 +1200,9 @@ pub fn git_diff(
     let path_filter = args.get("path").and_then(Value::as_str);
     if let Some(p) = path_filter {
         if let Err(e) = reject_path_traversal(p, project_root) {
+            return e;
+        }
+        if let Err(e) = validate_diff_path_exists(project_root, p) {
             return e;
         }
     }
@@ -3938,6 +3972,35 @@ mod tests {
         assert!(
             result.contains("Missing required parameter"),
             "missing action must produce helpful error: {result}"
+        );
+    }
+
+    #[test]
+    fn git_diff_rejects_nonexistent_path_instead_of_silent_empty() {
+        // Regression: previously, `git diff -- <missing-path>` produced empty
+        // output indistinguishable from "no changes". Now it returns an
+        // explicit error so callers know the filter itself was wrong.
+        let dir = init_temp_repo();
+        let result = super::git_diff(
+            dir.path(),
+            &json!({ "path": "totally/missing/path.rs" }),
+            0.0,
+            0,
+        );
+        assert!(
+            result.contains("does not exist"),
+            "missing path must produce explicit error, got: {result}"
+        );
+    }
+
+    #[test]
+    fn git_diff_accepts_tracked_path_with_no_changes() {
+        // Tracked path with no modifications must still succeed (not error).
+        let dir = init_temp_repo();
+        let result = super::git_diff(dir.path(), &json!({ "path": "tracked.txt" }), 0.0, 0);
+        assert!(
+            !result.contains("does not exist"),
+            "tracked path with no changes must not be rejected, got: {result}"
         );
     }
 }

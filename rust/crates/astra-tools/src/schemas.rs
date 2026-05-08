@@ -360,12 +360,71 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["status","diff","log","show","blame","file_history","log_search","contributors","commit","revert_commit","stash","checkout_file","worktree"], "description": "Git operation to perform"},
-                        "file": {"type": "string", "description": "File path (for blame, file_history)"},
-                        "ref": {"type": "string", "description": "Git ref — commit SHA, branch, or tag (for show, diff). Defaults to HEAD if omitted."},
-                        "n": {"type": "integer", "description": "Number of entries (for log)"},
-                        "query": {"type": "string", "description": "Search query (for log_search)"},
-                        "message": {"type": "string", "description": "Commit message (for commit)"}
+                        "action": {
+                            "type": "string",
+                            "enum": ["status","diff","log","show","blame","file_history","log_search","contributors","commit","revert_commit","stash","checkout_file","worktree"],
+                            "description": "Git operation to perform"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Repository-relative file or directory path. Used by: diff, log, blame, checkout_file, contributors."
+                        },
+                        "file": {
+                            "type": "string",
+                            "description": "Repository-relative file path. Used by: file_history (required)."
+                        },
+                        "ref": {
+                            "type": "string",
+                            "description": "Git ref — commit SHA, branch, or tag. Used by: diff (compares ref vs worktree), log (restrict to ref), checkout_file (required: ref to restore from). Defaults to HEAD when omitted."
+                        },
+                        "base_ref": {
+                            "type": "string",
+                            "description": "Base ref for range diffs. Used by: diff (with ref: diff base_ref..ref)."
+                        },
+                        "revision": {
+                            "type": "string",
+                            "description": "Commit-ish to inspect. Used by: show. Defaults to HEAD."
+                        },
+                        "staged": {
+                            "type": "boolean",
+                            "description": "Show staged (index vs HEAD) changes. Used by: diff. Default false."
+                        },
+                        "n": {
+                            "type": "integer",
+                            "description": "Max entries to return. Used by: log (default 10, max 100), file_history (default 10), log_search (default 200)."
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Search query (TF-IDF over commit messages). Used by: log_search (required)."
+                        },
+                        "since": {
+                            "type": "string",
+                            "description": "Git date expression (e.g. '2.weeks.ago', '2024-01-01'). Used by: contributors."
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Commit message. Used by: commit (required), stash (optional, with sub_action=push/save)."
+                        },
+                        "all": {
+                            "type": "boolean",
+                            "description": "Stage all tracked modifications before committing. Used by: commit. Default false."
+                        },
+                        "commit_sha": {
+                            "type": "string",
+                            "description": "Commit SHA to revert. Used by: revert_commit (required)."
+                        },
+                        "sub_action": {
+                            "type": "string",
+                            "description": "Sub-operation for multi-mode actions. Used by: stash (push/save/pop/apply/drop/list), worktree (add/list/remove)."
+                        },
+                        "index": {
+                            "type": "integer",
+                            "description": "Stash index (stash@{N}). Used by: stash with sub_action=apply/pop/drop. Default 0."
+                        },
+                        "stash_ref": {
+                            "type": "string",
+                            "description": "Exact stash selector or OID. Used by: stash with sub_action=apply. Takes precedence over index."
+                        }
                     },
                     "required": ["action"]
                 }
