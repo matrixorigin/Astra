@@ -59,7 +59,14 @@ impl ToolChatCell {
 
     fn bullet(&self) -> Span<'static> {
         match self.status {
-            ToolStatus::Running => Span::styled("• ", Style::default().dim()),
+            // Running uses the theme accent so the in-progress row
+            // pops from the dim scrollback — users reported the dim
+            // bullet was invisible on their terminal, making fast tool
+            // calls look like they skipped the "running" phase entirely.
+            ToolStatus::Running => {
+                let theme = crate::tui::theme::current();
+                Span::styled("• ", Style::default().fg(theme.accent).bold())
+            }
             ToolStatus::Success => Span::styled("• ", Style::default().fg(Color::Green).bold()),
             ToolStatus::Failed => Span::styled("• ", Style::default().fg(Color::Red).bold()),
         }

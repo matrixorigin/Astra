@@ -635,8 +635,7 @@ pub(super) fn do_draw(
     active_cell: &Option<Box<dyn ChatCell>>,
     bottom_pane: &mut BottomPane,
 ) -> Result<(), String> {
-    use render::Insets;
-    use render::renderable::{FlexRenderable, Renderable, RenderableExt, RenderableItem};
+    use render::renderable::{FlexRenderable, Renderable, RenderableItem};
 
     bottom_pane.pre_draw_tick(std::time::Instant::now());
 
@@ -647,7 +646,12 @@ pub(super) fn do_draw(
             let lines = cell.display_lines(width);
             let text = ratatui::text::Text::from(lines);
             let para = ratatui::widgets::Paragraph::new(text);
-            RenderableItem::Owned(Box::new(para)).inset(Insets::tlbr(1, 0, 0, 0))
+            // No top inset — the active cell butts up against the last
+            // scrollback line. A 1-row inset previously meant the
+            // running tool/thinking cell looked "floated" with a blank
+            // between it and scrollback, which then snapped closed once
+            // the cell flushed into scrollback (feeling janky).
+            RenderableItem::Owned(Box::new(para))
         }
         None => RenderableItem::Owned(Box::new(())),
     };
