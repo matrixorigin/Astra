@@ -950,6 +950,19 @@ impl ToolExecutor {
     }
 
     fn handle_introspect(&self, args: &Value) -> String {
+        // `subtopic` routes to a specialized diagnostic. Default behavior
+        // (session health: token pressure, tool health, alerts) remains
+        // unchanged when `subtopic` is missing, empty, or "session".
+        let subtopic = args
+            .get("subtopic")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if subtopic == "cache" {
+            return self.handle_introspect_cache();
+        }
+
         let detail_arg = args
             .get("detail")
             .and_then(Value::as_str)
@@ -970,6 +983,41 @@ impl ToolExecutor {
         // structured output instead of an opaque "first turn" string.
         let snap = snapshot.unwrap_or_default();
         astra_turn_core::introspect::render_introspect(&snap, detail)
+    }
+
+    /// `introspect(subtopic="cache")` — scan recent `llm_capture_*.json`
+    /// files for the current session and run the four cache-diagnosis
+    /// rules over them. Returns a markdown report.
+    ///
+    /// Requires `full_llm_capture=true` in session metadata; otherwise
+    /// the renderer explains why no data is available so the LLM knows
+    /// how to enable it. A future task (#17) adds an in-memory per-turn
+    /// ring so diagnosis also works without full capture.
+    fn handle_introspect_cache(&self) -> String {
+        use astra_turn_core::introspect::cache_diagnosis;
+        let session_id = match self.active_session_id() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => {
+                return cache_diagnosis::render_findings_markdown(&[], &[]);
+            }
+        };
+        let session_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".astra")
+            .join("sessions")
+            .join(&session_id);
+        let rounds = match cache_diagnosis::load_session_captures(&session_dir) {
+            Ok(rs) => rs,
+            Err(e) => {
+                astra_core::agent_warn!(
+                    "introspect",
+                    "cache diagnosis: failed to read session dir {}: {e}",
+                    session_dir.display(),
+                );
+                Vec::new()
+            }
+        };
+        let findings = cache_diagnosis::evaluate_all(&rounds);
+        cache_diagnosis::render_findings_markdown(&rounds, &findings)
     }
 
     pub fn update_introspect_snapshot(
@@ -2064,6 +2112,39 @@ mod tests {
         let out = executor.handle_introspect(&serde_json::json!({"detail": "summary"}));
         assert!(out.contains("Turns: 5/15"), "got: {out}");
         assert!(out.contains("12345in"), "got: {out}");
+    }
+
+    #[test]
+    fn introspect_subtopic_cache_routes_to_cache_diagnosis() {
+        let executor = test_executor();
+        // No session set → renderer explains the "no data" path.
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "cache"}));
+        assert!(
+            out.contains("Cache Diagnosis"),
+            "subtopic=cache must produce the cache section, got: {out}",
+        );
+        assert!(
+            out.contains("No per-round cache snapshots"),
+            "without a session / captures, the renderer must explain why: {out}",
+        );
+    }
+
+    #[test]
+    fn introspect_subtopic_session_is_default_behavior() {
+        // Without subtopic the tool still shows Session Health unchanged.
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({"detail": "summary"}));
+        assert!(
+            out.contains("Session Health"),
+            "default subtopic must preserve legacy output, got: {out}",
+        );
+    }
+
+    #[test]
+    fn introspect_subtopic_cache_is_case_insensitive() {
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "Cache"}));
+        assert!(out.contains("Cache Diagnosis"), "got: {out}");
     }
 
     #[test]

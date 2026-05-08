@@ -1,0 +1,394 @@
+{
+  "model": "us.anthropic.claude-opus-4-7",
+  "outcome": "success",
+  "provider": "bedrock",
+  "request": {
+    "message_count": 26,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "<024dbd2bebefa43f:5954>",
+            "type": "text"
+          },
+          {
+            "text": "<e908c6ff44e4857e:4062>",
+            "type": "text"
+          },
+          {
+            "cache_control": {
+              "type": "ephemeral"
+            },
+            "text": "<9646122f6e4d9438:200>",
+            "type": "text"
+          },
+          {
+            "text": "<3134189627c5047e:3484>",
+            "type": "text"
+          }
+        ],
+        "role": "system"
+      },
+      {
+        "content": "hi",
+        "role": "user"
+      },
+      {
+        "content": "Hi! How can I help you today?",
+        "role": "assistant"
+      },
+      {
+        "content": "hello",
+        "role": "user"
+      },
+      {
+        "content": "<3236b57b0c02ff02:139>",
+        "role": "assistant"
+      },
+      {
+        "content": "hi",
+        "role": "user"
+      },
+      {
+        "content": "<b45b9c6b44c28dfe:66>",
+        "role": "assistant"
+      },
+      {
+        "content": "\u4e3a\u5565\u521a\u624d\u7684cache rate \u8fd9\u4e48\u4f4e\uff01",
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "cache_control": {
+              "type": "ephemeral"
+            },
+            "text": "<2b89537371cbab1a:636>",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": "<1e6300d4637de468:68>",
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "cache_control": {
+              "type": "ephemeral"
+            },
+            "text": "<a75c6c7bcf82e34d:1113>",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": "\u90fd\u68c0\u67e5\u4e00\u4e0b\u554a",
+        "role": "user"
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "<e6e6889e466e1652:111>",
+              "name": "bash"
+            },
+            "id": "tooluse_0IBdKMZnkQxdoeXmZiXgHw",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "_round_index": 0,
+        "_tool_name": "bash",
+        "content": "bash: line 1: rg: command not found",
+        "role": "tool",
+        "tool_call_id": "tooluse_0IBdKMZnkQxdoeXmZiXgHw"
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "<155ddaabfe50331c:145>",
+              "name": "bash"
+            },
+            "id": "tooluse_kAY3GjfLa44P4EREeCSZ2J",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "_round_index": 1,
+        "_tool_name": "bash",
+        "content": "<0b94da16f75ccfde:8356>",
+        "role": "tool",
+        "tool_call_id": "tooluse_kAY3GjfLa44P4EREeCSZ2J"
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "<70eef31634f2a707:93>",
+              "name": "read_file"
+            },
+            "id": "tooluse_ZQjaQ5icVNPZEb4s8kLlAQ",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "_round_index": 2,
+        "_tool_name": "read_file",
+        "content": "<85f61dc615ac687c:2086>",
+        "role": "tool",
+        "tool_call_id": "tooluse_ZQjaQ5icVNPZEb4s8kLlAQ"
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "<b233a1f6c5e76bc8:169>",
+              "name": "bash"
+            },
+            "id": "tooluse_IVlGbYVQBoXOovZV9LL6nr",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "_round_index": 3,
+        "_tool_name": "bash",
+        "content": "<59a34abc5e8461f8:1793>",
+        "role": "tool",
+        "tool_call_id": "tooluse_IVlGbYVQBoXOovZV9LL6nr"
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "<d9b14c086e240dd4:141>",
+              "name": "bash"
+            },
+            "id": "tooluse_lkWNac2o8TqtiYSWEzWGVE",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "_round_index": 4,
+        "_tool_name": "bash",
+        "content": "<dda1084f525a8176:3532>",
+        "role": "tool",
+        "tool_call_id": "tooluse_lkWNac2o8TqtiYSWEzWGVE"
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "<92a9c3956d2996d9:86>",
+              "name": "read_file"
+            },
+            "id": "tooluse_O53I1BCsXoPJzK2PfdDJFG",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "_round_index": 5,
+        "_tool_name": "read_file",
+        "content": "<da47fce54ee05617:5092>",
+        "role": "tool",
+        "tool_call_id": "tooluse_O53I1BCsXoPJzK2PfdDJFG"
+      },
+      {
+        "content": "<2a5f416dffe94914:315>",
+        "role": "system"
+      },
+      {
+        "content": "<e195511ec74dffa3:177>",
+        "role": "system"
+      }
+    ],
+    "tool_count": 21,
+    "tools": [
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<f036392ee6ecad0a:481>",
+          "name": "bash"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<a5c1724998bc2627:610>",
+          "name": "read_file"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<32c9d2f246f0cd4a:443>",
+          "name": "write_file"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<80ba8de0af921882:946>",
+          "name": "str_replace"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<169dd2d6b97d457a:332>",
+          "name": "list_dir"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<9737c05e630a9475:893>",
+          "name": "grep"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<a4a2cad08abafcd8:827>",
+          "name": "glob"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<ecdbd9a0ab98dc81:344>",
+          "name": "introspect"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<17dae0e631c586b4:1717>",
+          "name": "lsp"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<db30cbd4649dc53c:2552>",
+          "name": "git"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<31e1a0b3e9863d8b:510>",
+          "name": "github"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<7b6c83b45c9f85b4:814>",
+          "name": "web_fetch"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<38a3a5b392734f26:683>",
+          "name": "memory"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<8f7eb16c3ba1f11c:1540>",
+          "name": "session"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<6f50aa59ce23b0f4:412>",
+          "name": "mo"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<b76aaafca238b8af:1629>",
+          "name": "agent"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<6099cf86e756edc5:1008>",
+          "name": "symbols"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<a0167fcc5daafadb:421>",
+          "name": "powershell"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<605bc90866fa1dcd:1726>",
+          "name": "run_script"
+        },
+        "type": "function"
+      },
+      {
+        "cache_control": {
+          "type": "ephemeral"
+        },
+        "function": {
+          "_scrubbed_schema_digest": "<21b8adc67b35d234:1049>",
+          "name": "skill"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<d9324ec6f5265316:750>",
+          "name": "web_search"
+        },
+        "type": "function"
+      }
+    ]
+  },
+  "response": {
+    "finish_reason": "tool_calls",
+    "usage": {
+      "cache_creation_tokens": 3494,
+      "cached_input_tokens": 11312,
+      "input_tokens": 10298,
+      "output_tokens": 130,
+      "total_tokens": 25234
+    }
+  },
+  "round": 6,
+  "session_id": "d0640d3d-SCRUBBED",
+  "turn": 6
+}

@@ -544,11 +544,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Query own runtime state: token pressure, cache hit rate, tool health, alerts, working memory. Budget-adaptive detail.",
+                "description": "Query own runtime state. Default topic (subtopic=session) surfaces token pressure, cache hit rate, tool health, alerts, working memory. subtopic='cache' runs a specialized diagnosis over recent LLM captures to locate cache-regression bugs (rolling breakpoint issues, tool-marker positions, prefix collapses, creation/read ratio).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Output detail level (default: auto from budget)"}
+                        "subtopic": {"type": "string", "enum": ["session","cache"], "description": "Which diagnostic to run (default: session)"},
+                        "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Output detail level for the session topic (default: auto from budget). Ignored for subtopic='cache'."}
                     }
                 }
             }

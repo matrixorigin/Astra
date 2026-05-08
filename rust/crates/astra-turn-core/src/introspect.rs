@@ -5,6 +5,8 @@
 //! detail scales with available context budget so the tool never wastes tokens
 //! on verbose diagnostics when the model is under pressure.
 
+pub mod cache_diagnosis;
+
 use serde::{Deserialize, Serialize};
 
 /// Input snapshot provided by the runtime to the introspect renderer.
