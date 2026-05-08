@@ -586,17 +586,31 @@ fn build_working_memory_content(messages: &[Value], max_chars: usize) -> String 
 
     // Extract key information from recent messages.
     //
-    // Scaffolding messages (runtime-injected nudges, attention manifests,
-    // correction headers, verification directives, tool-rollups) are
-    // filtered *before* counting toward the 10-message budget. Without
-    // this filter, the stored working memory becomes a replay of the
-    // runtime's own injections — which Memoria then retrieves on the
-    // next turn as "memories", polluting the volatile lane. Single
-    // source of truth: `astra_turn_types::is_runtime_scaffolding_message`.
+    // Write-time gate: route every candidate through
+    // `should_store_in_memory`. That predicate composes the
+    // scaffolding-message check (runtime-injected nudges / attention
+    // manifests / correction headers / tool-rollups) with the
+    // ephemeral-ack length gate (rejects "继续啊", "修复", "hi",
+    // "好", "ok" and similar short user inputs that carry no durable
+    // signal).
+    //
+    // Both filters run at WRITE time so Memoria never indexes them —
+    // read-time filters (is_memory_worthy / is_digest_worthy) are now
+    // defense-in-depth for legacy-polluted sessions, not the primary
+    // cleanup path. Single source of truth:
+    // `astra_turn_types::should_store_in_memory`.
+    //
+    // Systematic rather than whack-a-mole: Claude Code's memdir design
+    // (see docs/design/memoria-compared-to-claude-code.md) makes the
+    // type-and-description frontmatter mandatory at store time; this
+    // is L1 of porting that principle — reject obvious non-memories
+    // before they ever reach the index. L2 (require [@ns/type] prefix
+    // on stored bodies) and L3 (replace Memoria with file-based
+    // memdir) are follow-ups.
     for msg in messages
         .iter()
         .rev()
-        .filter(|m| !astra_turn_types::is_runtime_scaffolding_message(m))
+        .filter(|m| astra_turn_types::should_store_in_memory(m))
         .take(10)
     {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("unknown");
@@ -2223,16 +2237,28 @@ mod tests {
 
     #[test]
     fn working_memory_user_and_assistant() {
-        let msgs = vec![user("hello"), assistant("world")];
+        // User messages must clear the should_store_in_memory length
+        // gate (20+ unicode scalars), else they're treated as
+        // ephemeral acks and skipped. Use realistic prose.
+        let msgs = vec![
+            user("please review the auth middleware refactor"),
+            assistant("Reviewed. Found one issue with the token compare path."),
+        ];
         let r = build_working_memory_content(&msgs, 10000);
-        assert!(r.contains("User: hello"));
-        assert!(r.contains("Assistant: world"));
+        assert!(r.contains("review the auth middleware"));
+        assert!(r.contains("Reviewed. Found one issue"));
     }
 
     #[test]
     fn working_memory_skips_tool_role() {
         let tool_msg = json!({"role": "tool", "content": "tool output", "tool_call_id": "t1"});
-        let msgs = vec![user("q"), tool_msg, assistant("a")];
+        // Long user msg passes the length gate so we have signal in the
+        // output; assertion is on tool_msg NOT appearing.
+        let msgs = vec![
+            user("look up the current build state of the repo"),
+            tool_msg,
+            assistant("Build is green."),
+        ];
         let r = build_working_memory_content(&msgs, 10000);
         assert!(!r.contains("tool output"));
     }
@@ -2244,7 +2270,13 @@ mod tests {
             "content": null,
             "tool_calls": [{"function": {"name": "bash", "arguments": "{}"}}]
         });
-        let msgs = vec![user("run it"), a];
+        // User msg long enough to pass the write-time gate, so the
+        // assistant tool_calls line has a preceding user line to
+        // anchor the format.
+        let msgs = vec![
+            user("kick off the build and report the result"),
+            a,
+        ];
         let r = build_working_memory_content(&msgs, 10000);
         assert!(r.contains("[tools: bash]"));
     }
@@ -2286,17 +2318,22 @@ mod tests {
 
     #[test]
     fn working_memory_skips_runtime_correction_headers() {
+        // Long enough user msgs to pass the write-time length gate —
+        // these carry real intent that's worth storing. The short
+        // acks "continue" / "fix it" are now (correctly) rejected as
+        // ephemeral, but the scaffolding-filter assertion below still
+        // holds.
         let msgs = vec![
-            user("continue"),
+            user("please continue from where the last turn left off"),
             assistant("## ⤴ Execution Escalation Runtime correction: ten read-only calls"),
             assistant("## ⚠ Sequential Tool Calls Detected. Last 4 rounds each ran one tool."),
-            user("fix it"),
+            user("fix the broken migration and verify it runs cleanly"),
         ];
         let r = build_working_memory_content(&msgs, 10000);
         assert!(!r.contains("⤴"), "correction header leaked: {r}");
         assert!(!r.contains("Sequential Tool Calls Detected"), "leaked: {r}");
-        assert!(r.contains("User: continue"));
-        assert!(r.contains("User: fix it"));
+        assert!(r.contains("continue from where"));
+        assert!(r.contains("broken migration"));
     }
 
     #[test]
@@ -2321,18 +2358,18 @@ mod tests {
         let msgs = vec![
             user("⚠️ VERIFICATION REQUIRED: Before you finish"),
             user("🔄 ERROR BUDGET EXHAUSTED: hit 3 errors"),
-            user("just fix it"),
+            user("skip the verification nudges and just fix the test assertion"),
         ];
         let r = build_working_memory_content(&msgs, 10000);
         assert!(!r.contains("VERIFICATION REQUIRED"), "leaked: {r}");
         assert!(!r.contains("ERROR BUDGET"), "leaked: {r}");
-        assert!(r.contains("just fix it"));
+        assert!(r.contains("just fix the test assertion"));
     }
 
     #[test]
     fn working_memory_skips_tools_used_rollup() {
         let msgs = vec![
-            user("explore the repo"),
+            user("explore the repo and summarize the top-level layout"),
             assistant("Tools used: bash, grep, read_file"),
             assistant("Found three relevant files."),
         ];
@@ -2346,10 +2383,13 @@ mod tests {
         // Defensive: system messages should never reach compaction, but
         // if they do, they are scaffolding by definition.
         let sys = json!({"role": "system", "content": "runtime injected guidance"});
-        let msgs = vec![sys, user("real question")];
+        let msgs = vec![
+            sys,
+            user("please walk through the pipeline compaction logic"),
+        ];
         let r = build_working_memory_content(&msgs, 10000);
         assert!(!r.contains("runtime injected"), "system leaked: {r}");
-        assert!(r.contains("real question"));
+        assert!(r.contains("pipeline compaction logic"));
     }
 
     #[test]
@@ -2366,6 +2406,81 @@ mod tests {
         assert!(
             r.is_empty(),
             "pure-scaffolding input must yield empty working memory: {r:?}"
+        );
+    }
+
+    // ── L1 memory-writability gate ────────────────────────────────────
+    // `should_store_in_memory` rejects short user messages (below 20
+    // unicode scalars) as ephemeral acks / imperatives. Regression
+    // for session `c6e18730` where "继续啊", "修复啊！", "hi", "好"
+    // polluted Memoria's index on every compaction write. Real
+    // signal-bearing user messages still pass through — the gate is
+    // length-based, not prefix-based, because the bad content had no
+    // consistent prefix to filter on.
+
+    #[test]
+    fn working_memory_rejects_short_user_acks() {
+        let msgs = vec![
+            user("hi"),                                // English single-word
+            user("好"),                                // CJK single char
+            user("继续啊"),                            // CJK 3 chars + particle
+            user("修复啊！"),                          // CJK 3 chars + punctuation
+            user("ok"),
+            user("yes"),
+            user("continue"),
+            user("just fix it"), // 11 chars — still below threshold
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(
+            r.is_empty(),
+            "short ephemeral user acks must not reach Memoria; got: {r:?}"
+        );
+    }
+
+    #[test]
+    fn working_memory_keeps_substantive_user_intent() {
+        // Long user messages — the kind that carry durable signal —
+        // pass through unchanged. The gate is narrow by design.
+        let msgs = vec![
+            user(
+                "Add OAuth2 support with JWT tokens and refresh-token rotation, \
+                 using RS256 for signing.",
+            ),
+            user(
+                "Focus on the auth middleware path, not the schema migration \
+                 that's already in flight.",
+            ),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(r.contains("Add OAuth2 support"));
+        assert!(r.contains("auth middleware path"));
+    }
+
+    #[test]
+    fn working_memory_mixed_user_acks_and_signal() {
+        // Realistic mixed sequence from session `c6e18730`: short
+        // imperatives interleaved with substantive requests. Only the
+        // substantive ones survive into working memory.
+        let msgs = vec![
+            user("continue"),                                     // reject
+            user("please review the delegation fan-out code path"), // keep
+            assistant("Reviewed — three potential issues."),        // keep
+            user("修复啊！"),                                     // reject
+            user("fix the ordering bug in the prefix-store write"), // keep
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        // Kept content present
+        assert!(r.contains("delegation fan-out"));
+        assert!(r.contains("three potential issues"));
+        assert!(r.contains("ordering bug"));
+        // Rejected content absent
+        assert!(
+            !r.contains("User: continue"),
+            "short ack 'continue' leaked into output: {r}"
+        );
+        assert!(
+            !r.contains("修复啊"),
+            "short CJK imperative leaked into output: {r}"
         );
     }
 
