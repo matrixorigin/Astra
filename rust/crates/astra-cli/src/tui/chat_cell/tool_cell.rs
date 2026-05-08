@@ -82,6 +82,47 @@ impl ToolChatCell {
         }
     }
 
+    /// A one-row progress line rendered under the header while a tool
+    /// is running past the 3s threshold. Uses a Braille spinner (time-
+    /// driven phase) plus a logarithmic fill bar so the user sees
+    /// activity even when the underlying work offers no real progress
+    /// metric.
+    fn progress_line(&self, width: usize, elapsed_ms: u64) -> Line<'static> {
+        const FRAMES: [&str; 10] = [
+            "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+        ];
+        let frame_idx = ((elapsed_ms / 80) % FRAMES.len() as u64) as usize;
+        let theme = crate::tui::theme::current();
+        let dim = Style::default().fg(ratatui::style::Color::DarkGray);
+
+        // Logarithmic bar: 0 at t=0, ~86% at t=30s, asymptotic but
+        // capped below 100% so the user can always tell a long-running
+        // tool apart from a finished one.
+        let raw = 1.0 - (-(elapsed_ms as f32 / 15_000.0)).exp();
+        let progress = raw.min(0.99);
+        // Bar area: gutter(4) + spinner(2) + " " + bar ...  leave 8 slack.
+        let bar_max = width.saturating_sub(14).clamp(10, 40);
+        // Floor instead of round so the bar never visually tops out.
+        let filled = ((bar_max as f32) * progress).floor() as usize;
+        let filled = filled.min(bar_max.saturating_sub(1));
+        let bar = format!(
+            "{}{}",
+            "█".repeat(filled),
+            "░".repeat(bar_max.saturating_sub(filled))
+        );
+
+        Line::from(vec![
+            Span::styled("    ", dim),
+            Span::styled(FRAMES[frame_idx].to_string(), Style::default().fg(theme.accent)),
+            Span::raw(" "),
+            Span::styled(bar, Style::default().fg(theme.accent)),
+            Span::styled(
+                format!(" {:.0}%", progress * 100.0),
+                dim,
+            ),
+        ])
+    }
+
     fn title_text(&self) -> &str {
         match self.status {
             ToolStatus::Running => "Running",
@@ -123,6 +164,17 @@ impl ChatCell for ToolChatCell {
         };
 
         let mut lines = vec![header];
+
+        // For running tools that have been going for a while, add a
+        // Braille spinner line so the user can see the turn hasn't
+        // frozen. Shown only after 3s to avoid visual noise on fast
+        // tool calls.
+        if self.status == ToolStatus::Running {
+            let elapsed = self.started_at.elapsed().as_millis() as u64;
+            if elapsed >= 3_000 {
+                lines.push(self.progress_line(w, elapsed));
+            }
+        }
 
         // Command/description with │ prefix
         if !self.description.is_empty() {
@@ -207,4 +259,58 @@ fn truncate_by_width(s: &str, max_width: usize) -> String {
         end = i + c.len_utf8();
     }
     format!("{}…", &s[..end])
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    fn text_of(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn short_running_shows_no_progress_line() {
+        let cell = ToolChatCell::new_running("bash".into(), "ls".into());
+        // 0 elapsed → no progress line.
+        let lines = cell.display_lines(80);
+        assert_eq!(lines.len(), 2, "header + description only");
+    }
+
+    #[test]
+    fn progress_line_contains_spinner_and_bar() {
+        let cell = ToolChatCell::new_running("bash".into(), String::new());
+        let line = cell.progress_line(80, 5_000);
+        let t = text_of(&line);
+        assert!(
+            ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+                .iter()
+                .any(|g| t.contains(g)),
+            "spinner glyph missing; got {t:?}"
+        );
+        assert!(t.contains("█") || t.contains("░"), "bar missing; got {t:?}");
+        assert!(t.contains("%"), "percent label missing; got {t:?}");
+    }
+
+    #[test]
+    fn progress_fill_monotonically_grows() {
+        let cell = ToolChatCell::new_running("bash".into(), String::new());
+        let early = cell.progress_line(80, 3_000);
+        let late = cell.progress_line(80, 25_000);
+        let early_fill = text_of(&early).matches('█').count();
+        let late_fill = text_of(&late).matches('█').count();
+        assert!(
+            late_fill > early_fill,
+            "bar should grow over time; early={early_fill} late={late_fill}"
+        );
+    }
+
+    #[test]
+    fn progress_percent_caps_below_100() {
+        // Even after an hour we shouldn't show >=100%.
+        let cell = ToolChatCell::new_running("bash".into(), String::new());
+        let line = cell.progress_line(80, 3_600_000);
+        let t = text_of(&line);
+        assert!(!t.contains(" 100%"), "should asymptote below 100%; got {t}");
+    }
 }
