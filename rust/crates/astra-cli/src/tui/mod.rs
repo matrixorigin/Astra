@@ -618,7 +618,7 @@ pub(crate) async fn run_tui_repl(
     result
 }
 
-fn do_draw(
+pub(super) fn do_draw(
     guard: &mut TerminalGuard,
     active_cell: &Option<Box<dyn ChatCell>>,
     bottom_pane: &mut BottomPane,

@@ -305,6 +305,16 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 );
                 return SlashResult::Handled;
             }
+            // Paint a BusyView over the bottom pane so the user sees
+            // *something* while the SQL runs. We force an immediate
+            // draw because nothing else will redraw until the
+            // spawn_blocking future resolves.
+            use crate::tui::bottom_pane::busy_view::BusyView;
+            ctx.bottom_pane.push_view(Box::new(
+                BusyView::new("Running SQL query…").with_title(" /table "),
+            ));
+            let _ = crate::tui::do_draw(ctx.guard, &None, ctx.bottom_pane);
+
             // `mo_query` shells out to the mysql client (blocking IO) —
             // park it on a blocking thread so we don't freeze the async
             // event loop while the query runs.
@@ -317,6 +327,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             })
             .await
             .unwrap_or_else(|e| format!("Error: SQL execution task failed: {e}"));
+
+            // Remove the BusyView — a real panel (or info message)
+            // takes its place below.
+            let _ = ctx.bottom_pane.pop_view();
             use crate::tui::bottom_pane::table_view::TablePanelView;
             use crate::tui::table_view::parse;
             match parse(&output) {
