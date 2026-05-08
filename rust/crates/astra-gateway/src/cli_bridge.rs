@@ -625,18 +625,13 @@ fn parse_claude_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
 fn parse_claude_stream_json_line(line: &str) -> Option<CliProgress> {
     let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
     match v["type"].as_str()? {
-        // Assistant message — may contain text tokens or tool_use blocks.
+        // Assistant message — complete snapshot after streaming finishes.
+        // Text is already delivered incrementally via stream_event/text_delta,
+        // so skip text here to avoid duplicates. Only extract tool lifecycle.
         "assistant" => {
             let content = v["message"]["content"].as_array()?;
             for block in content {
                 match block["type"].as_str() {
-                    Some("text") => {
-                        if let Some(text) = block["text"].as_str()
-                            && !text.is_empty()
-                        {
-                            return Some(CliProgress::Token(text.to_string()));
-                        }
-                    }
                     Some("tool_use") => {
                         let name = block["name"].as_str().unwrap_or("tool").to_string();
                         return Some(CliProgress::ToolStarted { name });
@@ -653,6 +648,33 @@ fn parse_claude_stream_json_line(line: &str) -> Option<CliProgress> {
                     }
                     _ => {}
                 }
+            }
+            None
+        }
+        // Streaming events from --include-partial-messages: incremental text deltas.
+        "stream_event" => {
+            let event = &v["event"];
+            match event["type"].as_str() {
+                Some("content_block_delta") => {
+                    let delta = &event["delta"];
+                    match delta["type"].as_str() {
+                        Some("text_delta") => {
+                            let text = delta["text"].as_str().unwrap_or_default();
+                            if !text.is_empty() {
+                                return Some(CliProgress::Token(text.to_string()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some("content_block_start") => {
+                    let block = &event["content_block"];
+                    if block["type"].as_str() == Some("tool_use") {
+                        let name = block["name"].as_str().unwrap_or("tool").to_string();
+                        return Some(CliProgress::ToolStarted { name });
+                    }
+                }
+                _ => {}
             }
             None
         }

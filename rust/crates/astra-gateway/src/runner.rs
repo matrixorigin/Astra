@@ -26,8 +26,8 @@ use tokio_util::sync::CancellationToken;
 const MAX_CHUNK_LEN: usize = 3800;
 const INITIAL_ACK_DELAY: Duration = Duration::from_secs(3);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
-const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(8);
-const PROGRESSIVE_MIN_CHARS: usize = 200;
+const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(20);
+const PROGRESSIVE_MIN_CHARS: usize = 800;
 
 // ─── Send Circuit Breaker ───────────────────────────────────────────────────
 
@@ -610,6 +610,22 @@ impl GatewayRunner {
             return Ok(None);
         }
 
+        // Strip @mention prefix so slash commands and CLI see clean text
+        let msg = &{
+            let mut m = msg.clone();
+            m.text = strip_mention(&m.text, &self.config.bot_name);
+            m
+        };
+
+        // If stripping the mention left an empty message, treat as a greeting
+        let msg = &if msg.text.is_empty() {
+            let mut m = msg.clone();
+            m.text = "你好".to_string();
+            m
+        } else {
+            msg.clone()
+        };
+
         // Group chat: per-user session isolation
         let effective_chat_id = if msg.chat_type == crate::platforms::ChatType::Group
             && self.config.group_sessions_per_user
@@ -1008,6 +1024,7 @@ impl GatewayRunner {
         let message_text = msg.text.clone();
         let sid = session_id.clone();
         let chat_id = effective_chat_id.clone();
+        let outbound_chat_id = msg.chat_id.clone();
         let cli_name = cli_profile.name().to_string();
         let cli_timeout = Duration::from_secs(self.config.cli_timeout_secs.max(1));
 
@@ -1126,7 +1143,7 @@ impl GatewayRunner {
                                 token_buf.push_str(&filtered);
                                 if token_buf.len() >= PROGRESSIVE_MIN_CHARS {
                                     chunk_counter += 1;
-                                    progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter);
+                                    progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &outbound_chat_id, &request_tag, chunk_counter);
                                     next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
                                 }
                             }
@@ -1155,7 +1172,7 @@ impl GatewayRunner {
                                 token_buf.push_str(&tail);
                             }
                             chunk_counter += 1;
-                            progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter);
+                            progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &outbound_chat_id, &request_tag, chunk_counter);
                             break;
                         }
                     }
@@ -1168,7 +1185,7 @@ impl GatewayRunner {
                     }
                     if !token_buf.is_empty() {
                         chunk_counter += 1;
-                        progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter);
+                        progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &outbound_chat_id, &request_tag, chunk_counter);
                         next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
                     } else if !sent_initial_ack {
                         sent_initial_ack = true;
@@ -1177,7 +1194,7 @@ impl GatewayRunner {
                             // try_send: drop heartbeat if channel backpressured —
                             // stale heartbeats are worse than missing ones.
                             let _ = tx.try_send(OutboundMessage::plain(
-                                msg.platform.to_string(), chat_id.clone(), heartbeat,
+                                msg.platform.to_string(), outbound_chat_id.clone(), heartbeat,
                             ));
                         }
                         next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
@@ -1191,7 +1208,7 @@ impl GatewayRunner {
                         };
                         if let Some(ref tx) = self.outbound_tx {
                             let _ = tx.try_send(OutboundMessage::plain(
-                                msg.platform.to_string(), chat_id.clone(), heartbeat,
+                                msg.platform.to_string(), outbound_chat_id.clone(), heartbeat,
                             ));
                         }
                         next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
@@ -4793,6 +4810,31 @@ fn is_mentioned(text: &str, bot_name: &str) -> bool {
     } else {
         let pattern = format!("@{}", bot_name);
         text.to_lowercase().contains(&pattern.to_lowercase())
+    }
+}
+
+/// Remove `@BotName` from text so downstream handlers see clean input.
+fn strip_mention(text: &str, bot_name: &str) -> String {
+    if bot_name.is_empty() {
+        // Strip any single @word at the start
+        let trimmed = text.trim_start();
+        if let Some(rest) = trimmed.strip_prefix('@') {
+            // Skip the word after @
+            let after_word = rest.trim_start_matches(|c: char| !c.is_whitespace());
+            after_word.trim_start().to_string()
+        } else {
+            text.to_string()
+        }
+    } else {
+        let lower = text.to_lowercase();
+        let pattern = format!("@{}", bot_name).to_lowercase();
+        if let Some(pos) = lower.find(&pattern) {
+            let before = &text[..pos];
+            let after = &text[pos + pattern.len()..];
+            format!("{}{}", before, after).trim().to_string()
+        } else {
+            text.to_string()
+        }
     }
 }
 

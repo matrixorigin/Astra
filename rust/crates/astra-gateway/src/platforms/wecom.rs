@@ -16,6 +16,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+const PONG_TIMEOUT_SECS: u64 = 60;
 const MAX_TEXT_LENGTH: usize = 4000;
 const RECONNECT_DELAYS: &[u64] = &[2, 5, 10, 30, 60];
 const WECOM_CAPABILITIES: &[AdapterCapability] = &[
@@ -39,6 +40,8 @@ pub struct WeComAdapter {
     msg_rx: Mutex<mpsc::Receiver<InboundMessage>>,
     out_tx: mpsc::Sender<OutboundMessage>,
     shutdown: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Tracks reply_tokens already used via aibot_respond_msg (one-shot per inbound request).
+    used_reply_tokens: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl WeComAdapter {
@@ -51,6 +54,9 @@ impl WeComAdapter {
             msg_rx: Mutex::new(msg_rx),
             out_tx,
             shutdown: None,
+            used_reply_tokens: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 }
@@ -145,11 +151,24 @@ impl PlatformAdapter for WeComAdapter {
             text.to_string()
         };
 
+        // aibot_respond_msg is one-shot per inbound request: once used, fall back to aibot_send_msg.
+        let effective_reply_token = if let Some(token) = reply_token {
+            let mut used = self.used_reply_tokens.lock().await;
+            if used.contains(token) {
+                None
+            } else {
+                used.insert(token.to_string());
+                Some(token.to_string())
+            }
+        } else {
+            None
+        };
+
         self.out_tx
             .send(OutboundMessage {
                 chat_id: chat_id.to_string(),
                 text,
-                reply_token: reply_token.map(String::from),
+                reply_token: effective_reply_token,
             })
             .await
             .map_err(|e| format!("outbound channel send failed: {e}"))
@@ -208,8 +227,14 @@ async fn run_wecom_connection(
         tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
     heartbeat.tick().await;
     let bot_id = config.bot_id.clone();
+    let mut last_recv = tokio::time::Instant::now();
 
     loop {
+        // If we haven't received anything for PONG_TIMEOUT_SECS, the connection is dead.
+        if last_recv.elapsed().as_secs() > PONG_TIMEOUT_SECS {
+            return Err("wecom connection timed out (no message received)".into());
+        }
+
         let mut out_guard = out_rx.lock().await;
 
         tokio::select! {
@@ -253,7 +278,10 @@ async fn run_wecom_connection(
             msg = ws_read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        last_recv = tokio::time::Instant::now();
                         if let Ok(data) = serde_json::from_str::<Value>(&text) {
+                            let cmd = data["cmd"].as_str().unwrap_or("unknown");
+                            tracing::debug!(cmd, "wecom ws recv");
                             handle_wecom_message(&data, msg_tx, &mut dedup).await;
                         }
                     }
@@ -355,7 +383,6 @@ async fn handle_wecom_message(
         return;
     }
 
-    let chat_id = body["chatid"].as_str().unwrap_or("").to_string();
     let user_id = body["from"]["userid"]
         .as_str()
         .unwrap_or("unknown")
@@ -365,7 +392,22 @@ async fn handle_wecom_message(
     } else {
         ChatType::DirectMessage
     };
+    // DM: chatid is empty; fall back to userid so replies can be routed back.
+    let chatid_raw = body["chatid"].as_str().unwrap_or("").to_string();
+    let chat_id = if chatid_raw.is_empty() {
+        user_id.clone()
+    } else {
+        chatid_raw
+    };
     let reply_token = data["headers"]["req_id"].as_str().map(String::from);
+
+    tracing::debug!(
+        chat_type = ?chat_type,
+        chat_id = %chat_id,
+        user_id = %user_id,
+        reply_token = ?reply_token,
+        "wecom inbound message"
+    );
 
     let msg = InboundMessage {
         platform: "wecom",
