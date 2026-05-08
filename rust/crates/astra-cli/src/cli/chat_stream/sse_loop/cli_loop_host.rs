@@ -112,7 +112,10 @@ fn derive_turn_interaction_mode(
 }
 
 impl CliAgenticLoopHost<'_> {
-    fn turn_interaction_mode(&self) -> TurnInteractionMode {
+    /// Internal accessor. The trait impl delegates here; this method
+    /// exists separately so other CLI-only call sites can use it
+    /// without going through the `AgenticLoopHost` trait object.
+    fn turn_interaction_mode_inherent(&self) -> TurnInteractionMode {
         derive_turn_interaction_mode(
             self.perm_manager.mode(),
             self.is_plan_subtask,
@@ -120,6 +123,12 @@ impl CliAgenticLoopHost<'_> {
             self.render_policy.is_silent(),
             std::io::stdin().is_terminal(),
         )
+    }
+
+    /// Backwards-compatible inherent alias used by existing call sites
+    /// inside this module. Delegates to `turn_interaction_mode_inherent`.
+    fn turn_interaction_mode(&self) -> TurnInteractionMode {
+        self.turn_interaction_mode_inherent()
     }
 }
 
@@ -463,6 +472,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
     fn is_quiet(&self) -> bool {
         self.render_policy.is_silent()
+    }
+
+    fn turn_interaction_mode(&self) -> TurnInteractionMode {
+        self.turn_interaction_mode_inherent()
     }
 
     fn valid_tool_names(&self) -> &HashSet<String> {

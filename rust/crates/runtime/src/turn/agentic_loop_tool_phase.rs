@@ -1276,22 +1276,28 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 state.error_recovery.last_error_category = dominant;
             }
             if state.error_recovery.consecutive_same_error >= CONSECUTIVE_ERROR_BUDGET {
-                let cat_name = state
-                    .error_recovery
-                    .last_error_category
-                    .map(|c| format!("{c:?}"))
-                    .unwrap_or_else(|| "Unknown".into());
-                state.messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": format!(
-                        "🔄 ERROR BUDGET EXHAUSTED: You've hit {cat_name} errors \
-                         {n} turns in a row. Your current approach is not working. \
-                         STOP repeating the same strategy. You MUST try a fundamentally \
-                         different approach: different tool, different file, different \
-                         method. If you cannot make progress, explain what's blocking you.",
-                        n = state.error_recovery.consecutive_same_error,
-                    )
-                }));
+                // In Auto mode the user opted to let the model drive —
+                // drop the error-budget nudge (it's another "stop doing
+                // that" message that breaks cache + interrupts flow).
+                // The counter still resets so other paths remain sane.
+                if !host.turn_interaction_mode().suppresses_loop_nudges() {
+                    let cat_name = state
+                        .error_recovery
+                        .last_error_category
+                        .map(|c| format!("{c:?}"))
+                        .unwrap_or_else(|| "Unknown".into());
+                    state.messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!(
+                            "🔄 ERROR BUDGET EXHAUSTED: You've hit {cat_name} errors \
+                             {n} turns in a row. Your current approach is not working. \
+                             STOP repeating the same strategy. You MUST try a fundamentally \
+                             different approach: different tool, different file, different \
+                             method. If you cannot make progress, explain what's blocking you.",
+                            n = state.error_recovery.consecutive_same_error,
+                        )
+                    }));
+                }
                 state.error_recovery.consecutive_same_error = 0;
             }
         } else {

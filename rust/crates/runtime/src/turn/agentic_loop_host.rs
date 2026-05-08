@@ -173,6 +173,20 @@ pub trait AgenticLoopHost: Send {
     /// Whether output is suppressed (quiet mode).
     fn is_quiet(&self) -> bool;
 
+    /// The user-facing interaction mode for this turn.
+    ///
+    /// Used by the execution phase to decide whether to inject the
+    /// interruption-style nudges (execution escalation, parallel-batching
+    /// force, circuit breaker corrections, etc.). See
+    /// [`TurnInteractionMode::suppresses_loop_nudges`] for the policy.
+    ///
+    /// Defaults to [`TurnInteractionMode::NonInteractive`] which preserves
+    /// the pre-existing behaviour (nudges enabled) for any host that
+    /// hasn't been updated yet.
+    fn turn_interaction_mode(&self) -> TurnInteractionMode {
+        TurnInteractionMode::NonInteractive
+    }
+
     /// Optional LLM summary client for summary-based compaction helpers.
     ///
     /// Hosts can provide a client that uses the same model/credentials as the
@@ -1492,6 +1506,7 @@ pub(crate) mod tests {
         pub(crate) valid_tools: HashSet<String>,
         pub(crate) emitted_lines: Vec<String>,
         quiet: bool,
+        interaction_mode: TurnInteractionMode,
         pub(crate) injected_schemas: Vec<Value>,
         reflection_text: Option<String>,
         reflection_error: Option<String>,
@@ -1514,6 +1529,7 @@ pub(crate) mod tests {
                 valid_tools: HashSet::new(),
                 emitted_lines: Vec::new(),
                 quiet: true,
+                interaction_mode: TurnInteractionMode::NonInteractive,
                 injected_schemas: Vec::new(),
                 reflection_text: None,
                 reflection_error: None,
@@ -1526,6 +1542,11 @@ pub(crate) mod tests {
 
         pub(crate) fn with_valid_tools(mut self, tools: &[&str]) -> Self {
             self.valid_tools = tools.iter().map(|s| s.to_string()).collect();
+            self
+        }
+
+        pub(crate) fn with_interaction_mode(mut self, mode: TurnInteractionMode) -> Self {
+            self.interaction_mode = mode;
             self
         }
 
@@ -1594,6 +1615,10 @@ pub(crate) mod tests {
 
         fn is_quiet(&self) -> bool {
             self.quiet
+        }
+
+        fn turn_interaction_mode(&self) -> TurnInteractionMode {
+            self.interaction_mode
         }
 
         fn valid_tool_names(&self) -> &HashSet<String> {

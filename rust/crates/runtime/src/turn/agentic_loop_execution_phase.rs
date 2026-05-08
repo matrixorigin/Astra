@@ -15,6 +15,7 @@ use astra_turn_core::agentic_turn_ingest::{
     map_ingest_outcome_to_iteration_control,
 };
 use astra_turn_core::compaction_types::CompactionTier;
+use astra_turn_core::interaction_types::TurnInteractionMode;
 use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
 
 /// Lazily-initialized process-wide alert dispatcher.
@@ -147,6 +148,19 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
     inject_runtime_attention_manifest(state);
 
+    // ── Nudge suppression gate ──────────────────────────────────────────
+    // In PermissionMode::Auto the user has explicitly asked to let the
+    // model run to completion without interruption. Skip all corrective
+    // / interruption-style nudges in that case: execution escalation,
+    // parallel-batching force, circuit-breaker correction/introspect/
+    // soft-stop, exploration-family retries, redundant-reads, cache-
+    // waste. Safety-critical abort (circuit breaker) still fires — it
+    // terminates the loop, not just nudges.
+    //
+    // Observed in session 3b7ac18f: ~10 nudge injections across 15
+    // turns in Auto mode, user complaint "不停的被打断,不一气呵成".
+    let suppress_nudges = host.turn_interaction_mode().suppresses_loop_nudges();
+
     // Inject round budget guidance so the model knows to batch or synthesize.
     // Use llm_rounds_completed (actual LLM call count) not turn_index (step
     // counter inflated by progressive penalty).
@@ -170,13 +184,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if !host.injects_round_guidance() {
         // Drop any stale guidance message(s) from prior rounds before this call.
         state.messages.retain(|m| !is_ephemeral_round_budget_msg(m));
-        let guidance =
-            crate::prompts::tool_round_guidance(&state.messages, state.llm_rounds_completed);
-        if !guidance.is_empty() {
-            astra_turn_core::chat_history_openai::append_openai_user_content_messages(
-                &mut state.messages,
-                &[guidance],
-            );
+        if !suppress_nudges {
+            let guidance =
+                crate::prompts::tool_round_guidance(&state.messages, state.llm_rounds_completed);
+            if !guidance.is_empty() {
+                astra_turn_core::chat_history_openai::append_openai_user_content_messages(
+                    &mut state.messages,
+                    &[guidance],
+                );
+            }
         }
     }
 
@@ -186,7 +202,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // catches the failure mode where the loop runs out of budget in an
     // inspection spiral (see session 4178c6a7). One-shot per turn; stripped
     // by `finalize_and_render`.
-    if should_escalate_execution(state) {
+    if !suppress_nudges && should_escalate_execution(state) {
         let read_only_calls = state
             .stall
             .tool_call_records
@@ -229,7 +245,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // streak of trailing single-tool rounds despite the prompt-layer nudge,
     // regardless of task type. Catches the "exploratory churn" failure mode
     // (sessions 6566d6a8, bbae8641, 6da9cf8f). One-shot per turn.
-    if should_force_parallel_batching(state, parallel_batching_force_threshold) {
+    if !suppress_nudges && should_force_parallel_batching(state, parallel_batching_force_threshold)
+    {
         let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
         state.stall.forced_parallel_batching = true;
         state.messages.push(serde_json::json!({
@@ -261,6 +278,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         let signal = build_circuit_breaker_signal(state);
         let action = state.stall.circuit_breaker.observe(signal);
         match action {
+            astra_turn_core::loop_circuit_breaker::BreakerAction::InjectCorrection
+                if suppress_nudges =>
+            {
+                // Auto mode: drop the correction entirely. Abort path
+                // below still fires because it represents a real budget
+                // exhaustion, not a soft nudge.
+                state.stall.circuit_breaker.correction_injected();
+            }
             astra_turn_core::loop_circuit_breaker::BreakerAction::InjectCorrection => {
                 state.stall.forced_round_budget_phase1 = true;
                 state.stall.circuit_breaker.correction_injected();
@@ -337,6 +362,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 finalize_and_render(host, state).await;
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
             }
+            astra_turn_core::loop_circuit_breaker::BreakerAction::Introspect { .. }
+                if suppress_nudges =>
+            {
+                // Auto mode: don't interject a [Self-check — round N]
+                // message; the user opted in to uninterrupted execution.
+            }
             astra_turn_core::loop_circuit_breaker::BreakerAction::Introspect {
                 consecutive_read_only,
             } => {
@@ -371,6 +402,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     );
                 }
             }
+            astra_turn_core::loop_circuit_breaker::BreakerAction::SoftStop
+                if suppress_nudges => {}
             astra_turn_core::loop_circuit_breaker::BreakerAction::SoftStop => {
                 state.stall.forced_completion_soft_stop = true;
                 state.messages.push(serde_json::json!({
@@ -400,7 +433,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
-    if !state.stall.forced_round_budget_phase1
+    if !suppress_nudges
+        && !state.stall.forced_round_budget_phase1
         && !state.stall.forced_completion_soft_stop
         && let Some((family, blocked_tools)) = exploration_family_phase2_candidate(state)
     {
@@ -434,7 +468,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // rather than re-reading. Lives below round-budget phase-1 because
     // phase-1 is the harder finalization push — if both would fire on the
     // same round we prefer phase-1's narrower "stop calling tools" message.
-    if !state.stall.forced_round_budget_phase1
+    if !suppress_nudges
+        && !state.stall.forced_round_budget_phase1
         && !state.stall.forced_completion_soft_stop
         && !state.stall.forced_exploration_family_phase2
         && should_inject_redundant_reads_corrective(state, redundant_reads_threshold)
@@ -464,7 +499,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             );
         }
     }
-    if !state.stall.forced_round_budget_phase1
+    if !suppress_nudges
+        && !state.stall.forced_round_budget_phase1
         && !state.stall.forced_completion_soft_stop
         && !state.stall.forced_exploration_family_phase2
         && !state.stall.forced_redundant_reads_corrective
@@ -496,7 +532,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             );
         }
     }
-    if !state.stall.forced_round_budget_phase1
+    if !suppress_nudges
+        && !state.stall.forced_round_budget_phase1
         && !state.stall.forced_completion_soft_stop
         && !state.stall.forced_exploration_family_phase2
         && !state.stall.forced_redundant_reads_corrective
@@ -3594,6 +3631,139 @@ mod tests {
     // unit tests in `astra_turn_core::loop_circuit_breaker::tests`.
     // The circuit breaker is integration-tested via the full agentic loop
     // E2E tests.
+
+    // ── Auto-mode nudge suppression ────────────────────────────────────
+    // In PermissionMode::Auto (→ TurnInteractionMode::Auto) the user
+    // opted into uninterrupted execution. Every corrective nudge we
+    // would otherwise inject must be dropped. Regression coverage for
+    // the "不停被打断" complaint in session 3b7ac18f.
+
+    fn prep(quiet: bool) -> TurnIterationPrep {
+        TurnIterationPrep {
+            quiet,
+            turn_start_time: Instant::now(),
+        }
+    }
+
+    fn has_message_starting_with(state: &AgenticLoopState, prefix: &str) -> bool {
+        state.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.starts_with(prefix))
+        })
+    }
+
+    #[tokio::test]
+    async fn auto_mode_suppresses_parallel_batching_force_injection() {
+        // Set up a state that DEFINITELY would inject the
+        // parallel-batching-force nudge in non-auto mode: long enough
+        // single-tool streak past threshold.
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD + 2) {
+            push_single_tool_round(&mut state);
+        }
+
+        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))])
+            .with_interaction_mode(TurnInteractionMode::Auto);
+        let _ = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(true))
+            .await
+            .unwrap();
+
+        assert!(
+            !has_message_starting_with(&state, PARALLEL_BATCHING_FORCE_MARKER),
+            "Auto mode must not inject parallel-batching-force nudge"
+        );
+        assert!(
+            !state.stall.forced_parallel_batching,
+            "Auto mode must not set forced_parallel_batching flag"
+        );
+    }
+
+    // Non-auto positive control is covered by the existing unit tests
+    // `parallel_batching_force_fires_at_streak_threshold` etc. — those
+    // test the predicate directly without the RuntimeConfig-dependent
+    // loading code path that `execute_turn_and_ingest_phase` runs. The
+    // Auto-mode suppression tests below target the new gate, which is
+    // the only behaviour that changed.
+
+    #[tokio::test]
+    async fn auto_mode_suppresses_execution_escalation_injection() {
+        // Build a state that would trigger execution escalation: many
+        // read-only successful tool calls on a mutating-sounding task.
+        let mut state = make_state();
+        state.message = "fix the broken auth middleware".into();
+        // Accumulate EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD successful
+        // read-only records with no write. `ok: true` + non-synthetic is
+        // the shape `should_escalate_execution` counts.
+        for i in 0..EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD {
+            state.stall.tool_call_records.push(ToolCallRecord {
+                name: "read_file".to_string(),
+                ok: true,
+                ms: 10,
+                error: None,
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: Some(format!("path: src/{i}.rs")),
+                result_preview: None,
+                file_path: Some(format!("src/{i}.rs")),
+                surgically_removed: None,
+                original_tool_name: None,
+                start_offset_ms: None,
+                batch_id: None,
+                parallel: None,
+                round: None,
+                args_full: None,
+                result_full: None,
+                skill_reentry_count: None,
+                skill_locked_out: None,
+            });
+        }
+
+        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))])
+            .with_interaction_mode(TurnInteractionMode::Auto);
+        let _ = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(true))
+            .await
+            .unwrap();
+
+        assert!(
+            !has_message_starting_with(&state, EXECUTION_ESCALATION_MARKER),
+            "Auto mode must not inject execution-escalation nudge"
+        );
+        assert!(!state.stall.forced_execution_escalation);
+    }
+
+    #[tokio::test]
+    async fn auto_mode_suppresses_round_budget_guidance_injection() {
+        // The prompt-side tool_round_guidance (parallel-batching soft
+        // nudge at streak=4, before the hard force at streak=5) also
+        // must stay silent in Auto.
+        let mut state = make_state();
+        state.message = "keep going".into();
+        // Below the force threshold but at/above the soft-nudge
+        // threshold (=4). This should emit a user message in non-auto.
+        for _ in 0..crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD {
+            push_single_tool_round(&mut state);
+        }
+
+        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))])
+            .with_interaction_mode(TurnInteractionMode::Auto);
+        let _ = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(true))
+            .await
+            .unwrap();
+
+        // Neither the soft "Sequential Tool Calls Detected" nudge nor
+        // the positive "Previous round: N tools" feedback should be
+        // re-injected in Auto mode — both ride `tool_round_guidance`.
+        assert!(
+            !has_message_starting_with(&state, "## ⚠ Sequential Tool Calls Detected")
+                && !state.messages.iter().any(|m| m
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("## ⚠ Sequential Tool Calls Detected"))),
+            "Auto mode must not inject round-budget/tool guidance nudges"
+        );
+    }
 
     fn push_redundant_sed_read(state: &mut AgenticLoopState, round: u32) {
         // Same file, same range, no intervening mutation — counts as one
