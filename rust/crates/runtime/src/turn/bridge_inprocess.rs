@@ -1804,20 +1804,25 @@ impl InProcessChatTurnBridge {
                 } else {
                     resolved_model.clone()
                 };
-                record_full_llm_request_event(
-                    &mut turn_event_buffer,
-                    full_llm_capture,
-                    &session_id,
-                    trace_turn,
-                    &trace_correlation,
-                    "bridge_inprocess",
-                    &request_capture_model,
-                    &provider,
-                    attempt_in_round,
-                    &llm_messages,
-                    &pruned_tools,
-                    Some(max_output_tokens),
-                );
+
+                // Capture the request AFTER all wire mutations: session-anchor
+                // append, prompt-cache metadata (cache_control markers,
+                // cache_reference on tool_results, cache_edits blocks), tool
+                // schema annotations. Historically the capture ran here,
+                // BEFORE `apply_anthropic_cache_metadata` — which meant the
+                // trace reported a pre-mutation snapshot that doesn't match
+                // what actually went out on the wire. Concretely: Anthropic
+                // request captures showed 0 `cache_control` markers on
+                // messages even though the downstream call DID have them,
+                // making "is prompt-cache working?" uninvestigable from a
+                // trace alone. See session c6e18730 analysis.
+                //
+                // The capture now happens after the e2e-round fixture branch
+                // so that both real and fixture paths record the final
+                // bytes. E2E path: mutations already applied by the fixture
+                // (no re-mutate). Real path: mutations applied here, then
+                // capture, then the real LLM call consumes `llm_messages`
+                // which STILL carries those mutations.
 
                 let e2e_round: Option<&Value> = if use_e2e_llm {
                     bridge_e2e
@@ -1828,6 +1833,27 @@ impl InProcessChatTurnBridge {
                 };
 
                 if let Some(round_val) = e2e_round {
+                    // E2E fixture path: apply cache annotations first so the
+                    // captured wire state matches the real-LLM branch below.
+                    // Otherwise fixture runs would trace pre-mutation state
+                    // even though the request shape sent to the real API
+                    // would be post-mutation. Traces from E2E tests must be
+                    // comparable to traces from real runs.
+                    apply_anthropic_cache_metadata(&mut llm_messages, &cache_cfg, &session_id);
+                    record_full_llm_request_event(
+                        &mut turn_event_buffer,
+                        full_llm_capture,
+                        &session_id,
+                        trace_turn,
+                        &trace_correlation,
+                        "bridge_inprocess",
+                        &request_capture_model,
+                        &provider,
+                        attempt_in_round,
+                        &llm_messages,
+                        &pruned_tools,
+                        Some(max_output_tokens),
+                    );
                     #[cfg(feature = "bridge-e2e-hooks")]
                     {
                         let (t, r, tc, u_delta) =
@@ -1856,6 +1882,24 @@ impl InProcessChatTurnBridge {
                 } else {
                     // Add Anthropic protocol-level prompt-cache metadata on the request clone.
                     apply_anthropic_cache_metadata(&mut llm_messages, &cache_cfg, &session_id);
+
+                    // Capture the final post-mutation request state (see the
+                    // long note ~60 lines up for why this is here and not
+                    // before the mutations).
+                    record_full_llm_request_event(
+                        &mut turn_event_buffer,
+                        full_llm_capture,
+                        &session_id,
+                        trace_turn,
+                        &trace_correlation,
+                        "bridge_inprocess",
+                        &request_capture_model,
+                        &provider,
+                        attempt_in_round,
+                        &llm_messages,
+                        &pruned_tools,
+                        Some(max_output_tokens),
+                    );
 
                     // Emit system prompt breakdown so CLI can record precise per-component trace.
                     let skill_injections: Vec<astra_turn_core::context_assembly_trace::SkillInjection> =
