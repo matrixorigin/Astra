@@ -666,6 +666,33 @@ pub struct VolatileInjection {
     pub round_index: u32,
 }
 
+/// In-memory summary of one LLM round within the current session.
+/// Populated in parallel with the journal's `LlmRoundRecord` so
+/// `introspect` can answer "what were my recent rounds doing?" without
+/// requiring `full_llm_capture=true` and on-disk I/O. Capped to a
+/// small ring (latest [`RECENT_ROUNDS_RING_CAPACITY`] entries) to keep
+/// state size bounded.
+#[derive(Debug, Clone, Default)]
+pub struct RecentRoundSummary {
+    pub turn: u32,
+    pub round: u32,
+    pub provider: String,
+    pub model: String,
+    pub prompt_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub completion_tokens: u64,
+    pub tool_calls_returned: u32,
+    pub tool_call_names: Vec<String>,
+    pub duration_ms: u64,
+    pub finish_reason: Option<String>,
+}
+
+/// Ring capacity for [`AgenticLoopState::recent_rounds`]. Small enough
+/// to keep state lean, large enough to cover a typical tool-loop turn
+/// (sessions 05e63cac / 65606b95 t6 observed up to 19 rounds).
+pub const RECENT_ROUNDS_RING_CAPACITY: usize = 32;
+
 /// Taxonomy of runtime-produced volatile content. Add a new variant
 /// when introducing a new injection kind — both the producer and the
 /// drain path become compile-time-checked.
@@ -764,6 +791,12 @@ pub struct AgenticLoopState {
     /// wire layer (`wire_assembly::assemble_llm_messages`) drains this
     /// field on every call, so producers just append and move on.
     pub volatile_pending: Vec<VolatileInjection>,
+    /// In-memory ring of recent LLM-round summaries. Fed from the same
+    /// site that records into the journal buffer, but available at
+    /// introspect time regardless of `full_llm_capture` setting. Capped
+    /// to [`RECENT_ROUNDS_RING_CAPACITY`] entries — older rounds fall
+    /// out (they're still in the journal if capture was enabled).
+    pub recent_rounds: Vec<RecentRoundSummary>,
     pub tool_results: Vec<Value>,
     pub current_session_id: Option<String>,
     pub current_run_id: Option<String>,
@@ -1111,6 +1144,18 @@ impl AgenticLoopState {
     #[must_use]
     pub fn take_volatile_pending(&mut self) -> Vec<VolatileInjection> {
         std::mem::take(&mut self.volatile_pending)
+    }
+
+    /// Append an LLM-round summary to the in-memory ring (capped at
+    /// [`RECENT_ROUNDS_RING_CAPACITY`]). Callers should use this
+    /// alongside `TurnEventBuffer::record_llm_round` so the ring is
+    /// populated regardless of `full_llm_capture` setting.
+    pub fn push_recent_round(&mut self, summary: RecentRoundSummary) {
+        self.recent_rounds.push(summary);
+        if self.recent_rounds.len() > RECENT_ROUNDS_RING_CAPACITY {
+            let excess = self.recent_rounds.len() - RECENT_ROUNDS_RING_CAPACITY;
+            self.recent_rounds.drain(0..excess);
+        }
     }
 }
 
@@ -1584,6 +1629,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
     AgenticLoopState {
         messages: Vec::new(),
         volatile_pending: Vec::new(),
+        recent_rounds: Vec::new(),
         tool_results: Vec::new(),
         current_session_id: None,
         current_run_id: None,
@@ -1975,6 +2021,7 @@ pub(crate) mod tests {
         AgenticLoopState {
             messages: Vec::new(),
             volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,

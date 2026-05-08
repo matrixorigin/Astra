@@ -982,6 +982,26 @@ impl ToolExecutor {
         // host has had a chance to populate one) so the model always gets
         // structured output instead of an opaque "first turn" string.
         let snap = snapshot.unwrap_or_default();
+
+        // Task #46: three new subtopics for fine-grained runtime
+        // self-awareness. All read from `IntrospectSnapshot`, which the
+        // runtime populates every turn — no disk I/O required.
+        match subtopic.as_str() {
+            "recent" | "recent_rounds" | "rounds" => {
+                return astra_turn_core::introspect::render_recent_rounds(&snap);
+            }
+            "volatile" | "volatile_pending" | "pending" => {
+                return astra_turn_core::introspect::render_volatile_pending(&snap);
+            }
+            "stall" | "stall_state" | "loop_guard" => {
+                return astra_turn_core::introspect::render_stall_state(&snap);
+            }
+            "all" => {
+                return astra_turn_core::introspect::render_all(&snap);
+            }
+            _ => {}
+        }
+
         astra_turn_core::introspect::render_introspect(&snap, detail)
     }
 

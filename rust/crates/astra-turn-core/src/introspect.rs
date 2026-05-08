@@ -24,6 +24,70 @@ pub struct IntrospectSnapshot {
     pub total_output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+
+    // ── Task #46: enhanced self-awareness ──
+    /// Summary of the most recent LLM rounds (in-memory ring). Available
+    /// regardless of `full_llm_capture` setting. Populated by
+    /// `AgenticLoopState.recent_rounds`. Feeds `subtopic=recent`.
+    #[serde(default)]
+    pub recent_rounds: Vec<RoundSnapshotEntry>,
+    /// Currently-pending volatile injections scheduled for the next LLM
+    /// call (tool-health warnings, working-set snapshots, stall nudges,
+    /// …). Lets the agent answer "what runtime nudges am I about to
+    /// see?". Feeds `subtopic=volatile`.
+    #[serde(default)]
+    pub volatile_pending: Vec<VolatileSnapshotEntry>,
+    /// Current stall / loop-guard telemetry — nudge count, event log,
+    /// circuit breaker state. Feeds `subtopic=stall`.
+    #[serde(default)]
+    pub stall_state: StallSnapshotSummary,
+}
+
+/// Per-round summary surfaced through `introspect(subtopic=recent)`.
+/// Mirrors `RecentRoundSummary` in the runtime but serializes cleanly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoundSnapshotEntry {
+    pub turn: u32,
+    pub round: u32,
+    pub provider: String,
+    pub model: String,
+    pub prompt_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub completion_tokens: u64,
+    pub tool_calls_returned: u32,
+    pub tool_call_names: Vec<String>,
+    pub duration_ms: u64,
+    pub finish_reason: Option<String>,
+}
+
+/// Single entry in the volatile lane at introspect time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VolatileSnapshotEntry {
+    /// Kind as a short string ("WorkingSet", "StallNudge", …). Keeps the
+    /// core crate dependency-free from the runtime's `VolatileKind`.
+    pub kind: String,
+    /// Content preview — full text (the renderers may truncate at
+    /// display time based on detail level).
+    pub content: String,
+    /// Round the injection was produced in.
+    pub round_index: u32,
+}
+
+/// Stall / loop-guard state at introspect time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StallSnapshotSummary {
+    pub nudge_count: u32,
+    pub events: Vec<String>,
+    /// Total circuit-breaker introspection emissions this turn.
+    pub introspection_count: u32,
+    pub forced_execution_escalation: bool,
+    pub forced_parallel_batching: bool,
+    pub forced_completion_soft_stop: bool,
+    pub forced_redundant_reads_corrective: bool,
+    pub forced_cache_waste_corrective: bool,
+    pub forced_exploration_family_phase2: bool,
+    pub forced_exploration_family_corrective: bool,
 }
 
 /// Per-tool health entry.
@@ -152,6 +216,172 @@ fn render_full(s: &IntrospectSnapshot) -> String {
     out.trim_end().to_string()
 }
 
+/// Render `subtopic=recent` — the in-memory ring of recent LLM rounds.
+/// Compact table per round with tokens + tool counts + timing.
+pub fn render_recent_rounds(s: &IntrospectSnapshot) -> String {
+    if s.recent_rounds.is_empty() {
+        return "## Recent Rounds\n(No rounds recorded yet in this turn.)".to_string();
+    }
+    let mut out = String::from(
+        "## Recent Rounds (most recent last)\n\
+         | t_r | provider | in | cached | cc_w | out | tools | dur_ms | finish |\n\
+         |-----|----------|----|--------|------|-----|-------|--------|--------|\n",
+    );
+    for r in &s.recent_rounds {
+        let provider = if r.provider.is_empty() {
+            "-"
+        } else {
+            r.provider.as_str()
+        };
+        let tools_label = if r.tool_call_names.is_empty() {
+            "-".to_string()
+        } else {
+            r.tool_call_names.join(",")
+        };
+        let finish = r.finish_reason.as_deref().unwrap_or("-");
+        out.push_str(&format!(
+            "| t{}_r{} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            r.turn,
+            r.round,
+            provider,
+            r.prompt_tokens,
+            r.cache_read_tokens,
+            r.cache_creation_tokens,
+            r.completion_tokens,
+            tools_label,
+            r.duration_ms,
+            finish,
+        ));
+    }
+    // Summary stats so the LLM gets a one-liner without re-totalling.
+    let total_in: u64 = s.recent_rounds.iter().map(|r| r.prompt_tokens).sum();
+    let total_cached: u64 = s.recent_rounds.iter().map(|r| r.cache_read_tokens).sum();
+    let billable: u64 = total_in + total_cached;
+    let pct = if billable > 0 {
+        (total_cached as f64 / billable as f64) * 100.0
+    } else {
+        0.0
+    };
+    out.push_str(&format!(
+        "\nRing: {} rounds, cache_hit={:.0}% ({}/{} billable).\n",
+        s.recent_rounds.len(),
+        pct,
+        total_cached,
+        billable,
+    ));
+    out
+}
+
+/// Render `subtopic=volatile` — what's queued in the volatile lane
+/// right now (about to ride the next LLM call's preamble).
+pub fn render_volatile_pending(s: &IntrospectSnapshot) -> String {
+    if s.volatile_pending.is_empty() {
+        return "## Volatile Lane\n(Empty — no pending runtime injections.)".to_string();
+    }
+    let mut out = String::from("## Volatile Lane (pending for next LLM call)\n");
+    for (i, inj) in s.volatile_pending.iter().enumerate() {
+        out.push_str(&format!(
+            "- [{i}] **{kind}** (round {round}) — {preview}\n",
+            i = i,
+            kind = inj.kind,
+            round = inj.round_index,
+            preview = preview_line(&inj.content, 120),
+        ));
+    }
+    out
+}
+
+/// Render `subtopic=stall` — stall / loop-guard telemetry.
+pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
+    let st = &s.stall_state;
+    let any_forced = st.forced_execution_escalation
+        || st.forced_parallel_batching
+        || st.forced_completion_soft_stop
+        || st.forced_redundant_reads_corrective
+        || st.forced_cache_waste_corrective
+        || st.forced_exploration_family_phase2
+        || st.forced_exploration_family_corrective;
+    if st.nudge_count == 0 && st.events.is_empty() && !any_forced {
+        return "## Stall / Loop-Guard\n(Healthy — no nudges, no forced corrections this turn.)"
+            .to_string();
+    }
+    let mut out = String::from("## Stall / Loop-Guard\n");
+    out.push_str(&format!(
+        "Soft nudges: {} | Circuit-breaker introspections: {}\n",
+        st.nudge_count, st.introspection_count,
+    ));
+    if !st.events.is_empty() {
+        out.push_str("\n### Recent stall events\n");
+        for e in &st.events {
+            out.push_str("- ");
+            out.push_str(e);
+            out.push('\n');
+        }
+    }
+    let mut forced: Vec<&str> = Vec::new();
+    if st.forced_execution_escalation {
+        forced.push("execution_escalation");
+    }
+    if st.forced_parallel_batching {
+        forced.push("parallel_batching_force");
+    }
+    if st.forced_completion_soft_stop {
+        forced.push("completion_soft_stop");
+    }
+    if st.forced_redundant_reads_corrective {
+        forced.push("redundant_reads_corrective");
+    }
+    if st.forced_cache_waste_corrective {
+        forced.push("cache_waste_corrective");
+    }
+    if st.forced_exploration_family_phase2 {
+        forced.push("exploration_family_phase2");
+    }
+    if st.forced_exploration_family_corrective {
+        forced.push("exploration_family_corrective");
+    }
+    if !forced.is_empty() {
+        out.push_str("\n### Forced corrections fired this turn\n");
+        for f in &forced {
+            out.push_str("- ");
+            out.push_str(f);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Render `subtopic=all` — everything. Useful when debugging / when
+/// the agent isn't sure which lens to pick. Same content as
+/// `render_full` + the three Task #46 subtopics.
+pub fn render_all(s: &IntrospectSnapshot) -> String {
+    let mut out = render_full(s);
+    out.push_str("\n\n");
+    out.push_str(&render_recent_rounds(s));
+    out.push_str("\n\n");
+    out.push_str(&render_volatile_pending(s));
+    out.push_str("\n\n");
+    out.push_str(&render_stall_state(s));
+    out
+}
+
+fn preview_line(text: &str, max: usize) -> String {
+    let one_line: String = text
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(max)
+        .collect();
+    if one_line.len() < text.lines().next().map(str::len).unwrap_or(0) {
+        format!("{one_line}…")
+    } else {
+        one_line
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +422,9 @@ mod tests {
             total_output_tokens: 12_000,
             cache_read_tokens: 95_000,
             cache_creation_tokens: 8_000,
+            recent_rounds: Vec::new(),
+            volatile_pending: Vec::new(),
+            stall_state: StallSnapshotSummary::default(),
         }
     }
 
@@ -271,5 +504,119 @@ mod tests {
         let full = render_introspect(&s, IntrospectDetail::Full);
         assert!(full.contains("## All Alerts"));
         assert!(full.contains("alert-9"));
+    }
+
+    // ── Task #46: recent-rounds / volatile / stall renderers ──
+
+    #[test]
+    fn render_recent_rounds_empty_state_message() {
+        let snap = IntrospectSnapshot::default();
+        let out = render_recent_rounds(&snap);
+        assert!(out.contains("No rounds recorded"), "got: {out}");
+    }
+
+    #[test]
+    fn render_recent_rounds_tabulates_and_summarizes() {
+        let mut snap = IntrospectSnapshot::default();
+        snap.recent_rounds = vec![
+            RoundSnapshotEntry {
+                turn: 3,
+                round: 0,
+                provider: "anthropic".into(),
+                model: "claude".into(),
+                prompt_tokens: 100,
+                cache_read_tokens: 7000,
+                tool_calls_returned: 2,
+                tool_call_names: vec!["bash".into(), "read_file".into()],
+                duration_ms: 1500,
+                finish_reason: Some("tool_calls".into()),
+                ..Default::default()
+            },
+            RoundSnapshotEntry {
+                turn: 3,
+                round: 1,
+                provider: "anthropic".into(),
+                model: "claude".into(),
+                prompt_tokens: 200,
+                cache_read_tokens: 7300,
+                tool_calls_returned: 0,
+                tool_call_names: vec![],
+                duration_ms: 900,
+                finish_reason: Some("stop".into()),
+                ..Default::default()
+            },
+        ];
+        let out = render_recent_rounds(&snap);
+        assert!(out.contains("t3_r0"));
+        assert!(out.contains("t3_r1"));
+        assert!(out.contains("bash,read_file"));
+        // Summary line has cache-hit percentage.
+        assert!(out.contains("Ring: 2 rounds"));
+        assert!(out.contains("cache_hit"));
+    }
+
+    #[test]
+    fn render_volatile_pending_empty_and_populated() {
+        let empty = IntrospectSnapshot::default();
+        assert!(render_volatile_pending(&empty).contains("Empty"));
+
+        let mut snap = IntrospectSnapshot::default();
+        snap.volatile_pending = vec![
+            VolatileSnapshotEntry {
+                kind: "WorkingSet".into(),
+                content: "[working-set:v1]\ngoal: fix bug\nactive_files: src/foo.rs".into(),
+                round_index: 2,
+            },
+            VolatileSnapshotEntry {
+                kind: "StallNudge".into(),
+                content: "⚠ REFLECTION: same read_file 3 times in a row".into(),
+                round_index: 2,
+            },
+        ];
+        let out = render_volatile_pending(&snap);
+        assert!(out.contains("WorkingSet"));
+        assert!(out.contains("StallNudge"));
+        // Preview shows first line only.
+        assert!(out.contains("[working-set:v1]"));
+        assert!(out.contains("round 2"));
+    }
+
+    #[test]
+    fn render_stall_state_healthy_and_triggered() {
+        let healthy = IntrospectSnapshot::default();
+        assert!(render_stall_state(&healthy).contains("Healthy"));
+
+        let mut snap = IntrospectSnapshot::default();
+        snap.stall_state.nudge_count = 2;
+        snap.stall_state.introspection_count = 1;
+        snap.stall_state.forced_parallel_batching = true;
+        snap.stall_state.events = vec!["sig_stall @ turn 5".into()];
+        let out = render_stall_state(&snap);
+        assert!(out.contains("Soft nudges: 2"));
+        assert!(out.contains("sig_stall @ turn 5"));
+        assert!(out.contains("parallel_batching_force"));
+    }
+
+    #[test]
+    fn render_all_includes_every_section() {
+        let mut snap = sample_snapshot();
+        snap.recent_rounds.push(RoundSnapshotEntry {
+            turn: 1,
+            round: 0,
+            prompt_tokens: 10,
+            cache_read_tokens: 50,
+            ..Default::default()
+        });
+        snap.volatile_pending.push(VolatileSnapshotEntry {
+            kind: "WorkingSet".into(),
+            content: "[working-set:v1]".into(),
+            round_index: 0,
+        });
+        snap.stall_state.nudge_count = 1;
+        let out = render_all(&snap);
+        assert!(out.contains("## Session Health"));
+        assert!(out.contains("## Recent Rounds"));
+        assert!(out.contains("## Volatile Lane"));
+        assert!(out.contains("## Stall / Loop-Guard"));
     }
 }

@@ -544,12 +544,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Query own runtime state. Default topic (subtopic=session) surfaces token pressure, cache hit rate, tool health, alerts, working memory. subtopic='cache' runs a specialized diagnosis over recent LLM captures to locate cache-regression bugs (rolling breakpoint issues, tool-marker positions, prefix collapses, creation/read ratio).",
+                "description": "Query own runtime state. Subtopics: 'session' (default — token pressure, cache hit rate, tool health, alerts, working memory); 'cache' (cache-regression diagnosis over recent LLM captures); 'recent' (last N LLM-round summaries from in-memory ring — tokens, tool calls, duration); 'volatile' (what runtime nudges / working-set / coaching are about to be injected); 'stall' (loop-guard state — nudge count, stall events, forced corrections); 'all' (session + recent + volatile + stall).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "subtopic": {"type": "string", "enum": ["session","cache"], "description": "Which diagnostic to run (default: session)"},
-                        "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Output detail level for the session topic (default: auto from budget). Ignored for subtopic='cache'."}
+                        "subtopic": {"type": "string", "enum": ["session","cache","recent","volatile","stall","all"], "description": "Which diagnostic to run (default: session)"},
+                        "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Output detail level for the session topic (default: auto from budget). Ignored for other subtopics."}
                     }
                 }
             }

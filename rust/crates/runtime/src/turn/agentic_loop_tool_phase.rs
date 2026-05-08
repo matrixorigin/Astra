@@ -1074,18 +1074,50 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     let agentic_step = current_agentic_step(state);
     let run_id = state.current_run_id.clone();
+    let tool_names: Vec<String> = turn_result
+        .accum
+        .tool_calls
+        .iter()
+        .filter_map(|tc| {
+            tc.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .map(String::from)
+        })
+        .collect();
+
+    // Populate the in-memory round ring unconditionally (regardless of
+    // whether `full_llm_capture` / turn_event_buffer is active). This is
+    // what powers `introspect(subtopic=recent)` — the agent can ask
+    // "what were my last few rounds doing?" without any disk I/O.
+    //
+    // provider/model aren't plumbed through `AgenticLoopState` today;
+    // leave empty. Introspect readers care most about tokens +
+    // tool_calls + duration — those are all fed from `turn_result`.
+    let round_duration_ms = prep.turn_start_time.elapsed().as_millis() as u64;
+    let recent_summary = super::agentic_loop_host::RecentRoundSummary {
+        turn: state.session_turn,
+        round: state.current_round_index,
+        provider: String::new(),
+        model: String::new(),
+        prompt_tokens: turn_result.accum.prompt_tokens,
+        cache_read_tokens: turn_result.accum.cache_read_tokens,
+        cache_creation_tokens: 0,
+        completion_tokens: turn_result.accum.completion_tokens,
+        tool_calls_returned: turn_result.accum.tool_calls.len() as u32,
+        tool_call_names: tool_names.clone(),
+        duration_ms: round_duration_ms,
+        finish_reason: Some(
+            super::agentic_loop_host::synthesise_finish_reason(
+                None,
+                !turn_result.accum.tool_calls.is_empty(),
+            )
+            .to_string(),
+        ),
+    };
+    state.push_recent_round(recent_summary);
+
     if let Some(ref mut buf) = state.turn_event_buffer {
-        let tool_names: Vec<String> = turn_result
-            .accum
-            .tool_calls
-            .iter()
-            .filter_map(|tc| {
-                tc.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .map(String::from)
-            })
-            .collect();
         buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
             ttft_ms: turn_result.ttft_ms,
             duration_ms: prep.turn_start_time.elapsed().as_millis() as u64,
@@ -1561,6 +1593,53 @@ fn build_introspect_snapshot(
         .map(|s| s.working_memory().render_prompt_section())
         .unwrap_or_default();
 
+    // Task #46: populate the in-memory self-awareness fields from state.
+    let recent_rounds = state
+        .recent_rounds
+        .iter()
+        .map(|r| astra_turn_core::introspect::RoundSnapshotEntry {
+            turn: r.turn,
+            round: r.round,
+            provider: r.provider.clone(),
+            model: r.model.clone(),
+            prompt_tokens: r.prompt_tokens,
+            cache_read_tokens: r.cache_read_tokens,
+            cache_creation_tokens: r.cache_creation_tokens,
+            completion_tokens: r.completion_tokens,
+            tool_calls_returned: r.tool_calls_returned,
+            tool_call_names: r.tool_call_names.clone(),
+            duration_ms: r.duration_ms,
+            finish_reason: r.finish_reason.clone(),
+        })
+        .collect();
+    let volatile_pending = state
+        .volatile_pending
+        .iter()
+        .map(|inj| astra_turn_core::introspect::VolatileSnapshotEntry {
+            kind: format!("{:?}", inj.kind),
+            content: inj.content.clone(),
+            round_index: inj.round_index,
+        })
+        .collect();
+    let events: Vec<String> = state
+        .stall
+        .events
+        .iter()
+        .map(|(name, turn)| format!("{name} @ turn {turn}"))
+        .collect();
+    let stall_state = astra_turn_core::introspect::StallSnapshotSummary {
+        nudge_count: state.stall.nudge_count,
+        events,
+        introspection_count: state.stall.introspection_count,
+        forced_execution_escalation: state.stall.forced_execution_escalation,
+        forced_parallel_batching: state.stall.forced_parallel_batching,
+        forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
+        forced_redundant_reads_corrective: state.stall.forced_redundant_reads_corrective,
+        forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
+        forced_exploration_family_phase2: state.stall.forced_exploration_family_phase2,
+        forced_exploration_family_corrective: state.stall.forced_exploration_family_corrective,
+    };
+
     astra_turn_core::introspect::IntrospectSnapshot {
         token_pressure: 0.0, // TODO: wire from pipeline_session.stats when available
         cache_hit_ratio: cache_ratio,
@@ -1574,6 +1653,9 @@ fn build_introspect_snapshot(
         total_output_tokens: state.total_completion,
         cache_read_tokens: state.total_cache_read,
         cache_creation_tokens: state.total_cache_creation,
+        recent_rounds,
+        volatile_pending,
+        stall_state,
     }
 }
 

@@ -346,6 +346,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
 
         let mut state = AgenticLoopState {
             messages,
+            volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),

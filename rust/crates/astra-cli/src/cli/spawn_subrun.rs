@@ -283,6 +283,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 
         let mut state = AgenticLoopState {
             messages,
+            volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: server_session_id,
             current_run_id: Some(config.run_id.clone()),

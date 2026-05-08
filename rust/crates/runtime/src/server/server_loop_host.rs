@@ -4584,6 +4584,7 @@ mod tests {
         AgenticLoopState {
             messages: Vec::new(),
             volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,

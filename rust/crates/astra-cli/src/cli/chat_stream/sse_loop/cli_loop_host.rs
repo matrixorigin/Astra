@@ -364,6 +364,55 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 total_output_tokens: state.total_completion,
                 cache_read_tokens: state.total_cache_read,
                 cache_creation_tokens: state.total_cache_creation,
+                // Task #46 fields populated from state on each turn.
+                recent_rounds: state
+                    .recent_rounds
+                    .iter()
+                    .map(|r| astra_turn_core::introspect::RoundSnapshotEntry {
+                        turn: r.turn,
+                        round: r.round,
+                        provider: r.provider.clone(),
+                        model: r.model.clone(),
+                        prompt_tokens: r.prompt_tokens,
+                        cache_read_tokens: r.cache_read_tokens,
+                        cache_creation_tokens: r.cache_creation_tokens,
+                        completion_tokens: r.completion_tokens,
+                        tool_calls_returned: r.tool_calls_returned,
+                        tool_call_names: r.tool_call_names.clone(),
+                        duration_ms: r.duration_ms,
+                        finish_reason: r.finish_reason.clone(),
+                    })
+                    .collect(),
+                volatile_pending: state
+                    .volatile_pending
+                    .iter()
+                    .map(|inj| astra_turn_core::introspect::VolatileSnapshotEntry {
+                        kind: format!("{:?}", inj.kind),
+                        content: inj.content.clone(),
+                        round_index: inj.round_index,
+                    })
+                    .collect(),
+                stall_state: astra_turn_core::introspect::StallSnapshotSummary {
+                    nudge_count: state.stall.nudge_count,
+                    events: state
+                        .stall
+                        .events
+                        .iter()
+                        .map(|(name, turn)| format!("{name} @ turn {turn}"))
+                        .collect(),
+                    introspection_count: state.stall.introspection_count,
+                    forced_execution_escalation: state.stall.forced_execution_escalation,
+                    forced_parallel_batching: state.stall.forced_parallel_batching,
+                    forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
+                    forced_redundant_reads_corrective: state
+                        .stall
+                        .forced_redundant_reads_corrective,
+                    forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
+                    forced_exploration_family_phase2: state.stall.forced_exploration_family_phase2,
+                    forced_exploration_family_corrective: state
+                        .stall
+                        .forced_exploration_family_corrective,
+                },
             });
 
         Ok(HostTurnResult {

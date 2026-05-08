@@ -340,6 +340,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         let mut state = AgenticLoopState {
             messages,
             volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: Some(self.session_id.clone()),
             current_run_id: None,
