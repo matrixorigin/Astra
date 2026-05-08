@@ -59,6 +59,14 @@ pub struct RoundSnapshot {
     /// happen to be populated.
     #[serde(default)]
     pub message_count: u32,
+    /// Roles of each message in order (`system`, `user`, `assistant`,
+    /// `tool`). Populated by the capture parser. The volatile rule
+    /// uses this to distinguish "volatile in a system message block"
+    /// (where the runtime owns block-level cache_control layout and
+    /// we should trust it) from "volatile in a user/tool mid-history
+    /// message" (the real regression the rule was built to catch).
+    #[serde(default)]
+    pub message_roles: Vec<String>,
 }
 
 /// Severity of a diagnostic finding.
@@ -149,6 +157,18 @@ pub fn snapshot_from_capture_json(v: &serde_json::Value) -> RoundSnapshot {
 
     let msgs_arr = req.and_then(|r| r.get("messages")).and_then(Value::as_array);
     let message_count = msgs_arr.map(|a| a.len() as u32).unwrap_or(0);
+    let message_roles: Vec<String> = msgs_arr
+        .map(|arr| {
+            arr.iter()
+                .map(|m| {
+                    m.get("role")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let message_cc_indices = msgs_arr
         .map(|arr| {
             arr.iter()
@@ -210,6 +230,7 @@ pub fn snapshot_from_capture_json(v: &serde_json::Value) -> RoundSnapshot {
         message_cc_indices,
         volatile_msg_indices: message_volatile_indices,
         message_count,
+        message_roles,
     }
 }
 
@@ -236,14 +257,39 @@ fn flatten_message_text_for_scan(m: &serde_json::Value) -> String {
     }
 }
 
+/// Safely look up a message's role from the parsed snapshot. Returns
+/// `""` when the index is out of range or roles weren't populated
+/// (older snapshots serialized before `message_roles` was added).
+fn role_at(snap: &RoundSnapshot, idx: u32) -> &str {
+    snap.message_roles
+        .get(idx as usize)
+        .map(String::as_str)
+        .unwrap_or("")
+}
+
 fn contains_volatile_pattern(text: &str) -> bool {
-    // Ordered by observed frequency in astra traffic. First match wins.
-    const PATTERNS: &[&str] = &[
-        "## Self-Awareness",
-        "[session-memory:",
-        "[attention:v1]",
-    ];
-    PATTERNS.iter().any(|p| text.contains(p))
+    // Each pattern requires a CO-OCCURRENCE with a structural sibling
+    // so incidental mentions in tool output (e.g. a git show of a
+    // commit whose body quotes `## Self-Awareness`) don't register as
+    // astra-injected volatile content. Observed false positive in
+    // session bc5764b6: a `tool` message carrying the commit body for
+    // d2d6f96a matched `## Self-Awareness` alone.
+    //
+    // Real volatile produced by the SelfModel renderer always emits
+    // the section header immediately followed by `Turn: N | Tokens: M`.
+    // The session-memory and attention manifests carry a similarly
+    // distinctive header + `goal:` line. Gate on both to cut false
+    // positives.
+    if text.contains("## Self-Awareness") && text.contains("Turn: ") && text.contains("Tokens: ") {
+        return true;
+    }
+    if text.contains("[session-memory:") && text.contains("goal:") {
+        return true;
+    }
+    if text.contains("[attention:v1]") && text.contains("goal:") {
+        return true;
+    }
+    false
 }
 
 /// Scan a session directory for `llm_capture_t{N}_r{M}_*.json` files
@@ -598,14 +644,24 @@ fn rule_cache_creation_waste(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
 #[must_use]
 fn rule_volatile_in_cached_prefix(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
     use crate::cache_placement::{CacheCapability, VolatilePlacement};
-    // Take the most recent round with any volatile signal — that's the
-    // one the LLM cares about right now.
-    let sample = rounds
+    // Take the most recent round with any volatile signal at a
+    // message position we actually police. System messages carry
+    // their own block-level cache_control layout (runtime owns that);
+    // the rule is specifically about volatile bytes appearing at
+    // user/assistant/tool mid-history positions where message-level
+    // cc alone can't protect them.
+    let sample = rounds.iter().rev().find(|r| {
+        r.volatile_msg_indices
+            .iter()
+            .any(|&idx| role_at(r, idx) != "system")
+    })?;
+    let cap = CacheCapability::for_provider_and_model(&sample.provider, &sample.model);
+    // Last non-system volatile index — that's the relevant one.
+    let vol_idx = *sample
+        .volatile_msg_indices
         .iter()
         .rev()
-        .find(|r| !r.volatile_msg_indices.is_empty())?;
-    let cap = CacheCapability::for_provider_and_model(&sample.provider, &sample.model);
-    let vol_idx = *sample.volatile_msg_indices.last()?;
+        .find(|&&idx| role_at(sample, idx) != "system")?;
     let count = sample.message_count;
     if count == 0 {
         return None;
@@ -798,10 +854,15 @@ mod tests {
             message_cc_indices: msg_cc.to_vec(),
             volatile_msg_indices: Vec::new(),
             message_count: 0,
+            message_roles: Vec::new(),
         }
     }
 
     /// Extended test helper for the volatile-in-cached-prefix rule.
+    /// Defaults `message_roles` to `user` for every index so the rule
+    /// reasons about user/tool mid-history placements. Tests that
+    /// specifically exercise system-block behavior should pass custom
+    /// roles via `snap_with_volatile_and_roles`.
     fn snap_with_volatile(
         turn: u32,
         round: u32,
@@ -810,6 +871,28 @@ mod tests {
         msg_cc: &[u32],
         volatile_indices: &[u32],
         message_count: u32,
+    ) -> RoundSnapshot {
+        snap_with_volatile_and_roles(
+            turn,
+            round,
+            provider,
+            model,
+            msg_cc,
+            volatile_indices,
+            message_count,
+            &vec!["user"; message_count as usize],
+        )
+    }
+
+    fn snap_with_volatile_and_roles(
+        turn: u32,
+        round: u32,
+        provider: &str,
+        model: &str,
+        msg_cc: &[u32],
+        volatile_indices: &[u32],
+        message_count: u32,
+        roles: &[&str],
     ) -> RoundSnapshot {
         RoundSnapshot {
             turn,
@@ -823,6 +906,7 @@ mod tests {
             message_cc_indices: msg_cc.to_vec(),
             volatile_msg_indices: volatile_indices.to_vec(),
             message_count,
+            message_roles: roles.iter().map(|&s| s.to_string()).collect(),
         }
     }
 
@@ -1333,6 +1417,64 @@ mod tests {
         );
     }
 
+    /// Regression from session bc5764b6 — the system message renders
+    /// both (a) a cache_control-marked block and (b) a Self-Awareness
+    /// block placed AFTER it in the same `content` array. Message-level
+    /// cc index is [0] and volatile index is [0] (same msg). Our
+    /// simple index-based check would fire, but the runtime has
+    /// placed the volatile block AFTER the cc within the message, so
+    /// block-level layout is safe. Rule trusts the runtime for system
+    /// messages and stays silent.
+    #[test]
+    fn volatile_rule_trusts_system_block_layout() {
+        // Single-message system with both cc and volatile at msg[0].
+        // Plus a trailing user msg at idx 1 so message_count > 0.
+        let rs = vec![snap_with_volatile_and_roles(
+            5,
+            0,
+            "bedrock",
+            "us.anthropic.claude-sonnet-4-6",
+            /* msg_cc */ &[0],
+            /* volatile */ &[0],
+            /* count */ 2,
+            &["system", "user"],
+        )];
+        let findings = evaluate_all(&rs);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == "volatile_in_cached_prefix"),
+            "rule must trust runtime block-level layout inside a system \
+             message. got findings={findings:?}",
+        );
+    }
+
+    /// The negation: if volatile appears at a USER (mid-history)
+    /// position, with cc markers at/after it, the rule fires as before.
+    /// This is the bug we're actually guarding against.
+    #[test]
+    fn volatile_rule_still_fires_on_user_mid_history() {
+        let rs = vec![snap_with_volatile_and_roles(
+            5,
+            0,
+            "bedrock",
+            "us.anthropic.claude-sonnet-4-6",
+            /* msg_cc */ &[0, 10],
+            /* volatile at user msg[8] */ &[8],
+            /* count */ 11,
+            &["system", "user", "assistant", "user", "assistant", "user",
+              "assistant", "user", "user", "assistant", "user"],
+        )];
+        let findings = evaluate_all(&rs);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == "volatile_in_cached_prefix"),
+            "rule must still fire when volatile sits in a user/assistant \
+             msg mid-history with cc markers at/after. got findings={findings:?}",
+        );
+    }
+
     #[test]
     fn volatile_rule_silent_on_unknown_provider() {
         // Unknown provider → VolatilePlacement::Free → rule doesn't apply.
@@ -1356,8 +1498,13 @@ mod tests {
 
     #[test]
     fn contains_volatile_pattern_catches_known_markers() {
-        assert!(contains_volatile_pattern("## Self-Awareness\nTurn: 5"));
-        assert!(contains_volatile_pattern("<system-reminder>\n[session-memory:v1]\ngoal: foo"));
+        // Each pattern needs its co-occurring structural sibling.
+        assert!(contains_volatile_pattern(
+            "## Self-Awareness\nTurn: 5 | Tokens: 1234/80000"
+        ));
+        assert!(contains_volatile_pattern(
+            "<system-reminder>\n[session-memory:v1]\ngoal: foo"
+        ));
         assert!(contains_volatile_pattern("[attention:v1]\ngoal: hi"));
     }
 
@@ -1365,9 +1512,40 @@ mod tests {
     fn contains_volatile_pattern_ignores_unrelated_text() {
         assert!(!contains_volatile_pattern("Hi, what's up?"));
         assert!(!contains_volatile_pattern("```\nlet x = 1;\n```"));
-        // Similar but NOT exact matches — avoid false positives on
-        // well-meaning user content that happens to mention these.
-        assert!(!contains_volatile_pattern("I'm using self-awareness techniques"));
+        assert!(!contains_volatile_pattern(
+            "I'm using self-awareness techniques"
+        ));
+    }
+
+    /// Regression from session bc5764b6 — a `tool` message carrying a
+    /// `git show` output of the commit that introduced
+    /// `## Self-Awareness` handling must NOT be flagged as volatile
+    /// injection. The rule's previous substring match fired on any
+    /// occurrence of `## Self-Awareness`, misattributing commit
+    /// bodies as runtime-injected volatile content.
+    #[test]
+    fn contains_volatile_pattern_ignores_commit_body_mentioning_marker() {
+        let commit_body = "commit d2d6f96acc5018648373db9e8d28de4e521bc884\n\
+                           Author: XuPeng-SH <xupeng@matrixorigin.io>\n\
+                           Date:   Thu May 8 16:42:12 2026 +0800\n\n\
+                           fix(cache): suppress volatile on strict-history bridge path\n\n\
+                           The bridge's /chat/turn path was NOT routed through the new\n\
+                           CacheCapability API. MiniMax requests kept injecting\n\
+                           `## Self-Awareness` every round.";
+        assert!(
+            !contains_volatile_pattern(commit_body),
+            "commit body mentioning '## Self-Awareness' without the live \
+             `Turn: N | Tokens: M/K` co-occurrence must not be flagged",
+        );
+    }
+
+    /// Complement: a tool_result that quotes `[session-memory:v1]` in
+    /// an explanatory context (no `goal:` sibling) also mustn't fire.
+    #[test]
+    fn contains_volatile_pattern_ignores_session_memory_mention_without_goal() {
+        let doc = "The `[session-memory:v1]` header is the start of the \
+                   session-memory manifest. See module docs for layout.";
+        assert!(!contains_volatile_pattern(doc));
     }
 
     #[test]
