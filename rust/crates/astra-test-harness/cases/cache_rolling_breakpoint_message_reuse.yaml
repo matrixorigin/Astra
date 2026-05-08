@@ -1,0 +1,85 @@
+name: cache_rolling_breakpoint_message_reuse
+description: |
+  **What**: A 4-turn session that exercises the **rolling 2-breakpoint**
+  message-history cache scheme. Across rounds 3 and 4 the cacheable prefix
+  MUST extend past system + tools into the conversation history, proving
+  that Anthropic's prefix cache is hitting message-level cache_control
+  markers placed by `annotate_last_message_cache_breakpoint`.
+
+  **Why**: Production traffic (captured in
+  ~/.astra/sessions/<sid>/llm_capture_*.json) previously showed
+  `cached_input_tokens` pinned at ~10K — exactly `system + tools` — for
+  every round of a 60+ round session. Root cause: the old
+  `annotate_last_message_cache_breakpoint` placed a single marker and
+  rebuilt from scratch each round, so the previous round's marker was
+  silently stripped when that message became history, changing its
+  serialized bytes and invalidating the cached prefix.
+
+  The fix emits two markers per round — `[historical, tail]` — where
+  the tail of round N lands on the exact message index that round N+1
+  uses as its historical, keeping the bytes byte-identical across
+  rounds for cache hits on the full message history.
+
+  **Pass means**: by round 4 (`steps[2]`) `cached_input_tokens` reflects
+  not just the static system+tools slab but also the built-up chat
+  history. `min_read >= 20000` is intentionally generous: the system
+  prompt alone is ~8K, tools ~3K, and the `[historical, tail]` pair
+  should add at least another ~9K of replayable history through rounds
+  2 and 3.
+
+  **Fail means**: cache_read regressed to the ~10-16K range (system +
+  tools only). That signals:
+    - marker placement reverted to a single marker, or
+    - `apply_cache_policy_to_blocks` started emitting 2 system markers
+      again (pushing the total past Anthropic's 4-breakpoint cap and
+      silently losing a slot), or
+    - the `content: "..."` → `content: [{type:text, ...}]` upgrade
+      drifted across rounds (the test would also fail at the
+      `rolling_breakpoint_historical_prefix_bytes_stable_across_rounds`
+      unit-level check first).
+
+  **Provider scope**: runs across three providers in parallel:
+    - `us.anthropic.claude-sonnet-4-6`  — Bedrock (Converse API).
+      This is where the production regression was captured.
+    - `deepseek-v4-pro-anthropic`       — DeepSeek via Anthropic-
+      compatible endpoint (`wire_model_name` alias of the upstream
+      `deepseek-v4-pro`). Exercises the rolling-breakpoint path on a
+      non-Bedrock anthropic-protocol provider.
+    - `MiniMax-M2.7`                    — OpenAI-compatible provider.
+      No `cache_control` is emitted on this path; the cache-token
+      criterion is vacuous, but a clean 0-exit proves the multi-round
+      protocol still works for providers that ignore the markers.
+  The `prompt_cache_tokens` criterion is satisfied by any provider that
+  actually supports message-level cache_control. For OpenAI-compatible
+  providers the `cached_input_tokens` stays at 0, which on paper fails
+  the `min_read` floor — that's by design: the harness surfaces the
+  provider-dependent split instead of silently passing no-op runs.
+prompt: |
+  Reply with the single word ACK. Do not call any tools.
+models:
+  - us.anthropic.claude-sonnet-4-6
+  - deepseek-v4-pro-anthropic
+  - MiniMax-M2.7
+capability: custom:cache
+difficulty: 3
+weight: 1.0
+timeout_seconds: 180
+steps:
+  - prompt: 'Reply with the single word ACK. Do not call any tools.'
+  - prompt: 'Reply with the single word ACK. Do not call any tools.'
+  - prompt: 'Reply with the single word ACK. Do not call any tools.'
+criteria:
+  - type: exit_code
+    code: 0
+  - type: prompt_cache_tokens
+    # After 4 rounds the rolling [historical, tail] pair should extend
+    # the cached prefix past the static system+tools floor of ~10-12K
+    # into the replayable chat history. A value below this range
+    # indicates the rolling scheme is inactive.
+    min_read: 20000
+    min_creation: 0
+    # Cap creation to catch regressions where cache_control churn
+    # rebuilds the entire prefix every round (what the pre-fix code
+    # did). Legitimate growth of creation is bounded by the size of
+    # each new [historical, tail] delta (≈ 1 assistant reply worth).
+    max_creation: 35000

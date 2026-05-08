@@ -7,8 +7,8 @@ use std::fmt;
 use serde_json::Value;
 
 use astra_turn_types::continuity::{
-    narrative_task_contradicts_facts, redact_sensitive, AttentionManifest, ContinuityState,
-    GoalState, TodoItem, TodoState, TodoStatus,
+    AttentionManifest, ContinuityState, GoalState, TodoItem, TodoState, TodoStatus,
+    narrative_task_contradicts_facts, redact_sensitive,
 };
 
 use astra_turn_types::session_facts::SessionFacts;
@@ -1515,9 +1515,11 @@ mod tests {
     fn validate_empty_required_section() {
         let l1 = SessionMemory::parse(sample_l1_empty_required()).unwrap();
         let errors = l1.validate().unwrap_err();
-        assert!(errors
-            .iter()
-            .any(|e| e.contains("empty section: Task Specification")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("empty section: Task Specification"))
+        );
     }
 
     // ── L1 Size Governance Tests ────────────────────────────────────────
@@ -1785,16 +1787,18 @@ mod tests {
             "should be valid: {:?}",
             l1.validate()
         );
-        assert!(l1
-            .section("Task Specification")
-            .unwrap()
-            .contains("rate limiter"));
+        assert!(
+            l1.section("Task Specification")
+                .unwrap()
+                .contains("rate limiter")
+        );
         assert!(l1.section("Key Files").unwrap().contains("src/main.rs"));
         assert!(l1.section("Decisions").unwrap().contains("read_file"));
-        assert!(l1
-            .section("User Messages")
-            .unwrap()
-            .contains("Redis connection"));
+        assert!(
+            l1.section("User Messages")
+                .unwrap()
+                .contains("Redis connection")
+        );
         assert!(l1.section("Context").unwrap().contains("50K"));
     }
 
@@ -2066,8 +2070,8 @@ mod tests {
     mod persist_l1_tests {
         use super::*;
         use crate::turn::cloud::memoria_compact::{MemoriaClient, MemoriaMemory};
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// Mock that tracks calls and can fail N times before succeeding.
         struct MockMemoria {

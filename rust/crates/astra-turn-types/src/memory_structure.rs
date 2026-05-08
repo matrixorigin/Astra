@@ -36,45 +36,20 @@
 //!   - Does not block `working` writes; those are session-scoped and
 //!     handled by `should_store_in_memory` (L1).
 
-/// Minimum length of the abstract layer, in Unicode scalars.
-///
-/// Mirrors `astra_prompts::memory_proto::ABSTRACT_MIN_CHARS` —
-/// duplicated here so this crate stays prompt-independent (a single
-/// test in prompts will flag drift). Below this, the abstract can't
-/// carry retrievable signal on its own and wouldn't make a useful
-/// one-liner in the compact-view lane.
-const ABSTRACT_MIN_CHARS: usize = 30;
-
-/// Maximum length of the abstract layer, in Unicode scalars.
-///
-/// Mirrors `astra_prompts::memory_proto::ABSTRACT_MAX_CHARS`. Above
-/// this the writer should push content into the overview or detail
-/// layer; the cap keeps the volatile prompt-cache lane small.
-const ABSTRACT_MAX_CHARS: usize = 150;
-
-/// Separator that ends the abstract layer and starts the overview.
-///
-/// Mirrors `astra_prompts::memory_proto::LAYER_SEP_OVERVIEW`.
-const LAYER_SEP_OVERVIEW: &str = "\n\n";
-
-/// Separator that ends the overview layer and starts the detail.
-///
-/// Mirrors `astra_prompts::memory_proto::LAYER_SEP_DETAIL`. Needed
-/// so the gate can extract just the abstract from a body that skips
-/// overview (abstract + detail).
-const LAYER_SEP_DETAIL: &str = "\n<!--layer:detail-->\n";
+// Re-export the layer-protocol constants from their canonical home
+// in `astra_prompts::memory_proto`. Using `use` instead of mirror
+// constants guarantees zero drift at compile time; the previous
+// mirror was only guarded by a single drift-detection test.
+use astra_prompts::memory_proto::{
+    ABSTRACT_MAX_CHARS, ABSTRACT_MIN_CHARS, LAYER_SEP_DETAIL, LAYER_SEP_OVERVIEW,
+};
 
 /// Memory types that Memoria persists across sessions. Writes with
 /// these types MUST satisfy [`validate_persistent_memory_content`].
 ///
 /// `working` is deliberately absent — those writes are session-scoped
 /// and L1's `should_store_in_memory` already gates them.
-pub const PERSISTENT_MEMORY_TYPES: &[&str] = &[
-    "semantic",
-    "episodic",
-    "procedural",
-    "profile",
-];
+pub const PERSISTENT_MEMORY_TYPES: &[&str] = &["semantic", "episodic", "procedural", "profile"];
 
 /// Reason a persistent memory write was rejected by the structural
 /// gate. Returned as a string so callers can log it verbatim; the
@@ -167,9 +142,7 @@ const KNOWN_NAMESPACES: &[&str] = &[
 /// Use via [`should_store_persistent_memory`] which composes memory-
 /// type filtering + content validation into a single call-site-friendly
 /// predicate.
-pub fn validate_persistent_memory_content(
-    content: &str,
-) -> Result<(), PersistentStoreRejection> {
+pub fn validate_persistent_memory_content(content: &str) -> Result<(), PersistentStoreRejection> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return Err(PersistentStoreRejection::Empty);
@@ -293,7 +266,8 @@ mod tests {
 
     #[test]
     fn accepts_well_formed_fact() {
-        let content = "[@fact/active] astra-engine uses Rust 2024 edition with clippy warnings as errors.";
+        let content =
+            "[@fact/active] astra-engine uses Rust 2024 edition with clippy warnings as errors.";
         assert!(validate_persistent_memory_content(content).is_ok());
     }
 
@@ -313,9 +287,8 @@ mod tests {
     #[test]
     fn accepts_all_known_namespaces() {
         for ns in KNOWN_NAMESPACES {
-            let content = format!(
-                "[@{ns}/active] a sufficiently long body to clear the minimum-chars gate."
-            );
+            let content =
+                format!("[@{ns}/active] a sufficiently long body to clear the minimum-chars gate.");
             assert!(
                 validate_persistent_memory_content(&content).is_ok(),
                 "namespace {ns} should be accepted"
@@ -542,36 +515,16 @@ mod tests {
             max: 150,
         };
         let msg = format!("{e}");
-        assert!(
-            msg.contains("200") && msg.contains("150"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("200") && msg.contains("150"), "got: {msg}");
 
         let e = PersistentStoreRejection::AbstractNotSingleLine;
         let msg = format!("{e}");
         assert!(msg.contains("single line"), "got: {msg}");
     }
 
-    #[test]
-    fn abstract_constants_match_memory_proto() {
-        // Single source of truth lives in astra_prompts::memory_proto.
-        // If those values change, this test fails loudly so we update
-        // the local mirrors.
-        assert_eq!(
-            ABSTRACT_MIN_CHARS,
-            astra_prompts::memory_proto::ABSTRACT_MIN_CHARS
-        );
-        assert_eq!(
-            ABSTRACT_MAX_CHARS,
-            astra_prompts::memory_proto::ABSTRACT_MAX_CHARS
-        );
-        assert_eq!(
-            LAYER_SEP_OVERVIEW,
-            astra_prompts::memory_proto::LAYER_SEP_OVERVIEW
-        );
-        assert_eq!(
-            LAYER_SEP_DETAIL,
-            astra_prompts::memory_proto::LAYER_SEP_DETAIL
-        );
-    }
+    // Note: a drift-detection test used to live here to keep local
+    // mirror constants in sync with `astra_prompts::memory_proto`.
+    // Since the constants are now re-exported directly via `use`,
+    // drift is impossible by construction — the test was removed
+    // as redundant.
 }

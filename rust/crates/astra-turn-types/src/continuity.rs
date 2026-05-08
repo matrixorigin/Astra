@@ -552,10 +552,7 @@ pub fn append_attention_manifest_message(
 /// the attention manifest was the single biggest drift source in the
 /// history tail.
 #[must_use]
-pub fn build_attention_manifest_text(
-    state: &ContinuityState,
-    max_chars: usize,
-) -> Option<String> {
+pub fn build_attention_manifest_text(state: &ContinuityState, max_chars: usize) -> Option<String> {
     let manifest = AttentionManifest::from_state(state, max_chars).into_string();
     if manifest_is_empty(&manifest) {
         None
@@ -1001,7 +998,12 @@ mod tests {
         // And the legacy path produces the same payload.
         let mut msgs = Vec::new();
         assert!(append_attention_manifest_message(&mut msgs, &state, 2_000));
-        let legacy = msgs[0].get("content").unwrap().as_str().unwrap().to_string();
+        let legacy = msgs[0]
+            .get("content")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
         assert_eq!(text, legacy);
     }
 

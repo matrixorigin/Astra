@@ -353,9 +353,11 @@ mod tests {
             Some("/path with spaces/file".to_string())
         );
         // Trailing quote shouldn't leak into the returned string.
-        assert!(!extract_first_absolute_path("echo '/a/b'")
-            .unwrap()
-            .contains('\''));
+        assert!(
+            !extract_first_absolute_path("echo '/a/b'")
+                .unwrap()
+                .contains('\'')
+        );
     }
 
     // Ported from the legacy `stream_render::extract_first_absolute_path`

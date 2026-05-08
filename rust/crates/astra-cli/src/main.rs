@@ -144,6 +144,7 @@ mod repl_state;
 mod repl_turn;
 #[path = "cli/repl_ui.rs"]
 mod repl_ui;
+mod sandbox_retry;
 #[path = "cli/self_command.rs"]
 mod self_command;
 #[path = "cli/session_cleanup.rs"]
@@ -220,7 +221,6 @@ mod terminal_region;
 mod theme;
 #[path = "cli/tool_call_groups.rs"]
 mod tool_call_groups;
-mod sandbox_retry;
 mod tool_safety_guard;
 mod tui;
 #[path = "cli/ui_adapter.rs"]
@@ -529,7 +529,8 @@ async fn run_chat_repl(
                                     );
                                     eprintln!(
                                         "  {}",
-                                        "  Use /allow prompt to restore confirmation prompts.".dim()
+                                        "  Use /allow prompt to restore confirmation prompts."
+                                            .dim()
                                     );
                                 }
                             } else if approved {

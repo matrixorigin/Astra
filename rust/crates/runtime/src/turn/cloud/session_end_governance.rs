@@ -355,11 +355,8 @@ mod tests {
         // added when the writer calls `MemoryEntry::encode` or stores
         // directly). Callers wrap it with the `[@knowledge/curated]`
         // tag via `MemoryEntry`.
-        let entry = astra_prompts::memory_proto::MemoryEntry::new(
-            "knowledge",
-            "curated",
-            &formatted,
-        );
+        let entry =
+            astra_prompts::memory_proto::MemoryEntry::new("knowledge", "curated", &formatted);
         // Abstract: deterministic count line.
         assert_eq!(
             entry.abstract_layer(),
@@ -395,11 +392,8 @@ mod tests {
         };
         let sid = "1234567890abcdef-extra-very-long-suffix";
         let formatted = format_knowledge_for_storage(&knowledge, sid).unwrap();
-        let entry = astra_prompts::memory_proto::MemoryEntry::new(
-            "knowledge",
-            "curated",
-            &formatted,
-        );
+        let entry =
+            astra_prompts::memory_proto::MemoryEntry::new("knowledge", "curated", &formatted);
         // Should use the first 12 chars of the session id.
         assert!(
             entry.abstract_layer().starts_with("Session 1234567890ab"),
@@ -495,8 +489,7 @@ mod tests {
         assert!(stored[0].0.contains("RS256"));
         // The wire form must pass the same L2 gate production uses.
         assert!(
-            astra_turn_types::should_store_persistent_memory(&stored[0].0, "semantic")
-                .is_ok(),
+            astra_turn_types::should_store_persistent_memory(&stored[0].0, "semantic").is_ok(),
             "stored wire must pass L2 gate"
         );
 

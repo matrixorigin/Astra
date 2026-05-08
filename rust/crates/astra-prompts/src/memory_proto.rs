@@ -345,11 +345,7 @@ pub fn split_body_layers(body: &str) -> BodyLayers<'_> {
 /// Omitting `overview` and `detail` produces an abstract-only body.
 /// The caller is responsible for abstract validity; the L2 gate
 /// re-checks on write.
-pub fn encode_body_layers(
-    abstract_: &str,
-    overview: Option<&str>,
-    detail: Option<&str>,
-) -> String {
+pub fn encode_body_layers(abstract_: &str, overview: Option<&str>, detail: Option<&str>) -> String {
     let mut out = String::with_capacity(
         abstract_.len()
             + overview.map_or(0, |o| o.len() + LAYER_SEP_OVERVIEW.len())
@@ -1157,7 +1153,10 @@ mod tests {
             Some("ovr"),
             Some("det with\nmultiple lines"),
         );
-        assert_eq!(e.full_view(), "abs\n\novr\n<!--layer:detail-->\ndet with\nmultiple lines");
+        assert_eq!(
+            e.full_view(),
+            "abs\n\novr\n<!--layer:detail-->\ndet with\nmultiple lines"
+        );
     }
 
     #[test]
@@ -1171,7 +1170,10 @@ mod tests {
             entry.abstract_layer(),
             "Session sess1: 1 corrections, 1 learnings"
         );
-        assert_eq!(entry.overview_layer(), Some("User flagged auth middleware."));
+        assert_eq!(
+            entry.overview_layer(),
+            Some("User flagged auth middleware.")
+        );
         assert_eq!(
             entry.detail_layer(),
             Some("- Use RS256\n- Migrate sessions")
@@ -1188,8 +1190,12 @@ mod tests {
         // Legacy-style single-line entries still parse — they just
         // count as abstract-only. (L2 will reject them at write time
         // if the abstract doesn't meet MIN/MAX.)
-        let entry = MemoryEntry::parse("[@pref/active] Focus project: matrixorigin/memoria").unwrap();
-        assert_eq!(entry.abstract_layer(), "Focus project: matrixorigin/memoria");
+        let entry =
+            MemoryEntry::parse("[@pref/active] Focus project: matrixorigin/memoria").unwrap();
+        assert_eq!(
+            entry.abstract_layer(),
+            "Focus project: matrixorigin/memoria"
+        );
         assert!(entry.overview_layer().is_none());
         assert!(entry.detail_layer().is_none());
     }

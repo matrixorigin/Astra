@@ -1832,6 +1832,30 @@ impl InProcessChatTurnBridge {
                     None
                 };
 
+                // Both branches below apply the same wire mutations and then
+                // capture the final state. Binding the capture args once here
+                // makes "E2E and real path record byte-identical traces" a
+                // structural property rather than a copy-paste invariant
+                // (reviewers previously had to diff the two call sites).
+                let capture_request = |buf: &mut Option<TurnEventBuffer>,
+                                       msgs: &[Value],
+                                       attempt: u32| {
+                    record_full_llm_request_event(
+                        buf,
+                        full_llm_capture,
+                        &session_id,
+                        trace_turn,
+                        &trace_correlation,
+                        "bridge_inprocess",
+                        &request_capture_model,
+                        &provider,
+                        attempt,
+                        msgs,
+                        &pruned_tools,
+                        Some(max_output_tokens),
+                    );
+                };
+
                 if let Some(round_val) = e2e_round {
                     // E2E fixture path: apply cache annotations first so the
                     // captured wire state matches the real-LLM branch below.
@@ -1840,20 +1864,7 @@ impl InProcessChatTurnBridge {
                     // would be post-mutation. Traces from E2E tests must be
                     // comparable to traces from real runs.
                     apply_anthropic_cache_metadata(&mut llm_messages, &cache_cfg, &session_id);
-                    record_full_llm_request_event(
-                        &mut turn_event_buffer,
-                        full_llm_capture,
-                        &session_id,
-                        trace_turn,
-                        &trace_correlation,
-                        "bridge_inprocess",
-                        &request_capture_model,
-                        &provider,
-                        attempt_in_round,
-                        &llm_messages,
-                        &pruned_tools,
-                        Some(max_output_tokens),
-                    );
+                    capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
                     #[cfg(feature = "bridge-e2e-hooks")]
                     {
                         let (t, r, tc, u_delta) =
@@ -1886,20 +1897,7 @@ impl InProcessChatTurnBridge {
                     // Capture the final post-mutation request state (see the
                     // long note ~60 lines up for why this is here and not
                     // before the mutations).
-                    record_full_llm_request_event(
-                        &mut turn_event_buffer,
-                        full_llm_capture,
-                        &session_id,
-                        trace_turn,
-                        &trace_correlation,
-                        "bridge_inprocess",
-                        &request_capture_model,
-                        &provider,
-                        attempt_in_round,
-                        &llm_messages,
-                        &pruned_tools,
-                        Some(max_output_tokens),
-                    );
+                    capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
 
                     // Emit system prompt breakdown so CLI can record precise per-component trace.
                     let skill_injections: Vec<astra_turn_core::context_assembly_trace::SkillInjection> =

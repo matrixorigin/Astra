@@ -407,8 +407,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     );
                 }
             }
-            astra_turn_core::loop_circuit_breaker::BreakerAction::SoftStop
-                if suppress_nudges => {}
+            astra_turn_core::loop_circuit_breaker::BreakerAction::SoftStop if suppress_nudges => {}
             astra_turn_core::loop_circuit_breaker::BreakerAction::SoftStop => {
                 state.stall.forced_completion_soft_stop = true;
                 state.messages.push(serde_json::json!({

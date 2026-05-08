@@ -2740,11 +2740,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             let tool = req.tool.clone();
             let args = req.args.clone();
             let sandbox_tool_key = format!("sandbox_expand:{tool}");
-            let sandbox_msg = crate::sandbox_retry::sandbox_denied_message(
-                &outputs[pos].0.output,
-            )
-            .unwrap_or("")
-            .to_string();
+            let sandbox_msg = crate::sandbox_retry::sandbox_denied_message(&outputs[pos].0.output)
+                .unwrap_or("")
+                .to_string();
             let guard_args = serde_json::json!({"reason": sandbox_msg});
             let decision = crate::tool_safety_guard::ToolSafetyGuard::check_request(
                 self.perm_manager.as_deref_mut(),
@@ -2764,10 +2762,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             if let Some(pm) = &mut self.perm_manager {
                 pm.record_approval(&sandbox_tool_key, Some(&args), true);
             }
-            let (retried, retry_dur) = catch_tool_execution_panic(
-                self.executor.execute_with_metadata(&tool, &args),
-            )
-            .await;
+            let (retried, retry_dur) =
+                catch_tool_execution_panic(self.executor.execute_with_metadata(&tool, &args)).await;
             outputs[pos] = (retried, retry_dur);
         }
 

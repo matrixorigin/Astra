@@ -739,11 +739,7 @@ fn build_compaction_layered_body(session_id: &str, summary: &str) -> Option<Stri
         astra_prompts::memory_proto::MemoryEntry::new(
             astra_prompts::memory_proto::NS_EPISODE,
             "compaction",
-            &astra_prompts::memory_proto::encode_body_layers(
-                &abstract_,
-                None,
-                Some(&detail),
-            ),
+            &astra_prompts::memory_proto::encode_body_layers(&abstract_, None, Some(&detail)),
         )
         .encode(),
     )
@@ -1131,8 +1127,7 @@ pub async fn compact_with_memoria(
                 // sessions, so it stays within the 150-char cap even
                 // when summaries are long.
                 if config.store_on_compact
-                    && let Some(semantic_content) =
-                        build_compaction_layered_body(sid, &summary)
+                    && let Some(semantic_content) = build_compaction_layered_body(sid, &summary)
                 {
                     match astra_turn_types::should_store_persistent_memory(
                         &semantic_content,
@@ -1154,9 +1149,7 @@ pub async fn compact_with_memoria(
                             }
                         }
                         Err(reason) => {
-                            eprintln!(
-                                "[compact] L2 rejected compaction summary write: {reason}"
-                            );
+                            eprintln!("[compact] L2 rejected compaction summary write: {reason}");
                         }
                     }
                 }
@@ -2373,10 +2366,7 @@ mod tests {
         // User msg long enough to pass the write-time gate, so the
         // assistant tool_calls line has a preceding user line to
         // anchor the format.
-        let msgs = vec![
-            user("kick off the build and report the result"),
-            a,
-        ];
+        let msgs = vec![user("kick off the build and report the result"), a];
         let r = build_working_memory_content(&msgs, 10000);
         assert!(r.contains("[tools: bash]"));
     }
@@ -2521,10 +2511,10 @@ mod tests {
     #[test]
     fn working_memory_rejects_short_user_acks() {
         let msgs = vec![
-            user("hi"),                                // English single-word
-            user("好"),                                // CJK single char
-            user("继续啊"),                            // CJK 3 chars + particle
-            user("修复啊！"),                          // CJK 3 chars + punctuation
+            user("hi"),       // English single-word
+            user("好"),       // CJK single char
+            user("继续啊"),   // CJK 3 chars + particle
+            user("修复啊！"), // CJK 3 chars + punctuation
             user("ok"),
             user("yes"),
             user("continue"),
@@ -2562,10 +2552,10 @@ mod tests {
         // imperatives interleaved with substantive requests. Only the
         // substantive ones survive into working memory.
         let msgs = vec![
-            user("continue"),                                     // reject
+            user("continue"),                                       // reject
             user("please review the delegation fan-out code path"), // keep
             assistant("Reviewed — three potential issues."),        // keep
-            user("修复啊！"),                                     // reject
+            user("修复啊！"),                                       // reject
             user("fix the ordering bug in the prefix-store write"), // keep
         ];
         let r = build_working_memory_content(&msgs, 10000);
@@ -2818,8 +2808,8 @@ mod tests {
             "should have L2 structural envelope, got: {}",
             &content[..50.min(content.len())]
         );
-        let entry = astra_prompts::memory_proto::MemoryEntry::parse(content)
-            .expect("wire form must parse");
+        let entry =
+            astra_prompts::memory_proto::MemoryEntry::parse(content).expect("wire form must parse");
         let abs_chars = entry.abstract_layer().chars().count();
         assert!(
             (30..=150).contains(&abs_chars),
@@ -2850,7 +2840,8 @@ mod tests {
     fn compaction_body_uses_first_sentence_when_it_fits() {
         // 30–150 chars, ends with `. ` → verbatim abstract.
         let sid = "sess-xyz";
-        let summary = "User picked axum over actix for its tower stack. Then wired sqlx for persistence.";
+        let summary =
+            "User picked axum over actix for its tower stack. Then wired sqlx for persistence.";
         let body = build_compaction_layered_body(sid, summary).unwrap();
         let entry = astra_prompts::memory_proto::MemoryEntry::parse(&body).unwrap();
         assert_eq!(
@@ -2867,9 +2858,7 @@ mod tests {
         let sid = "sess-short";
         let summary = "OK done. Details: we refactored the auth path, added refresh rotation, and migrated the session table to MatrixOne.";
         let body = build_compaction_layered_body(sid, summary).unwrap();
-        assert!(
-            astra_turn_types::should_store_persistent_memory(&body, "semantic").is_ok()
-        );
+        assert!(astra_turn_types::should_store_persistent_memory(&body, "semantic").is_ok());
         let entry = astra_prompts::memory_proto::MemoryEntry::parse(&body).unwrap();
         // Fallback format is stable.
         assert!(
@@ -2886,9 +2875,7 @@ mod tests {
         let sid = "sess-long";
         let summary = "a".repeat(500);
         let body = build_compaction_layered_body(sid, &summary).unwrap();
-        assert!(
-            astra_turn_types::should_store_persistent_memory(&body, "semantic").is_ok()
-        );
+        assert!(astra_turn_types::should_store_persistent_memory(&body, "semantic").is_ok());
         let entry = astra_prompts::memory_proto::MemoryEntry::parse(&body).unwrap();
         assert!(entry.abstract_layer().starts_with("Compaction of session"));
         assert!(

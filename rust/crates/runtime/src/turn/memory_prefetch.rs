@@ -96,7 +96,11 @@ pub async fn prefetch_memories(
 ///
 /// Entries that don't parse as structured protocol memories pass
 /// through verbatim — downstream `is_memory_worthy` still filters
-/// them, and legacy unstructured hits remain visible.
+/// them, and legacy unstructured hits remain visible. The fallback
+/// path is counted at `trace` level so operators can tell from logs
+/// whether the v1→v1.1 hard break is actually landing (all hits on
+/// the structured path) or whether legacy v1 entries still dominate
+/// retrieval (fallback rate stays high).
 pub(crate) fn compact_view_of(content: &str) -> String {
     match astra_prompts::memory_proto::MemoryEntry::parse(content) {
         Some(entry) => astra_prompts::memory_proto::MemoryEntry::new(
@@ -105,7 +109,14 @@ pub(crate) fn compact_view_of(content: &str) -> String {
             entry.compact_view(),
         )
         .encode(),
-        None => content.to_string(),
+        None => {
+            tracing::trace!(
+                target: "astra::memory::compact_view",
+                bytes = content.len(),
+                "compact_view_of: unstructured fallback (v1 legacy or malformed)"
+            );
+            content.to_string()
+        }
     }
 }
 
