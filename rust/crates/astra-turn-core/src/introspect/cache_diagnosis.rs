@@ -395,6 +395,9 @@ pub fn evaluate_all(rounds: &[RoundSnapshot]) -> Vec<CacheFinding> {
     if let Some(f) = rule_volatile_in_cached_prefix(rounds) {
         out.push(f);
     }
+    if let Some(f) = rule_deepseek_anthropic_tools_not_cached(rounds) {
+        out.push(f);
+    }
     out.sort_by_key(|f| f.rule_id);
     out
 }
@@ -564,45 +567,66 @@ fn rule_cache_read_collapsed(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
 
 /// **Rule 4 — cache_creation_waste.**
 ///
-/// Within a single turn, if the ratio `sum(cache_creation) / sum(cache_read)`
-/// exceeds 0.3 across 2+ rounds, we're spending more than ~23% of the
-/// cache budget REBUILDING entries — the cache is churning instead of
-/// amortizing. Session d0640d3d t6: sum(cache_creation)≈44K,
-/// sum(cache_read)≈158K, ratio≈0.28 on the edge — our threshold catches
-/// the worst offenders while staying insensitive to normal growth.
+/// Within a single turn, if the ratio of **post-first-round**
+/// `cache_creation / cache_read` exceeds 0.3 across 3+ rounds, the
+/// runtime is repeatedly rebuilding the cached prefix instead of
+/// amortizing it. Session d0640d3d t6 fires cleanly (14 rounds, 94%
+/// waste); bc5764b6 t5 (2 rounds, first-round-heavy) does NOT fire
+/// — the 10 K of first-round creation is inherent, not waste.
+///
+/// Why skip the first round: cache_creation on round 0 is the
+/// *cost of first filling the cache entry*. Counting it against the
+/// ratio effectively penalizes **any** turn that started with a
+/// fresh session. The pathology the rule is built to catch is
+/// repeated re-creation across tool-loop rounds, which only shows
+/// up from round 2 onward.
+///
+/// Why require 3+ rounds: a 2-round sample means 1 "real" data
+/// point after dropping round 0 — not enough to conclude churn vs.
+/// single-round artifact.
 #[must_use]
 fn rule_cache_creation_waste(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
     // Aggregate per-turn on anthropic-protocol providers (openai-compat
-    // returns cache_creation=0 by definition).
-    let mut per_turn: std::collections::BTreeMap<u32, (u64, u64, Vec<(u32, u32)>)> =
-        std::collections::BTreeMap::new();
+    // returns cache_creation=0 by definition). Track rounds individually
+    // so we can drop the earliest one before computing the ratio.
+    use std::collections::BTreeMap;
+    let mut per_turn: BTreeMap<u32, Vec<&RoundSnapshot>> = BTreeMap::new();
     for r in rounds {
         if r.cache_read_tokens == 0 && r.cache_creation_tokens == 0 {
             continue;
         }
-        let e = per_turn.entry(r.turn).or_default();
-        e.0 += r.cache_read_tokens;
-        e.1 += r.cache_creation_tokens;
-        e.2.push((r.turn, r.round));
+        per_turn.entry(r.turn).or_default().push(r);
     }
-    for (turn, (reads, creations, trigs)) in per_turn {
-        if trigs.len() < 2 {
+    for (turn, mut group) in per_turn {
+        if group.len() < 3 {
+            // Need >=3 so we have >=2 "real" rounds after dropping
+            // the first.
             continue;
         }
+        group.sort_by_key(|r| r.round);
+        // Drop the first round: its cache_creation is the inherent
+        // cost of filling the cache, not waste.
+        let amortized = &group[1..];
+        let reads: u64 = amortized.iter().map(|r| r.cache_read_tokens).sum();
+        let creations: u64 = amortized.iter().map(|r| r.cache_creation_tokens).sum();
         if reads < 5_000 {
-            // Too little signal to decide.
+            // Too little post-amortization signal to decide.
             continue;
         }
         let ratio = creations as f64 / reads as f64;
         if ratio > 0.3 {
             let pct = (ratio * 100.0).round() as u32;
+            let trigs: Vec<(u32, u32)> =
+                amortized.iter().map(|r| (r.turn, r.round)).collect();
             return Some(CacheFinding {
                 rule_id: "cache_creation_waste",
                 severity: Severity::Warn,
                 narrative: format!(
                     "turn {turn}: cache_creation/cache_read ratio is {pct}% \
-                     (creation={creations}, read={reads}) across {n} rounds — the \
-                     cache is being rebuilt, not amortized.",
+                     (creation={creations}, read={reads}) across {n} post-first \
+                     rounds — the cache is being rebuilt, not amortized. \
+                     (First round's creation is excluded as it's the natural \
+                     fill cost.)",
                     n = trigs.len(),
                 ),
                 actionable_fix:
@@ -751,6 +775,100 @@ fn rule_volatile_in_cached_prefix(rounds: &[RoundSnapshot]) -> Option<CacheFindi
     }
 }
 
+/// **Rule 6 — deepseek_anthropic_tools_not_cached.**
+///
+/// DeepSeek's Anthropic-compatible endpoint (`/anthropic`) accepts
+/// `cache_control` on system-block content, but in observed traffic
+/// it **does not** create a cache entry for the tool-schema prefix
+/// — the tool-level marker is silently ignored. Session bc5764b6
+/// t7 showed `cache_read` pinned at 2432 tokens (= system prefix
+/// alone, ~2553 tokens by char/token ratio) across four rounds
+/// while the expected upper bound was ~7500 tokens (system +
+/// ~5000 tokens of tool schemas).
+///
+/// This is a provider-level limitation, not an astra bug: native
+/// Anthropic and Bedrock both honor tool-level markers, but
+/// DeepSeek's proxy does not. Surface as Info severity so operators
+/// investigating cache-rate gaps can distinguish "provider quirk
+/// — expected" from "our bug — fixable."
+///
+/// Trigger: at least 2 rounds on `provider=anthropic` with a model
+/// id matching `deepseek-*-anthropic`, tool_cc_index is set (marker
+/// was emitted), but cache_read stayed below 4000 across the
+/// window. The 4000 floor is conservative: a typical astra system
+/// prefix is ~2500–3000 tokens, so 4000 = "system cached and then
+/// some, but clearly not reaching the ~7500 we'd see if tools were
+/// also cached."
+#[must_use]
+fn rule_deepseek_anthropic_tools_not_cached(
+    rounds: &[RoundSnapshot],
+) -> Option<CacheFinding> {
+    let relevant: Vec<&RoundSnapshot> = rounds
+        .iter()
+        .filter(|r| {
+            r.provider == "anthropic"
+                && r.model.to_ascii_lowercase().starts_with("deepseek")
+                && r.model.to_ascii_lowercase().contains("anthropic")
+        })
+        .collect();
+    if relevant.len() < 2 {
+        return None;
+    }
+    // Tool marker was emitted — confirms astra did its part.
+    if !relevant.iter().any(|r| r.tool_cc_index.is_some()) {
+        return None;
+    }
+    // Cache_read is stuck below the "system-only" ceiling for every
+    // observed round.
+    let all_below_tools_ceiling = relevant
+        .iter()
+        .all(|r| r.cache_read_tokens > 0 && r.cache_read_tokens < 4_000);
+    if !all_below_tools_ceiling {
+        return None;
+    }
+    let min = relevant
+        .iter()
+        .map(|r| r.cache_read_tokens)
+        .min()
+        .unwrap_or(0);
+    let max = relevant
+        .iter()
+        .map(|r| r.cache_read_tokens)
+        .max()
+        .unwrap_or(0);
+    // If min==max across all rounds, cache_read is suspiciously flat —
+    // the classic "system cached once, tools never joined" shape.
+    if min != max {
+        return None;
+    }
+    let first = relevant[0];
+    let trigs: Vec<(u32, u32)> = relevant.iter().map(|r| (r.turn, r.round)).collect();
+    Some(CacheFinding {
+        rule_id: "deepseek_anthropic_tools_not_cached",
+        severity: Severity::Info,
+        narrative: format!(
+            "{model} via {prov}: cache_read held flat at {min} tokens across \
+             {n} rounds even though the tool cache_control marker was set \
+             (tool_cc_index={tcc:?}). DeepSeek's Anthropic-compatible \
+             endpoint caches the system prefix but does NOT honor \
+             tool-level markers — the ~5000 tokens of tool schemas get \
+             re-tokenized every request.",
+            model = first.model,
+            prov = first.provider,
+            n = relevant.len(),
+            tcc = first.tool_cc_index,
+        ),
+        actionable_fix:
+            "Provider-level limitation, not astra code. If tool-schema \
+             caching matters for this workload, route it through native \
+             Anthropic or Bedrock instead of deepseek-*-anthropic. \
+             Otherwise accept the ~5K tokens/request overhead as a \
+             provider cost."
+                .into(),
+        triggered_on: trigs,
+    })
+}
+
 /// Render findings + round-level aggregates as markdown suitable for
 /// returning to the LLM from `introspect(subtopic="cache")`. Designed
 /// to be informative but compact (~30-60 lines depending on the
@@ -882,6 +1000,16 @@ mod tests {
             message_count,
             &vec!["user"; message_count as usize],
         )
+    }
+
+    /// Convenience: override the default `model: "test-model"` on a
+    /// snap(). Used by deepseek-anthropic tests that rely on model-id
+    /// substring matching.
+    impl RoundSnapshot {
+        fn with_model(mut self, m: &str) -> Self {
+            self.model = m.into();
+            self
+        }
     }
 
     fn snap_with_volatile_and_roles(
@@ -1084,26 +1212,59 @@ mod tests {
 
     // ── Rule 4: cache_creation_waste ────────────────────────────────────
     #[test]
-    fn cache_creation_waste_fires_when_ratio_exceeds_threshold() {
-        // sum(cache_creation)=40K, sum(cache_read)=100K → ratio=0.4 > 0.3
+    fn cache_creation_waste_fires_on_sustained_churn() {
+        // 3+ rounds, and AFTER dropping the first round the ratio is
+        // still 0.4 — that's real post-amortization waste. Mirrors
+        // session d0640d3d t6's 14-round pattern collapsed to 3.
         let rs = vec![
-            snap(6, 0, "bedrock", 50_000, 20_000, &[0, 8, 10], 21, Some(19)),
+            // Round 0: inherent first-round creation. Dropped by the rule.
+            snap(6, 0, "bedrock", 0, 100_000, &[0, 8, 10], 21, Some(19)),
             snap(6, 1, "bedrock", 50_000, 20_000, &[0, 8, 10], 21, Some(19)),
+            snap(6, 2, "bedrock", 50_000, 20_000, &[0, 8, 10], 21, Some(19)),
         ];
         let findings = evaluate_all(&rs);
         let f = findings
             .iter()
             .find(|f| f.rule_id == "cache_creation_waste")
-            .expect("rule must fire at 0.4 ratio");
+            .expect("rule must fire on sustained post-first-round churn");
         assert_eq!(f.severity, Severity::Warn);
+        assert!(
+            f.narrative.contains("post-first"),
+            "narrative should clarify that first-round was excluded: {}",
+            f.narrative,
+        );
+    }
+
+    /// Regression from session bc5764b6: 2-round bedrock turn where
+    /// round 0 creates a lot (fill) and round 1 reads. The old rule
+    /// lumped both rounds together and reported 134% ratio — a false
+    /// positive because the creation was the inherent first-round cost.
+    /// With the updated rule (drop round 0, require >=3 rounds total),
+    /// this 2-round session stays silent.
+    #[test]
+    fn cache_creation_waste_silent_on_first_round_heavy_short_session() {
+        let rs = vec![
+            // Round 0 fills cache (high creation, zero read). Dropped.
+            snap(5, 0, "bedrock", 8, 10_628, &[0, 6, 8], 21, Some(20)),
+            // Round 1 reads most of it back. Healthy churn.
+            snap(5, 1, "bedrock", 8_519, 807, &[0, 12], 21, Some(20)),
+        ];
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "cache_creation_waste"),
+            "rule must not fire on 2-round sessions with first-round-heavy \
+             creation (session bc5764b6 regression)",
+        );
     }
 
     #[test]
     fn cache_creation_waste_silent_at_healthy_ratio() {
-        // sum(cache_creation)=1K, sum(cache_read)=100K → ratio=0.01
+        // 3 rounds, low creation throughout.
         let rs = vec![
-            snap(6, 0, "bedrock", 50_000, 500, &[0, 4], 21, Some(20)),
+            snap(6, 0, "bedrock", 0, 10_000, &[0, 4], 21, Some(20)),
             snap(6, 1, "bedrock", 50_000, 500, &[0, 4, 6], 21, Some(20)),
+            snap(6, 2, "bedrock", 50_000, 500, &[0, 6, 8], 21, Some(20)),
         ];
         assert!(
             !evaluate_all(&rs)
@@ -1121,6 +1282,115 @@ mod tests {
             !evaluate_all(&rs)
                 .iter()
                 .any(|f| f.rule_id == "cache_creation_waste"),
+        );
+    }
+
+    #[test]
+    fn cache_creation_waste_requires_three_rounds_not_just_two() {
+        // 2 rounds with sustained waste: old rule would fire. New rule
+        // (>=3 required) stays silent to avoid over-eager alerts on
+        // short sessions.
+        let rs = vec![
+            snap(6, 0, "bedrock", 50_000, 20_000, &[0, 4], 21, Some(20)),
+            snap(6, 1, "bedrock", 50_000, 20_000, &[0, 4, 6], 21, Some(20)),
+        ];
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "cache_creation_waste"),
+            "rule requires 3+ rounds after the updated threshold (need >=2 \
+             post-first rounds to establish a trend)",
+        );
+    }
+
+    // ── Rule 6: deepseek_anthropic_tools_not_cached ─────────────────────
+
+    #[test]
+    fn deepseek_anthropic_tools_not_cached_fires_on_flat_system_only_cache() {
+        // Session bc5764b6 t7-t8 shape: 4 rounds, cache_read stuck at
+        // 2432 (≈ system prefix), tool_cc_index set.
+        let rs = vec![
+            snap(7, 0, "anthropic", 2432, 0, &[0, 10, 12], 21, Some(20))
+                .with_model("deepseek-v4-pro-anthropic"),
+            snap(7, 1, "anthropic", 2432, 0, &[0, 16], 21, Some(20))
+                .with_model("deepseek-v4-pro-anthropic"),
+            snap(8, 0, "anthropic", 2432, 0, &[0, 12, 14], 21, Some(20))
+                .with_model("deepseek-v4-pro-anthropic"),
+        ];
+        let findings = evaluate_all(&rs);
+        let f = findings
+            .iter()
+            .find(|f| f.rule_id == "deepseek_anthropic_tools_not_cached")
+            .expect("rule must fire on flat system-only cache pattern");
+        assert_eq!(f.severity, Severity::Info);
+        assert!(
+            f.narrative.contains("deepseek"),
+            "narrative must name the provider: {}",
+            f.narrative,
+        );
+    }
+
+    #[test]
+    fn deepseek_anthropic_tools_not_cached_silent_when_cache_grows() {
+        // Cache grows across rounds → tools are being cached, no finding.
+        let rs = vec![
+            snap(7, 0, "anthropic", 2432, 0, &[0, 10], 21, Some(20))
+                .with_model("deepseek-v4-pro-anthropic"),
+            snap(7, 1, "anthropic", 7500, 0, &[0, 12], 21, Some(20))
+                .with_model("deepseek-v4-pro-anthropic"),
+        ];
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "deepseek_anthropic_tools_not_cached"),
+        );
+    }
+
+    #[test]
+    fn deepseek_anthropic_tools_not_cached_silent_on_native_anthropic() {
+        // Model isn't deepseek — rule skips. Native Anthropic / Bedrock
+        // are known to honor tool markers; this rule is deepseek-specific.
+        let rs = vec![
+            snap(7, 0, "anthropic", 2432, 0, &[0, 10, 12], 21, Some(20))
+                .with_model("claude-sonnet-4"),
+            snap(7, 1, "anthropic", 2432, 0, &[0, 16], 21, Some(20))
+                .with_model("claude-sonnet-4"),
+        ];
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "deepseek_anthropic_tools_not_cached"),
+        );
+    }
+
+    #[test]
+    fn deepseek_anthropic_tools_not_cached_silent_on_single_round() {
+        // Need >=2 rounds to detect a flat pattern.
+        let rs = vec![
+            snap(7, 0, "anthropic", 2432, 0, &[0, 10, 12], 21, Some(20))
+                .with_model("deepseek-v4-pro-anthropic"),
+        ];
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "deepseek_anthropic_tools_not_cached"),
+        );
+    }
+
+    #[test]
+    fn deepseek_anthropic_tools_not_cached_silent_without_tool_marker() {
+        // If tool_cc_index is None, astra didn't emit a marker — the
+        // provider can't be blamed. Rule skips.
+        let rs = vec![
+            snap(7, 0, "anthropic", 2432, 0, &[0, 10, 12], 21, None)
+                .with_model("deepseek-v4-pro-anthropic"),
+            snap(7, 1, "anthropic", 2432, 0, &[0, 16], 21, None)
+                .with_model("deepseek-v4-pro-anthropic"),
+        ];
+        assert!(
+            !evaluate_all(&rs)
+                .iter()
+                .any(|f| f.rule_id == "deepseek_anthropic_tools_not_cached"),
         );
     }
 

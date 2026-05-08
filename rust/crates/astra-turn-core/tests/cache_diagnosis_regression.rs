@@ -7,7 +7,6 @@
 //! | ----------- | --------- | --------------------------- |
 //! | t3 r0       | tool[20] outside cache marker       | `tool_marker_not_on_tail` |
 //! | t6 r0–r13   | rolling cc frozen in 14-round loop  | `cc_marker_frozen`        |
-//! | t4, t6      | creation/read ratio > 0.3           | `cache_creation_waste`    |
 //!
 //! Note: **`cache_read_collapsed` does NOT fire on this fixture**, by
 //! design. The d0640d3d bedrock pathology is that `cache_read`
@@ -17,6 +16,13 @@
 //! (prefix invalidation mid-turn, e.g. volatile content leaking into
 //! the cached block), and has its own unit test coverage in
 //! `cache_diagnosis::tests::cache_read_collapsed_*`.
+//!
+//! **`cache_creation_waste` also does NOT fire** — this was noise the
+//! rule used to emit before the threshold was tightened. Post-tighten
+//! (see `cache_creation_waste_silent_on_first_round_heavy_short_session`),
+//! t6's post-first ratio sits at 29.9%, just below the 0.3 threshold.
+//! That's the correct reading of d0640d3d: the real pathology was
+//! cc_marker_frozen (the cache wasn't churning — it wasn't *advancing*).
 //!
 //! The fixture is a scrubbed mirror of the production capture files —
 //! free-form text replaced with `<sha:len>` digests. Structural data
@@ -116,13 +122,11 @@ fn d0640d3d_fixture_triggers_session_specific_rules() {
     let findings: Vec<CacheFinding> = evaluate_all(&rounds);
     let ids: Vec<&str> = findings.iter().map(|f| f.rule_id).collect();
 
-    // Three rules specifically exposed by this session.
-    // `cache_read_collapsed` is covered by unit tests — see module docstring.
-    let expected = [
-        "cache_creation_waste",
-        "cc_marker_frozen",
-        "tool_marker_not_on_tail",
-    ];
+    // Two rules specifically exposed by this session's bug pattern.
+    // `cache_read_collapsed` and `cache_creation_waste` are intentionally
+    // silent — see the negative assertions below and the module docstring
+    // for rationale.
+    let expected = ["cc_marker_frozen", "tool_marker_not_on_tail"];
     for rule in expected {
         assert!(
             ids.contains(&rule),
@@ -131,15 +135,17 @@ fn d0640d3d_fixture_triggers_session_specific_rules() {
         );
     }
 
-    // And a negative: cache_read_collapsed MUST NOT fire on this fixture.
-    // If a future change causes it to fire here, the rule is too eager —
-    // d0640d3d's cache never *collapsed*, it just never *amortized*.
-    assert!(
-        !ids.contains(&"cache_read_collapsed"),
-        "cache_read_collapsed must stay silent on d0640d3d — the session \
-         pattern is flat cache_read, not a collapse. Rule got over-eager? \
-         findings={findings:#?}",
-    );
+    // Negative assertions — these rules are deliberately silent on this
+    // fixture. If a future change makes them fire, the rule has become
+    // over-eager and needs retuning.
+    for silent in ["cache_read_collapsed", "cache_creation_waste"] {
+        assert!(
+            !ids.contains(&silent),
+            "{silent} must stay silent on d0640d3d: cache never collapsed \
+             and post-first-round ratio sits at 29.9% (below 0.3 threshold). \
+             Rule got over-eager? findings={findings:#?}",
+        );
+    }
 
     // Spot-check key narratives so a renaming/refactor that changes the
     // finding content surfaces loudly rather than silently.
