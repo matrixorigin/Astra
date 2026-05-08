@@ -125,8 +125,28 @@ pub fn annotate_last_message_cache_breakpoint(messages: &mut [Value]) {
 
 /// Determine which message indices should receive cache breakpoints.
 ///
-/// Returns up to 2 indices in ascending order: `[historical, tail]` for
-/// multi-turn conversations, `[tail]` for single-turn, empty for none.
+/// Returns up to 2 indices in ascending order: `[historical, tail]` when
+/// a rolling invariant is available, `[tail]` for single-turn /
+/// incomplete-rolling, empty for none.
+///
+/// **Two rolling modes**, both obey the same cross-round invariant: *round
+/// N's tail index == round N+1's historical index*. That byte-stable
+/// anchor is what makes Anthropic's prefix cache hit through the
+/// conversation history.
+///
+/// 1. **Normal multi-user turn growth** (chat UI pattern): conversation
+///    ends on a `user` message and grows one `(assistant, user)` pair per
+///    turn. tail = message before the last user; historical = message
+///    before the penultimate user. Across turns, today's tail equals
+///    tomorrow's historical by construction.
+///
+/// 2. **Tool-loop growth inside a single user turn** (agentic pattern,
+///    observed in session d0640d3d causing 94% wasted cache_creation):
+///    the conversation ends on a `tool` (tool_result) or `assistant`
+///    (tool_call) message and grows one `(assistant_tc, tool_result)`
+///    pair per LLM round. tail = `len - 1`; historical = `len - 3`
+///    (two messages back — the previous round's tail). After appending
+///    one more pair, new `len - 3` == old `len - 1` — the invariant.
 fn find_cache_breakpoint_targets(messages: &[Value]) -> Vec<usize> {
     let user_indices: Vec<usize> = messages
         .iter()
@@ -148,6 +168,36 @@ fn find_cache_breakpoint_targets(messages: &[Value]) -> Vec<usize> {
             .map(|(i, _)| i)
     };
 
+    let is_non_system = |idx: usize| -> bool {
+        messages
+            .get(idx)
+            .and_then(|m| m.get("role").and_then(Value::as_str))
+            .is_some_and(|r| r != "system")
+    };
+
+    // Tool-loop detection: if there are any messages strictly after the
+    // last user, the conversation tail is an assistant/tool, not a user.
+    // Route through the tool-loop-aware branch so the tail advances with
+    // each appended pair instead of staying pinned at `last_user - 1`.
+    let last_user = user_indices.last().copied();
+    if let Some(last_user) = last_user
+        && messages.len() > last_user + 1
+    {
+        let tail = messages.len() - 1;
+        // `tail - 2` is the previous round's tail (one `(assistant_tc,
+        // tool)` pair back). Accept only when it's a real, non-system
+        // index AND is strictly after `last_user` — if it would sit on
+        // or before the last user we'd break the normal-turn invariant,
+        // so fall through to just `[tail]`.
+        let historical_candidate = tail.checked_sub(2);
+        let historical = historical_candidate
+            .filter(|&h| h > last_user && is_non_system(h) && h != tail);
+        return match historical {
+            Some(h) => vec![h, tail],
+            None => vec![tail],
+        };
+    }
+
     match user_indices.len() {
         0 => last_non_system().map(|i| vec![i]).unwrap_or_default(),
         1 => last_non_system().map(|i| vec![i]).unwrap_or_default(),
@@ -166,13 +216,9 @@ fn find_cache_breakpoint_targets(messages: &[Value]) -> Vec<usize> {
             // message — we never place message-level markers on system
             // (system blocks carry their own `cache_control` metadata via
             // `apply_cache_policy_to_blocks`).
-            let historical_candidate = penult_user.checked_sub(1);
-            let historical = historical_candidate.filter(|&idx| {
-                messages
-                    .get(idx)
-                    .and_then(|m| m.get("role").and_then(Value::as_str))
-                    .is_some_and(|r| r != "system")
-            });
+            let historical = penult_user
+                .checked_sub(1)
+                .filter(|&idx| is_non_system(idx));
 
             match historical {
                 None => vec![tail],
@@ -547,6 +593,93 @@ mod tests {
         // system + user1 are byte-identical (they have no marker on them in turn 2)
         assert_eq!(turn2_msgs[0], system);
         assert_eq!(turn2_msgs[1], user1);
+    }
+
+    // ── tool-loop rolling: observed in session d0640d3d ────────────────
+    //
+    // Production capture showed the bridge re-issuing the same user turn
+    // 14 times while appending `(assistant_tool_call, tool_result)` pairs
+    // each round. With the pre-fix policy — tail = `last_user - 1` — the
+    // marker froze at `msgs[last_user - 1]` regardless of how many tool
+    // pairs were appended after `last_user`. New pairs sat AFTER the
+    // marker → not in cached prefix → re-sent uncached every round.
+    // Observed wasted cache_creation: ~44 K tokens over 14 rounds (94%).
+    //
+    // Post-fix contract: when the conversation tail is a
+    // non-user message (tool_result / assistant-with-tool_calls — i.e.
+    // inside an agentic tool loop), the tail marker MUST advance to the
+    // last non-user message, so the next round's call hits cache through
+    // every pair emitted so far.
+    #[test]
+    fn cache_breakpoint_tool_loop_tail_advances_past_last_user() {
+        // Shape after 2 tool rounds within one user turn:
+        //   [user, assistant(tc), tool, assistant(tc), tool]
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": null,
+                   "tool_calls": [{"id":"c1", "function":{"name":"git"}}]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "r1"}),
+            json!({"role": "assistant", "content": null,
+                   "tool_calls": [{"id":"c2", "function":{"name":"git"}}]}),
+            json!({"role": "tool", "tool_call_id": "c2", "content": "r2"}),
+        ];
+        annotate_last_message_cache_breakpoint(&mut msgs);
+        let marks = marker_indices(&msgs);
+        assert!(
+            marks.contains(&4),
+            "tail marker must sit on the last tool_result (idx 4) — \
+             otherwise tool pairs appended inside the agentic loop are \
+             re-sent uncached every round. got {marks:?}",
+        );
+    }
+
+    // And the rolling invariant across tool rounds: round N's tail index
+    // must equal round N+1's historical index, so Anthropic's prefix cache
+    // hits through the previous round's tool_result.
+    #[test]
+    fn cache_breakpoint_tool_loop_rolls_forward_across_rounds() {
+        // Round N: [u, a(tc), tool, a(tc), tool]  → markers should include idx 4
+        let mut round_n = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": null,
+                   "tool_calls": [{"id":"c1", "function":{"name":"git"}}]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "r1"}),
+            json!({"role": "assistant", "content": null,
+                   "tool_calls": [{"id":"c2", "function":{"name":"git"}}]}),
+            json!({"role": "tool", "tool_call_id": "c2", "content": "r2"}),
+        ];
+        annotate_last_message_cache_breakpoint(&mut round_n);
+        let n_marks = marker_indices(&round_n);
+        let n_tail = *n_marks.last().expect("round N must emit a marker");
+        assert_eq!(n_tail, 4, "round N tail is last tool_result");
+
+        // Round N+1: one more (assistant_tc, tool) pair appended.
+        let mut round_np1 = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": null,
+                   "tool_calls": [{"id":"c1", "function":{"name":"git"}}]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "r1"}),
+            json!({"role": "assistant", "content": null,
+                   "tool_calls": [{"id":"c2", "function":{"name":"git"}}]}),
+            json!({"role": "tool", "tool_call_id": "c2", "content": "r2"}),
+            json!({"role": "assistant", "content": null,
+                   "tool_calls": [{"id":"c3", "function":{"name":"git"}}]}),
+            json!({"role": "tool", "tool_call_id": "c3", "content": "r3"}),
+        ];
+        annotate_last_message_cache_breakpoint(&mut round_np1);
+        let np1_marks = marker_indices(&round_np1);
+        assert!(
+            np1_marks.contains(&n_tail),
+            "round N+1's historical marker must sit at round N's tail index \
+             (= idx {n_tail}) so anthropic's prefix cache hits through that \
+             point. round N markers={n_marks:?}, round N+1 markers={np1_marks:?}",
+        );
+        let np1_tail = *np1_marks.last().unwrap();
+        assert!(
+            np1_tail > n_tail,
+            "round N+1 tail must advance past round N's (= {n_tail}) to \
+             include the newly appended tool pair. got {np1_tail}",
+        );
     }
 
     #[test]
