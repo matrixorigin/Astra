@@ -126,7 +126,7 @@ fn render_list(tl: &Timeline, area: Rect, buf: &mut Buffer) {
             .clone()
             .unwrap_or_else(|| "(no input)".into());
 
-        lines.push(Line::from(vec![
+        let mut line = Line::from(vec![
             gutter,
             Span::styled(format!("#{:<3}", t.turn), name_style),
             Span::raw(" "),
@@ -137,7 +137,11 @@ fn render_list(tl: &Timeline, area: Rect, buf: &mut Buffer) {
             Span::styled(format!("{toks:>11}"), dim),
             Span::raw("  "),
             Span::styled(user, Style::default().fg(row_color)),
-        ]));
+        ]);
+        if is_sel {
+            line = line.style(Style::default().bg(theme.selected_bg));
+        }
+        lines.push(line);
     }
 
     Paragraph::new(lines)

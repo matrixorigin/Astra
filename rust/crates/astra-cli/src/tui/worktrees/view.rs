@@ -69,21 +69,22 @@ pub(crate) fn render(list: &WorktreeList, area: Rect, buf: &mut Buffer) {
 
 fn render_list(list: &WorktreeList, area: Rect, buf: &mut Buffer) {
     let dim = Style::default().fg(Color::DarkGray);
+    let theme = crate::tui::theme::current();
     let sel_idx = list.selected().unwrap_or(0);
     let mut lines = Vec::with_capacity(list.len());
     for (i, e) in list.entries().iter().enumerate() {
         let is_sel = i == sel_idx;
         let gutter = if is_sel {
-            Span::styled("▌ ", Style::default().fg(Color::Cyan))
+            Span::styled("▌ ", Style::default().fg(theme.gutter))
         } else {
             Span::raw("  ")
         };
         let label_style = if is_sel {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
         } else if e.is_bare {
             Style::default().add_modifier(Modifier::DIM)
         } else if e.is_detached {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.warn)
         } else {
             Style::default()
         };
@@ -93,12 +94,16 @@ fn render_list(list: &WorktreeList, area: Rect, buf: &mut Buffer) {
         } else {
             format!("{} sessions", e.session_count)
         };
-        lines.push(Line::from(vec![
+        let mut line = Line::from(vec![
             gutter,
             Span::styled(format!("{label:<28}"), label_style),
             Span::raw(" "),
             Span::styled(sessions, dim),
-        ]));
+        ]);
+        if is_sel {
+            line = line.style(Style::default().bg(theme.selected_bg));
+        }
+        lines.push(line);
     }
     Paragraph::new(lines)
         .wrap(Wrap { trim: false })

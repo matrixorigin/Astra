@@ -18,7 +18,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
@@ -72,12 +72,14 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(window_end - window_start);
 
+    let theme = crate::tui::theme::current();
+
     for (idx, item) in matches[window_start..window_end].iter().enumerate() {
         let absolute = window_start + idx;
         let is_selected = absolute == selected;
 
         let gutter = if is_selected {
-            Span::styled("▌ ", Style::default().fg(Color::Cyan))
+            Span::styled("▌ ", Style::default().fg(theme.gutter))
         } else {
             Span::raw("  ")
         };
@@ -85,10 +87,10 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
         let padded_name = pad_right(item.name, name_col_width);
         let name_style = if is_selected {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(theme.accent)
         };
 
         // Compute remaining width for the description column:
@@ -99,7 +101,7 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
             .saturating_sub(2);
         let truncated_desc = truncate_ellipsis(item.description, desc_budget);
 
-        lines.push(Line::from(vec![
+        let mut line = Line::from(vec![
             gutter,
             Span::styled(padded_name, name_style),
             Span::raw("  "),
@@ -107,7 +109,14 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
                 truncated_desc,
                 Style::default().add_modifier(Modifier::DIM),
             ),
-        ]));
+        ]);
+        // Cursor-style: the whole row gets a subtle tinted background
+        // when selected so it stays visible even on wide terminals
+        // where the left gutter is off-screen in peripheral vision.
+        if is_selected {
+            line = line.style(Style::default().bg(theme.selected_bg));
+        }
+        lines.push(line);
     }
 
     Paragraph::new(lines).render(area, buf);

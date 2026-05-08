@@ -103,19 +103,20 @@ fn render_list(disco: &SessionDiscovery, area: Rect, buf: &mut Buffer, _two_pane
     let entries_visible = (max_rows / rows_per_entry).max(1);
     let (start, end) = window_around(selected, matches.len(), entries_visible);
 
+    let theme = crate::tui::theme::current();
     let mut lines: Vec<Line<'static>> = Vec::with_capacity((end - start) * 2);
     for (idx, entry) in matches[start..end].iter().enumerate() {
         let absolute = start + idx;
         let is_selected = absolute == selected;
 
         let gutter = if is_selected {
-            Span::styled("▌ ", Style::default().fg(Color::Cyan))
+            Span::styled("▌ ", Style::default().fg(theme.gutter))
         } else {
             Span::raw("  ")
         };
 
         let name_style = if is_selected {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -150,17 +151,21 @@ fn render_list(disco: &SessionDiscovery, area: Rect, buf: &mut Buffer, _two_pane
                 Style::default().fg(Color::Blue),
             ));
         }
-        lines.push(Line::from(header_spans));
-
-        // Summary row.
-        let summary = entry
-            .summary
-            .as_deref()
-            .unwrap_or("(no summary)");
-        lines.push(Line::from(vec![
+        let mut header_line = Line::from(header_spans);
+        let mut summary_line = Line::from(vec![
             Span::raw("    "),
-            Span::styled(summary.to_string(), dim),
-        ]));
+            Span::styled(
+                entry.summary.as_deref().unwrap_or("(no summary)").to_string(),
+                dim,
+            ),
+        ]);
+        if is_selected {
+            let bg = Style::default().bg(theme.selected_bg);
+            header_line = header_line.style(bg);
+            summary_line = summary_line.style(bg);
+        }
+        lines.push(header_line);
+        lines.push(summary_line);
     }
 
     Paragraph::new(lines)
