@@ -43,8 +43,7 @@ pub enum PromptCacheProtocol {
     /// Provider benefits from stable deterministic prompt prefixes.
     #[default]
     Prefix,
-    /// Provider supports Anthropic-style `cache_control`, `cache_reference`,
-    /// and `cache_edits` request metadata.
+    /// Provider supports Anthropic-style `cache_control` metadata.
     AnthropicCacheControl,
 }
 
@@ -54,10 +53,6 @@ pub struct ProviderCacheStrategy {
     pub prompt_cache_protocol: PromptCacheProtocol,
     pub compact_strategy: CompactStrategy,
     pub supports_cache_control: bool,
-    /// Capability flag consumed by API-layer request annotation code.
-    pub supports_cache_reference: bool,
-    /// Capability flag consumed by API-layer request annotation code.
-    pub supports_cache_edits: bool,
 }
 
 impl Default for ProviderCacheStrategy {
@@ -66,8 +61,6 @@ impl Default for ProviderCacheStrategy {
             prompt_cache_protocol: PromptCacheProtocol::Prefix,
             compact_strategy: CompactStrategy::Normalized,
             supports_cache_control: false,
-            supports_cache_reference: false,
-            supports_cache_edits: false,
         }
     }
 }
@@ -86,8 +79,6 @@ impl ProviderCacheStrategy {
                 prompt_cache_protocol: PromptCacheProtocol::AnthropicCacheControl,
                 compact_strategy: CompactStrategy::Minimal,
                 supports_cache_control: true,
-                supports_cache_reference: true,
-                supports_cache_edits: true,
             }
         } else {
             Self::default()
@@ -2302,15 +2293,11 @@ mod tests {
         );
         assert_eq!(anthropic.compact_strategy, CompactStrategy::Minimal);
         assert!(anthropic.supports_cache_control);
-        assert!(anthropic.supports_cache_reference);
-        assert!(anthropic.supports_cache_edits);
 
         let openai = ProviderCacheStrategy::from_provider_hint("openai/gpt-4o");
         assert_eq!(openai.prompt_cache_protocol, PromptCacheProtocol::Prefix);
         assert_eq!(openai.compact_strategy, CompactStrategy::Normalized);
         assert!(!openai.supports_cache_control);
-        assert!(!openai.supports_cache_reference);
-        assert!(!openai.supports_cache_edits);
     }
 
     #[test]

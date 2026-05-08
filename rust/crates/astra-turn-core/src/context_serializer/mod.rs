@@ -274,20 +274,23 @@ fn cache_control_for_scope(_scope: CacheScope, _policy: &ProviderCachePolicy) ->
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// Anthropic wire-level cache annotations (tool + message + tool_result)
+// Anthropic wire-level cache annotations (tool + message)
 // ═════════════════════════════════════════════════════════════════════════
 //
 // The `wire_cache_annotations` submodule hosts the helpers that place
-// Anthropic `cache_control` / `cache_edits` / `cache_reference` metadata
-// on tool_schemas[] / messages[] (the wire-level counterpart to
-// `cache_markers` on `system_blocks`). They are pure data transforms and
-// split out of `mod.rs` to keep the serialize phase itself focused on
-// system-block assembly.
+// Anthropic `cache_control` markers on tool_schemas[] / messages[] (the
+// wire-level counterpart to `cache_markers` on `system_blocks`). They
+// are pure data transforms and split out of `mod.rs` to keep the
+// serialize phase itself focused on system-block assembly.
+//
+// The previously-exported `cache_edits` / `cache_reference` helpers
+// were removed: those fields don't exist in Anthropic's public schema
+// and `/v1/messages` returns HTTP 400 when it sees them
+// (session 5c5cbf78, 2026-05-08).
 mod wire_cache_annotations;
 pub use wire_cache_annotations::{
     annotate_last_message_cache_breakpoint, annotate_pinned_tool_schema,
-    annotate_tool_result_cache_references, anthropic_ephemeral_cache_control,
-    insert_cache_edits_block, message_has_cache_control,
+    anthropic_ephemeral_cache_control, message_has_cache_control,
 };
 
 #[cfg(test)]

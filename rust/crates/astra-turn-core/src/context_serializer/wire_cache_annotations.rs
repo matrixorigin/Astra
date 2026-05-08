@@ -1,16 +1,19 @@
-//! Anthropic wire-level cache annotations (tool + message + tool_result).
+//! Anthropic wire-level cache annotations (tool + message).
 //!
-//! These helpers place Anthropic `cache_control` / `cache_edits` /
-//! `cache_reference` metadata on the `tool_schemas[]` and `messages[]`
-//! arrays — the wire-level counterpart to `cache_markers` on
-//! `system_blocks` (handled in `mod.rs`). They are pure data transforms
-//! and live here (rather than in `astra-runtime`) because the pipeline's
-//! Optimize+Serialize phase should be the single owner of provider-specific
-//! wire annotations.
+//! These helpers place Anthropic `cache_control` markers on the
+//! `tool_schemas[]` and `messages[]` arrays — the wire-level counterpart
+//! to `cache_markers` on `system_blocks` (handled in `mod.rs`). They are
+//! pure data transforms and live here (rather than in `astra-runtime`)
+//! because the pipeline's Optimize+Serialize phase should be the single
+//! owner of provider-specific wire annotations.
 //!
-//! Session-scoped state (the "deleted cache_references" list that survives
-//! across turns) is the runtime's responsibility — it feeds a `delete_refs`
-//! slice into [`insert_cache_edits_block`].
+//! Historical note: an earlier revision of this module also exported
+//! `insert_cache_edits_block` / `annotate_tool_result_cache_references`
+//! helpers that emitted `cache_edits` / `cache_reference` fields.
+//! Those fields aren't part of Anthropic's public API; real
+//! `/v1/messages` returns HTTP 400 on them (session 5c5cbf78,
+//! 2026-05-08), so the helpers and all their state (session-keyed
+//! pin map, merge logic) were removed entirely.
 
 use serde_json::{Value, json};
 
@@ -294,84 +297,6 @@ fn apply_cache_control_to_message(msg: &mut Value) {
             last_block["cache_control"] = anthropic_ephemeral_cache_control();
         }
     }
-}
-
-/// Attach `cache_reference: <tool_call_id>` to every `role: "tool"` message
-/// at or before the last message carrying a `cache_control` marker. These
-/// tool results are part of the cached prefix — the `cache_reference` tells
-/// Anthropic's API to skip re-processing their content on cache hits.
-///
-/// No-op if no message carries `cache_control` (nothing to reference against).
-pub fn annotate_tool_result_cache_references(messages: &mut [Value]) {
-    let Some(last_cc_idx) = messages
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, msg)| message_has_cache_control(msg))
-        .map(|(idx, _)| idx)
-    else {
-        return;
-    };
-
-    // Include the marker-bearing message itself (it may be a tool message
-    // when the marker sits on the last message of the previous turn).
-    for msg in messages.iter_mut().take(last_cc_idx + 1) {
-        if msg.get("role").and_then(Value::as_str) != Some("tool") {
-            continue;
-        }
-        if let Some(tool_call_id) = msg.get("tool_call_id").and_then(Value::as_str) {
-            msg["cache_reference"] = Value::String(tool_call_id.to_string());
-        }
-    }
-}
-
-/// Insert a `cache_edits` block on the last user message listing the
-/// provided `delete_refs` (tool_call_ids whose results were cleared/compacted
-/// in a prior turn). Anthropic uses this to drop cached tool results that
-/// are no longer valid.
-///
-/// The `delete_refs` slice is the caller's responsibility — runtime keeps
-/// a session-keyed pin map so the delete list survives across turns.
-///
-/// No-op when `delete_refs` is empty or `messages` has no user message.
-pub fn insert_cache_edits_block(messages: &mut [Value], delete_refs: &[String]) {
-    if delete_refs.is_empty() {
-        return;
-    }
-    let Some(last_user) = messages
-        .iter_mut()
-        .rev()
-        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-    else {
-        return;
-    };
-    ensure_content_array(last_user);
-    let Some(content) = last_user.get_mut("content").and_then(Value::as_array_mut) else {
-        return;
-    };
-    content.retain(|block| block.get("type").and_then(Value::as_str) != Some("cache_edits"));
-    content.push(json!({
-        "type": "cache_edits",
-        "edits": delete_refs
-            .iter()
-            .map(|cache_reference| json!({
-                "type": "delete",
-                "cache_reference": cache_reference,
-            }))
-            .collect::<Vec<_>>(),
-    }));
-}
-
-fn ensure_content_array(msg: &mut Value) {
-    if msg.get("content").is_some_and(Value::is_array) {
-        return;
-    }
-    let text = msg
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    msg["content"] = json!([{ "type": "text", "text": text }]);
 }
 
 pub fn message_has_cache_control(msg: &Value) -> bool {
@@ -704,98 +629,4 @@ mod tests {
         assert_eq!(msgs[0]["content"], "sys");
     }
 
-    #[test]
-    fn annotate_tool_result_cache_references_stamps_tool_msgs_before_marker() {
-        let mut msgs = vec![
-            json!({"role": "user", "content": "question"}),
-            json!({
-                "role": "assistant",
-                "tool_calls": [{"id": "c1", "function": {"name": "bash"}}]
-            }),
-            json!({"role": "tool", "tool_call_id": "c1", "content": "result-1"}),
-            json!({
-                "role": "user",
-                "content": [{"type": "text", "text": "next", "cache_control": {"type": "ephemeral"}}]
-            }),
-        ];
-        annotate_tool_result_cache_references(&mut msgs);
-        // The tool message at idx 2 sits BEFORE the marker at idx 3 → gets cache_reference
-        assert_eq!(msgs[2]["cache_reference"], json!("c1"));
-        // The user message AT the marker is unchanged
-        assert!(msgs[3]["cache_reference"].is_null());
-    }
-
-    #[test]
-    fn annotate_tool_result_cache_references_noop_when_no_marker() {
-        let mut msgs = vec![
-            json!({"role": "user", "content": "hi"}),
-            json!({"role": "tool", "tool_call_id": "c1", "content": "r"}),
-        ];
-        annotate_tool_result_cache_references(&mut msgs);
-        assert!(msgs[1]["cache_reference"].is_null());
-    }
-
-    #[test]
-    fn insert_cache_edits_block_appends_to_last_user_message() {
-        let mut msgs = vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "continue"}),
-        ];
-        insert_cache_edits_block(&mut msgs, &["c1".to_string(), "c2".to_string()]);
-
-        // user.content upgraded to array, cache_edits block appended
-        let arr = msgs[1]["content"].as_array().unwrap();
-        let edits_block = arr
-            .iter()
-            .find(|b| b.get("type").and_then(Value::as_str) == Some("cache_edits"))
-            .expect("cache_edits block present");
-        let edits = edits_block["edits"].as_array().unwrap();
-        assert_eq!(edits.len(), 2);
-        assert_eq!(edits[0]["type"], "delete");
-        assert_eq!(edits[0]["cache_reference"], "c1");
-        assert_eq!(edits[1]["cache_reference"], "c2");
-    }
-
-    #[test]
-    fn insert_cache_edits_block_replaces_existing_block() {
-        let mut msgs = vec![json!({
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "task"},
-                {"type": "cache_edits", "edits": [{"type": "delete", "cache_reference": "stale"}]}
-            ]
-        })];
-        insert_cache_edits_block(&mut msgs, &["fresh".to_string()]);
-
-        let arr = msgs[0]["content"].as_array().unwrap();
-        let cache_edits_blocks: Vec<_> = arr
-            .iter()
-            .filter(|b| b.get("type").and_then(Value::as_str) == Some("cache_edits"))
-            .collect();
-        assert_eq!(
-            cache_edits_blocks.len(),
-            1,
-            "old cache_edits block must be replaced, not duplicated"
-        );
-        assert_eq!(
-            cache_edits_blocks[0]["edits"][0]["cache_reference"],
-            "fresh"
-        );
-    }
-
-    #[test]
-    fn insert_cache_edits_block_noop_on_empty_refs() {
-        let mut msgs = vec![json!({"role": "user", "content": "x"})];
-        insert_cache_edits_block(&mut msgs, &[]);
-        // content untouched (still string, no cache_edits block)
-        assert!(msgs[0]["content"].is_string());
-    }
-
-    #[test]
-    fn insert_cache_edits_block_noop_when_no_user_message() {
-        let mut msgs = vec![json!({"role": "system", "content": "sys"})];
-        insert_cache_edits_block(&mut msgs, &["c1".into()]);
-        // No user message — function silently no-ops, doesn't panic.
-        assert_eq!(msgs[0]["content"], "sys");
-    }
 }

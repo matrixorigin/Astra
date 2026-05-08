@@ -1560,9 +1560,6 @@ fn carry_cache_annotations(src: &Value, dst: &mut Value) {
     if let Some(cc) = src.get("cache_control") {
         dst["cache_control"] = cc.clone();
     }
-    if let Some(cr) = src.get("cache_reference") {
-        dst["cache_reference"] = cr.clone();
-    }
 }
 
 fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
@@ -1644,9 +1641,9 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
                     .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
             {
                 let mut blocks = arr.clone();
-                // Defensively stamp `tool_use_id` / `cache_reference` on any
-                // tool_result blocks that lack them (the annotator always
-                // supplies tool_use_id but cache_reference is runtime-level).
+                // Defensively stamp `tool_use_id` on any tool_result blocks
+                // that lack them (the annotator always supplies tool_use_id
+                // but we re-check here for robustness).
                 for block in blocks.iter_mut() {
                     if block.get("type").and_then(Value::as_str) != Some("tool_result") {
                         continue;
@@ -1659,11 +1656,6 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
                             "tool_use_id".into(),
                             Value::String(tool_use_id.to_string()),
                         );
-                    }
-                    if !obj.contains_key("cache_reference")
-                        && let Some(cr) = msg.get("cache_reference").cloned()
-                    {
-                        obj.insert("cache_reference".into(), cr);
                     }
                 }
                 let mut out = json!({
@@ -1682,14 +1674,11 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
                         .cloned()
                         .unwrap_or(Value::String(String::new()))
                 });
-            let mut tool_result_block = json!({
+            let tool_result_block = json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
                 "content": content,
             });
-            if let Some(cr) = msg.get("cache_reference") {
-                tool_result_block["cache_reference"] = cr.clone();
-            }
             let mut out = json!({
                 "role": "user",
                 "content": [tool_result_block]
@@ -1743,11 +1732,6 @@ fn merge_consecutive_anthropic_messages(messages: Vec<Value>) -> Vec<Value> {
             {
                 last["cache_control"] = cache_control.clone();
             }
-            if last.get("cache_reference").is_none()
-                && let Some(cache_reference) = msg.get("cache_reference")
-            {
-                last["cache_reference"] = cache_reference.clone();
-            }
             continue;
         }
         merged.push(msg);
@@ -1768,7 +1752,7 @@ fn anthropic_content_blocks_from_openai_user(msg: &Value) -> Vec<Value> {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        matches!(ty, "tool_result" | "cache_edits" | "image" | "document")
+        matches!(ty, "tool_result" | "image" | "document")
     });
     if !has_anthropic_types {
         return Vec::new();
@@ -4952,8 +4936,14 @@ mod tests {
         assert_eq!(converted["cache_control"]["type"], "ephemeral");
     }
 
+    /// Regression guard for session 5c5cbf78 (2026-05-08): real Anthropic
+    /// `/v1/messages` returns HTTP 400 when asked to decode a `cache_reference`
+    /// top-level key on a message or inside a `tool_result` block. The
+    /// speculative wire helper that emitted those fields has been removed;
+    /// this test pins that invariant at the converter layer so an upstream
+    /// regression can't reintroduce it silently.
     #[test]
-    fn anthropic_message_conversion_preserves_cache_reference_on_tool() {
+    fn anthropic_message_conversion_drops_speculative_cache_reference_on_tool() {
         let msg = json!({
             "role": "tool",
             "tool_call_id": "call_1",
@@ -4964,14 +4954,26 @@ mod tests {
         let converted = anthropic_message_from_openai(&msg).unwrap();
         assert_eq!(converted["role"], "user");
         assert_eq!(converted["cache_control"]["type"], "ephemeral");
-        assert_eq!(converted["cache_reference"], "call_1");
+        assert!(
+            converted.get("cache_reference").is_none(),
+            "cache_reference must be stripped (not a real Anthropic field): {converted}",
+        );
         let blocks = converted["content"].as_array().unwrap();
         assert_eq!(blocks[0]["type"], "tool_result");
-        assert_eq!(blocks[0]["cache_reference"], "call_1");
+        assert!(
+            blocks[0].get("cache_reference").is_none(),
+            "tool_result block must not carry cache_reference: {:?}",
+            blocks[0],
+        );
     }
 
+    /// Companion regression: a user message with a `cache_edits` content
+    /// block — the shape that actually hit HTTP 400 on 5c5cbf78 t6_r7 —
+    /// must no longer be treated as a pass-through Anthropic-native type.
+    /// `cache_edits` isn't in Anthropic's content-block grammar, so the
+    /// converter should fall back to the text-only path and strip it.
     #[test]
-    fn anthropic_message_conversion_user_with_cache_edits_block() {
+    fn anthropic_message_conversion_drops_cache_edits_content_block() {
         let msg = json!({
             "role": "user",
             "content": [
@@ -4981,10 +4983,13 @@ mod tests {
         });
         let converted = anthropic_message_from_openai(&msg).unwrap();
         let blocks = converted["content"].as_array().unwrap();
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0]["type"], "text");
-        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
-        assert_eq!(blocks[1]["type"], "cache_edits");
+        for (i, b) in blocks.iter().enumerate() {
+            let ty = b.get("type").and_then(Value::as_str).unwrap_or("");
+            assert_ne!(
+                ty, "cache_edits",
+                "block[{i}] must not be cache_edits (5c5cbf78 regression): {b}",
+            );
+        }
     }
 
     // ── pre-annotated tool_result content must not be double-wrapped ────
@@ -5128,6 +5133,100 @@ mod tests {
                 .any(|block| block.get("text").and_then(Value::as_str) == Some("continue")),
             "final user text should be merged after tool results: {msgs:#?}"
         );
+    }
+
+    /// Session 5c5cbf78 (2026-05-08) regression: after seven tool-loop rounds,
+    /// enough `MICRO_COMPACT_STUB`-cleared tool results had accumulated that the
+    /// now-removed `insert_cache_edits_block` helper emitted a
+    /// `{type: "cache_edits", edits: [...]}` content block on the final user
+    /// message. Real Anthropic `/v1/messages` returns HTTP 400:
+    /// `unknown variant \`cache_edits\``. Also accumulated:
+    /// `cache_reference` top-level keys on tool messages.
+    ///
+    /// Both helpers are gone. This test feeds a representative multi-round
+    /// shape through the full wire builder and asserts neither field leaks.
+    /// A future reviewer reintroducing either field will fail this test.
+    #[test]
+    fn build_anthropic_wire_never_contains_cache_edits_or_cache_reference() {
+        // Shape: system + 3 turns with tool-loop activity, including a
+        // MICRO_COMPACT_STUB-cleared tool output (the pattern that used to
+        // trigger cache_edits emission). Even hand-seeded cache_reference
+        // keys in the input must be stripped by the converter.
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "stable prompt",
+                     "cache_control": {"type": "ephemeral"}}
+                ],
+            }),
+            json!({"role": "user", "content": "turn 1"}),
+            json!({"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+            ]}),
+            json!({
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": "full result 1",
+                "cache_reference": "c1",
+            }),
+            json!({"role": "user", "content": "turn 2"}),
+            json!({"role": "assistant", "tool_calls": [
+                {"id": "c2", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+            ]}),
+            json!({
+                "role": "tool",
+                "tool_call_id": "c2",
+                "content": crate::turn::cloud::analytics::MICRO_COMPACT_STUB,
+                "cache_reference": "c2",
+            }),
+            json!({"role": "user", "content": "turn 3 continue"}),
+        ];
+
+        let (system, msgs) = build_anthropic_system_and_messages(&messages);
+
+        // Real fields we still expect:
+        assert!(!system.is_empty(), "system blocks must be emitted");
+        assert!(!msgs.is_empty(), "messages must be emitted");
+
+        // Walk every emitted message + content block + nested block and assert
+        // no speculative cache field survived.
+        for (i, m) in msgs.iter().enumerate() {
+            assert!(
+                m.get("cache_reference").is_none(),
+                "wire msg[{i}] must not carry cache_reference (5c5cbf78 regression): {m}",
+            );
+            let Some(blocks) = m.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for (j, b) in blocks.iter().enumerate() {
+                let ty = b.get("type").and_then(Value::as_str).unwrap_or("");
+                assert_ne!(
+                    ty, "cache_edits",
+                    "wire msg[{i}].content[{j}] must not be cache_edits: {b}",
+                );
+                assert!(
+                    b.get("cache_reference").is_none(),
+                    "wire msg[{i}].content[{j}] must not carry cache_reference: {b}",
+                );
+                // tool_result's nested `content` field may itself be an array
+                // (multi-part tool output) — scan one level deeper.
+                if let Some(nested) = b.get("content").and_then(Value::as_array) {
+                    for (k, nb) in nested.iter().enumerate() {
+                        let nty = nb.get("type").and_then(Value::as_str).unwrap_or("");
+                        assert_ne!(
+                            nty, "cache_edits",
+                            "wire msg[{i}].content[{j}].content[{k}] must not be cache_edits: {nb}",
+                        );
+                        assert!(
+                            nb.get("cache_reference").is_none(),
+                            "wire msg[{i}].content[{j}].content[{k}] must not carry \
+                             cache_reference: {nb}",
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

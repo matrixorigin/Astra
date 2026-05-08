@@ -1860,9 +1860,9 @@ impl InProcessChatTurnBridge {
                 };
 
                 // Capture the request AFTER all wire mutations: session-anchor
-                // append, prompt-cache metadata (cache_control markers,
-                // cache_reference on tool_results, cache_edits blocks), tool
-                // schema annotations. Historically the capture ran here,
+                // append, prompt-cache metadata (cache_control marker on the
+                // last pre-user message), tool schema annotations.
+                // Historically the capture ran here,
                 // BEFORE `apply_anthropic_cache_metadata` — which meant the
                 // trace reported a pre-mutation snapshot that doesn't match
                 // what actually went out on the wire. Concretely: Anthropic

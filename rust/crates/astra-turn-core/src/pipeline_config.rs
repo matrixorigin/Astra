@@ -19,8 +19,6 @@ pub struct ProviderCachePolicy {
     pub max_markers: u32,
     /// Whether `scope: global` or equivalent is supported.
     pub supports_global_scope: bool,
-    /// Whether cached tool results can be referenced instead of resent.
-    pub supports_cache_reference: bool,
     /// Fork/side-query behavior that reuses a prefix without polluting the main cache.
     pub supports_skip_cache_write: bool,
 }
@@ -32,7 +30,6 @@ impl Default for ProviderCachePolicy {
             compact_strategy: CompactStrategy::Normalized,
             max_markers: 0,
             supports_global_scope: false,
-            supports_cache_reference: false,
             supports_skip_cache_write: false,
         }
     }
@@ -47,7 +44,6 @@ impl ProviderCachePolicy {
             compact_strategy: CompactStrategy::Minimal,
             max_markers: 4,
             supports_global_scope: true,
-            supports_cache_reference: true,
             supports_skip_cache_write: true,
         }
     }
@@ -60,7 +56,6 @@ impl ProviderCachePolicy {
             compact_strategy: CompactStrategy::Normalized,
             max_markers: 0,
             supports_global_scope: false,
-            supports_cache_reference: false,
             supports_skip_cache_write: false,
         }
     }
