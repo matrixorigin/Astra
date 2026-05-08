@@ -536,6 +536,34 @@ pub fn append_attention_manifest_message(
     true
 }
 
+/// Build the attention manifest as a plain text string for injection into
+/// the volatile system-prompt lane.
+///
+/// Returns `None` when the manifest carries no information beyond the
+/// default "none" placeholders — in that case the caller should NOT emit
+/// anything so the system prompt stays byte-stable.
+///
+/// Callers should route the returned string through the cache-volatile
+/// lane (system-block with `cache_control` absent, post-session marker)
+/// rather than pushing it into `messages[]` as a `role:user` message.
+/// Prior versions appended it as a user message, which broke prefix cache
+/// every turn because the manifest content drifts (active_files grows,
+/// current_todo status flips, etc.). Observed in session `a3fda286`:
+/// the attention manifest was the single biggest drift source in the
+/// history tail.
+#[must_use]
+pub fn build_attention_manifest_text(
+    state: &ContinuityState,
+    max_chars: usize,
+) -> Option<String> {
+    let manifest = AttentionManifest::from_state(state, max_chars).into_string();
+    if manifest_is_empty(&manifest) {
+        None
+    } else {
+        Some(manifest)
+    }
+}
+
 fn manifest_is_empty(manifest: &str) -> bool {
     manifest.contains("goal: none\n")
         && manifest.contains("current_todo: none\n")
@@ -942,6 +970,88 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("runtime-todo")
+        );
+    }
+
+    // ── build_attention_manifest_text — volatile-lane API ─────────────────
+    //
+    // The legacy `append_attention_manifest_message` mutates `messages[]`
+    // in-place, which pushes a `role:user` message carrying the manifest
+    // into history. That path burns prefix-cache every turn: the manifest
+    // drifts turn to turn (current_todo flips status, active_files grows,
+    // last_error changes), so any provider that caches by byte prefix
+    // (Anthropic Mycro, Bedrock, OpenAI, DeepSeek) rebuilds from the tail
+    // of history on every round. Observed in session `a3fda286` as the
+    // single biggest drift source.
+    //
+    // The new `build_attention_manifest_text` returns the same rendered
+    // text as `Option<String>` — callers route it into the volatile
+    // system-prompt lane (alongside Session Anchor / Memoria digest /
+    // Git State). Tests here pin the equivalence between shapes.
+
+    #[test]
+    fn build_attention_manifest_text_mirrors_append_when_non_trivial() {
+        let state = state_with_todo();
+        let text = build_attention_manifest_text(&state, 2_000)
+            .expect("non-trivial state must produce text");
+        // Same content as the legacy push path would produce.
+        assert!(text.starts_with(ATTENTION_PREFIX));
+        assert!(text.contains("runtime-todo"));
+
+        // And the legacy path produces the same payload.
+        let mut msgs = Vec::new();
+        assert!(append_attention_manifest_message(&mut msgs, &state, 2_000));
+        let legacy = msgs[0].get("content").unwrap().as_str().unwrap().to_string();
+        assert_eq!(text, legacy);
+    }
+
+    #[test]
+    fn build_attention_manifest_text_returns_none_for_trivial_state() {
+        // Empty goal + no todos + no facts = the sentinel shape that
+        // `manifest_is_empty` detects. Caller must receive None so the
+        // volatile block stays quiet — otherwise every turn-1 hi message
+        // would push a useless manifest into the prompt.
+        let state = ContinuityState::new("");
+        assert!(build_attention_manifest_text(&state, 2_000).is_none());
+    }
+
+    #[test]
+    fn build_attention_manifest_text_does_not_mutate_state() {
+        // Pure read — state is &, tests can't easily assert non-mutation
+        // via the borrow checker since state is immutable, but we can
+        // show repeated calls return identical content.
+        let state = state_with_todo();
+        let t1 = build_attention_manifest_text(&state, 2_000);
+        let t2 = build_attention_manifest_text(&state, 2_000);
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn build_attention_manifest_text_respects_char_cap() {
+        // Same cap behaviour as the underlying `AttentionManifest::from_state`.
+        let mut state = ContinuityState::new("x");
+        // Stuff enough todos to overflow a tight cap.
+        for i in 0..20 {
+            state.todos.add_item(TodoItem {
+                id: format!("t{i}"),
+                title: format!("task {i} with some length to it"),
+                description: String::new(),
+                status: TodoStatus::Pending,
+                evidence: vec![],
+                blocked_reason: None,
+            });
+        }
+        let text = build_attention_manifest_text(&state, 600).expect("non-trivial");
+        assert!(text.len() <= 600 + ATTENTION_PREFIX.len());
+    }
+
+    #[test]
+    fn build_attention_manifest_text_starts_with_prefix_when_present() {
+        let state = state_with_todo();
+        let text = build_attention_manifest_text(&state, 2_000).unwrap();
+        assert!(
+            text.starts_with(ATTENTION_PREFIX),
+            "manifest must keep its detectable prefix, got: {text}"
         );
     }
 

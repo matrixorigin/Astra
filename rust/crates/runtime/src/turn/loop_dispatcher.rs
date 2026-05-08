@@ -269,6 +269,7 @@ mod tests {
             current_session_id: None,
             current_run_id: None,
             recursion_depth: 0,
+            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,

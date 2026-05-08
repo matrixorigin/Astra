@@ -106,20 +106,25 @@ fn inject_runtime_attention_manifest(state: &mut AgenticLoopState) {
     state.continuity.sync_facts(state.session_facts.clone());
     state.session_facts = state.continuity.facts.clone();
 
-    if state.continuity.todos.has_items()
+    // Always strip any legacy attention-manifest messages from
+    // `state.messages` — older code paths (and checkpoints restored
+    // from before this refactor) may still push one into history. The
+    // attention manifest now rides the volatile system-prompt lane
+    // exclusively, so the message tail must stay clean for prefix
+    // caching.
+    astra_turn_types::continuity::strip_attention_manifest_messages(&mut state.messages);
+
+    let carries_signal = state.continuity.todos.has_items()
         || !state.continuity.facts.active_files.is_empty()
         || state.continuity.facts.error_state.total_errors > 0
         || !state.continuity.user_corrections.is_empty()
-        || state.continuity.verification.last_status.is_some()
-    {
-        astra_turn_types::continuity::append_attention_manifest_message(
-            &mut state.messages,
-            &state.continuity,
-            4_000,
-        );
+        || state.continuity.verification.last_status.is_some();
+
+    state.attention_manifest_text = if carries_signal {
+        astra_turn_types::continuity::build_attention_manifest_text(&state.continuity, 4_000)
     } else {
-        astra_turn_types::continuity::strip_attention_manifest_messages(&mut state.messages);
-    }
+        None
+    };
 }
 
 fn circuit_breaker_introspection_message(
@@ -2498,32 +2503,75 @@ mod tests {
         assert_eq!(guard.turn_timings[0].turn, 6);
     }
 
+    // ── Attention manifest lives in state.attention_manifest_text,
+    //    NOT in state.messages ────────────────────────────────────────
+    // Regression guard for the prefix-cache drift fix. Previously the
+    // manifest was pushed as a `role:user` message in history, which
+    // broke byte-prefix caching every turn because the manifest
+    // content drifts (todo status flips, active_files grows). It now
+    // rides the volatile system-prompt lane — the host reads
+    // `state.attention_manifest_text` when building the payload.
+    //
+    // Regression coverage requires both halves:
+    // 1. The text IS populated on state (so downstream can surface it)
+    // 2. `state.messages` has ZERO `[attention:v1]` entries (so prefix
+    //    cache stays stable).
+
     #[test]
-    fn runtime_attention_manifest_creates_todo_without_task_tool_call() {
+    fn runtime_attention_manifest_populates_state_not_messages() {
         let mut state = make_state();
         state.message =
             "Implement runtime continuity and validate that active todo survives compaction".into();
+        let original_msg_count = state.messages.len();
         state.messages.push(serde_json::json!({
             "role": "user",
             "content": state.message,
         }));
+        let msg_count_before_inject = state.messages.len();
 
         inject_runtime_attention_manifest(&mut state);
 
+        // 1. Continuity state carries the todo correctly.
         assert_eq!(state.continuity.todos.items.len(), 1);
         assert_eq!(state.continuity.todos.items[0].id, "runtime-goal");
-        let manifest = state
+
+        // 2. Manifest text is on state, reflects the todo.
+        let text = state
+            .attention_manifest_text
+            .as_ref()
+            .expect("manifest must be set when todos present");
+        assert!(text.starts_with("[attention:v1]\n"));
+        assert!(text.contains("current_todo: runtime-goal [pending]"));
+
+        // 3. CRITICAL: no attention-manifest message leaked into history.
+        let manifest_msgs = state
             .messages
-            .last()
-            .and_then(|message| message.get("content"))
-            .and_then(|content| content.as_str())
-            .unwrap();
-        assert!(manifest.starts_with("[attention:v1]\n"));
-        assert!(manifest.contains("current_todo: runtime-goal [pending]"));
+            .iter()
+            .filter(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.starts_with("[attention:v1]"))
+            })
+            .count();
+        assert_eq!(
+            manifest_msgs, 0,
+            "attention manifest must NOT appear in state.messages — prefix cache depends on stable history"
+        );
+
+        // 4. messages length didn't grow from injection (only the user
+        //    message we pushed ourselves is present).
+        assert_eq!(
+            state.messages.len(),
+            msg_count_before_inject,
+            "inject_runtime_attention_manifest must not push to messages; original={original_msg_count}"
+        );
     }
 
     #[test]
-    fn runtime_attention_manifest_replaces_stale_manifest_and_keeps_active_facts() {
+    fn runtime_attention_manifest_strips_legacy_manifest_from_messages() {
+        // Older code paths / restored checkpoints may still carry a
+        // manifest message in history. The inject step must always
+        // strip it so prefix cache stays clean going forward.
         let mut state = make_state();
         state.message = "Fix the runtime continuity bug and add tests".into();
         state.messages.push(serde_json::json!({
@@ -2542,21 +2590,53 @@ mod tests {
         inject_runtime_attention_manifest(&mut state);
         inject_runtime_attention_manifest(&mut state);
 
-        let manifests: Vec<&str> = state
+        // Legacy manifest messages must be gone.
+        let manifest_msgs = state
             .messages
             .iter()
-            .filter_map(|message| message.get("content").and_then(|content| content.as_str()))
-            .filter(|content| content.starts_with("[attention:v1]"))
-            .collect();
-        assert_eq!(manifests.len(), 1);
-        assert!(manifests[0].contains(
+            .filter(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.starts_with("[attention:v1]"))
+            })
+            .count();
+        assert_eq!(manifest_msgs, 0, "legacy manifest msg must be stripped");
+
+        // The fresh manifest on state reflects the active files, not
+        // the stale placeholder content.
+        let text = state
+            .attention_manifest_text
+            .as_ref()
+            .expect("non-trivial state must produce manifest");
+        assert!(text.contains(
             "active_files:\n- rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs"
         ));
-        assert!(!manifests[0].contains("stale"));
+        assert!(!text.contains("stale"));
+    }
+
+    #[test]
+    fn runtime_attention_manifest_is_none_for_trivial_state() {
+        // Turn 1 of a plain "hi" session: no todos, no active files,
+        // no errors, no corrections, no verifications. State should
+        // report None so the volatile block emits nothing.
+        let mut state = make_state();
+        state.message = "hi".into();
+
+        inject_runtime_attention_manifest(&mut state);
+
+        assert!(
+            state.attention_manifest_text.is_none(),
+            "trivial state must not produce manifest text, got: {:?}",
+            state.attention_manifest_text
+        );
     }
 
     #[tokio::test]
-    async fn execute_turn_strips_stale_manifest_and_injects_fresh_manifest_before_host_call() {
+    async fn execute_turn_strips_legacy_manifest_and_populates_state_text() {
+        // Post-refactor: the attention manifest MUST NOT appear in
+        // messages executed against the host. Instead, the fresh
+        // manifest text is on `state.attention_manifest_text` for the
+        // host's payload builder to route into the volatile lane.
         let mut state = make_state();
         state.message = "Continue the checkpoint restore refactor and add tests".into();
         state.messages.push(serde_json::json!({
@@ -2585,16 +2665,31 @@ mod tests {
         .await
         .unwrap();
 
+        // No manifest message reached the host.
         let captured = host.executed_messages.first().expect("host was called");
-        let manifests: Vec<&str> = captured
+        let manifest_msgs = captured
             .iter()
-            .filter_map(|message| message.get("content").and_then(|content| content.as_str()))
-            .filter(|content| content.starts_with("[attention:v1]"))
-            .collect();
-        assert_eq!(manifests.len(), 1);
-        assert!(manifests[0].contains("checkpoint restore refactor"));
-        assert!(manifests[0].contains("rust/crates/astra-pipeline/src/step_restore.rs"));
-        assert!(!manifests[0].contains("stale compacted summary"));
+            .filter(|message| {
+                message
+                    .get("content")
+                    .and_then(|content| content.as_str())
+                    .is_some_and(|s| s.starts_with("[attention:v1]"))
+            })
+            .count();
+        assert_eq!(
+            manifest_msgs, 0,
+            "post-refactor: no attention manifest in history — it rides state.attention_manifest_text instead"
+        );
+
+        // The fresh manifest text is on state with the new file info,
+        // and does NOT carry the stale compacted summary wording.
+        let text = state
+            .attention_manifest_text
+            .as_ref()
+            .expect("non-trivial state must carry manifest");
+        assert!(text.contains("checkpoint restore refactor"));
+        assert!(text.contains("rust/crates/astra-pipeline/src/step_restore.rs"));
+        assert!(!text.contains("stale compacted summary"));
     }
 
     // PR 5a: the turn loop must invoke host.on_turn_completed

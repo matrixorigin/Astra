@@ -350,6 +350,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),
             recursion_depth: config.recursion_depth,
+            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,

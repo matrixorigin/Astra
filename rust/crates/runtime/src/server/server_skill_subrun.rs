@@ -343,6 +343,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             current_session_id: Some(self.session_id.clone()),
             current_run_id: None,
             recursion_depth: child_recursion_depth,
+            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,

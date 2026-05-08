@@ -643,6 +643,16 @@ pub struct AgenticLoopState {
     /// Current nested agent/sub-run depth. Root loops start at 0.
     pub recursion_depth: u8,
 
+    /// Current turn's attention manifest text (`[attention:v1]\n…`), when
+    /// non-trivial. Populated by `inject_runtime_attention_manifest` and
+    /// routed into the **volatile system-prompt lane** by the host's
+    /// payload builder. Must NOT be pushed into `messages[]` — the
+    /// manifest drifts every turn and doing so breaks prefix cache.
+    ///
+    /// `None` when the continuity state is the trivial "nothing to
+    /// report" shape — the volatile block emits nothing in that case.
+    pub attention_manifest_text: Option<String>,
+
     // ── Accumulated output ──
     pub final_text: String,
     /// True once the current `final_text` has already been sent to the user.
@@ -1391,6 +1401,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         current_session_id: None,
         current_run_id: None,
         recursion_depth: 0,
+        attention_manifest_text: None,
         final_text: String::new(),
         final_text_streamed: false,
         total_prompt: 0,
@@ -1780,6 +1791,7 @@ pub(crate) mod tests {
             current_session_id: None,
             current_run_id: None,
             recursion_depth: 0,
+            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
