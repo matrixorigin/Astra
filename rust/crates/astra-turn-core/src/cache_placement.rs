@@ -53,11 +53,29 @@ pub enum CacheProtocol {
     /// inferred at the longest stable prefix; bytes after the first
     /// diverging position are uncached.
     OpenAiAutoPrefix,
-    /// MiniMax observed semantics (session 986a553e, 2026-05-08):
-    /// cache entry is keyed on the full message history except the
-    /// final user message. ANY byte change mid-history invalidates
-    /// the entire cache hit, even if a long stable prefix precedes the
-    /// change. Similar vendor behaviors in this class will land here.
+    /// MiniMax observed semantics (session 986a553e, 2026-05-08).
+    ///
+    /// **Empirically verified** (2026-05-08) via a controlled API probe
+    /// at `tests/fixtures/minimax_cache_probe.py`. Results against the
+    /// live `api.minimaxi.com/v1` endpoint:
+    ///
+    /// | Scenario                  | r0  | r1  | r2  | r3  |
+    /// | ------------------------- | --- | --- | --- | --- |
+    /// | advancing preamble in u[1]| 576 | 0   | 0   | 0   |
+    /// | frozen preamble in u[1]   | 443 | 443 | 0*  | 443 |
+    ///
+    /// Single-byte change at msg[1] **wipes the entire history cache**
+    /// for every subsequent round of a tool loop. An unchanged u[1]
+    /// keeps the cache warm through appended (assistant_tc, tool_result)
+    /// pairs. This is not pure prefix caching — a prefix cache would
+    /// still hit everything before the divergence point; MiniMax throws
+    /// out the whole history.
+    ///
+    /// (The `r2=0` in the frozen case is sporadic eviction noise —
+    /// MiniMax's auto-prefix cache isn't deterministic at low traffic —
+    /// but the trend is unambiguous.)
+    ///
+    /// Other vendors with the same behavior land here.
     StrictHistoryMatch,
     /// Provider doesn't advertise prompt caching. Placement is
     /// irrelevant; content goes wherever is natural.
@@ -92,6 +110,14 @@ pub enum VolatilePlacement {
     /// loses Self-Awareness / session-anchor signals in exchange for
     /// usable cache — observed collapse was 100% of cache reads for
     /// six consecutive tool-loop rounds in session 986a553e.
+    ///
+    /// **Empirical confirmation** (2026-05-08): a controlled API probe
+    /// at `tests/fixtures/minimax_cache_probe.py` compared "advancing
+    /// preamble" vs "frozen preamble" across 4 rounds of a tool loop.
+    /// Advancing: cache_read = 576, 0, 0, 0. Frozen: cache_read = 443,
+    /// 443, 0*, 443. Suppression recovers ~75% of possible cache reads
+    /// on a 4-round loop. Re-run the probe if you doubt this strategy;
+    /// see the `StrictHistoryMatch` variant doc for the full table.
     CurrentUserOnly,
     /// No cache to break. Volatile content goes anywhere convenient —
     /// we pick "in system" for consistency with marker-based output.
