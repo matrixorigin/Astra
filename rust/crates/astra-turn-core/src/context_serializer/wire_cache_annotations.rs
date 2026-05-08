@@ -186,19 +186,45 @@ fn find_cache_breakpoint_targets(messages: &[Value]) -> Vec<usize> {
     if let Some(last_user) = last_user
         && messages.len() > last_user + 1
     {
-        let tail = messages.len() - 1;
-        // `tail - 2` is the previous round's tail (one `(assistant_tc,
-        // tool)` pair back). Accept only when it's a real, non-system
-        // index AND is strictly after `last_user` — if it would sit on
-        // or before the last user we'd break the normal-turn invariant,
-        // so fall through to just `[tail]`.
-        let historical_candidate = tail.checked_sub(2);
-        let historical = historical_candidate
-            .filter(|&h| h > last_user && is_non_system(h) && h != tail);
-        return match historical {
-            Some(h) => vec![h, tail],
-            None => vec![tail],
-        };
+        // Walk back through any trailing `role=system` msgs. The runtime
+        // appends `[working-set:v1]`, `Already Fetched`, stall nudges etc.
+        // as `role=system` entries at the end of `state.messages`
+        // (agentic_loop_lifecycle.rs:787). Their content changes every
+        // round, so putting a cache_control marker on one of them creates
+        // an unstable cache boundary: the marker "wins" as the deepest
+        // boundary (Anthropic merges role=system into the top-level
+        // `system[]` array via `build_anthropic_system_and_messages`) and
+        // invalidates every round.
+        //
+        // Session c0905eab t5 observed cached stuck at 2432 (system[0..2]
+        // only) because the trailing working-set block carried cc and
+        // overrode the stable system+tools cache. Controlled probe
+        // recovered 7936 cached (31x) by skipping this marker. See
+        // `tests/fixtures/deepseek_anthropic_cache_probe.py` callers.
+        let mut tail_candidate = messages.len() - 1;
+        while tail_candidate > last_user && !is_non_system(tail_candidate) {
+            // Safe: `tail_candidate > last_user ≥ 0`.
+            tail_candidate -= 1;
+        }
+        if tail_candidate == last_user {
+            // All messages after the last user are `role=system`. No
+            // meaningful non-system tail to mark; fall through to the
+            // normal-turn branch (which will pick `last_user - 1`).
+        } else {
+            let tail = tail_candidate;
+            // `tail - 2` is the previous round's tail (one `(assistant_tc,
+            // tool)` pair back). Accept only when it's a real, non-system
+            // index AND is strictly after `last_user` — if it would sit on
+            // or before the last user we'd break the normal-turn invariant,
+            // so fall through to just `[tail]`.
+            let historical_candidate = tail.checked_sub(2);
+            let historical = historical_candidate
+                .filter(|&h| h > last_user && is_non_system(h) && h != tail);
+            return match historical {
+                Some(h) => vec![h, tail],
+                None => vec![tail],
+            };
+        }
     }
 
     match user_indices.len() {
@@ -629,4 +655,95 @@ mod tests {
         assert_eq!(msgs[0]["content"], "sys");
     }
 
+    /// Session c0905eab regression: runtime appends `[working-set:v1]`
+    /// (and similar volatile signals — inventory, stall nudges) as
+    /// `role=system` messages at the end of `state.messages`. Anthropic's
+    /// wire converter merges these into the top-level `system[]` array.
+    /// If `annotate_last_message_cache_breakpoint` lands its marker on
+    /// one of those trailing system messages, the marker's content
+    /// changes every round and invalidates the cache boundary for the
+    /// rest of the request. Cache_read stays pinned at the size of the
+    /// stable prefix only.
+    ///
+    /// The fix walks the tail backwards past any `role=system` msgs and
+    /// anchors the marker on the last non-system msg (which is the one
+    /// preserved byte-identical across rounds via the rolling-tail
+    /// invariant).
+    #[test]
+    fn cache_breakpoint_tool_loop_skips_trailing_system_msgs() {
+        // Shape after 2 tool rounds inside a user turn, THEN a trailing
+        // working-set system msg appended by agentic_loop_lifecycle:
+        //   [user, a(tc), tool, a(tc), tool, system(working-set)]
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": null,
+                   "tool_calls": [{"id": "c1", "function": {"name": "bash"}}]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "r1"}),
+            json!({"role": "assistant", "content": null,
+                   "tool_calls": [{"id": "c2", "function": {"name": "bash"}}]}),
+            json!({"role": "tool", "tool_call_id": "c2", "content": "r2"}),
+            json!({"role": "system", "content": "[working-set:v1]\n..."}),
+        ];
+        annotate_last_message_cache_breakpoint(&mut msgs);
+        let marks = marker_indices(&msgs);
+        assert!(
+            !marks.contains(&5),
+            "trailing system msg MUST NOT carry cache_control — its content \
+             changes every round and would invalidate the cache boundary. \
+             got {marks:?}",
+        );
+        assert!(
+            marks.contains(&4),
+            "fallback tail should be the last non-system msg (idx 4 = last \
+             tool_result). got {marks:?}",
+        );
+    }
+
+    /// Two trailing system msgs in a row (e.g. working-set + inventory).
+    /// The walker should skip both and land on the last non-system msg.
+    #[test]
+    fn cache_breakpoint_tool_loop_skips_multiple_trailing_system_msgs() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": null,
+                   "tool_calls": [{"id": "c1", "function": {"name": "bash"}}]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "r1"}),
+            json!({"role": "system", "content": "[working-set:v1]\n..."}),
+            json!({"role": "system", "content": "## Already Fetched\n..."}),
+        ];
+        annotate_last_message_cache_breakpoint(&mut msgs);
+        let marks = marker_indices(&msgs);
+        for trailing in [3usize, 4] {
+            assert!(
+                !marks.contains(&trailing),
+                "trailing system msg at idx {trailing} must not carry cc. got {marks:?}",
+            );
+        }
+        assert!(
+            marks.contains(&2),
+            "fallback tail should be the last non-system msg (tool at idx 2). \
+             got {marks:?}",
+        );
+    }
+
+    /// When ALL messages after the last user are system msgs, no
+    /// meaningful non-system tail exists in the tool-loop branch. Fall
+    /// through to the normal branch which picks `last_user - 1`.
+    #[test]
+    fn cache_breakpoint_all_trailing_system_falls_through_to_normal_branch() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": "a1"}),
+            json!({"role": "user", "content": "q2"}),
+            json!({"role": "system", "content": "[working-set:v1]\n..."}),
+        ];
+        annotate_last_message_cache_breakpoint(&mut msgs);
+        let marks = marker_indices(&msgs);
+        // Normal branch: tail = last_user - 1 = 1 (assistant "a1"). The
+        // trailing system at idx 3 must not be marked.
+        assert!(
+            !marks.contains(&3),
+            "trailing system must not be marked. got {marks:?}",
+        );
+    }
 }
