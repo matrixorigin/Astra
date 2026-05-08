@@ -205,6 +205,19 @@ pub(crate) async fn run_tui_repl(
         bottom_pane.set_skill_items(skill_items);
     }
 
+    // Load slash-command catalog for the inline `/` menu.
+    {
+        let slash_items: Vec<slash_menu::SlashItem> = crate::command_registry::COMMANDS
+            .iter()
+            .filter(|m| !m.is_alias && !m.name.contains(' '))
+            .map(|m| slash_menu::SlashItem {
+                name: m.name,
+                description: m.description,
+            })
+            .collect();
+        bottom_pane.set_slash_items(slash_items);
+    }
+
     let mut active_cell: Option<Box<dyn ChatCell>> = None;
     let mut stream_controller: Option<StreamController> = None;
     let mut transcript: Vec<ratatui::text::Line<'static>> = Vec::new();

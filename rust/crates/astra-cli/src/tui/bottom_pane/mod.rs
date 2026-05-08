@@ -6,10 +6,12 @@ pub(crate) mod history_view;
 pub(crate) mod info_view;
 pub(crate) mod list_selection_view;
 pub(crate) mod skill_popup;
-pub(crate) mod slash_popup;
 pub(crate) mod textarea;
 pub(crate) mod transcript_view;
 pub(crate) mod view;
+
+#[cfg(test)]
+mod slash_integration_tests;
 
 use chat_composer::{ChatComposer, ComposerAction};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -19,9 +21,9 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
 };
 use skill_popup::SkillPopup;
-use slash_popup::SlashPopup;
 use view::{BottomPaneView, CancellationEvent};
 
+use super::slash_menu::{SlashItem, SlashMenu, is_open_for, popup as slash_popup_render};
 use super::task_status::TaskStatus;
 
 pub(crate) struct BottomPane {
@@ -29,7 +31,8 @@ pub(crate) struct BottomPane {
     pub footer: Footer,
     view_stack: Vec<Box<dyn BottomPaneView>>,
     task_status: TaskStatus,
-    slash_popup: Option<SlashPopup>,
+    slash_menu: Option<SlashMenu>,
+    slash_items: Vec<SlashItem>,
     skill_popup: Option<SkillPopup>,
     skill_items: Vec<skill_popup::SkillItem>,
     pub queued_messages: Vec<String>,
@@ -42,7 +45,8 @@ impl BottomPane {
             footer: Footer::new(),
             view_stack: Vec::new(),
             task_status: TaskStatus::Idle,
-            slash_popup: None,
+            slash_menu: None,
+            slash_items: Vec::new(),
             skill_popup: None,
             skill_items: Vec::new(),
             queued_messages: Vec::new(),
@@ -70,6 +74,34 @@ impl BottomPane {
 
     pub fn set_skill_items(&mut self, items: Vec<skill_popup::SkillItem>) {
         self.skill_items = items;
+    }
+
+    /// Inject the slash-command catalog used by the inline menu.
+    pub fn set_slash_items(&mut self, items: Vec<SlashItem>) {
+        self.slash_items = items;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn slash_menu_is_open(&self) -> bool {
+        self.slash_menu.is_some()
+    }
+    #[cfg(test)]
+    pub(crate) fn slash_menu_len(&self) -> usize {
+        self.slash_menu.as_ref().map(|m| m.len()).unwrap_or(0)
+    }
+    #[cfg(test)]
+    pub(crate) fn slash_menu_selected_name(&self) -> Option<&str> {
+        self.slash_menu
+            .as_ref()
+            .and_then(|m| m.selected_item())
+            .map(|i| i.name)
+    }
+    #[cfg(test)]
+    pub(crate) fn slash_menu_names(&self) -> Vec<String> {
+        self.slash_menu
+            .as_ref()
+            .map(|m| m.matches().iter().map(|i| i.name.to_string()).collect())
+            .unwrap_or_default()
     }
 
     pub fn set_task_status(&mut self, status: TaskStatus) {
@@ -100,8 +132,8 @@ impl BottomPane {
     }
 
     fn popup_height(&self) -> u16 {
-        if let Some(p) = &self.slash_popup {
-            return p.height();
+        if let Some(m) = &self.slash_menu {
+            return slash_popup_render::desired_height(m);
         }
         if let Some(p) = &self.skill_popup {
             return p.height();
@@ -111,18 +143,28 @@ impl BottomPane {
 
     pub fn sync_popups(&mut self) {
         let text = self.composer.text();
-        if self.view_stack.is_empty() && text.starts_with('/') && !text.contains(' ') {
+
+        // Slash menu: open whenever the first line starts with '/'. Empty
+        // matches still keep the menu open so users see a "no matches"
+        // message rather than silent closure.
+        if self.view_stack.is_empty() && is_open_for(&text) && !self.slash_items.is_empty() {
             self.skill_popup = None;
-            let popup = self.slash_popup.get_or_insert_with(SlashPopup::new);
-            popup.set_filter(&text);
-            if popup.is_empty() {
-                self.slash_popup = None;
+            match self.slash_menu.as_mut() {
+                Some(menu) => menu.set_filter(&text),
+                None => {
+                    let mut menu = SlashMenu::new(self.slash_items.clone());
+                    menu.set_filter(&text);
+                    self.slash_menu = Some(menu);
+                }
             }
-        } else if self.view_stack.is_empty()
+            return;
+        }
+
+        if self.view_stack.is_empty()
             && text.starts_with('$')
             && !self.skill_items.is_empty()
         {
-            self.slash_popup = None;
+            self.slash_menu = None;
             let popup = self
                 .skill_popup
                 .get_or_insert_with(|| SkillPopup::new(self.skill_items.clone()));
@@ -130,10 +172,11 @@ impl BottomPane {
             if popup.is_empty() {
                 self.skill_popup = None;
             }
-        } else {
-            self.slash_popup = None;
-            self.skill_popup = None;
+            return;
         }
+
+        self.slash_menu = None;
+        self.skill_popup = None;
     }
 
     fn queue_preview_height(&self) -> u16 {
@@ -213,8 +256,8 @@ impl BottomPane {
 
         // Esc: dismiss popup
         if key.code == KeyCode::Esc {
-            if self.slash_popup.is_some() {
-                self.slash_popup = None;
+            if self.slash_menu.is_some() {
+                self.slash_menu = None;
                 return BottomPaneAction::Consumed;
             }
             if self.skill_popup.is_some() {
@@ -223,33 +266,45 @@ impl BottomPane {
             }
         }
 
-        // Popup key handling: Up/Down/Tab/Enter when popup is visible
-        if self.slash_popup.is_some() {
+        // Popup key handling: Up/Down/Tab/Enter when slash menu is visible.
+        //
+        // Enter with no matches falls through so the composer handles it
+        // (submits the raw draft), avoiding a silent no-op.
+        if self.slash_menu.is_some() {
             match key.code {
                 KeyCode::Up => {
-                    self.slash_popup.as_mut().unwrap().move_up();
+                    self.slash_menu.as_mut().unwrap().move_up();
                     return BottomPaneAction::Consumed;
                 }
                 KeyCode::Down => {
-                    self.slash_popup.as_mut().unwrap().move_down();
+                    self.slash_menu.as_mut().unwrap().move_down();
                     return BottomPaneAction::Consumed;
                 }
                 KeyCode::Tab => {
-                    if let Some(cmd) = self.slash_popup.as_ref().and_then(|p| p.selected_command())
+                    if let Some(picked) = self
+                        .slash_menu
+                        .as_ref()
+                        .and_then(|m| m.selected_item())
+                        .map(|i| i.name.to_string())
                     {
-                        self.composer.set_text(&format!("{cmd} "));
-                        self.slash_popup = None;
+                        self.composer.set_text(&format!("{picked} "));
+                        self.slash_menu = None;
                     }
                     return BottomPaneAction::Consumed;
                 }
                 KeyCode::Enter => {
-                    if let Some(cmd) = self.slash_popup.as_ref().and_then(|p| p.selected_command())
+                    if let Some(picked) = self
+                        .slash_menu
+                        .as_ref()
+                        .and_then(|m| m.selected_item())
+                        .map(|i| i.name.to_string())
                     {
-                        let text = cmd.to_string();
                         self.composer.clear_draft();
-                        self.slash_popup = None;
-                        return BottomPaneAction::SubmitInput(text);
+                        self.slash_menu = None;
+                        return BottomPaneAction::SubmitInput(picked);
                     }
+                    // Empty matches: fall through to composer so the raw
+                    // draft gets submitted as-is.
                 }
                 _ => {}
             }
@@ -280,7 +335,7 @@ impl BottomPane {
         let action = match self.composer.handle_key(key) {
             ComposerAction::Submit => {
                 let text = self.composer.clear_and_submit();
-                self.slash_popup = None;
+                self.slash_menu = None;
                 BottomPaneAction::SubmitInput(text)
             }
             ComposerAction::Interrupt => BottomPaneAction::Interrupt,
@@ -362,8 +417,8 @@ impl BottomPane {
 
             self.composer.render(chunks[0], buf);
             self.render_queue_preview(chunks[1], buf);
-            if let Some(ref popup) = self.slash_popup {
-                popup.render(chunks[3], buf);
+            if let Some(ref menu) = self.slash_menu {
+                slash_popup_render::render(menu, chunks[3], buf);
             } else if let Some(ref popup) = self.skill_popup {
                 popup.render(chunks[3], buf);
             }
