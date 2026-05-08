@@ -26,6 +26,7 @@ mod markdown_render;
 mod markdown_stream;
 mod mention_menu;
 mod render;
+mod session_picker;
 mod shimmer;
 mod slash_dispatch;
 mod slash_menu;

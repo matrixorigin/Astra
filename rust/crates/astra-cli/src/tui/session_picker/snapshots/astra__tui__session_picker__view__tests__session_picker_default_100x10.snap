@@ -1,0 +1,14 @@
+---
+source: crates/astra-cli/src/tui/session_picker/view.rs
+expression: "render_picker(&d, 100, 10)"
+---
+┌ Resume session (3) ──────────────────────────────────────────────────────────────────────────────┐
+│▌ 844d ago · 12t · $0.42 · ~/astra · ⎇ enhance_tui         sess_abc123                            │
+│    refactor tui approval                                  status completed                       │
+│  844d ago · 3t · $0.05 · ~/astra · ⎇ main                 model  sonnet-4.6                      │
+│    initial setup                                          branch enhance_tui @ 616d4cf           │
+│  845d ago · 20t · $3.10 · ~/other · ⎇ feat/login          tokens 8.1k in · 3.4k out              │
+│    add auth flow with OAuth                               cost   $0.42                           │
+│                                                           turns  12                              │
+│                                                           ckpts  2                               │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

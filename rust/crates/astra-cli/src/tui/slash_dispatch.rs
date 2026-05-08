@@ -264,6 +264,25 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Fallback
         }
 
+        // ── Resume picker (TUI-native) ──────────────────────────────
+        "/resume" => {
+            if !args.is_empty() {
+                // `/resume <id>` — direct path takes the rustyline-compatible
+                // fallback so we go through the full restore pipeline.
+                return SlashResult::Fallback;
+            }
+            use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
+            use crate::tui::session_picker::{FsSessionSource, SessionDiscovery};
+            let disco = SessionDiscovery::new(FsSessionSource::new(), 50);
+            if disco.total() == 0 {
+                ctx.show_info("No previous sessions found.".into());
+                return SlashResult::Handled;
+            }
+            ctx.bottom_pane
+                .push_view(Box::new(SessionPickerView::new(disco)));
+            SlashResult::Handled
+        }
+
         // ── Copy last response ──────────────────────────────────────
         "/copy" => {
             match &ctx.state.last_response {
@@ -468,6 +487,15 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
     }
 }
 
+/// Detect the conventional "sess_<…>" / uuid-like session id shape.
+fn looks_like_session_id(s: &str) -> bool {
+    if s.starts_with("sess_") {
+        return true;
+    }
+    // Fallback: UUID-like 36 chars with 4 dashes.
+    s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
+}
+
 /// Handle a ViewCompleted result from a BottomPaneView.
 pub(crate) fn handle_view_result(
     name: &str,
@@ -476,6 +504,17 @@ pub(crate) fn handle_view_result(
     bottom_pane: &mut BottomPane,
 ) {
     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+
+    // Session picker result → queue `/resume <id>` for auto-dispatch
+    // via the normal fallback path. Session IDs are prefixed with
+    // `sess_` or are UUIDs; we recognise them heuristically and let
+    // anything else fall through to the older menu dispatch.
+    if looks_like_session_id(name) {
+        bottom_pane.queued_messages.push(format!("/resume {name}"));
+        let msg = SystemChatCell::info(format!("Resuming session {name}…"));
+        guard.queue_history_lines(msg.display_lines(w));
+        return;
+    }
 
     // Skill menu actions
     if name == "List skills" {
