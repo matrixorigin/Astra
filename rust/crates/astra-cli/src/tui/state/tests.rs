@@ -152,6 +152,89 @@ fn slash_menu_accept_with_empty_matches_is_noop() {
     assert!(effects.is_empty());
 }
 
+// ─── Mention menu reducer integration ─────────────────────────────
+//
+// The reducer only shuffles the pre-built `MentionMenu`; building it
+// (and therefore talking to the filesystem) is the caller's job.
+
+use crate::tui::mention_menu::{MentionMenu, MentionToken, provider::{FileKind, StaticFileProvider}};
+
+fn mention_fixture() -> MentionMenu {
+    let mut menu = MentionMenu::new(StaticFileProvider::with_root_listing(&[
+        ("src", FileKind::Dir),
+        ("Cargo.toml", FileKind::File),
+        ("README.md", FileKind::File),
+    ]));
+    menu.set_token(&MentionToken {
+        at_byte: 0,
+        end_byte: 1,
+        partial: String::new(),
+    });
+    menu
+}
+
+#[test]
+fn mention_menu_set_some_installs_menu() {
+    let (s, effects) = reduce(State::default(), Action::MentionMenuSet(Some(mention_fixture())));
+    assert!(s.mention_menu.is_some());
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn mention_menu_set_none_clears_menu() {
+    let s = State {
+        mention_menu: Some(mention_fixture()),
+        ..State::default()
+    };
+    let (s, _) = reduce(s, Action::MentionMenuSet(None));
+    assert!(s.mention_menu.is_none());
+}
+
+#[test]
+fn mention_menu_navigation_moves_selection() {
+    let s = State {
+        mention_menu: Some(mention_fixture()),
+        ..State::default()
+    };
+    let before = s
+        .mention_menu
+        .as_ref()
+        .and_then(|m| m.selected_item())
+        .map(|e| e.path.clone());
+
+    let (s, _) = reduce(s, Action::MentionMenuMoveDown);
+    let after = s
+        .mention_menu
+        .as_ref()
+        .and_then(|m| m.selected_item())
+        .map(|e| e.path.clone());
+    assert_ne!(before, after, "selection should advance");
+}
+
+#[test]
+fn mention_menu_navigation_without_menu_is_noop() {
+    let s = State::default();
+    let (s, effects) = reduce(s, Action::MentionMenuMoveDown);
+    assert!(s.mention_menu.is_none());
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn mention_menu_accept_closes_menu_without_changing_draft() {
+    let s = State {
+        input_draft: "look at @".into(),
+        mention_menu: Some(mention_fixture()),
+        ..State::default()
+    };
+    let (s, effects) = reduce(s, Action::MentionMenuAccept);
+    assert!(s.mention_menu.is_none(), "menu closes after accept");
+    assert_eq!(
+        s.input_draft, "look at @",
+        "reducer leaves composer splicing to caller"
+    );
+    assert!(effects.is_empty());
+}
+
 #[test]
 fn reduce_is_total_function_for_noop_on_idle() {
     // Sending stream events when idle must not panic and must not corrupt state.

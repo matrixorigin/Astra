@@ -59,6 +59,11 @@ impl ChatComposer {
         self.textarea.set_text(text);
     }
 
+    /// Current cursor byte offset within `text()`.
+    pub fn cursor_byte(&self) -> usize {
+        self.textarea.cursor_byte()
+    }
+
     fn prefix_display_width(&self) -> u16 {
         self.prompt_prefix.width() as u16
     }

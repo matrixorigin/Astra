@@ -15,6 +15,7 @@ pub(crate) mod reducer;
 #[allow(unused_imports)]
 pub(crate) use reducer::{Effect, reduce};
 
+use crate::tui::mention_menu::MentionMenu;
 use crate::tui::slash_menu::SlashMenu;
 
 #[cfg(test)]
@@ -36,6 +37,10 @@ pub(crate) struct State {
     /// Items used to populate a fresh [`SlashMenu`] when the draft becomes
     /// a slash command. Injected at startup from `command_registry::COMMANDS`.
     pub slash_items: Vec<crate::tui::slash_menu::SlashItem>,
+    /// Inline `@`-mention file menu. Construction requires a
+    /// [`FileProvider`], which the reducer doesn't own — callers (e.g.
+    /// `BottomPane`) build the menu and push it in via [`Action::MentionMenuSet`].
+    pub mention_menu: Option<MentionMenu>,
 }
 
 impl State {
@@ -195,6 +200,18 @@ pub(crate) enum Action {
     /// Accept current menu selection, replacing the draft with the picked
     /// command token and closing the menu.
     SlashMenuAccept,
+
+    // ── Mention menu ──────────────────────────────────────────────
+    /// Install (`Some`) or clear (`None`) the mention menu. Callers
+    /// build the menu against their own `FileProvider`; the reducer
+    /// only shuffles the value.
+    MentionMenuSet(Option<MentionMenu>),
+    MentionMenuMoveUp,
+    MentionMenuMoveDown,
+    /// Accept current selection; the caller is responsible for splicing
+    /// the picked path into the composer — the reducer only clears the
+    /// menu (since draft mutation logic is composer-specific).
+    MentionMenuAccept,
 
     // ── Session / system ──────────────────────────────────────────
     SessionLoaded(String),

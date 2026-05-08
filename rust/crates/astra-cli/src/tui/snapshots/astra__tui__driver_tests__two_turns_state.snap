@@ -39,4 +39,5 @@ State {
     token_budget: None,
     slash_menu: None,
     slash_items: [],
+    mention_menu: None,
 }

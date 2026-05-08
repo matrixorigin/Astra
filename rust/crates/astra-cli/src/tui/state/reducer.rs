@@ -241,6 +241,29 @@ pub(crate) fn reduce(mut state: State, action: Action) -> (State, Vec<Effect>) {
                 // Empty matches: leave draft and menu untouched.
             }
         }
+
+        // ── Mention menu ─────────────────────────────────────────
+        Action::MentionMenuSet(menu) => {
+            state.mention_menu = menu;
+        }
+
+        Action::MentionMenuMoveUp => {
+            if let Some(menu) = state.mention_menu.as_mut() {
+                menu.move_up();
+            }
+        }
+
+        Action::MentionMenuMoveDown => {
+            if let Some(menu) = state.mention_menu.as_mut() {
+                menu.move_down();
+            }
+        }
+
+        Action::MentionMenuAccept => {
+            // Draft splicing is composer-specific; reducer just dismisses
+            // the menu so state reflects the user's intent.
+            state.mention_menu = None;
+        }
     }
 
     (state, effects)

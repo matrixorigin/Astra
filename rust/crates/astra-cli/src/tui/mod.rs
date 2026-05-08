@@ -23,6 +23,7 @@ mod layout;
 mod markdown;
 mod markdown_render;
 mod markdown_stream;
+mod mention_menu;
 mod render;
 mod shimmer;
 mod slash_dispatch;
@@ -216,6 +217,13 @@ pub(crate) async fn run_tui_repl(
             })
             .collect();
         bottom_pane.set_slash_items(slash_items);
+    }
+
+    // Install a filesystem-backed file provider for the `@`-mention menu,
+    // rooted at the current working directory.
+    if let Ok(cwd) = std::env::current_dir() {
+        bottom_pane
+            .set_file_provider(std::sync::Arc::new(mention_menu::provider::FsFileProvider::new(cwd)));
     }
 
     let mut active_cell: Option<Box<dyn ChatCell>> = None;

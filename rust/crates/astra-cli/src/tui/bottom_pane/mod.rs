@@ -11,6 +11,8 @@ pub(crate) mod transcript_view;
 pub(crate) mod view;
 
 #[cfg(test)]
+mod mention_integration_tests;
+#[cfg(test)]
 mod slash_integration_tests;
 
 use chat_composer::{ChatComposer, ComposerAction};
@@ -23,8 +25,12 @@ use ratatui::{
 use skill_popup::SkillPopup;
 use view::{BottomPaneView, CancellationEvent};
 
+use super::mention_menu::{
+    FileProvider, MentionMenu, extract_mention_at, popup as mention_popup_render,
+};
 use super::slash_menu::{SlashItem, SlashMenu, is_open_for, popup as slash_popup_render};
 use super::task_status::TaskStatus;
+use std::sync::Arc;
 
 pub(crate) struct BottomPane {
     pub composer: ChatComposer,
@@ -35,6 +41,11 @@ pub(crate) struct BottomPane {
     slash_items: Vec<SlashItem>,
     skill_popup: Option<SkillPopup>,
     skill_items: Vec<skill_popup::SkillItem>,
+    mention_menu: Option<MentionMenu>,
+    /// Byte range `[at_byte, end_byte)` within the composer that the
+    /// active mention covers, used for splicing on accept.
+    mention_range: Option<(usize, usize)>,
+    file_provider: Option<Arc<dyn FileProvider>>,
     pub queued_messages: Vec<String>,
 }
 
@@ -49,6 +60,9 @@ impl BottomPane {
             slash_items: Vec::new(),
             skill_popup: None,
             skill_items: Vec::new(),
+            mention_menu: None,
+            mention_range: None,
+            file_provider: None,
             queued_messages: Vec::new(),
         }
     }
@@ -79,6 +93,23 @@ impl BottomPane {
     /// Inject the slash-command catalog used by the inline menu.
     pub fn set_slash_items(&mut self, items: Vec<SlashItem>) {
         self.slash_items = items;
+    }
+
+    /// Inject the [`FileProvider`] used by the `@`-mention menu.
+    pub fn set_file_provider(&mut self, provider: Arc<dyn FileProvider>) {
+        self.file_provider = Some(provider);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mention_menu_is_open(&self) -> bool {
+        self.mention_menu.is_some()
+    }
+    #[cfg(test)]
+    pub(crate) fn mention_menu_names(&self) -> Vec<String> {
+        self.mention_menu
+            .as_ref()
+            .map(|m| m.matches().iter().map(|e| e.path.clone()).collect())
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -135,6 +166,9 @@ impl BottomPane {
         if let Some(m) = &self.slash_menu {
             return slash_popup_render::desired_height(m);
         }
+        if let Some(m) = &self.mention_menu {
+            return mention_popup_render::desired_height(m);
+        }
         if let Some(p) = &self.skill_popup {
             return p.height();
         }
@@ -148,6 +182,7 @@ impl BottomPane {
         // matches still keep the menu open so users see a "no matches"
         // message rather than silent closure.
         if self.view_stack.is_empty() && is_open_for(&text) && !self.slash_items.is_empty() {
+            self.close_mention();
             self.skill_popup = None;
             match self.slash_menu.as_mut() {
                 Some(menu) => menu.set_filter(&text),
@@ -160,11 +195,32 @@ impl BottomPane {
             return;
         }
 
+        // Mention menu: active when the cursor is inside an `@token`.
+        if self.view_stack.is_empty() && self.file_provider.is_some() {
+            let cursor = self.composer.cursor_byte();
+            if let Some(token) = extract_mention_at(&text, cursor) {
+                self.slash_menu = None;
+                self.skill_popup = None;
+                self.mention_range = Some((token.at_byte, token.end_byte));
+                let provider = self.file_provider.clone().unwrap();
+                match self.mention_menu.as_mut() {
+                    Some(menu) => menu.set_token(&token),
+                    None => {
+                        let mut menu = MentionMenu::from_arc(provider);
+                        menu.set_token(&token);
+                        self.mention_menu = Some(menu);
+                    }
+                }
+                return;
+            }
+        }
+
         if self.view_stack.is_empty()
             && text.starts_with('$')
             && !self.skill_items.is_empty()
         {
             self.slash_menu = None;
+            self.close_mention();
             let popup = self
                 .skill_popup
                 .get_or_insert_with(|| SkillPopup::new(self.skill_items.clone()));
@@ -176,7 +232,39 @@ impl BottomPane {
         }
 
         self.slash_menu = None;
+        self.close_mention();
         self.skill_popup = None;
+    }
+
+    fn close_mention(&mut self) {
+        self.mention_menu = None;
+        self.mention_range = None;
+    }
+
+    /// Splice the selected mention entry into the composer, replacing
+    /// the current mention range. Called by Tab/Enter handlers.
+    /// Returns whether anything was spliced (selection must exist).
+    fn accept_mention(&mut self) -> bool {
+        let Some((at, end)) = self.mention_range else {
+            return false;
+        };
+        let Some(entry) = self.mention_menu.as_ref().and_then(|m| m.selected_item()) else {
+            return false;
+        };
+
+        let replacement = mention_popup_render::format_replacement(entry);
+        let text = self.composer.text();
+        // Guard against stale ranges if the buffer shrank.
+        if end > text.len() || at > end {
+            return false;
+        }
+        let mut new_text = String::with_capacity(text.len() + replacement.len());
+        new_text.push_str(&text[..at]);
+        new_text.push_str(&replacement);
+        new_text.push_str(&text[end..]);
+        self.composer.set_text(&new_text);
+        self.close_mention();
+        true
     }
 
     fn queue_preview_height(&self) -> u16 {
@@ -260,6 +348,10 @@ impl BottomPane {
                 self.slash_menu = None;
                 return BottomPaneAction::Consumed;
             }
+            if self.mention_menu.is_some() {
+                self.close_mention();
+                return BottomPaneAction::Consumed;
+            }
             if self.skill_popup.is_some() {
                 self.skill_popup = None;
                 return BottomPaneAction::Consumed;
@@ -331,11 +423,36 @@ impl BottomPane {
             }
         }
 
+        // Mention menu: Up/Down/Tab; Enter falls through to composer so
+        // the user can submit the whole line with an inline mention.
+        if self.mention_menu.is_some() {
+            match key.code {
+                KeyCode::Up => {
+                    self.mention_menu.as_mut().unwrap().move_up();
+                    return BottomPaneAction::Consumed;
+                }
+                KeyCode::Down => {
+                    self.mention_menu.as_mut().unwrap().move_down();
+                    return BottomPaneAction::Consumed;
+                }
+                KeyCode::Tab => {
+                    if self.accept_mention() {
+                        // After accept, re-sync in case the new draft
+                        // (e.g. a directory `/`) keeps a menu open.
+                        self.sync_popups();
+                    }
+                    return BottomPaneAction::Consumed;
+                }
+                _ => {}
+            }
+        }
+
         // Route to composer
         let action = match self.composer.handle_key(key) {
             ComposerAction::Submit => {
                 let text = self.composer.clear_and_submit();
                 self.slash_menu = None;
+                self.close_mention();
                 BottomPaneAction::SubmitInput(text)
             }
             ComposerAction::Interrupt => BottomPaneAction::Interrupt,
@@ -419,6 +536,8 @@ impl BottomPane {
             self.render_queue_preview(chunks[1], buf);
             if let Some(ref menu) = self.slash_menu {
                 slash_popup_render::render(menu, chunks[3], buf);
+            } else if let Some(ref menu) = self.mention_menu {
+                mention_popup_render::render(menu, chunks[3], buf);
             } else if let Some(ref popup) = self.skill_popup {
                 popup.render(chunks[3], buf);
             }

@@ -60,6 +60,11 @@ impl TextArea {
         self.invalidate_wrap();
     }
 
+    /// Current cursor byte offset within `text()`.
+    pub fn cursor_byte(&self) -> usize {
+        self.cursor_pos
+    }
+
     pub fn desired_height(&self, width: u16) -> u16 {
         if width == 0 {
             return 1;
