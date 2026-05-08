@@ -264,6 +264,46 @@ fn approval_narrow_40() {
 }
 
 #[test]
+fn approval_focus_on_reject_80() {
+    let mut cell = ApprovalChatCell::new(
+        5,
+        "bash".into(),
+        "bash wants to run a command".into(),
+        Some("rm -rf ~/important".into()),
+        "would remove user data".into(),
+        true,
+    );
+    cell.move_button_right(); // now on Reject
+    insta::assert_snapshot!("approval_focus_reject_80", render_cell(&cell, 80, 6));
+}
+
+#[test]
+fn approval_with_batch_buttons_80() {
+    let cell = ApprovalChatCell::with_batch(
+        6,
+        "bash".into(),
+        "bash wants to run".into(),
+        None,
+        "3 pending".into(),
+        true,
+    );
+    insta::assert_snapshot!("approval_with_batch_80", render_cell(&cell, 100, 6));
+}
+
+#[test]
+fn approval_with_batch_buttons_narrow_wraps() {
+    let cell = ApprovalChatCell::with_batch(
+        7,
+        "edit".into(),
+        "edit src/lib.rs".into(),
+        None,
+        "".into(),
+        true,
+    );
+    insta::assert_snapshot!("approval_with_batch_narrow_60", render_cell(&cell, 60, 8));
+}
+
+#[test]
 fn all_rendered_outputs_are_non_empty() {
     // Guard against accidentally empty renderings from refactors.
     let samples: Vec<(&str, Box<dyn ChatCell>)> = vec![

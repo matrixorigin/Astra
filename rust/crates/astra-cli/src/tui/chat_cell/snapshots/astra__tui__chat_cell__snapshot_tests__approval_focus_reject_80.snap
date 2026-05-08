@@ -3,8 +3,8 @@ source: crates/astra-cli/src/tui/chat_cell/snapshot_tests.rs
 expression: "render_cell(&cell, 80, 6)"
 ---
   ⏸ bash wants to run a command
-    rm -rf /tmp/scratch
-    destructive path outside cwd
+    rm -rf ~/important
+    would remove user data
 
-  ▸ Accept     Reject     Always     Skip
+    Accept   ▸ Reject     Always     Skip
     ← → navigate · Enter confirm · Esc reject

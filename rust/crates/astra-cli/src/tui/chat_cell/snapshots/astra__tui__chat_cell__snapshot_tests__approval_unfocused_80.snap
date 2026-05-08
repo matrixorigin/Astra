@@ -3,5 +3,6 @@ source: crates/astra-cli/src/tui/chat_cell/snapshot_tests.rs
 expression: "render_cell(&cell, 80, 4)"
 ---
   ⏸ edit src/lib.rs
-    Reason: modifies source
-    [y] allow  [n] deny  [a] always  [s] skip
+    modifies source
+
+    Accept     Reject     Always     Skip

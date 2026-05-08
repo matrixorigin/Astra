@@ -415,30 +415,17 @@ pub(crate) async fn run_tui_repl(
                                                     let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
                                                 }
                                                 Some(req) = approval_rx.recv() => {
-                                                    // Non-blocking: enqueue the request and render an
-                                                    // inline ApprovalChatCell in scrollback. The
-                                                    // composer stays live, the turn keeps streaming.
-                                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                                    let id = bottom_pane.enqueue_approval(
-                                                        req.tool.clone(),
-                                                        req.header.clone(),
-                                                        req.detail.clone(),
-                                                        req.reason.clone(),
-                                                        req.response_tx,
-                                                    );
-                                                    let focused = bottom_pane
-                                                        .focused_approval_index()
-                                                        .map(|i| i == bottom_pane.approval_views().len().saturating_sub(1))
-                                                        .unwrap_or(false);
-                                                    let cell = chat_cell::approval_cell::ApprovalChatCell::new(
-                                                        id,
+                                                    // Non-blocking: enqueue only. The live, interactive
+                                                    // approval card is rendered by BottomPane above the
+                                                    // composer so arrow-key focus is visible. Resolve
+                                                    // events flush a compact audit line to scrollback.
+                                                    let _id = bottom_pane.enqueue_approval(
                                                         req.tool,
                                                         req.header,
                                                         req.detail,
                                                         req.reason,
-                                                        focused,
+                                                        req.response_tx,
                                                     );
-                                                    flush_cell_to_scrollback(&mut guard, Box::new(cell), w, &mut transcript);
                                                     frame_requester.schedule_frame();
                                                     let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
                                                 }

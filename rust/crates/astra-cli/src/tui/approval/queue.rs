@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use tokio::sync::oneshot;
 
+use super::button_row::ButtonRow;
 use crate::chat_stream::ApprovalResponse;
 
 /// Monotonic id assigned by the queue. Stable across the session so the
@@ -21,6 +22,9 @@ pub(crate) struct PendingApproval {
     pub detail: Option<String>,
     pub reason: String,
     pub response_tx: Option<oneshot::Sender<ApprovalResponse>>,
+    /// Live button row owned per entry so arrow-key focus sticks
+    /// through navigation even when focus cycles between entries.
+    pub buttons: ButtonRow,
 }
 
 impl std::fmt::Debug for PendingApproval {
@@ -89,6 +93,14 @@ impl ApprovalQueue {
     ) -> ApprovalId {
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
+        // Promote to 6-button row when the queue already has entries:
+        // the newcomer will coexist with others so batch actions are
+        // useful. Otherwise the plain 4-button row suffices.
+        let buttons = if self.entries.is_empty() {
+            ButtonRow::primary()
+        } else {
+            ButtonRow::primary_with_batch()
+        };
         self.entries.push_back(PendingApproval {
             id,
             tool,
@@ -96,9 +108,16 @@ impl ApprovalQueue {
             detail,
             reason,
             response_tx: Some(response_tx),
+            buttons,
         });
-        // Focus stays on the first unresolved entry by default; newly
-        // pushed items land at the back and don't steal focus.
+        // Promote pre-existing entries too — they now share the queue
+        // and should expose the batch buttons on their next focus.
+        let total = self.entries.len();
+        if total > 1 {
+            for entry in self.entries.iter_mut().take(total - 1) {
+                entry.buttons = ButtonRow::primary_with_batch();
+            }
+        }
         id
     }
 
@@ -180,5 +199,52 @@ impl ApprovalQueue {
         } else if self.focus >= self.entries.len() {
             self.focus = self.entries.len() - 1;
         }
+    }
+
+    /// Move button focus inside the currently focused entry.
+    pub fn focused_button_move_left(&mut self) {
+        if let Some(e) = self.entries.get_mut(self.focus) {
+            e.buttons.move_left();
+        }
+    }
+    pub fn focused_button_move_right(&mut self) {
+        if let Some(e) = self.entries.get_mut(self.focus) {
+            e.buttons.move_right();
+        }
+    }
+
+    /// Action of the currently focused button on the focused entry.
+    pub fn focused_button_action(&self) -> Option<super::button_row::ButtonAction> {
+        self.entries.get(self.focus).and_then(|e| e.buttons.activate())
+    }
+
+    /// Resolve every pending entry with the same response. Returns the
+    /// count actually resolved (senders may have been dropped).
+    pub fn respond_all(&mut self, response: ApprovalResponse) -> usize {
+        let mut n = 0usize;
+        while !self.entries.is_empty() {
+            // Always target index 0 so focus ordering doesn't matter.
+            if self.send_at(0, response) {
+                n += 1;
+            }
+            self.entries.pop_front();
+        }
+        self.focus = 0;
+        n
+    }
+
+    /// Button row of the currently focused entry (for rendering).
+    pub fn focused_button_row(&self) -> Option<&super::button_row::ButtonRow> {
+        self.entries.get(self.focus).map(|e| &e.buttons)
+    }
+
+    /// Button focus index of the currently focused entry.
+    pub fn focused_button_index(&self) -> Option<usize> {
+        self.entries.get(self.focus).map(|e| e.buttons.focus())
+    }
+
+    /// View projection of the focused entry (no oneshot).
+    pub fn focused_view(&self) -> Option<ApprovalView> {
+        self.entries.get(self.focus).map(ApprovalView::from)
     }
 }

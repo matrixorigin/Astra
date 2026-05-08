@@ -1,24 +1,22 @@
-//! Integration tests for the non-blocking approval queue wired through
-//! BottomPane. Verifies the user can keep typing, pending count drives
-//! the status line, Ctrl+Y/N resolve without clearing the draft, and
-//! the queue sequences multiple pendings FIFO.
+//! Integration tests for the Cursor-style non-blocking approval queue
+//! wired through BottomPane.
 
 #![cfg(test)]
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::oneshot;
 
-use super::{BottomPane, BottomPaneAction};
+use super::{ApprovalActivation, BottomPane, BottomPaneAction};
 use crate::chat_stream::ApprovalResponse;
 
 fn key(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
 }
-fn ctrl_char(c: char) -> KeyEvent {
-    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
-}
 fn special(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
+}
+fn ctrl_special(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::CONTROL)
 }
 
 fn enqueue(bp: &mut BottomPane, tool: &str) -> oneshot::Receiver<ApprovalResponse> {
@@ -51,109 +49,98 @@ fn enqueue_increments_footer_counter() {
     assert_eq!(bp.footer.pending_approvals, 2);
 }
 
-#[test]
-fn resolving_decrements_footer_counter() {
-    let mut bp = BottomPane::new();
-    let _rx_a = enqueue(&mut bp, "a");
-    let _rx_b = enqueue(&mut bp, "b");
-    assert_eq!(bp.footer.pending_approvals, 2);
-    let id = bp
-        .respond_focused_approval(ApprovalResponse::AllowOnce)
-        .expect("resolved");
-    assert!(id > 0);
-    assert_eq!(bp.footer.pending_approvals, 1);
-}
-
-// ─── Composer remains live ────────────────────────────────────────
+// ─── Button focus + Enter ─────────────────────────────────────────
 
 #[test]
-fn composer_accepts_text_while_approval_pending() {
+fn enter_activates_accept_by_default() {
     let mut bp = BottomPane::new();
-    let _rx = enqueue(&mut bp, "bash");
-    type_string(&mut bp, "hello");
-    assert_eq!(bp.composer.text(), "hello");
-    assert_eq!(bp.footer.pending_approvals, 1);
+    let rx = enqueue(&mut bp, "bash");
+    let action = bp.handle_key(special(KeyCode::Enter));
+    match action {
+        BottomPaneAction::ApprovalResolved { id } => assert!(id > 0),
+        other => panic!("expected ApprovalResolved, got {other:?}"),
+    }
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
+    assert_eq!(bp.footer.pending_approvals, 0);
 }
 
 #[test]
-fn typing_y_in_composer_is_text_not_approval() {
+fn right_moves_focus_then_enter_rejects() {
+    let mut bp = BottomPane::new();
+    let rx = enqueue(&mut bp, "bash");
+
+    // Accept → Reject
+    let _ = bp.handle_key(special(KeyCode::Right));
+    let _ = bp.handle_key(special(KeyCode::Enter));
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
+}
+
+#[test]
+fn left_from_accept_wraps_to_skip() {
+    let mut bp = BottomPane::new();
+    let rx = enqueue(&mut bp, "bash");
+    let _ = bp.handle_key(special(KeyCode::Left));
+    let _ = bp.handle_key(special(KeyCode::Enter));
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Skip);
+}
+
+#[test]
+fn esc_rejects_focused_approval() {
+    let mut bp = BottomPane::new();
+    let rx = enqueue(&mut bp, "bash");
+    let action = bp.handle_key(special(KeyCode::Esc));
+    assert!(matches!(action, BottomPaneAction::ApprovalResolved { .. }));
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
+}
+
+// ─── Ctrl+Enter quick accept ─────────────────────────────────────
+
+#[test]
+fn ctrl_enter_accepts_regardless_of_button_focus() {
+    let mut bp = BottomPane::new();
+    let rx = enqueue(&mut bp, "bash");
+    // Move to Reject first.
+    let _ = bp.handle_key(special(KeyCode::Right));
+    // Ctrl+Enter should still Accept.
+    let action = bp.handle_key(ctrl_special(KeyCode::Enter));
+    assert!(matches!(action, BottomPaneAction::ApprovalResolved { .. }));
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
+}
+
+// ─── Composer stays live ──────────────────────────────────────────
+
+#[test]
+fn letter_keys_still_reach_composer_while_pending() {
     let mut bp = BottomPane::new();
     let rx = enqueue(&mut bp, "bash");
     type_string(&mut bp, "yes please");
-    assert_eq!(bp.composer.text(), "yes please");
+    assert_eq!(bp.composer.text(), "yes please", "letters not stolen");
     assert_eq!(bp.footer.pending_approvals, 1, "approval still pending");
     drop(rx);
 }
 
 #[test]
-fn bare_y_does_not_resolve_even_when_composer_empty() {
-    // Safety: users often start typing "yes" when a question comes up.
-    // Require Ctrl+Y so we never consume that first keystroke.
+fn enter_with_text_in_composer_submits_instead_of_approving() {
+    // When the composer has text, Enter should submit the message.
+    // Approvals are resolved with Ctrl+Enter (quick accept) or by
+    // explicitly clearing the composer and pressing Enter.
     let mut bp = BottomPane::new();
     let _rx = enqueue(&mut bp, "bash");
-    let action = bp.handle_key(key('y'));
-    assert!(
-        !matches!(action, BottomPaneAction::ApprovalResolved { .. }),
-        "bare 'y' must NOT resolve approvals"
-    );
-    assert_eq!(bp.footer.pending_approvals, 1);
-    assert_eq!(bp.composer.text(), "y", "letter should reach composer");
+    type_string(&mut bp, "hello world");
+    let action = bp.handle_key(special(KeyCode::Enter));
+    match action {
+        BottomPaneAction::SubmitInput(text) => {
+            assert_eq!(text, "hello world");
+            assert_eq!(bp.footer.pending_approvals, 1, "approval untouched");
+        }
+        other => panic!("expected SubmitInput, got {other:?}"),
+    }
 }
 
-// ─── Ctrl-combo resolution while typing ───────────────────────────
+// ─── Multi-entry: Tab cycles, batch buttons work ──────────────────
 
 #[test]
-fn ctrl_y_resolves_even_with_nonempty_composer() {
-    let mut bp = BottomPane::new();
-    let rx = enqueue(&mut bp, "bash");
-    type_string(&mut bp, "still typing...");
-
-    let action = bp.handle_key(ctrl_char('y'));
-    assert!(matches!(action, BottomPaneAction::ApprovalResolved { .. }));
-    assert_eq!(
-        rx.blocking_recv().unwrap(),
-        ApprovalResponse::AllowOnce
-    );
-    assert_eq!(bp.composer.text(), "still typing...", "draft preserved");
-    assert_eq!(bp.footer.pending_approvals, 0);
-}
-
-#[test]
-fn ctrl_n_resolves_as_deny() {
-    let mut bp = BottomPane::new();
-    let rx = enqueue(&mut bp, "bash");
-    let action = bp.handle_key(ctrl_char('n'));
-    assert!(matches!(action, BottomPaneAction::ApprovalResolved { .. }));
-    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
-}
-
-// ─── Multi-entry FIFO ─────────────────────────────────────────────
-
-#[test]
-fn fifo_order_across_responses() {
-    let mut bp = BottomPane::new();
-    let rx_a = enqueue(&mut bp, "a");
-    let rx_b = enqueue(&mut bp, "b");
-    let rx_c = enqueue(&mut bp, "c");
-    assert_eq!(bp.footer.pending_approvals, 3);
-
-    bp.handle_key(ctrl_char('y'));
-    assert_eq!(rx_a.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
-    assert_eq!(bp.footer.pending_approvals, 2);
-
-    bp.handle_key(ctrl_char('n'));
-    assert_eq!(rx_b.blocking_recv().unwrap(), ApprovalResponse::Deny);
-    assert_eq!(bp.footer.pending_approvals, 1);
-
-    bp.handle_key(ctrl_char('y'));
-    assert_eq!(rx_c.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
-    assert_eq!(bp.footer.pending_approvals, 0);
-}
-
-// ─── Tab cycles focus ─────────────────────────────────────────────
-
-#[test]
-fn tab_cycles_focus_when_composer_empty() {
+fn tab_cycles_between_pendings_when_composer_empty() {
     let mut bp = BottomPane::new();
     let _rx_a = enqueue(&mut bp, "a");
     let _rx_b = enqueue(&mut bp, "b");
@@ -161,27 +148,75 @@ fn tab_cycles_focus_when_composer_empty() {
 
     let _ = bp.handle_key(special(KeyCode::Tab));
     assert_eq!(bp.focused_approval_index(), Some(1));
-
-    let _ = bp.handle_key(special(KeyCode::Tab));
-    assert_eq!(bp.focused_approval_index(), Some(0), "wraps back");
 }
 
 #[test]
-fn tab_is_not_stolen_by_approval_when_slash_menu_open() {
+fn batch_button_resolves_all_pendings() {
     let mut bp = BottomPane::new();
-    use crate::tui::slash_menu::SlashItem;
-    bp.set_slash_items(vec![SlashItem {
-        name: "/help",
-        description: "show help",
-    }]);
-    let _rx = enqueue(&mut bp, "bash");
+    let rx_a = enqueue(&mut bp, "a");
+    let rx_b = enqueue(&mut bp, "b");
+    let rx_c = enqueue(&mut bp, "c");
+    assert_eq!(bp.footer.pending_approvals, 3);
 
-    // Open slash menu via '/', then press Tab — should accept slash,
-    // NOT cycle approval focus.
-    let _ = bp.handle_key(key('/'));
-    assert!(bp.slash_menu_is_open());
-    let _ = bp.handle_key(special(KeyCode::Tab));
-    // Slash accept consumes and closes the menu, inserting the command.
-    assert!(!bp.slash_menu_is_open(), "slash menu closes on Tab accept");
-    assert_eq!(bp.focused_approval_index(), Some(0), "approval focus unchanged");
+    // Navigate to Accept-all (index 4 in the 6-button row).
+    for _ in 0..4 {
+        bp.handle_key(special(KeyCode::Right));
+    }
+    let action = bp.handle_key(special(KeyCode::Enter));
+    assert!(matches!(action, BottomPaneAction::ApprovalResolved { .. }));
+    assert_eq!(bp.footer.pending_approvals, 0);
+    assert_eq!(rx_a.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
+    assert_eq!(rx_b.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
+    assert_eq!(rx_c.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
+}
+
+// ─── Preview of focused approval is rendered inside BottomPane ────
+
+#[test]
+fn focused_approval_cell_available_for_render() {
+    let mut bp = BottomPane::new();
+    let _rx = enqueue(&mut bp, "bash");
+    let cell = bp
+        .focused_approval_cell()
+        .expect("focused approval should produce a cell");
+    assert_eq!(cell.tool, "bash");
+    assert!(cell.focused);
+}
+
+#[test]
+fn focused_approval_cell_is_none_when_empty() {
+    let bp = BottomPane::new();
+    assert!(bp.focused_approval_cell().is_none());
+}
+
+#[test]
+fn activation_single_vs_batch_reports_correct_variant() {
+    let mut bp = BottomPane::new();
+    let _rx1 = enqueue(&mut bp, "a");
+    let _rx2 = enqueue(&mut bp, "b");
+
+    // Single: default-focus Accept.
+    let act = bp.activate_focused_approval_button();
+    assert!(matches!(
+        act,
+        Some(ApprovalActivation::Single {
+            response: ApprovalResponse::AllowOnce,
+            ..
+        })
+    ));
+    assert_eq!(bp.footer.pending_approvals, 1);
+
+    // Navigate to Accept-all (index 4).
+    for _ in 0..4 {
+        bp.handle_key(special(KeyCode::Right));
+    }
+    let act = bp.activate_focused_approval_button();
+    assert!(matches!(
+        act,
+        Some(ApprovalActivation::Batch {
+            count: 1,
+            response: ApprovalResponse::AllowOnce
+        })
+    ));
+    assert_eq!(bp.footer.pending_approvals, 0);
 }

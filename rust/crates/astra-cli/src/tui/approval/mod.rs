@@ -7,10 +7,15 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod button_row;
 pub(crate) mod queue;
 
 #[allow(unused_imports)]
+pub(crate) use button_row::{Button, ButtonAction, ButtonRow};
+#[allow(unused_imports)]
 pub(crate) use queue::{ApprovalQueue, ApprovalView, PendingApproval};
 
+#[cfg(test)]
+mod button_row_tests;
 #[cfg(test)]
 mod tests;

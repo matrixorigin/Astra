@@ -26,7 +26,7 @@ use ratatui::{
 use skill_popup::SkillPopup;
 use view::{BottomPaneView, CancellationEvent};
 
-use super::approval::{ApprovalQueue, ApprovalView};
+use super::approval::{ApprovalQueue, ApprovalView, ButtonAction};
 use super::mention_menu::{
     FileProvider, MentionMenu, extract_mention_at, popup as mention_popup_render,
 };
@@ -317,6 +317,39 @@ impl BottomPane {
         self.approval_queue.move_focus_down();
     }
 
+    /// Move button focus **within** the currently focused approval row.
+    pub fn move_approval_button_left(&mut self) {
+        self.approval_queue.focused_button_move_left();
+    }
+    pub fn move_approval_button_right(&mut self) {
+        self.approval_queue.focused_button_move_right();
+    }
+
+    /// Activate the currently focused button on the currently focused
+    /// approval. Returns:
+    /// - `Some((id, None))` if a single entry was resolved,
+    /// - `Some((0, Some(n)))` if a batch action resolved `n` entries,
+    /// - `None` if there's nothing to act on.
+    pub fn activate_focused_approval_button(&mut self) -> Option<ApprovalActivation> {
+        let action = self.approval_queue.focused_button_action()?;
+        match action {
+            ButtonAction::Respond(resp) => {
+                let id = self.respond_focused_approval(resp)?;
+                Some(ApprovalActivation::Single { id, response: resp })
+            }
+            ButtonAction::RespondAll(resp) => {
+                let n = self.approval_queue.respond_all(resp);
+                self.footer.pending_approvals = self.approval_queue.len();
+                Some(ApprovalActivation::Batch { count: n, response: resp })
+            }
+        }
+    }
+
+    /// Default-reject the focused approval (Esc shortcut).
+    pub fn reject_focused_approval(&mut self) -> Option<u64> {
+        self.respond_focused_approval(ApprovalResponse::Deny)
+    }
+
     /// Splice the selected mention entry into the composer, replacing
     /// the current mention range. Called by Tab/Enter handlers.
     /// Returns whether anything was spliced (selection must exist).
@@ -351,17 +384,45 @@ impl BottomPane {
         }
     }
 
+    /// Build a live `ApprovalChatCell` from the currently focused queue
+    /// entry. `None` when nothing is pending.
+    pub fn focused_approval_cell(&self) -> Option<crate::tui::chat_cell::approval_cell::ApprovalChatCell> {
+        let view = self.approval_queue.focused_view()?;
+        let buttons = self.approval_queue.focused_button_row()?.clone();
+        let mut cell = crate::tui::chat_cell::approval_cell::ApprovalChatCell::new(
+            view.id,
+            view.tool,
+            view.header,
+            view.detail,
+            view.reason,
+            true,
+        );
+        cell.buttons = buttons;
+        Some(cell)
+    }
+
+    /// Height reserved for the focused approval widget (rendered above
+    /// the composer so `←/→/Enter` feedback is visible).
+    fn focused_approval_height(&self, width: u16) -> u16 {
+        let Some(cell) = self.focused_approval_cell() else {
+            return 0;
+        };
+        use crate::tui::chat_cell::ChatCell;
+        cell.desired_height(width)
+    }
+
     pub fn desired_height(&self, width: u16) -> u16 {
         if let Some(view) = self.active_view() {
             return view.desired_height(width);
         }
         let content_h = self.composer.desired_height(width);
         let queue_h = self.queue_preview_height();
+        let approval_h = self.focused_approval_height(width);
         let popup_h = self.popup_height();
         if popup_h > 0 {
-            content_h + queue_h + 1 + popup_h
+            content_h + queue_h + approval_h + 1 + popup_h
         } else {
-            content_h + queue_h + 1 + 1
+            content_h + queue_h + approval_h + 1 + 1
         }
     }
 
@@ -400,28 +461,80 @@ impl BottomPane {
 
         // ── Approval keys ────────────────────────────────────────
         //
-        // Ctrl+Y/N/A/S work regardless of composer state so the user
-        // can keep typing and still approve. Bare y/n/a/s only fire
-        // when the composer is empty so mid-sentence letters don't
-        // accidentally resolve an approval.
+        // The focused approval cell captures:
+        //   • ← / →          — move button focus
+        //   • Enter          — activate the focused button
+        //   • Ctrl+Enter     — quick-Accept regardless of focus
+        //   • Esc            — default-Reject the focused approval
+        //   • Tab            — cycle focus to next pending (empty composer only)
+        //
+        // We intentionally do NOT map bare letters or Ctrl+Y/N: the
+        // Cursor-style button row already exposes every action, and
+        // any letter shortcut risks consuming text the user is still
+        // typing.
         if self.has_pending_approvals() {
-            let mapped = approval_response_for_key(&key, self.composer.is_empty());
-            if let Some(resp) = mapped {
-                if let Some(id) = self.respond_focused_approval(resp) {
+            // Ctrl+Enter → quick accept regardless of button focus.
+            if key.code == KeyCode::Enter && ctrl {
+                if let Some(id) =
+                    self.respond_focused_approval(ApprovalResponse::AllowOnce)
+                {
                     return BottomPaneAction::ApprovalResolved { id };
                 }
                 return BottomPaneAction::Consumed;
             }
 
-            // Tab cycles focus among pending approvals when the composer
-            // is empty (otherwise Tab is the menu-accept key and we must
-            // not steal it).
-            if key.code == KeyCode::Tab && self.composer.is_empty() && self.slash_menu.is_none()
-                && self.mention_menu.is_none()
-                && self.skill_popup.is_none()
-            {
-                self.move_approval_focus_down();
-                return BottomPaneAction::Consumed;
+            match key.code {
+                KeyCode::Left => {
+                    self.move_approval_button_left();
+                    return BottomPaneAction::Consumed;
+                }
+                KeyCode::Right => {
+                    self.move_approval_button_right();
+                    return BottomPaneAction::Consumed;
+                }
+                KeyCode::Enter
+                    if self.composer.is_empty()
+                        && self.slash_menu.is_none()
+                        && self.mention_menu.is_none()
+                        && self.skill_popup.is_none()
+                        && self.view_stack.is_empty() =>
+                {
+                    // Composer empty and no popup is capturing Enter —
+                    // activate the focused approval button. With text
+                    // in the composer, Enter submits the message
+                    // instead; `Ctrl+Enter` (handled above) is the
+                    // explicit approval shortcut.
+                    if let Some(act) = self.activate_focused_approval_button() {
+                        return match act {
+                            ApprovalActivation::Single { id, .. } => {
+                                BottomPaneAction::ApprovalResolved { id }
+                            }
+                            ApprovalActivation::Batch { .. } => {
+                                BottomPaneAction::ApprovalResolved { id: 0 }
+                            }
+                        };
+                    }
+                }
+                KeyCode::Esc
+                    if self.slash_menu.is_none()
+                        && self.mention_menu.is_none()
+                        && self.skill_popup.is_none()
+                        && self.view_stack.is_empty() =>
+                {
+                    if let Some(id) = self.reject_focused_approval() {
+                        return BottomPaneAction::ApprovalResolved { id };
+                    }
+                }
+                KeyCode::Tab
+                    if self.composer.is_empty()
+                        && self.slash_menu.is_none()
+                        && self.mention_menu.is_none()
+                        && self.skill_popup.is_none() =>
+                {
+                    self.move_approval_focus_down();
+                    return BottomPaneAction::Consumed;
+                }
+                _ => {}
             }
         }
 
@@ -626,8 +739,10 @@ impl BottomPane {
         let content_h = self.composer.desired_height(area.width);
         let queue_h = self.queue_preview_height();
 
+        let approval_h = self.focused_approval_height(area.width);
         if popup_h > 0 {
             let chunks = Layout::vertical([
+                Constraint::Length(approval_h),
                 Constraint::Length(content_h),
                 Constraint::Length(queue_h),
                 Constraint::Length(1),
@@ -635,17 +750,19 @@ impl BottomPane {
             ])
             .split(area);
 
-            self.composer.render(chunks[0], buf);
-            self.render_queue_preview(chunks[1], buf);
+            self.render_focused_approval(chunks[0], buf);
+            self.composer.render(chunks[1], buf);
+            self.render_queue_preview(chunks[2], buf);
             if let Some(ref menu) = self.slash_menu {
-                slash_popup_render::render(menu, chunks[3], buf);
+                slash_popup_render::render(menu, chunks[4], buf);
             } else if let Some(ref menu) = self.mention_menu {
-                mention_popup_render::render(menu, chunks[3], buf);
+                mention_popup_render::render(menu, chunks[4], buf);
             } else if let Some(ref popup) = self.skill_popup {
-                popup.render(chunks[3], buf);
+                popup.render(chunks[4], buf);
             }
         } else {
             let chunks = Layout::vertical([
+                Constraint::Length(approval_h),
                 Constraint::Length(content_h),
                 Constraint::Length(queue_h),
                 Constraint::Length(1),
@@ -653,10 +770,26 @@ impl BottomPane {
             ])
             .split(area);
 
-            self.composer.render(chunks[0], buf);
-            self.render_queue_preview(chunks[1], buf);
-            self.footer.render(chunks[3], buf);
+            self.render_focused_approval(chunks[0], buf);
+            self.composer.render(chunks[1], buf);
+            self.render_queue_preview(chunks[2], buf);
+            self.footer.render(chunks[4], buf);
         }
+    }
+
+    fn render_focused_approval(&self, area: Rect, buf: &mut Buffer) {
+        if area.height == 0 {
+            return;
+        }
+        let Some(cell) = self.focused_approval_cell() else {
+            return;
+        };
+        use crate::tui::chat_cell::ChatCell;
+        use ratatui::widgets::{Paragraph, Widget, Wrap};
+        let lines = cell.display_lines(area.width);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(area, buf);
     }
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
@@ -672,27 +805,14 @@ impl BottomPane {
     }
 }
 
-/// Map a key event to an `ApprovalResponse` if it should resolve a pending
-/// approval. **Ctrl-chorded only** — bare y/n/a/s are deliberately NOT
-/// mapped because they're too dangerous to fire while the user thinks
-/// they're writing text (you'd lose the first letter of "yes please"
-/// because the composer happens to be empty at that moment).
-fn approval_response_for_key(key: &KeyEvent, _composer_empty: bool) -> Option<ApprovalResponse> {
-    if !key.modifiers.contains(KeyModifiers::CONTROL) {
-        return None;
-    }
-    match key.code {
-        KeyCode::Char(c) => match c.to_ascii_lowercase() {
-            'y' => Some(ApprovalResponse::AllowOnce),
-            'n' => Some(ApprovalResponse::Deny),
-            // Ctrl+A / Ctrl+S belong to the textarea (beginning-of-line /
-            // save-line) — we intentionally don't shadow them. Users get
-            // "always" and "skip" by first hitting Ctrl+Y/N then using
-            // the slash command to tweak permissions if needed.
-            _ => None,
-        },
-        _ => None,
-    }
+/// Summary of what happened when the user activates a button on the
+/// focused approval cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovalActivation {
+    /// Resolved a single entry via its button.
+    Single { id: u64, response: ApprovalResponse },
+    /// Resolved the whole queue via Accept-all / Reject-all.
+    Batch { count: usize, response: ApprovalResponse },
 }
 
 #[derive(Debug)]
