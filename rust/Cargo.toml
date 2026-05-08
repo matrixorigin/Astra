@@ -108,6 +108,7 @@ http-body-util = "0.1"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 clap = { version = "4", features = ["derive", "env"] }
 hostname = "0.4"
+insta = { version = "1.41", features = ["yaml"] }
 
 [profile.dev]
 debug = "line-tables-only"

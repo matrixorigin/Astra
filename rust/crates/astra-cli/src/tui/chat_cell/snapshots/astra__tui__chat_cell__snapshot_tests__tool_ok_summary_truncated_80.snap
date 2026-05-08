@@ -1,0 +1,12 @@
+---
+source: crates/astra-cli/src/tui/chat_cell/snapshot_tests.rs
+expression: "render_cell(&cell, 80, 8)"
+---
+• Ran ls (8ms)
+  │ /tmp
+  └ one
+    two
+    three
+    four
+    five
+    … +2 lines

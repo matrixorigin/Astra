@@ -1,0 +1,6 @@
+---
+source: crates/astra-cli/src/tui/chat_cell/snapshot_tests.rs
+expression: "render_cell(&cell, 80, 2)"
+---
+• Ran build (2.5s)
+  │ cargo check

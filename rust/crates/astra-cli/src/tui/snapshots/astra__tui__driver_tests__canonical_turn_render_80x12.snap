@@ -1,0 +1,13 @@
+---
+source: crates/astra-cli/src/tui/driver_tests.rs
+expression: "render_state(&state, 80, 12)"
+---
+› list the files
+
+
+
+• Ran bash (42ms)
+  │ ls /tmp
+  └ 3 entries
+
+• There are 3 files.

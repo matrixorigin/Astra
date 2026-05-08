@@ -1,0 +1,10 @@
+---
+source: crates/astra-cli/src/tui/chat_cell/snapshot_tests.rs
+expression: "render_cell_transcript(&cell, 80, 8)"
+---
+• Ran bash (5ms)
+  │ echo
+
+    line1
+    line2
+    line3

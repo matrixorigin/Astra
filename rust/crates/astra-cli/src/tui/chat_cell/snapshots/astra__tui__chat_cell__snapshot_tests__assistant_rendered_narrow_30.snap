@@ -1,0 +1,6 @@
+---
+source: crates/astra-cli/src/tui/chat_cell/snapshot_tests.rs
+expression: "render_cell(&cell, 30, 4)"
+---
+• a longer paragraph that will
+need wrapping at small widths

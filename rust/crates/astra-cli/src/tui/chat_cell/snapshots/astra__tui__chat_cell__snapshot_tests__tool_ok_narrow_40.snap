@@ -1,0 +1,7 @@
+---
+source: crates/astra-cli/src/tui/chat_cell/snapshot_tests.rs
+expression: "render_cell(&cell, 40, 4)"
+---
+• Ran read (15ms)
+  │ a-long-filename-that-needs-trimming…
+  └ some content here

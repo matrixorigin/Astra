@@ -1,5 +1,9 @@
 #[cfg(test)]
+mod driver_tests;
+#[cfg(test)]
 mod layout_test;
+#[cfg(test)]
+mod testing;
 #[cfg(test)]
 mod tests;
 
@@ -22,6 +26,8 @@ mod markdown_stream;
 mod render;
 mod shimmer;
 mod slash_dispatch;
+mod state;
+mod view_stack;
 mod stream_bridge;
 mod streaming;
 mod style;

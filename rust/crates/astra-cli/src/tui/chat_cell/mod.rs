@@ -5,6 +5,9 @@ pub(crate) mod thinking_cell;
 pub(crate) mod tool_cell;
 pub(crate) mod user_cell;
 
+#[cfg(test)]
+mod snapshot_tests;
+
 use std::any::Any;
 use std::fmt::Debug;
 

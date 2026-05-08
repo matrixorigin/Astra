@@ -1,0 +1,42 @@
+---
+source: crates/astra-cli/src/tui/driver_tests.rs
+expression: "(&state, &effects)"
+---
+(
+    State {
+        messages: [
+            User {
+                text: "list the files",
+            },
+            Tool {
+                name: "bash",
+                description: "ls /tmp",
+                status: Ok,
+                duration_ms: Some(
+                    42,
+                ),
+                output_summary: Some(
+                    "3 entries",
+                ),
+                output: Some(
+                    "a.txt\nb.txt\nc.txt",
+                ),
+            },
+            Assistant {
+                markdown: "There are 3 files.",
+            },
+        ],
+        turn_status: Idle,
+        permission_mode: Ask,
+        input_draft: "",
+        viewport_scroll: Bottom,
+        session_id: None,
+        token_budget: None,
+    },
+    [
+        SendPrompt(
+            "list the files",
+        ),
+        PersistJournal,
+    ],
+)
