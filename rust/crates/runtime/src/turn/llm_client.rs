@@ -2744,6 +2744,14 @@ async fn collect_anthropic_llm_stream(
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
+    // Anthropic emits the HMAC signature for each `thinking` content block
+    // via a dedicated `signature_delta`. The next round MUST echo it
+    // verbatim on the assistant message, or the API returns HTTP 400
+    // `content[].thinking in the thinking mode must be passed back`
+    // (see session effccfcd-28d8-41f4-a4b0-ecd0ec503625 for the original
+    // failure mode; bridge_llm_stream was patched earlier, this path
+    // was the latent one).
+    let mut reasoning_signature = String::new();
     let mut tool_calls_map: HashMap<usize, Map<String, Value>> = HashMap::new();
     let mut usage_tokens = crate::turn::token_usage::TokenUsage::default();
     let mut finish_reason: Option<String> = None;
@@ -2751,6 +2759,7 @@ async fn collect_anthropic_llm_stream(
     let mut made_progress = false;
     let partial_result = |full_text: &String,
                           reasoning: &String,
+                          reasoning_signature: &String,
                           tool_calls_map: &HashMap<usize, Map<String, Value>>,
                           usage_tokens: &crate::turn::token_usage::TokenUsage,
                           finish_reason: &Option<String>| {
@@ -2763,7 +2772,7 @@ async fn collect_anthropic_llm_stream(
         LlmCallResult {
             full_text: full_text.clone(),
             reasoning: reasoning.clone(),
-            reasoning_signature: String::new(),
+            reasoning_signature: reasoning_signature.clone(),
             tool_calls,
             usage: usage_tokens.to_json_map(),
             model_used: model_name.to_string(),
@@ -2782,6 +2791,7 @@ async fn collect_anthropic_llm_stream(
                 partial: partial_result(
                     &full_text,
                     &reasoning,
+                    &reasoning_signature,
                     &tool_calls_map,
                     &usage_tokens,
                     &finish_reason,
@@ -2796,6 +2806,7 @@ async fn collect_anthropic_llm_stream(
                         partial: partial_result(
                             &full_text,
                             &reasoning,
+                            &reasoning_signature,
                             &tool_calls_map,
                             &usage_tokens,
                             &finish_reason,
@@ -2813,6 +2824,7 @@ async fn collect_anthropic_llm_stream(
                     partial: partial_result(
                         &full_text,
                         &reasoning,
+                        &reasoning_signature,
                         &tool_calls_map,
                         &usage_tokens,
                         &finish_reason,
@@ -2888,6 +2900,7 @@ async fn collect_anthropic_llm_stream(
                                     partial: partial_result(
                                         &full_text,
                                         &reasoning,
+                                        &reasoning_signature,
                                         &tool_calls_map,
                                         &usage_tokens,
                                         &finish_reason,
@@ -2909,6 +2922,7 @@ async fn collect_anthropic_llm_stream(
                                     partial: partial_result(
                                         &full_text,
                                         &reasoning,
+                                        &reasoning_signature,
                                         &tool_calls_map,
                                         &usage_tokens,
                                         &finish_reason,
@@ -2916,6 +2930,23 @@ async fn collect_anthropic_llm_stream(
                                 });
                             }
                             reasoning.push_str(text);
+                            made_progress = true;
+                        }
+                    }
+                    Some("signature_delta") => {
+                        // Anthropic closes a `thinking` content block with
+                        // an HMAC signature. The next turn MUST echo this
+                        // on the assistant message or the API returns
+                        // HTTP 400 `content[].thinking in the thinking
+                        // mode must be passed back`. See session
+                        // effccfcd-28d8-41f4-a4b0-ecd0ec503625 for the
+                        // original symptom on the bridge path; this
+                        // branch plugs the same hole on the server_loop
+                        // path.
+                        if let Some(sig) = delta.get("signature").and_then(Value::as_str)
+                            && !sig.is_empty()
+                        {
+                            reasoning_signature.push_str(sig);
                             made_progress = true;
                         }
                     }
@@ -2935,6 +2966,7 @@ async fn collect_anthropic_llm_stream(
                                 partial: partial_result(
                                     &full_text,
                                     &reasoning,
+                                    &reasoning_signature,
                                     &tool_calls_map,
                                     &usage_tokens,
                                     &finish_reason,
@@ -2990,6 +3022,7 @@ async fn collect_anthropic_llm_stream(
                     partial: partial_result(
                         &full_text,
                         &reasoning,
+                        &reasoning_signature,
                         &tool_calls_map,
                         &usage_tokens,
                         &finish_reason,
@@ -3009,7 +3042,7 @@ async fn collect_anthropic_llm_stream(
     Ok(LlmCallResult {
         full_text,
         reasoning,
-        reasoning_signature: String::new(),
+        reasoning_signature,
         tool_calls,
         usage: usage_tokens.to_json_map(),
         model_used: model_name.to_string(),
@@ -3353,6 +3386,12 @@ fn parse_anthropic_nonstream_response(
 ) -> LlmCallResult {
     let mut full_text = String::new();
     let mut reasoning = String::new();
+    // See `collect_anthropic_llm_stream` for the signature-echo contract.
+    // Non-stream fallback (triggered on stream idle timeout) is on the
+    // same hook — dropping the signature here would re-open the
+    // effccfcd-28d8-41f4-a4b0-ecd0ec503625 failure on the one retry path
+    // the streaming fix doesn't cover.
+    let mut reasoning_signature = String::new();
     let mut tool_calls = Vec::new();
     if let Some(content) = v.get("content").and_then(Value::as_array) {
         for block in content {
@@ -3365,6 +3404,11 @@ fn parse_anthropic_nonstream_response(
                 Some("thinking") => {
                     if let Some(text) = block.get("thinking").and_then(Value::as_str) {
                         reasoning.push_str(text);
+                    }
+                    if let Some(sig) = block.get("signature").and_then(Value::as_str)
+                        && !sig.is_empty()
+                    {
+                        reasoning_signature.push_str(sig);
                     }
                 }
                 Some("tool_use") => {
@@ -3402,7 +3446,7 @@ fn parse_anthropic_nonstream_response(
     LlmCallResult {
         full_text,
         reasoning,
-        reasoning_signature: String::new(),
+        reasoning_signature,
         tool_calls,
         usage,
         model_used: model_name.to_string(),
@@ -4838,6 +4882,79 @@ mod tests {
         .expect("stream should succeed");
         assert_eq!(r.reasoning, "Let me think...");
         assert_eq!(r.full_text, "answer");
+    }
+
+    /// Regression: session ff1cbaca audit uncovered that
+    /// `collect_anthropic_llm_stream` was returning
+    /// `reasoning_signature: String::new()` unconditionally because the
+    /// parser had no `signature_delta` branch. Any thinking-model
+    /// request routed through `call_llm_and_collect` (server_loop_host
+    /// / conflict_resolver) would lose the HMAC signature and fail the
+    /// next round with HTTP 400
+    /// `content[].thinking in the thinking mode must be passed back to
+    /// the API` — the same failure mode as effccfcd-28d8-41f4-a4b0-ecd0ec503625.
+    #[tokio::test]
+    async fn collect_anthropic_stream_captures_signature_delta() {
+        let events = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"deep thought"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_abc123"}}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}),
+            json!({"type":"message_stop"}),
+        ];
+        let body = anthropic_sse(&events);
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let r = collect_anthropic_llm_stream(
+            stream,
+            "claude-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("stream should succeed");
+        assert_eq!(r.reasoning, "deep thought");
+        assert_eq!(
+            r.reasoning_signature, "sig_abc123",
+            "signature_delta must flow into reasoning_signature — otherwise the \
+             next round hits HTTP 400 (effccfcd regression via server_loop_host)",
+        );
+    }
+
+    /// Signature concatenation across multiple `thinking` content blocks
+    /// (Anthropic emits one signature per thinking block, but signed
+    /// thinking CAN be interleaved with text). Accumulator must append,
+    /// not overwrite.
+    #[tokio::test]
+    async fn collect_anthropic_stream_accumulates_multiple_signatures() {
+        let events = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"t1"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig1"}}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"t2"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"sig2"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}),
+            json!({"type":"message_stop"}),
+        ];
+        let body = anthropic_sse(&events);
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let r = collect_anthropic_llm_stream(
+            stream,
+            "claude-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("stream should succeed");
+        assert_eq!(r.reasoning_signature, "sig1sig2");
     }
 
     #[tokio::test]
@@ -7569,6 +7686,39 @@ mod tests {
         assert_eq!(
             r.usage.get("total_tokens").and_then(Value::as_u64),
             Some(25)
+        );
+    }
+
+    /// Companion to `collect_anthropic_stream_captures_signature_delta`.
+    /// When the stream idles and we fall back to the non-stream endpoint,
+    /// the body is shaped like `{content: [{type: "thinking", thinking: ...,
+    /// signature: ...}, {type: "tool_use", ...}]}`. Dropping the signature
+    /// here re-opens the effccfcd failure on the one retry path the
+    /// streaming fix doesn't cover.
+    #[test]
+    fn parse_anthropic_nonstream_response_extracts_thinking_signature() {
+        let v = json!({
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "let me check",
+                    "signature": "sig_nonstream_abc",
+                },
+                {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {"cmd": "ls"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let r = parse_nonstream_response_for_provider(
+            &v,
+            "anthropic",
+            "claude-sonnet-4",
+            Instant::now(),
+        );
+        assert_eq!(r.reasoning, "let me check");
+        assert_eq!(
+            r.reasoning_signature, "sig_nonstream_abc",
+            "signature on the thinking block must survive into LlmCallResult",
         );
     }
 
