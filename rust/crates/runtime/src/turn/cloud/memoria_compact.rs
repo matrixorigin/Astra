@@ -712,6 +712,90 @@ fn adjusted_message_budget_chars(
     budget_chars.saturating_sub(memory_content_chars.saturating_add(summary_reserve_chars))
 }
 
+/// Build the `[@episode/compaction]`-tagged memory body for storing a
+/// compaction summary as semantic memory.
+///
+/// The LLM summary is usually multi-paragraph; we need a one-line
+/// abstract (30–150 chars) for the compact view plus the full summary
+/// as detail so future sessions can `memory_expand` on demand.
+///
+/// Strategy:
+/// 1. Take the first sentence (or line). If it fits 30–150 chars after
+///    collapsing whitespace, use it verbatim as the abstract.
+/// 2. Otherwise synthesize a deterministic fallback:
+///    `"Compaction of session <sid-prefix>: <N>-char summary"`.
+///
+/// Returns `None` when the summary is empty — caller skips the store.
+fn build_compaction_layered_body(session_id: &str, summary: &str) -> Option<String> {
+    let summary_trimmed = summary.trim();
+    if summary_trimmed.is_empty() {
+        return None;
+    }
+
+    let abstract_ = compaction_abstract_from_summary(session_id, summary_trimmed);
+    let detail = format!("session={session_id}\n\n{summary_trimmed}");
+
+    Some(
+        astra_prompts::memory_proto::MemoryEntry::new(
+            astra_prompts::memory_proto::NS_EPISODE,
+            "compaction",
+            &astra_prompts::memory_proto::encode_body_layers(
+                &abstract_,
+                None,
+                Some(&detail),
+            ),
+        )
+        .encode(),
+    )
+}
+
+/// Try the summary's first sentence as the abstract; fall back to a
+/// deterministic count-based line if the sentence doesn't fit.
+fn compaction_abstract_from_summary(session_id: &str, summary: &str) -> String {
+    let min = astra_prompts::memory_proto::ABSTRACT_MIN_CHARS;
+    let max = astra_prompts::memory_proto::ABSTRACT_MAX_CHARS;
+
+    // First-sentence candidate: everything up to the first `. `, `。`,
+    // `\n`, or EOF — whichever comes first. Collapsed whitespace, no
+    // leading/trailing space.
+    let first = first_sentence(summary);
+    let first_chars = first.chars().count();
+    if (min..=max).contains(&first_chars) {
+        return first;
+    }
+
+    // Fallback: deterministic, bounded. `session_id` is truncated to
+    // 12 chars (same convention as session_end_governance).
+    let sid_short: String = session_id.chars().take(12).collect();
+    let summary_chars = summary.chars().count();
+    format!("Compaction of session {sid_short}: {summary_chars}-char summary")
+}
+
+fn first_sentence(s: &str) -> String {
+    // Terminators: `\n`, `。`, or `.` followed by whitespace/EOF.
+    // The `.` case needs lookahead — `v1.0` shouldn't split at the
+    // dot, but `axum over actix.` should.
+    let terminator_pos = s
+        .char_indices()
+        .find_map(|(i, c)| {
+            let is_terminator = match c {
+                '\n' | '。' => true,
+                '.' => s[i + c.len_utf8()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|n| n.is_whitespace() || n == '\n'),
+                _ => false,
+            };
+            is_terminator.then_some(i)
+        })
+        .unwrap_or(s.len());
+
+    s[..terminator_pos]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn truncate_summary_for_budget(summary: String, summary_token_budget: usize) -> String {
     let max_chars = summary_token_budget.saturating_mul(4).max(256);
     if summary.chars().count() <= max_chars {
@@ -1038,18 +1122,18 @@ pub async fn compact_with_memoria(
                     cfg.summary_token_budget
                 );
 
-                // Step 6b: Store compaction summary as semantic memory for cross-session retrieval.
-                // Wrapped in the `[@episode/compaction]` structural envelope
-                // so the L2 write-time gate accepts it: episode is the
-                // memory_proto namespace for "summary of past activity",
-                // compaction is the source tag. Pre-L2 code stored this as
-                // `[compaction:sid] <prose>` which lacked any namespace and
-                // was the main pollution source observed in session
-                // c6e18730 — unstructured summaries cross-surfacing on
-                // unrelated future queries.
-                if config.store_on_compact {
-                    let semantic_content =
-                        format!("[@episode/compaction] session={sid} {summary}");
+                // Step 6b: Store compaction summary as semantic memory
+                // for cross-session retrieval. Wrapped in the
+                // `[@episode/compaction]` structural envelope with a
+                // layered body — abstract = first sentence (or a
+                // deterministic fallback), detail = full summary. The
+                // abstract is what the compact view ships to future
+                // sessions, so it stays within the 150-char cap even
+                // when summaries are long.
+                if config.store_on_compact
+                    && let Some(semantic_content) =
+                        build_compaction_layered_body(sid, &summary)
+                {
                     match astra_turn_types::should_store_persistent_memory(
                         &semantic_content,
                         "semantic",
@@ -2723,21 +2807,32 @@ mod tests {
             semantic_entries.len()
         );
         let (content, _) = &semantic_entries[0];
-        // L2 structural envelope: `[@episode/compaction]` replaces the
-        // legacy `[compaction:sid]` prefix so the write-time gate in
-        // `should_store_persistent_memory` accepts the entry. Session
-        // id is embedded inline as `session=…` rather than as a bracket
-        // prefix.
+        // L2 structural envelope + layered body. The abstract is
+        // drawn from the summary's first sentence (or a deterministic
+        // fallback when that doesn't fit 30–150 chars). The summary
+        // text always lives in detail, so we assert there — the
+        // pipeline sometimes prefixes a section-hint warning which
+        // would otherwise dominate the abstract.
         assert!(
             content.starts_with("[@episode/compaction]"),
             "should have L2 structural envelope, got: {}",
             &content[..50.min(content.len())]
         );
+        let entry = astra_prompts::memory_proto::MemoryEntry::parse(content)
+            .expect("wire form must parse");
+        let abs_chars = entry.abstract_layer().chars().count();
         assert!(
-            content.contains("session=sess-test-42"),
-            "should embed session id in body"
+            (30..=150).contains(&abs_chars),
+            "abstract must clear the L2 gate, got {} chars: {}",
+            abs_chars,
+            entry.abstract_layer(),
         );
-        assert!(content.contains("JWT"), "should contain the summary text");
+        let detail = entry.detail_layer().expect("detail layer emitted");
+        assert!(
+            detail.contains("session=sess-test-42"),
+            "detail should embed the session id"
+        );
+        assert!(detail.contains("JWT"), "detail must carry the summary text");
         // The stored content must pass the L2 gate by construction;
         // if a future refactor weakens the envelope this assertion
         // catches it immediately.
@@ -2745,6 +2840,67 @@ mod tests {
             astra_turn_types::should_store_persistent_memory(content, "semantic").is_ok(),
             "auto-stored compaction summary must satisfy L2 gate"
         );
+    }
+
+    // Unit-level coverage for the summary→layered-body helper. Direct
+    // tests for each branch so future changes to the fallback rule
+    // don't silently regress.
+
+    #[test]
+    fn compaction_body_uses_first_sentence_when_it_fits() {
+        // 30–150 chars, ends with `. ` → verbatim abstract.
+        let sid = "sess-xyz";
+        let summary = "User picked axum over actix for its tower stack. Then wired sqlx for persistence.";
+        let body = build_compaction_layered_body(sid, summary).unwrap();
+        let entry = astra_prompts::memory_proto::MemoryEntry::parse(&body).unwrap();
+        assert_eq!(
+            entry.abstract_layer(),
+            "User picked axum over actix for its tower stack"
+        );
+        assert!(entry.detail_layer().unwrap().contains(summary));
+    }
+
+    #[test]
+    fn compaction_body_falls_back_when_first_sentence_too_short() {
+        // First sentence is 14 chars — under the 30-char minimum.
+        // Fallback abstract must take over and still pass the L2 gate.
+        let sid = "sess-short";
+        let summary = "OK done. Details: we refactored the auth path, added refresh rotation, and migrated the session table to MatrixOne.";
+        let body = build_compaction_layered_body(sid, summary).unwrap();
+        assert!(
+            astra_turn_types::should_store_persistent_memory(&body, "semantic").is_ok()
+        );
+        let entry = astra_prompts::memory_proto::MemoryEntry::parse(&body).unwrap();
+        // Fallback format is stable.
+        assert!(
+            entry.abstract_layer().starts_with("Compaction of session"),
+            "got: {}",
+            entry.abstract_layer()
+        );
+    }
+
+    #[test]
+    fn compaction_body_falls_back_when_first_sentence_too_long() {
+        // No `. ` terminator and no newlines → the whole summary is
+        // the "first sentence", which is likely way over 150 chars.
+        let sid = "sess-long";
+        let summary = "a".repeat(500);
+        let body = build_compaction_layered_body(sid, &summary).unwrap();
+        assert!(
+            astra_turn_types::should_store_persistent_memory(&body, "semantic").is_ok()
+        );
+        let entry = astra_prompts::memory_proto::MemoryEntry::parse(&body).unwrap();
+        assert!(entry.abstract_layer().starts_with("Compaction of session"));
+        assert!(
+            entry.abstract_layer().chars().count()
+                <= astra_prompts::memory_proto::ABSTRACT_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn compaction_body_returns_none_for_empty_summary() {
+        assert!(build_compaction_layered_body("sid", "").is_none());
+        assert!(build_compaction_layered_body("sid", "   \n  ").is_none());
     }
 
     #[tokio::test]

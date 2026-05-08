@@ -1,99 +1,34 @@
-//! L3: layered memory recall with trust-aware ranking.
+//! L3: layered memory recall — shaping Memoria results for injection.
 //!
-//! **Problem**: Memoria retrieval returns a flat list of memories
-//! ordered by raw vector-similarity score. An auto-generated,
-//! low-trust `episodic` summary with 0.72 score outranks a user-
-//! confirmed `semantic` fact with 0.68 score, even though the fact
-//! is more durable and much more likely to be useful. Observed in
-//! session `c6e18730`: pollution entries like auto-compaction blobs
-//! displaced curated learnings in the volatile `## User Memories`
-//! block.
+//! **Memoria already ranks by tier.** The server's `final_score` is
+//! `0.3·vec + 0.2·kw + 0.2·time + 0.3·conf_score` where `conf_score`
+//! is the tier-aware confidence-decay signal (half-life T1=365d,
+//! T2=180d, T3=60d, T4=30d). A client-side tier multiplier on top of
+//! that would double-count — exactly the bug we shipped and reverted.
 //!
-//! **Fix**: re-rank retrieved memories by a **composite score** that
-//! combines trust tier and raw similarity:
+//! So this module is intentionally *minimal*:
 //!
-//!     composite = raw_score * tier_weight(trust_tier)
+//! 1. [`RankableMemory`] — a transport-agnostic record (no Memoria
+//!    HTTP client types leak into the ranking layer; the tests and
+//!    any future memdir backend can synthesize it).
+//! 2. [`partition_by_scope`] — split retrieved memories into
+//!    persistent (cross-session) vs. session-scoped (`working`) so
+//!    the caller can allocate budget per lane (e.g. 4 persistent + 1
+//!    working in the volatile system-prompt lane).
+//! 3. [`sort_by_retrieval_score`] — a *stable* sort on the server's
+//!    `retrieval_score` for cases where the caller has merged results
+//!    from multiple queries (full-message + entity tokens) and needs a
+//!    deterministic ordering. Ties break on `memory_id` so the volatile
+//!    prompt-cache prefix stays stable across runs.
 //!
-//! Tier weights are chosen so that a big trust gap can overcome a
-//! small score gap, but not the reverse:
+//! # Why not re-rank client-side at all?
 //!
-//! | Tier              | Constant         | Weight |
-//! | ----------------- | ---------------- | ------ |
-//! | VERIFIED   (T1)   | user confirmed   | 1.00   |
-//! | CURATED    (T2)   | session-end      | 0.85   |
-//! | INFERRED   (T3)   | auto-compaction  | 0.55   |
-//! | UNVERIFIED (T4)   | speculative      | 0.35   |
-//! | (no tier)         | legacy           | 0.50   |
-//!
-//! This is a **pure re-ranker** — it runs after Memoria returns
-//! results, doesn't change the retrieval call itself. The backend
-//! stays unchanged; we just pick the right top_k from what it
-//! returned.
-//!
-//! Companion concept: memory_type filtering. The caller can
-//! pre-partition by `memory_type` (session-scoped `working` versus
-//! persistent semantic/episodic/procedural/profile) before ranking,
-//! so working memory doesn't compete with long-term facts.
-
-/// Tier weight lookup. Recognized tier constants match
-/// `astra_prompts::memory_proto::TIER_*`, but we redeclare here so
-/// this crate stays prompt-independent.
-///
-/// Unknown / missing tier → `0.50` (middle of the scale, no bias
-/// either way).
-#[must_use]
-pub fn tier_weight(trust_tier: Option<&str>) -> f64 {
-    match trust_tier {
-        Some("T1") => 1.00, // VERIFIED
-        Some("T2") => 0.85, // CURATED
-        Some("T3") => 0.55, // INFERRED
-        Some("T4") => 0.35, // UNVERIFIED
-        _ => 0.50,          // legacy / unknown
-    }
-}
-
-/// Compute the composite ranking score used by [`sort_memories`] and
-/// similar.
-///
-/// Returns 0.0 when `raw_score` is None (absent) or NaN; callers who
-/// want to drop those rather than rank them can filter upstream.
-#[must_use]
-pub fn composite_score(raw_score: Option<f64>, trust_tier: Option<&str>) -> f64 {
-    let raw = raw_score.unwrap_or(0.0);
-    if raw.is_nan() {
-        return 0.0;
-    }
-    raw * tier_weight(trust_tier)
-}
-
-/// A memory record exposing the fields needed for ranking. Callers
-/// build this from their Memoria client's result type — we keep the
-/// ranking layer free of crate dependencies so it can run in tests
-/// and in any future memdir/file-based fallback.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RankableMemory {
-    pub memory_id: String,
-    pub content: String,
-    pub memory_type: String,
-    pub retrieval_score: Option<f64>,
-    pub trust_tier: Option<String>,
-}
-
-/// Sort `memories` in-place by descending composite score.
-///
-/// Stable sort on (−composite_score, memory_id) so ties break
-/// deterministically — same inputs produce the same output across
-/// runs, which matters for prompt-cache prefix stability.
-pub fn sort_memories(memories: &mut [RankableMemory]) {
-    memories.sort_by(|a, b| {
-        let sa = composite_score(a.retrieval_score, a.trust_tier.as_deref());
-        let sb = composite_score(b.retrieval_score, b.trust_tier.as_deref());
-        // Descending on score; ascending on memory_id as tiebreak.
-        sb.partial_cmp(&sa)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.memory_id.cmp(&b.memory_id))
-    });
-}
+//! Memoria's server-side ranking is the only place that sees global
+//! statistics (corpus confidence distribution, per-user decay, graph
+//! neighborhood signals). Re-ranking client-side would need all of
+//! that as input to avoid the double-count trap — and if we had it,
+//! we wouldn't need to re-rank. Trust the server; shape what comes
+//! back.
 
 /// Persistent memory types — long-lived, cross-session. Entries in
 /// these types are candidates for the `## User Memories` volatile-
@@ -103,6 +38,47 @@ pub const PERSISTENT_TYPES: &[&str] = &["semantic", "episodic", "procedural", "p
 /// Session-scoped memory type — auto-purged, only valid within the
 /// originating session.
 pub const SESSION_SCOPED_TYPE: &str = "working";
+
+/// A memory record exposing the fields needed for shaping. Callers
+/// build this from their Memoria client's result type — we keep the
+/// shaping layer free of crate dependencies so it can run in tests
+/// and in any future memdir/file-based fallback.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RankableMemory {
+    pub memory_id: String,
+    pub content: String,
+    pub memory_type: String,
+    /// Server-side `final_score` from Memoria. Already tier-weighted.
+    pub retrieval_score: Option<f64>,
+    pub trust_tier: Option<String>,
+}
+
+/// Sort `memories` in-place by descending `retrieval_score` (the
+/// server's already-tier-weighted `final_score`).
+///
+/// Use this *only* when the caller has merged results from multiple
+/// queries and needs one ordered list — a single-query result from
+/// Memoria is already ordered.
+///
+/// Stable: ties break ascending on `memory_id` so the volatile
+/// prompt-cache prefix stays identical across runs. `None` /
+/// `NaN` scores sort to the end.
+pub fn sort_by_retrieval_score(memories: &mut [RankableMemory]) {
+    memories.sort_by(|a, b| {
+        let sa = finite_or_neg_inf(a.retrieval_score);
+        let sb = finite_or_neg_inf(b.retrieval_score);
+        sb.partial_cmp(&sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.memory_id.cmp(&b.memory_id))
+    });
+}
+
+fn finite_or_neg_inf(score: Option<f64>) -> f64 {
+    match score {
+        Some(s) if s.is_finite() => s,
+        _ => f64::NEG_INFINITY,
+    }
+}
 
 /// Is this memory_type one of the cross-session persistent kinds?
 #[must_use]
@@ -115,9 +91,9 @@ pub fn is_persistent_type(memory_type: &str) -> bool {
 /// persistent partition by default (fail-open: don't silently drop
 /// retrievals we don't fully understand).
 ///
-/// Used so the caller can rank each bucket independently and then
-/// allocate its budget (e.g. 4 persistent + 1 working in the volatile
-/// lane) without cross-bucket interference.
+/// Used so the caller can allocate the volatile-lane budget per
+/// bucket (e.g. 4 persistent + 1 working) without cross-bucket
+/// interference.
 #[must_use]
 pub fn partition_by_scope(
     memories: Vec<RankableMemory>,
@@ -138,67 +114,6 @@ pub fn partition_by_scope(
 mod tests {
     use super::*;
 
-    // ── tier_weight ───────────────────────────────────────────────────
-
-    #[test]
-    fn tier_weight_known_tiers() {
-        assert_eq!(tier_weight(Some("T1")), 1.00);
-        assert_eq!(tier_weight(Some("T2")), 0.85);
-        assert_eq!(tier_weight(Some("T3")), 0.55);
-        assert_eq!(tier_weight(Some("T4")), 0.35);
-    }
-
-    #[test]
-    fn tier_weight_unknown_or_missing_is_midpoint() {
-        assert_eq!(tier_weight(None), 0.50);
-        assert_eq!(tier_weight(Some("T99")), 0.50);
-        assert_eq!(tier_weight(Some("")), 0.50);
-    }
-
-    // ── composite_score ──────────────────────────────────────────────
-
-    #[test]
-    fn composite_multiplies_raw_and_tier() {
-        // T1 (1.0) × 0.8 raw = 0.8
-        assert!((composite_score(Some(0.8), Some("T1")) - 0.8).abs() < 1e-9);
-        // T3 (0.55) × 0.8 raw = 0.44
-        assert!((composite_score(Some(0.8), Some("T3")) - 0.44).abs() < 1e-9);
-    }
-
-    #[test]
-    fn composite_trust_gap_can_overcome_score_gap() {
-        // Real scenario from session c6e18730: a T1 VERIFIED user
-        // preference at 0.62 score should outrank a T3 INFERRED
-        // compaction summary at 0.78 score — because the summary is
-        // auto-generated pollution and the preference is durable.
-        let verified = composite_score(Some(0.62), Some("T1")); // 0.62
-        let inferred = composite_score(Some(0.78), Some("T3")); // 0.429
-        assert!(verified > inferred, "T1@0.62 must beat T3@0.78");
-    }
-
-    #[test]
-    fn composite_small_score_gap_does_not_flip_tiers() {
-        // Inverse safety check: two T1 entries, the one with higher
-        // raw score must win (tier equality → raw score decides).
-        let a = composite_score(Some(0.9), Some("T1"));
-        let b = composite_score(Some(0.8), Some("T1"));
-        assert!(a > b);
-    }
-
-    #[test]
-    fn composite_handles_missing_score() {
-        // No retrieval_score → 0.0 composite. Matches "nothing to rank
-        // on" more usefully than pretending it's relevant.
-        assert_eq!(composite_score(None, Some("T1")), 0.0);
-    }
-
-    #[test]
-    fn composite_handles_nan() {
-        assert_eq!(composite_score(Some(f64::NAN), Some("T1")), 0.0);
-    }
-
-    // ── sort_memories ────────────────────────────────────────────────
-
     fn mk(id: &str, score: f64, tier: Option<&str>, mem_type: &str) -> RankableMemory {
         RankableMemory {
             memory_id: id.to_string(),
@@ -209,24 +124,26 @@ mod tests {
         }
     }
 
+    // ── sort_by_retrieval_score ────────────────────────────────────
+
     #[test]
-    fn sort_puts_higher_composite_first() {
+    fn sort_descends_by_server_score() {
+        // Server already tier-weighted; we just order deterministically.
         let mut mems = vec![
-            mk("low-tier-high-score", 0.78, Some("T3"), "episodic"), // 0.429
-            mk("high-tier-mid-score", 0.62, Some("T1"), "semantic"), // 0.62
-            mk("mid-tier-mid-score", 0.70, Some("T2"), "procedural"), // 0.595
+            mk("lo", 0.40, Some("T1"), "semantic"),
+            mk("hi", 0.82, Some("T3"), "episodic"),
+            mk("mid", 0.65, Some("T2"), "procedural"),
         ];
-        sort_memories(&mut mems);
-        assert_eq!(mems[0].memory_id, "high-tier-mid-score");
-        assert_eq!(mems[1].memory_id, "mid-tier-mid-score");
-        assert_eq!(mems[2].memory_id, "low-tier-high-score");
+        sort_by_retrieval_score(&mut mems);
+        assert_eq!(mems[0].memory_id, "hi");
+        assert_eq!(mems[1].memory_id, "mid");
+        assert_eq!(mems[2].memory_id, "lo");
     }
 
     #[test]
     fn sort_is_deterministic_on_ties() {
-        // Two memories with identical composite scores — sort_memories
-        // must produce the same order across runs because prompt-cache
-        // prefix stability depends on it.
+        // Identical scores → ascending memory_id. Prompt-cache prefix
+        // stability depends on this being identical across runs.
         let mut a = vec![
             mk("z-id", 0.8, Some("T1"), "semantic"),
             mk("a-id", 0.8, Some("T1"), "semantic"),
@@ -235,33 +152,39 @@ mod tests {
             mk("a-id", 0.8, Some("T1"), "semantic"),
             mk("z-id", 0.8, Some("T1"), "semantic"),
         ];
-        sort_memories(&mut a);
-        sort_memories(&mut b);
+        sort_by_retrieval_score(&mut a);
+        sort_by_retrieval_score(&mut b);
         assert_eq!(a[0].memory_id, "a-id");
         assert_eq!(b[0].memory_id, "a-id");
     }
 
     #[test]
-    fn sort_handles_missing_tier_at_midpoint_weight() {
-        // Legacy entries (no trust_tier) should land between T2 and T3
-        // because 0.50 is the default weight.
+    fn sort_pushes_missing_and_nan_scores_to_end() {
         let mut mems = vec![
-            mk("t1", 1.0, Some("T1"), "semantic"),
-            mk("legacy", 1.0, None, "semantic"),
-            mk("t2", 1.0, Some("T2"), "semantic"),
-            mk("t3", 1.0, Some("T3"), "semantic"),
-            mk("t4", 1.0, Some("T4"), "semantic"),
+            RankableMemory {
+                memory_id: "nan".into(),
+                content: "c".into(),
+                memory_type: "semantic".into(),
+                retrieval_score: Some(f64::NAN),
+                trust_tier: None,
+            },
+            mk("ok", 0.5, Some("T1"), "semantic"),
+            RankableMemory {
+                memory_id: "none".into(),
+                content: "c".into(),
+                memory_type: "semantic".into(),
+                retrieval_score: None,
+                trust_tier: None,
+            },
         ];
-        sort_memories(&mut mems);
-        assert_eq!(mems[0].memory_id, "t1");
-        assert_eq!(mems[1].memory_id, "t2");
-        // T3=0.55, legacy=0.50
-        assert_eq!(mems[2].memory_id, "t3");
-        assert_eq!(mems[3].memory_id, "legacy");
-        assert_eq!(mems[4].memory_id, "t4");
+        sort_by_retrieval_score(&mut mems);
+        assert_eq!(mems[0].memory_id, "ok");
+        // The two sink values tie at -inf; memory_id breaks the tie.
+        assert_eq!(mems[1].memory_id, "nan");
+        assert_eq!(mems[2].memory_id, "none");
     }
 
-    // ── partition_by_scope ────────────────────────────────────────────
+    // ── partition_by_scope ────────────────────────────────────────
 
     #[test]
     fn partition_splits_working_from_persistent() {
@@ -300,53 +223,5 @@ mod tests {
         }
         assert!(!is_persistent_type(SESSION_SCOPED_TYPE));
         assert!(!is_persistent_type("tool_result"));
-    }
-
-    // ── End-to-end scenario: the c6e18730 pollution ranking bug ──────
-
-    #[test]
-    fn user_curated_preference_outranks_compaction_summary() {
-        // Concrete reproduction: three memories retrieved, flat
-        // ordering would put the compaction summary first, tier-aware
-        // ordering puts the user preference first.
-        let mut mems = vec![
-            // Auto-compaction summary, raw score 0.72, inferred tier.
-            RankableMemory {
-                memory_id: "compact-abc".into(),
-                content: "[@episode/compaction] session=abc older discussion".into(),
-                memory_type: "episodic".into(),
-                retrieval_score: Some(0.72),
-                trust_tier: Some("T3".into()),
-            },
-            // User-confirmed preference, raw score 0.58, verified tier.
-            RankableMemory {
-                memory_id: "pref-rust".into(),
-                content: "[@pref/active] senior Rust engineer, prefers CLI tools".into(),
-                memory_type: "profile".into(),
-                retrieval_score: Some(0.58),
-                trust_tier: Some("T1".into()),
-            },
-            // Session-end curated learning, raw score 0.65, curated tier.
-            RankableMemory {
-                memory_id: "learn-cache".into(),
-                content: "[@knowledge/curated] Bedrock cache_reference fields are stripped".into(),
-                memory_type: "semantic".into(),
-                retrieval_score: Some(0.65),
-                trust_tier: Some("T2".into()),
-            },
-        ];
-
-        sort_memories(&mut mems);
-
-        // Expected composite scores:
-        //   pref-rust     = 0.58 * 1.00 = 0.580
-        //   learn-cache   = 0.65 * 0.85 = 0.5525
-        //   compact-abc   = 0.72 * 0.55 = 0.396
-        assert_eq!(mems[0].memory_id, "pref-rust", "T1 preference must win");
-        assert_eq!(mems[1].memory_id, "learn-cache", "T2 learning next");
-        assert_eq!(
-            mems[2].memory_id, "compact-abc",
-            "T3 auto-compaction last despite highest raw score"
-        );
     }
 }

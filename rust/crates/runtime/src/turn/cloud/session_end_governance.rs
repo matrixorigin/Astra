@@ -78,7 +78,20 @@ pub fn extract_session_knowledge(
     knowledge
 }
 
-/// Format extracted knowledge as a single markdown string for Memoria storage.
+/// Format extracted knowledge as a layered-body memory string for
+/// Memoria storage.
+///
+/// Layers emitted:
+/// - **abstract** (deterministic, single line, 30–150 chars):
+///   `"Session <sid>: N corrections, M learnings, K decisions"`.
+///   No LLM call — session-end is a hot path on shutdown and we don't
+///   want extra latency here.
+/// - **overview** (short narrative): count summary plus the first
+///   correction/learning/decision preview so the overview view is
+///   useful without expanding.
+/// - **detail** (bullet sections): the existing User Corrections /
+///   Learnings / Decisions markdown — unchanged payload, just moved
+///   into the detail layer.
 pub fn format_knowledge_for_storage(
     knowledge: &SessionKnowledge,
     session_id: &str,
@@ -90,19 +103,58 @@ pub fn format_knowledge_for_storage(
         return None; // Nothing worth persisting
     }
 
-    // `[@knowledge/curated]` structural envelope so the L2 write-time
-    // gate accepts the write. `knowledge` is the memory_proto namespace
-    // for "curated cross-session facts/lessons"; `curated` marks the
-    // source as session-end governance (higher trust than auto-compaction
-    // summaries which use `[@episode/compaction]`).
-    //
-    // Legacy format was `[session-knowledge:sid]` with `## User Corrections`
-    // / `## Learnings` / `## Decisions` markdown sections. That had no
-    // namespace — the L2 gate would reject it. We embed the session id
-    // inline as `session=…` so it's still discoverable in the indexed
-    // body, while the prefix satisfies the structural contract.
-    let mut out = format!("[@knowledge/curated] session={session_id}\n");
+    let abstract_ = synthesize_session_abstract(knowledge, session_id);
+    let overview = synthesize_session_overview(knowledge);
+    let detail = format_session_detail(knowledge);
 
+    Some(astra_prompts::memory_proto::encode_body_layers(
+        &abstract_,
+        Some(&overview),
+        Some(&detail),
+    ))
+}
+
+/// Deterministic abstract for session-end knowledge. Must clear L2's
+/// `ABSTRACT_MIN_CHARS` (30) and stay under `ABSTRACT_MAX_CHARS`
+/// (150).
+fn synthesize_session_abstract(knowledge: &SessionKnowledge, session_id: &str) -> String {
+    // Truncate session id to a stable prefix so very long UUIDs don't
+    // blow the abstract cap. 12 chars = enough to disambiguate in
+    // retrieval without dominating the budget.
+    let sid_short: String = session_id.chars().take(12).collect();
+    format!(
+        "Session {sid_short}: {} corrections, {} learnings, {} decisions",
+        knowledge.corrections.len(),
+        knowledge.learnings.len(),
+        knowledge.decisions.len(),
+    )
+}
+
+/// Overview layer: a short narrative that previews each bucket's
+/// first entry so the `overview` view stays informative.
+fn synthesize_session_overview(knowledge: &SessionKnowledge) -> String {
+    let mut out = String::new();
+    if let Some(first) = knowledge.corrections.first() {
+        out.push_str(&format!("First correction: {}.", preview(first, 120)));
+    }
+    if let Some(first) = knowledge.learnings.first() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!("First learning: {}.", preview(first, 120)));
+    }
+    if let Some(first) = knowledge.decisions.first() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!("First decision: {}.", preview(first, 120)));
+    }
+    out
+}
+
+/// Detail layer: the full bullet sections as before.
+fn format_session_detail(knowledge: &SessionKnowledge) -> String {
+    let mut out = String::new();
     if !knowledge.corrections.is_empty() {
         out.push_str("## User Corrections\n");
         for c in &knowledge.corrections {
@@ -121,8 +173,19 @@ pub fn format_knowledge_for_storage(
             out.push_str(&format!("- {d}\n"));
         }
     }
+    out
+}
 
-    Some(out)
+fn preview(s: &str, max_chars: usize) -> String {
+    let trimmed = s.trim().replace('\n', " ");
+    let count = trimmed.chars().count();
+    if count <= max_chars {
+        trimmed
+    } else {
+        let mut out: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
 /// Full session-end governance: extract knowledge, store to Memoria, purge working memory.
@@ -139,15 +202,24 @@ pub async fn run_session_end_governance(
     };
 
     // Store knowledge as semantic memory (cross-session). Route through
-    // the L2 structural gate so a malformed envelope (empty body,
+    // the L2 structural gate so a malformed envelope (short abstract,
     // missing `[@ns/type]` prefix) fails fast at write rather than
     // polluting retrieval on future sessions.
-    if let Some(content) = format_knowledge_for_storage(&knowledge, session_id) {
+    if let Some(body) = format_knowledge_for_storage(&knowledge, session_id) {
         let items =
             knowledge.corrections.len() + knowledge.learnings.len() + knowledge.decisions.len();
-        match astra_turn_types::should_store_persistent_memory(&content, "semantic") {
+        // Wrap the layered body with the `[@knowledge/curated]` tag —
+        // the formatter intentionally returns body-only so callers can
+        // choose namespace/status explicitly.
+        let wire = astra_prompts::memory_proto::MemoryEntry::new(
+            astra_prompts::memory_proto::NS_KNOWLEDGE,
+            "curated",
+            &body,
+        )
+        .encode();
+        match astra_turn_types::should_store_persistent_memory(&wire, "semantic") {
             Ok(()) => match client
-                .store(&content, "semantic", Some(session_id), Some("T2"))
+                .store(&wire, "semantic", Some(session_id), Some("T2"))
                 .await
             {
                 Ok(_) => {
@@ -271,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn format_knowledge_includes_all_sections() {
+    fn format_knowledge_emits_layered_body() {
         let knowledge = SessionKnowledge {
             corrections: vec!["Use RS256".to_string()],
             learnings: vec!["CJK needs char_indices".to_string()],
@@ -279,20 +351,60 @@ mod tests {
             error_patterns: vec![],
         };
         let formatted = format_knowledge_for_storage(&knowledge, "sess1").unwrap();
-        // L2 structural envelope — replaces legacy `[session-knowledge:sid]`
-        // prefix so the write-time gate in `should_store_persistent_memory`
-        // accepts the content. `@knowledge/curated` matches memory_proto's
-        // NS_KNOWLEDGE; `curated` marks it as session-end (higher trust).
-        assert!(formatted.starts_with("[@knowledge/curated]"));
-        assert!(formatted.contains("session=sess1"));
-        assert!(formatted.contains("## User Corrections"));
-        assert!(formatted.contains("- Use RS256"));
-        assert!(formatted.contains("## Learnings"));
-        assert!(formatted.contains("## Decisions"));
-        // The L2 gate must accept what this formatter produces.
+        // The formatter now emits wire-body (no tag prefix — the tag is
+        // added when the writer calls `MemoryEntry::encode` or stores
+        // directly). Callers wrap it with the `[@knowledge/curated]`
+        // tag via `MemoryEntry`.
+        let entry = astra_prompts::memory_proto::MemoryEntry::new(
+            "knowledge",
+            "curated",
+            &formatted,
+        );
+        // Abstract: deterministic count line.
+        assert_eq!(
+            entry.abstract_layer(),
+            "Session sess1: 1 corrections, 1 learnings, 1 decisions"
+        );
+        // Overview: contains first-of-each preview.
+        let overview = entry.overview_layer().expect("overview emitted");
+        assert!(overview.contains("First correction"));
+        assert!(overview.contains("RS256"));
+        // Detail: full markdown sections.
+        let detail = entry.detail_layer().expect("detail emitted");
+        assert!(detail.contains("## User Corrections"));
+        assert!(detail.contains("- Use RS256"));
+        assert!(detail.contains("## Learnings"));
+        assert!(detail.contains("## Decisions"));
+        // The full wire form must pass the L2 gate.
+        let wire = entry.encode();
         assert!(
-            astra_turn_types::should_store_persistent_memory(&formatted, "semantic").is_ok(),
-            "formatted knowledge must pass L2 gate"
+            astra_turn_types::should_store_persistent_memory(&wire, "semantic").is_ok(),
+            "wire-form must pass L2 gate; got: {wire}"
+        );
+    }
+
+    #[test]
+    fn format_knowledge_abstract_truncates_long_session_id() {
+        // Long UUIDs should be shortened in the abstract so they don't
+        // dominate the 150-char budget.
+        let knowledge = SessionKnowledge {
+            corrections: vec!["a".to_string()],
+            learnings: vec![],
+            decisions: vec![],
+            error_patterns: vec![],
+        };
+        let sid = "1234567890abcdef-extra-very-long-suffix";
+        let formatted = format_knowledge_for_storage(&knowledge, sid).unwrap();
+        let entry = astra_prompts::memory_proto::MemoryEntry::new(
+            "knowledge",
+            "curated",
+            &formatted,
+        );
+        // Should use the first 12 chars of the session id.
+        assert!(
+            entry.abstract_layer().starts_with("Session 1234567890ab"),
+            "got abstract: {}",
+            entry.abstract_layer()
         );
     }
 
@@ -375,12 +487,18 @@ mod tests {
         let stored = stored.lock().unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].1, "semantic");
-        // L2 structural envelope; session id is embedded inline
-        // (`session=…`) rather than as a legacy `[session-knowledge:…]`
-        // prefix, so the write-time gate accepts the memory.
+        // L2 structural envelope + layered body. The abstract is the
+        // deterministic count line; the detail still carries the
+        // bullet sections so a future `memory_expand` can surface them.
         assert!(stored[0].0.starts_with("[@knowledge/curated]"));
-        assert!(stored[0].0.contains("session=sess1"));
+        assert!(stored[0].0.contains("Session sess1:"));
         assert!(stored[0].0.contains("RS256"));
+        // The wire form must pass the same L2 gate production uses.
+        assert!(
+            astra_turn_types::should_store_persistent_memory(&stored[0].0, "semantic")
+                .is_ok(),
+            "stored wire must pass L2 gate"
+        );
 
         let purged = purged.lock().unwrap();
         assert_eq!(purged.len(), 1);

@@ -1,28 +1,167 @@
-/// Structured memory entry protocol (v1).
-///
-/// Every memory stored by astra follows this wire format:
-///
-/// ```text
-/// [@<namespace>/<status>] <body>
-/// ```
-///
-/// Examples:
-/// - `[@task/pending] Review PR #42`
-/// - `[@plan/active] Finish API integration by Friday`
-/// - `[@fact/semantic] User prefers Rust for CLI tools.`
-/// - `[@episode/summary] ### Goals\nUser wants to fix auth...`
-/// - `[@pref/active] Focus project: matrixorigin/memoria`
-/// - `[@swap/archived] Swapped context from turn 5-12`
-/// - `[@insight/active] User frequently works on Rust CLI + memory systems`
-///
-/// The tag line is machine-parseable via regex. The body carries the
-/// semantic content that Memoria indexes for similarity search.
-/// The `memory_type` field sent to Memoria is derived from the namespace
-/// via `memory_ns::to_memory_type()`.
+//! Structured memory entry protocol.
+//!
+//! # Wire format
+//!
+//! Every memory stored by astra follows this tagged format:
+//!
+//! ```text
+//! [@<namespace>/<status>] <body>
+//! ```
+//!
+//! Examples:
+//! - `[@task/pending] Review PR #42`
+//! - `[@plan/active] Finish API integration by Friday`
+//! - `[@fact/semantic] User prefers Rust for CLI tools.`
+//! - `[@episode/summary] ### Goals\nUser wants to fix auth...`
+//! - `[@pref/active] Focus project: matrixorigin/memoria`
+//! - `[@swap/archived] Swapped context from turn 5-12`
+//! - `[@insight/active] User frequently works on Rust CLI + memory systems`
+//!
+//! The tag line is machine-parseable via regex. The body carries the
+//! semantic content that Memoria indexes for similarity search. The
+//! `memory_type` field sent to Memoria is derived from the namespace
+//! via [`memory_ns::to_memory_type`].
+//!
+//! # Layered body
+//!
+//! The body is split into up to **three layers** by well-known
+//! separators so the read path can slice just what it needs at
+//! injection time, without a round-trip to the server:
+//!
+//! ```text
+//! [@<namespace>/<status>] <abstract>
+//!
+//! <overview>
+//! <!--layer:detail-->
+//! <detail>
+//! ```
+//!
+//! Layers:
+//! | Layer      | Required | Size target        | Purpose                                               |
+//! | ---------- | -------- | ------------------ | ----------------------------------------------------- |
+//! | `abstract` | yes      | 30–150 scalars     | One-line gist. Always injected. Ranking signal.       |
+//! | `overview` | optional | ~300–600 scalars   | Short paragraph for list views / `overview` view.     |
+//! | `detail`   | optional | up to Memoria cap  | Full content: bullets, code, trace IDs, rationale.    |
+//!
+//! Separators are bytes, not regex — exact-match to keep splitting cheap
+//! and reversible:
+//! - `LAYER_SEP_OVERVIEW = "\n\n"` (ASCII blank line) separates abstract
+//!   from overview. Overview ends at the first detail sentinel or EOF.
+//! - `LAYER_SEP_DETAIL = "\n<!--layer:detail-->\n"` separates overview
+//!   from detail. An HTML comment sentinel (instead of Markdown's
+//!   `---`) so session-end learnings and compacted blocks can contain
+//!   thematic breaks without ambiguity. The sentinel is invisible in
+//!   most Markdown renderers, so layered bodies still read cleanly
+//!   when inspected raw.
+//!
+//! **Hard-break from the single-body format:** entries must carry an
+//! `abstract` layer that satisfies [`ABSTRACT_MIN_CHARS`] /
+//! [`ABSTRACT_MAX_CHARS`]. The L2 write gate rejects entries without
+//! a valid abstract — there is no fallback to "treat the whole body
+//! as the abstract". This is deliberate: silent fallback would let
+//! unsynthesized dumps land in the compact view and poison the
+//! volatile cache lane.
+//!
+//! # Read-path slicing (simulates Memoria v2 views)
+//!
+//! Memoria v2 (unreleased, `open-memoria` branch commit `5eed8ef`,
+//! crates: `memoria-api/src/v2/{router,models}.rs`) exposes three
+//! recall views: `compact`, `overview`, `full`. We simulate those views
+//! on the v1 `/memory/retrieve` endpoint by slicing the layered body
+//! client-side:
+//!
+//! | v2 view     | v1.1 slice                         | Used by                                |
+//! | ----------- | ---------------------------------- | -------------------------------------- |
+//! | `compact`   | abstract only                      | Volatile system-prompt lane, ranking   |
+//! | `overview`  | abstract + overview                | `introspect`, list views, UI summaries |
+//! | `full`      | abstract + overview + detail       | Lazy `memory_expand`, debug traces     |
+//!
+//! When Memoria v2 ships, the server-side views will replace the
+//! client-side slicing — the protocol stays the same, only the
+//! transport changes. Callers that store layered bodies today will
+//! light up v2's compact view automatically.
+//!
+//! # Writer obligations (abstract synthesis)
+//!
+//! Every writer MUST emit a valid abstract. "Valid" means:
+//! - Length in `[ABSTRACT_MIN_CHARS, ABSTRACT_MAX_CHARS]` scalars.
+//! - Single line (no `\n` — use overview/detail for structure).
+//! - Self-contained (readable without the rest of the body, because
+//!   that's what the compact view ships to the LLM).
+//! - Specific (names the entity, action, or decision — not "notes
+//!   about the session").
+//!
+//! Per-writer synthesis rules:
+//!
+//! | Writer                          | Layers emitted          | Abstract source                                                                                                       |
+//! | ------------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------- |
+//! | `memoria_compact.rs`            | abstract + detail       | LLM-synthesized in the same call that produces the compacted block. Prompt asks for "one-line topic < 150 chars".     |
+//! | `session_end_governance.rs`     | abstract + overview + detail | Deterministic from section counts, e.g. `"Session <sid>: N corrections, M learnings, K decisions"`. No extra LLM call. |
+//! | Short structural facts (pref, task, plan, insight) | abstract only | The fact *is* the abstract. Writer rejects its own input if it would exceed `ABSTRACT_MAX_CHARS`.             |
+//! | External/unstructured           | abstract only           | Writer synthesizes via simple heuristic (first sentence, trimmed, padded if < MIN). If even that fails, the write is refused at L2 — we do not ship unsynthesized content into the compact view. |
+//!
+//! When an LLM is already in the loop (compact path), synthesis is
+//! free — reuse the same call. When there is none (session-end),
+//! prefer deterministic synthesis over adding latency; the overview
+//! layer carries the readable narrative for anyone who expands it.
+//!
+//! # Future: corpus-level re-synthesis (`memory_reindex`)
+//!
+//! Abstracts are frozen at write time. Over many sessions, local
+//! abstracts drift from the global narrative (e.g. ten session-end
+//! entries each say "N corrections, M learnings" — fine individually,
+//! noisy as a set). A future `memory_reindex` job re-synthesizes
+//! abstracts in neighbor groups (clustered by retrieval) so the
+//! compact view stays coherent corpus-wide. Out of scope for v1.1.
+//!
+//! # Constants at a glance
+//!
+//! - [`VERSION`] — `"v1.1"`. No back-compat with single-body v1.
+//! - [`LAYER_SEP_OVERVIEW`], [`LAYER_SEP_DETAIL`] — the splitters.
+//! - [`ABSTRACT_MIN_CHARS`], [`ABSTRACT_MAX_CHARS`] — enforced by the L2
+//!   structural gate on write; violations are rejected, not silently
+//!   truncated, so the layered promise holds.
 use crate::memory_ns;
 
-/// Protocol version tag for forward compatibility.
-pub const VERSION: &str = "v1";
+/// Protocol version tag.
+///
+/// Bumped from `"v1"` → `"v1.1"` when the layered body became
+/// mandatory. No back-compat for single-body entries — the store is
+/// still in early development, rewriting the few live writers is
+/// cheaper than dragging a compatibility shim forward.
+pub const VERSION: &str = "v1.1";
+
+/// Separator between the `abstract` layer and the `overview` layer.
+///
+/// A single ASCII blank line (`\n\n`). Must appear *outside* code
+/// fences in the abstract — the abstract layer is plain text by
+/// contract, so this is safe.
+pub const LAYER_SEP_OVERVIEW: &str = "\n\n";
+
+/// Separator between the `overview` layer and the `detail` layer.
+///
+/// An HTML comment sentinel (`\n<!--layer:detail-->\n`). Chosen over
+/// Markdown's `---` thematic break because detail often contains
+/// Markdown (session-end learnings, compacted trace blocks) that
+/// legitimately uses thematic breaks — a `---` splitter would
+/// misfire. The comment is invisible in most Markdown renderers, so
+/// layered bodies still read cleanly when inspected raw.
+pub const LAYER_SEP_DETAIL: &str = "\n<!--layer:detail-->\n";
+
+/// Minimum length of the `abstract` layer, in Unicode scalars.
+///
+/// Below this, the entry is too terse to be useful as a ranking
+/// signal or compact-view one-liner. Enforced by the L2 write gate.
+pub const ABSTRACT_MIN_CHARS: usize = 30;
+
+/// Maximum length of the `abstract` layer, in Unicode scalars.
+///
+/// Above this, writers must push the extra content into the
+/// `overview` or `detail` layer. The cap keeps the volatile system-
+/// prompt lane small and cache-friendly. Enforced by the L2 write
+/// gate; over-long abstracts are rejected so the layered promise
+/// holds (silent truncation would lose the writer's chosen framing).
+pub const ABSTRACT_MAX_CHARS: usize = 150;
 
 // ── Namespace short names (used in tags) ─────────────────────────
 pub const NS_TASK: &str = "task";
@@ -142,24 +281,162 @@ impl EntryMeta {
 }
 
 /// A parsed memory entry.
+///
+/// `body` is the raw layered body as stored — callers use
+/// [`Self::abstract_layer`] / [`Self::overview_layer`] /
+/// [`Self::detail_layer`] to slice it, or [`Self::compact_view`] /
+/// [`Self::overview_view`] / [`Self::full_view`] to render the v2-
+/// equivalent views.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryEntry {
     /// Namespace short name (e.g. "task", "plan", "fact").
     pub ns: String,
     /// Status (e.g. "pending", "active", "done", "summary").
     pub status: String,
-    /// The semantic body content (everything after the tag line).
+    /// The raw layered body: `abstract [\n\n overview] [\n<!--layer:detail-->\n detail]`.
     pub body: String,
 }
 
+/// Layers split out of a [`MemoryEntry`]'s body. Borrowed from the
+/// entry so no allocation happens during slicing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyLayers<'a> {
+    /// One-line gist. Always present in a well-formed entry.
+    pub abstract_: &'a str,
+    /// Short paragraph. `None` if the writer didn't emit one.
+    pub overview: Option<&'a str>,
+    /// Full content. `None` if the writer didn't emit one.
+    pub detail: Option<&'a str>,
+}
+
+/// Split a raw layered body string into its three layers.
+///
+/// Grammar: `abstract [LAYER_SEP_OVERVIEW overview] [LAYER_SEP_DETAIL detail]`.
+/// All four combinations are supported:
+/// - abstract only
+/// - abstract + overview
+/// - abstract + detail (skips overview)
+/// - abstract + overview + detail
+///
+/// First occurrence of each separator wins — writers must keep the
+/// abstract free of `\n\n` and the overview free of the detail
+/// sentinel. The L2 write gate enforces the abstract side; overview
+/// hygiene is left to the writer contract.
+pub fn split_body_layers(body: &str) -> BodyLayers<'_> {
+    // Peel off detail first so a detail sentinel inside overview
+    // can't happen (overview ends at the first sentinel by definition).
+    let (head, detail) = match body.split_once(LAYER_SEP_DETAIL) {
+        Some((h, d)) => (h, Some(d)),
+        None => (body, None),
+    };
+    let (abstract_, overview) = match head.split_once(LAYER_SEP_OVERVIEW) {
+        Some((a, o)) => (a, Some(o)),
+        None => (head, None),
+    };
+    BodyLayers {
+        abstract_,
+        overview,
+        detail,
+    }
+}
+
+/// Assemble a layered body from its components.
+///
+/// Omitting `overview` and `detail` produces an abstract-only body.
+/// The caller is responsible for abstract validity; the L2 gate
+/// re-checks on write.
+pub fn encode_body_layers(
+    abstract_: &str,
+    overview: Option<&str>,
+    detail: Option<&str>,
+) -> String {
+    let mut out = String::with_capacity(
+        abstract_.len()
+            + overview.map_or(0, |o| o.len() + LAYER_SEP_OVERVIEW.len())
+            + detail.map_or(0, |d| d.len() + LAYER_SEP_DETAIL.len()),
+    );
+    out.push_str(abstract_);
+    if let Some(o) = overview {
+        out.push_str(LAYER_SEP_OVERVIEW);
+        out.push_str(o);
+    }
+    if let Some(d) = detail {
+        out.push_str(LAYER_SEP_DETAIL);
+        out.push_str(d);
+    }
+    out
+}
+
 impl MemoryEntry {
-    /// Create a new entry.
+    /// Create an entry with a pre-built layered body.
     pub fn new(ns: &str, status: &str, body: &str) -> Self {
         Self {
             ns: ns.to_string(),
             status: status.to_string(),
             body: body.to_string(),
         }
+    }
+
+    /// Create an entry from discrete layers. Layers are assembled via
+    /// [`encode_body_layers`] — prefer this over `new()` when you have
+    /// the pieces separately, so you can't accidentally emit an
+    /// unseparated body.
+    pub fn new_layered(
+        ns: &str,
+        status: &str,
+        abstract_: &str,
+        overview: Option<&str>,
+        detail: Option<&str>,
+    ) -> Self {
+        Self {
+            ns: ns.to_string(),
+            status: status.to_string(),
+            body: encode_body_layers(abstract_, overview, detail),
+        }
+    }
+
+    /// Split the body into its layers. Cheap — returns borrows.
+    pub fn layers(&self) -> BodyLayers<'_> {
+        split_body_layers(&self.body)
+    }
+
+    /// The abstract layer — always present in a well-formed entry.
+    pub fn abstract_layer(&self) -> &str {
+        self.layers().abstract_
+    }
+
+    /// The overview layer, if emitted.
+    pub fn overview_layer(&self) -> Option<&str> {
+        self.layers().overview
+    }
+
+    /// The detail layer, if emitted.
+    pub fn detail_layer(&self) -> Option<&str> {
+        self.layers().detail
+    }
+
+    /// Compact view: abstract only. The slice injected into the
+    /// volatile system-prompt lane. Simulates Memoria v2's `compact`
+    /// recall view.
+    pub fn compact_view(&self) -> &str {
+        self.abstract_layer()
+    }
+
+    /// Overview view: abstract + overview (if any). Simulates Memoria
+    /// v2's `overview` recall view — used by `introspect`, list UIs,
+    /// and the `overview_details` rendering in CLI flows.
+    pub fn overview_view(&self) -> String {
+        let layers = self.layers();
+        match layers.overview {
+            Some(o) => format!("{}{}{}", layers.abstract_, LAYER_SEP_OVERVIEW, o),
+            None => layers.abstract_.to_string(),
+        }
+    }
+
+    /// Full view: the entire body. Simulates Memoria v2's `full`
+    /// recall view — used by lazy `memory_expand` and debug traces.
+    pub fn full_view(&self) -> &str {
+        &self.body
     }
 
     /// Encode to wire format: `[@ns/status] body`
@@ -740,5 +1017,180 @@ mod tests {
         let result = format_for_llm(&contents);
         assert!(result.contains("✓"));
         assert!(result.contains("○"));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Layered body: split / encode / views
+    // ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn split_abstract_only() {
+        let layers = split_body_layers("just the abstract");
+        assert_eq!(layers.abstract_, "just the abstract");
+        assert_eq!(layers.overview, None);
+        assert_eq!(layers.detail, None);
+    }
+
+    #[test]
+    fn split_abstract_and_overview() {
+        let body = "the abstract\n\nthe overview continues here";
+        let layers = split_body_layers(body);
+        assert_eq!(layers.abstract_, "the abstract");
+        assert_eq!(layers.overview, Some("the overview continues here"));
+        assert_eq!(layers.detail, None);
+    }
+
+    #[test]
+    fn split_abstract_and_detail_no_overview() {
+        // Skipping overview is legal (compact writers do this).
+        let body = "the abstract\n<!--layer:detail-->\nthe detail body";
+        let layers = split_body_layers(body);
+        assert_eq!(layers.abstract_, "the abstract");
+        assert_eq!(layers.overview, None);
+        assert_eq!(layers.detail, Some("the detail body"));
+    }
+
+    #[test]
+    fn split_all_three_layers() {
+        let body = "abs\n\novr\n<!--layer:detail-->\ndet";
+        let layers = split_body_layers(body);
+        assert_eq!(layers.abstract_, "abs");
+        assert_eq!(layers.overview, Some("ovr"));
+        assert_eq!(layers.detail, Some("det"));
+    }
+
+    #[test]
+    fn detail_sentinel_not_confused_by_markdown_thematic_break() {
+        // `---` inside detail used to collide with the old separator.
+        // With the HTML-comment sentinel, a thematic break in detail
+        // stays inside the detail layer.
+        let body = "abs\n\novr\n<!--layer:detail-->\nbefore\n\n---\n\nafter";
+        let layers = split_body_layers(body);
+        assert_eq!(layers.abstract_, "abs");
+        assert_eq!(layers.overview, Some("ovr"));
+        assert_eq!(layers.detail, Some("before\n\n---\n\nafter"));
+    }
+
+    #[test]
+    fn encode_layers_roundtrip_all_three() {
+        let encoded = encode_body_layers("abs", Some("ovr"), Some("det"));
+        let layers = split_body_layers(&encoded);
+        assert_eq!(layers.abstract_, "abs");
+        assert_eq!(layers.overview, Some("ovr"));
+        assert_eq!(layers.detail, Some("det"));
+    }
+
+    #[test]
+    fn encode_layers_abstract_only() {
+        let encoded = encode_body_layers("just abstract", None, None);
+        assert_eq!(encoded, "just abstract");
+    }
+
+    #[test]
+    fn encode_layers_abstract_and_detail_skips_overview() {
+        let encoded = encode_body_layers("abs", None, Some("det"));
+        // Detail still attaches via its own separator — no empty
+        // overview sandwich.
+        assert_eq!(encoded, "abs\n<!--layer:detail-->\ndet");
+        let layers = split_body_layers(&encoded);
+        assert_eq!(layers.abstract_, "abs");
+        assert_eq!(layers.overview, None);
+        assert_eq!(layers.detail, Some("det"));
+    }
+
+    #[test]
+    fn memory_entry_new_layered_emits_valid_body() {
+        let e = MemoryEntry::new_layered(
+            "episode",
+            "summary",
+            "Session sess1: 2 corrections, 3 learnings",
+            Some("User asked to switch from black to ruff."),
+            Some("- Use RS256\n- Don't use rm -rf"),
+        );
+        assert_eq!(
+            e.abstract_layer(),
+            "Session sess1: 2 corrections, 3 learnings"
+        );
+        assert_eq!(
+            e.overview_layer(),
+            Some("User asked to switch from black to ruff.")
+        );
+        assert_eq!(e.detail_layer(), Some("- Use RS256\n- Don't use rm -rf"));
+    }
+
+    #[test]
+    fn memory_entry_compact_view_is_abstract() {
+        let e = MemoryEntry::new_layered(
+            "fact",
+            "semantic",
+            "User prefers Rust for CLI tools",
+            Some("Mentioned while reviewing axum code."),
+            None,
+        );
+        assert_eq!(e.compact_view(), "User prefers Rust for CLI tools");
+    }
+
+    #[test]
+    fn memory_entry_overview_view_joins_abstract_and_overview() {
+        let e = MemoryEntry::new_layered(
+            "fact",
+            "semantic",
+            "abs line",
+            Some("overview paragraph"),
+            Some("detail not included in overview view"),
+        );
+        assert_eq!(e.overview_view(), "abs line\n\noverview paragraph");
+    }
+
+    #[test]
+    fn memory_entry_overview_view_falls_back_to_abstract_when_absent() {
+        let e = MemoryEntry::new_layered("fact", "semantic", "abs only", None, None);
+        assert_eq!(e.overview_view(), "abs only");
+    }
+
+    #[test]
+    fn memory_entry_full_view_returns_raw_body() {
+        let e = MemoryEntry::new_layered(
+            "episode",
+            "summary",
+            "abs",
+            Some("ovr"),
+            Some("det with\nmultiple lines"),
+        );
+        assert_eq!(e.full_view(), "abs\n\novr\n<!--layer:detail-->\ndet with\nmultiple lines");
+    }
+
+    #[test]
+    fn parse_and_slice_through_wire_format() {
+        // End-to-end: parse `[@ns/status] body` then slice.
+        let wire = "[@knowledge/curated] Session sess1: 1 corrections, 1 learnings\n\nUser flagged auth middleware.\n<!--layer:detail-->\n- Use RS256\n- Migrate sessions";
+        let entry = MemoryEntry::parse(wire).unwrap();
+        assert_eq!(entry.ns, "knowledge");
+        assert_eq!(entry.status, "curated");
+        assert_eq!(
+            entry.abstract_layer(),
+            "Session sess1: 1 corrections, 1 learnings"
+        );
+        assert_eq!(entry.overview_layer(), Some("User flagged auth middleware."));
+        assert_eq!(
+            entry.detail_layer(),
+            Some("- Use RS256\n- Migrate sessions")
+        );
+        // Compact view is what the volatile lane ships.
+        assert_eq!(
+            entry.compact_view(),
+            "Session sess1: 1 corrections, 1 learnings"
+        );
+    }
+
+    #[test]
+    fn single_line_body_has_abstract_only() {
+        // Legacy-style single-line entries still parse — they just
+        // count as abstract-only. (L2 will reject them at write time
+        // if the abstract doesn't meet MIN/MAX.)
+        let entry = MemoryEntry::parse("[@pref/active] Focus project: matrixorigin/memoria").unwrap();
+        assert_eq!(entry.abstract_layer(), "Focus project: matrixorigin/memoria");
+        assert!(entry.overview_layer().is_none());
+        assert!(entry.detail_layer().is_none());
     }
 }

@@ -4,12 +4,11 @@
 //! merging and deduplicating results into a structured section for injection into
 //! the system prompt.
 //!
-//! Ranking (L3): retrieved memories are re-ordered by composite score
-//! (`raw_retrieval_score × tier_weight`) before the content is flattened
-//! into the `## User Memories` section. A T1 VERIFIED user preference
-//! outranks a T3 INFERRED auto-compaction summary even if the summary
-//! has a higher raw vector score — see
-//! [`astra_turn_types::composite_score`].
+//! Ranking: Memoria's server-side `final_score` already tier-weights
+//! via confidence decay (half-life T1=365d … T4=30d) — we trust it and
+//! only re-sort the merged hybrid results by that score so the output
+//! is deterministic. No client-side tier multiplier: doing one here
+//! would double-count what the server already did.
 
 use std::time::Instant;
 
@@ -58,19 +57,24 @@ pub async fn prefetch_memories(
         }
     );
     // Merge by memory_id (dedup across the two parallel queries), then
-    // re-rank by composite score, then cap at top_k*2 (heuristic: we
-    // want enough to pick from downstream but not 100s).
+    // re-sort by server-side retrieval_score (already tier-weighted),
+    // then cap at top_k*2 (heuristic: we want enough to pick from
+    // downstream but not 100s).
     let mut merged_records = merge_structured_results(full_result, entity_result);
-    astra_turn_types::sort_memories(&mut merged_records);
+    astra_turn_types::sort_by_retrieval_score(&mut merged_records);
     let ranked_cap = (top_k as usize).saturating_mul(2).max(top_k as usize);
     merged_records.truncate(ranked_cap);
 
-    // Legacy downstream code still takes `Vec<String>` — flatten
-    // post-ranking so higher-trust entries land at the top of the
-    // `## User Memories` section.
+    // Slice each record to its compact view (tag + abstract layer)
+    // before handing it to the section builders. The volatile system-
+    // prompt lane should only ship the one-line abstract; overview
+    // and detail layers stay behind Memoria for lazy `memory_expand`.
+    // Records that don't parse as tagged entries fall through
+    // untouched — those are legacy / unstructured retrievals that
+    // will be filtered downstream by `is_memory_worthy`.
     let merged: Vec<String> = merged_records
         .iter()
-        .map(|m| m.content.clone())
+        .map(|m| compact_view_of(&m.content))
         .collect();
     let fetch_ms = started.elapsed().as_millis() as i64;
     let preview = merged.iter().take(3).map(|l| l.to_string()).collect();
@@ -83,6 +87,25 @@ pub async fn prefetch_memories(
         items,
         preview,
         fetch_ms,
+    }
+}
+
+/// Flatten a retrieved entry to its compact view:
+/// `[@ns/status] <abstract>`. Drops any overview/detail layers so the
+/// volatile system-prompt lane stays within budget.
+///
+/// Entries that don't parse as structured protocol memories pass
+/// through verbatim — downstream `is_memory_worthy` still filters
+/// them, and legacy unstructured hits remain visible.
+pub(crate) fn compact_view_of(content: &str) -> String {
+    match astra_prompts::memory_proto::MemoryEntry::parse(content) {
+        Some(entry) => astra_prompts::memory_proto::MemoryEntry::new(
+            &entry.ns,
+            &entry.status,
+            entry.compact_view(),
+        )
+        .encode(),
+        None => content.to_string(),
     }
 }
 
@@ -641,41 +664,64 @@ mod tests {
         assert_eq!(merged[0].content, "from full query");
     }
 
-    // ── L3: end-to-end ranking through prefetch output ─────────────────
+    // ── Merge + re-sort preserves server ordering across queries ──
     //
-    // Can't drive prefetch_memories with a real HTTP server here, but
-    // we can assert the observable invariant: when rank-eligible data
-    // reaches `sort_memories`, higher-trust entries land at the front.
-    // The c6e18730 reproduction test lives in astra-turn-types and
-    // covers that logic end-to-end; here we just confirm merge+rank
-    // composes correctly.
+    // Tier weighting is Memoria's job (server `final_score` already
+    // does it via conf_score half-life). Here we only verify that
+    // after merging the two parallel-query results we re-sort by the
+    // server-provided score so the volatile section is deterministic.
+
+    // ── Compact-view slicing ──────────────────────────────────────
 
     #[test]
-    fn merge_then_rank_puts_curated_fact_before_inferred_summary() {
+    fn compact_view_strips_overview_and_detail() {
+        let wire = "[@knowledge/curated] Session sess1: 2 corrections, 1 decisions\n\n\
+                    First correction: RS256. First decision: axum.\n\
+                    <!--layer:detail-->\n\
+                    ## User Corrections\n- Use RS256\n";
+        let compact = compact_view_of(wire);
+        assert_eq!(
+            compact,
+            "[@knowledge/curated] Session sess1: 2 corrections, 1 decisions"
+        );
+    }
+
+    #[test]
+    fn compact_view_passthrough_for_unstructured() {
+        let raw = "legacy unstructured memory line";
+        assert_eq!(compact_view_of(raw), raw);
+    }
+
+    #[test]
+    fn compact_view_preserves_tag_when_abstract_is_single_line() {
+        let wire = "[@pref/active] memoria = matrixorigin/Memoria";
+        assert_eq!(compact_view_of(wire), wire);
+    }
+
+    #[test]
+    fn merge_then_sort_orders_by_server_score() {
         use astra_turn_types::RankableMemory;
-        let full = vec![
-            RankableMemory {
-                memory_id: "compact-blob".into(),
-                content: "[@episode/compaction] session=abc auto-summary".into(),
-                memory_type: "episodic".into(),
-                retrieval_score: Some(0.82),
-                trust_tier: Some("T3".into()),
-            },
-        ];
-        let entity = vec![RankableMemory {
-            memory_id: "user-pref".into(),
+        let full = vec![RankableMemory {
+            memory_id: "lower-score".into(),
             content: "[@pref/active] prefers terse answers".into(),
             memory_type: "profile".into(),
             retrieval_score: Some(0.65),
             trust_tier: Some("T1".into()),
         }];
+        let entity = vec![RankableMemory {
+            memory_id: "higher-score".into(),
+            content: "[@episode/compaction] session=abc auto-summary".into(),
+            memory_type: "episodic".into(),
+            retrieval_score: Some(0.82),
+            trust_tier: Some("T3".into()),
+        }];
         let mut merged = merge_structured_results(full, entity);
-        astra_turn_types::sort_memories(&mut merged);
+        astra_turn_types::sort_by_retrieval_score(&mut merged);
         assert_eq!(
-            merged[0].memory_id, "user-pref",
-            "T1@0.65 ({}) must beat T3@0.82 ({})",
-            0.65, 0.82 * 0.55
+            merged[0].memory_id, "higher-score",
+            "trust the server score; don't re-rank client-side"
         );
+        assert_eq!(merged[1].memory_id, "lower-score");
     }
 
     #[test]
