@@ -191,12 +191,7 @@ fn is_memory_worthy(trimmed: &str) -> bool {
     }
 
     // Reject well-known low-signal fragments.
-    const NOISE_EXACT: &[&str] = &[
-        "None",
-        "(none)",
-        "Tools used: none",
-        "🔄 In progress",
-    ];
+    const NOISE_EXACT: &[&str] = &["None", "(none)", "Tools used: none", "🔄 In progress"];
     if NOISE_EXACT.contains(&trimmed) {
         return false;
     }
@@ -208,19 +203,11 @@ fn is_memory_worthy(trimmed: &str) -> bool {
     // value — retrieving them as "memories" just replays runtime
     // injections back into the prompt. Observed in session 6676c7b5,
     // turn 4: 78 such `**Context:**` entries filled a 6,397c block.
-    const SCAFFOLDING_PREFIXES: &[&str] = &[
-        "Tools used:",                     // per-turn tool-call roll-up
-        "[Active task attachment]",        // attention manifest
-        "[Self-check",                     // runtime self-check directive
-        "✓ Previous round:",              // parallel-feedback nudge
-        "♻ Duplicate calls detected",      // dedup nudge
-        "⚠️ VERIFICATION REQUIRED",        // runtime verification directive
-        "## ⤴",                           // runtime correction headers (escalation, batching force, repeated-cache)
-        "## ⚠",                           // runtime warning headers (sequential, cascade)
-        "🔄 ERROR BUDGET",                // error-budget exhaustion directive
-        "Runtime correction:",             // inline correction prefix
-    ];
-    for prefix in SCAFFOLDING_PREFIXES {
+    //
+    // Routed through the single source of truth in
+    // `astra_turn_types::SCAFFOLDING_BODY_PREFIXES` so new runtime
+    // injections added there are automatically filtered here.
+    for prefix in astra_turn_types::SCAFFOLDING_BODY_PREFIXES {
         if trimmed.starts_with(prefix) {
             return false;
         }
@@ -257,10 +244,7 @@ fn is_memory_worthy(trimmed: &str) -> bool {
 /// punctuation + collapse whitespace. Matches the `memoria_insights`
 /// dedup key so behaviour is consistent across the two surfaces.
 fn memory_dedup_key(trimmed: &str) -> String {
-    let collapsed: String = trimmed
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed: String = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed
         .trim_end_matches(['.', '!', '?', ';', ':', ','])
         .to_lowercase()
@@ -526,8 +510,10 @@ mod tests {
         // `build_memory_entries`.
         let lines = vec!["[@swap/archived] Turns 1-1 swapped out".to_string()];
         let section = build_memory_section(&lines).expect("tagged entry survives");
-        assert!(section.contains("Archived Context") || section.contains("[@swap/archived]"),
-            "structured-tagged entries must pass through, got: {section}");
+        assert!(
+            section.contains("Archived Context") || section.contains("[@swap/archived]"),
+            "structured-tagged entries must pass through, got: {section}"
+        );
     }
 
     #[test]
@@ -564,7 +550,11 @@ mod tests {
         ];
         let entries = build_memory_entries(&lines);
         let contents: Vec<&str> = entries.iter().map(|e| e.content.as_str()).collect();
-        assert_eq!(entries.len(), 1, "only the real memory should survive: {contents:?}");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the real memory should survive: {contents:?}"
+        );
         assert!(entries[0].content.contains("prefers Rust"));
     }
 
@@ -584,7 +574,11 @@ mod tests {
             "真实的 memory fragment with actual content we want to keep".to_string(),
         ];
         let entries = build_memory_entries(&lines);
-        assert_eq!(entries.len(), 1, "only the substantive entry should survive");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the substantive entry should survive"
+        );
         assert!(entries[0].content.contains("真实"));
     }
 
@@ -606,7 +600,7 @@ mod tests {
         let lines = vec![
             "OceanBase is a distributed HTAP database".to_string(),
             "OceanBase is a distributed HTAP database.".to_string(), // trailing dot
-            "oceanbase IS a DISTRIBUTED HTAP database".to_string(), // case-varied
+            "oceanbase IS a DISTRIBUTED HTAP database".to_string(),  // case-varied
         ];
         let entries = build_memory_entries(&lines);
         assert_eq!(entries.len(), 1, "near-duplicates should collapse");
@@ -640,21 +634,28 @@ mod tests {
         ];
         let entries = build_memory_entries(&lines);
         assert_eq!(entries.len(), 1);
-        assert!(entries[0].content.contains("parallel tool execution for speed"));
+        assert!(
+            entries[0]
+                .content
+                .contains("parallel tool execution for speed")
+        );
     }
 
     #[test]
     fn build_memory_entries_drops_runtime_correction_headers() {
         let lines = vec![
-            "## ⤴ Execution Escalation Runtime correction: you have made 10 read-only tool calls".to_string(),
-            "## ⤴ Parallel Batching Force Runtime correction: your last 3 rounds each ran".to_string(),
+            "## ⤴ Execution Escalation Runtime correction: you have made 10 read-only tool calls"
+                .to_string(),
+            "## ⤴ Parallel Batching Force Runtime correction: your last 3 rounds each ran"
+                .to_string(),
             "## ⤴ Repeated Cached Tool Calls Detected".to_string(),
             "## ⚠ Sequential Tool Calls Detected".to_string(),
             "Project uses Cargo workspaces for build organization.".to_string(),
         ];
         let entries = build_memory_entries(&lines);
         assert_eq!(
-            entries.len(), 1,
+            entries.len(),
+            1,
             "runtime correction headers must be filtered out, keeping only real memory"
         );
         assert!(entries[0].content.contains("Cargo workspaces"));
@@ -675,14 +676,16 @@ mod tests {
     #[test]
     fn build_memory_entries_drops_verification_and_error_budget_directives() {
         let lines = vec![
-            "⚠️ VERIFICATION REQUIRED: Before you finish, run these checks using the bash tool".to_string(),
+            "⚠️ VERIFICATION REQUIRED: Before you finish, run these checks using the bash tool"
+                .to_string(),
             "🔄 ERROR BUDGET EXHAUSTED: You've hit Unknown errors 3 turns in a row.".to_string(),
             "♻ Duplicate calls detected: [read_file (3x)]. You've made identical calls".to_string(),
             "Real insight: parallelize independent read_file calls when exploring repo".to_string(),
         ];
         let entries = build_memory_entries(&lines);
         assert_eq!(
-            entries.len(), 1,
+            entries.len(),
+            1,
             "only the legit insight should survive, got {entries:?}"
         );
         assert!(entries[0].content.contains("Real insight"));
