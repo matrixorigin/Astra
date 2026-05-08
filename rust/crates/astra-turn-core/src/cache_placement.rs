@@ -79,11 +79,19 @@ pub enum VolatilePlacement {
     /// so the cached prefix = everything before the final user turn.
     TailSuffix,
     /// Strict-history providers (MiniMax): any byte change mid-history
-    /// destroys the full cache entry. Volatile content is injected
-    /// ONLY on the first LLM round of a visible turn; subsequent
-    /// rounds (tool-loop continuations) skip injection entirely so the
-    /// history bytes stay identical. The first-round cost is paid once
-    /// per user turn, not once per tool round.
+    /// destroys the full cache entry. **Volatile content is suppressed
+    /// on EVERY round** — even round 0.
+    ///
+    /// The round-0-only variant was tried and rejected: prepending
+    /// volatile to msg[1] on round 0 but not on round 1+ still
+    /// produces different bytes at msg[1] across rounds (round 0's
+    /// msg[1] = preamble + user_q; round 1's msg[1] = user_q only),
+    /// and MiniMax's cache sees that as a total miss. The only way
+    /// to keep history byte-stable for strict-history providers is
+    /// to never inject volatile at all on this path. The agent
+    /// loses Self-Awareness / session-anchor signals in exchange for
+    /// usable cache — observed collapse was 100% of cache reads for
+    /// six consecutive tool-loop rounds in session 986a553e.
     CurrentUserOnly,
     /// No cache to break. Volatile content goes anywhere convenient —
     /// we pick "in system" for consistency with marker-based output.
@@ -139,13 +147,16 @@ impl CacheCapability {
     }
 
     /// Shortcut used by call sites that only care whether volatile
-    /// content should be injected on the current LLM round. Returns
-    /// true for every placement except [`VolatilePlacement::CurrentUserOnly`]
-    /// past its first round — see that variant's docs.
+    /// content should be injected on the current LLM round.
+    ///
+    /// `MarkerIsolated` / `TailSuffix` / `Free`: always true.
+    /// `CurrentUserOnly`: always **false** — see the variant's doc
+    /// for why round-0-only didn't work and we had to suppress
+    /// volatile entirely for strict-history providers.
     #[must_use]
-    pub fn should_inject_volatile_on_round(&self, round_within_turn: u32) -> bool {
+    pub fn should_inject_volatile_on_round(&self, _round_within_turn: u32) -> bool {
         match self.volatile_placement {
-            VolatilePlacement::CurrentUserOnly => round_within_turn == 0,
+            VolatilePlacement::CurrentUserOnly => false,
             VolatilePlacement::MarkerIsolated
             | VolatilePlacement::TailSuffix
             | VolatilePlacement::Free => true,
@@ -212,13 +223,17 @@ mod tests {
     // ── should_inject_volatile_on_round ─────────────────────────────────
 
     #[test]
-    fn current_user_only_injects_on_round_zero_skips_after() {
+    fn current_user_only_never_injects_on_any_round() {
+        // Strict-history providers: injecting on round 0 but not after
+        // still makes msg[1] bytes differ across rounds (round 0's
+        // msg[1] includes the preamble, round 1+ doesn't). MiniMax
+        // sees that as a total cache miss. So CurrentUserOnly
+        // suppresses volatile entirely.
         let minimax = CacheCapability {
             protocol: CacheProtocol::StrictHistoryMatch,
             volatile_placement: VolatilePlacement::CurrentUserOnly,
         };
-        assert!(minimax.should_inject_volatile_on_round(0));
-        for round in 1..=10 {
+        for round in 0..=10 {
             assert!(
                 !minimax.should_inject_volatile_on_round(round),
                 "CurrentUserOnly must skip round {round}",
@@ -268,8 +283,11 @@ mod tests {
         // Pin the exact model id observed in the regression session so a
         // future provider/model normalization change doesn't silently
         // route MiniMax back to TailSuffix and reopen the cache hole.
+        // With CurrentUserOnly's total-suppression contract every round
+        // — including round 0 — must be silent.
         let c = CacheCapability::for_provider_and_model("openai", "MiniMax-M2.7");
         assert_eq!(c.volatile_placement, VolatilePlacement::CurrentUserOnly);
+        assert!(!c.should_inject_volatile_on_round(0));
         assert!(!c.should_inject_volatile_on_round(1));
         assert!(!c.should_inject_volatile_on_round(6));
     }

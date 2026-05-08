@@ -474,6 +474,15 @@ fn rule_cache_read_collapsed(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
         if prev.turn != curr.turn || prev.provider != curr.provider {
             continue;
         }
+        // `turn` + `round` in the fixture index are captured from the
+        // LLM exchange's local counters, which can legitimately repeat
+        // (e.g. different `astra chat` invocations each start at
+        // turn=1 round=0). When we see duplicate (turn, round) pairs
+        // we're looking at unrelated invocations, not a prefix
+        // collapse — skip them to avoid false positives.
+        if prev.round == curr.round {
+            continue;
+        }
         if prev.cache_read_tokens < 1_000 {
             // Too small to trigger — avoid false positives on first
             // rounds where cache isn't warm yet.
@@ -657,26 +666,26 @@ fn rule_volatile_in_cached_prefix(rounds: &[RoundSnapshot]) -> Option<CacheFindi
         }
         VolatilePlacement::CurrentUserOnly => {
             // MiniMax-style strict history: volatile injection must be
-            // skipped entirely on tool-loop rounds. Any non-zero-round
-            // sample with volatile content is a violation.
-            if sample.round == 0 {
-                return None;
-            }
+            // skipped on EVERY round. A round-0-only injection still
+            // makes msg[1] bytes differ vs round 1+, so cache misses
+            // anyway — see `VolatilePlacement::CurrentUserOnly` docs.
+            // Any sample with volatile content is a violation.
             Some(CacheFinding {
                 rule_id: "volatile_in_cached_prefix",
                 severity: Severity::Critical,
                 narrative: format!(
                     "{prov} ({model}) uses strict-history prompt cache; \
                      volatile content at msg[{vol_idx}] on round {round} \
-                     (not round 0) invalidates the whole turn's cache every \
-                     tool-loop continuation.",
+                     invalidates the turn's cache — strict-history \
+                     providers cannot tolerate volatile bytes anywhere in \
+                     the history, including round 0.",
                     prov = sample.provider,
                     model = sample.model,
                     round = sample.round,
                 ),
                 actionable_fix:
-                    "Skip volatile-content injection on rounds > 0 within a \
-                     visible turn for this provider. See \
+                    "Suppress volatile-content injection entirely for this \
+                     provider. See \
                      `CacheCapability::should_inject_volatile_on_round`."
                         .into(),
                 triggered_on: vec![(sample.turn, sample.round)],
@@ -1207,8 +1216,10 @@ mod tests {
     }
 
     #[test]
-    fn volatile_rule_silent_on_minimax_round_zero() {
-        // Round 0 is the "safe" injection point for CurrentUserOnly.
+    fn volatile_rule_fires_on_minimax_round_zero_too() {
+        // Updated contract (see CurrentUserOnly docs): even round 0
+        // volatile injection on MiniMax is a cache-miss trigger,
+        // because round 1+ won't have it and bytes at msg[1] differ.
         let rs = vec![snap_with_volatile(
             4,
             0,
@@ -1218,10 +1229,10 @@ mod tests {
             &[7],
             8,
         )];
+        let findings = evaluate_all(&rs);
         assert!(
-            !evaluate_all(&rs)
-                .iter()
-                .any(|f| f.rule_id == "volatile_in_cached_prefix"),
+            findings.iter().any(|f| f.rule_id == "volatile_in_cached_prefix"),
+            "rule must fire even on round 0 for strict-history providers; got {findings:?}",
         );
     }
 

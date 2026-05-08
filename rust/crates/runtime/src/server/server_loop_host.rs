@@ -4035,34 +4035,21 @@ mod tests {
         ));
         let tools = host.edge_tools.clone();
 
-        // Round 0: volatile preamble is allowed (first round of a
-        // visible turn always carries fresh Self-Awareness).
-        state.current_round_index = 0;
-        let out_round0 =
-            host.run_turn_pipeline(&mut state, &tools, "openai", "MiniMax-M2.7", "hi");
-        // We can't assert preamble is non-empty without the pipeline
-        // actually emitting CacheScope::None blocks (depends on
-        // upstream config) — what we CAN assert is that round 0
-        // produces at least as much content as round 1.
-        let preamble_round0_len = out_round0.volatile_preamble.len();
-
-        // Round 1 (tool-loop continuation): volatile injection must
-        // be suppressed.
-        state.current_round_index = 1;
-        let out_round1 =
-            host.run_turn_pipeline(&mut state, &tools, "openai", "MiniMax-M2.7", "hi");
-        assert!(
-            out_round1.volatile_preamble.is_empty(),
-            "MiniMax tool-loop round > 0 must not emit volatile preamble. \
-             round 0 preamble len={preamble_round0_len}, round 1 preamble={:?}",
-            out_round1.volatile_preamble,
-        );
-
-        // Every subsequent round should also skip.
-        state.current_round_index = 5;
-        let out_round5 =
-            host.run_turn_pipeline(&mut state, &tools, "openai", "MiniMax-M2.7", "hi");
-        assert!(out_round5.volatile_preamble.is_empty());
+        // Updated contract: strict-history providers (MiniMax) must
+        // suppress volatile preamble on EVERY round, not just >0.
+        // Round-0-only injection still causes a byte mismatch at
+        // msg[1] vs round 1+ (round 0 has preamble+user_q, round 1
+        // has only user_q), so the whole turn's cache misses.
+        for round in [0u32, 1, 5] {
+            state.current_round_index = round;
+            let out = host.run_turn_pipeline(&mut state, &tools, "openai", "MiniMax-M2.7", "hi");
+            assert!(
+                out.volatile_preamble.is_empty(),
+                "MiniMax must suppress volatile preamble on every round \
+                 (strict-history provider). round={round} preamble={:?}",
+                out.volatile_preamble,
+            );
+        }
     }
 
     /// OpenAI auto-prefix cache can tolerate volatile-in-tail every

@@ -1609,11 +1609,31 @@ impl InProcessChatTurnBridge {
                 .get("project_context")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty());
+            // Provider-aware volatile gating: strict-history providers
+            // (e.g. MiniMax) cannot tolerate mid-history byte change
+            // across tool-loop rounds. `CacheCapability::should_inject_volatile_on_round`
+            // returns false for those providers on round > 0; when false
+            // we drop ALL dynamic_sections (Self-Awareness, session
+            // anchor, memoria insights, feedback rules, …) so the
+            // history bytes stay identical across the loop and cache
+            // can actually hit. First round still emits the full
+            // volatile payload so turn-level signals reach the model
+            // at least once per visible turn.
+            let cache_cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+                &provider,
+                &model_name,
+            );
+            let effective_dynamic_sections: Vec<prompts::PromptSection> =
+                if cache_cap.should_inject_volatile_on_round(round_index) {
+                    dynamic_sections.clone()
+                } else {
+                    Vec::new()
+                };
             let pipeline_outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome(
                 &tool_names,
                 &edge_tools,
                 &stable_sections,
-                &dynamic_sections,
+                &effective_dynamic_sections,
                 &memoria_prefetch_entries,
                 selection_confidence,
                 task_type,
