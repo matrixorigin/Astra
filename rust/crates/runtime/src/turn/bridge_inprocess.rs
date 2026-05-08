@@ -87,6 +87,39 @@ pub(crate) fn bridge_should_run_memoria_prefetch(edge_profile: &Map<String, Valu
     !cli_has_insights
 }
 
+/// Strip volatile `dynamic_sections` when the provider can't tolerate
+/// per-round byte churn in the request prefix.
+///
+/// Strict-history providers (MiniMax-style, classified as
+/// `VolatilePlacement::CurrentUserOnly`) invalidate the whole cache
+/// entry on ANY mid-history byte change. Re-injecting volatile content
+/// (Self-Awareness, session anchor, memoria insights, feedback rules)
+/// on every round collapses their cache. `CacheCapability::should_inject_volatile_on_round`
+/// returns `false` for them on every round — including round 0 — and
+/// we must respond by dropping all volatile sections.
+///
+/// Round-0-only injection was tried and rejected: round 0's msg[1]
+/// would include `preamble + user_q` while round 1+'s msg[1] would be
+/// `user_q` only, so the byte-stable-history invariant still breaks.
+/// See `cache_placement::VolatilePlacement::CurrentUserOnly` docs and
+/// the session 986a553e regression for the full rationale.
+///
+/// Extracted as a standalone pure function so the dual-path
+/// (bridge + server) invariant can be unit-tested without spinning up
+/// the full bridge pipeline. The server path has its own equivalent
+/// in `run_turn_pipeline`; both must stay in sync.
+fn effective_volatile_sections_for_round(
+    cache_cap: astra_turn_core::cache_placement::CacheCapability,
+    round_index: u32,
+    dynamic_sections: &[prompts::PromptSection],
+) -> Vec<prompts::PromptSection> {
+    if cache_cap.should_inject_volatile_on_round(round_index) {
+        dynamic_sections.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
 fn self_awareness_volatile_section(text: &str) -> Option<prompts::PromptSection> {
     (!text.is_empty()).then(|| {
         prompts::PromptSection::dynamic(text.to_string(), prompts::PromptTokenBucket::Environment)
@@ -1609,26 +1642,18 @@ impl InProcessChatTurnBridge {
                 .get("project_context")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty());
-            // Provider-aware volatile gating: strict-history providers
-            // (e.g. MiniMax) cannot tolerate mid-history byte change
-            // across tool-loop rounds. `CacheCapability::should_inject_volatile_on_round`
-            // returns false for those providers on round > 0; when false
-            // we drop ALL dynamic_sections (Self-Awareness, session
-            // anchor, memoria insights, feedback rules, …) so the
-            // history bytes stay identical across the loop and cache
-            // can actually hit. First round still emits the full
-            // volatile payload so turn-level signals reach the model
-            // at least once per visible turn.
+            // Provider-aware volatile gating — see
+            // `effective_volatile_sections_for_round` for the full rationale.
+            // CurrentUserOnly (MiniMax) drops ALL rounds, not just >0.
             let cache_cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
                 &provider,
                 &model_name,
             );
-            let effective_dynamic_sections: Vec<prompts::PromptSection> =
-                if cache_cap.should_inject_volatile_on_round(round_index) {
-                    dynamic_sections.clone()
-                } else {
-                    Vec::new()
-                };
+            let effective_dynamic_sections = effective_volatile_sections_for_round(
+                cache_cap,
+                round_index,
+                &dynamic_sections,
+            );
             let pipeline_outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome(
                 &tool_names,
                 &edge_tools,
@@ -3787,6 +3812,156 @@ mod tests {
     fn count_inprocess_persisted_events_skips_failed_tool_events() {
         assert_eq!(count_inprocess_persisted_events(2, 3, false), 2);
         assert_eq!(count_inprocess_persisted_events(2, 3, true), 5);
+    }
+
+    // ── effective_volatile_sections_for_round ────────────────────────────
+    //
+    // Regression tests for the dual-path volatile-gating invariant.
+    // Session 986a553e was first fixed only on the server path
+    // (`run_turn_pipeline`), but `astra chat` routes through this bridge
+    // which had its own volatile-injection flow. The bridge's fix shipped
+    // afterwards, and these tests exist so the next dual-path bug gets
+    // caught at unit-test speed instead of during a cache-rate postmortem.
+    //
+    // Pairs with `server_loop_host::tests::run_turn_pipeline_minimax_skips_volatile_on_tool_loop_round`.
+
+    fn sample_volatile_sections() -> Vec<prompts::PromptSection> {
+        vec![
+            prompts::PromptSection::dynamic(
+                "Self-Awareness: Turn 3 | Tokens 4200/8000".to_string(),
+                prompts::PromptTokenBucket::Environment,
+            ),
+            prompts::PromptSection::dynamic(
+                "session anchor: pay down test flakes".to_string(),
+                prompts::PromptTokenBucket::Environment,
+            ),
+        ]
+    }
+
+    #[test]
+    fn effective_volatile_minimax_is_empty_on_every_round() {
+        // Strict-history (MiniMax) must suppress volatile on round 0, 1,
+        // 6, and any other round — round-0-only injection still makes
+        // msg[1] bytes diverge across rounds, so we suppress unconditionally.
+        let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+            "openai",
+            "MiniMax-M2.7",
+        );
+        let dyn_sections = sample_volatile_sections();
+        for round in [0u32, 1, 2, 6, 12] {
+            let out = effective_volatile_sections_for_round(cap, round, &dyn_sections);
+            assert!(
+                out.is_empty(),
+                "MiniMax must suppress volatile on round {round}; got {} sections",
+                out.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn effective_volatile_openai_keeps_sections_on_every_round() {
+        // OpenAI auto-prefix (TailSuffix): safe to inject every round
+        // since volatile lives at the tail of the last user message.
+        let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+            "openai",
+            "gpt-4o",
+        );
+        let dyn_sections = sample_volatile_sections();
+        for round in [0u32, 1, 5] {
+            let out = effective_volatile_sections_for_round(cap, round, &dyn_sections);
+            assert_eq!(
+                out.len(),
+                dyn_sections.len(),
+                "OpenAI TailSuffix must pass through all volatile on round {round}",
+            );
+        }
+    }
+
+    #[test]
+    fn effective_volatile_anthropic_keeps_sections_on_every_round() {
+        // Anthropic MarkerIsolated: volatile lives AFTER the last
+        // cache_control marker inside the system block, so it's safe to
+        // emit every round. The bridge still gets all sections back;
+        // the downstream pipeline is responsible for marker placement.
+        let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+            "anthropic",
+            "claude-sonnet-4",
+        );
+        let dyn_sections = sample_volatile_sections();
+        for round in [0u32, 1, 5] {
+            let out = effective_volatile_sections_for_round(cap, round, &dyn_sections);
+            assert_eq!(
+                out.len(),
+                dyn_sections.len(),
+                "Anthropic MarkerIsolated must pass through all volatile on round {round}",
+            );
+        }
+    }
+
+    #[test]
+    fn effective_volatile_bedrock_keeps_sections_on_every_round() {
+        // Bedrock cachePoint is also MarkerIsolated — same invariant
+        // as Anthropic.
+        let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+            "bedrock",
+            "us.anthropic.claude-sonnet-4-6",
+        );
+        let dyn_sections = sample_volatile_sections();
+        for round in [0u32, 1, 5] {
+            let out = effective_volatile_sections_for_round(cap, round, &dyn_sections);
+            assert_eq!(
+                out.len(),
+                dyn_sections.len(),
+                "Bedrock MarkerIsolated must pass through all volatile on round {round}",
+            );
+        }
+    }
+
+    /// Pin the exact model id observed in the 986a553e regression so a
+    /// future provider/model normalization change doesn't silently route
+    /// MiniMax back to TailSuffix and reopen the cache hole on the bridge
+    /// path. Mirrors the equivalent server-path regression in
+    /// `cache_placement::tests::minimax_m27_session_986a553e_routes_to_current_user_only`.
+    #[test]
+    fn effective_volatile_bridge_minimax_m27_session_986a553e_regression() {
+        let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+            "openai",
+            "MiniMax-M2.7",
+        );
+        let dyn_sections = sample_volatile_sections();
+        // Round 0 explicitly — the subtle part of the invariant is that
+        // even round 0 must skip, because round-0-only injection still
+        // breaks history byte stability across the tool loop.
+        assert!(
+            effective_volatile_sections_for_round(cap, 0, &dyn_sections).is_empty(),
+            "bridge path must skip volatile on round 0 for MiniMax (strict-history)",
+        );
+        // And stays empty through the typical tool-loop length.
+        assert!(
+            effective_volatile_sections_for_round(cap, 6, &dyn_sections).is_empty(),
+        );
+    }
+
+    #[test]
+    fn effective_volatile_empty_input_produces_empty_output() {
+        // Degenerate: no dynamic sections to begin with. All providers
+        // should return empty — no work to preserve or suppress.
+        let empty: Vec<prompts::PromptSection> = Vec::new();
+        for (prov, model) in [
+            ("openai", "MiniMax-M2.7"),
+            ("openai", "gpt-4o"),
+            ("anthropic", "claude-sonnet-4"),
+            ("bedrock", "us.anthropic.claude-sonnet-4-6"),
+        ] {
+            let cap =
+                astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+                    prov, model,
+                );
+            assert!(
+                effective_volatile_sections_for_round(cap, 0, &empty).is_empty(),
+                "empty input must yield empty output for {prov}/{model}",
+            );
+        }
     }
 
     #[test]
