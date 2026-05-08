@@ -2066,8 +2066,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         resp_rx.await.unwrap_or(ApprovalResponse::Deny)
                                     };
                                     if let ApprovalResponse::AlwaysAllow = response {
+                                        // Persistent: writes a tool-level allow
+                                        // rule to settings for future sessions.
                                         let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, args);
                                         pm.add_allow_rule(&rule);
+                                        // Session-scoped trust for the
+                                        // specific path subtree, so later
+                                        // requests under the same directory
+                                        // (from any tool) skip the prompt.
+                                        pm.trust_sandbox_root_from_reason(sandbox_msg);
                                     }
                                     if response == ApprovalResponse::AutoRunSession {
                                         pm.set_mode(
@@ -2110,6 +2117,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     let grant = matches!(ch, 'y' | 'a' | '!');
                                     if grant {
                                         pm.record_approval(&sandbox_tool_key, Some(args), true);
+                                    }
+                                    if ch == 'a' {
+                                        let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, args);
+                                        pm.add_allow_rule(&rule);
+                                        pm.trust_sandbox_root_from_reason(sandbox_msg);
                                     }
                                     if ch == '!' {
                                         let was_auto = matches!(
