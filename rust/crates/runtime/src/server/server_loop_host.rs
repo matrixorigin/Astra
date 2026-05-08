@@ -2171,10 +2171,16 @@ impl ServerAgenticLoopHost {
         system_messages: Vec<Value>,
         volatile_preamble: Vec<Value>,
         compacted_messages: Vec<Value>,
-        state: &AgenticLoopState,
+        state: &mut AgenticLoopState,
         llm_cfg: &ResolvedTurnLlmConfig,
         cache_cfg: &PromptCacheConfig,
     ) -> Vec<Value> {
+        // Drain the structured volatile lane BEFORE we borrow `state`
+        // immutably (via `state.skills` / `state.recent_file_reads`) —
+        // the borrow checker can't interleave a mutable drain with the
+        // later immutable reads that feed `attachments`.
+        let drained = state.take_volatile_pending();
+
         // Sort skills most-recent-first (matches legacy ordering; shared
         // assembler emits them in the order we supply).
         let mut skills: Vec<_> = state.skills.invoked.values().collect();
@@ -2200,6 +2206,7 @@ impl ServerAgenticLoopHost {
         crate::turn::wire_assembly::assemble_llm_messages(
             system_messages,
             volatile_preamble,
+            drained,
             compacted_messages,
             &attachments,
             &self.session_id,
@@ -4020,7 +4027,7 @@ mod tests {
             vec![json!({"role": "system", "content": "system prompt text"})],
             Vec::new(),
             state.messages.clone(),
-            &state,
+            &mut state,
             &llm_cfg,
             &PromptCacheConfig::latch("openai", "gpt-4"),
         );
@@ -4576,6 +4583,7 @@ mod tests {
 
         AgenticLoopState {
             messages: Vec::new(),
+            volatile_pending: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,

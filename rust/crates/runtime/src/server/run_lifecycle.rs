@@ -2119,6 +2119,7 @@ impl AgenticRunLifecycleService {
 
         AgenticLoopState {
             messages: vec![user_message],
+            volatile_pending: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: Some(session_id.to_string()),
             current_run_id: Some(run_id.to_string()),
@@ -3886,6 +3887,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
         let mut loop_state = AgenticLoopState {
             messages: vec![user_message],
+            volatile_pending: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),

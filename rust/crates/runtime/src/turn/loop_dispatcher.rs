@@ -265,6 +265,7 @@ mod tests {
     fn test_state(message: &str) -> AgenticLoopState {
         AgenticLoopState {
             messages: vec![json!({"role": "user", "content": message})],
+            volatile_pending: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,

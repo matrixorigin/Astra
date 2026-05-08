@@ -521,6 +521,149 @@ async fn matrix_trailing_system_msg_does_not_capture_cache_marker() {
     }
 }
 
+// ── Invariant 6.5: structured volatile lane keeps messages[] clean ─────────
+//
+// Post-Task #45 architectural invariant: when runtime code fires a
+// volatile injection via `state.push_volatile(Kind, content)`, the
+// content rides `volatile_pending` and NEVER lands in
+// `state.messages[]`. The wire layer drains the lane into the
+// preamble for each LLM call.
+//
+// This test is stricter than Invariant 6 (which allowed legacy
+// callers to still push into messages[]): it mocks a single turn and
+// asserts that post-wire-assembly, `messages[]` contains only real
+// conversation turns — no volatile content leaked through.
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
+async fn matrix_volatile_lane_keeps_history_clean() {
+    use astra_runtime::turn::agentic_loop_host::VolatileKind;
+
+    for case in PROVIDER_MATRIX.iter().copied() {
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        let mut host = build_host_for(case, vec![scripted_round("r1")], capture.clone());
+        let mut state = make_test_loop_state();
+        state.max_turn_input_tokens = 200_000;
+
+        // Simulate a turn where multiple runtime components fire volatile
+        // injections into the lane (working-set, already-fetched, a stall
+        // nudge, a coaching ping). After the turn runs, none of these
+        // should appear as standalone msgs in `state.messages` — they
+        // should all be in the captured LAST user message's prefix.
+        state.push_volatile(
+            VolatileKind::WorkingSet,
+            "[working-set:v1]\ngoal: ship it\nrecent_tools:\n- bash [ok t1]",
+        );
+        state.push_volatile(
+            VolatileKind::AlreadyFetched,
+            "## Already Fetched\nsrc/foo.rs",
+        );
+        state.push_volatile(
+            VolatileKind::StallNudge,
+            "⚠ REFLECTION: same read_file called 3 times in a row",
+        );
+        state.push_volatile(
+            VolatileKind::ToolBatchCoaching,
+            "✓ 2 tools executed in parallel — excellent. Keep batching independent operations.",
+        );
+        state
+            .messages
+            .push(json!({"role": "user", "content": "real question"}));
+
+        host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+        // After the turn: the lane was drained (take_volatile_pending),
+        // so `state.volatile_pending` is empty and the captured wire
+        // payload should have the injections folded into the last user
+        // message.
+        assert!(
+            state.volatile_pending.is_empty(),
+            "[{label}] volatile lane must be drained after assemble; got {n} entries",
+            n = state.volatile_pending.len(),
+            label = case.label,
+        );
+
+        let guard = capture.lock().unwrap();
+        let cap = &guard[0];
+
+        // Flatten a message's content whether it's a string or a
+        // block-array (Anthropic shape). Needed because marker-isolated
+        // providers render content as `[{type:"text", text:"…"}, …]`.
+        fn flatten_content(m: &Value) -> String {
+            match m.get("content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(parts)) => {
+                    let mut out = String::new();
+                    for p in parts {
+                        if let Some(t) = p.get("text").and_then(Value::as_str) {
+                            if !out.is_empty() {
+                                out.push('\n');
+                            }
+                            out.push_str(t);
+                        }
+                    }
+                    out
+                }
+                _ => String::new(),
+            }
+        }
+
+        // No standalone message in `messages[]` should be pure volatile
+        // content — real history stays clean.
+        for (i, m) in cap.messages.iter().enumerate() {
+            let c = flatten_content(m);
+            if c.is_empty() {
+                continue;
+            }
+            // The LAST msg legitimately carries the folded preamble.
+            if i == cap.messages.len() - 1 {
+                continue;
+            }
+            assert!(
+                !c.starts_with("[working-set:v1]"),
+                "[{label}] msg[{i}] leaked working-set into history: {c}",
+                label = case.label,
+            );
+            assert!(
+                !c.starts_with("## Already Fetched"),
+                "[{label}] msg[{i}] leaked already-fetched into history: {c}",
+                label = case.label,
+            );
+            assert!(
+                !c.starts_with("⚠ REFLECTION"),
+                "[{label}] msg[{i}] leaked stall-nudge into history: {c}",
+                label = case.label,
+            );
+            assert!(
+                !c.starts_with("✓ ") || c.contains("real question"),
+                "[{label}] msg[{i}] leaked coaching-ping into history: {c}",
+                label = case.label,
+            );
+        }
+
+        // And at least one of the lane contents should appear in the
+        // final user message's prefix.
+        let last_text = cap
+            .messages
+            .last()
+            .map(flatten_content)
+            .unwrap_or_default();
+        assert!(
+            last_text.contains("[working-set:v1]")
+                || last_text.contains("## Already Fetched")
+                || last_text.contains("⚠ REFLECTION")
+                || last_text.contains("✓ 2 tools executed"),
+            "[{label}] last user msg must carry the lane's folded preamble; got {last_text:?}",
+            label = case.label,
+        );
+        assert!(
+            last_text.contains("real question"),
+            "[{label}] last user msg must preserve real question; got {last_text:?}",
+            label = case.label,
+        );
+    }
+}
+
 // ── Invariant 6: mid-history runtime injections get consolidated ──────────
 //
 // 5d48887e regression: session 05e63cac t5 had 12 consecutive

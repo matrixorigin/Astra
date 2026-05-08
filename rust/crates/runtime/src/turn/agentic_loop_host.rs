@@ -632,11 +632,138 @@ pub struct ErrorRecoveryState {
 
 /// Cross-turn state managed by the runtime loop.
 ///
+/// A structured volatile-injection lane. The runtime produces many
+/// kinds of per-round hints that must be visible to the LLM but must
+/// NOT live in `AgenticLoopState.messages[]` — tool_health warnings,
+/// working-set snapshots, inventory blocks, stall reflections,
+/// execution-escalation / parallel-batching-force nudges, tactical
+/// adaptations, budget-exhaustion alerts, and similar corrective
+/// messages.
+///
+/// Before this lane existed, every producer called
+/// `state.messages.push(...)` and the wire layer had to scan the full
+/// history for known patterns and consolidate them. That worked but
+/// was fragile: new patterns forgot to match the classifier, and the
+/// history-is-byte-stable invariant lived implicitly across dozens of
+/// call sites.
+///
+/// Post-fix, every producer calls [`AgenticLoopState::push_volatile`]
+/// instead. `wire_assembly::assemble_llm_messages` drains this lane
+/// into the volatile_preamble on every LLM call, so `messages[]` only
+/// ever carries real user/assistant/tool conversation turns.
+#[derive(Debug, Clone)]
+pub struct VolatileInjection {
+    /// Classification — used by introspect to enumerate injections by
+    /// type, and by downstream dedup/coalescing if needed.
+    pub kind: VolatileKind,
+    /// The human-readable injection text the LLM will see. Role is
+    /// implicit in `kind` (coaching / working-set / inventory land as
+    /// system; nudges / corrections land as user). The consumer
+    /// decides the wrapper shape at drain time.
+    pub content: String,
+    /// Round index the injection was produced in (for introspect
+    /// telemetry; not used by the wire layer).
+    pub round_index: u32,
+}
+
+/// Taxonomy of runtime-produced volatile content. Add a new variant
+/// when introducing a new injection kind — both the producer and the
+/// drain path become compile-time-checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolatileKind {
+    /// TurnGuard "⚠ The following tools have failed…" output.
+    ToolHealthWarning,
+    /// Stall-reflection nudge (`build_stall_reflection`).
+    StallNudge,
+    /// Parallel-batching-force corrective ("Detected N consecutive
+    /// single-tool rounds…").
+    ParallelBatchingForce,
+    /// Execution-escalation nudge for mutating-task reads-only-churn.
+    ExecutionEscalation,
+    /// `[working-set:v1]` session-facts snapshot.
+    WorkingSet,
+    /// `## Already Fetched` inventory block.
+    AlreadyFetched,
+    /// "✓ N tools executed in parallel" coaching ping.
+    ToolBatchCoaching,
+    /// Budget/turn/round limit advisory ("You have reached the token
+    /// budget…", "Do NOT call any more tools…").
+    BudgetAdvisory,
+    /// Tactical adaptation hint.
+    TacticalAdaptation,
+    /// Circuit-breaker intermediate / soft-stop messages.
+    CircuitBreaker,
+    /// Error-budget-exhausted / redundant-reads-corrective /
+    /// cache-waste-corrective / exploration-family-corrective — the
+    /// family of "stop and change approach" messages.
+    Corrective,
+    /// Mailbox / agent-to-agent volatile drop-offs.
+    Mailbox,
+    /// Budget-review acknowledgment.
+    BudgetReview,
+    /// Open-ended exploration budget reminder.
+    ExplorationBudget,
+    /// Execution retry with corrective reason.
+    ExecutionRetry,
+    /// Catch-all for producers we haven't categorized yet. Prefer
+    /// adding a new variant over reusing this — introspect reports
+    /// by kind and a generic bucket degrades the signal.
+    Other,
+}
+
+impl VolatileKind {
+    /// Snapshot-style kinds where only the most recent value is
+    /// semantically meaningful. `push_volatile` replaces any prior
+    /// entry of the same kind instead of appending. Non-singleton
+    /// kinds (nudges, corrections) accumulate so the LLM sees every
+    /// one fired in the same prepare cycle.
+    #[must_use]
+    pub fn is_singleton(self) -> bool {
+        matches!(
+            self,
+            Self::WorkingSet | Self::AlreadyFetched | Self::ExplorationBudget | Self::Mailbox,
+        )
+    }
+
+    /// Default wire role for this kind. System-role for coaching /
+    /// snapshots; user-role for nudges / corrections that deliberately
+    /// mimic the user scolding the LLM.
+    #[must_use]
+    pub fn default_role(self) -> &'static str {
+        match self {
+            // Operator-persona messages — land in the user slot so the
+            // LLM reads them with "correct my behavior" framing.
+            Self::ToolHealthWarning
+            | Self::StallNudge
+            | Self::ParallelBatchingForce
+            | Self::ExecutionEscalation
+            | Self::Corrective
+            | Self::CircuitBreaker
+            | Self::BudgetAdvisory
+            | Self::ExecutionRetry
+            | Self::ExplorationBudget
+            | Self::BudgetReview => "user",
+            // System-role: in-band runtime snapshots or coaching.
+            Self::WorkingSet
+            | Self::AlreadyFetched
+            | Self::ToolBatchCoaching
+            | Self::TacticalAdaptation
+            | Self::Mailbox
+            | Self::Other => "system",
+        }
+    }
+}
+
 /// Created by the CLI/host from session parameters; mutated by the runtime
 /// during multi-turn execution. Consumed at the end to produce results.
 pub struct AgenticLoopState {
     // ── Message context ──
     pub messages: Vec<Value>,
+    /// Runtime-produced volatile content scheduled to ride the next
+    /// LLM call's volatile_preamble. See [`VolatileInjection`]. The
+    /// wire layer (`wire_assembly::assemble_llm_messages`) drains this
+    /// field on every call, so producers just append and move on.
+    pub volatile_pending: Vec<VolatileInjection>,
     pub tool_results: Vec<Value>,
     pub current_session_id: Option<String>,
     pub current_run_id: Option<String>,
@@ -926,6 +1053,65 @@ pub struct AgenticLoopState {
 
     // ── Harness (observation + verification layer) ──
     pub harness: super::harness_adapter::HarnessSlot,
+}
+
+impl AgenticLoopState {
+    /// Queue a runtime-produced volatile injection for the next LLM call.
+    ///
+    /// Prefer this over `state.messages.push(...)` for any content that
+    /// (a) isn't a genuine user / assistant / tool conversation turn and
+    /// (b) changes across rounds or turns.
+    ///
+    /// The injection rides `volatile_preamble` on the next call (see
+    /// `wire_assembly::assemble_llm_messages`) which keeps `messages[]`
+    /// byte-stable across rounds — the property Anthropic / DeepSeek
+    /// prompt caches rely on.
+    ///
+    /// **Singleton kinds auto-dedup**: `WorkingSet`, `AlreadyFetched`,
+    /// and `ExplorationBudget` are snapshot-style — only the most
+    /// recent value matters. If one is already pending when a new one
+    /// is pushed, the old entry is replaced in place (preserving order
+    /// for other kinds). This mirrors the legacy `state.messages.retain()`
+    /// guard that producers used to write by hand.
+    ///
+    /// Silently trims empty content so call sites can pass formatter
+    /// output directly without a guard.
+    pub fn push_volatile(&mut self, kind: VolatileKind, content: impl Into<String>) {
+        let content = content.into();
+        if content.trim().is_empty() {
+            return;
+        }
+        let injection = VolatileInjection {
+            kind,
+            content,
+            round_index: self.current_round_index,
+        };
+        if kind.is_singleton() {
+            // Replace any prior entry of the same kind so the snapshot
+            // semantics are preserved: second push within a turn drops
+            // the first, never doubles up.
+            if let Some(existing) = self
+                .volatile_pending
+                .iter_mut()
+                .find(|inj| inj.kind == kind)
+            {
+                *existing = injection;
+                return;
+            }
+        }
+        self.volatile_pending.push(injection);
+    }
+
+    /// Drain all pending volatile injections. Called by
+    /// `wire_assembly::assemble_llm_messages` once per LLM call.
+    ///
+    /// Consumers (and tests inspecting runtime state) get an owned
+    /// list; the lane is empty afterward so the NEXT LLM call starts
+    /// from a clean slate.
+    #[must_use]
+    pub fn take_volatile_pending(&mut self) -> Vec<VolatileInjection> {
+        std::mem::take(&mut self.volatile_pending)
+    }
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -1397,6 +1583,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         .resolve_for_model(model);
     AgenticLoopState {
         messages: Vec::new(),
+        volatile_pending: Vec::new(),
         tool_results: Vec::new(),
         current_session_id: None,
         current_run_id: None,
@@ -1787,6 +1974,7 @@ pub(crate) mod tests {
     pub(crate) fn make_state() -> AgenticLoopState {
         AgenticLoopState {
             messages: Vec::new(),
+            volatile_pending: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
@@ -2276,10 +2464,11 @@ pub(crate) mod tests {
         assert_eq!(state.final_text, "completed after extension");
         assert!(
             state
-                .messages
+                .volatile_pending
                 .iter()
-                .filter_map(|message| message.get("content").and_then(Value::as_str))
-                .any(|content| content.contains("Budget review"))
+                .any(|inj| inj.content.contains("Budget review")),
+            "budget-review injection expected in volatile_pending; got {:?}",
+            state.volatile_pending,
         );
     }
 
@@ -2427,10 +2616,11 @@ pub(crate) mod tests {
         assert_eq!(state.final_text, "completed after exploratory extension");
         assert!(
             state
-                .messages
+                .volatile_pending
                 .iter()
-                .filter_map(|message| message.get("content").and_then(Value::as_str))
-                .any(|content| content.contains("Budget review"))
+                .any(|inj| inj.content.contains("Budget review")),
+            "budget-review injection expected in volatile_pending; got {:?}",
+            state.volatile_pending,
         );
     }
 
@@ -4599,13 +4789,13 @@ pub(crate) mod tests {
         assert!(outcome.is_ok());
         assert!(state.budget_wrapup_injected);
         assert_eq!(state.final_text, "Here is my summary.");
-        // Verify a system message was injected about budget
-        let has_budget_msg = state.messages.iter().any(|m| {
-            m.get("content")
-                .and_then(|c| c.as_str())
-                .is_some_and(|s| s.contains("token budget limit"))
-        });
-        assert!(has_budget_msg, "expected budget wrapup system message");
+        // Post-Task #45 volatile lane: budget wrapup rides
+        // volatile_pending, not state.messages.
+        let has_budget_msg = state
+            .volatile_pending
+            .iter()
+            .any(|inj| inj.content.contains("token budget limit"));
+        assert!(has_budget_msg, "expected budget wrapup in volatile lane");
     }
 
     #[tokio::test]

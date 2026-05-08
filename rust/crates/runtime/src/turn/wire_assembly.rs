@@ -307,6 +307,7 @@ fn is_completion_signal(content: &str) -> bool {
 pub(crate) fn assemble_llm_messages(
     system_messages: Vec<Value>,
     volatile_preamble: Vec<Value>,
+    drained_volatile: Vec<crate::turn::agentic_loop_host::VolatileInjection>,
     compacted_messages: Vec<Value>,
     attachments: &PostCompactAttachments<'_>,
     session_id: &str,
@@ -317,15 +318,27 @@ pub(crate) fn assemble_llm_messages(
     let mut llm_messages = system_messages;
     llm_messages.extend(compacted_messages);
 
-    // Consolidate mid-history volatile injections into `volatile_preamble`
-    // before we prepend it to the last user message. See
-    // `consolidate_mid_history_volatile_injections` for what we strip and
-    // why — TL;DR: sessions like 05e63cac showed 12+ tool_health warnings
-    // + working-set + already-fetched + coaching pings scattered mid-
-    // history, each rewritten per-round. DeepSeek's Anthropic-compat cache
-    // sees that byte churn as "new payload" every round and never warms
-    // past the system prefix.
+    // Structured volatile lane (`state.volatile_pending`): drained upstream,
+    // rendered to the same preamble slot as the historical preamble.
+    // Producers use `state.push_volatile(Kind, content)` and never touch
+    // `state.messages[]` for volatile content, so `messages[]` stays byte-
+    // stable across rounds — the property Anthropic / DeepSeek prompt
+    // caches rely on.
     let mut volatile_preamble = volatile_preamble;
+    let drained_text = render_drained_volatile(&drained_volatile);
+    if !drained_text.is_empty() {
+        volatile_preamble.push(serde_json::json!({
+            "role": "user",
+            "content": drained_text,
+        }));
+    }
+
+    // Belt-and-suspenders: legacy callers still push mid-history volatile
+    // into messages[] directly (there are ~30 such sites being migrated
+    // piecemeal). Until that migration completes,
+    // `consolidate_mid_history_volatile_injections` still picks up stragglers.
+    // Once zero producers call `state.messages.push(...)` with runtime
+    // content, this pass becomes a no-op and can be removed.
     let harvested = consolidate_mid_history_volatile_injections(&mut llm_messages);
     if !harvested.is_empty() {
         volatile_preamble.push(serde_json::json!({
@@ -387,6 +400,35 @@ pub(crate) fn assemble_llm_messages(
 
     apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, session_id);
     llm_messages
+}
+
+/// Render the structured volatile lane drained from
+/// `AgenticLoopState.volatile_pending` into a single concatenated
+/// preamble string. Producers (stall nudges, working-set snapshots,
+/// tool-health warnings, …) call `state.push_volatile(kind, content)`
+/// and the wire layer renders them all together here so the LLM sees
+/// one coherent blob of per-round runtime signal.
+///
+/// Dedup policy: the producer is responsible for ensuring that each
+/// CATEGORY of signal appears at most once in a given drain (e.g. the
+/// turn-guard only emits one tool-health warning per turn). This
+/// function preserves insertion order so if multiple kinds were queued
+/// they come out in the order they were produced.
+pub(crate) fn render_drained_volatile(
+    drained: &[crate::turn::agentic_loop_host::VolatileInjection],
+) -> String {
+    let mut out = String::new();
+    for inj in drained {
+        let text = inj.content.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(text);
+    }
+    out
 }
 
 /// Remove mid-history volatile-style injections from `messages` and return
@@ -563,6 +605,7 @@ mod tests {
         let msgs = assemble_llm_messages(
             system.clone(),
             Vec::new(),
+            Vec::new(),
             compacted.clone(),
             &PostCompactAttachments::default(),
             "s1",
@@ -583,6 +626,7 @@ mod tests {
         let compacted = vec![json!({"role": "user", "content": "hi"})];
         let msgs = assemble_llm_messages(
             system,
+            Vec::new(),
             Vec::new(),
             compacted,
             &PostCompactAttachments {
@@ -730,6 +774,7 @@ mod tests {
         let bridge_msgs = assemble_llm_messages(
             system.clone(),
             Vec::new(),
+            Vec::new(),
             compacted.clone(),
             &PostCompactAttachments::default(),
             "sid",
@@ -739,6 +784,7 @@ mod tests {
         );
         let server_msgs = assemble_llm_messages(
             system,
+            Vec::new(),
             Vec::new(),
             compacted,
             &PostCompactAttachments {
@@ -780,6 +826,7 @@ mod tests {
         let first_out = assemble_llm_messages(
             system.clone(),
             Vec::new(),
+            Vec::new(),
             first,
             &PostCompactAttachments::default(),
             "sid",
@@ -792,6 +839,7 @@ mod tests {
         maybe_append_continuation_prompt(&mut second, true);
         let second_out = assemble_llm_messages(
             system,
+            Vec::new(),
             Vec::new(),
             second,
             &PostCompactAttachments::default(),
@@ -822,6 +870,7 @@ mod tests {
         let bridge_out = assemble_llm_messages(
             system.clone(),
             Vec::new(),
+            Vec::new(),
             compacted.clone(),
             &PostCompactAttachments::default(),
             "sid",
@@ -831,6 +880,7 @@ mod tests {
         );
         let server_out = assemble_llm_messages(
             system,
+            Vec::new(),
             Vec::new(),
             compacted,
             &PostCompactAttachments {
@@ -876,6 +926,7 @@ mod tests {
         let bridge_out = assemble_llm_messages(
             system.clone(),
             Vec::new(),
+            Vec::new(),
             compacted.clone(),
             &PostCompactAttachments::default(),
             "sid",
@@ -885,6 +936,7 @@ mod tests {
         );
         let server_out = assemble_llm_messages(
             system,
+            Vec::new(),
             Vec::new(),
             compacted,
             &PostCompactAttachments {
@@ -931,6 +983,7 @@ mod tests {
         let msgs = assemble_llm_messages(
             stable_sys,
             volatile_preamble,
+            Vec::new(),
             history,
             &PostCompactAttachments::default(),
             "sid",
@@ -980,6 +1033,7 @@ mod tests {
         let msgs = assemble_llm_messages(
             system,
             preamble,
+            Vec::new(),
             compacted,
             &PostCompactAttachments::default(),
             "sid",

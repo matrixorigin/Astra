@@ -215,10 +215,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             .filter(|r| !r.is_synthetic_placeholder() && r.ok)
             .count();
         state.stall.forced_execution_escalation = true;
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": execution_escalation_message(&state.message, read_only_calls),
-        }));
+        let msg = execution_escalation_message(&state.message, read_only_calls);
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::ExecutionEscalation,
+            msg,
+        );
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "execution_escalation",
@@ -254,10 +255,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     {
         let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
         state.stall.forced_parallel_batching = true;
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": parallel_batching_force_message(streak, &state.message),
-        }));
+        let msg = parallel_batching_force_message(streak, &state.message);
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::ParallelBatchingForce,
+            msg,
+        );
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "parallel_batching_force",
@@ -308,10 +310,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 for name in host.valid_tool_names() {
                     state.restricted_tools.insert(name.clone());
                 }
-                state.messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": round_budget_phase1_message(state.llm_rounds_completed, &state.message),
-                }));
+                let msg = round_budget_phase1_message(
+                    state.llm_rounds_completed,
+                    &state.message,
+                );
+                state.push_volatile(
+                    super::agentic_loop_host::VolatileKind::BudgetAdvisory,
+                    msg,
+                );
                 tracing::warn!(
                     target: "astra::loop_guard",
                     tier = "circuit_breaker_correction",
@@ -382,13 +388,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 // for structured logging / observability only.
                 state.stall.introspection_count = state.stall.introspection_count.saturating_add(1);
                 let emission_index = state.stall.introspection_count;
-                state.messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": circuit_breaker_introspection_message(
-                        state.llm_rounds_completed,
-                        consecutive_read_only,
-                    ),
-                }));
+                let msg = circuit_breaker_introspection_message(
+                    state.llm_rounds_completed,
+                    consecutive_read_only,
+                );
+                state.push_volatile(
+                    super::agentic_loop_host::VolatileKind::CircuitBreaker,
+                    msg,
+                );
                 tracing::info!(
                     target: "astra::loop_guard",
                     tier = "circuit_breaker_introspect",
@@ -410,10 +417,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             astra_turn_core::loop_circuit_breaker::BreakerAction::SoftStop if suppress_nudges => {}
             astra_turn_core::loop_circuit_breaker::BreakerAction::SoftStop => {
                 state.stall.forced_completion_soft_stop = true;
-                state.messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": completion_soft_stop_message(state.llm_rounds_completed, &state.message),
-                }));
+                let msg = completion_soft_stop_message(
+                    state.llm_rounds_completed,
+                    &state.message,
+                );
+                state.push_volatile(
+                    super::agentic_loop_host::VolatileKind::CircuitBreaker,
+                    msg,
+                );
                 tracing::info!(
                     target: "astra::loop_guard",
                     tier = "completion_soft_stop",
@@ -443,10 +454,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         && let Some((family, blocked_tools)) = exploration_family_phase2_candidate(state)
     {
         state.stall.forced_exploration_family_phase2 = true;
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": exploration_family_phase2_message(&family, &blocked_tools, &state.message),
-        }));
+        let msg = exploration_family_phase2_message(&family, &blocked_tools, &state.message);
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::Corrective,
+            msg,
+        );
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "exploration_family_phase2",
@@ -482,10 +494,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             &state.stall.tool_call_records,
         );
         state.stall.forced_redundant_reads_corrective = true;
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": redundant_reads_corrective_message(count, &state.message),
-        }));
+        let msg = redundant_reads_corrective_message(count, &state.message);
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::Corrective,
+            msg,
+        );
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "redundant_reads_corrective",
@@ -512,10 +525,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     {
         let wasteful = cache_wasteful_tools(state, cache_waste_threshold);
         state.stall.forced_cache_waste_corrective = true;
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": cache_waste_corrective_message(&wasteful, &state.message),
-        }));
+        let msg = cache_waste_corrective_message(&wasteful, &state.message);
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::Corrective,
+            msg,
+        );
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "cache_waste_corrective",
@@ -547,10 +561,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     {
         let restricted = apply_exploration_family_restrictions(state, &family);
         state.stall.forced_exploration_family_corrective = true;
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": exploration_family_corrective_message(&family, streak, &restricted, &state.message),
-        }));
+        let msg = exploration_family_corrective_message(&family, streak, &restricted, &state.message);
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::Corrective,
+            msg,
+        );
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "exploration_family_corrective",
@@ -2291,13 +2306,13 @@ async fn handle_token_budget<H: AgenticLoopHost>(
             ),
         );
     }
-    state.messages.push(serde_json::json!({
-        "role": "system",
-        "content": "You have reached the token budget limit for this turn. \
-            Do NOT call any more tools. Summarize your progress so far and \
-            present your results to the user. If you have partial work, \
-            explain what remains to be done."
-    }));
+    state.push_volatile(
+        super::agentic_loop_host::VolatileKind::BudgetAdvisory,
+        "You have reached the token budget limit for this turn. \
+         Do NOT call any more tools. Summarize your progress so far and \
+         present your results to the user. If you have partial work, \
+         explain what remains to be done.",
+    );
     try_write_heavy_checkpoint(state);
     Some(TurnExecutionControl::ContinueLoop)
 }
@@ -2337,12 +2352,12 @@ fn should_wrap_up_for_cumulative_budget<H: AgenticLoopHost>(
             ),
         );
     }
-    state.messages.push(serde_json::json!({
-        "role": "system",
-        "content": "You have reached the cumulative token budget. \
-            Do NOT call any more tools. Summarize your progress so far and \
-            present your results to the user."
-    }));
+    state.push_volatile(
+        super::agentic_loop_host::VolatileKind::BudgetAdvisory,
+        "You have reached the cumulative token budget. \
+         Do NOT call any more tools. Summarize your progress so far and \
+         present your results to the user.",
+    );
     try_write_heavy_checkpoint(state);
     true
 }

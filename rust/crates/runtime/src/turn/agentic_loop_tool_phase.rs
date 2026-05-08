@@ -1024,10 +1024,17 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     // Record LLM round in the turn event buffer and advance the round counter.
     // Also post-process new ToolCallRecords to set batch_id and parallel flags.
     let new_records_start = evo_records_before;
-    let round_tool_calls = {
+    // Scope the mutable slice borrow so `state.push_volatile` (another
+    // mutable borrow) can run after the slice is released. We record the
+    // "executed N tools in parallel" count while we still hold the slice
+    // and defer the volatile push to outside the block.
+    let (round_tool_calls, coaching_count): (_, Option<usize>) = {
         let new_records = &mut state.stall.tool_call_records[new_records_start..];
+        let mut parallel_count_emit: Option<usize> = None;
         if !new_records.is_empty() && turn_result.accum.tool_calls.len() > 1 {
             let batch_id = state.turn_event_buffer.as_mut().map(|b| b.next_batch_id());
+            // Re-borrow after consuming turn_event_buffer's mutable access.
+            let new_records = &mut state.stall.tool_call_records[new_records_start..];
             let has_parallel = new_records
                 .iter()
                 .filter(|r| !r.is_synthetic_placeholder())
@@ -1042,22 +1049,27 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     rec.parallel = Some(true);
                 }
             }
-            // B4: Inject positive reinforcement when LLM successfully batched tools.
             if has_parallel {
-                let parallel_count = new_records
-                    .iter()
-                    .filter(|r| !r.is_synthetic_placeholder())
-                    .count();
-                state.messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": format!(
-                        "✓ {parallel_count} tools executed in parallel — excellent. Keep batching independent operations."
-                    )
-                }));
+                parallel_count_emit = Some(
+                    new_records
+                        .iter()
+                        .filter(|r| !r.is_synthetic_placeholder())
+                        .count(),
+                );
             }
         }
-        new_records.to_vec()
+        let snapshot = state.stall.tool_call_records[new_records_start..].to_vec();
+        (snapshot, parallel_count_emit)
     };
+    // B4: Inject positive reinforcement when LLM successfully batched tools.
+    if let Some(parallel_count) = coaching_count {
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::ToolBatchCoaching,
+            format!(
+                "✓ {parallel_count} tools executed in parallel — excellent. Keep batching independent operations."
+            ),
+        );
+    }
     update_runtime_todo_from_tool_records(state, &round_tool_calls);
 
     let agentic_step = current_agentic_step(state);
@@ -1224,10 +1236,10 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             let hint_parts = apply_tactical_actions(state, &step_actions);
             if !hint_parts.is_empty() {
                 let hint_text = format!("[Tactical Adaptation]\n{}", hint_parts.join("\n"));
-                state.messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": hint_text
-                }));
+                state.push_volatile(
+                    super::agentic_loop_host::VolatileKind::TacticalAdaptation,
+                    hint_text,
+                );
             }
         }
     }
@@ -1340,17 +1352,17 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                         .last_error_category
                         .map(|c| format!("{c:?}"))
                         .unwrap_or_else(|| "Unknown".into());
-                    state.messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": format!(
+                    let n = state.error_recovery.consecutive_same_error;
+                    state.push_volatile(
+                        super::agentic_loop_host::VolatileKind::Corrective,
+                        format!(
                             "🔄 ERROR BUDGET EXHAUSTED: You've hit {cat_name} errors \
                              {n} turns in a row. Your current approach is not working. \
                              STOP repeating the same strategy. You MUST try a fundamentally \
                              different approach: different tool, different file, different \
                              method. If you cannot make progress, explain what's blocking you.",
-                            n = state.error_recovery.consecutive_same_error,
-                        )
-                    }));
+                        ),
+                    );
                 }
                 state.error_recovery.consecutive_same_error = 0;
             }

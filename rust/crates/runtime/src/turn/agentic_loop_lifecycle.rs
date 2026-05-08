@@ -232,14 +232,20 @@ fn apply_open_ended_exploration_budget(state: &mut AgenticLoopState) -> bool {
     state.max_tools_per_turn = state
         .max_tools_per_turn
         .min(OPEN_ENDED_EXPLORATION_MAX_TOOLS_PER_TURN);
-    if !state.messages.iter().any(|message| {
-        message.get("content").and_then(|content| content.as_str())
-            == Some(OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE)
-    }) {
-        state.messages.push(serde_json::json!({
-            "role": "system",
-            "content": OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE,
-        }));
+    // Previously-pushed exploration-budget messages lived in
+    // state.messages; no-op today because the structured lane drains
+    // per-call and the old `any(|m| content == MSG)` guard never finds
+    // them. Keep the single-push-per-turn semantics via the lane: if
+    // any prior injection this turn already queued the message, skip.
+    let already_queued = state
+        .volatile_pending
+        .iter()
+        .any(|inj| inj.content == OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE);
+    if !already_queued {
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::ExplorationBudget,
+            OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE,
+        );
     }
     true
 }
@@ -277,10 +283,10 @@ fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
         additional_turns,
         budget.hard_turn_limit,
     );
-    state.messages.push(serde_json::json!({
-        "role": "system",
-        "content": review_message,
-    }));
+    state.push_volatile(
+        super::agentic_loop_host::VolatileKind::BudgetReview,
+        review_message.clone(),
+    );
     Some(review_message)
 }
 
@@ -732,10 +738,10 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     if has_more { "+, more queued" } else { "" },
                     parts.join("\n")
                 );
-                state.messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": mailbox_text,
-                }));
+                state.push_volatile(
+                    super::agentic_loop_host::VolatileKind::Mailbox,
+                    mailbox_text,
+                );
             }
         }
     }
@@ -776,6 +782,15 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
 
     if turn_index > 0 {
+        // Working-set + inventory snapshots go through the structured
+        // volatile lane so they stay out of `state.messages[]` — the
+        // wire layer drains them into volatile_preamble for each LLM
+        // call. Previously these were pushed as trailing `role=system`
+        // messages and had to be re-deduped before every push, which
+        // still broke Anthropic/DeepSeek prefix caching (session
+        // 05e63cac / c0905eab). Legacy retains() stay for a grace
+        // period to scrub checkpoints restored from pre-migration
+        // sessions.
         const WORKING_SET_HEADER: &str = "[working-set:v1]\n";
         state.messages.retain(|m| {
             m.get("role").and_then(Value::as_str) != Some("system")
@@ -784,10 +799,13 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     .and_then(Value::as_str)
                     .is_some_and(|c| c.starts_with(WORKING_SET_HEADER))
         });
-        state.messages.push(serde_json::json!({
-            "role": "system",
-            "content": state.session_facts.to_working_set_injection(&state.message),
-        }));
+        let working_set_text = state
+            .session_facts
+            .to_working_set_injection(&state.message);
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::WorkingSet,
+            working_set_text,
+        );
 
         const INVENTORY_HEADER: &str = "## Already Fetched (do NOT re-read/re-grep these)\n";
         state.messages.retain(|m| {
@@ -799,10 +817,10 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         });
         let inventory = state.semantic_dedup.context_inventory();
         if !inventory.is_empty() {
-            state.messages.push(serde_json::json!({
-                "role": "system",
-                "content": format!("{INVENTORY_HEADER}{inventory}"),
-            }));
+            state.push_volatile(
+                super::agentic_loop_host::VolatileKind::AlreadyFetched,
+                format!("{INVENTORY_HEADER}{inventory}"),
+            );
         }
     }
 
@@ -830,10 +848,10 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     state.stall.nudge_count as usize,
                 );
                 let nudge = reflection.to_nudge_message();
-                state.messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": nudge,
-                }));
+                state.push_volatile(
+                    super::agentic_loop_host::VolatileKind::StallNudge,
+                    nudge,
+                );
                 state.stall.nudge_count += 1;
                 if !quiet {
                     host.emit_headless_line(
@@ -1081,22 +1099,29 @@ mod tests {
             state.max_tools_per_turn,
             OPEN_ENDED_EXPLORATION_MAX_TOOLS_PER_TURN
         );
-        assert!(state.messages.iter().any(|msg| {
-            msg.get("content")
-                .and_then(|content| content.as_str())
-                .is_some_and(|content| content.contains("Open-ended file exploration budget"))
-        }));
+        // Post-Task #45: exploration-budget message goes into the
+        // structured volatile lane, not state.messages. The singleton
+        // dedup in `push_volatile` enforces idempotence.
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .any(|inj| inj.content.contains("Open-ended file exploration budget")),
+            "expected exploration-budget injection in volatile lane; got {:?}",
+            state.volatile_pending,
+        );
 
         assert!(apply_open_ended_exploration_budget(&mut state));
-        let budget_messages = state
-            .messages
+        let budget_entries = state
+            .volatile_pending
             .iter()
-            .filter(|msg| {
-                msg.get("content").and_then(|content| content.as_str())
-                    == Some(OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE)
-            })
+            .filter(|inj| inj.content == OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE)
             .count();
-        assert_eq!(budget_messages, 1, "budget message must be idempotent");
+        assert_eq!(
+            budget_entries, 1,
+            "budget injection must be idempotent (singleton dedup); pending={:?}",
+            state.volatile_pending,
+        );
     }
 
     #[tokio::test]
@@ -1120,19 +1145,42 @@ mod tests {
             .await
             .expect("prepare next turn");
 
+        // Post-Task #45: working-set lives in the structured volatile lane,
+        // not in state.messages. The lane drains per LLM call so at
+        // prepare-turn time we see at most ONE pending entry (the
+        // current turn's snapshot) — second-call replace, not accumulate.
         let working_sets: Vec<_> = state
-            .messages
+            .volatile_pending
             .iter()
-            .filter_map(|m| m.get("content").and_then(serde_json::Value::as_str))
-            .filter(|content| content.starts_with("[working-set:v1]\n"))
+            .filter(|inj| inj.content.starts_with("[working-set:v1]\n"))
             .collect();
         assert_eq!(
             working_sets.len(),
             1,
-            "working set injection should be replaced, not accumulated"
+            "working set lane must hold exactly one entry per prepare cycle, \
+             got {} in pending={:?} and messages={:?}",
+            working_sets.len(),
+            state.volatile_pending,
+            state.messages,
         );
-        assert!(working_sets[0].contains("goal: continue fixing context continuity"));
-        assert!(working_sets[0].contains("- src/main.rs [write t1]"));
+        assert_eq!(
+            working_sets[0].kind,
+            super::super::agentic_loop_host::VolatileKind::WorkingSet,
+        );
+        assert!(working_sets[0].content.contains("goal: continue fixing context continuity"));
+        assert!(working_sets[0].content.contains("- src/main.rs [write t1]"));
+        // And messages[] must stay clean of working-set content.
+        let msg_working_sets: Vec<_> = state
+            .messages
+            .iter()
+            .filter_map(|m| m.get("content").and_then(serde_json::Value::as_str))
+            .filter(|c| c.starts_with("[working-set:v1]\n"))
+            .collect();
+        assert!(
+            msg_working_sets.is_empty(),
+            "working-set must NEVER end up in state.messages (byte-stable \
+             history invariant); leaked into: {msg_working_sets:?}",
+        );
     }
 
     #[test]
