@@ -1470,21 +1470,7 @@ impl<'a> CliSseStreamHost<'a> {
     }
 }
 
-/// Extract the first absolute path from a bash command string.
-/// Used to determine which directory to expand the sandbox to when the user
-/// approves a sandbox-denied bash command.
-fn extract_first_absolute_path(command: &str) -> Option<String> {
-    for token in command.split_whitespace() {
-        if token.starts_with('/') && !token.starts_with("//") && !token.contains('$') {
-            // Strip trailing punctuation that might be shell syntax
-            let clean = token.trim_end_matches([';', '&', ')']);
-            if !clean.is_empty() {
-                return Some(clean.to_string());
-            }
-        }
-    }
-    None
-}
+// `extract_first_absolute_path` moved to `crate::sandbox_retry`.
 
 /// D-9 correctness guard: decide whether a speculative result may be
 /// reused as-is in place of a real tool execution.
@@ -2026,13 +2012,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // If the sandbox denied the operation, prompt the user for
                 // authorization. On approval, temporarily expand the sandbox
                 // boundary and retry the tool.
-                if outcome
-                    .output
-                    .starts_with(crate::edge_tools::SANDBOX_DENIED_PREFIX)
-                {
+                if crate::sandbox_retry::is_sandbox_denied(&outcome.output) {
                     if let Some(pm) = &mut self.perm_manager {
                         let sandbox_msg =
-                            &outcome.output[crate::edge_tools::SANDBOX_DENIED_PREFIX.len()..];
+                            crate::sandbox_retry::sandbox_denied_message(&outcome.output)
+                                .unwrap_or("");
                         let sandbox_tool_key = format!("sandbox_expand:{tool}");
                         let guard_args = serde_json::json!({"reason": sandbox_msg});
                         let decision = crate::tool_safety_guard::ToolSafetyGuard::check_request(
@@ -2132,38 +2116,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             }
                         };
                         if approved {
-                            // Temporarily expand sandbox to allow the requested path,
-                            // then retry the tool.
-                            // Use parent directory so sibling files are also accessible,
-                            // but never expand to "/" (would open entire filesystem).
-                            let expand_dir = args
-                                .get("path")
-                                .or_else(|| args.get("file_path"))
-                                .and_then(serde_json::Value::as_str)
-                                .and_then(|p| {
-                                    let parent = std::path::Path::new(p).parent()?;
-                                    if parent == std::path::Path::new("/") {
-                                        // For root-level files like /passwd, expand to
-                                        // the file itself, not "/"
-                                        Some(std::path::PathBuf::from(p))
-                                    } else {
-                                        Some(parent.to_path_buf())
-                                    }
-                                })
-                                .or_else(|| {
-                                    args.get("command")
-                                        .and_then(serde_json::Value::as_str)
-                                        .and_then(extract_first_absolute_path)
-                                        .and_then(|p| {
-                                            let parent = std::path::Path::new(&p).parent()?;
-                                            if parent == std::path::Path::new("/") {
-                                                Some(std::path::PathBuf::from(&p))
-                                            } else {
-                                                Some(parent.to_path_buf())
-                                            }
-                                        })
-                                });
-                            if let Some(dir) = expand_dir {
+                            // Single source of truth in `sandbox_retry` — both
+                            // the sequential path here and the parallel batch
+                            // path call the same derivation so their behaviour
+                            // stays byte-identical.
+                            if let Some(dir) =
+                                crate::sandbox_retry::sandbox_expand_dir_from_args(args)
+                            {
                                 self.executor.expand_sandbox_path(dir);
                             }
                             outcome = self.executor.execute_with_metadata(tool, args).await;
@@ -2737,6 +2696,62 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // Stop grouped spinner if we used one.
         if use_grouped_spinner {
             self.render.stop_tool_stderr_running();
+        }
+
+        // ── Phase 2.5: Sandbox-denied retry (Auto mode) ──
+        // The sequential dispatch path (lines 2025–2181) wraps every
+        // tool call in a SANDBOX_DENIED→prompt→retry flow; the parallel
+        // batch above does not, because each future can't hold `&mut
+        // self`. Handle retries here where we're sequential again: for
+        // any tool that returned SANDBOX_DENIED, if the permission
+        // manager's check returns Allow (the shape PermissionMode::Auto
+        // produces for `sandbox_expand:*`), widen the sandbox and
+        // re-execute the tool. This closes the bug in session
+        // `3b7ac18f` where `cat ~/claudecode/*` was blocked 4 times in
+        // auto mode with no approval path.
+        //
+        // Interactive / Prompt mode intentionally stays on the
+        // sequential path — the parallel batch is only used when the
+        // cloud has already pre-approved every request in it, so there
+        // is no UI to invoke here anyway.
+        let mut outputs = outputs;
+        for pos in 0..outputs.len() {
+            if !crate::sandbox_retry::is_sandbox_denied(&outputs[pos].0.output) {
+                continue;
+            }
+            let (_, req) = conc_reqs[pos];
+            let tool = req.tool.clone();
+            let args = req.args.clone();
+            let sandbox_tool_key = format!("sandbox_expand:{tool}");
+            let sandbox_msg = crate::sandbox_retry::sandbox_denied_message(
+                &outputs[pos].0.output,
+            )
+            .unwrap_or("")
+            .to_string();
+            let guard_args = serde_json::json!({"reason": sandbox_msg});
+            let decision = crate::tool_safety_guard::ToolSafetyGuard::check_request(
+                self.perm_manager.as_deref_mut(),
+                &sandbox_tool_key,
+                &guard_args,
+            );
+            let approved = matches!(
+                decision,
+                crate::permission_manager::PermissionDecision::Allow
+            );
+            if !approved {
+                continue;
+            }
+            if let Some(dir) = crate::sandbox_retry::sandbox_expand_dir_from_args(&args) {
+                self.executor.expand_sandbox_path(dir);
+            }
+            if let Some(pm) = &mut self.perm_manager {
+                pm.record_approval(&sandbox_tool_key, Some(&args), true);
+            }
+            let (retried, retry_dur) = catch_tool_execution_panic(
+                self.executor.execute_with_metadata(&tool, &args),
+            )
+            .await;
+            outputs[pos] = (retried, retry_dur);
         }
 
         for (pos, (outcome, duration_ms)) in outputs.into_iter().enumerate() {
@@ -6879,43 +6894,9 @@ mod tests {
         assert_eq!(got.as_ref(), embedded.trim());
     }
 
-    // ── extract_first_absolute_path ─────────────────────────────────────
-
-    #[test]
-    fn extract_absolute_path_from_cat_command() {
-        assert_eq!(
-            extract_first_absolute_path("cat /etc/passwd"),
-            Some("/etc/passwd".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_absolute_path_skips_relative() {
-        assert_eq!(extract_first_absolute_path("cat src/main.rs"), None);
-    }
-
-    #[test]
-    fn extract_absolute_path_skips_variable() {
-        assert_eq!(extract_first_absolute_path("cat $HOME/.bashrc"), None);
-    }
-
-    #[test]
-    fn extract_absolute_path_skips_unc() {
-        assert_eq!(extract_first_absolute_path("cat //server/share"), None);
-    }
-
-    #[test]
-    fn extract_absolute_path_strips_trailing_semicolon() {
-        assert_eq!(
-            extract_first_absolute_path("cat /etc/passwd;"),
-            Some("/etc/passwd".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_absolute_path_empty_command() {
-        assert_eq!(extract_first_absolute_path(""), None);
-    }
+    // extract_first_absolute_path moved to crate::sandbox_retry — its
+    // tests live there now as part of the TDD coverage for the shared
+    // SANDBOX_DENIED retry path.
 
     // ── style_tool_description tests ──
 

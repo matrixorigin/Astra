@@ -220,6 +220,7 @@ mod terminal_region;
 mod theme;
 #[path = "cli/tool_call_groups.rs"]
 mod tool_call_groups;
+mod sandbox_retry;
 mod tool_safety_guard;
 mod tui;
 #[path = "cli/ui_adapter.rs"]
