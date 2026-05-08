@@ -98,6 +98,14 @@ fn is_digest_worthy(line: &str) -> bool {
     if line.starts_with("[session:") {
         return false;
     }
+    // Legacy pre-L2 auto-write shapes. L2 now rejects these at write,
+    // but entries that landed *before* the gate shipped still live in
+    // Memoria. Observed dominant pollution in session 72ef747f: 43 of
+    // 68 User Memories entries were `[compaction:<sid>] …` from before
+    // L2. Parity with `memory_prefetch::is_memory_worthy`.
+    if line.starts_with("[compaction:") || line.starts_with("[session-knowledge:") {
+        return false;
+    }
     // Runtime scaffolding that leaked into conversation history and was
     // then indexed by Memoria. Routed through the single source of truth
     // in `astra_turn_types::SCAFFOLDING_BODY_PREFIXES` so new runtime
@@ -412,5 +420,23 @@ mod tests {
             out.contains("[@swap/archived]"),
             "structured-tagged entries must pass filter, got:\n{out}"
         );
+    }
+
+    #[test]
+    fn rejects_pre_l2_compaction_and_session_knowledge() {
+        // Pre-L2 auto-writers emitted `[compaction:<sid>] <summary>`
+        // and `[session-knowledge:<sid>] ## …`. L2 now refuses those
+        // at write, but pre-existing entries linger in Memoria until
+        // their confidence decays. Filter them here for parity with
+        // `memory_prefetch::is_memory_worthy`.
+        let hits = vec![
+            "[compaction:055932d7-22bd] ### Primary Request: review PR 42".to_string(),
+            "[session-knowledge:abc] ## User Corrections - Use RS256".to_string(),
+            "Real curated fact that survives the filter.".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        assert!(!out.contains("[compaction:"), "leaked: {out}");
+        assert!(!out.contains("[session-knowledge:"), "leaked: {out}");
+        assert!(out.contains("Real curated fact"));
     }
 }

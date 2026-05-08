@@ -267,7 +267,16 @@ fn is_memory_worthy(trimmed: &str) -> bool {
     if trimmed.starts_with("[session-memory:")
         || trimmed.starts_with("[attention:")
         || trimmed.starts_with("[session:")
+        || trimmed.starts_with("[compaction:")
+        || trimmed.starts_with("[session-knowledge:")
     {
+        // Legacy pre-L2 auto-write shapes. L2 now rejects these at
+        // write, but entries that landed *before* the gate shipped
+        // still live in Memoria. Observed dominant pollution source
+        // in session 72ef747f: every `## User Memories` entry was
+        // `**Context:** [compaction:<sid>] …` from before L2. Decay
+        // (T3 half-life 60d) eventually removes them; until then
+        // filter at read so they don't reach the prompt.
         return false;
     }
 
@@ -799,6 +808,33 @@ mod tests {
         assert!(!section.contains("session-memory:v1"), "got: {section}");
         assert!(!section.contains("attention:v1"), "got: {section}");
         assert!(section.contains("Legitimate memory"));
+    }
+
+    #[test]
+    fn build_memory_section_drops_pre_l2_legacy_writes() {
+        // Pre-L2 auto-compaction + session-end-governance writers
+        // emitted these shapes. L2 now rejects them at write, but
+        // entries that landed before the gate still live in Memoria.
+        // Observed dominant pollution in session 72ef747f: 43 of 68
+        // User Memories entries were `[compaction:<sid>] …`.
+        let lines = vec![
+            "[compaction:055932d7-22bd] ### Primary Request: review PR 42".to_string(),
+            "[session-knowledge:abc123] ## User Corrections\n- Use RS256".to_string(),
+            "[@pref/active] user prefers terse answers over long explanations".to_string(),
+        ];
+        let section = build_memory_section(&lines).expect("tagged pref survives");
+        assert!(
+            !section.contains("[compaction:"),
+            "pre-L2 compaction leak: {section}"
+        );
+        assert!(
+            !section.contains("[session-knowledge:"),
+            "pre-L2 session-knowledge leak: {section}"
+        );
+        assert!(
+            section.contains("prefers terse answers"),
+            "tagged entry must survive: {section}"
+        );
     }
 
     #[test]
