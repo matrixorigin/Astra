@@ -182,7 +182,7 @@ impl TextArea {
         self.invalidate_wrap();
     }
 
-    fn insert_str(&mut self, s: &str) {
+    pub(super) fn insert_str(&mut self, s: &str) {
         self.text.insert_str(self.cursor_pos, s);
         self.cursor_pos += s.len();
         self.preferred_col = None;

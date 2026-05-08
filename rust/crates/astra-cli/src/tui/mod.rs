@@ -471,7 +471,14 @@ pub(crate) async fn run_tui_repl(
                                     finalize_stream(&mut stream_controller, &mut guard, w, &mut transcript);
 
                                     // Flush any remaining active cell (thinking indicator, tool cell)
-                                    if let Some(cell) = active_cell.take() {
+                                    if let Some(mut cell) = active_cell.take() {
+                                        // If it's an assistant cell, mark the
+                                        // stream as complete so its display no
+                                        // longer paints the trailing cursor
+                                        // before being flushed to scrollback.
+                                        if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
+                                            ac.finalize();
+                                        }
                                         flush_cell_to_scrollback(&mut guard, cell, w, &mut transcript);
                                     }
 
@@ -598,10 +605,12 @@ pub(crate) async fn run_tui_repl(
                         do_draw(&mut guard, &active_cell, &mut bottom_pane)?;
                     }
                     TuiEvent::Paste(text) => {
-                        for c in text.chars() {
-                            let fk = crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char(c), crossterm::event::KeyModifiers::NONE);
-                            let _ = bottom_pane.handle_key(fk);
-                        }
+                        // BottomPane routes short pastes to the textarea
+                        // verbatim and folds multi-line pastes behind a
+                        // `[Pasted #N · M lines]` placeholder. The
+                        // placeholder expands back to the original text
+                        // on submit.
+                        bottom_pane.handle_paste(&text);
                         frame_requester.schedule_frame();
                     }
                 }

@@ -14,6 +14,12 @@ pub(crate) struct AssistantChatCell {
     thinking_started_at: Option<Instant>,
     thinking_finished: bool,
     is_first_chunk: bool,
+    /// True while the cell is still receiving stream tokens. Drives the
+    /// trailing cursor block in `display_lines` so users can see that
+    /// more output is coming. Default `true` because every chat cell
+    /// starts as live; callers flip it to `false` via `finalize()` the
+    /// moment the stream closes.
+    streaming: bool,
 }
 
 impl AssistantChatCell {
@@ -25,6 +31,7 @@ impl AssistantChatCell {
             thinking_started_at: None,
             thinking_finished: false,
             is_first_chunk: true,
+            streaming: true,
         }
     }
 
@@ -38,7 +45,20 @@ impl AssistantChatCell {
             thinking_started_at: None,
             thinking_finished: false,
             is_first_chunk: false,
+            // `from_source` is used to reconstruct finalized cells
+            // (e.g. when replaying history), so they're not streaming.
+            streaming: false,
         }
+    }
+
+    /// Mark this cell's stream as complete — hides the trailing cursor.
+    pub fn finalize(&mut self) {
+        self.streaming = false;
+    }
+
+    /// Whether a mid-stream cursor should render.
+    pub fn is_streaming(&self) -> bool {
+        self.streaming && !self.rendered_lines.is_empty()
     }
 
     pub fn update_rendered_lines(&mut self, lines: Vec<Line<'static>>) {
@@ -81,6 +101,12 @@ impl AssistantChatCell {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
+        self
+    }
+
     fn thinking_elapsed_str(&self) -> String {
         match self.thinking_started_at {
             Some(t) => {
@@ -109,6 +135,8 @@ impl ChatCell for AssistantChatCell {
 
         // Main content with • prefix on first line (Codex style)
         if !self.rendered_lines.is_empty() {
+            let last_idx = self.rendered_lines.len().saturating_sub(1);
+            let show_cursor = self.is_streaming();
             for (i, line) in self.rendered_lines.iter().enumerate() {
                 let prefix = if i == 0 {
                     Span::styled("• ", Style::default().dim())
@@ -117,6 +145,18 @@ impl ChatCell for AssistantChatCell {
                 };
                 let mut spans = vec![prefix];
                 spans.extend(line.spans.iter().cloned());
+                // Append a blinking block cursor to the final rendered
+                // line while tokens are still streaming — gives users a
+                // clear "more is coming" cue without animating the text
+                // itself (which the terminal cursor blink handles).
+                if show_cursor && i == last_idx {
+                    spans.push(Span::styled(
+                        "▎",
+                        Style::default()
+                            .add_modifier(ratatui::style::Modifier::SLOW_BLINK)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ));
+                }
                 lines.push(Line::from(spans));
             }
         } else if self.is_thinking() {
@@ -168,5 +208,76 @@ impl ChatCell for AssistantChatCell {
         // Then the normal display content
         lines.extend(self.display_lines(width));
         lines
+    }
+}
+
+#[cfg(test)]
+mod streaming_cursor_tests {
+    use super::*;
+
+    fn line_text(l: &Line<'_>) -> String {
+        l.spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn streaming_cell_appends_cursor_to_last_line() {
+        let lines = vec![
+            Line::from(Span::raw("first")),
+            Line::from(Span::raw("last")),
+        ];
+        let cell = AssistantChatCell::from_rendered(lines);
+        assert!(cell.is_streaming(), "new from_rendered should be streaming");
+
+        let out = cell.display_lines(80);
+        assert_eq!(out.len(), 2);
+        assert!(
+            !line_text(&out[0]).contains('▎'),
+            "cursor should only be on the last line; first={:?}",
+            line_text(&out[0])
+        );
+        assert!(
+            line_text(&out[1]).ends_with('▎'),
+            "last line should end with the streaming cursor; got {:?}",
+            line_text(&out[1])
+        );
+    }
+
+    #[test]
+    fn finalized_cell_has_no_cursor() {
+        let lines = vec![Line::from(Span::raw("done"))];
+        let mut cell = AssistantChatCell::from_rendered(lines);
+        cell.finalize();
+        assert!(!cell.is_streaming());
+
+        let out = cell.display_lines(80);
+        assert_eq!(out.len(), 1);
+        assert!(
+            !line_text(&out[0]).contains('▎'),
+            "finalized cell must not render a cursor; got {:?}",
+            line_text(&out[0])
+        );
+    }
+
+    #[test]
+    fn from_source_is_not_streaming() {
+        // History replay — should render as a static cell, no cursor.
+        let cell = AssistantChatCell::from_source("hello world".into(), 80);
+        assert!(!cell.is_streaming());
+        let out = cell.display_lines(80);
+        assert!(
+            out.iter().all(|l| !line_text(l).contains('▎')),
+            "from_source must never render a cursor"
+        );
+    }
+
+    #[test]
+    fn empty_streaming_cell_shows_working_not_cursor() {
+        // No rendered lines yet + thinking → "Working" shimmer, no cursor.
+        let mut cell = AssistantChatCell::from_rendered(vec![]);
+        cell.start_thinking();
+        let out = cell.display_lines(80);
+        assert_eq!(out.len(), 1);
+        assert!(!line_text(&out[0]).contains('▎'));
+        assert!(line_text(&out[0]).contains("Working"));
     }
 }

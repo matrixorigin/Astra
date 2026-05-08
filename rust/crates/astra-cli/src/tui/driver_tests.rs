@@ -50,7 +50,11 @@ fn cell_from_snapshot(snap: &CellSnapshot) -> Box<dyn ChatCell> {
                 .lines()
                 .map(|l| Line::from(l.to_string()))
                 .collect();
-            Box::new(AssistantChatCell::from_rendered(lines))
+            // Driver snapshots assert finalized transcript output — no
+            // streaming cursor — so mark the cell as settled.
+            let mut cell = AssistantChatCell::from_rendered(lines);
+            cell.finalize();
+            Box::new(cell)
         }
         CellSnapshot::Tool {
             name,

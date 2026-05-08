@@ -115,7 +115,10 @@ fn assistant_from_rendered_simple() {
         Line::from(Span::raw("step one")),
         Line::from(Span::raw("step two")),
     ];
-    let cell = AssistantChatCell::from_rendered(lines);
+    // Finalize to exclude the streaming cursor — these snapshots cover
+    // the settled post-stream render.
+    let mut cell = AssistantChatCell::from_rendered(lines);
+    cell.finalize();
     insta::assert_snapshot!("assistant_rendered_simple_80", render_cell(&cell, 80, 4));
 }
 
@@ -124,7 +127,8 @@ fn assistant_from_rendered_narrow_wraps() {
     let lines = vec![Line::from(Span::raw(
         "a longer paragraph that will need wrapping at small widths",
     ))];
-    let cell = AssistantChatCell::from_rendered(lines);
+    let mut cell = AssistantChatCell::from_rendered(lines);
+    cell.finalize();
     insta::assert_snapshot!("assistant_rendered_narrow_30", render_cell(&cell, 30, 4));
 }
 

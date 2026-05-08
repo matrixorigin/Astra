@@ -149,6 +149,15 @@ impl BottomPane {
             .unwrap_or_default()
     }
 
+    /// Handle a bracketed-paste payload. Multi-line pastes get
+    /// collapsed into a `[Pasted #N · M lines]` placeholder; short
+    /// pastes are inserted verbatim. After the paste lands, popup
+    /// state is resynced because paste can newly trigger `/`, `@`, `$`.
+    pub fn handle_paste(&mut self, text: &str) {
+        self.composer.handle_paste(text);
+        self.sync_popups();
+    }
+
     pub fn set_task_status(&mut self, status: TaskStatus) {
         self.footer.is_turn_active = status.is_active();
         self.task_status = status;
@@ -703,6 +712,14 @@ impl BottomPane {
         if let Some(view) = self.active_view_mut() {
             view.pre_draw_tick(now);
         }
+    }
+
+    /// True when something in the bottom pane is currently animating and
+    /// needs a follow-up redraw (submit flash today; future tickers can
+    /// piggyback here). The outer event loop's 50ms tick already gives
+    /// plenty of redraws, so this mostly exists for test clarity.
+    pub fn wants_redraw(&self) -> bool {
+        self.composer.is_flashing()
     }
 
     fn render_queue_preview(&self, area: Rect, buf: &mut Buffer) {
