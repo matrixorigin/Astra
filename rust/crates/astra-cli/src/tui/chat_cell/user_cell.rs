@@ -24,34 +24,34 @@ impl ChatCell for UserChatCell {
     }
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        // Cursor-style: bold accent `› ` prefix + soft tinted background
+        // so the user turn reads as a distinct card against the dim
+        // scrollback, without the box-drawing weight of a full border.
         let bg = user_message_style();
+        let theme = crate::tui::theme::current();
+        let prefix_style = Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD);
 
-        let mut lines = Vec::new();
-        // No top blank — the FlexRenderable inset handles spacing above
+        let mut lines: Vec<Line<'static>> = Vec::new();
 
         for (i, text_line) in self.message.lines().enumerate() {
             let prefix = if i == 0 {
-                Span::styled(
-                    "› ",
-                    Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
-                )
+                Span::styled("› ", prefix_style)
             } else {
                 Span::raw("  ")
             };
             lines.push(Line::from(vec![prefix, Span::raw(text_line.to_string())]).style(bg));
         }
         if self.message.is_empty() {
-            lines.push(
-                Line::from(Span::styled(
-                    "› ",
-                    Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
-                ))
-                .style(bg),
-            );
+            lines.push(Line::from(Span::styled("› ", prefix_style)).style(bg));
         }
 
-        lines.push(Line::styled("", bg)); // blank line 1 below
-        lines.push(Line::default()); // blank line 2 below (Codex has 2 blank lines after user)
+        // One trailing blank inside the tinted background so the card
+        // has a little breathing room at the bottom. A second,
+        // non-tinted blank separates it from the next cell.
+        lines.push(Line::styled("", bg));
+        lines.push(Line::default());
         lines
     }
 }
