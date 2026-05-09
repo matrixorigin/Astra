@@ -162,10 +162,52 @@ pub async fn handle_get_agent_result_tool(args: &Value, ctx: Option<&SpawnAgentC
             "detail": format!("{status:?}"),
         })
         .to_string(),
-        None => json!({
+        None => {
+            // P2 (session 8d9e5903 T10 regression): distinguish "truly
+            // gone" from "still running — parent should call again".
+            // Before this refinement, every wait timeout looked
+            // identical to the LLM, so a still-executing child got
+            // treated as dead. Now the parent sees "still_running"
+            // when there is live state and "timeout" only when we
+            // genuinely have nothing to report.
+            let live_status = ctx
+                .spawner
+                .get_agent_state_any(agent_id)
+                .await
+                .map(|state| state.status);
+            render_wait_timeout_outcome(agent_id, live_status.as_ref(), timeout)
+        }
+    }
+}
+
+/// Decide the outcome JSON when `wait_for_agent` returns `None`.
+///
+/// Split out as a pure function so the P2 decision (timeout vs
+/// still_running) can be regression-tested without standing up a
+/// full `DynamicAgentSpawner`.
+pub(crate) fn render_wait_timeout_outcome(
+    agent_id: &str,
+    live_status: Option<&astra_turn_core::orchestration_types::AgentStatus>,
+    timeout: std::time::Duration,
+) -> String {
+    match live_status {
+        Some(status) if !status.is_terminal() => json!({
+            "status": "still_running",
+            "agent_id": agent_id,
+            "current_status": format!("{status:?}"),
+            "waited_secs": timeout.as_secs(),
+            "hint": "The child agent is still working. Call `get_agent_result` again \
+                    to continue waiting. Do NOT treat this as failure or fabricate \
+                    what the child would have returned.",
+        })
+        .to_string(),
+        _ => json!({
             "status": "timeout",
             "agent_id": agent_id,
-            "error": format!("Agent '{agent_id}' did not complete within {}s", timeout.as_secs()),
+            "error": format!(
+                "Agent '{agent_id}' did not complete within {}s and has no live state",
+                timeout.as_secs()
+            ),
         })
         .to_string(),
     }
@@ -252,5 +294,66 @@ mod tests {
         let args = json!({"agent_id": "child-1"});
         let result = handle_get_agent_result_tool(&args, None).await;
         assert!(result.contains("not available"));
+    }
+
+    // ── P2: wait-timeout decision (session 8d9e5903 T10 regression) ──
+
+    use astra_turn_core::orchestration_types::AgentStatus;
+    use std::time::Duration;
+
+    #[test]
+    fn wait_timeout_still_running_when_live_state_non_terminal() {
+        let status = AgentStatus::Running {
+            activity: "reading file".into(),
+        };
+        let out =
+            render_wait_timeout_outcome("reviewer-tests", Some(&status), Duration::from_secs(120));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["status"], "still_running",
+            "a timeout while the child is demonstrably running must NOT look like failure: {out}"
+        );
+        assert!(
+            v["hint"].as_str().unwrap_or("").contains("still working"),
+            "the hint must tell the LLM to call again rather than synthesize a fake result: {out}"
+        );
+        assert_eq!(v["waited_secs"], 120);
+    }
+
+    #[test]
+    fn wait_timeout_timeout_when_no_live_state() {
+        let out = render_wait_timeout_outcome("unknown-agent", None, Duration::from_secs(120));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["status"], "timeout",
+            "when there is no live state the outcome is a genuine timeout: {out}"
+        );
+        assert!(
+            v["error"].as_str().unwrap_or("").contains("no live state"),
+            "error must make the distinction auditable: {out}"
+        );
+    }
+
+    #[test]
+    fn wait_timeout_reports_terminal_states_as_timeout_not_still_running() {
+        // A terminal state (Failed / Cancelled / Completed) that
+        // somehow slipped past the wait-for-agent completion path
+        // should not be rendered as "still_running". Rare but
+        // possible if completion_notifier was dropped on a race; we
+        // still want the decision to be clear.
+        for terminal in [
+            AgentStatus::Cancelled,
+            AgentStatus::Failed { error: "x".into() },
+            AgentStatus::Completed {
+                result: "done".into(),
+            },
+        ] {
+            let out = render_wait_timeout_outcome("ag", Some(&terminal), Duration::from_secs(30));
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(
+                v["status"], "timeout",
+                "terminal state must not render as still_running: status={terminal:?} out={out}"
+            );
+        }
     }
 }

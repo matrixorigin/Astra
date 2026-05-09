@@ -498,6 +498,14 @@ pub struct StallTrackingState {
     /// when the model has produced a long streak of consecutive single-tool
     /// rounds despite the soft prompt-layer nudge. One-shot per turn.
     pub forced_parallel_batching: bool,
+    /// Escalation of `forced_parallel_batching`: fires a second, harder
+    /// corrective when the model has continued streaking despite the
+    /// first force injection. Session 8d9e5903 T11 showed 18 consecutive
+    /// single-tool rounds without any mid-loop correction because the
+    /// first-tier was silenced by a scaffolding-detection bug (fixed
+    /// separately); even with that bug fixed, one-shot correction is
+    /// insufficient when the streak keeps growing. One-shot per turn.
+    pub forced_parallel_batching_escalated: bool,
     /// Whether the round-budget convergence guard injected its phase-1
     /// corrective this loop. Phase-1 fires when `state.llm_rounds_completed`
     /// crosses the effective round-budget hard limit; it tells the model

@@ -160,6 +160,14 @@ pub fn headless_timeout_aborted_tool_names(
         .collect()
 }
 
+/// Sentinel prefix for cache-hit / duplicate-call stubs. All messages
+/// produced by [`idempotency_cache_hit_message`] start with this exact
+/// string, and downstream detectors (see list on that function's doc
+/// comment) use `starts_with(CACHED_SENTINEL)` to recognise replayed
+/// tool output across compaction boundaries. Changing this value is a
+/// breaking change across crates — audit before touching.
+pub const CACHED_SENTINEL: &str = "(cached";
+
 /// User-facing error when the LLM names a tool not in the local registry.
 pub fn unknown_local_tool_error_message(name: &str, valid_tool_names: &HashSet<String>) -> String {
     let mut names: Vec<_> = valid_tool_names.iter().cloned().collect();
@@ -186,9 +194,13 @@ pub fn unknown_local_tool_error_message(name: &str, valid_tool_names: &HashSet<S
 ///     for the rest. The preview makes the cached status obvious; the
 ///     byte count + head prove the content is real.
 ///
-/// Both forms start with `(cached` so downstream detectors (memory
-/// writability gates, adaptive tuning signals) that look for that
-/// sentinel continue to work.
+/// Both forms start with [`CACHED_SENTINEL`] so downstream detectors
+/// (memory writability gates, adaptive tuning signals, compaction
+/// replay guards in `context_compression::SYNTHETIC_USER_SENTINELS`,
+/// regression test `compaction_survival`) that look for that sentinel
+/// continue to work. Keep this single source of truth — if you change
+/// the sentinel, audit every `starts_with("(cached")` / fixed-string
+/// match in `astra-text-utils`, `astra-turn-core`, and `runtime`.
 #[must_use]
 pub fn idempotency_cache_hit_message(cached_output: &str) -> String {
     let trimmed = cached_output.trim_end();
@@ -196,12 +208,12 @@ pub fn idempotency_cache_hit_message(cached_output: &str) -> String {
         return "(cached — identical call already executed; original output was empty)".to_string();
     }
     if trimmed.len() <= IDEMPOTENCY_INLINE_MAX_BYTES {
-        // If the cached output itself already starts with `(cached`
+        // If the cached output itself already starts with the sentinel
         // (e.g. a replay across a compaction boundary where the stored
         // value is an earlier cache-hit stub), don't double-wrap — the
         // original stub already carries the sentinel that downstream
         // detectors look for.
-        if trimmed.starts_with("(cached") {
+        if trimmed.starts_with(CACHED_SENTINEL) {
             return trimmed.to_string();
         }
         return format!("(cached — identical call already executed)\n{trimmed}");

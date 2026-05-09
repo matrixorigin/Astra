@@ -1231,12 +1231,31 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
     if role == Some("system") {
         return true;
     }
-    role == Some("user")
-        && message
-            .get("content")
-            .and_then(|content| content.as_str())
-            .is_some_and(is_attention_manifest_content)
+    if role != Some("user") {
+        return false;
+    }
+    let Some(content) = message.get("content").and_then(|c| c.as_str()) else {
+        return false;
+    };
+    // Attention manifests carry the `[attention:v1]\n...` prefix.
+    if is_attention_manifest_content(content) {
+        return true;
+    }
+    // Session 8d9e5903 regression: every outbound request ends with a
+    // role=user `<system-reminder>` wrapper produced by the volatile
+    // lane (wire_assembly / bridge_inprocess / server_loop_host). This
+    // is runtime scaffolding, not a user query, and must not break
+    // round-cadence detection — otherwise the single-tool-streak
+    // counter always returns 0 on live sessions and the
+    // parallel-batching force never fires.
+    content.starts_with(SYSTEM_REMINDER_WRAPPER_PREFIX)
 }
+
+/// Wrapper tag applied by the volatile lane to mark runtime-injected
+/// scaffolding carried on a `role=user` message (git state / self-
+/// awareness / volatile nudges). See `wire_assembly`, `bridge_inprocess`,
+/// and `server_loop_host` for producers.
+const SYSTEM_REMINDER_WRAPPER_PREFIX: &str = "<system-reminder>";
 
 /// Returns true when `content` begins with the attention-manifest prefix
 /// followed by a newline. Allocation-free — safe to call in hot loops over
@@ -2836,6 +2855,60 @@ mod tests {
         assert_eq!(trailing_single_tool_round_streak(&msgs), 4);
         assert!(
             parallel_batching_nudge_directive(&msgs).contains("Sequential Tool Calls Detected")
+        );
+    }
+
+    /// Session 8d9e5903 regression: every outbound request has a
+    /// `role=user` message with a `<system-reminder>` wrapper at the
+    /// tail (volatile-lane injection carrying Git State / self-awareness
+    /// / volatile nudges). This is runtime scaffolding, not a user
+    /// query. Before the fix, `is_trailing_runtime_scaffolding_message`
+    /// only recognized attention-manifest user content, so the streak
+    /// detector broke at the first `<system-reminder>` it saw and
+    /// returned 0 — which meant the parallel-batching force never fired
+    /// despite 18 consecutive single-tool rounds in T11. The fix
+    /// extends scaffolding detection to any user message whose content
+    /// starts with `<system-reminder>`, which is a stable runtime
+    /// marker applied by every provider path (bridge_inprocess /
+    /// server_loop_host / wire_assembly).
+    #[test]
+    fn trailing_single_tool_streak_skips_system_reminder_wrapper() {
+        let mut msgs = rounds_pattern(&[1, 1, 1, 1]);
+        // The real shape seen in session 8d9e5903 captures:
+        msgs.push(serde_json::json!({
+            "role": "user",
+            "content": "<system-reminder>\n\n\n## Git State\n- Git branch: improve_promts\n</system-reminder>"
+        }));
+        assert_eq!(
+            trailing_single_tool_round_streak(&msgs),
+            4,
+            "runtime-injected <system-reminder> at tail must be treated as scaffolding \
+             so the single-tool streak detector can see the real round cadence; \
+             otherwise parallel-batching force never fires on live Astra sessions"
+        );
+        assert!(
+            parallel_batching_nudge_directive(&msgs).contains("Sequential Tool Calls Detected"),
+            "nudge must fire despite the <system-reminder> tail"
+        );
+    }
+
+    #[test]
+    fn trailing_single_tool_streak_skips_multiple_scaffolding_tails() {
+        // Realistic Astra tail: attention manifest + system-reminder +
+        // potentially a volatile-wrapper system message stacked up.
+        let mut msgs = rounds_pattern(&[1, 1, 1, 1, 1]);
+        msgs.push(serde_json::json!({
+            "role": "system",
+            "content": "(runtime-injected nudge)"
+        }));
+        msgs.push(serde_json::json!({
+            "role": "user",
+            "content": "<system-reminder>\nTurn: 5 | Tokens: 12000\n</system-reminder>"
+        }));
+        assert_eq!(
+            trailing_single_tool_round_streak(&msgs),
+            5,
+            "multiple stacked scaffolding tails must all be peeled off"
         );
     }
 

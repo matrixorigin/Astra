@@ -4280,6 +4280,7 @@ mod tests {
                 turns_completed: 15,
                 remaining_turns: 0,
                 error_detail: Some("Round budget hard-limit reached".to_string()),
+                stall_signal: None,
             },
         );
 
@@ -4896,6 +4897,7 @@ mod tests {
                 turns_completed: 15,
                 remaining_turns: 0,
                 error_detail: Some("Round budget hard-limit reached".to_string()),
+                stall_signal: None,
             },
         ));
 

@@ -275,6 +275,33 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 ),
             );
         }
+    } else if !suppress_nudges && should_escalate_parallel_batching(state) {
+        // Second-tier: the first force didn't stop the streak. Fire a
+        // harder corrective before the circuit breaker aborts the turn
+        // (session 8d9e5903 T11 reached streak 18 with no mid-loop
+        // escalation). One-shot per turn.
+        let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+        state.stall.forced_parallel_batching_escalated = true;
+        let msg = parallel_batching_escalation_message(streak);
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::ParallelBatchingForce,
+            msg,
+        );
+        tracing::warn!(
+            target: "astra::loop_guard",
+            tier = "parallel_batching_escalation",
+            streak,
+            round = state.llm_rounds_completed,
+            "loop guard escalated"
+        );
+        if !prep.quiet {
+            host.emit_headless_line(
+                HeadlessStderrStyle::Yellow,
+                format!(
+                    "↻↻ streak still growing ({streak}); escalating parallel-batching corrective…"
+                ),
+            );
+        }
     }
 
     // ── Circuit breaker observation ──────────────────────────────────────
@@ -1620,6 +1647,42 @@ pub(crate) fn should_force_parallel_batching(
         early_threshold
     };
     streak >= threshold
+}
+
+/// Escalation threshold: once the first parallel-batching force has
+/// fired, if the model is still producing single-tool rounds and the
+/// streak from *the round after the force* has grown by this many
+/// rounds, fire a second, harder corrective. Chosen to avoid immediate
+/// re-fire (the model needs at least 1 round to react) while catching
+/// cases where the streak grows without bound (session 8d9e5903 T11
+/// reached 18).
+pub(crate) const PARALLEL_BATCHING_ESCALATION_STREAK: usize = 10;
+
+pub(crate) fn should_escalate_parallel_batching(state: &AgenticLoopState) -> bool {
+    // Requires that the first-tier force already fired.
+    if !state.stall.forced_parallel_batching {
+        return false;
+    }
+    // One-shot: never re-fire the escalation in the same turn.
+    if state.stall.forced_parallel_batching_escalated {
+        return false;
+    }
+    let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+    streak >= PARALLEL_BATCHING_ESCALATION_STREAK
+}
+
+pub(crate) fn parallel_batching_escalation_message(streak: usize) -> String {
+    format!(
+        "{PARALLEL_BATCHING_FORCE_MARKER}\n\
+         Runtime ESCALATION: the prior parallel-batching correction did not \
+         change your behavior — you are still on a streak of {streak} consecutive \
+         single-tool rounds. This is a hard loop; the turn will be aborted \
+         by the circuit breaker if it continues. \
+         Your NEXT response MUST be one of:\n\
+         - A final answer (no tool calls), OR\n\
+         - ≥2 independent tool calls in a single parallel batch.\n\
+         Do not produce another single-tool round — there is no third warning."
+    )
 }
 
 pub(crate) fn parallel_batching_force_message(streak: usize, original_query: &str) -> String {
@@ -3675,6 +3738,85 @@ mod tests {
             &state,
             PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
         ));
+    }
+
+    // ── Escalation tier (P0: session 8d9e5903 regression) ──
+    //
+    // When the first-tier force has fired but the model keeps producing
+    // single-tool rounds, the runtime must escalate — one-shot is too
+    // lenient. Guards prevent infinite re-fire and prevent escalation
+    // from firing *before* the first-tier has fired.
+
+    #[test]
+    fn parallel_batching_escalation_silent_before_first_tier_fires() {
+        let mut state = make_state();
+        state.message = "explore".into();
+        for _ in 0..PARALLEL_BATCHING_ESCALATION_STREAK {
+            push_single_tool_round(&mut state);
+        }
+        // Even at high streak, escalation requires the first-tier to
+        // have fired already — otherwise the first-tier should fire
+        // instead (and does; asserted in its own tests).
+        assert!(!should_escalate_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_escalation_fires_when_streak_persists_after_first_tier() {
+        let mut state = make_state();
+        state.message = "explore".into();
+        // Simulate: first-tier already fired some rounds back; model
+        // ignored the correction and kept streaking.
+        state.stall.forced_parallel_batching = true;
+        for _ in 0..PARALLEL_BATCHING_ESCALATION_STREAK {
+            push_single_tool_round(&mut state);
+        }
+        assert!(
+            should_escalate_parallel_batching(&state),
+            "with forced_parallel_batching=true and streak>=10, escalation must fire \
+             — session 8d9e5903 T11 reached streak 18 with no escalation because \
+             this path did not exist"
+        );
+    }
+
+    #[test]
+    fn parallel_batching_escalation_silent_below_escalation_threshold() {
+        let mut state = make_state();
+        state.message = "explore".into();
+        state.stall.forced_parallel_batching = true;
+        for _ in 0..(PARALLEL_BATCHING_ESCALATION_STREAK - 1) {
+            push_single_tool_round(&mut state);
+        }
+        assert!(!should_escalate_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_escalation_is_one_shot_per_turn() {
+        let mut state = make_state();
+        state.message = "explore".into();
+        state.stall.forced_parallel_batching = true;
+        for _ in 0..PARALLEL_BATCHING_ESCALATION_STREAK {
+            push_single_tool_round(&mut state);
+        }
+        assert!(should_escalate_parallel_batching(&state));
+        // Once escalation has fired, a second round of single-tool does
+        // NOT re-escalate.
+        state.stall.forced_parallel_batching_escalated = true;
+        push_single_tool_round(&mut state);
+        assert!(!should_escalate_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_escalation_message_contains_streak_and_no_third_warning() {
+        let msg = parallel_batching_escalation_message(18);
+        assert!(msg.contains("18 consecutive"));
+        assert!(
+            msg.contains("no third warning"),
+            "escalation message must make clear this is the last chance: {msg}"
+        );
+        assert!(
+            msg.contains("ESCALATION"),
+            "message must distinguish itself from the first-tier force: {msg}"
+        );
     }
 
     #[test]

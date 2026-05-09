@@ -1360,6 +1360,16 @@ pub fn load_feedback(profile: &str, engine: &AutoTuningEngine) -> Result<bool, S
 
 // ─── Preset Rules ───────────────────────────────────────────────────────────
 
+/// Cooldown for the `high-tokens-reduce-budget` rule.
+///
+/// The 30-minute floor is load-bearing — see the regression test
+/// `high_tokens_reduce_budget_rule_cooldown_is_at_least_30min`, which
+/// asserts `>= HIGH_TOKENS_REDUCE_BUDGET_COOLDOWN_SECS`. Keep the const
+/// and the test's lower bound in lockstep so a future tuning that lowers
+/// this value fails loudly instead of silently re-introducing the
+/// 0e37eb46 budget-spiral regression.
+pub(crate) const HIGH_TOKENS_REDUCE_BUDGET_COOLDOWN_SECS: u64 = 1800;
+
 /// Create default evolution rules.
 pub fn default_rules() -> Vec<EvolutionRule> {
     vec![
@@ -1476,6 +1486,13 @@ pub fn default_rules() -> Vec<EvolutionRule> {
         //   • cooldown 30min: prevents firing multiple times inside a
         //     single long task, while still shrinking over a
         //     multi-hour session with genuinely runaway usage.
+        //
+        // The 30-minute floor is load-bearing — see the regression test
+        // `high_tokens_reduce_budget_rule_cooldown_is_at_least_30min`,
+        // which asserts `>= HIGH_TOKENS_REDUCE_BUDGET_COOLDOWN_SECS`.
+        // Keep the const and the test's lower bound in lockstep so a
+        // future tuning that lowers this value fails loudly instead of
+        // silently re-introducing the 0e37eb46 spiral.
         EvolutionRule::new(
             "high-tokens-reduce-budget",
             EvolutionTrigger::HighTokenUsage {
@@ -1491,7 +1508,7 @@ pub fn default_rules() -> Vec<EvolutionRule> {
             },
         )
         .with_name("Reduce token budget on high usage")
-        .with_cooldown(Duration::from_secs(1800)),
+        .with_cooldown(Duration::from_secs(HIGH_TOKENS_REDUCE_BUDGET_COOLDOWN_SECS)),
         // High token usage → also lower compression threshold to compress sooner
         EvolutionRule::new(
             "high-tokens-compress-earlier",

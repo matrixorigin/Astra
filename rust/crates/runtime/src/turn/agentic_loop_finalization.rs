@@ -527,6 +527,7 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     state.stall.forced_execution_retry = false;
     state.stall.forced_execution_escalation = false;
     state.stall.forced_parallel_batching = false;
+    state.stall.forced_parallel_batching_escalated = false;
     state.stall.forced_round_budget_phase1 = false;
     state.stall.forced_round_budget_phase2 = false;
     state.stall.forced_completion_soft_stop = false;
@@ -1050,6 +1051,7 @@ mod tests {
                 turns_completed: 4,
                 remaining_turns: 0,
                 error_detail: None,
+                stall_signal: None,
             },
         ));
 

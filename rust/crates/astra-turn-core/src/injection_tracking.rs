@@ -195,6 +195,16 @@ impl InjectionHistory {
         self.prune(channel);
     }
 
+    /// Prune the oldest runs for a channel down to [`MAX_RUNS_PER_CHANNEL`].
+    ///
+    /// Invariant: when the newest fingerprint matches a run that would
+    /// otherwise be pruned (repeated identical injection beyond the cap),
+    /// the earliest-matching run must be retained so `first_seen_round`
+    /// survives for the noise subtopic. See the inline comment in the
+    /// body and the regression test
+    /// `observe_single_fingerprint_beyond_cap_preserves_first_seen_round`
+    /// which asserts `rounds_alive` still reflects round 0 after pushing
+    /// `MAX_RUNS_PER_CHANNEL + 10` identical fingerprints.
     fn prune(&mut self, channel: InjectionChannel) {
         let count = self.entries.iter().filter(|e| e.channel == channel).count();
         if count <= Self::MAX_RUNS_PER_CHANNEL {

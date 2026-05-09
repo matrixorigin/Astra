@@ -51,9 +51,20 @@ Call `git_diff(stat_only: true)` (or `git_show(sha, stat_only: true)` for a comm
 | `staged` | `git_diff(staged: true)` |
 | `branch:<name>` | `git_diff(ref: "main")` |
 | `commit:<sha>` / `latest commit` | `git_log()` once → `git_show(sha)` |
+| `commits:N` / `latest N commits` / `review the latest N commits` | `git_log(limit=N)` once → `git_show(sha)` for **all N** shas |
 | `pr:<number>` / GitHub PR URL | `bash("gh pr diff N --repo owner/repo 2>&1")` |
 
 No changes? `git {action: "status"}`, try `staged: true`. Still nothing? Ask user.
+
+**🛑 Postcondition — "latest N commits" mode (P1, session 8d9e5903 regression):**
+
+When the user asked you to review **N commits**, you MUST have exactly N `git_show` (or equivalent full-diff) fetches in your context before writing the report. The common failure mode is: fetch 3 out of 5, tell yourself "I have enough signal from the commit messages", and write the review anyway. This is a lie to yourself — you don't know what's in the 2 you skipped.
+
+**Rule**: if your fetched-diff count < requested N, you have two choices and only two:
+1. Keep fetching until count == N, OR
+2. Explicitly tell the user "I only fetched K of N commits because [reason]; here is a partial review" — BEFORE the report.
+
+Do NOT write a full "## Code Review" header and act as if you covered everything when you didn't. The phrases "I have enough", "enough signal", "without more fetches" are banned in this mode unless count == N.
 
 ---
 

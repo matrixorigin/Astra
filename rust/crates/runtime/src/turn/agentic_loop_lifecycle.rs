@@ -295,12 +295,22 @@ pub(crate) fn interruption_state_summary(
     state: &AgenticLoopState,
     error_detail: Option<String>,
 ) -> InterruptionStateSummary {
+    // Compute a stall-signal breadcrumb from the single-tool streak at
+    // interruption time. Lets the resumed session see *why* it was cut
+    // (e.g. `"single_tool_streak=18"`) without re-scanning history.
+    let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+    let stall_signal = if streak >= 3 {
+        Some(format!("single_tool_streak={streak}"))
+    } else {
+        None
+    };
     InterruptionStateSummary {
         has_checkpoint: state.stall.last_heavy_checkpoint.is_some(),
         tool_calls_completed: completed_tool_calls(state),
         turns_completed: current_agentic_step(state),
         remaining_turns: state.remaining_turns as u32,
         error_detail,
+        stall_signal,
     }
 }
 

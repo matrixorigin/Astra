@@ -1475,7 +1475,7 @@ mod tests {
     #[test]
     fn observe_injections_stale_after_unchanged_signal_across_many_turns() {
         use astra_turn_core::injection_tracking::{
-            freshness_report, ChannelStatus, InjectionChannel,
+            ChannelStatus, InjectionChannel, freshness_report,
         };
         let mut session = ObservabilitySession::new_simple("sess-f85a02bb");
         session.recent_failing_tests = vec!["could not find Cargo.toml".to_string()];
@@ -1505,7 +1505,7 @@ mod tests {
     #[test]
     fn observe_injections_returns_to_fresh_when_content_changes() {
         use astra_turn_core::injection_tracking::{
-            freshness_report, ChannelStatus, InjectionChannel,
+            ChannelStatus, InjectionChannel, freshness_report,
         };
         let mut session = ObservabilitySession::new_simple("sess-tier4");
         session.recent_failing_tests = vec!["old failure".to_string()];
@@ -1534,7 +1534,7 @@ mod tests {
     #[test]
     fn observe_injections_tracks_each_channel_independently() {
         use astra_turn_core::injection_tracking::{
-            freshness_report, ChannelStatus, InjectionChannel,
+            ChannelStatus, InjectionChannel, freshness_report,
         };
         let mut session = ObservabilitySession::new_simple("sess-chan-sep");
         session.outcome_bias.insert("bash".to_string(), 0.10);
@@ -1958,7 +1958,7 @@ mod tests {
         // it, the next observation reports the channel as Empty (no
         // content) rather than Stale.
         use astra_turn_core::injection_tracking::{
-            freshness_report, ChannelStatus, InjectionChannel,
+            ChannelStatus, InjectionChannel, freshness_report,
         };
         let mut s = ObservabilitySession::new_simple("sess-tier1-e2e");
 
