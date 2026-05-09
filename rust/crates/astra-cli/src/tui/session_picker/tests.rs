@@ -4,13 +4,7 @@
 
 use super::discovery::{SessionDiscovery, SessionEntry, StaticSessionSource};
 
-fn entry(
-    id: &str,
-    cwd: &str,
-    branch: &str,
-    turns: u32,
-    summary: &str,
-) -> SessionEntry {
+fn entry(id: &str, cwd: &str, branch: &str, turns: u32, summary: &str) -> SessionEntry {
     SessionEntry {
         id: id.into(),
         cwd: cwd.into(),
@@ -35,7 +29,13 @@ fn entry(
 
 fn fixture_source() -> StaticSessionSource {
     StaticSessionSource::new(vec![
-        entry("sess_abc123", "~/astra", "enhance_tui", 12, "refactor tui approval"),
+        entry(
+            "sess_abc123",
+            "~/astra",
+            "enhance_tui",
+            12,
+            "refactor tui approval",
+        ),
         entry("sess_def456", "~/astra", "main", 3, "initial setup"),
         entry("sess_xyz789", "~/other", "feat/login", 20, "add auth flow"),
     ])
@@ -152,7 +152,10 @@ fn selection_clamps_when_filter_shrinks_matches() {
     assert!(before.is_some());
     d.set_filter("auth");
     let after = d.selected().expect("still has selection");
-    assert!(after < d.len(), "selection must clamp into the shrunk window");
+    assert!(
+        after < d.len(),
+        "selection must clamp into the shrunk window"
+    );
 }
 
 // ─── Accept ────────────────────────────────────────────────────────

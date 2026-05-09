@@ -105,10 +105,7 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
             gutter,
             Span::styled(padded_name, name_style),
             Span::raw("  "),
-            Span::styled(
-                truncated_desc,
-                Style::default().add_modifier(Modifier::DIM),
-            ),
+            Span::styled(truncated_desc, Style::default().add_modifier(Modifier::DIM)),
         ]);
         // Cursor-style: the whole row gets a subtle tinted background
         // when selected so it stays visible even on wide terminals
@@ -252,10 +249,7 @@ mod tests {
         for _ in 0..11 {
             menu.move_down();
         }
-        insta::assert_snapshot!(
-            "slash_popup_long_list_sel11_80",
-            render_menu(&menu, 80, 10)
-        );
+        insta::assert_snapshot!("slash_popup_long_list_sel11_80", render_menu(&menu, 80, 10));
     }
 
     // ─── Non-snapshot unit tests ──────────────────────────────────

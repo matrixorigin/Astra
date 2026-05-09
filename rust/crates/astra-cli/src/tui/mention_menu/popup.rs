@@ -85,10 +85,7 @@ pub(crate) fn render(menu: &MentionMenu, area: Rect, buf: &mut Buffer) {
             .saturating_sub(2)
             .saturating_sub(path_col_width);
 
-        let path_visible = truncate_ellipsis(
-            &padded_path,
-            (area.width as usize).saturating_sub(4),
-        );
+        let path_visible = truncate_ellipsis(&padded_path, (area.width as usize).saturating_sub(4));
 
         let mut line = Line::from(vec![
             gutter,

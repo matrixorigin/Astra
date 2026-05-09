@@ -142,8 +142,7 @@ impl StatusLine {
         }
 
         if let Some(branch) = ctx.git_branch.as_deref() {
-            out.right
-                .push(Segment::styled(format!("⎇ {branch}"), dim));
+            out.right.push(Segment::styled(format!("⎇ {branch}"), dim));
         }
 
         if let Some(cwd) = ctx.cwd.as_deref() {
@@ -169,8 +168,7 @@ impl StatusLine {
         }
 
         if let Some(cost) = ctx.cost_usd {
-            out.right
-                .push(Segment::styled(format!("${cost:.2}"), dim));
+            out.right.push(Segment::styled(format!("${cost:.2}"), dim));
         }
 
         out
@@ -219,8 +217,7 @@ impl StatusLine {
         }
 
         let right_w: usize = right_spans.iter().map(|s| s.content.width()).sum();
-        let padding = (area.width as usize)
-            .saturating_sub(left_w + right_w + 2);
+        let padding = (area.width as usize).saturating_sub(left_w + right_w + 2);
 
         let mut all = left_spans;
         all.push(Span::raw(" ".repeat(padding)));
@@ -230,17 +227,18 @@ impl StatusLine {
     }
 }
 
-fn join_segments(segments: &[Segment], sep: &Span<'_>, leading_spaces: usize) -> Vec<Span<'static>> {
+fn join_segments(
+    segments: &[Segment],
+    sep: &Span<'_>,
+    leading_spaces: usize,
+) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(segments.len() * 2 + 1);
     if leading_spaces > 0 {
         spans.push(Span::raw(" ".repeat(leading_spaces)));
     }
     for (i, seg) in segments.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(
-                sep.content.to_string(),
-                sep.style,
-            ));
+            spans.push(Span::styled(sep.content.to_string(), sep.style));
         }
         spans.push(Span::styled(seg.text.clone(), seg.style));
     }

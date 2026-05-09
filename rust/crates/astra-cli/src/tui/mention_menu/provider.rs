@@ -198,7 +198,10 @@ mod provider_tests {
         let names: Vec<&str> = root.iter().map(|e| e.path.as_str()).collect();
         assert!(names.contains(&"src"));
         assert!(names.contains(&"README.md"));
-        assert!(!names.contains(&"src/main.rs"), "nested file excluded at root");
+        assert!(
+            !names.contains(&"src/main.rs"),
+            "nested file excluded at root"
+        );
     }
 
     #[test]

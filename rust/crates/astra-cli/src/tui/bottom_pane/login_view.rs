@@ -55,13 +55,28 @@ impl LoginMode {
     fn fields(self) -> &'static [FieldSpec] {
         match self {
             LoginMode::Login => &[
-                FieldSpec { label: "Username", kind: FieldKind::Plain },
-                FieldSpec { label: "Password", kind: FieldKind::Secret },
+                FieldSpec {
+                    label: "Username",
+                    kind: FieldKind::Plain,
+                },
+                FieldSpec {
+                    label: "Password",
+                    kind: FieldKind::Secret,
+                },
             ],
             LoginMode::Register => &[
-                FieldSpec { label: "Username", kind: FieldKind::Plain },
-                FieldSpec { label: "Email   ", kind: FieldKind::Plain },
-                FieldSpec { label: "Password", kind: FieldKind::Secret },
+                FieldSpec {
+                    label: "Username",
+                    kind: FieldKind::Plain,
+                },
+                FieldSpec {
+                    label: "Email   ",
+                    kind: FieldKind::Plain,
+                },
+                FieldSpec {
+                    label: "Password",
+                    kind: FieldKind::Secret,
+                },
             ],
         }
     }
@@ -145,7 +160,9 @@ impl BottomPaneView for LoginView {
             let caret = if focused {
                 Span::styled(
                     "▸ ",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 )
             } else {
                 Span::raw("  ")
@@ -178,7 +195,10 @@ impl BottomPaneView for LoginView {
         if let Some(ref err) = self.error {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("✗ ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "✗ ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(err.clone(), Style::default().fg(Color::Red)),
             ]));
             lines.push(Line::default());

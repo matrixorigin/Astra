@@ -144,7 +144,8 @@ impl ChatComposer {
         }
         self.paste_counter += 1;
         let placeholder = format!("[Pasted #{} · {} lines]", self.paste_counter, line_count);
-        self.pasted_blobs.push((placeholder.clone(), text.to_string()));
+        self.pasted_blobs
+            .push((placeholder.clone(), text.to_string()));
         self.textarea.insert_str(&placeholder);
         true
     }
@@ -377,8 +378,7 @@ impl ChatComposer {
         // paint the prefix in the theme accent — gives users a quick
         // "message accepted" cue that doesn't require reading the
         // scrollback.
-        let mut prefix_style =
-            Style::default().add_modifier(ratatui::style::Modifier::BOLD);
+        let mut prefix_style = Style::default().add_modifier(ratatui::style::Modifier::BOLD);
         if self.is_flashing() {
             let theme = crate::tui::theme::current();
             prefix_style = prefix_style.fg(theme.accent);
@@ -489,7 +489,10 @@ mod paste_tests {
         let _ = c.clear_and_submit();
 
         let t0 = c.last_submit_at.expect("submit should stamp an instant");
-        assert!(c.is_flashing_at_for_test(t0), "flash is on immediately after submit");
+        assert!(
+            c.is_flashing_at_for_test(t0),
+            "flash is on immediately after submit"
+        );
         assert!(
             c.is_flashing_at_for_test(t0 + SUBMIT_FLASH_DURATION / 2),
             "still flashing halfway through"

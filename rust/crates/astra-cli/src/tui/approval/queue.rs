@@ -215,7 +215,9 @@ impl ApprovalQueue {
 
     /// Action of the currently focused button on the focused entry.
     pub fn focused_button_action(&self) -> Option<super::button_row::ButtonAction> {
-        self.entries.get(self.focus).and_then(|e| e.buttons.activate())
+        self.entries
+            .get(self.focus)
+            .and_then(|e| e.buttons.activate())
     }
 
     /// Resolve every pending entry with the same response. Returns the

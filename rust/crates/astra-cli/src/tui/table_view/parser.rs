@@ -107,8 +107,5 @@ fn split_row(s: &str) -> Vec<String> {
     let t = s.trim();
     // Strip the leading and trailing `|` then split on interior pipes.
     let inner = &t[1..t.len() - 1];
-    inner
-        .split('|')
-        .map(|c| c.trim().to_string())
-        .collect()
+    inner.split('|').map(|c| c.trim().to_string()).collect()
 }

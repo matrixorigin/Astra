@@ -239,10 +239,7 @@ impl BottomPane {
             }
         }
 
-        if self.view_stack.is_empty()
-            && text.starts_with('$')
-            && !self.skill_items.is_empty()
-        {
+        if self.view_stack.is_empty() && text.starts_with('$') && !self.skill_items.is_empty() {
             self.slash_menu = None;
             self.close_mention();
             let popup = self
@@ -358,7 +355,10 @@ impl BottomPane {
             ButtonAction::RespondAll(resp) => {
                 let n = self.approval_queue.respond_all(resp);
                 self.footer.pending_approvals = self.approval_queue.len();
-                Some(ApprovalActivation::Batch { count: n, response: resp })
+                Some(ApprovalActivation::Batch {
+                    count: n,
+                    response: resp,
+                })
             }
         }
     }
@@ -404,7 +404,9 @@ impl BottomPane {
 
     /// Build a live `ApprovalChatCell` from the currently focused queue
     /// entry. `None` when nothing is pending.
-    pub fn focused_approval_cell(&self) -> Option<crate::tui::chat_cell::approval_cell::ApprovalChatCell> {
+    pub fn focused_approval_cell(
+        &self,
+    ) -> Option<crate::tui::chat_cell::approval_cell::ApprovalChatCell> {
         let view = self.approval_queue.focused_view()?;
         let buttons = self.approval_queue.focused_button_row()?.clone();
         let mut cell = crate::tui::chat_cell::approval_cell::ApprovalChatCell::new(
@@ -503,9 +505,7 @@ impl BottomPane {
         if self.has_pending_approvals() {
             // Ctrl+Enter → quick accept regardless of button focus.
             if key.code == KeyCode::Enter && ctrl {
-                if let Some(id) =
-                    self.respond_focused_approval(ApprovalResponse::AllowOnce)
-                {
+                if let Some(id) = self.respond_focused_approval(ApprovalResponse::AllowOnce) {
                     return BottomPaneAction::ApprovalResolved { id };
                 }
                 return BottomPaneAction::Consumed;
@@ -784,8 +784,7 @@ impl BottomPane {
                     y += 1;
                 }
                 if want_status {
-                    self.footer
-                        .render(Rect::new(area.x, y, area.width, 1), buf);
+                    self.footer.render(Rect::new(area.x, y, area.width, 1), buf);
                 }
                 return;
             }
@@ -885,7 +884,10 @@ pub(crate) enum ApprovalActivation {
     /// Resolved a single entry via its button.
     Single { id: u64, response: ApprovalResponse },
     /// Resolved the whole queue via Accept-all / Reject-all.
-    Batch { count: usize, response: ApprovalResponse },
+    Batch {
+        count: usize,
+        response: ApprovalResponse,
+    },
 }
 
 #[derive(Debug)]

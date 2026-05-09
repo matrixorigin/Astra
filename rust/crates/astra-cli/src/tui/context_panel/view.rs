@@ -69,7 +69,9 @@ fn title_line(b: &ContextBreakdown, band: PressureBand) -> Line<'static> {
     let headline = format!(" Context window ({pct:.0}% · {}) ", band.label());
     Line::from(vec![Span::styled(
         headline,
-        Style::default().fg(band.color()).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(band.color())
+            .add_modifier(Modifier::BOLD),
     )])
 }
 
@@ -165,14 +167,7 @@ mod tests {
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
     use astra_turn_core::context_assembly_trace::TokenBudgetTrace;
 
-    fn trace(
-        max: u32,
-        sys: u32,
-        hist: u32,
-        mem: u32,
-        tools: u32,
-        user: u32,
-    ) -> TokenBudgetTrace {
+    fn trace(max: u32, sys: u32, hist: u32, mem: u32, tools: u32, user: u32) -> TokenBudgetTrace {
         let total = sys + hist + mem + tools + user;
         let pressure = if max == 0 {
             0.0

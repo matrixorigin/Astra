@@ -191,7 +191,10 @@ fn right_segments_joined_with_middle_dot() {
         ..ctx()
     };
     let s = StatusLine::from_context(&c);
-    assert!(s.right.len() >= 3, "three fields should yield >= 3 segments");
+    assert!(
+        s.right.len() >= 3,
+        "three fields should yield >= 3 segments"
+    );
     let plain = s.plain();
     assert!(
         plain.contains(" · "),
@@ -262,8 +265,9 @@ fn pending_chip_is_yellow_bold() {
         .find(|seg| seg.text.contains("pending"))
         .expect("pending chip");
     assert_eq!(chip.style.fg, Some(ratatui::style::Color::Yellow));
-    assert!(chip
-        .style
-        .add_modifier
-        .contains(ratatui::style::Modifier::BOLD));
+    assert!(
+        chip.style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
 }

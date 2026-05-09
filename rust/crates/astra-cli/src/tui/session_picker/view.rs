@@ -71,8 +71,8 @@ pub(crate) fn render(disco: &SessionDiscovery, area: Rect, buf: &mut Buffer) {
         return;
     }
 
-    let chunks = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(inner);
+    let chunks =
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(inner);
     render_list(disco, chunks[0], buf, true);
     render_detail(disco, chunks[1], buf);
 }
@@ -81,7 +81,9 @@ fn title_line(disco: &SessionDiscovery) -> Line<'static> {
     let total = format!(" Resume session ({}) ", disco.len());
     let mut spans = vec![Span::styled(
         total,
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )];
     if !disco.filter().is_empty() {
         spans.push(Span::styled(
@@ -116,7 +118,9 @@ fn render_list(disco: &SessionDiscovery, area: Rect, buf: &mut Buffer, _two_pane
         };
 
         let name_style = if is_selected {
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -155,7 +159,11 @@ fn render_list(disco: &SessionDiscovery, area: Rect, buf: &mut Buffer, _two_pane
         let mut summary_line = Line::from(vec![
             Span::raw("    "),
             Span::styled(
-                entry.summary.as_deref().unwrap_or("(no summary)").to_string(),
+                entry
+                    .summary
+                    .as_deref()
+                    .unwrap_or("(no summary)")
+                    .to_string(),
                 dim,
             ),
         ]);
@@ -307,7 +315,17 @@ mod tests {
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
 
     #[allow(clippy::too_many_arguments)]
-    fn mk(id: &str, cwd: &str, branch: &str, turns: u32, tin: u64, tout: u64, cost: Option<f64>, sum: &str, iso: &str) -> SessionEntry {
+    fn mk(
+        id: &str,
+        cwd: &str,
+        branch: &str,
+        turns: u32,
+        tin: u64,
+        tout: u64,
+        cost: Option<f64>,
+        sum: &str,
+        iso: &str,
+    ) -> SessionEntry {
         SessionEntry {
             id: id.into(),
             cwd: cwd.into(),
@@ -330,9 +348,39 @@ mod tests {
         // Use ISO timestamps far in the past so `short_age` yields
         // stable "days ago" values independent of when the test runs.
         let src = StaticSessionSource::new(vec![
-            mk("sess_abc123", "~/astra", "enhance_tui", 12, 8100, 3400, Some(0.42), "refactor tui approval", "2024-01-15T10:00:00Z"),
-            mk("sess_def456", "~/astra", "main", 3, 1200, 600, Some(0.05), "initial setup", "2024-01-15T08:00:00Z"),
-            mk("sess_xyz789", "~/other", "feat/login", 20, 42000, 18000, Some(3.10), "add auth flow with OAuth", "2024-01-14T12:00:00Z"),
+            mk(
+                "sess_abc123",
+                "~/astra",
+                "enhance_tui",
+                12,
+                8100,
+                3400,
+                Some(0.42),
+                "refactor tui approval",
+                "2024-01-15T10:00:00Z",
+            ),
+            mk(
+                "sess_def456",
+                "~/astra",
+                "main",
+                3,
+                1200,
+                600,
+                Some(0.05),
+                "initial setup",
+                "2024-01-15T08:00:00Z",
+            ),
+            mk(
+                "sess_xyz789",
+                "~/other",
+                "feat/login",
+                20,
+                42000,
+                18000,
+                Some(3.10),
+                "add auth flow with OAuth",
+                "2024-01-14T12:00:00Z",
+            ),
         ]);
         SessionDiscovery::new(src, 10)
     }
@@ -359,7 +407,10 @@ mod tests {
     fn snapshot_filtered_to_single_match() {
         let mut d = fixture();
         d.set_filter("auth");
-        insta::assert_snapshot!("session_picker_filter_auth_100x10", render_picker(&d, 100, 10));
+        insta::assert_snapshot!(
+            "session_picker_filter_auth_100x10",
+            render_picker(&d, 100, 10)
+        );
     }
 
     #[test]
@@ -379,14 +430,20 @@ mod tests {
     fn snapshot_empty_after_filter() {
         let mut d = fixture();
         d.set_filter("zzz_nope");
-        insta::assert_snapshot!("session_picker_empty_filtered_80x4", render_picker(&d, 80, 4));
+        insta::assert_snapshot!(
+            "session_picker_empty_filtered_80x4",
+            render_picker(&d, 80, 4)
+        );
     }
 
     #[test]
     fn snapshot_selection_moved_down() {
         let mut d = fixture();
         d.move_down();
-        insta::assert_snapshot!("session_picker_second_selected_100x10", render_picker(&d, 100, 10));
+        insta::assert_snapshot!(
+            "session_picker_second_selected_100x10",
+            render_picker(&d, 100, 10)
+        );
     }
 
     // ─── Pure unit tests ──────────────────────────────────────────

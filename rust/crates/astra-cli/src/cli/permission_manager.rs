@@ -1785,12 +1785,12 @@ impl PermissionManager {
         let Ok(abs) = canonicalize_lossy(candidate) else {
             return false;
         };
-        self.trusted_sandbox_roots.iter().any(|root| {
-            match canonicalize_lossy(root) {
+        self.trusted_sandbox_roots
+            .iter()
+            .any(|root| match canonicalize_lossy(root) {
                 Ok(abs_root) => abs.starts_with(&abs_root),
                 Err(_) => abs.starts_with(root),
-            }
-        })
+            })
     }
 
     /// Summary of current permission state for `/allow rules`.
@@ -2687,7 +2687,12 @@ mod tests {
         let args = serde_json::json!({"reason": raw_fs_msg});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
         match decision {
-            PermissionDecision::NeedApproval { header, detail, reason, .. } => {
+            PermissionDecision::NeedApproval {
+                header,
+                detail,
+                reason,
+                ..
+            } => {
                 assert_eq!(header, "read_file wants to read outside the project");
                 assert_eq!(detail, None, "detail must be empty — it would echo reason");
                 assert!(
@@ -2769,7 +2774,8 @@ mod tests {
         pm.add_allow_rule(&rule);
 
         // Second call, different path string.
-        let args_b = serde_json::json!({"reason": "Path '/b/deeper' is outside the project '/root'."});
+        let args_b =
+            serde_json::json!({"reason": "Path '/b/deeper' is outside the project '/root'."});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args_b);
         assert!(
             matches!(decision, PermissionDecision::Allow),

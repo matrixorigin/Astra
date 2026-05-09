@@ -9,8 +9,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Widget};
 
-use super::parser::MysqlTable;
 use super::TableNav;
+use super::parser::MysqlTable;
 
 pub(crate) const MAX_CELL_WIDTH: u16 = 24;
 
@@ -87,14 +87,12 @@ pub(crate) fn render(table: &MysqlTable, nav: &TableNav, area: Rect, buf: &mut B
     state.select(Some(nav.row));
 
     let theme = crate::tui::theme::current();
-    let table_widget = Table::new(body, widths)
-        .header(header)
-        .row_highlight_style(
-            Style::default()
-                .bg(theme.accent)
-                .fg(theme.selected_fg)
-                .add_modifier(Modifier::BOLD),
-        );
+    let table_widget = Table::new(body, widths).header(header).row_highlight_style(
+        Style::default()
+            .bg(theme.accent)
+            .fg(theme.selected_fg)
+            .add_modifier(Modifier::BOLD),
+    );
 
     ratatui::widgets::StatefulWidget::render(table_widget, table_rect, buf, &mut state);
 }
@@ -123,7 +121,9 @@ fn title_line(table: &MysqlTable, nav: &TableNav) -> Line<'static> {
             },
             col_label,
         ),
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     ))
 }
 

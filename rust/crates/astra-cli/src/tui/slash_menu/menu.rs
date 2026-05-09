@@ -133,9 +133,7 @@ impl SlashMenu {
 
     /// The currently selected item, if any.
     pub fn selected_item(&self) -> Option<&SlashItem> {
-        self.filtered
-            .get(self.selected)
-            .map(|&i| &self.items[i])
+        self.filtered.get(self.selected).map(|&i| &self.items[i])
     }
 
     pub fn len(&self) -> usize {

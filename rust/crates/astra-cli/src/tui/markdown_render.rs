@@ -148,12 +148,8 @@ impl Writer {
             // text. Body colour is already the blockquote style
             // (pushed on start_tag).
             if self.in_blockquote {
-                let mut with_bar: Vec<Span<'static>> =
-                    Vec::with_capacity(spans.len() + 1);
-                with_bar.push(Span::styled(
-                    "│ ",
-                    self.styles.blockquote,
-                ));
+                let mut with_bar: Vec<Span<'static>> = Vec::with_capacity(spans.len() + 1);
+                with_bar.push(Span::styled("│ ", self.styles.blockquote));
                 with_bar.extend(spans);
                 self.lines.push(Line::from(with_bar));
             } else {
@@ -694,7 +690,12 @@ mod polish_tests {
         render_markdown_text(md)
             .lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect()
     }
 
@@ -702,7 +703,12 @@ mod polish_tests {
         render_markdown_text_with_width(md, Some(width))
             .lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect()
     }
 
@@ -779,8 +785,12 @@ mod polish_tests {
 ";
         // Tight width — columns must shrink and body must wrap.
         let out = lines_at(md, 28);
-        let grid_lines: Vec<&String> =
-            out.iter().filter(|l| l.starts_with('│') || l.starts_with('┌') || l.starts_with('├') || l.starts_with('└')).collect();
+        let grid_lines: Vec<&String> = out
+            .iter()
+            .filter(|l| {
+                l.starts_with('│') || l.starts_with('┌') || l.starts_with('├') || l.starts_with('└')
+            })
+            .collect();
         assert!(!grid_lines.is_empty(), "no grid lines produced: {out:?}");
         for l in &grid_lines {
             assert!(

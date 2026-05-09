@@ -91,7 +91,9 @@ mod tests {
     }
 
     fn fixture() -> WorktreesView {
-        let v = parse("worktree /a\nHEAD abc\nbranch refs/heads/main\n\nworktree /b\nHEAD def\nbranch refs/heads/feat\n");
+        let v = parse(
+            "worktree /a\nHEAD abc\nbranch refs/heads/main\n\nworktree /b\nHEAD def\nbranch refs/heads/feat\n",
+        );
         WorktreesView::new(WorktreeList::new(v))
     }
 

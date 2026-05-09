@@ -13,7 +13,13 @@ fn channel() -> (
     oneshot::channel()
 }
 
-fn enqueue(q: &mut ApprovalQueue, tool: &str) -> (super::queue::ApprovalId, oneshot::Receiver<ApprovalResponse>) {
+fn enqueue(
+    q: &mut ApprovalQueue,
+    tool: &str,
+) -> (
+    super::queue::ApprovalId,
+    oneshot::Receiver<ApprovalResponse>,
+) {
     let (tx, rx) = channel();
     let id = q.push(
         tool.to_string(),

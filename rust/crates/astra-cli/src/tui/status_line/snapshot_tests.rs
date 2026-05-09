@@ -78,10 +78,7 @@ fn snapshot_high_token_usage_with_cost() {
         cost_usd: Some(3.47),
         ..base_ctx()
     };
-    insta::assert_snapshot!(
-        "status_high_tokens_with_cost_80",
-        render_ctx(&ctx, 80)
-    );
+    insta::assert_snapshot!("status_high_tokens_with_cost_80", render_ctx(&ctx, 80));
 }
 
 #[test]
@@ -142,9 +139,7 @@ fn snapshot_pending_with_auto_mode() {
 #[test]
 fn snapshot_very_long_cwd_truncates() {
     let ctx = StatusContext {
-        cwd: Some(
-            "~/a/very/very/very/deep/project/path/that/exceeds/limit".into(),
-        ),
+        cwd: Some("~/a/very/very/very/deep/project/path/that/exceeds/limit".into()),
         ..StatusContext::default()
     };
     insta::assert_snapshot!("status_long_cwd_80", render_ctx(&ctx, 80));

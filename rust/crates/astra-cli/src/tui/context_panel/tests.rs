@@ -7,7 +7,11 @@ use astra_turn_core::context_assembly_trace::TokenBudgetTrace;
 
 fn trace(max: u32, sys: u32, hist: u32, mem: u32, tools: u32, user: u32) -> TokenBudgetTrace {
     let total = sys + hist + mem + tools + user;
-    let pressure = if max == 0 { 0.0 } else { total as f64 / max as f64 };
+    let pressure = if max == 0 {
+        0.0
+    } else {
+        total as f64 / max as f64
+    };
     TokenBudgetTrace {
         max_tokens: max,
         system_prompt_tokens: sys,
