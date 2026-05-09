@@ -39,6 +39,41 @@ fn turn_active_replaces_hints_with_interrupt_prompt() {
     );
 }
 
+#[test]
+fn very_narrow_width_degrades_idle_hint_to_tiny_form() {
+    // At 40 cols with model + git branch on the right, the full hint
+    // won't fit; renderer must fall back to `/ @ $` so the right side
+    // stays visible. Verified via rendered ratatui buffer rather than
+    // `.plain()` because the degradation lives in `render()`.
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let c = StatusContext {
+        model: Some("sonnet-4.6".into()),
+        git_branch: Some("enhance_tui".into()),
+        ..ctx()
+    };
+    let s = StatusLine::from_context(&c);
+    let area = Rect::new(0, 0, 40, 1);
+    let mut buf = Buffer::empty(area);
+    s.render(area, &mut buf);
+    let rendered: String = (0..area.width)
+        .map(|x| buf[(x, 0)].symbol().to_string())
+        .collect();
+    assert!(
+        rendered.contains("/ @ $"),
+        "tiny hint should still show trigger keys; got {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("Ctrl+O transcript"),
+        "full hint must degrade at 40 cols; got {rendered:?}"
+    );
+    assert!(
+        rendered.contains("sonnet-4.6"),
+        "model must survive the degradation; got {rendered:?}"
+    );
+}
+
 // ─── Permission mode chip ─────────────────────────────────────────
 
 #[test]

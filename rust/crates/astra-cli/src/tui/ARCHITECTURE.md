@@ -203,6 +203,7 @@ slash_dispatch::dispatch("/model", ctx)
 | `Ctrl+D` | Composer empty | Quit |
 | `Ctrl+L` | Any | Force full redraw |
 | `Ctrl+O` | Idle | Open transcript overlay (scales to terminal height) |
+| `Ctrl+R` | Idle, composer empty | Pull last user message back into composer for editing / retry |
 | `Ctrl+U` | Composer | Kill to start of line |
 | `Esc` | Overlay/Popup | Close and return |
 | `/` | Composer | Slash command popup |

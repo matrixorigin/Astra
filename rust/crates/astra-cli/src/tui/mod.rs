@@ -323,6 +323,25 @@ pub(crate) async fn run_tui_repl(
                         // height is threaded through so the overlay
                         // fills the screen on tall windows instead of
                         // stopping at a fixed 16-line peephole.
+                        // Ctrl+R: edit last — pull the most recent user
+                        // message back into the composer so the user can
+                        // re-word and resubmit without retyping. Works only
+                        // when idle (no overlay, composer empty) so it
+                        // doesn't clobber in-flight drafts. The prior
+                        // scrollback stays visible: the retry runs as a
+                        // fresh turn below, and the model sees the earlier
+                        // attempt + its reply as context (which is the point
+                        // — "try again, differently").
+                        if key.code == crossterm::event::KeyCode::Char('r')
+                            && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                            && !bottom_pane.has_active_view()
+                            && bottom_pane.composer.is_empty()
+                            && let Some(prev) = chat_widget.last_user_text()
+                        {
+                            bottom_pane.composer.set_text(&prev);
+                            frame_requester.schedule_frame();
+                            continue;
+                        }
                         if key.code == crossterm::event::KeyCode::Char('o')
                             && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                             && !bottom_pane.has_active_view()

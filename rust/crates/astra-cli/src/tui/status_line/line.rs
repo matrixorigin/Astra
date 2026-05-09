@@ -80,6 +80,11 @@ pub(crate) struct StatusLine {
     pub right: Vec<Segment>,
 }
 
+/// Full idle hint. Shown when the terminal is wide enough.
+pub(crate) const IDLE_HINT_FULL: &str = "/ @ $ · Ctrl+O transcript";
+/// Tiny idle hint for very narrow terminals.
+pub(crate) const IDLE_HINT_TINY: &str = "/ @ $";
+
 /// Threshold below which the budget chip is dim, above which it warns.
 const BUDGET_WARN_PERCENT: f32 = 75.0;
 const BUDGET_ERROR_PERCENT: f32 = 90.0;
@@ -93,10 +98,14 @@ impl StatusLine {
         let mut out = Self::default();
 
         // ── Left: short hint, then permission chip if non-default ─
+        //
+        // Idle hint is built in two forms so the renderer can swap to the
+        // short form when the terminal is too narrow for the full one.
+        // `render()` picks between them based on remaining width.
         let hint_text = if ctx.turn_active {
             "Ctrl+C interrupt".to_string()
         } else {
-            "/ @ $ · Ctrl+O transcript".to_string()
+            IDLE_HINT_FULL.to_string()
         };
         out.left.push(Segment::styled(hint_text, dim));
 
@@ -200,7 +209,14 @@ impl StatusLine {
         }
         let sep = Span::styled(" · ", Style::default().fg(Color::DarkGray));
 
-        let left_spans = join_segments(&self.left, &sep, 2 /* leading indent */);
+        // Narrow-width degradation of the idle hint. When the full hint
+        // won't leave room for the model name / key stats on the right,
+        // swap to the short form, and ultimately to the tiny form. Only
+        // triggers if segment 0 is one of our known hint strings, so we
+        // never mutate user-supplied content.
+        let left_segments = self.narrowed_left_segments(area.width);
+
+        let left_spans = join_segments(&left_segments, &sep, 2 /* leading indent */);
         let mut right_segments: &[Segment] = &self.right;
         let mut right_spans;
         let left_w: usize = left_spans.iter().map(|s| s.content.width()).sum();
@@ -224,6 +240,55 @@ impl StatusLine {
         all.extend(right_spans);
 
         Widget::render(Line::from(all), area, buf);
+    }
+
+    /// Return `self.left` with the lead hint swapped for a shorter
+    /// variant if the full form plus non-droppable right segments
+    /// wouldn't fit. The "floor" right width is the first right segment
+    /// only (typically the model name) — we want to protect that above
+    /// the nice-to-have hint detail.
+    fn narrowed_left_segments(&self, width: u16) -> Vec<Segment> {
+        let Some(first) = self.left.first() else {
+            return self.left.clone();
+        };
+        // Only degrade the known idle-hint strings. `Ctrl+C interrupt`
+        // during an active turn is already short; leave untouched.
+        if first.text != IDLE_HINT_FULL {
+            return self.left.clone();
+        }
+        // Width of everything except the lead hint: rest of left segs +
+        // separators, all of right (floor) + margins. The lead hint
+        // itself is what we're shrinking, so exclude it from this sum.
+        let sep_w = " · ".chars().count();
+        let lead_indent = 2;
+        let trailing_margin = 2;
+
+        let other_left_w: usize = self
+            .left
+            .iter()
+            .skip(1)
+            .map(|s| s.text.chars().count() + sep_w)
+            .sum();
+        // Protect the first right segment (model name) minimum. Others
+        // drop naturally in render().
+        let right_floor = self
+            .right
+            .first()
+            .map(|s| s.text.chars().count() + sep_w)
+            .unwrap_or(0);
+
+        let overhead = lead_indent + other_left_w + right_floor + trailing_margin;
+        let available = (width as usize).saturating_sub(overhead);
+
+        let chosen = if IDLE_HINT_FULL.chars().count() <= available {
+            IDLE_HINT_FULL
+        } else {
+            IDLE_HINT_TINY
+        };
+
+        let mut out = self.left.clone();
+        out[0] = Segment::styled(chosen, first.style);
+        out
     }
 }
 

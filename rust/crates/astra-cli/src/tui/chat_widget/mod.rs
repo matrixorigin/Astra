@@ -158,6 +158,25 @@ impl ChatWidget {
         self.committed_watermark = self.history.len();
     }
 
+    /// Find the last committed `UserCell` and return its text, along
+    /// with the number of history entries from that cell onward
+    /// (caller may want to also truncate its own model-visible
+    /// history, e.g. `state.history`, by the matching turn count).
+    ///
+    /// Does NOT mutate the widget — this is a pure query. The display
+    /// scrollback is already painted to the terminal and cannot be
+    /// unwritten; the caller decides what state (if any) to
+    /// invalidate. `Ctrl+R` uses this to seed the composer with the
+    /// prior user prompt for re-editing.
+    pub fn last_user_text(&self) -> Option<String> {
+        use super::history_cell::user::UserCell;
+        self.history
+            .iter()
+            .rev()
+            .find_map(|c| c.as_any_ref().downcast_ref::<UserCell>())
+            .map(|cell| cell.text().to_string())
+    }
+
     /// Swap the backing session id. Cells committed BEFORE the
     /// swap stay where they were written; cells committed AFTER
     /// are persisted under the new id. Used when the server
@@ -699,6 +718,29 @@ mod tests {
         w.set_session_id("new-sid");
         assert_eq!(w.session_id(), "new-sid");
         assert_eq!(w.history().len(), 1, "history survives sid swap");
+    }
+
+    // ── Last user text lookup (Ctrl+R edit-last) ────────────────
+
+    #[test]
+    fn last_user_text_walks_back_past_trailing_cells() {
+        // History ends with non-User cells (assistant + summary);
+        // lookup must still surface the most recent user message.
+        let mut w = fresh();
+        w.handle_event(AppEvent::UserSubmit("first".into()));
+        w.handle_event(AppEvent::AnswerDelta("reply 1".into()));
+        w.handle_event(AppEvent::TurnComplete(Box::default()));
+        w.handle_event(AppEvent::UserSubmit("second".into()));
+        w.handle_event(AppEvent::AnswerDelta("reply 2".into()));
+        w.handle_event(AppEvent::TurnComplete(Box::default()));
+
+        assert_eq!(w.last_user_text().as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn last_user_text_none_on_empty_history() {
+        let w = fresh();
+        assert!(w.last_user_text().is_none());
     }
 
     // ── Replay ──────────────────────────────────────────────────
