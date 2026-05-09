@@ -116,32 +116,46 @@ impl HistoryCell for ReasoningCell {
             .add_modifier(Modifier::DIM)
             .add_modifier(Modifier::ITALIC);
 
-        // Header: `💭 Thinking (Xs)` live, `💭 Thought for Xs` done.
+        // Done thinking → collapse to header only (`💭 Thought for
+        // 22s (45 lines)`). A 20-second reasoning blob is ~40+
+        // wrapped rows of dim prose; scrollback-dumping all of it
+        // crowds out the actual answer below. Claude Code's default
+        // is collapse; users who want the detail can inspect the
+        // persisted transcript. Live cells still show content so
+        // the user sees progress during long thinks.
+        let line_count = self.text.lines().count();
         let header_text = if self.live {
             match self.duration_label() {
                 Some(d) => format!("💭 Thinking ({d})"),
                 None => "💭 Thinking…".to_string(),
             }
         } else {
+            let count_label = if line_count == 1 {
+                String::from("1 line")
+            } else {
+                format!("{line_count} lines")
+            };
             match self.duration_label() {
-                Some(d) => format!("💭 Thought for {d}"),
-                None => "💭 Thought".to_string(),
+                Some(d) => format!("💭 Thought for {d} ({count_label})"),
+                None => format!("💭 Thought ({count_label})"),
             }
         };
 
         let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(header_text, dim_italic))];
 
-        // Body: one line per logical line of thinking, each dim
-        // italic, prefixed with `  ` for alignment under the bullet.
-        // Hard-wrap long lines by display width to avoid terminal
-        // reflow chaos on tables in reasoning.
-        let inner_w = (width as usize).saturating_sub(2).max(20);
-        for logical in self.text.lines() {
-            for row in soft_wrap(logical, inner_w) {
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(row, dim_italic),
-                ]));
+        // Body only while live: gives progress visibility during the
+        // often-20+-second reasoning phase. Once finalised we stop
+        // rendering it — the header + line count carry the signal
+        // that thinking happened.
+        if self.live {
+            let inner_w = (width as usize).saturating_sub(2).max(20);
+            for logical in self.text.lines() {
+                for row in soft_wrap(logical, inner_w) {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(row, dim_italic),
+                    ]));
+                }
             }
         }
 
@@ -284,18 +298,59 @@ mod tests {
     }
 
     #[test]
-    fn body_rows_are_indented_under_bullet() {
+    fn live_body_rows_are_indented_under_bullet() {
+        // Live cells render their body so the user sees progress
+        // during long thinks. Each body row is indented under the
+        // `💭 ` bullet for visual alignment. Finalised cells collapse
+        // and have no body rows at all — see `finalised_cell_hides_body`.
         let mut c = ReasoningCell::new_streaming();
         c.push_delta("first thought\nsecond thought");
-        c.finalize();
         let out = render(&c, 60, 4);
         let body_rows: Vec<&str> = out
             .lines()
-            .filter(|l| !l.contains("Thought") && !l.trim().is_empty())
+            .filter(|l| !l.contains("Thinking") && !l.trim().is_empty())
             .collect();
+        assert!(!body_rows.is_empty(), "live cell must render body: {out}");
         for row in &body_rows {
             assert!(row.starts_with("  "), "body row must indent: {row:?}");
         }
+    }
+
+    #[test]
+    fn finalised_cell_hides_body_and_shows_line_count() {
+        // Claude-Code style: once thinking is done, scrollback shows
+        // only `💭 Thought for Xs (N lines)` — not the 20-40 row
+        // dim-italic wall. The count cues the user that there's
+        // substance behind the header without dumping it on-screen.
+        // (The full text stays in the JSONL transcript for later.)
+        let mut c = ReasoningCell::new_streaming();
+        c.push_delta("line one\nline two\nline three");
+        c.started_at = Some(Instant::now() - Duration::from_secs(3));
+        c.finalize();
+        let out = render(&c, 60, 4);
+        assert!(out.contains("Thought for"), "header missing: {out}");
+        assert!(out.contains("3 lines"), "line count missing: {out}");
+        assert!(
+            !out.contains("line one"),
+            "body must be hidden once finalised: {out}"
+        );
+        assert!(
+            !out.contains("line two"),
+            "body must be hidden once finalised: {out}"
+        );
+    }
+
+    #[test]
+    fn single_line_thought_uses_singular_label() {
+        let mut c = ReasoningCell::new_streaming();
+        c.push_delta("just one");
+        c.started_at = Some(Instant::now() - Duration::from_secs(1));
+        c.finalize();
+        let out = render(&c, 60, 2);
+        assert!(
+            out.contains("1 line"),
+            "singular form for single-line thought: {out}"
+        );
     }
 
     // ── Persistence ──────────────────────────────────────────────
