@@ -54,6 +54,27 @@ mod textarea_tests {
     }
 
     #[test]
+    fn ctrl_u_kills_to_start_of_line() {
+        let mut ta = TextArea::new();
+        ta.set_text("hello world");
+        // Cursor at end by default.
+        ta.handle_key(ctrl(KeyCode::Char('u')));
+        assert_eq!(ta.text(), "");
+        // Yank it back — proves the kill landed in the kill buffer.
+        ta.handle_key(ctrl(KeyCode::Char('y')));
+        assert_eq!(ta.text(), "hello world");
+    }
+
+    #[test]
+    fn ctrl_u_only_kills_current_line_not_prior_lines() {
+        let mut ta = TextArea::new();
+        ta.set_text("first\nsecond");
+        // Cursor ends at end of "second".
+        ta.handle_key(ctrl(KeyCode::Char('u')));
+        assert_eq!(ta.text(), "first\n");
+    }
+
+    #[test]
     fn ctrl_y_yanks_killed_text() {
         let mut ta = TextArea::new();
         ta.set_text("hello world");

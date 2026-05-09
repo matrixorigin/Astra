@@ -6,10 +6,17 @@ use ratatui::{
     text::{Line, Span},
     widgets::Widget,
 };
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 use super::textarea::{TextArea, TextAreaAction};
+
+/// Cap on the on-disk history so `~/.astra/history` doesn't grow
+/// unbounded. The oldest entries are dropped when the file is
+/// rewritten after an append crosses this threshold.
+const HISTORY_MAX_ENTRIES: usize = 500;
 
 /// Duration the `›` prefix glows after the user submits a message.
 /// Short enough to feel instantaneous, long enough to be noticed at a
@@ -34,6 +41,9 @@ pub(crate) struct ChatComposer {
     /// color so the user gets instant visual feedback that the message
     /// was accepted.
     last_submit_at: Option<Instant>,
+    /// On-disk history file. `None` when the home dir is undetermined
+    /// (keeps the struct usable in tests without touching the FS).
+    history_path: Option<PathBuf>,
 }
 
 /// Multi-line pastes above this threshold are swapped for a placeholder.
@@ -43,15 +53,29 @@ const PASTE_PLACEHOLDER_MIN_LINES: usize = 4;
 
 impl ChatComposer {
     pub fn new() -> Self {
+        let (history, hist_path) = load_history();
+        Self::build(history, hist_path)
+    }
+
+    /// In-memory-only composer for unit tests that shouldn't touch
+    /// `~/.astra/history`. Avoids cross-test contamination when the
+    /// suite runs in parallel with real users' history files.
+    #[cfg(test)]
+    pub(crate) fn new_ephemeral() -> Self {
+        Self::build(Vec::new(), None)
+    }
+
+    fn build(history: Vec<String>, history_path: Option<PathBuf>) -> Self {
         Self {
             textarea: TextArea::new(),
-            history: Vec::new(),
+            history,
             history_index: None,
             draft: None,
             prompt_prefix: "› ".to_string(),
             pasted_blobs: Vec::new(),
             paste_counter: 0,
             last_submit_at: None,
+            history_path,
         }
     }
 
@@ -81,7 +105,12 @@ impl ChatComposer {
         let raw = self.textarea.text().to_string();
         let expanded = self.expand_pastes(&raw);
         if !expanded.trim().is_empty() {
-            self.history.push(expanded.clone());
+            // Dedup consecutive entries — typing the same command twice
+            // in a row shouldn't double up the history list.
+            if self.history.last() != Some(&expanded) {
+                self.history.push(expanded.clone());
+                self.persist_entry(&expanded);
+            }
         }
         self.textarea.clear();
         self.history_index = None;
@@ -137,6 +166,112 @@ impl ChatComposer {
         self.pasted_blobs.len()
     }
 
+    /// Append the submitted line to the on-disk history. Multi-line
+    /// entries are encoded with a `\n` escape so each file line holds
+    /// exactly one entry — the same convention rustyline uses, making
+    /// the format interchangeable with the non-TUI REPL.
+    fn persist_entry(&self, entry: &str) {
+        let Some(ref path) = self.history_path else {
+            return;
+        };
+        let encoded = encode_entry(entry);
+        // Append-only for the common case; rotate the whole file only
+        // when the in-memory cache grows past the cap, to keep the
+        // amortised cost O(1) per submit.
+        if self.history.len() <= HISTORY_MAX_ENTRIES {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(f, "{encoded}");
+            }
+            return;
+        }
+        // Over budget: rewrite with only the newest `HISTORY_MAX_ENTRIES`.
+        let keep = &self.history[self.history.len() - HISTORY_MAX_ENTRIES..];
+        if let Ok(mut f) = std::fs::File::create(path) {
+            for line in keep {
+                let _ = writeln!(f, "{}", encode_entry(line));
+            }
+        }
+    }
+}
+
+fn history_file_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".astra").join("history"))
+}
+
+fn load_history() -> (Vec<String>, Option<PathBuf>) {
+    let Some(path) = history_file_path() else {
+        return (Vec::new(), None);
+    };
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return (Vec::new(), Some(path)),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if line.is_empty() {
+            continue;
+        }
+        out.push(decode_entry(&line));
+    }
+    // Drop ancient entries so the in-memory cache stays bounded even
+    // if the file on disk grew outside our control.
+    if out.len() > HISTORY_MAX_ENTRIES {
+        let drop = out.len() - HISTORY_MAX_ENTRIES;
+        out.drain(0..drop);
+    }
+    (out, Some(path))
+}
+
+/// Encode a history entry for single-line storage. Newlines become
+/// `\\n`, backslashes `\\\\` — lossless and readable by `decode_entry`.
+fn encode_entry(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn decode_entry(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('n') => {
+                    chars.next();
+                    out.push('\n');
+                }
+                Some('r') => {
+                    chars.next();
+                    out.push('\r');
+                }
+                Some('\\') => {
+                    chars.next();
+                    out.push('\\');
+                }
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+impl ChatComposer {
     #[cfg(test)]
     pub(crate) fn mark_submit_at_for_test(&mut self, t: Instant) {
         self.last_submit_at = Some(t);
@@ -298,7 +433,7 @@ mod paste_tests {
 
     #[test]
     fn short_paste_is_inserted_verbatim() {
-        let mut c = ChatComposer::new();
+        let mut c = ChatComposer::new_ephemeral();
         let placeholder_used = c.handle_paste("one liner");
         assert!(!placeholder_used);
         assert_eq!(c.text(), "one liner");
@@ -308,7 +443,7 @@ mod paste_tests {
     #[test]
     fn two_line_paste_still_verbatim() {
         // Only real multi-line pastes get folded; 2-line is still short.
-        let mut c = ChatComposer::new();
+        let mut c = ChatComposer::new_ephemeral();
         c.handle_paste("a\nb");
         assert_eq!(c.text(), "a\nb");
         assert_eq!(c.pasted_blob_count(), 0);
@@ -316,7 +451,7 @@ mod paste_tests {
 
     #[test]
     fn big_paste_becomes_placeholder_and_expands_on_submit() {
-        let mut c = ChatComposer::new();
+        let mut c = ChatComposer::new_ephemeral();
         let blob = "line1\nline2\nline3\nline4\nline5";
         let used = c.handle_paste(blob);
         assert!(used, "4+ line paste should trigger the placeholder");
@@ -333,7 +468,7 @@ mod paste_tests {
 
     #[test]
     fn multiple_big_pastes_get_unique_placeholders_and_both_expand() {
-        let mut c = ChatComposer::new();
+        let mut c = ChatComposer::new_ephemeral();
         c.handle_paste("a1\na2\na3\na4");
         c.set_text(&format!("{} prefix ", c.text())); // sanity: can edit around placeholder
         c.handle_paste("b1\nb2\nb3\nb4\nb5");
@@ -347,7 +482,7 @@ mod paste_tests {
 
     #[test]
     fn submit_triggers_flash_then_decays() {
-        let mut c = ChatComposer::new();
+        let mut c = ChatComposer::new_ephemeral();
         assert!(!c.is_flashing(), "fresh composer never flashes");
 
         c.set_text("hello");
@@ -371,7 +506,7 @@ mod paste_tests {
 
     #[test]
     fn empty_submit_does_not_flash() {
-        let mut c = ChatComposer::new();
+        let mut c = ChatComposer::new_ephemeral();
         // Empty textarea → clear_and_submit returns empty and should not
         // arm the flash (BottomPane also guards this upstream, but we
         // belt-and-suspenders it so accidental empty submits stay quiet).
@@ -381,8 +516,73 @@ mod paste_tests {
     }
 
     #[test]
-    fn clear_draft_drops_blobs() {
+    fn encode_decode_roundtrip_multiline() {
+        let entry = "line1\nline2\\with\\backslashes\n";
+        let encoded = encode_entry(entry);
+        assert!(
+            !encoded.contains('\n'),
+            "encoded form must be single-line for file storage, got {encoded:?}"
+        );
+        assert_eq!(decode_entry(&encoded), entry);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn history_persists_and_reloads() {
+        use std::env;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Reroute `dirs::home_dir()` by overriding HOME.
+        let prev = env::var("HOME").ok();
+        unsafe {
+            env::set_var("HOME", tmp.path());
+        }
+
+        {
+            let mut c = ChatComposer::new();
+            c.set_text("first command");
+            let _ = c.clear_and_submit();
+            c.set_text("second command\nwith newline");
+            let _ = c.clear_and_submit();
+        }
+
+        // Reload — a fresh composer should pick up both entries from disk.
+        let c2 = ChatComposer::new();
+        assert_eq!(c2.history.len(), 2);
+        assert_eq!(c2.history[0], "first command");
+        assert_eq!(c2.history[1], "second command\nwith newline");
+
+        match prev {
+            Some(v) => unsafe { env::set_var("HOME", v) },
+            None => unsafe { env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn duplicate_consecutive_submits_are_deduped() {
+        use std::env;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = env::var("HOME").ok();
+        unsafe {
+            env::set_var("HOME", tmp.path());
+        }
+
         let mut c = ChatComposer::new();
+        c.set_text("hi");
+        let _ = c.clear_and_submit();
+        c.set_text("hi");
+        let _ = c.clear_and_submit();
+        assert_eq!(c.history.len(), 1);
+
+        match prev {
+            Some(v) => unsafe { env::set_var("HOME", v) },
+            None => unsafe { env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    fn clear_draft_drops_blobs() {
+        let mut c = ChatComposer::new_ephemeral();
         c.handle_paste("1\n2\n3\n4\n5\n");
         assert_eq!(c.pasted_blob_count(), 1);
         c.clear_draft();
