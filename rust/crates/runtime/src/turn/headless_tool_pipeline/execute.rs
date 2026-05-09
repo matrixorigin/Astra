@@ -13,7 +13,6 @@ use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_resource_limit_blocked, headless_stderr_resource_limit_in_output,
 };
 use astra_turn_core::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
-use astra_turn_core::tool_result_semantics::is_tool_error;
 
 /// The sentinel error prefix emitted by `take_edge_output_for_tool_call_with_duration`
 /// when no edge agent matched the tool call.
@@ -89,6 +88,14 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             emitter.tool_executing(&execution.name, self.ctx.turn_index as u32);
         }
 
+        // P1 (tool-design-gaps plan): use `classify_tool_error` so that
+        // soft errors (read_file ENOENT, str_replace not-unique, grep
+        // no-match) are NOT counted as ToolCallFailed. Only HardError
+        // (permission denied, disk full, sandbox violation) is a real
+        // failure. Before this fix, any result starting with "Error:"
+        // was marked as failed via `is_tool_error`, which inflated
+        // ToolHealthTracker failure rates and caused CLI exit code 1
+        // even on expected-negative tool outcomes.
         let mut is_err = execution
             .tool_result_fields
             .as_ref()
@@ -96,7 +103,15 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             .and_then(serde_json::Value::as_str)
             .and_then(edge_tool_status_exit_code)
             .map(|exit_code| exit_code != 0)
-            .unwrap_or_else(|| is_tool_error(&execution.result_str));
+            .unwrap_or_else(|| {
+                use astra_turn_core::tool_result_semantics::{
+                    ToolErrorSeverity, classify_tool_error,
+                };
+                matches!(
+                    classify_tool_error(&execution.name, &execution.result_str),
+                    ToolErrorSeverity::HardError
+                )
+            });
         let tool_already_restricted = self.ctx.restricted_tools.contains(&execution.name);
         let quiet = self.ctx.quiet;
         let term = &mut self.ctx.term;

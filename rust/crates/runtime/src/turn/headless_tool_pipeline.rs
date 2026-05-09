@@ -274,8 +274,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         // Phase 3: post-process + record serially (fast, needs &mut self).
         for (execution, idem_key) in executions {
-            let is_err =
-                astra_turn_core::tool_result_semantics::is_tool_error(&execution.result_str);
+            let is_err = matches!(
+                astra_turn_core::tool_result_semantics::classify_tool_error(
+                    &execution.name,
+                    &execution.result_str,
+                ),
+                astra_turn_core::tool_result_semantics::ToolErrorSeverity::HardError
+            );
             let executed_ms = if execution.is_edge_tool && execution.edge_duration_ms > 0 {
                 execution.edge_duration_ms
             } else {
