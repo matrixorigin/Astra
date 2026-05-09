@@ -19,6 +19,7 @@ mod chat_viewport;
 // `docs/design/tui-refactor.md`.
 mod chat_widget;
 mod history_cell;
+mod status_indicator;
 mod transcript_jsonl;
 mod turn_event;
 mod color;
