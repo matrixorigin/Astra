@@ -151,8 +151,8 @@ fn flush_chat_widget(
         return;
     }
     // Batch layout: each cell renders its lines then gets a trailing
-    // blank for visual separation. Claude-Code-style response cells
-    // (`⎿ Set model to …`) want to hug the `› /cmd` line above —
+    // blank for visual separation. Response cells (`⎿ Set model to …`)
+    // want to hug the `› /cmd` line above —
     // both when paired in the same batch (no blank between them)
     // and when the UserCell flushed in an earlier event (the
     // picker-return path). For the former we detect the pair here
@@ -181,9 +181,9 @@ fn flush_chat_widget(
     guard.queue_history_lines(batch);
 }
 
-/// Detect a system cell rendered with Claude Code's corner-glyph
-/// style. Used by `flush_chat_widget` to omit the usual trailing
-/// blank so the response hugs the `› /cmd` line above it.
+/// Detect a `SystemLevel::Response` cell (the `⎿`-prefixed kind).
+/// Used by `flush_chat_widget` to omit the usual trailing blank so
+/// the response hugs the `› /cmd` line above it.
 fn is_response_cell(cell: &dyn history_cell::HistoryCell) -> bool {
     cell.as_any_ref()
         .downcast_ref::<history_cell::system::SystemCell>()

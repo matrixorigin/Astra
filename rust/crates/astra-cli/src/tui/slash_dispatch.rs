@@ -44,8 +44,8 @@ impl<'a> DispatchContext<'a> {
     }
 
     /// Slash-command response ("Set model to Opus 4.6", "Permission
-    /// mode → auto"). Rendered with Claude Code's `⎿` corner glyph
-    /// on the first line so the eye visually threads `› /cmd` → `⎿ …`.
+    /// mode → auto"). Rendered with the `⎿` corner glyph on the first
+    /// line so the eye visually threads `› /cmd` → `⎿ …`.
     fn show_response(&mut self, msg: String) {
         self.chat_widget.commit_system(SystemCell::response(msg));
     }

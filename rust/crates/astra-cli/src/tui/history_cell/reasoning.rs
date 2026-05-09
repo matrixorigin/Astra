@@ -1,13 +1,11 @@
 //! Reasoning / thinking history cell — the model's internal
 //! monologue, when the provider exposes it.
 //!
-//! Rendered as plain dim-italic rows with a bullet prefix,
-//! matching Codex's `ReasoningSummaryCell`. Deliberately NOT a
-//! framed window or a collapsing pill — the previous refactor
-//! invented both and both were wrong. A reasoning cell is just
-//! another cell in the scrollback; if the user doesn't want to
-//! see it they can hide reasoning via a toggle (not implemented
-//! here; that's a ChatWidget concern).
+//! While streaming: a fixed-height scrolling preview window so the
+//! composer stays visible. After completion: collapses to a one-line
+//! header (`💭 Thought for Xs (N lines)`) — not a framed window or
+//! expanding pill. A reasoning cell is just another cell in the
+//! scrollback; toggle visibility lives in ChatWidget, not here.
 //!
 //! Duration is captured at `finalize()` and rendered in the
 //! header (`(3s)`). Persists as [`TurnEvent::Thinking`].
@@ -128,11 +126,11 @@ impl HistoryCell for ReasoningCell {
         // Done thinking → collapse to header only (`💭 Thought for
         // 22s (45 lines)`). A 20-second reasoning blob is ~40+
         // wrapped rows of dim prose; scrollback-dumping all of it
-        // crowds out the actual answer below. Claude Code's default
-        // is collapse; users who want the detail can inspect the
-        // persisted transcript. Live cells show the most recent
-        // few rows (see `LIVE_PREVIEW_MAX_ROWS`) so the user sees
-        // progress without the viewport growing unboundedly.
+        // crowds out the actual answer below. Collapse to a one-line
+        // header; users who want the detail can inspect the persisted
+        // transcript. Live cells show the most recent few rows (see
+        // `LIVE_PREVIEW_MAX_ROWS`) so progress is visible without the
+        // viewport growing unboundedly.
         let line_count = self.text.lines().count();
         let header_text = if self.live {
             match self.duration_label() {
@@ -425,8 +423,8 @@ mod tests {
 
     #[test]
     fn finalised_cell_hides_body_and_shows_line_count() {
-        // Claude-Code style: once thinking is done, scrollback shows
-        // only `💭 Thought for Xs (N lines)` — not the 20-40 row
+        // Once thinking is done, scrollback shows only the compact
+        // header `💭 Thought for Xs (N lines)` — not the 20-40 row
         // dim-italic wall. The count cues the user that there's
         // substance behind the header without dumping it on-screen.
         // (The full text stays in the JSONL transcript for later.)

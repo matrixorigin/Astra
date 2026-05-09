@@ -186,8 +186,8 @@ slash_dispatch::dispatch("/model", ctx)
 | `bottom_pane/` | Composer, popups, overlay views, approval queue |
 | `slash_dispatch.rs` | TUI-native slash command handling (with Fallback for complex async) |
 | `terminal.rs` | `TerminalGuard` lifecycle, inline viewport, `with_restored` |
-| `custom_terminal.rs` | Dual-buffer diff terminal (ported from Codex, MIT) |
-| `wrapping.rs` | URL-aware span-preserving word wrap (ported from Codex, MIT) |
+| `custom_terminal.rs` | Dual-buffer diff terminal (inline-viewport with scroll) |
+| `wrapping.rs` | URL-aware span-preserving word wrap |
 | `markdown_render.rs` | pulldown-cmark → ratatui Lines with syntect code highlighting |
 | `insert_history.rs` | ANSI escape sequences for writing to terminal scrollback |
 
@@ -218,5 +218,5 @@ slash_dispatch::dispatch("/model", ctx)
 
 ## Design doc
 
-The full rationale, Codex / Claude Code reference audit, and phase-by-phase
-migration plan live in `docs/design/tui-refactor.md`.
+The full rationale and phase-by-phase migration plan live in
+`docs/design/tui-refactor.md`.

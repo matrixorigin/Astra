@@ -149,9 +149,9 @@ pub(crate) enum ToolStatus {
 pub(crate) enum SystemLevel {
     /// Free-floating TUI notice (session resumed, etc.). Dim.
     Info,
-    /// Result of a slash command, styled to match Claude Code's
-    /// `  ⎿  Set model to …` callback line. Dim + corner glyph so
-    /// the eye can pair it with the trailing `› /cmd` prompt above.
+    /// Result of a slash command — `  ⎿  Set model to …` style.
+    /// Dim + corner glyph so the eye can pair it with the trailing
+    /// `› /cmd` prompt above.
     #[serde(alias = "response")]
     Response,
     /// Non-fatal advisory — token budget near limit, etc. Yellow.

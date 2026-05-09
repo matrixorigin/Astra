@@ -15,11 +15,11 @@
 //!                                         ──▶ (outer draws on next frame)
 //! ```
 //!
-//! `handle_event` is deliberately one big `match`, Codex-style
-//! (§3.2 of the design doc). A reducer abstraction was tried and
-//! failed — the async HTTP stream + direct terminal IO don't map
-//! cleanly to pure `State, Action -> State`. One readable match
-//! beats a reducer that leaks `Effect`s everywhere.
+//! `handle_event` is deliberately one big `match` (§3.2 of the
+//! design doc). A reducer abstraction was tried and failed — the
+//! async HTTP stream + direct terminal IO don't map cleanly to pure
+//! `State, Action -> State`. One readable match beats a reducer that
+//! leaks `Effect`s everywhere.
 //!
 //! All non-trait callers still live in `tui/mod.rs` in Phase 3 —
 //! this module just provides the target API. Wire-up comes in

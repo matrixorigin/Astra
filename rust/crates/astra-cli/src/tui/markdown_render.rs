@@ -346,9 +346,9 @@ impl Writer {
                     }
                 }
                 Event::Code(code) => {
-                    // Cursor/Claude-Code convention: strip the literal
-                    // backticks and rely on the cyan code style to
-                    // communicate "this is code". A previous version
+                    // Strip the literal backticks and rely on the cyan
+                    // code style to communicate "this is code". A previous
+                    // version
                     // emitted `format!("`{code}`")` which left the
                     // backticks visible in scrollback — they read as
                     // noise next to the already-coloured span.

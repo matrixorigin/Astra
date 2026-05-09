@@ -96,10 +96,9 @@ impl HistoryCell for UserCell {
         }
 
         // No cell-local trailing blanks: `flush_chat_widget` adds
-        // exactly one blank row between committed cells, which
-        // matches Claude Code / Codex spacing (one visible gap
-        // between `› prose` and the next cell, zero between
-        // `› /cmd` and its `⎿ response` pair). The earlier
+        // exactly one blank row between committed cells — one visible
+        // gap between `› prose` and the next cell, zero between
+        // `› /cmd` and its `⎿ response` pair. The earlier
         // `tinted-blank + plain-blank` pair over-indented every
         // prose turn by ~2 rows of dead air before the model
         // response, which pushed tool output off the fold.

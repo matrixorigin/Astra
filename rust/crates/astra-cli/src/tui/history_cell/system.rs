@@ -32,8 +32,7 @@ impl SystemCell {
     }
 
     /// Response to a slash command. Renders with a `⎿` corner glyph
-    /// so the reply visually pairs with the `› /cmd` line above,
-    /// matching Claude Code's style:
+    /// so the reply visually pairs with the `› /cmd` line above:
     ///
     /// ```text
     /// › /model
@@ -108,10 +107,9 @@ impl HistoryCell for SystemCell {
             SystemLevel::Error => Style::default().red(),
         };
 
-        // `Response` gets the Claude-Code corner glyph on the first
-        // line and hanging-indent alignment on continuation lines,
-        // so multi-line responses read as one visual block paired
-        // with the `› /cmd` prompt above them:
+        // `Response` gets the `⎿` corner glyph on the first line and
+        // hanging-indent alignment on continuation lines, so multi-line
+        // responses read as one visual block paired with `› /cmd`:
         //
         //   › /model
         //     ⎿  Set model to Opus 4.6
@@ -214,8 +212,7 @@ mod tests {
     #[test]
     fn response_gets_claude_code_corner_glyph_on_first_line() {
         // Slash-command response must visually pair with the `›
-        // /cmd` prompt above it. Claude-Code uses `⎿` on the first
-        // content line.
+        // /cmd` prompt above it, with `⎿` on the first content line.
         let cell = SystemCell::response("Set model to Opus 4.6");
         let out = render(&cell, 60, 1);
         assert!(out.contains("⎿"), "⎿ glyph missing on response: {out:?}");
