@@ -1,0 +1,6 @@
+---
+source: crates/astra-cli/src/tui/history_cell/assistant.rs
+expression: "render(&c, 80, 3)"
+---
+  ✻ Thinking…
+    Actually, the user wants a concise answer.
