@@ -1,12 +1,17 @@
-use ratatui::style::Stylize;
-use ratatui::text::Line;
+use ratatui::style::{Style, Stylize};
+use ratatui::text::{Line, Span};
 
 use super::ChatCell;
 use crate::tui::wrapping::{RtOptions, adaptive_wrap_lines};
 
 /// A small streaming cell emitted per commit tick.
-/// Matches Codex's AgentMessageCell: a few lines with `• ` or `  ` prefix,
-/// wrapped to terminal width via adaptive_wrap_lines (URL-aware, span-preserving).
+///
+/// Cursor-style assistant reply: every line gets a colored `┃ `
+/// gutter in the theme accent so the reply reads as a distinct
+/// pull-quote without needing a separate label row. `is_first_line`
+/// still exists so the outer flow knows this cell continues a stream
+/// (no extra leading blank), but the visual prefix is now uniform
+/// across continuation cells.
 #[derive(Debug)]
 pub(crate) struct AgentMessageCell {
     lines: Vec<Line<'static>>,
@@ -31,15 +36,16 @@ impl ChatCell for AgentMessageCell {
     }
 
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let theme = crate::tui::theme::current();
+        let gutter: Line<'static> = Line::from(Span::styled(
+            "┃ ",
+            Style::default().fg(theme.accent).bold(),
+        ));
         adaptive_wrap_lines(
             &self.lines,
             RtOptions::new(width as usize)
-                .initial_indent(if self.is_first_line {
-                    "• ".dim().into()
-                } else {
-                    "  ".into()
-                })
-                .subsequent_indent("  ".into()),
+                .initial_indent(gutter.clone())
+                .subsequent_indent(gutter),
         )
     }
 

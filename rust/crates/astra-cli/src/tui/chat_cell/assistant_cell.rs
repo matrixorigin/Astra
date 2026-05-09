@@ -132,18 +132,16 @@ impl ChatCell for AssistantChatCell {
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
+        let theme = crate::tui::theme::current();
+        let gutter_style = Style::default().fg(theme.accent).bold();
 
-        // Main content with • prefix on first line (Codex style)
+        // Cursor-style: every line of the reply gets a `┃ ` gutter in
+        // the theme accent so the turn reads as a distinct pull-quote.
         if !self.rendered_lines.is_empty() {
             let last_idx = self.rendered_lines.len().saturating_sub(1);
             let show_cursor = self.is_streaming();
             for (i, line) in self.rendered_lines.iter().enumerate() {
-                let prefix = if i == 0 {
-                    Span::styled("• ", Style::default().dim())
-                } else {
-                    Span::raw("  ")
-                };
-                let mut spans = vec![prefix];
+                let mut spans = vec![Span::styled("┃ ", gutter_style)];
                 spans.extend(line.spans.iter().cloned());
                 // Append a blinking block cursor to the final rendered
                 // line while tokens are still streaming — gives users a
@@ -160,12 +158,14 @@ impl ChatCell for AssistantChatCell {
                 lines.push(Line::from(spans));
             }
         } else if self.is_thinking() {
-            // Thinking in progress, no content yet → shimmer "Working" like Codex
+            // Thinking in progress, no content yet → shimmer "Working"
+            // with the same gutter so the cell's identity is clear
+            // even before tokens start flowing.
             let working_text = format!(
                 "Working ({} • esc to interrupt)",
                 self.thinking_elapsed_str()
             );
-            let mut spans = vec![Span::styled("• ", Style::default().dim())];
+            let mut spans = vec![Span::styled("┃ ", gutter_style)];
             spans.extend(crate::tui::shimmer::shimmer_spans(&working_text));
             lines.push(Line::from(spans));
         }

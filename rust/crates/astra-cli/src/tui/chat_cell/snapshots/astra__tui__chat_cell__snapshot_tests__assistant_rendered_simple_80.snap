@@ -2,6 +2,6 @@
 source: crates/astra-cli/src/tui/chat_cell/snapshot_tests.rs
 expression: "render_cell(&cell, 80, 4)"
 ---
-• Here is the plan:
-  step one
-  step two
+┃ Here is the plan:
+┃ step one
+┃ step two
