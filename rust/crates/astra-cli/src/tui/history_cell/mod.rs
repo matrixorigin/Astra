@@ -27,6 +27,7 @@
 
 #![allow(dead_code)] // phase 2 still plumbing — consumers land with the event-loop swap.
 
+pub(crate) mod system;
 pub(crate) mod user;
 
 use std::any::Any;
