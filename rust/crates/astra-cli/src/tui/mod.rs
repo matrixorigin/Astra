@@ -315,9 +315,14 @@ pub(crate) async fn run_tui_repl(
         bottom_pane.footer.git_branch = Some(branch);
     }
 
-    let mut active_cell: Option<Box<dyn ChatCell>> = None;
-    let mut stream_controller: Option<StreamController> = None;
+    // Legacy placeholders kept only because `drain_tick` / Ctrl+O
+    // transcript overlay still read `transcript`. Phase 5 will
+    // delete `transcript` once the overlay is migrated to the
+    // ChatWidget history.
     let mut transcript: Vec<ratatui::text::Line<'static>> = Vec::new();
+    // Legacy stream_controller kept alive for the unused `drain_tick`
+    // call path; always None in the new rendering pipeline.
+    let mut stream_controller: Option<StreamController> = None;
     // Shadow ChatWidget — Phase 3 migration scaffolding. Every
     // legacy handle_app_event call also feeds the translated
     // AppEvent into here, so by the time Phase 3e swaps rendering
@@ -336,12 +341,12 @@ pub(crate) async fn run_tui_repl(
         let tick = tokio::time::sleep(Duration::from_millis(50));
         tokio::pin!(tick);
 
-        // After turn ends, load first queued message into composer for review/send
-        if active_cell.is_none() && stream_controller.is_none() {
-            if let Some(text) = inject_submit.take() {
-                bottom_pane.composer.set_text(&text);
-                frame_requester.schedule_frame();
-            }
+        // After turn ends, load first queued message into composer for review/send.
+        // The inner `select!` blocks until the turn completes, so by the time
+        // control returns here the turn is always over — no guard needed.
+        if let Some(text) = inject_submit.take() {
+            bottom_pane.composer.set_text(&text);
+            frame_requester.schedule_frame();
         }
 
         tokio::select! {
@@ -372,7 +377,7 @@ pub(crate) async fn run_tui_repl(
                             continue;
                         }
                         match bottom_pane.handle_key(key) {
-                            BottomPaneAction::SubmitInput(text) if active_cell.is_none() => {
+                            BottomPaneAction::SubmitInput(text) => {
                                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                 // Shadow: mirror the user submit into
                                 // ChatWidget so its history stays in
@@ -427,10 +432,6 @@ pub(crate) async fn run_tui_repl(
                                     if let Some(ref s) = state.session_id { bottom_pane.footer.session_id = Some(s[..8.min(s.len())].to_string()); }
                                     bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
                                 } else {
-                                    let mut ac = AssistantChatCell::from_rendered(vec![]);
-                                    ac.start_thinking();
-                                    active_cell = Some(Box::new(ac));
-                                    stream_controller = Some(StreamController::new(Some(w as usize)));
                                     bottom_pane.set_task_status(TaskStatus::WaitingModel);
                                     let turn_start = std::time::Instant::now();
                                     let pre_prompt_tokens = state.total_prompt_tokens;
@@ -590,11 +591,10 @@ pub(crate) async fn run_tui_repl(
                                     // Turn end — ChatWidget handles any
                                     // remaining live cell on TurnComplete.
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                    // Legacy stream_controller is unused in
-                                    // the new path; keep the variable so
-                                    // shape matches until Phase 5 removes
-                                    // it. Same for `active_cell` below.
-                                    let _ = (&mut stream_controller, &mut transcript, &mut active_cell);
+                                    // `transcript` / `stream_controller` are
+                                    // only still read by drain_tick + Ctrl+O
+                                    // in the legacy path; untouched here.
+                                    let _ = (&mut transcript, &mut stream_controller);
 
                                     bottom_pane.set_task_status(TaskStatus::Idle);
                                     status_indicator.set_state(
@@ -679,7 +679,6 @@ pub(crate) async fn run_tui_repl(
                                     inject_submit = bottom_pane.take_next_queued();
                                 }
                             }
-                            BottomPaneAction::SubmitInput(_) => {}
                             BottomPaneAction::ViewCompleted { result, reopen } => {
                                 if let Some(name) = result {
                                     // LoginView / RegisterView completion:
