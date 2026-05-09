@@ -320,20 +320,25 @@ pub(crate) async fn run_tui_repl(
                         // history so the content always matches
                         // what's in scrollback. Blank lines between
                         // cells mirror the single-blank separator
-                        // used by `flush_chat_widget`.
+                        // used by `flush_chat_widget`. The terminal
+                        // height is threaded through so the overlay
+                        // fills the screen on tall windows instead of
+                        // stopping at a fixed 16-line peephole.
                         if key.code == crossterm::event::KeyCode::Char('o')
                             && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                             && !bottom_pane.has_active_view()
                         {
                             use bottom_pane::transcript_view::TranscriptView;
-                            let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                            let size = guard.terminal.size().ok();
+                            let w = size.map(|s| s.width).unwrap_or(80);
+                            let h = size.map(|s| s.height).unwrap_or(0);
                             let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
                             for cell in chat_widget.history() {
                                 lines.extend(cell.display_lines(w));
                                 lines.push(ratatui::text::Line::default());
                             }
                             if !lines.is_empty() {
-                                bottom_pane.push_view(Box::new(TranscriptView::new(lines)));
+                                bottom_pane.push_view(Box::new(TranscriptView::new(lines, h)));
                             }
                             frame_requester.schedule_frame();
                             continue;
