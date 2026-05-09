@@ -158,6 +158,12 @@ pub struct SpawnRunConfig {
     /// child will simply run without cache inheritance (equivalent to
     /// the PR 4 soft-fallback path).
     pub inherited_prefix: Option<InheritedChildPrefix>,
+    /// True when this child inherited a parent prefix (fork mode).
+    /// Fork children are NOT allowed to fork again — prevents
+    /// degenerate case where a forked child forks with its own prefix
+    /// (which differs from the original parent's, breaking the cache
+    /// reuse chain). Same semantics as Claude Code's `isInForkChild()`.
+    pub is_fork_child: bool,
 }
 
 /// Payload an executor needs to consume an inherited prefix.
@@ -183,6 +189,14 @@ pub struct InheritedChildPrefix {
     /// called on the prefix with no additional suffix (the executor
     /// appends its own child task message).
     pub prefix_messages: Vec<serde_json::Value>,
+    /// Frozen tool schemas from the parent's capture — each entry
+    /// deserialized from `ToolSchemaEntry.canonical_bytes`. When
+    /// present, the executor should use these instead of the live
+    /// registry to ensure tool-schema-hash stability with the parent
+    /// (cache key alignment). `None` if the prefix has no tool
+    /// schemas (e.g., older captures, or capture happened before
+    /// tool_schema hashing was wired).
+    pub frozen_tool_schemas: Option<Vec<serde_json::Value>>,
     /// Estimated cache-eligible tokens from the parent's perspective.
     /// Used as the `expected_cache_read_tokens` baseline when the
     /// executor evaluates the child's first response for a
@@ -632,6 +646,7 @@ impl DynamicAgentSpawner {
             permission_context,
             // Skills inherited from parent
             inherited_skills: context.inherited_skills.clone(),
+            is_fork_child: inherited_prefix.is_some(),
             inherited_prefix,
         };
 
@@ -1276,21 +1291,32 @@ pub(crate) fn build_inherited_child_prefix(
     // "reconstruct failed" event here; currently no sink is wired
     // through so the failure is silent.
     match reconstruct_messages(prefix, Vec::new()) {
-        Ok(r) => Some(InheritedChildPrefix {
-            prefix_id: prefix.prefix_id.clone(),
-            parent_run_id: prefix.parent_run_id.clone(),
-            provider: prefix.provider.clone(),
-            prefix_messages: r.messages,
-            // Best-effort estimate. PR 1 doesn't carry a cache-token
-            // estimate on ForkPrefix itself; the capture site could
-            // plumb one through in a future PR. For now we pass 0 so
-            // the evaluator's degenerate branch classifies early
-            // observations as Miss or ExceededExpected until a real
-            // estimate is wired — neither label is a false positive
-            // against "cache worked", which preserves dashboard
-            // integrity.
-            expected_cache_read_tokens: 0,
-        }),
+        Ok(r) => {
+            let frozen_tools: Option<Vec<serde_json::Value>> = {
+                let entries = prefix.tool_schemas();
+                if entries.is_empty() {
+                    None
+                } else {
+                    let parsed: Vec<serde_json::Value> = entries
+                        .iter()
+                        .filter_map(|e| serde_json::from_slice(&e.canonical_bytes).ok())
+                        .collect();
+                    if parsed.is_empty() {
+                        None
+                    } else {
+                        Some(parsed)
+                    }
+                }
+            };
+            Some(InheritedChildPrefix {
+                prefix_id: prefix.prefix_id.clone(),
+                parent_run_id: prefix.parent_run_id.clone(),
+                provider: prefix.provider.clone(),
+                prefix_messages: r.messages,
+                frozen_tool_schemas: frozen_tools,
+                expected_cache_read_tokens: 0,
+            })
+        }
         Err(_) => None,
     }
 }

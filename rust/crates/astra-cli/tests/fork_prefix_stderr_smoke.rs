@@ -92,6 +92,7 @@ fn stderr_sink_end_to_end_smoke() {
         parent_run_id: stored.parent_run_id.clone(),
         provider: stored.provider.clone(),
         prefix_messages: vec![],
+        frozen_tool_schemas: None,
         expected_cache_read_tokens: 1_000,
     };
     let mut probe_state = astra_runtime::orchestration::ForkCacheProbeState::new();

@@ -82,15 +82,22 @@ static FORK_FLAG_CACHE: AtomicU8 = AtomicU8::new(0);
 /// - 1 (disabled) — explicitly off.
 /// - 2 (enabled) — explicitly on.
 ///
-/// Unread defaults to disabled so that missing startup wiring
-/// produces no-op behavior rather than silently relying on env.
-/// This is the safe direction — the only cost is the operator has
-/// to explicitly enable the feature.
+/// Default: **enabled**. Fork-prefix capture has negligible cost
+/// (one `Arc<bytes>` write per turn into a DashMap with TTL + LRU
+/// eviction at cap=64). Enabling by default means `spawn_agent` with
+/// `inherit_prefix: {}` always has a prefix to resolve — operators no
+/// longer need to set `ASTRA_FORK_INHERIT_PREFIX=1` or
+/// `fork_prefix.enabled = true` to get cache-reusable fork children.
+///
+/// Set to `false` explicitly via `set_fork_inherit_prefix_enabled(false)`
+/// or env `ASTRA_FORK_INHERIT_PREFIX=0` to suppress capture entirely
+/// (e.g., in memory-constrained environments where even the DashMap
+/// overhead is unwanted).
 pub fn is_fork_inherit_prefix_enabled() -> bool {
     match FORK_FLAG_CACHE.load(Ordering::Relaxed) {
-        2 => true,
-        // state 0 (unread) or 1 (disabled) — both treated as false.
-        _ => false,
+        1 => false, // explicitly disabled
+        // state 0 (unread) or 2 (enabled) — both treated as true.
+        _ => true,
     }
 }
 
@@ -598,24 +605,32 @@ mod tests {
     }
 
     #[test]
-    fn unread_flag_defaults_to_disabled_under_test() {
-        // Regression guard for the #[cfg(test)] branch in
-        // `is_fork_inherit_prefix_enabled`. If a future change drops
-        // that branch, a leaked ASTRA_FORK_INHERIT_PREFIX=1 env var
-        // in CI would silently flip tests that forgot to install a
-        // FlagGuard. We verify the branch's behavior: state 0 MUST
-        // return false.
+    fn unread_flag_defaults_to_enabled() {
+        // After the default-enable change (fork subagent feature),
+        // state 0 (unread) is treated as enabled. Capture cost is
+        // negligible (one Arc per turn, DashMap with TTL+LRU).
+        // Only explicit `set_fork_inherit_prefix_enabled(false)` or
+        // env `ASTRA_FORK_INHERIT_PREFIX=0` disables.
         let _lock = FORK_FLAG_TEST_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let prev = FORK_FLAG_CACHE.swap(0, Ordering::Relaxed);
         let observed = is_fork_inherit_prefix_enabled();
-        // Restore before any panic-able assert, so later tests see
-        // a predictable state.
         FORK_FLAG_CACHE.store(prev, Ordering::Relaxed);
         assert!(
-            !observed,
-            "unread flag state must default to disabled in test builds"
+            observed,
+            "unread flag (state 0) must default to enabled after the fork-subagent change"
         );
+    }
+
+    #[test]
+    fn explicit_disable_returns_false() {
+        let _lock = FORK_FLAG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = FORK_FLAG_CACHE.swap(1, Ordering::Relaxed);
+        let observed = is_fork_inherit_prefix_enabled();
+        FORK_FLAG_CACHE.store(prev, Ordering::Relaxed);
+        assert!(!observed, "state 1 (explicitly disabled) must return false");
     }
 }

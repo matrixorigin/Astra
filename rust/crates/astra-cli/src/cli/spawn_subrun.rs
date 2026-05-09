@@ -54,15 +54,31 @@ pub struct CliSpawnAgentExecutor {
 /// inherited prefix, and the child task. Ensures role alternation is
 /// valid for providers that require strict user/assistant alternation
 /// (e.g. Bedrock Converse).
+///
+/// **Fork mode** (`prefix_messages` is `Some`): The prefix already
+/// contains the parent's system message at [0] plus its full
+/// conversation history — reconstructed byte-for-byte from the
+/// captured `ForkPrefix.canonical_prefix_bytes`. We do NOT prepend a
+/// fresh system message because that would:
+/// - Create a duplicate system message (providers only expect one)
+/// - Break byte-for-byte prefix cache reuse (the extra bytes shift
+///   the cache key so the parent's cached KV is unusable)
+///
+/// The child's identity ("You are agent_id, specialized sub-agent…")
+/// is communicated via the child_task user message, not via a system
+/// block, so the fork child still knows its role.
+///
+/// **Fresh mode** (`prefix_messages` is `None`): the child gets a
+/// system message with its identity, then the child task as a user
+/// message — same as before fork support.
 pub(crate) fn build_child_messages(
     system_prompt: &str,
     prefix_messages: Option<&[Value]>,
     child_task: &str,
 ) -> Vec<Value> {
-    let prefix_len = prefix_messages.map_or(0, |p| p.len());
-    let mut messages = Vec::with_capacity(3 + prefix_len);
-    messages.push(json!({ "role": "system", "content": system_prompt }));
     if let Some(prefix) = prefix_messages {
+        // Fork mode: reuse parent prefix verbatim for cache alignment.
+        let mut messages = Vec::with_capacity(prefix.len() + 2);
         messages.extend(prefix.iter().cloned());
         // Bedrock Converse requires strict role alternation. If the
         // prefix ends with user or tool role, inserting the child task
@@ -79,9 +95,15 @@ pub(crate) fn build_child_messages(
                 "content": "I'll now work on the delegated task."
             }));
         }
+        messages.push(json!({ "role": "user", "content": child_task }));
+        messages
+    } else {
+        // Fresh mode: system prompt + child task only.
+        vec![
+            json!({ "role": "system", "content": system_prompt }),
+            json!({ "role": "user", "content": child_task }),
+        ]
     }
-    messages.push(json!({ "role": "user", "content": child_task }));
-    messages
 }
 
 impl CliSpawnAgentExecutor {

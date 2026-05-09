@@ -214,10 +214,18 @@ impl AgenticLoopHost for SubRunHost {
         payload["skill_search"] =
             serde_json::to_value(&state.skills.search).unwrap_or_else(|_| json!({}));
 
-        // Attach tool schemas directly (no selector).
+        // Attach tool schemas. In fork mode, prefer the parent's frozen
+        // canonical schemas so the tool-schema hash matches the parent's
+        // cached prefix (cache key alignment). Falls back to live
+        // registry if no frozen schemas are available.
+        let schemas_to_use = self
+            .inherited_prefix
+            .as_ref()
+            .and_then(|ip| ip.frozen_tool_schemas.clone())
+            .unwrap_or_else(|| self.all_schemas.clone());
         astra_runtime::turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools(
             &mut payload,
-            self.all_schemas.clone(),
+            schemas_to_use,
             &mut state.restricted_tools,
             None,  // no selection report
             0.5,   // neutral confidence
