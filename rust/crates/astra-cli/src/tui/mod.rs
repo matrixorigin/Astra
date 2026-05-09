@@ -388,7 +388,8 @@ pub(crate) async fn run_tui_repl(
                                     let pre_sid = state.session_id.clone();
                                     let mut dctx = slash_dispatch::DispatchContext {
                                         api, profile, state: &mut state,
-                                        guard: &mut guard, bottom_pane: &mut bottom_pane, width: w,
+                                        guard: &mut guard, bottom_pane: &mut bottom_pane,
+                                        chat_widget: &mut chat_widget, width: w,
                                     };
                                     let result = slash_dispatch::dispatch(&text, &mut dctx).await;
                                     match result {
@@ -407,16 +408,20 @@ pub(crate) async fn run_tui_repl(
                                                 Ok(Ok(true)) => { break 'main Ok(()); }
                                                 Ok(Ok(false)) => {}
                                                 Ok(Err(e)) => {
-                                                    let err = history_cell::system::SystemCell::error(e);
-                                                    guard.queue_history_lines(err.display_lines(w));
+                                                    chat_widget.commit_system(history_cell::system::SystemCell::error(e));
                                                 }
                                                 Err(e) => {
-                                                    let err = history_cell::system::SystemCell::error(format!("Terminal restore failed: {e}"));
-                                                    guard.queue_history_lines(err.display_lines(w));
+                                                    chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Terminal restore failed: {e}")));
                                                 }
                                             }
                                         }
                                     }
+                                    // Flush the slash-command response
+                                    // cells (`⎿ Set model to …`, etc.)
+                                    // into scrollback immediately so
+                                    // the reply appears under `› /cmd`
+                                    // without the ~50ms tick delay.
+                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
                                     // If the slash command rebound state.session_id
                                     // (resume/new-session paths), swap the
                                     // ChatWidget so its scrollback + persistence
@@ -679,19 +684,16 @@ pub(crate) async fn run_tui_repl(
                                     // auth without leaving the TUI (no
                                     // more rpassword against bare terminal).
                                     if let Some(rest) = name.strip_prefix("__login__\n") {
-                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         let mut parts = rest.splitn(2, '\n');
                                         let username = parts.next().unwrap_or("").to_string();
                                         let password = parts.next().unwrap_or("").to_string();
                                         match crate::auth_flow::do_login(api, profile, &username, &password).await {
                                             Ok(_) => {
-                                                let info = history_cell::system::SystemCell::response(format!("Logged in as {username}"));
-                                                guard.queue_history_lines(info.display_lines(w));
+                                                chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
                                                 crate::post_auth_cloud_resync(profile, &mut state).await;
                                             }
                                             Err(e) => {
-                                                let err = history_cell::system::SystemCell::error(format!("Login failed: {e}"));
-                                                guard.queue_history_lines(err.display_lines(w));
+                                                chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Login failed: {e}")));
                                             }
                                         }
                                         bottom_pane.sync_popups();
@@ -699,30 +701,25 @@ pub(crate) async fn run_tui_repl(
                                         continue;
                                     }
                                     if let Some(rest) = name.strip_prefix("__register__\n") {
-                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         let mut parts = rest.splitn(3, '\n');
                                         let username = parts.next().unwrap_or("").to_string();
                                         let email = parts.next().unwrap_or("").to_string();
                                         let password = parts.next().unwrap_or("").to_string();
                                         match crate::auth_flow::do_register(api, &username, &email, &password).await {
                                             Ok(_) => {
-                                                let info = history_cell::system::SystemCell::response("Registered — logging in…");
-                                                guard.queue_history_lines(info.display_lines(w));
+                                                chat_widget.commit_system(history_cell::system::SystemCell::response("Registered — logging in…"));
                                                 match crate::auth_flow::do_login(api, profile, &username, &password).await {
                                                     Ok(_) => {
-                                                        let info = history_cell::system::SystemCell::response(format!("Logged in as {username}"));
-                                                        guard.queue_history_lines(info.display_lines(w));
+                                                        chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
                                                         crate::post_auth_cloud_resync(profile, &mut state).await;
                                                     }
                                                     Err(e) => {
-                                                        let err = history_cell::system::SystemCell::error(format!("Auto-login failed: {e}"));
-                                                        guard.queue_history_lines(err.display_lines(w));
+                                                        chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Auto-login failed: {e}")));
                                                     }
                                                 }
                                             }
                                             Err(e) => {
-                                                let err = history_cell::system::SystemCell::error(format!("Register failed: {e}"));
-                                                guard.queue_history_lines(err.display_lines(w));
+                                                chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Register failed: {e}")));
                                             }
                                         }
                                         bottom_pane.sync_popups();
@@ -750,12 +747,10 @@ pub(crate) async fn run_tui_repl(
                                             Ok(Ok(true)) => { break 'main Ok(()); }
                                             Ok(Ok(false)) => {}
                                             Ok(Err(e)) => {
-                                                let err = history_cell::system::SystemCell::error(e);
-                                                guard.queue_history_lines(err.display_lines(w));
+                                                chat_widget.commit_system(history_cell::system::SystemCell::error(e));
                                             }
                                             Err(e) => {
-                                                let err = history_cell::system::SystemCell::error(format!("Terminal restore failed: {e}"));
-                                                guard.queue_history_lines(err.display_lines(w));
+                                                chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Terminal restore failed: {e}")));
                                             }
                                         }
                                         // If the resume attached a new session
@@ -777,8 +772,15 @@ pub(crate) async fn run_tui_repl(
                                     } else {
                                         slash_dispatch::handle_view_result(
                                             &name, &mut state, &mut guard, &mut bottom_pane,
+                                            &mut chat_widget,
                                         );
                                     }
+                                    // Flush view-driven system cells
+                                    // (login success, permission change,
+                                    // etc.) into scrollback without waiting
+                                    // for the 50ms tick.
+                                    let _w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                    flush_chat_widget(&mut guard, &mut chat_widget, _w);
                                     bottom_pane.sync_popups();
                                     // Update footer after view actions (model/permission may change)
                                     if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
@@ -788,9 +790,11 @@ pub(crate) async fn run_tui_repl(
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                     let mut dctx = slash_dispatch::DispatchContext {
                                         api, profile, state: &mut state,
-                                        guard: &mut guard, bottom_pane: &mut bottom_pane, width: w,
+                                        guard: &mut guard, bottom_pane: &mut bottom_pane,
+                                        chat_widget: &mut chat_widget, width: w,
                                     };
                                     let _ = slash_dispatch::dispatch(&cmd, &mut dctx).await;
+                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
                                 }
                             }
                             BottomPaneAction::Interrupt | BottomPaneAction::Quit => { break 'main Ok(()); }

@@ -9,7 +9,7 @@ use crate::command_registry;
 use crate::repl_state::ReplState;
 use crate::tui::bottom_pane::BottomPane;
 use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
-use crate::tui::history_cell::{HistoryCell, system::SystemCell};
+use crate::tui::history_cell::system::SystemCell;
 use crate::tui::terminal::TerminalGuard;
 
 pub(crate) enum SlashResult {
@@ -25,6 +25,7 @@ pub(crate) struct DispatchContext<'a> {
     pub state: &'a mut ReplState,
     pub guard: &'a mut TerminalGuard,
     pub bottom_pane: &'a mut BottomPane,
+    pub chat_widget: &'a mut crate::tui::chat_widget::ChatWidget,
     pub width: u16,
 }
 
@@ -33,25 +34,24 @@ impl<'a> DispatchContext<'a> {
     /// Use for passive state ("No history yet", "astra v0.1.0"),
     /// NOT for command acknowledgements — those should visually pair
     /// with the `› /cmd` prompt above them; see `show_response`.
+    ///
+    /// Routed through `ChatWidget::commit_system` so the line lands
+    /// in both the on-screen scrollback AND the JSONL transcript —
+    /// resume will surface it, Ctrl+O will include it, the model's
+    /// next turn will see it in history.
     fn show_info(&mut self, msg: String) {
-        let cell = SystemCell::info(msg);
-        self.guard
-            .queue_history_lines(cell.display_lines(self.width));
+        self.chat_widget.commit_system(SystemCell::info(msg));
     }
 
     /// Slash-command response ("Set model to Opus 4.6", "Permission
     /// mode → auto"). Rendered with Claude Code's `⎿` corner glyph
     /// on the first line so the eye visually threads `› /cmd` → `⎿ …`.
     fn show_response(&mut self, msg: String) {
-        let cell = SystemCell::response(msg);
-        self.guard
-            .queue_history_lines(cell.display_lines(self.width));
+        self.chat_widget.commit_system(SystemCell::response(msg));
     }
 
     fn show_error(&mut self, msg: String) {
-        let cell = SystemCell::error(msg);
-        self.guard
-            .queue_history_lines(cell.display_lines(self.width));
+        self.chat_widget.commit_system(SystemCell::error(msg));
     }
 }
 
@@ -736,8 +736,13 @@ pub(crate) fn handle_view_result(
     state: &mut ReplState,
     guard: &mut TerminalGuard,
     bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
 ) {
     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+    // Keep the legacy `w` binding above for call sites below that
+    // still take a width into their local helpers; unused when the
+    // whole function routes through `chat_widget`.
+    let _ = w;
 
     // Session picker result is handled by the outer event loop (it
     // needs to run the async resume pipeline); this sync fn just
@@ -752,8 +757,9 @@ pub(crate) fn handle_view_result(
         return;
     }
     if name == "Skill info" {
-        let msg = SystemCell::info("Use /skill info <name> for details");
-        guard.queue_history_lines(msg.display_lines(w));
+        chat_widget.commit_system(SystemCell::info(
+            "Use /skill info <name> for details",
+        ));
         return;
     }
 
@@ -792,10 +798,9 @@ pub(crate) fn handle_view_result(
                     .with_reopen("/instructions"),
                 ));
             } else {
-                let msg = SystemCell::info(
+                chat_widget.commit_system(SystemCell::info(
                     "No project instructions loaded. Create .astra/instructions.md",
-                );
-                guard.queue_history_lines(msg.display_lines(w));
+                ));
             }
             return;
         }
@@ -804,19 +809,18 @@ pub(crate) fn handle_view_result(
             {
                 let lc = instructions.lines().count();
                 state.project_instructions = Some(instructions);
-                let msg = SystemCell::info(format!("Reloaded project instructions ({lc} lines)"));
-                guard.queue_history_lines(msg.display_lines(w));
+                chat_widget.commit_system(SystemCell::response(format!(
+                    "Reloaded project instructions ({lc} lines)"
+                )));
             } else {
                 state.project_instructions = None;
-                let msg = SystemCell::info("No .astra/instructions.md found");
-                guard.queue_history_lines(msg.display_lines(w));
+                chat_widget.commit_system(SystemCell::info("No .astra/instructions.md found"));
             }
             return;
         }
         "Off" => {
             state.project_instructions = None;
-            let msg = SystemCell::info("Project instructions disabled");
-            guard.queue_history_lines(msg.display_lines(w));
+            chat_widget.commit_system(SystemCell::response("Project instructions disabled"));
             return;
         }
         _ => {}
@@ -827,22 +831,19 @@ pub(crate) fn handle_view_result(
         "Auto" => {
             use crate::permission_manager::PermissionMode;
             state.perm_manager.set_mode(PermissionMode::Auto);
-            let msg = SystemCell::info("Permission mode → auto");
-            guard.queue_history_lines(msg.display_lines(w));
+            chat_widget.commit_system(SystemCell::response("Permission mode → auto"));
             return;
         }
         "Prompt" => {
             use crate::permission_manager::PermissionMode;
             state.perm_manager.set_mode(PermissionMode::Prompt);
-            let msg = SystemCell::info("Permission mode → prompt");
-            guard.queue_history_lines(msg.display_lines(w));
+            chat_widget.commit_system(SystemCell::response("Permission mode → prompt"));
             return;
         }
         "Deny" => {
             use crate::permission_manager::PermissionMode;
             state.perm_manager.set_mode(PermissionMode::Deny);
-            let msg = SystemCell::info("Permission mode → deny");
-            guard.queue_history_lines(msg.display_lines(w));
+            chat_widget.commit_system(SystemCell::response("Permission mode → deny"));
             return;
         }
         "Rules" => {
@@ -869,8 +870,7 @@ pub(crate) fn handle_view_result(
     // Model name → apply
     state.model = Some(name.to_string());
     bottom_pane.footer.model = Some(name.to_string());
-    let msg = SystemCell::info(format!("Model set to: {name}"));
-    guard.queue_history_lines(msg.display_lines(w));
+    chat_widget.commit_system(SystemCell::response(format!("Set model to {name}")));
 }
 
 fn show_stats_view(

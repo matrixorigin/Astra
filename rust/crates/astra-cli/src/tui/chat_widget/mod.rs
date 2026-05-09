@@ -115,6 +115,16 @@ pub(crate) struct ChatWidget {
     /// flushed to the terminal scrollback. `drain_new_committed`
     /// returns everything past this index and advances it.
     committed_watermark: usize,
+    /// Index into `history` marking cells that have already been
+    /// persisted to the JSONL transcript. Starts at 0; advanced by
+    /// `persist_from_watermark`. Kept separate from the display
+    /// watermark because their lifecycles diverge — a cell is
+    /// committed to scrollback as soon as it finalises, but may be
+    /// held back from disk if the server hasn't yet assigned a
+    /// session id (turn 1 edge case). When `set_session_id` is
+    /// eventually called, we drain this watermark to persist every
+    /// cell accumulated in the meantime.
+    persist_watermark: usize,
 }
 
 impl ChatWidget {
@@ -124,6 +134,7 @@ impl ChatWidget {
             history: Vec::new(),
             active_cell: None,
             committed_watermark: 0,
+            persist_watermark: 0,
         }
     }
 
@@ -177,23 +188,52 @@ impl ChatWidget {
             .map(|cell| cell.text().to_string())
     }
 
-    /// Swap the backing session id. Cells committed BEFORE the
-    /// swap stay where they were written; cells committed AFTER
-    /// are persisted under the new id. Used when the server
-    /// finally assigns an id after startup.
+    /// Swap the backing session id.
+    ///
+    /// - If cells accumulated under an empty sid (turn-1 edge case:
+    ///   server hadn't assigned one yet), they get flushed to the
+    ///   new session's JSONL transcript on first assignment. This
+    ///   is what lets resume replay show the user's very first
+    ///   message instead of starting mid-conversation.
+    /// - Cells already persisted under a non-empty sid stay in
+    ///   their original transcript; only the new cells ride under
+    ///   the new id.
     pub fn set_session_id(&mut self, sid: impl Into<String>) {
         self.session_id = sid.into();
+        // Flush any cells that accumulated while sid was empty.
+        self.persist_from_watermark();
     }
 
     /// Replay a previously-persisted turn stream into `history`.
     /// Used by the Phase 4 resume path. Cells land already
     /// finalised — no live state, no further mutation.
+    ///
+    /// Advances the persist watermark past the replayed cells so
+    /// subsequent `commit_*` calls don't re-persist them to the
+    /// JSONL (which would double every resumed line on every
+    /// future write).
     pub fn replay(&mut self, events: Vec<TurnEvent>) {
         for ev in events {
             if let Some(cell) = cell_from_persist(ev) {
                 self.history.push(cell.into());
             }
         }
+        self.persist_watermark = self.history.len();
+    }
+
+    /// Commit a free-standing `SystemCell` — slash-command responses,
+    /// info banners, inline errors, etc. Goes into `history` and the
+    /// JSONL transcript the same way model-generated cells do, so
+    /// resume replay surfaces them and the Ctrl+O overlay keeps them.
+    ///
+    /// Before this, slash-dispatch wrote system lines directly to the
+    /// terminal via `queue_history_lines` — they showed in the live
+    /// scrollback but never made it to disk, so a resumed session
+    /// silently lost every `/model`, `/login`, `/permission` response
+    /// as well as the `Session expired` / "token refreshed" banners.
+    pub fn commit_system(&mut self, cell: SystemCell) {
+        self.commit_active(); // finalise anything live first
+        self.commit_cell(Box::new(cell));
     }
 
     /// Single choke-point for routing events into state mutation.
@@ -371,30 +411,41 @@ impl ChatWidget {
             return;
         };
         cell.finalize();
-        self.persist(cell.as_ref());
         // Box → Arc: the scrollback index shares cells with
         // long-lived render paths (e.g. Ctrl+O overlay) without
         // forcing everyone onto `&dyn`.
         self.history.push(box_into_arc(cell));
+        self.persist_from_watermark();
     }
 
     /// Append an already-finalised cell. Used for UserCell /
     /// synthesised ToolCell / TurnSummary etc. — things built
     /// whole rather than streamed.
     fn commit_cell(&mut self, cell: Box<dyn HistoryCell>) {
-        self.persist(cell.as_ref());
         self.history.push(box_into_arc(cell));
+        self.persist_from_watermark();
     }
 
-    /// Persist best-effort. Errors are logged by the underlying
-    /// `transcript_jsonl` helper; we don't propagate because the
-    /// TUI must keep running even if disk writes fail.
-    fn persist(&self, cell: &dyn HistoryCell) {
+    /// Persist every cell between `persist_watermark` and
+    /// `history.len()`. Best-effort: errors are logged by the
+    /// underlying `transcript_jsonl` helper and the watermark is
+    /// advanced regardless, because the TUI must keep running and
+    /// retrying a flaky write every turn would re-attempt the same
+    /// failure.
+    ///
+    /// When `session_id` is empty (turn-1 edge case: server hasn't
+    /// assigned an id yet) the watermark is NOT advanced, so
+    /// subsequent `set_session_id` can flush the accumulated cells.
+    fn persist_from_watermark(&mut self) {
         if self.session_id.is_empty() {
             return;
         }
-        if let Some(ev) = cell.to_persist() {
-            transcript_jsonl::append(&self.session_id, &ev);
+        while self.persist_watermark < self.history.len() {
+            let cell = &self.history[self.persist_watermark];
+            if let Some(ev) = cell.to_persist() {
+                transcript_jsonl::append(&self.session_id, &ev);
+            }
+            self.persist_watermark += 1;
         }
     }
 }
@@ -718,6 +769,127 @@ mod tests {
         w.set_session_id("new-sid");
         assert_eq!(w.session_id(), "new-sid");
         assert_eq!(w.history().len(), 1, "history survives sid swap");
+    }
+
+    // ── Persist watermark (turn-1 edge case) ────────────────────
+
+    /// Run a test body with `$HOME` pointed at a fresh tempdir so
+    /// real `~/.astra/transcripts/` is left alone.
+    fn with_tmp_home<F: FnOnce()>(f: F) {
+        use std::env;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = env::var("HOME").ok();
+        unsafe {
+            env::set_var("HOME", tmp.path());
+        }
+        f();
+        match prev {
+            Some(v) => unsafe { env::set_var("HOME", v) },
+            None => unsafe { env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn set_session_id_flushes_cells_committed_under_empty_sid() {
+        // Turn 1 edge case: cells commit before the server returns
+        // a session id. `set_session_id` must retroactively flush
+        // them to the new session's JSONL, so resume replay can
+        // surface the user's very first message.
+        with_tmp_home(|| {
+            let mut w = ChatWidget::new(""); // empty sid — server pending
+            w.handle_event(AppEvent::UserSubmit("hi".into()));
+            w.handle_event(AppEvent::AnswerDelta("hello back".into()));
+            w.handle_event(AppEvent::TurnComplete(Box::default()));
+
+            // Before sid is set, nothing should be on disk yet.
+            assert!(super::super::transcript_jsonl::load("late-sid").is_empty());
+
+            // Server finally assigns an id → we flush retroactively.
+            w.set_session_id("late-sid");
+            let events = super::super::transcript_jsonl::load("late-sid");
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, TurnEvent::User { text, .. } if text == "hi")),
+                "turn-1 user message must be persisted after sid arrives"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, TurnEvent::Assistant { .. })),
+                "turn-1 assistant reply must be persisted after sid arrives"
+            );
+            assert!(
+                events.iter().any(|e| matches!(e, TurnEvent::TurnSummary { .. })),
+                "turn-1 summary must be persisted after sid arrives"
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn post_sid_cells_dont_double_persist_previous_cells() {
+        // Sanity: after the initial flush, committing another turn
+        // must append only that turn's cells — we must NOT re-write
+        // the earlier turn's cells. This is what the persist
+        // watermark guards against.
+        with_tmp_home(|| {
+            let mut w = ChatWidget::new("");
+            w.handle_event(AppEvent::UserSubmit("first".into()));
+            w.handle_event(AppEvent::TurnComplete(Box::default()));
+            w.set_session_id("s");
+
+            let count_after_first = super::super::transcript_jsonl::load("s").len();
+
+            w.handle_event(AppEvent::UserSubmit("second".into()));
+            w.handle_event(AppEvent::TurnComplete(Box::default()));
+            let count_after_second = super::super::transcript_jsonl::load("s").len();
+
+            assert!(
+                count_after_second > count_after_first,
+                "second turn must add cells: {count_after_first} → {count_after_second}"
+            );
+            // Each commit cycle (UserSubmit + TurnComplete) adds 2
+            // cells: the user + the summary. Duplicate persistence
+            // would give us 4 new rows instead of 2.
+            assert_eq!(
+                count_after_second - count_after_first,
+                2,
+                "second turn should append exactly 2 cells, not double-write earlier ones"
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn replay_does_not_re_persist_resumed_cells() {
+        // When resuming a session, cells land in `history` via
+        // `replay()` — they already exist on disk. A subsequent
+        // `commit_*` must not re-persist the replayed cells.
+        with_tmp_home(|| {
+            let sid = "s_replay";
+            // Seed a one-turn session on disk.
+            super::super::transcript_jsonl::append(
+                sid,
+                &TurnEvent::User {
+                    ts: None,
+                    text: "seed".into(),
+                },
+            );
+            let before = super::super::transcript_jsonl::load(sid).len();
+            assert_eq!(before, 1);
+
+            let mut w = ChatWidget::new(sid);
+            w.replay(super::super::transcript_jsonl::load(sid));
+            // Commit a new cell — only this cell should land on disk.
+            w.handle_event(AppEvent::UserSubmit("new".into()));
+            let after = super::super::transcript_jsonl::load(sid).len();
+            assert_eq!(
+                after, before + 1,
+                "only the new cell should persist; {before} → {after}"
+            );
+        });
     }
 
     // ── Last user text lookup (Ctrl+R edit-last) ────────────────
