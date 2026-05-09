@@ -535,6 +535,62 @@ pub(crate) async fn run_tui_repl(
                             BottomPaneAction::SubmitInput(_) => {}
                             BottomPaneAction::ViewCompleted { result, reopen } => {
                                 if let Some(name) = result {
+                                    // LoginView / RegisterView completion:
+                                    // credentials arrive as a sentinel-
+                                    // prefixed string so we can dispatch
+                                    // auth without leaving the TUI (no
+                                    // more rpassword against bare terminal).
+                                    if let Some(rest) = name.strip_prefix("__login__\n") {
+                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                        let mut parts = rest.splitn(2, '\n');
+                                        let username = parts.next().unwrap_or("").to_string();
+                                        let password = parts.next().unwrap_or("").to_string();
+                                        match crate::auth_flow::do_login(api, profile, &username, &password).await {
+                                            Ok(_) => {
+                                                let info = SystemChatCell::info(format!("Logged in as {username}"));
+                                                guard.queue_history_lines(info.display_lines(w));
+                                                crate::post_auth_cloud_resync(profile, &mut state).await;
+                                            }
+                                            Err(e) => {
+                                                let err = SystemChatCell::error(format!("Login failed: {e}"));
+                                                guard.queue_history_lines(err.display_lines(w));
+                                            }
+                                        }
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
+                                    if let Some(rest) = name.strip_prefix("__register__\n") {
+                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                        let mut parts = rest.splitn(3, '\n');
+                                        let username = parts.next().unwrap_or("").to_string();
+                                        let email = parts.next().unwrap_or("").to_string();
+                                        let password = parts.next().unwrap_or("").to_string();
+                                        match crate::auth_flow::do_register(api, &username, &email, &password).await {
+                                            Ok(_) => {
+                                                let info = SystemChatCell::info("Registered — logging in…".into());
+                                                guard.queue_history_lines(info.display_lines(w));
+                                                match crate::auth_flow::do_login(api, profile, &username, &password).await {
+                                                    Ok(_) => {
+                                                        let info = SystemChatCell::info(format!("Logged in as {username}"));
+                                                        guard.queue_history_lines(info.display_lines(w));
+                                                        crate::post_auth_cloud_resync(profile, &mut state).await;
+                                                    }
+                                                    Err(e) => {
+                                                        let err = SystemChatCell::error(format!("Auto-login failed: {e}"));
+                                                        guard.queue_history_lines(err.display_lines(w));
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let err = SystemChatCell::error(format!("Register failed: {e}"));
+                                                guard.queue_history_lines(err.display_lines(w));
+                                            }
+                                        }
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
                                     // Session picker result → run the async
                                     // `/resume <id>` pipeline via the usual
                                     // slash fallback path. This is the same

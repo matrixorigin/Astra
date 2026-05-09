@@ -74,6 +74,19 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
+        // ── Auth forms (inline TUI card instead of dropping out to
+        //    bare-terminal prompts that looked disjoint and stole keys) ─
+        "/login" => {
+            use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
+            ctx.bottom_pane.push_view(Box::new(LoginView::new(LoginMode::Login)));
+            SlashResult::Handled
+        }
+        "/register" => {
+            use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
+            ctx.bottom_pane.push_view(Box::new(LoginView::new(LoginMode::Register)));
+            SlashResult::Handled
+        }
+
         // ── Model selector ──────────────────────────────────────────
         "/model" => {
             if !args.is_empty() {
