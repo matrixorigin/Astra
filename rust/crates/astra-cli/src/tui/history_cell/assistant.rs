@@ -108,42 +108,76 @@ impl AssistantCell {
         &self.source
     }
 
-    /// Split the raw source into the optional leading `<think>`
-    /// block and the reply body. Returns
-    /// `(think_inner, think_closed, body)`:
+    /// Split the raw source into the optional thinking prefix and
+    /// the reply body. Returns `(think_inner, think_closed, body)`:
     ///
-    /// - `think_inner`: content *inside* the tags, not including
-    ///   the opening/closing markers. `None` if the source didn't
-    ///   start with `<think>` at all.
-    /// - `think_closed`: `true` once `</think>` has arrived;
-    ///   `false` means we're mid-think (still streaming).
-    /// - `body`: everything after `</think>` (empty while still
-    ///   thinking). Always the raw-markdown slice the existing
-    ///   renderer expects.
+    /// - `think_inner`: the aggregated thinking content (may come
+    ///   from an explicit `<think>` tag OR from prose that precedes
+    ///   a bare `</think>` — see below). `None` iff the source has
+    ///   no thinking markers at all.
+    /// - `think_closed`: `true` once `</think>` has arrived.
+    /// - `body`: everything after the LAST `</think>`, if any; the
+    ///   full source otherwise.
     ///
-    /// Only the LEADING `<think>` matters — the model sometimes
-    /// re-uses `<think>` mid-reply as a code fence or prose
-    /// reference, and treating those as meta tags would mangle
-    /// the rendered output. The opening tag is matched only when
-    /// it's the first non-whitespace content in `source`.
+    /// The reason this is messier than it looks: MiniMax / DeepSeek
+    /// / GLM often strip the opening `<think>` before the edge
+    /// sees it (the server feeds the reasoning content via the
+    /// separate thinking channel, but the prose body still carries
+    /// a bare `</think>` to close the window). So we have to
+    /// handle:
+    ///
+    /// 1. Matched `<think>…</think>`: inner is between the tags.
+    /// 2. Bare leading `</think>`: empty inner, body is the rest.
+    /// 3. Prose `…</think>`: the prose WAS thinking that leaked;
+    ///    inner is the prose, body is whatever follows `</think>`.
+    /// 4. Only `<think>` (no close yet): streaming think.
+    /// 5. No tags: pure body.
+    ///
+    /// A mid-body `<think>` / `</think>` that appears AFTER a real
+    /// body has started is left alone — prose occasionally mentions
+    /// the tag and collapsing there would mangle the reply.
     fn split_think(&self) -> (Option<&str>, bool, &str) {
-        let trimmed = self.source.trim_start();
-        let leading_ws = self.source.len() - trimmed.len();
-        let Some(after_open) = trimmed.strip_prefix("<think>") else {
-            return (None, false, &self.source);
-        };
-        let Some(close_rel) = after_open.find("</think>") else {
-            // Still streaming the think block; body is empty.
+        let source = self.source.as_str();
+        let trimmed = source.trim_start();
+        if trimmed.is_empty() {
+            return (None, false, source);
+        }
+        let close_tag = "</think>";
+        let open_tag = "<think>";
+
+        // Case 1 / 4: explicit `<think>` at the very start.
+        if let Some(after_open) = trimmed.strip_prefix(open_tag) {
+            if let Some(close_rel) = after_open.find(close_tag) {
+                let think_inner = &after_open[..close_rel];
+                let leading_ws = source.len() - trimmed.len();
+                let body_start =
+                    leading_ws + open_tag.len() + close_rel + close_tag.len();
+                let body = source[body_start..].trim_start_matches('\n');
+                return (Some(think_inner), true, body);
+            }
+            // Still streaming the think block — no close yet.
             return (Some(after_open), false, "");
-        };
-        let think_inner = &after_open[..close_rel];
-        // Body starts after `</think>`. Use byte offsets relative
-        // to `self.source` to keep lifetimes tied to &self.
-        let open_tag_len = "<think>".len();
-        let close_tag_len = "</think>".len();
-        let body_start = leading_ws + open_tag_len + close_rel + close_tag_len;
-        let body = self.source[body_start..].trim_start_matches('\n');
-        (Some(think_inner), true, body)
+        }
+
+        // Cases 2 & 3: content precedes a bare `</think>`. We
+        // recognise this only when the source does not open with a
+        // `<think>` — otherwise case 1 above already handled it.
+        // The content before the close is treated as thinking; the
+        // body is whatever follows the LAST `</think>` (MiniMax
+        // sometimes emits several per reply as it re-opens thinking
+        // mid-turn).
+        if let Some(last_close) = source.rfind(close_tag) {
+            let think_inner = source[..last_close].trim();
+            let body_start = last_close + close_tag.len();
+            let body = source[body_start..].trim_start_matches('\n');
+            // Sanity: if the think region contains no content at
+            // all (pure `</think>` cell), still signal a closed
+            // thought so the header renders instead of raw tags.
+            return (Some(think_inner), true, body);
+        }
+
+        // Case 5: no thinking markers anywhere.
+        (None, false, source)
     }
 }
 
@@ -542,6 +576,76 @@ mod tests {
             "collapsed header with line count: {out}"
         );
         assert!(out.contains("answer"), "body still visible: {out}");
+    }
+
+    #[test]
+    fn bare_trailing_close_tag_treats_prose_as_thinking() {
+        // Regression: MiniMax / GLM / DeepSeek strip the opening
+        // `<think>` tag before the CLI sees it (thinking content
+        // comes through the separate reasoning channel) but the
+        // closing `</think>` tag leaks into the main body stream.
+        // So a cell that looks like `preamble prose</think>` is
+        // entirely thinking — the "prose" is leaked reasoning.
+        let c = AssistantCell::from_markdown(
+            "The user wants me to review the commit. Let me fetch the diff.</think>",
+        );
+        let out = render(&c, 80, 3);
+        assert!(
+            out.contains("Thought"),
+            "bare trailing `</think>` must trigger collapse: {out}"
+        );
+        assert!(
+            !out.contains("The user wants me to review"),
+            "leaked thinking prose must not show: {out}"
+        );
+    }
+
+    #[test]
+    fn thinking_prose_then_close_then_body_splits_correctly() {
+        // Same pattern but with a real body after the close.
+        let c = AssistantCell::from_markdown(
+            "internal reasoning here</think>\n\nThe answer is 42.",
+        );
+        let out = render(&c, 60, 4);
+        assert!(out.contains("Thought"), "header missing: {out}");
+        assert!(out.contains("The answer is 42"), "body missing: {out}");
+        assert!(
+            !out.contains("internal reasoning"),
+            "thinking leak: {out}"
+        );
+    }
+
+    #[test]
+    fn leading_close_tag_alone_renders_empty_thought_header() {
+        // First assistant cell in a turn can be just `</think>` —
+        // the model closed a reasoning window but hasn't emitted
+        // body content yet. We still want a header so the user
+        // sees that thinking happened.
+        let c = AssistantCell::from_markdown("</think>");
+        let out = render(&c, 60, 2);
+        assert!(
+            out.contains("Thought"),
+            "bare leading `</think>` should still collapse: {out}"
+        );
+        assert!(
+            !out.contains("</think>"),
+            "tag must not appear raw: {out}"
+        );
+    }
+
+    #[test]
+    fn multiple_close_tags_take_body_after_last_one() {
+        // Some providers emit several `</think>` as the model
+        // re-opens thinking mid-turn. Body is what follows the
+        // LAST close.
+        let c = AssistantCell::from_markdown(
+            "think A</think>\nthink B</think>\n\nFinal answer.",
+        );
+        let out = render(&c, 60, 4);
+        assert!(out.contains("Thought"), "header missing: {out}");
+        assert!(out.contains("Final answer"), "body missing: {out}");
+        assert!(!out.contains("think A"), "first think leak: {out}");
+        assert!(!out.contains("think B"), "second think leak: {out}");
     }
 
     #[test]

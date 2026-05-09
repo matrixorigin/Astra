@@ -95,11 +95,17 @@ impl HistoryCell for UserCell {
             }
         }
 
-        // One trailing tinted blank for breathing room + one
-        // untinted blank to separate from the next cell. Matches
-        // the spacing contract §4 of the design doc.
-        lines.push(Line::styled("", bg));
-        lines.push(Line::default());
+        // Slash commands pair visually with a `⎿ response` on the
+        // very next line (Claude-Code style), so we emit no trailing
+        // blank — the batch-level separator in `flush_chat_widget`
+        // is also suppressed for this pair. Prose user messages get
+        // one tinted + one plain blank for breathing room before
+        // the model's reply; matches the spacing contract §4 of the
+        // design doc.
+        if !self.text.trim_start().starts_with('/') {
+            lines.push(Line::styled("", bg));
+            lines.push(Line::default());
+        }
         lines
     }
 
@@ -184,6 +190,38 @@ mod tests {
         let back = UserCell::from_persist(persisted.clone()).expect("from_persist");
         assert_eq!(back.text, "hello world");
         assert_eq!(back.ts.as_deref(), Some("2026-05-09T12:00:00Z"));
+    }
+
+    #[test]
+    fn slash_command_user_cell_omits_trailing_blanks() {
+        // Slash user messages pair visually with their `⎿ response`
+        // — the breathing-room blanks that prose user cells use
+        // would push the reply down with dead space. Verify that
+        // a `/model` UserCell renders exactly one line.
+        let cell = UserCell::new("/model glm-5.1");
+        let lines = cell.display_lines(60);
+        assert_eq!(
+            lines.len(),
+            1,
+            "slash UserCell should produce exactly one line (no trailing blanks); got {:?}",
+            lines
+        );
+    }
+
+    #[test]
+    fn prose_user_cell_keeps_trailing_blanks() {
+        // Regression: non-slash prose must keep its two trailing
+        // blanks (§4 of the design doc) so the model's reply has
+        // breathing room. Only `/` commands get the tight layout.
+        let cell = UserCell::new("just a prose question");
+        let lines = cell.display_lines(60);
+        // 1 content line + 2 trailing blanks = 3 total.
+        assert_eq!(
+            lines.len(),
+            3,
+            "prose UserCell should keep its 2 trailing blanks; got {:?}",
+            lines
+        );
     }
 
     #[test]

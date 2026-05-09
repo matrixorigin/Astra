@@ -99,12 +99,55 @@ fn flush_chat_widget(
     if new_cells.is_empty() {
         return;
     }
+    // Batch layout: each cell renders its lines then gets a trailing
+    // blank for visual separation. Claude-Code-style response cells
+    // (`⎿ Set model to …`) want to hug the `› /cmd` line above —
+    // both when paired in the same batch (no blank between them)
+    // and when the UserCell flushed in an earlier event (the
+    // picker-return path). For the former we detect the pair here
+    // and skip its separator; for the latter we also skip the
+    // response's OWN leading and trailing blanks so the reply
+    // stacks tight onto the previous flush's `› /cmd`.
     let mut batch: Vec<ratatui::text::Line<'static>> = Vec::new();
-    for cell in new_cells {
+    for (i, cell) in new_cells.iter().enumerate() {
         batch.extend(cell.display_lines(width));
-        batch.push(ratatui::text::Line::default());
+        let is_last = i + 1 == new_cells.len();
+        let next_is_response = !is_last
+            && is_response_cell(new_cells[i + 1].as_ref());
+        let this_is_slash_user = is_slash_user_cell(cell.as_ref());
+        let this_is_response = is_response_cell(cell.as_ref());
+
+        // Skip the trailing blank in two cases:
+        //   1. This cell is a slash UserCell and the next is a
+        //      response — they're a visual pair.
+        //   2. This cell is a response — its reply should stack
+        //      tight onto whatever came next, and nothing in the
+        //      current batch should push air below it.
+        let suppress_blank =
+            (this_is_slash_user && next_is_response) || this_is_response;
+        if !suppress_blank {
+            batch.push(ratatui::text::Line::default());
+        }
     }
     guard.queue_history_lines(batch);
+}
+
+/// Detect a system cell rendered with Claude Code's corner-glyph
+/// style. Used by `flush_chat_widget` to omit the usual trailing
+/// blank so the response hugs the `› /cmd` line above it.
+fn is_response_cell(cell: &dyn history_cell::HistoryCell) -> bool {
+    cell.as_any_ref()
+        .downcast_ref::<history_cell::system::SystemCell>()
+        .is_some_and(|sc| sc.level() == crate::tui::turn_event::SystemLevel::Response)
+}
+
+/// Detect a UserCell whose text is a slash command (`/model`,
+/// `/login`, …). These pair tightly with a following response cell
+/// so their trailing blank is suppressed — `› /cmd` hugs `⎿ reply`.
+fn is_slash_user_cell(cell: &dyn history_cell::HistoryCell) -> bool {
+    cell.as_any_ref()
+        .downcast_ref::<history_cell::user::UserCell>()
+        .is_some_and(|uc| uc.text().trim_start().starts_with('/'))
 }
 
 /// Replay a session's JSONL transcript into a fresh `ChatWidget`,
