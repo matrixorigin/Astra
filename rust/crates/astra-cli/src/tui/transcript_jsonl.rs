@@ -18,8 +18,6 @@
 //! partially-written trailing records from a crash mid-flush —
 //! we'd rather show N-1 turns than refuse to open the session.
 
-#![allow(dead_code)] // phase 1: no consumers yet; event loop lands in phase 3.
-
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
@@ -52,10 +50,7 @@ pub(crate) fn append(session_id: &str, event: &TurnEvent) {
     };
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            astra_core::agent_warn!(
-                "tui.transcript",
-                "create_dir_all({parent:?}) failed: {e}"
-            );
+            astra_core::agent_warn!("tui.transcript", "create_dir_all({parent:?}) failed: {e}");
             return;
         }
     }
@@ -70,10 +65,7 @@ pub(crate) fn append(session_id: &str, event: &TurnEvent) {
     let serialized = match serde_json::to_string(event) {
         Ok(s) => s,
         Err(e) => {
-            astra_core::agent_warn!(
-                "tui.transcript",
-                "serialize {event:?} failed: {e}"
-            );
+            astra_core::agent_warn!("tui.transcript", "serialize {event:?} failed: {e}");
             return;
         }
     };
@@ -218,7 +210,10 @@ mod tests {
                 },
             );
             // Poke a corrupt line directly onto the file.
-            let path = tmp.join(".astra").join("transcripts").join("sess_malformed.jsonl");
+            let path = tmp
+                .join(".astra")
+                .join("transcripts")
+                .join("sess_malformed.jsonl");
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&path)

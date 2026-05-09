@@ -145,12 +145,8 @@ impl ToolCell {
                 let theme = crate::tui::theme::current();
                 Span::styled("• ", Style::default().fg(theme.accent).bold())
             }
-            ToolStatus::Success => {
-                Span::styled("• ", Style::default().fg(Color::Green).bold())
-            }
-            ToolStatus::Failed => {
-                Span::styled("• ", Style::default().fg(Color::Red).bold())
-            }
+            ToolStatus::Success => Span::styled("• ", Style::default().fg(Color::Green).bold()),
+            ToolStatus::Failed => Span::styled("• ", Style::default().fg(Color::Red).bold()),
         }
     }
 
@@ -178,9 +174,7 @@ impl ToolCell {
     /// the user reassured even when the underlying work has no
     /// real progress metric.
     fn progress_line(&self, width: usize, elapsed_ms: u64) -> Line<'static> {
-        const FRAMES: [&str; 10] = [
-            "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
-        ];
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame_idx = ((elapsed_ms / 80) % FRAMES.len() as u64) as usize;
         let theme = crate::tui::theme::current();
         let dim = Style::default().fg(Color::DarkGray);
@@ -198,7 +192,10 @@ impl ToolCell {
 
         Line::from(vec![
             Span::styled("    ", dim),
-            Span::styled(FRAMES[frame_idx].to_string(), Style::default().fg(theme.accent)),
+            Span::styled(
+                FRAMES[frame_idx].to_string(),
+                Style::default().fg(theme.accent),
+            ),
             Span::raw(" "),
             Span::styled(bar, Style::default().fg(theme.accent)),
             Span::styled(format!(" {:.0}%", progress * 100.0), dim),
@@ -365,8 +362,8 @@ mod tests {
 
     fn render(cell: &ToolCell, width: u16, height: u16) -> String {
         let lines = cell.display_lines(width);
-        let p = ratatui::widgets::Paragraph::new(lines)
-            .wrap(ratatui::widgets::Wrap { trim: false });
+        let p =
+            ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         buffer_to_string(&draw_widget(p, width, height))
     }
 
@@ -420,10 +417,7 @@ mod tests {
     #[test]
     fn running_does_not_persist() {
         let t = ToolCell::new_running("bash", "sleep 10");
-        assert!(
-            t.to_persist().is_none(),
-            "live cells must stay off disk"
-        );
+        assert!(t.to_persist().is_none(), "live cells must stay off disk");
     }
 
     #[test]
@@ -478,7 +472,12 @@ mod tests {
     #[test]
     fn output_summary_truncates_at_5_lines_with_marker() {
         let mut t = ok_tool("ls", "ls -la", 8);
-        t.output_summary = Some((1..=8).map(|i| format!("file-{i}")).collect::<Vec<_>>().join("\n"));
+        t.output_summary = Some(
+            (1..=8)
+                .map(|i| format!("file-{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         let out = render(&t, 80, 8);
         assert!(out.contains("file-1"));
         assert!(out.contains("file-5"));
@@ -505,9 +504,6 @@ mod tests {
 
     #[test]
     fn snapshot_err_80() {
-        insta::assert_snapshot!(
-            "tool_err_80",
-            render(&err_tool("bash", "false", 10), 80, 3)
-        );
+        insta::assert_snapshot!("tool_err_80", render(&err_tool("bash", "false", 10), 80, 3));
     }
 }

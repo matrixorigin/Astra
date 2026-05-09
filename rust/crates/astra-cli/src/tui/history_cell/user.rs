@@ -91,9 +91,7 @@ impl HistoryCell for UserCell {
                     // so the text column stays aligned.
                     Span::raw("  ")
                 };
-                lines.push(
-                    Line::from(vec![prefix, Span::raw(row.to_string())]).style(bg),
-                );
+                lines.push(Line::from(vec![prefix, Span::raw(row.to_string())]).style(bg));
             }
         }
 
@@ -127,8 +125,8 @@ mod tests {
 
     fn render_cell(cell: &UserCell, width: u16, height: u16) -> String {
         let lines = cell.display_lines(width);
-        let p = ratatui::widgets::Paragraph::new(lines)
-            .wrap(ratatui::widgets::Wrap { trim: false });
+        let p =
+            ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         buffer_to_string(&draw_widget(p, width, height))
     }
 
@@ -205,18 +203,12 @@ mod tests {
     #[test]
     fn snapshot_single_line_40col() {
         let cell = UserCell::new("rebuild the index");
-        insta::assert_snapshot!(
-            "user_single_line_40",
-            render_cell(&cell, 40, 3)
-        );
+        insta::assert_snapshot!("user_single_line_40", render_cell(&cell, 40, 3));
     }
 
     #[test]
     fn snapshot_multiline_60col() {
         let cell = UserCell::new("first line\nsecond line with more words\nthird line");
-        insta::assert_snapshot!(
-            "user_multiline_60",
-            render_cell(&cell, 60, 5)
-        );
+        insta::assert_snapshot!("user_multiline_60", render_cell(&cell, 60, 5));
     }
 }

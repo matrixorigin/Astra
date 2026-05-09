@@ -1,7 +1,0 @@
----
-source: crates/astra-cli/src/tui/chat_cell/snapshot_tests.rs
-expression: "render_cell(&cell, 20, 6)"
----
-› this message
-should wrap past 20
-columns

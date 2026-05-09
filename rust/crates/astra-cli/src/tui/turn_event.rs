@@ -23,8 +23,6 @@
 //! one row per user-visible cell. Conceptually distinct, so they
 //! get sibling files.
 
-#![allow(dead_code)] // phase 1: schema only, no writers yet.
-
 use serde::{Deserialize, Serialize};
 
 /// One committed entry in a session transcript.
@@ -224,11 +222,7 @@ mod tests {
 
     #[test]
     fn system_event_levels_roundtrip() {
-        for lv in [
-            SystemLevel::Info,
-            SystemLevel::Warning,
-            SystemLevel::Error,
-        ] {
+        for lv in [SystemLevel::Info, SystemLevel::Warning, SystemLevel::Error] {
             assert_roundtrip(&TurnEvent::System {
                 ts: None,
                 level: lv,
@@ -298,8 +292,7 @@ mod tests {
         // want the loader to surface that (and the enclosing file-
         // reader will just skip the bad line). A silent pass-through
         // would mean quietly dropping user data.
-        let r: Result<TurnEvent, _> =
-            serde_json::from_str(r#"{"kind":"nonsense","text":"x"}"#);
+        let r: Result<TurnEvent, _> = serde_json::from_str(r#"{"kind":"nonsense","text":"x"}"#);
         assert!(r.is_err(), "unknown kind must be rejected");
     }
 }

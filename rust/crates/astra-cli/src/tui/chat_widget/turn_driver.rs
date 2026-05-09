@@ -36,8 +36,8 @@ fn render_history(w: &ChatWidget, width: u16) -> String {
         all_lines.extend(cell.display_lines(width));
     }
     let height = (all_lines.len() as u16).max(1);
-    let p = ratatui::widgets::Paragraph::new(all_lines)
-        .wrap(ratatui::widgets::Wrap { trim: false });
+    let p =
+        ratatui::widgets::Paragraph::new(all_lines).wrap(ratatui::widgets::Wrap { trim: false });
     buffer_to_string(&draw_widget(p, width, height))
 }
 
@@ -52,9 +52,7 @@ fn canonical_turn_commits_every_cell_kind_in_order() {
     let _ = Instant::now();
 
     // User kicks off the turn.
-    w.handle_event(AppEvent::UserSubmit(
-        "build the plan and run ls".into(),
-    ));
+    w.handle_event(AppEvent::UserSubmit("build the plan and run ls".into()));
 
     // Model reasons first.
     w.handle_event(AppEvent::ReasoningDelta("user wants X. ".into()));
@@ -77,9 +75,7 @@ fn canonical_turn_commits_every_cell_kind_in_order() {
 
     // Answer streams in two chunks.
     w.handle_event(AppEvent::AnswerDelta("Here is the plan:\n\n".into()));
-    w.handle_event(AppEvent::AnswerDelta(
-        "- step one\n- step two\n".into(),
-    ));
+    w.handle_event(AppEvent::AnswerDelta("- step one\n- step two\n".into()));
 
     // Turn ends — widget emits the summary.
     w.handle_event(AppEvent::TurnComplete(Box::new(TurnStats {
@@ -189,7 +185,7 @@ fn two_back_to_back_tools_both_commit() {
         });
     }
 
-    w.handle_event(AppEvent::TurnComplete(Box::new(TurnStats::default())));
+    w.handle_event(AppEvent::TurnComplete(Box::default()));
     // user + t1 + t2 + summary
     assert_eq!(w.history().len(), 4);
 }
@@ -216,8 +212,8 @@ fn turn_error_mid_stream_commits_partial_assistant_then_error() {
 
 fn cell_kind_name(c: &dyn HistoryCell) -> &'static str {
     use crate::tui::history_cell::{
-        assistant::AssistantCell, reasoning::ReasoningCell, system::SystemCell,
-        tool::ToolCell, turn_summary::TurnSummaryCell, user::UserCell,
+        assistant::AssistantCell, reasoning::ReasoningCell, system::SystemCell, tool::ToolCell,
+        turn_summary::TurnSummaryCell, user::UserCell,
     };
     let a = c.as_any_ref();
     if a.is::<UserCell>() {

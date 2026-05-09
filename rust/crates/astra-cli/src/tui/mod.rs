@@ -1,8 +1,4 @@
 #[cfg(test)]
-mod driver_tests;
-#[cfg(test)]
-mod layout_test;
-#[cfg(test)]
 mod testing;
 #[cfg(test)]
 mod tests;
@@ -10,66 +6,53 @@ mod tests;
 mod app_event;
 mod approval;
 mod bottom_pane;
-mod context_panel;
 mod chat_cell;
-mod chat_viewport;
-// ── Refactored core (phase 1–3) ────────────────────────────────
-// Trait + schema + cells + event router. Not yet wired into
-// `run_tui_repl`; Phase 3d swap completes it. See
+mod context_panel;
+// Core (post-refactor): HistoryCell trait + TurnEvent schema +
+// single ChatWidget router + on-disk JSONL transcript. See
 // `docs/design/tui-refactor.md`.
 mod chat_widget;
-mod history_cell;
-mod status_indicator;
-mod transcript_jsonl;
-mod turn_event;
 mod color;
 mod custom_terminal;
 mod diff_render;
 mod event;
 mod frame_rate_limiter;
 mod frame_requester;
+mod history_cell;
 mod insert_history;
 mod keymap;
 mod layout;
 mod markdown;
 mod markdown_render;
-mod markdown_stream;
 mod mention_menu;
 mod render;
 mod session_picker;
 mod shimmer;
 mod slash_dispatch;
 mod slash_menu;
-mod state;
+mod status_indicator;
 mod status_line;
-mod table_view;
-mod theme;
-mod timeline;
-mod view_stack;
-mod worktrees;
 mod stream_bridge;
-mod streaming;
 mod style;
+mod table_view;
 mod task_status;
 mod terminal;
 mod terminal_palette;
+mod theme;
+mod timeline;
+mod transcript_jsonl;
+mod turn_event;
 pub(crate) mod ui_adapter;
+mod view_stack;
+mod worktrees;
 mod wrapping;
 
 use app_event::TuiAppEvent;
 use bottom_pane::{BottomPane, BottomPaneAction};
-// ChatCell imports — narrowed to what's still touched by Phase-5
-// cleanup pending removal. Most cell types are unused here now
-// that ChatWidget is the scrollback owner.
-#[allow(unused_imports)]
-use chat_cell::{
-    ChatCell, assistant_cell::AssistantChatCell, system_cell::SystemChatCell,
-    tool_cell::ToolChatCell, user_cell::UserChatCell,
-};
+use history_cell::HistoryCell;
 
 use ratatui::widgets::Clear;
 use std::time::Duration;
-use streaming::controller::StreamController;
 use task_status::TaskStatus;
 use terminal::TerminalGuard;
 use tokio::sync::broadcast;
@@ -145,7 +128,7 @@ fn replay_session_into_widget(
         return widget;
     }
     // Banner first so it lands above the restored cells.
-    let banner = SystemChatCell::info(format!(
+    let banner = history_cell::system::SystemCell::info(format!(
         "Resumed session {} — {} cells restored",
         &session_id[..8.min(session_id.len())],
         restored
@@ -161,72 +144,6 @@ fn replay_session_into_widget(
     // safe.
     widget.mark_all_flushed();
     widget
-}
-
-/// Legacy helper — kept only so Phase-5 deletes are easier to
-/// grep. The new render pipeline does not call this; the chat
-/// widget's scrollback flush replaces it.
-#[allow(dead_code)]
-fn flush_cell_to_scrollback(
-    guard: &mut TerminalGuard,
-    cell: Box<dyn ChatCell>,
-    width: u16,
-    transcript: &mut Vec<ratatui::text::Line<'static>>,
-) {
-    let display = cell.display_lines(width);
-    let trans = cell.transcript_lines(width);
-
-    if !display.is_empty() {
-        let mut hist = Vec::new();
-        hist.extend(display);
-        // Single trailing blank between cells — Codex uses two, but at
-        // our default font metrics that reads as a full paragraph break
-        // and the transcript starts looking sparse. One blank is still
-        // enough to separate cells visually.
-        hist.push(ratatui::text::Line::default());
-        guard.queue_history_lines(hist);
-    }
-
-    if !trans.is_empty() {
-        transcript.extend(trans);
-        transcript.push(ratatui::text::Line::default());
-    }
-}
-
-/// Flush a streaming mini-cell to scrollback (no trailing blanks — continuation).
-fn flush_mini_cell(
-    guard: &mut TerminalGuard,
-    cell: Box<dyn ChatCell>,
-    width: u16,
-    transcript: &mut Vec<ratatui::text::Line<'static>>,
-) {
-    let display = cell.display_lines(width);
-    let trans = cell.transcript_lines(width);
-    if !display.is_empty() {
-        guard.queue_history_lines(display);
-    }
-    if !trans.is_empty() {
-        transcript.extend(trans);
-    }
-}
-
-/// Finalize stream controller: emit final mini-cell + trailing blanks.
-fn finalize_stream(
-    sc: &mut Option<StreamController>,
-    guard: &mut TerminalGuard,
-    width: u16,
-    transcript: &mut Vec<ratatui::text::Line<'static>>,
-) {
-    if let Some(mut controller) = sc.take() {
-        let (final_cell, _source) = controller.finalize();
-        if let Some(cell) = final_cell {
-            flush_mini_cell(guard, cell, width, transcript);
-        }
-        // One blank after the stream finalizes — matches the single-
-        // blank convention used by `flush_cell_to_scrollback`.
-        guard.queue_history_lines(vec![ratatui::text::Line::default()]);
-        transcript.push(ratatui::text::Line::default());
-    }
 }
 
 /// One-shot lookup of the current git branch name via `gix`. Returns
@@ -342,8 +259,9 @@ pub(crate) async fn run_tui_repl(
     // Install a filesystem-backed file provider for the `@`-mention menu,
     // rooted at the current working directory.
     if let Ok(cwd) = std::env::current_dir() {
-        bottom_pane
-            .set_file_provider(std::sync::Arc::new(mention_menu::provider::FsFileProvider::new(cwd)));
+        bottom_pane.set_file_provider(std::sync::Arc::new(
+            mention_menu::provider::FsFileProvider::new(cwd),
+        ));
     }
 
     // Seed the current git branch into the status line. One-shot read at
@@ -353,14 +271,6 @@ pub(crate) async fn run_tui_repl(
         bottom_pane.footer.git_branch = Some(branch);
     }
 
-    // Legacy placeholders kept only because `drain_tick` / Ctrl+O
-    // transcript overlay still read `transcript`. Phase 5 will
-    // delete `transcript` once the overlay is migrated to the
-    // ChatWidget history.
-    let mut transcript: Vec<ratatui::text::Line<'static>> = Vec::new();
-    // Legacy stream_controller kept alive for the unused `drain_tick`
-    // call path; always None in the new rendering pipeline.
-    let mut stream_controller: Option<StreamController> = None;
     // ChatWidget owns the scrollback + active cell. If the user
     // entered via `astra -c` / `astra --resume <id>`, replay the
     // prior session's JSONL transcript into the widget and paint
@@ -405,16 +315,25 @@ pub(crate) async fn run_tui_repl(
                             frame_requester.schedule_frame();
                             continue;
                         }
-                        // Ctrl+O: open transcript view
+                        // Ctrl+O: open transcript view. Built on
+                        // demand from the ChatWidget's committed
+                        // history so the content always matches
+                        // what's in scrollback. Blank lines between
+                        // cells mirror the single-blank separator
+                        // used by `flush_chat_widget`.
                         if key.code == crossterm::event::KeyCode::Char('o')
                             && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                             && !bottom_pane.has_active_view()
                         {
                             use bottom_pane::transcript_view::TranscriptView;
-                            if transcript.is_empty() {
-                                // nothing to show
-                            } else {
-                                bottom_pane.push_view(Box::new(TranscriptView::new(transcript.clone())));
+                            let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                            let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
+                            for cell in chat_widget.history() {
+                                lines.extend(cell.display_lines(w));
+                                lines.push(ratatui::text::Line::default());
+                            }
+                            if !lines.is_empty() {
+                                bottom_pane.push_view(Box::new(TranscriptView::new(lines)));
                             }
                             frame_requester.schedule_frame();
                             continue;
@@ -465,11 +384,11 @@ pub(crate) async fn run_tui_repl(
                                                 Ok(Ok(true)) => { break 'main Ok(()); }
                                                 Ok(Ok(false)) => {}
                                                 Ok(Err(e)) => {
-                                                    let err = SystemChatCell::error(e);
+                                                    let err = history_cell::system::SystemCell::error(e);
                                                     guard.queue_history_lines(err.display_lines(w));
                                                 }
                                                 Err(e) => {
-                                                    let err = SystemChatCell::error(format!("Terminal restore failed: {e}"));
+                                                    let err = history_cell::system::SystemCell::error(format!("Terminal restore failed: {e}"));
                                                     guard.queue_history_lines(err.display_lines(w));
                                                 }
                                             }
@@ -604,12 +523,9 @@ pub(crate) async fn run_tui_repl(
                                 }
                                                 }
                                                 _ = &mut itick => {
-                                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80); drain_tick(&mut stream_controller, &mut guard, w, &mut transcript, &frame_requester);
-                                                    {
-                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
-                                    let _ = do_draw(&mut guard, lines, &mut bottom_pane);
-                                }
+                                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                                    let _ = do_draw(&mut guard, lines, &mut bottom_pane);
                                                 }
                                             }
                                         };
@@ -648,10 +564,6 @@ pub(crate) async fn run_tui_repl(
                                     // Turn end — ChatWidget handles any
                                     // remaining live cell on TurnComplete.
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                    // `transcript` / `stream_controller` are
-                                    // only still read by drain_tick + Ctrl+O
-                                    // in the legacy path; untouched here.
-                                    let _ = (&mut transcript, &mut stream_controller);
 
                                     bottom_pane.set_task_status(TaskStatus::Idle);
                                     status_indicator.set_state(
@@ -750,12 +662,12 @@ pub(crate) async fn run_tui_repl(
                                         let password = parts.next().unwrap_or("").to_string();
                                         match crate::auth_flow::do_login(api, profile, &username, &password).await {
                                             Ok(_) => {
-                                                let info = SystemChatCell::info(format!("Logged in as {username}"));
+                                                let info = history_cell::system::SystemCell::info(format!("Logged in as {username}"));
                                                 guard.queue_history_lines(info.display_lines(w));
                                                 crate::post_auth_cloud_resync(profile, &mut state).await;
                                             }
                                             Err(e) => {
-                                                let err = SystemChatCell::error(format!("Login failed: {e}"));
+                                                let err = history_cell::system::SystemCell::error(format!("Login failed: {e}"));
                                                 guard.queue_history_lines(err.display_lines(w));
                                             }
                                         }
@@ -771,22 +683,22 @@ pub(crate) async fn run_tui_repl(
                                         let password = parts.next().unwrap_or("").to_string();
                                         match crate::auth_flow::do_register(api, &username, &email, &password).await {
                                             Ok(_) => {
-                                                let info = SystemChatCell::info("Registered — logging in…".into());
+                                                let info = history_cell::system::SystemCell::info("Registered — logging in…");
                                                 guard.queue_history_lines(info.display_lines(w));
                                                 match crate::auth_flow::do_login(api, profile, &username, &password).await {
                                                     Ok(_) => {
-                                                        let info = SystemChatCell::info(format!("Logged in as {username}"));
+                                                        let info = history_cell::system::SystemCell::info(format!("Logged in as {username}"));
                                                         guard.queue_history_lines(info.display_lines(w));
                                                         crate::post_auth_cloud_resync(profile, &mut state).await;
                                                     }
                                                     Err(e) => {
-                                                        let err = SystemChatCell::error(format!("Auto-login failed: {e}"));
+                                                        let err = history_cell::system::SystemCell::error(format!("Auto-login failed: {e}"));
                                                         guard.queue_history_lines(err.display_lines(w));
                                                     }
                                                 }
                                             }
                                             Err(e) => {
-                                                let err = SystemChatCell::error(format!("Register failed: {e}"));
+                                                let err = history_cell::system::SystemCell::error(format!("Register failed: {e}"));
                                                 guard.queue_history_lines(err.display_lines(w));
                                             }
                                         }
@@ -815,11 +727,11 @@ pub(crate) async fn run_tui_repl(
                                             Ok(Ok(true)) => { break 'main Ok(()); }
                                             Ok(Ok(false)) => {}
                                             Ok(Err(e)) => {
-                                                let err = SystemChatCell::error(e);
+                                                let err = history_cell::system::SystemCell::error(e);
                                                 guard.queue_history_lines(err.display_lines(w));
                                             }
                                             Err(e) => {
-                                                let err = SystemChatCell::error(format!("Terminal restore failed: {e}"));
+                                                let err = history_cell::system::SystemCell::error(format!("Terminal restore failed: {e}"));
                                                 guard.queue_history_lines(err.display_lines(w));
                                             }
                                         }
@@ -907,12 +819,11 @@ pub(crate) async fn run_tui_repl(
                                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
             }
             _ = &mut tick => {
+                // Pulse the chat-widget scrollback so if any async
+                // event was handled since the last draw the new
+                // cells land promptly instead of waiting for the
+                // next event edge.
                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                drain_tick(&mut stream_controller, &mut guard, w, &mut transcript, &frame_requester);
-                // Each tick also pulses the chat-widget scrollback so
-                // if any async event was handled since the last draw
-                // the new cells land promptly instead of waiting for
-                // the next event edge.
                 flush_chat_widget(&mut guard, &mut chat_widget, w);
             }
         }
@@ -993,18 +904,15 @@ fn handle_app_event(
             // Bump the per-turn token approximation so the
             // StatusIndicator shows `↓ N tokens` climbing.
             status_indicator.bump_stream_chars(text.chars().count());
-            bottom_pane.set_task_status(TaskStatus::TurnRunning {
-                started_at: now,
-            });
+            bottom_pane.set_task_status(TaskStatus::TurnRunning { started_at: now });
             // Don't switch the indicator — it's set to Thinking at
             // turn start and remains "Thinking" even once tokens
             // arrive; the active_cell in ChatWidget takes over
             // rendering from here.
         }
         TuiAppEvent::ThinkingStarted => {
-            status_indicator.set_state(
-                status_indicator::IndicatorState::Thinking { started_at: now },
-            );
+            status_indicator
+                .set_state(status_indicator::IndicatorState::Thinking { started_at: now });
         }
         TuiAppEvent::ThinkingChunk(_) => {
             // ChatWidget handles the cell update; nothing to do
@@ -1017,36 +925,29 @@ fn handle_app_event(
         }
         TuiAppEvent::WaitingForModel => {
             bottom_pane.set_task_status(TaskStatus::WaitingModel);
-            status_indicator.set_state(
-                status_indicator::IndicatorState::WaitingModel { started_at: now },
-            );
+            status_indicator
+                .set_state(status_indicator::IndicatorState::WaitingModel { started_at: now });
         }
         TuiAppEvent::ModelResponding => {
-            bottom_pane.set_task_status(TaskStatus::TurnRunning {
-                started_at: now,
-            });
-            status_indicator.set_state(
-                status_indicator::IndicatorState::Thinking { started_at: now },
-            );
+            bottom_pane.set_task_status(TaskStatus::TurnRunning { started_at: now });
+            status_indicator
+                .set_state(status_indicator::IndicatorState::Thinking { started_at: now });
         }
         TuiAppEvent::ToolStarted { name, .. } => {
             bottom_pane.set_task_status(TaskStatus::ToolExecuting {
                 name: name.clone(),
                 started_at: now,
             });
-            status_indicator.set_state(
-                status_indicator::IndicatorState::Tool {
-                    name: name.clone(),
-                    started_at: now,
-                },
-            );
+            status_indicator.set_state(status_indicator::IndicatorState::Tool {
+                name: name.clone(),
+                started_at: now,
+            });
         }
         TuiAppEvent::ToolCompleted { .. } => {
             // Flip back to thinking; the ChatWidget committed the
             // tool cell in its own event handler.
-            status_indicator.set_state(
-                status_indicator::IndicatorState::Thinking { started_at: now },
-            );
+            status_indicator
+                .set_state(status_indicator::IndicatorState::Thinking { started_at: now });
         }
         TuiAppEvent::StatusLine(_) => {}
         TuiAppEvent::TurnComplete | TuiAppEvent::TurnError(_) => {
@@ -1057,155 +958,7 @@ fn handle_app_event(
     fr.schedule_frame();
 }
 
-/// Codex pattern: each tick drains queued lines into a mini-cell,
-/// immediately flushed to scrollback. No bulk flush at turn end.
-fn drain_tick(
-    sc: &mut Option<StreamController>,
-    guard: &mut TerminalGuard,
-    width: u16,
-    transcript: &mut Vec<ratatui::text::Line<'static>>,
-    fr: &FrameRequester,
-) {
-    if let Some(s) = sc {
-        let (cell, _idle) = s.on_commit_tick();
-        if let Some(cell) = cell {
-            flush_mini_cell(guard, cell, width, transcript);
-            fr.schedule_frame();
-        }
-    }
-}
-
 use ratatui::widgets::Widget;
-
-/// Format a compact, icon-segmented turn-summary line.
-///
-/// Shape: `  ─ ⏱ <elapsed> (ttft <ms>) │ ⚡ <tokens> ↑in ↓out │ 🛠 <n>
-///           │ 💾 <cache%> │ Σ <session-tokens> · $<session-cost> ─`
-///
-/// Segments that don't apply (no tools, no cache, no cost) are
-/// elided entirely so short turns don't carry empty markers.
-#[allow(clippy::too_many_arguments)]
-fn format_turn_summary(
-    state: &crate::repl_state::ReplState,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    cache_read_tokens: u64,
-    cache_creation_tokens: u64,
-    turn_cost: f64,
-    elapsed: std::time::Duration,
-    ttft_ms: Option<u64>,
-    tool_count: u32,
-) -> String {
-    let elapsed_str = fmt_duration(elapsed);
-    let total_input = prompt_tokens + cache_read_tokens + cache_creation_tokens;
-    let total_tokens = total_input + completion_tokens;
-
-    let mut segments: Vec<String> = Vec::new();
-
-    // ⏱ time: always shown; ttft nested in parens when available.
-    let time_seg = match ttft_ms {
-        Some(ms) if ms > 0 => format!("⏱ {} (ttft {})", elapsed_str, fmt_ms(ms)),
-        _ => format!("⏱ {}", elapsed_str),
-    };
-    segments.push(time_seg);
-
-    // ⚡ tokens: total + ↑in ↓out breakdown.
-    segments.push(format!(
-        "⚡ {} ↑{} ↓{}",
-        fmt_tokens(total_tokens),
-        fmt_tokens(total_input),
-        fmt_tokens(completion_tokens)
-    ));
-
-    if tool_count > 0 {
-        segments.push(format!("🛠 {tool_count}"));
-    }
-
-    if cache_read_tokens > 0 && total_input > 0 {
-        let pct = cache_read_tokens as f64 / total_input as f64 * 100.0;
-        segments.push(format!("💾 {pct:.0}%"));
-    }
-
-    // Σ session totals: cumulative tokens + optional cost. Skip when
-    // both are zero (first-turn / free models).
-    let session_in = state.total_prompt_tokens
-        + state.total_cache_read_tokens
-        + state.total_cache_creation_tokens;
-    let session_tokens = session_in + state.total_completion_tokens;
-    let session_cost = state.total_session_cost;
-    if session_tokens > 0 || session_cost > 0.0 {
-        let mut sigma = format!("Σ {}", fmt_tokens(session_tokens));
-        if session_cost > 0.0 {
-            sigma.push_str(&format!(" · {}", crate::slash_stats::format_cost(session_cost)));
-        } else if turn_cost > 0.0 {
-            // Mid-session with only turn cost available — still useful.
-            sigma.push_str(&format!(" · {}", crate::slash_stats::format_cost(turn_cost)));
-        }
-        segments.push(sigma);
-    }
-
-    format!("  ─ {} ─", segments.join(" │ "))
-}
-
-fn fmt_duration(elapsed: std::time::Duration) -> String {
-    if elapsed.as_secs() >= 60 {
-        format!("{}m{:.0}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
-    } else {
-        format!("{:.1}s", elapsed.as_secs_f64())
-    }
-}
-
-fn fmt_ms(ms: u64) -> String {
-    if ms >= 1000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        format!("{ms}ms")
-    }
-}
-
-fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
-#[cfg(test)]
-mod summary_fmt_tests {
-    use super::*;
-
-    #[test]
-    fn tokens_short_scale() {
-        assert_eq!(fmt_tokens(0), "0");
-        assert_eq!(fmt_tokens(999), "999");
-        assert_eq!(fmt_tokens(1_234), "1.2k");
-        assert_eq!(fmt_tokens(23_456), "23.5k");
-        assert_eq!(fmt_tokens(1_500_000), "1.5M");
-    }
-
-    #[test]
-    fn ms_collapses_to_seconds_over_1s() {
-        assert_eq!(fmt_ms(250), "250ms");
-        assert_eq!(fmt_ms(999), "999ms");
-        assert_eq!(fmt_ms(1_000), "1.0s");
-        assert_eq!(fmt_ms(1_757), "1.8s");
-    }
-
-    #[test]
-    fn duration_uses_mmss_over_minute() {
-        assert_eq!(
-            fmt_duration(std::time::Duration::from_millis(2_500)),
-            "2.5s"
-        );
-        assert_eq!(
-            fmt_duration(std::time::Duration::from_secs(125)),
-            "2m5s"
-        );
-    }
-}
 
 struct BottomPaneRenderable<'a>(&'a mut BottomPane);
 

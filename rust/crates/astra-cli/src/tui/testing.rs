@@ -131,7 +131,11 @@ mod harness_self_tests {
         let s = render::buffer_to_string(&buf);
         let lines: Vec<&str> = s.split('\n').collect();
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "hi", "row 0 should be trimmed, got {:?}", lines[0]);
+        assert_eq!(
+            lines[0], "hi",
+            "row 0 should be trimmed, got {:?}",
+            lines[0]
+        );
         assert_eq!(lines[1], "", "blank row should trim to empty string");
     }
 

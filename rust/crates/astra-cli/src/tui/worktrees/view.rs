@@ -42,7 +42,9 @@ pub(crate) fn render(list: &WorktreeList, area: Rect, buf: &mut Buffer) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Line::from(Span::styled(
             format!(" Worktrees ({}) ", list.len()),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
     let inner = outer.inner(area);
     outer.render(area, buf);
@@ -61,8 +63,8 @@ pub(crate) fn render(list: &WorktreeList, area: Rect, buf: &mut Buffer) {
         return;
     }
 
-    let chunks = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(inner);
+    let chunks =
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(inner);
     render_list(list, chunks[0], buf);
     render_detail(list, chunks[1], buf);
 }
@@ -80,7 +82,9 @@ fn render_list(list: &WorktreeList, area: Rect, buf: &mut Buffer) {
             Span::raw("  ")
         };
         let label_style = if is_sel {
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
         } else if e.is_bare {
             Style::default().add_modifier(Modifier::DIM)
         } else if e.is_detached {

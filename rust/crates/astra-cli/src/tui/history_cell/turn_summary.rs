@@ -204,8 +204,8 @@ mod tests {
 
     fn render(cell: &TurnSummaryCell, width: u16) -> String {
         let lines = cell.display_lines(width);
-        let p = ratatui::widgets::Paragraph::new(lines)
-            .wrap(ratatui::widgets::Wrap { trim: false });
+        let p =
+            ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         buffer_to_string(&draw_widget(p, width, 1))
     }
 

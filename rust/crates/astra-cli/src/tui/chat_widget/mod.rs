@@ -25,8 +25,6 @@
 //! this module just provides the target API. Wire-up comes in
 //! step 3d.
 
-#![allow(dead_code)] // phase 3 plumbing; full wiring lands with the event-loop swap.
-
 mod bridge;
 mod resume;
 #[cfg(test)]
@@ -38,13 +36,8 @@ pub(crate) use resume::load as load_resume;
 use std::sync::Arc;
 
 use super::history_cell::{
-    HistoryCell,
-    assistant::AssistantCell,
-    reasoning::ReasoningCell,
-    system::SystemCell,
-    tool::ToolCell,
-    turn_summary::TurnSummaryCell,
-    user::UserCell,
+    HistoryCell, assistant::AssistantCell, reasoning::ReasoningCell, system::SystemCell,
+    tool::ToolCell, turn_summary::TurnSummaryCell, user::UserCell,
 };
 use super::transcript_jsonl;
 use super::turn_event::TurnEvent;
@@ -72,10 +65,7 @@ pub(crate) enum AppEvent {
     ReasoningDone,
 
     /// Server announced a new tool invocation starting.
-    ToolStarted {
-        name: String,
-        description: String,
-    },
+    ToolStarted { name: String, description: String },
 
     /// Tool finished. `status` mirrors the string we receive on
     /// the wire ("success" / anything-else = failure).
@@ -197,9 +187,7 @@ impl ChatWidget {
             AppEvent::AnswerDelta(d) => self.on_answer_delta(&d),
             AppEvent::ReasoningDelta(d) => self.on_reasoning_delta(&d),
             AppEvent::ReasoningDone => self.on_reasoning_done(),
-            AppEvent::ToolStarted { name, description } => {
-                self.on_tool_started(name, description)
-            }
+            AppEvent::ToolStarted { name, description } => self.on_tool_started(name, description),
             AppEvent::ToolCompleted {
                 name,
                 description,
@@ -574,7 +562,10 @@ mod tests {
         assert_eq!(w.history.len(), 1);
         assert!(w.active_cell.is_none());
 
-        let cell = w.history[0].as_any_ref().downcast_ref::<ToolCell>().unwrap();
+        let cell = w.history[0]
+            .as_any_ref()
+            .downcast_ref::<ToolCell>()
+            .unwrap();
         assert_eq!(cell.status, ToolStatus::Success);
         assert_eq!(cell.duration_ms, Some(42));
     }
@@ -613,19 +604,21 @@ mod tests {
         assert!(w.active_cell.is_none());
         // Expect: user cell + assistant cell + summary cell.
         assert_eq!(w.history.len(), 3);
-        assert!(matches!(
-            w.history.last().unwrap().as_any_ref().downcast_ref::<TurnSummaryCell>(),
-            Some(_)
-        ));
+        assert!(
+            w.history
+                .last()
+                .unwrap()
+                .as_any_ref()
+                .downcast_ref::<TurnSummaryCell>()
+                .is_some()
+        );
     }
 
     #[test]
     fn turn_error_commits_system_error_cell() {
         let mut w = fresh();
         w.handle_event(AppEvent::UserSubmit("hi".into()));
-        w.handle_event(AppEvent::TurnError(
-            "<error>rate limited</error>".into(),
-        ));
+        w.handle_event(AppEvent::TurnError("<error>rate limited</error>".into()));
         assert_eq!(w.history.len(), 2);
         let err = w
             .history

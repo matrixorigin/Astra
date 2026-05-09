@@ -207,7 +207,10 @@ fn unhandled_event_falls_through_to_lower_view() {
     let log = journal.borrow().clone();
     let top_idx = log.iter().position(|e| e == "handle_key:top");
     let base_idx = log.iter().position(|e| e == "handle_key:base");
-    assert!(top_idx.is_some() && base_idx.is_some(), "both called; log={log:?}");
+    assert!(
+        top_idx.is_some() && base_idx.is_some(),
+        "both called; log={log:?}"
+    );
     assert!(top_idx < base_idx, "top must fire before base");
 }
 
@@ -269,8 +272,14 @@ fn render_draws_bottom_up() {
     let log = journal.borrow().clone();
     let base_idx = log.iter().position(|e| e == "render:base");
     let top_idx = log.iter().position(|e| e == "render:top");
-    assert!(base_idx.is_some() && top_idx.is_some(), "both render; log={log:?}");
-    assert!(base_idx < top_idx, "base must render before top (bottom-up)");
+    assert!(
+        base_idx.is_some() && top_idx.is_some(),
+        "both render; log={log:?}"
+    );
+    assert!(
+        base_idx < top_idx,
+        "base must render before top (bottom-up)"
+    );
 
     // Final buffer shows top view's glyph because it overwrites base.
     let row: String = (area.left()..area.right())

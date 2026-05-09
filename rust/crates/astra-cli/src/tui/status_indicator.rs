@@ -24,8 +24,6 @@
 //! - Elapsed time rounds to whole seconds so the counter ticks
 //!   once per second instead of jittering sub-second.
 
-#![allow(dead_code)] // wired into BottomPane in phase 3d.
-
 use std::time::{Duration, Instant};
 
 use ratatui::style::{Color, Modifier, Style};
@@ -110,11 +108,7 @@ impl StatusIndicator {
 
 /// Rendering extracted to a free fn with explicit `now` so tests
 /// can pin the clock without mocking `Instant`.
-fn render_for(
-    state: &IndicatorState,
-    stream_chars: u64,
-    now: Instant,
-) -> Option<Line<'static>> {
+fn render_for(state: &IndicatorState, stream_chars: u64, now: Instant) -> Option<Line<'static>> {
     if !state.is_active() {
         return None;
     }
@@ -156,7 +150,10 @@ fn suffix(elapsed: Option<Duration>, stream_chars: u64) -> String {
         parts.push(fmt_duration_coarse(d));
     }
     if stream_chars > 0 {
-        parts.push(format!("↓ {} tokens", fmt_tokens(approx_tokens(stream_chars))));
+        parts.push(format!(
+            "↓ {} tokens",
+            fmt_tokens(approx_tokens(stream_chars))
+        ));
     }
     parts.push("esc to interrupt".into());
     format!(" ({})", parts.join(" · "))
@@ -224,12 +221,7 @@ mod tests {
         let mut s = StatusIndicator::new();
         let t0 = Instant::now();
         s.set_state(IndicatorState::Thinking { started_at: t0 });
-        let line = render_for(
-            &s.state,
-            s.stream_chars,
-            t0 + Duration::from_secs(3),
-        )
-        .unwrap();
+        let line = render_for(&s.state, s.stream_chars, t0 + Duration::from_secs(3)).unwrap();
         let text = text_of(&line);
         assert!(any_star(&text), "star missing: {text}");
         assert!(text.contains("Thinking"));

@@ -98,7 +98,10 @@ pub(crate) struct WorktreeList {
 
 impl WorktreeList {
     pub fn new(entries: Vec<WorktreeEntry>) -> Self {
-        Self { entries, selected: 0 }
+        Self {
+            entries,
+            selected: 0,
+        }
     }
 
     pub fn len(&self) -> usize {

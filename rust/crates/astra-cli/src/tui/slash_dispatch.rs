@@ -9,8 +9,7 @@ use crate::command_registry;
 use crate::repl_state::ReplState;
 use crate::tui::bottom_pane::BottomPane;
 use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
-use crate::tui::chat_cell::ChatCell;
-use crate::tui::chat_cell::system_cell::SystemChatCell;
+use crate::tui::history_cell::{HistoryCell, system::SystemCell};
 use crate::tui::terminal::TerminalGuard;
 
 pub(crate) enum SlashResult {
@@ -31,13 +30,13 @@ pub(crate) struct DispatchContext<'a> {
 
 impl<'a> DispatchContext<'a> {
     fn show_info(&mut self, msg: String) {
-        let cell = SystemChatCell::info(msg);
+        let cell = SystemCell::info(msg);
         self.guard
             .queue_history_lines(cell.display_lines(self.width));
     }
 
     fn show_error(&mut self, msg: String) {
-        let cell = SystemChatCell::error(msg);
+        let cell = SystemCell::error(msg);
         self.guard
             .queue_history_lines(cell.display_lines(self.width));
     }
@@ -78,12 +77,14 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         //    bare-terminal prompts that looked disjoint and stole keys) ─
         "/login" => {
             use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
-            ctx.bottom_pane.push_view(Box::new(LoginView::new(LoginMode::Login)));
+            ctx.bottom_pane
+                .push_view(Box::new(LoginView::new(LoginMode::Login)));
             SlashResult::Handled
         }
         "/register" => {
             use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
-            ctx.bottom_pane.push_view(Box::new(LoginView::new(LoginMode::Register)));
+            ctx.bottom_pane
+                .push_view(Box::new(LoginView::new(LoginMode::Register)));
             SlashResult::Handled
         }
 
@@ -377,8 +378,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
             // `git worktree list --porcelain` on a blocking thread.
             let porcelain = tokio::task::spawn_blocking(|| {
-                let cwd = std::env::current_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 let out = std::process::Command::new("git")
                     .args(["worktree", "list", "--porcelain"])
                     .current_dir(&cwd)
@@ -395,21 +395,19 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             // Enrich each entry with session count (best-effort; any
             // errors collapse to zero).
             for e in entries.iter_mut() {
-                let sessions = astra_services::session_workspace::list_sessions_by_git_root(
-                    &e.path, None, 50,
-                );
+                let sessions =
+                    astra_services::session_workspace::list_sessions_by_git_root(&e.path, None, 50);
                 e.session_count = sessions.len();
                 e.last_session_at = sessions.first().map(|s| s.updated_at.clone());
             }
 
             if entries.is_empty() {
-                ctx.show_info(
-                    "No worktrees found (or `git worktree list` failed).".into(),
-                );
+                ctx.show_info("No worktrees found (or `git worktree list` failed).".into());
                 return SlashResult::Handled;
             }
             let list = WorktreeList::new(entries);
-            ctx.bottom_pane.push_view(Box::new(WorktreesView::new(list)));
+            ctx.bottom_pane
+                .push_view(Box::new(WorktreesView::new(list)));
             SlashResult::Handled
         }
 
@@ -735,7 +733,7 @@ pub(crate) fn handle_view_result(
         return;
     }
     if name == "Skill info" {
-        let msg = SystemChatCell::info("Use /skill info <name> for details".into());
+        let msg = SystemCell::info("Use /skill info <name> for details");
         guard.queue_history_lines(msg.display_lines(w));
         return;
     }
@@ -775,8 +773,8 @@ pub(crate) fn handle_view_result(
                     .with_reopen("/instructions"),
                 ));
             } else {
-                let msg = SystemChatCell::info(
-                    "No project instructions loaded. Create .astra/instructions.md".into(),
+                let msg = SystemCell::info(
+                    "No project instructions loaded. Create .astra/instructions.md",
                 );
                 guard.queue_history_lines(msg.display_lines(w));
             }
@@ -787,19 +785,18 @@ pub(crate) fn handle_view_result(
             {
                 let lc = instructions.lines().count();
                 state.project_instructions = Some(instructions);
-                let msg =
-                    SystemChatCell::info(format!("Reloaded project instructions ({lc} lines)"));
+                let msg = SystemCell::info(format!("Reloaded project instructions ({lc} lines)"));
                 guard.queue_history_lines(msg.display_lines(w));
             } else {
                 state.project_instructions = None;
-                let msg = SystemChatCell::info("No .astra/instructions.md found".into());
+                let msg = SystemCell::info("No .astra/instructions.md found");
                 guard.queue_history_lines(msg.display_lines(w));
             }
             return;
         }
         "Off" => {
             state.project_instructions = None;
-            let msg = SystemChatCell::info("Project instructions disabled".into());
+            let msg = SystemCell::info("Project instructions disabled");
             guard.queue_history_lines(msg.display_lines(w));
             return;
         }
@@ -811,21 +808,21 @@ pub(crate) fn handle_view_result(
         "Auto" => {
             use crate::permission_manager::PermissionMode;
             state.perm_manager.set_mode(PermissionMode::Auto);
-            let msg = SystemChatCell::info("Permission mode → auto".into());
+            let msg = SystemCell::info("Permission mode → auto");
             guard.queue_history_lines(msg.display_lines(w));
             return;
         }
         "Prompt" => {
             use crate::permission_manager::PermissionMode;
             state.perm_manager.set_mode(PermissionMode::Prompt);
-            let msg = SystemChatCell::info("Permission mode → prompt".into());
+            let msg = SystemCell::info("Permission mode → prompt");
             guard.queue_history_lines(msg.display_lines(w));
             return;
         }
         "Deny" => {
             use crate::permission_manager::PermissionMode;
             state.perm_manager.set_mode(PermissionMode::Deny);
-            let msg = SystemChatCell::info("Permission mode → deny".into());
+            let msg = SystemCell::info("Permission mode → deny");
             guard.queue_history_lines(msg.display_lines(w));
             return;
         }
@@ -853,7 +850,7 @@ pub(crate) fn handle_view_result(
     // Model name → apply
     state.model = Some(name.to_string());
     bottom_pane.footer.model = Some(name.to_string());
-    let msg = SystemChatCell::info(format!("Model set to: {name}"));
+    let msg = SystemCell::info(format!("Model set to: {name}"));
     guard.queue_history_lines(msg.display_lines(w));
 }
 
@@ -1181,17 +1178,8 @@ mod panels_tests {
     #[test]
     fn cheat_sheet_lists_every_tui_native_panel() {
         let text = build_panels_cheat_sheet_lines().join("\n");
-        for cmd in [
-            "/resume",
-            "/context",
-            "/timeline",
-            "/table",
-            "/worktrees",
-        ] {
-            assert!(
-                text.contains(cmd),
-                "cheat sheet missing {cmd}; got: {text}"
-            );
+        for cmd in ["/resume", "/context", "/timeline", "/table", "/worktrees"] {
+            assert!(text.contains(cmd), "cheat sheet missing {cmd}; got: {text}");
         }
     }
 

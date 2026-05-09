@@ -161,8 +161,8 @@ mod tests {
 
     fn render(cell: &SystemCell, width: u16, height: u16) -> String {
         let lines = cell.display_lines(width);
-        let p = ratatui::widgets::Paragraph::new(lines)
-            .wrap(ratatui::widgets::Wrap { trim: false });
+        let p =
+            ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         buffer_to_string(&draw_widget(p, width, height))
     }
 
@@ -190,10 +190,7 @@ mod tests {
     #[test]
     fn persist_roundtrip_for_each_level() {
         for (mk, lv) in [
-            (
-                SystemCell::info("a") as SystemCell,
-                SystemLevel::Info,
-            ),
+            (SystemCell::info("a") as SystemCell, SystemLevel::Info),
             (SystemCell::warning("b"), SystemLevel::Warning),
             (SystemCell::error("c"), SystemLevel::Error),
         ] {
@@ -253,7 +250,10 @@ mod tests {
 
     #[test]
     fn humanize_truncates_long_body_with_marker() {
-        let long: String = (0..25).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let long: String = (0..25)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let out = humanize_error(&long);
         assert_eq!(out.lines().count(), 11, "10 kept + 1 marker");
         assert!(out.ends_with("… (+15 more lines)"));

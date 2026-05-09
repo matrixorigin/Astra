@@ -1,9 +1,0 @@
----
-source: crates/astra-cli/src/tui/chat_cell/snapshot_tests.rs
-expression: "render_cell(&cell, 100, 6)"
----
-  ⏸ bash wants to run
-    3 pending
-
-  ▸ Accept     Reject     Always     Skip     Accept all     Reject all
-    ← → navigate · Enter confirm · Esc reject

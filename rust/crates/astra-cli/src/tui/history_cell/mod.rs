@@ -25,8 +25,6 @@
 //! (markdown parsing, syntax highlighting) should happen once, on
 //! mutation — not inside `display_lines`.
 
-#![allow(dead_code)] // phase 2 still plumbing — consumers land with the event-loop swap.
-
 pub(crate) mod assistant;
 pub(crate) mod reasoning;
 pub(crate) mod system;

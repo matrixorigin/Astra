@@ -91,7 +91,9 @@ impl ReasoningCell {
     }
 
     fn duration_label(&self) -> Option<String> {
-        let d = self.duration.or_else(|| self.started_at.map(|t| t.elapsed()))?;
+        let d = self
+            .duration
+            .or_else(|| self.started_at.map(|t| t.elapsed()))?;
         let secs = d.as_secs();
         if secs == 0 {
             Some("<1s".into())
@@ -127,8 +129,7 @@ impl HistoryCell for ReasoningCell {
             }
         };
 
-        let mut lines: Vec<Line<'static>> =
-            vec![Line::from(Span::styled(header_text, dim_italic))];
+        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(header_text, dim_italic))];
 
         // Body: one line per logical line of thinking, each dim
         // italic, prefixed with `  ` for alignment under the bullet.
@@ -213,8 +214,8 @@ mod tests {
 
     fn render(cell: &ReasoningCell, width: u16, height: u16) -> String {
         let lines = cell.display_lines(width);
-        let p = ratatui::widgets::Paragraph::new(lines)
-            .wrap(ratatui::widgets::Wrap { trim: false });
+        let p =
+            ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         buffer_to_string(&draw_widget(p, width, height))
     }
 
@@ -293,10 +294,7 @@ mod tests {
             .filter(|l| !l.contains("Thought") && !l.trim().is_empty())
             .collect();
         for row in &body_rows {
-            assert!(
-                row.starts_with("  "),
-                "body row must indent: {row:?}"
-            );
+            assert!(row.starts_with("  "), "body row must indent: {row:?}");
         }
     }
 
@@ -356,10 +354,7 @@ mod tests {
 
     #[test]
     fn snapshot_finalised_reasoning_60() {
-        let c = ReasoningCell::from_text(
-            "The user wants X.\nPlan: do Y, then Z.",
-            Some(3000),
-        );
+        let c = ReasoningCell::from_text("The user wants X.\nPlan: do Y, then Z.", Some(3000));
         insta::assert_snapshot!("reasoning_finalised_60", render(&c, 60, 4));
     }
 }

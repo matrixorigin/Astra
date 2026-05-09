@@ -98,8 +98,7 @@ impl HistoryCell for AssistantCell {
         // keeps the renderer sane on very small terminals.
         let inner_w = (width as usize).saturating_sub(2).max(20);
         let text = render_markdown_text_with_width(&self.source, Some(inner_w));
-        let rendered: Vec<Line<'static>> =
-            text.lines.iter().map(line_to_static).collect();
+        let rendered: Vec<Line<'static>> = text.lines.iter().map(line_to_static).collect();
 
         if rendered.is_empty() {
             return Vec::new();
@@ -166,8 +165,8 @@ mod tests {
 
     fn render(cell: &AssistantCell, width: u16, height: u16) -> String {
         let lines = cell.display_lines(width);
-        let p = ratatui::widgets::Paragraph::new(lines)
-            .wrap(ratatui::widgets::Wrap { trim: false });
+        let p =
+            ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         buffer_to_string(&draw_widget(p, width, height))
     }
 
@@ -227,10 +226,7 @@ mod tests {
         let mut c = AssistantCell::new_streaming();
         c.push_delta("line one\n\nline two");
         let out = render(&c, 60, 4);
-        let rows: Vec<&str> = out
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .collect();
+        let rows: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
         assert!(
             rows.len() >= 2,
             "expected at least two non-blank rows: {out}"

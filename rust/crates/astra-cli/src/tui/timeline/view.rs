@@ -60,8 +60,8 @@ pub(crate) fn render(tl: &Timeline, area: Rect, buf: &mut Buffer) {
         return;
     }
 
-    let chunks = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(inner);
+    let chunks =
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(inner);
     render_list(tl, chunks[0], buf);
     render_detail(tl, chunks[1], buf);
 }
@@ -70,10 +70,16 @@ fn title_line(tl: &Timeline) -> Line<'static> {
     let n = tl.total();
     let tin = tl.grand_total_tokens_in();
     let tout = tl.grand_total_tokens_out();
-    let title = format!(" Timeline · {n} turns · {} in {} out ", fmt_tokens(tin), fmt_tokens(tout));
+    let title = format!(
+        " Timeline · {n} turns · {} in {} out ",
+        fmt_tokens(tin),
+        fmt_tokens(tout)
+    );
     Line::from(Span::styled(
         title,
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     ))
 }
 
@@ -116,7 +122,10 @@ fn render_list(tl: &Timeline, area: Rect, buf: &mut Buffer) {
             .duration_ms
             .map(fmt_duration)
             .unwrap_or_else(|| "-".into());
-        let tools = t.tool_count.map(|c| format!("{c}t")).unwrap_or_else(|| "-".into());
+        let tools = t
+            .tool_count
+            .map(|c| format!("{c}t"))
+            .unwrap_or_else(|| "-".into());
         let toks = match (t.tokens_in, t.tokens_out) {
             (Some(i), Some(o)) => format!("{}/{}", fmt_tokens_u64(i), fmt_tokens_u64(o)),
             _ => "-".into(),

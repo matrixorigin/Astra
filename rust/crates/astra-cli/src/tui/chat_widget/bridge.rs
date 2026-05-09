@@ -7,8 +7,6 @@
 //! one place where the mapping is declared, so later removal is a
 //! one-file delete.
 
-#![allow(dead_code)] // wired into run_tui_repl in phase 3e.
-
 use super::{AppEvent, TurnStats};
 use crate::tui::app_event::TuiAppEvent;
 
@@ -74,9 +72,7 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
             output_summary,
             output,
         }),
-        TuiAppEvent::TurnComplete => {
-            Some(AppEvent::TurnComplete(Box::new(ctx.into_stats())))
-        }
+        TuiAppEvent::TurnComplete => Some(AppEvent::TurnComplete(Box::new(ctx.into_stats()))),
         TuiAppEvent::TurnError(msg) => Some(AppEvent::TurnError(msg)),
         // Bottom-pane-only events — ChatWidget doesn't care.
         TuiAppEvent::ThinkingStarted

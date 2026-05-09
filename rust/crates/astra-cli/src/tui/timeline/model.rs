@@ -187,7 +187,10 @@ impl Timeline {
     }
 
     pub fn grand_total_tokens_in(&self) -> u64 {
-        self.turns.last().map(|t| t.cumulative_tokens_in).unwrap_or(0)
+        self.turns
+            .last()
+            .map(|t| t.cumulative_tokens_in)
+            .unwrap_or(0)
     }
 
     pub fn grand_total_tokens_out(&self) -> u64 {

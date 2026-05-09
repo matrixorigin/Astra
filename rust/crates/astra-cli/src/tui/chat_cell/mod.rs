@@ -1,13 +1,11 @@
-pub(crate) mod agent_message_cell;
-pub(crate) mod approval_cell;
-pub(crate) mod assistant_cell;
-pub(crate) mod system_cell;
-pub(crate) mod thinking_cell;
-pub(crate) mod tool_cell;
-pub(crate) mod user_cell;
+//! Legacy `ChatCell` trait — kept exclusively for
+//! `ApprovalChatCell`, which renders the inline approval widget
+//! inside `BottomPane`. The scrollback path moved to the
+//! `history_cell::HistoryCell` trait in the refactor; new cells
+//! go there. This module exists so the approval widget doesn't
+//! have to be rewritten at the same time.
 
-#[cfg(test)]
-mod snapshot_tests;
+pub(crate) mod approval_cell;
 
 use std::any::Any;
 use std::fmt::Debug;
@@ -28,17 +26,5 @@ pub(crate) trait ChatCell: Debug + Send + Sync + Any {
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
             .line_count(width) as u16
-    }
-
-    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
-        self.display_lines(width)
-    }
-
-    fn is_stream_continuation(&self) -> bool {
-        false
-    }
-
-    fn transcript_animation_tick(&self) -> Option<u64> {
-        None
     }
 }
