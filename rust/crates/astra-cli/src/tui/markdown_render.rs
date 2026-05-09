@@ -311,8 +311,14 @@ impl Writer {
                     }
                 }
                 Event::Code(code) => {
+                    // Cursor/Claude-Code convention: strip the literal
+                    // backticks and rely on the cyan code style to
+                    // communicate "this is code". A previous version
+                    // emitted `format!("`{code}`")` which left the
+                    // backticks visible in scrollback — they read as
+                    // noise next to the already-coloured span.
                     let style = self.current_style().patch(self.styles.code);
-                    let span = Span::styled(format!("`{code}`"), style);
+                    let span = Span::styled(code.to_string(), style);
                     if let Some(ref mut t) = self.table {
                         t.current_cell.push(span);
                     } else {
