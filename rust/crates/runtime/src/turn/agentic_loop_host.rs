@@ -3224,6 +3224,59 @@ pub(crate) mod tests {
         assert!(state.has_any_usage); // has_usage=true in text_result
     }
 
+    #[tokio::test]
+    async fn preloaded_history_survives_to_host_execute_turn() {
+        // Reproduces the post-resume scenario: the CLI packs repl history
+        // into `state.messages` before the agentic loop starts. We need
+        // the host's `execute_turn` to see those messages on the wire —
+        // NOT an empty list or just the current user message.
+        let mut host = MockHost::new(vec![text_result("ack", 100, 10, Some(42))]);
+        let mut state = make_state();
+
+        // Simulate post-resume messages: 2 prior turns + current user,
+        // matching the shape `openai_messages_from_repl_history` produces.
+        state.messages = vec![
+            json!({"role": "user", "content": "你叫什么"}),
+            json!({"role": "assistant", "content": "我叫 Astra。"}),
+            json!({"role": "user", "content": "你是谁"}),
+            json!({"role": "assistant", "content": "我是 Astra。"}),
+            json!({"role": "user", "content": "之前我们聊过什么？"}),
+        ];
+        state.message = "之前我们聊过什么？".to_string();
+        let expected_before = state.messages.len();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
+
+        assert!(
+            !host.executed_messages.is_empty(),
+            "host should have been called once"
+        );
+        let seen = &host.executed_messages[0];
+        assert!(
+            seen.len() >= expected_before,
+            "host must see at least the {} pre-loaded messages + any volatile additions, got {}",
+            expected_before,
+            seen.len()
+        );
+        let user_count = seen
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .count();
+        let asst_count = seen
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+            .count();
+        assert!(
+            user_count >= 3,
+            "expected ≥3 user messages (history has 3), got {user_count}"
+        );
+        assert!(
+            asst_count >= 2,
+            "expected ≥2 assistant messages (history has 2), got {asst_count}"
+        );
+    }
+
     // ── Cancel flag tests ───────────────────────────────────────────────────
 
     #[tokio::test]
