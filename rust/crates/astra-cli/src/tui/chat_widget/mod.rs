@@ -28,10 +28,12 @@
 #![allow(dead_code)] // phase 3 plumbing; full wiring lands with the event-loop swap.
 
 mod bridge;
+mod resume;
 #[cfg(test)]
 mod turn_driver;
 
 pub(crate) use bridge::{TurnContext, translate};
+pub(crate) use resume::load as load_resume;
 
 use std::sync::Arc;
 

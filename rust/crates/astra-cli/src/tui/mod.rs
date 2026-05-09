@@ -125,6 +125,44 @@ fn flush_chat_widget(
     guard.queue_history_lines(batch);
 }
 
+/// Replay a session's JSONL transcript into a fresh `ChatWidget`,
+/// paint the restored cells into the terminal scrollback, and
+/// advance the widget's watermark so future ticks don't reflush
+/// them. Returns the new widget; caller rebinds.
+///
+/// A one-line banner is prepended so the user can tell the
+/// scrollback they're seeing is restored context, not live.
+/// Empty transcripts short-circuit to an empty widget with no
+/// banner — there's nothing to tell the user about.
+fn replay_session_into_widget(
+    guard: &mut TerminalGuard,
+    session_id: &str,
+    width: u16,
+) -> chat_widget::ChatWidget {
+    let mut widget = chat_widget::load_resume(session_id);
+    let restored = widget.history().len();
+    if restored == 0 {
+        return widget;
+    }
+    // Banner first so it lands above the restored cells.
+    let banner = SystemChatCell::info(format!(
+        "Resumed session {} — {} cells restored",
+        &session_id[..8.min(session_id.len())],
+        restored
+    ));
+    guard.queue_history_lines(banner.display_lines(width));
+    guard.queue_history_lines(vec![ratatui::text::Line::default()]);
+    // Paint the restored cells exactly once via the same rendering
+    // path that streaming flushes use, so the visual match is
+    // lossless.
+    flush_chat_widget(guard, &mut widget, width);
+    // Belt-and-suspenders: if flush_chat_widget's implementation
+    // ever changes to not advance the watermark, this keeps us
+    // safe.
+    widget.mark_all_flushed();
+    widget
+}
+
 /// Legacy helper — kept only so Phase-5 deletes are easier to
 /// grep. The new render pipeline does not call this; the chat
 /// widget's scrollback flush replaces it.
@@ -323,15 +361,20 @@ pub(crate) async fn run_tui_repl(
     // Legacy stream_controller kept alive for the unused `drain_tick`
     // call path; always None in the new rendering pipeline.
     let mut stream_controller: Option<StreamController> = None;
-    // Shadow ChatWidget — Phase 3 migration scaffolding. Every
-    // legacy handle_app_event call also feeds the translated
-    // AppEvent into here, so by the time Phase 3e swaps rendering
-    // to this widget the state is already correct + persisted.
-    // The sid starts empty (persistence becomes a no-op); we
-    // re-seat it once state.session_id lands.
-    let mut chat_widget = chat_widget::ChatWidget::new(
-        state.session_id.clone().unwrap_or_default(),
-    );
+    // ChatWidget owns the scrollback + active cell. If the user
+    // entered via `astra -c` / `astra --resume <id>`, replay the
+    // prior session's JSONL transcript into the widget and paint
+    // it to the terminal scrollback exactly once. A brand-new
+    // session falls through to an empty widget with an empty sid
+    // (persistence becomes a no-op until the server hands out an
+    // id on first turn).
+    let mut chat_widget = match state.session_id.as_deref() {
+        Some(sid) if !sid.is_empty() => {
+            let w0 = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+            replay_session_into_widget(&mut guard, sid, w0)
+        }
+        _ => chat_widget::ChatWidget::new(String::new()),
+    };
     let mut status_indicator = status_indicator::StatusIndicator::new();
     let mut inject_submit: Option<String> = None;
 
@@ -397,6 +440,10 @@ pub(crate) async fn run_tui_repl(
                                 }
 
                                 if text.starts_with('/') {
+                                    // Snapshot session id before dispatch so we
+                                    // can detect when a `/resume <id>` fallback
+                                    // rebinds it and trigger the replay.
+                                    let pre_sid = state.session_id.clone();
                                     let mut dctx = slash_dispatch::DispatchContext {
                                         api, profile, state: &mut state,
                                         guard: &mut guard, bottom_pane: &mut bottom_pane, width: w,
@@ -427,6 +474,16 @@ pub(crate) async fn run_tui_repl(
                                                 }
                                             }
                                         }
+                                    }
+                                    // If the slash command rebound state.session_id
+                                    // (resume/new-session paths), swap the
+                                    // ChatWidget so its scrollback + persistence
+                                    // attach to the restored session.
+                                    if state.session_id != pre_sid
+                                        && let Some(ref new_sid) = state.session_id
+                                        && !new_sid.is_empty()
+                                    {
+                                        chat_widget = replay_session_into_widget(&mut guard, new_sid, w);
                                     }
                                     if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
                                     if let Some(ref s) = state.session_id { bottom_pane.footer.session_id = Some(s[..8.min(s.len())].to_string()); }
@@ -745,8 +802,7 @@ pub(crate) async fn run_tui_repl(
                                     // exercised identically.
                                     if slash_dispatch::looks_like_session_id(&name) {
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                        let info = SystemChatCell::info(format!("Resuming session {name}…"));
-                                        guard.queue_history_lines(info.display_lines(w));
+                                        let pre_sid = state.session_id.clone();
                                         let slash_text = format!("/resume {name}");
                                         let slash_result = guard.with_restored(|| async {
                                             let token = crate::repl_runtime::current_access_token(profile);
@@ -766,6 +822,18 @@ pub(crate) async fn run_tui_repl(
                                                 let err = SystemChatCell::error(format!("Terminal restore failed: {e}"));
                                                 guard.queue_history_lines(err.display_lines(w));
                                             }
+                                        }
+                                        // If the resume attached a new session
+                                        // id, swap the ChatWidget to replay
+                                        // that session's transcript. The
+                                        // `replay_session_into_widget` helper
+                                        // emits its own "resumed N cells"
+                                        // banner — so no extra info line here.
+                                        if state.session_id != pre_sid
+                                            && let Some(ref new_sid) = state.session_id
+                                            && !new_sid.is_empty()
+                                        {
+                                            chat_widget = replay_session_into_widget(&mut guard, new_sid, w);
                                         }
                                         bottom_pane.footer.session_id = state
                                             .session_id
