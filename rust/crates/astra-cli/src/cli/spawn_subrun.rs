@@ -48,6 +48,8 @@ pub struct CliSpawnAgentExecutor {
     /// prepend the parent prefix — but no ForkCacheEvent is emitted.
     /// Zero-cost when unset.
     fork_cache_sink: Option<Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>>,
+    /// Parent session journal writer for unified timeline.
+    journal: Option<std::sync::Arc<astra_services::session_journal::JournalWriter>>,
 }
 
 /// Build the child agent's message array from system prompt, optional
@@ -124,7 +126,17 @@ impl CliSpawnAgentExecutor {
             skill_search: SkillSearchSettings::default(),
             active_session_id: None,
             fork_cache_sink: None,
+            journal: None,
         }
+    }
+
+    /// Install the parent session's journal writer for unified timeline.
+    pub fn with_journal(
+        mut self,
+        journal: std::sync::Arc<astra_services::session_journal::JournalWriter>,
+    ) -> Self {
+        self.journal = Some(journal);
+        self
     }
 
     /// Install a fork-cache event sink. When present, every child
@@ -215,6 +227,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             inherited_prefix: config.inherited_prefix.clone(),
             fork_cache_sink: self.fork_cache_sink.clone(),
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: self.journal.clone(),
         };
 
         // Build system message from agent type definition

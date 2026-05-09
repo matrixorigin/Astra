@@ -289,6 +289,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             inherited_prefix: config.inherited_prefix.clone(),
             fork_cache_sink: self.fork_cache_sink.clone(),
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: None,
         };
 
         // Build system message from agent profile.

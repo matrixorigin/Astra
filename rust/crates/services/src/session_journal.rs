@@ -958,6 +958,7 @@ impl JournalWriter {
 // ─── Turn Event Buffer ───────────────────────────────────────────────────────
 
 /// Data for one LLM→tools round within a turn.
+#[derive(Default)]
 pub struct LlmRoundRecord {
     pub ttft_ms: Option<u64>,
     pub duration_ms: u64,
@@ -972,6 +973,10 @@ pub struct LlmRoundRecord {
     pub source: Option<String>,
     pub run_id: Option<String>,
     pub tool_calls: Option<Vec<ToolCallRecord>>,
+    /// When set, this round belongs to a child agent (not the parent).
+    /// Written into journal metadata so the unified timeline can
+    /// interleave child rounds with parent rounds.
+    pub agent_id: Option<String>,
 }
 
 /// In-memory collector for fine-grained turn events.
@@ -1053,6 +1058,7 @@ impl TurnEventBuffer {
             || r.finish_reason.is_some()
             || r.source.is_some()
             || r.run_id.is_some()
+            || r.agent_id.is_some()
         {
             let mut meta = serde_json::Map::new();
             meta.insert(
@@ -1065,6 +1071,9 @@ impl TurnEventBuffer {
             }
             if let Some(run_id) = r.run_id {
                 meta.insert("run_id".into(), serde_json::json!(run_id));
+            }
+            if let Some(ref agent_id) = r.agent_id {
+                meta.insert("agent_id".into(), serde_json::json!(agent_id));
             }
             evt.metadata = Some(serde_json::Value::Object(meta));
         }
@@ -6032,6 +6041,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         assert_eq!(buf.current_round(), 1);
         assert_eq!(buf.len(), 1);
@@ -6050,6 +6060,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         assert_eq!(buf.current_round(), 2);
         assert_eq!(buf.len(), 2);
@@ -6072,6 +6083,7 @@ mod turn_event_buffer_tests {
             source: Some("agentic_loop".into()),
             run_id: Some("run-42".into()),
             tool_calls: None,
+            ..Default::default()
         });
         let events = buf.drain();
         assert_eq!(events.len(), 1);
@@ -6116,6 +6128,7 @@ mod turn_event_buffer_tests {
                 round: Some(0),
                 ..Default::default()
             }]),
+            ..Default::default()
         });
         let events = buf.drain();
         let ev = &events[0];
@@ -6148,6 +6161,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         assert_eq!(buf.next_batch_id(), "b-1-0");
     }
@@ -6172,6 +6186,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         let events = buf.drain();
         assert_eq!(
@@ -6201,6 +6216,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         assert_eq!(
             buf.current_round(),
@@ -6233,6 +6249,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         // Auto-reflection round
         buf.record_llm_round(LlmRoundRecord {
@@ -6249,6 +6266,7 @@ mod turn_event_buffer_tests {
             source: Some("auto_reflection".into()),
             run_id: Some("run-reflect".into()),
             tool_calls: None,
+            ..Default::default()
         });
         assert_eq!(buf.current_round(), 2);
         let events = buf.drain();
@@ -6281,6 +6299,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         let events = buf.drain();
         assert_eq!(events.len(), 1);
@@ -6307,6 +6326,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         let events = buf.drain();
         assert_eq!(events.len(), 1);
@@ -6337,6 +6357,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         buf.record(JournalEvent::base_public(
             JournalEventType::Turn,
@@ -6378,6 +6399,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
 
         buf.flush_interrupted(&writer).unwrap();
@@ -6515,6 +6537,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         let obs1 = buf1.drain();
         writer.append_bulk(&obs1).unwrap();
@@ -6547,6 +6570,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         buf2.record_llm_round(LlmRoundRecord {
             ttft_ms: Some(1200),
@@ -6562,6 +6586,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         let obs2 = buf2.drain();
         writer.append_bulk(&obs2).unwrap();
@@ -6594,6 +6619,7 @@ mod turn_event_buffer_tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         let obs3 = buf3.drain();
         writer.append_bulk(&obs3).unwrap();

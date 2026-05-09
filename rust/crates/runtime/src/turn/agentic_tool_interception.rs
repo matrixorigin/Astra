@@ -756,6 +756,7 @@ mod tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
             prompt_tokens: 200,
@@ -771,6 +772,7 @@ mod tests {
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         assert_eq!(buf.current_round(), 2);
         state.turn_event_buffer = Some(buf);

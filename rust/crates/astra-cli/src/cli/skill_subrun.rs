@@ -61,6 +61,10 @@ pub(crate) struct SubRunHost {
     pub(crate) all_schemas: Vec<Value>,
     pub(crate) valid_tool_names: HashSet<String>,
     pub(crate) perm_manager: PermissionManager,
+    /// Shared journal writer from the parent session. When present,
+    /// child LLM rounds are written to the parent's journal with an
+    /// `agent_id` tag so the unified timeline can interleave them.
+    pub(crate) journal: Option<std::sync::Arc<astra_services::session_journal::JournalWriter>>,
     /// Per-response completion token limit from the skill manifest.
     pub(crate) max_completion_tokens: Option<u32>,
     /// Effort level from the skill manifest.
@@ -354,12 +358,6 @@ impl AgenticLoopHost for SubRunHost {
     fn on_turn_completed(&mut self, state: &AgenticLoopState) {
         // PR 5.6: probe the first successful ingested turn's
         // cache_read_input_tokens against the parent-side estimate.
-        // Subsequent turns no-op. Sink may be None — runtime is
-        // harmless without telemetry. We pass the *accumulated*
-        // total_cache_read because ingest has already added the
-        // current turn's cache_read_input_tokens into it, and this
-        // is the first call after ingest, so the accumulator IS the
-        // first-turn value.
         if let Some(ref sink) = self.fork_cache_sink {
             astra_runtime::orchestration::maybe_emit_fork_cache_probe(
                 &mut self.fork_cache_probe_state,
@@ -369,6 +367,34 @@ impl AgenticLoopHost for SubRunHost {
                 astra_turn_core::fork_cache_event::ForkCacheThresholds::default(),
                 sink.as_ref(),
             );
+        }
+
+        // Unified timeline: emit per-round events tagged with agent_id
+        // to the parent's journal so the timeline renderer can
+        // interleave child rounds with parent rounds.
+        if let Some(ref journal) = self.journal {
+            let mut buf = astra_services::session_journal::TurnEventBuffer::begin_turn(
+                state.current_session_id.as_deref(),
+                state.current_round_index.saturating_add(1),
+            );
+            for round_summary in &state.recent_rounds {
+                buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
+                    duration_ms: round_summary.duration_ms,
+                    prompt_tokens: round_summary.prompt_tokens,
+                    completion_tokens: round_summary.completion_tokens,
+                    cache_read_tokens: round_summary.cache_read_tokens,
+                    cache_creation_tokens: round_summary.cache_creation_tokens,
+                    tool_calls_returned: round_summary.tool_calls_returned,
+                    tool_call_names: round_summary.tool_call_names.clone(),
+                    finish_reason: round_summary.finish_reason.clone(),
+                    source: Some("child_agent".to_string()),
+                    run_id: state.current_run_id.clone(),
+                    agent_id: Some(self.agent_id.clone()),
+                    ..Default::default()
+                });
+            }
+            let events = buf.drain();
+            let _ = journal.append_bulk_no_sync(&events);
         }
     }
 }
@@ -508,6 +534,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: None,
         };
 
         let messages = vec![
@@ -724,6 +751,7 @@ mod tests {
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: None,
         };
         assert!(host.is_quiet());
     }
@@ -752,6 +780,7 @@ mod tests {
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: None,
         };
         assert!(!host.is_quiet());
     }
@@ -779,6 +808,7 @@ mod tests {
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: None,
         };
         let schema = json!({
             "type": "function",

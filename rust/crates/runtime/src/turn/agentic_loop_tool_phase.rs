@@ -1212,6 +1212,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             source: Some("agentic_loop".into()),
             run_id,
             tool_calls: Some(round_tool_calls),
+            ..Default::default()
         });
     }
 

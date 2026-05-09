@@ -2885,6 +2885,7 @@ impl InProcessChatTurnBridge {
                         source: Some("bridge_inprocess".to_string()),
                         run_id: Some(run_id.clone()),
                         tool_calls: None,
+                        ..Default::default()
                     });
                 }
 
@@ -6353,6 +6354,7 @@ mod tests {
                 source: Some("bridge_inprocess".to_string()),
                 run_id: None,
                 tool_calls: None,
+                ..Default::default()
             });
         }
         record_full_llm_response_event(

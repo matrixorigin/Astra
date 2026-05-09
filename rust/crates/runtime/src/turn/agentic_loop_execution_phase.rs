@@ -84,6 +84,7 @@ fn record_early_exit_llm_round(
             source: Some("agentic_loop".into()),
             run_id,
             tool_calls: None,
+            ..Default::default()
         });
     }
 }
