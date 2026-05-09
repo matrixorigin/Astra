@@ -17,6 +17,7 @@ pub const DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "web_fetch",
     "web_search",
     "run_script",
+    "task",
 ];
 
 pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
@@ -39,6 +40,7 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "web_search",
     "symbols",
     "run_script",
+    "task",
 ];
 
 fn filter_tool_schemas_by_name(allowed_names: &[&str]) -> Vec<Value> {
@@ -551,6 +553,42 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "subtopic": {"type": "string", "enum": ["session","cache","recent","volatile","stall","noise","all"], "description": "Which diagnostic to run (default: session). `noise`: per-channel freshness of runtime-injected prompt signals — flags channels re-rendered unchanged for many turns."},
                         "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Output detail level for the session topic (default: auto from budget). Ignored for other subtopics."}
                     }
+                }
+            }
+        }),
+        // ── Task management (unified tool) ───────────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "task",
+                "description": "Track work progress for multi-step tasks. Actions: create, update, list, get, stop.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["create","update","list","get","stop"], "description": "Operation to perform"},
+                        "title": {"type": "string", "description": "(create) Brief imperative title"},
+                        "description": {"type": "string", "description": "(create) What needs to be done"},
+                        "task_id": {"type": "string", "description": "(update/get/stop) Task ID (e.g. 'task-1')"},
+                        "status": {"type": "string", "enum": ["pending","in_progress","completed","failed","all","active"], "description": "(update) New status; (list) Filter by status"},
+                        "subtask_id": {"type": "string", "description": "(update) Update a specific subtask"},
+                        "subtasks": {
+                            "type": "array",
+                            "description": "(create) Optional sub-steps",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "title": {"type": "string"},
+                                    "description": {"type": "string"},
+                                    "depends_on": {"type": "array", "items": {"type": "string"}}
+                                },
+                                "required": ["id", "title"]
+                            }
+                        },
+                        "reason": {"type": "string", "description": "(stop) Why the task is being stopped"},
+                        "error_message": {"type": "string", "description": "(update) Reason for failure"}
+                    },
+                    "required": ["action"]
                 }
             }
         }),

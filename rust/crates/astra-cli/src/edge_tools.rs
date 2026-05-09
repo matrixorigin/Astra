@@ -1561,7 +1561,20 @@ impl ToolExecutor {
                         other => format!("Unknown session action: '{other}'"),
                     }
                 }
-                // Task management tools
+                // Task management (unified tool with action param)
+                "task" => {
+                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    match action {
+                        "create" => self.task_create(args).await,
+                        "list" => self.task_list(args).await,
+                        "get" => self.task_get(args).await,
+                        "update" => self.task_update(args).await,
+                        "stop" => self.task_stop(args).await,
+                        "" => "Missing required parameter: action. Use: create, update, list, get, stop".to_string(),
+                        other => format!("Unknown task action: '{other}'. Use: create, update, list, get, stop"),
+                    }
+                }
+                // Legacy separate task_* names (backward compat)
                 "task_create" => self.task_create(args).await,
                 "task_list" => self.task_list(args).await,
                 "task_get" => self.task_get(args).await,
