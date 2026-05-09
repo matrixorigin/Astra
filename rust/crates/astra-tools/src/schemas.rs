@@ -17,6 +17,7 @@ pub const DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "web_fetch",
     "web_search",
     "run_script",
+    "ask_user",
     "task",
 ];
 
@@ -40,6 +41,7 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "web_search",
     "symbols",
     "run_script",
+    "ask_user",
     "task",
 ];
 
@@ -556,6 +558,24 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 }
             }
         }),
+        // ── Ask user (interactive clarification) ─────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "ask_user",
+                "description": "Ask the user a question when you need clarification or a decision. Supports multiple-choice (2-9 options, single-key select) and free-form text input. Use sparingly — only when the next step is genuinely ambiguous.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string", "description": "The question to ask"},
+                        "choices": {"type": "array", "items": {"type": "string"}, "description": "2-9 options for multiple choice. Omit for free-form input."},
+                        "default": {"type": "string", "description": "Default answer (used if user presses Enter without typing)"},
+                        "context": {"type": "string", "description": "Brief context shown above the question (dimmed)"}
+                    },
+                    "required": ["question"]
+                }
+            }
+        }),
         // ── Task management (unified tool) ───────────────────────────────
         json!({
             "type": "function",
@@ -709,7 +729,8 @@ mod tests {
         assert!(!names.contains(&"delete_file"));
         assert!(!names.contains(&"enter_plan_mode"));
         assert!(!names.contains(&"exit_plan_mode"));
-        assert!(!names.contains(&"ask_user"));
+        // ask_user is now a first-class tool (P2 completion)
+        assert!(names.contains(&"ask_user"));
         assert!(!names.contains(&"sleep"));
     }
 

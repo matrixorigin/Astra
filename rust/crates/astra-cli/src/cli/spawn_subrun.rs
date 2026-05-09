@@ -665,15 +665,18 @@ mod tests {
     }
 
     /// When prefix ends with assistant, no bridge is needed.
+    /// Fork mode: prefix is used verbatim (no system prepend).
     #[test]
     fn prefix_ending_with_assistant_needs_no_bridge() {
         let prefix_messages = vec![
+            json!({"role": "system", "content": "parent system prompt"}),
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": "hello"}),
         ];
-        let messages = build_child_messages("system", Some(&prefix_messages), "child task");
+        let messages = build_child_messages("ignored", Some(&prefix_messages), "child task");
 
-        // Should be: system, user, assistant, user(child task) — no extra assistant
+        // Fork mode: prefix verbatim + child task. No bridge needed
+        // because prefix ends with assistant → child task (user) is valid.
         let roles: Vec<&str> = messages
             .iter()
             .filter_map(|m| m.get("role").and_then(|r| r.as_str()))

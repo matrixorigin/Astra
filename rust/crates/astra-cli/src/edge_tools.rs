@@ -1845,6 +1845,7 @@ impl ToolExecutor {
                 "task_update" => self.task_update(args).await,
                 "task_stop" => self.task_stop(args).await,
                 "web_search" => self.web_search(args),
+                "ask_user" => self.ask_user(args),
                 "share_context" => self.share_context(args),
                 "query_context" => self.query_context(args),
                 astra_runtime::turn::agentic_loop_host::DELEGATE_TOOL_NAME => {
