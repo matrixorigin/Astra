@@ -13,10 +13,11 @@ mod bottom_pane;
 mod context_panel;
 mod chat_cell;
 mod chat_viewport;
-// ── Refactored core (phase 1) ──────────────────────────────────
-// Trait + schema only; no event-loop wiring yet. Gradually takes
-// over from `chat_cell` as cells migrate in Phase 2+. See
+// ── Refactored core (phase 1–3) ────────────────────────────────
+// Trait + schema + cells + event router. Not yet wired into
+// `run_tui_repl`; Phase 3d swap completes it. See
 // `docs/design/tui-refactor.md`.
+mod chat_widget;
 mod history_cell;
 mod transcript_jsonl;
 mod turn_event;
