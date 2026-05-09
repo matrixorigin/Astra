@@ -58,6 +58,7 @@ pub mod headless_tool_status_display;
 pub mod headless_tool_stderr_lines;
 pub mod history;
 pub mod hook_plans;
+pub mod injection_tracking;
 pub mod interaction_types;
 pub mod interruption;
 pub mod introspect;

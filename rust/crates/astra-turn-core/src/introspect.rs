@@ -9,6 +9,8 @@ pub mod cache_diagnosis;
 
 use serde::{Deserialize, Serialize};
 
+use crate::injection_tracking::{ChannelFreshness, ChannelStatus, InjectionChannel};
+
 /// Input snapshot provided by the runtime to the introspect renderer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IntrospectSnapshot {
@@ -41,6 +43,17 @@ pub struct IntrospectSnapshot {
     /// circuit breaker state. Feeds `subtopic=stall`.
     #[serde(default)]
     pub stall_state: StallSnapshotSummary,
+    /// Per-channel freshness of runtime-injected prompt signals
+    /// (recent_failing_tests, outcome_bias, lessons, volatile_pending).
+    /// Populated by the agentic loop from `AgenticLoopState.injection_history`
+    /// at the start of each round. Feeds `subtopic=noise`. Empty when
+    /// the runtime has not yet observed any round.
+    #[serde(default)]
+    pub injection_freshness: Vec<ChannelFreshness>,
+    /// Current round index at snapshot time — used to interpret
+    /// `rounds_alive` in the freshness report. 0 when unknown.
+    #[serde(default)]
+    pub current_round: u32,
 }
 
 /// Per-round summary surfaced through `introspect(subtopic=recent)`.
@@ -351,9 +364,91 @@ pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
     out
 }
 
+/// Render `subtopic=noise` — per-channel freshness of runtime-injected
+/// prompt signals. Surfaces stale injections (e.g., a "Recent test
+/// failures" entry that has been re-rendered unchanged for 58 rounds
+/// — session f85a02bb). Operators and the model can use this to
+/// distinguish fresh runtime context from signals that have aged out.
+pub fn render_injection_freshness(s: &IntrospectSnapshot) -> String {
+    if s.injection_freshness.is_empty() {
+        return "## Injection Freshness\n(No injections tracked yet — runtime has not observed any round.)".to_string();
+    }
+    let mut out = String::from(&format!(
+        "## Injection Freshness (round {})\n\
+         | channel | status | first_seen | rounds_alive | preview |\n\
+         |---------|--------|------------|--------------|---------|\n",
+        s.current_round,
+    ));
+    let mut stale_count = 0usize;
+    let mut tracked_count = 0usize;
+    for entry in &s.injection_freshness {
+        let (status_label, rounds_alive_str, first_seen_str) = match &entry.status {
+            ChannelStatus::Untracked => ("untracked", "-".to_string(), "-".to_string()),
+            ChannelStatus::Empty { first_seen_round } => {
+                ("empty", "-".to_string(), format!("r{first_seen_round}"))
+            }
+            ChannelStatus::Fresh { rounds_alive } => {
+                tracked_count += 1;
+                (
+                    "fresh",
+                    rounds_alive.to_string(),
+                    entry
+                        .first_seen_round
+                        .map(|r| format!("r{r}"))
+                        .unwrap_or_else(|| "-".to_string()),
+                )
+            }
+            ChannelStatus::Stale { rounds_alive } => {
+                tracked_count += 1;
+                stale_count += 1;
+                (
+                    "⚠ STALE",
+                    rounds_alive.to_string(),
+                    entry
+                        .first_seen_round
+                        .map(|r| format!("r{r}"))
+                        .unwrap_or_else(|| "-".to_string()),
+                )
+            }
+        };
+        let preview = if entry.preview.is_empty() {
+            "-".to_string()
+        } else {
+            entry.preview.replace('|', "\\|")
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            channel_tag(entry.channel),
+            status_label,
+            first_seen_str,
+            rounds_alive_str,
+            preview,
+        ));
+    }
+    out.push('\n');
+    if tracked_count == 0 {
+        out.push_str(
+            "Summary: no channel has any non-empty content observed — runtime has not injected anything.\n",
+        );
+    } else if stale_count == 0 {
+        out.push_str(&format!(
+            "Summary: {tracked_count}/{tracked_count} tracked channels are fresh.\n",
+        ));
+    } else {
+        out.push_str(&format!(
+            "Summary: {stale_count}/{tracked_count} channels unchanged beyond stale threshold — these signals may no longer reflect current state; verify before acting on them.\n",
+        ));
+    }
+    out
+}
+
+fn channel_tag(ch: InjectionChannel) -> &'static str {
+    ch.tag()
+}
+
 /// Render `subtopic=all` — everything. Useful when debugging / when
 /// the agent isn't sure which lens to pick. Same content as
-/// `render_full` + the three Task #46 subtopics.
+/// `render_full` + the three Task #46 subtopics + injection freshness.
 pub fn render_all(s: &IntrospectSnapshot) -> String {
     let mut out = render_full(s);
     out.push_str("\n\n");
@@ -362,6 +457,8 @@ pub fn render_all(s: &IntrospectSnapshot) -> String {
     out.push_str(&render_volatile_pending(s));
     out.push_str("\n\n");
     out.push_str(&render_stall_state(s));
+    out.push_str("\n\n");
+    out.push_str(&render_injection_freshness(s));
     out
 }
 
@@ -424,6 +521,8 @@ mod tests {
             recent_rounds: Vec::new(),
             volatile_pending: Vec::new(),
             stall_state: StallSnapshotSummary::default(),
+            injection_freshness: Vec::new(),
+            current_round: 0,
         }
     }
 
@@ -616,10 +715,162 @@ mod tests {
             round_index: 0,
         });
         snap.stall_state.nudge_count = 1;
+        snap.injection_freshness = vec![ChannelFreshness {
+            channel: InjectionChannel::Lessons,
+            status: ChannelStatus::Fresh { rounds_alive: 0 },
+            preview: "lesson preview".into(),
+            first_seen_round: Some(0),
+        }];
         let out = render_all(&snap);
         assert!(out.contains("## Session Health"));
         assert!(out.contains("## Recent Rounds"));
         assert!(out.contains("## Volatile Lane"));
         assert!(out.contains("## Stall / Loop-Guard"));
+        assert!(out.contains("## Injection Freshness"));
+    }
+
+    // ── Injection freshness (subtopic=noise) renderer ──
+
+    #[test]
+    fn render_injection_freshness_empty_emits_empty_state_message() {
+        let snap = IntrospectSnapshot::default();
+        let out = render_injection_freshness(&snap);
+        assert!(
+            out.contains("No injections tracked yet"),
+            "empty state message missing: {out}"
+        );
+    }
+
+    #[test]
+    fn render_injection_freshness_marks_stale_channels() {
+        let snap = IntrospectSnapshot {
+            current_round: 58,
+            injection_freshness: vec![
+                ChannelFreshness {
+                    channel: InjectionChannel::RecentFailingTests,
+                    status: ChannelStatus::Stale { rounds_alive: 58 },
+                    preview: "could not find Cargo.toml in /home/.../astra".into(),
+                    first_seen_round: Some(0),
+                },
+                ChannelFreshness {
+                    channel: InjectionChannel::OutcomeBias,
+                    status: ChannelStatus::Fresh { rounds_alive: 2 },
+                    preview: "bash ↑0.10 · git ↑0.10 · run_script ↓0.08".into(),
+                    first_seen_round: Some(56),
+                },
+                ChannelFreshness {
+                    channel: InjectionChannel::Lessons,
+                    status: ChannelStatus::Untracked,
+                    preview: String::new(),
+                    first_seen_round: None,
+                },
+                ChannelFreshness {
+                    channel: InjectionChannel::VolatilePending,
+                    status: ChannelStatus::Empty {
+                        first_seen_round: 57,
+                    },
+                    preview: String::new(),
+                    first_seen_round: Some(57),
+                },
+            ],
+            ..Default::default()
+        };
+        let out = render_injection_freshness(&snap);
+        assert!(out.contains("## Injection Freshness (round 58)"), "{out}");
+        assert!(
+            out.contains("recent_failing_tests") && out.contains("⚠ STALE"),
+            "stale channel must be flagged: {out}"
+        );
+        assert!(
+            out.contains("outcome_bias") && out.contains("fresh"),
+            "{out}"
+        );
+        assert!(
+            out.contains("lessons") && out.contains("untracked"),
+            "{out}"
+        );
+        assert!(
+            out.contains("volatile_pending") && out.contains("empty"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Cargo.toml"),
+            "preview content must render: {out}"
+        );
+        assert!(
+            out.contains("1/2 channels unchanged"),
+            "summary should count 1 stale of 2 tracked (non-untracked, non-empty): {out}"
+        );
+    }
+
+    #[test]
+    fn render_injection_freshness_all_fresh_summary() {
+        let snap = IntrospectSnapshot {
+            current_round: 3,
+            injection_freshness: vec![ChannelFreshness {
+                channel: InjectionChannel::Lessons,
+                status: ChannelStatus::Fresh { rounds_alive: 1 },
+                preview: "recent lesson".into(),
+                first_seen_round: Some(2),
+            }],
+            ..Default::default()
+        };
+        let out = render_injection_freshness(&snap);
+        assert!(
+            out.contains("1/1 tracked channels are fresh"),
+            "all-fresh summary line missing: {out}"
+        );
+        assert!(
+            !out.contains("⚠ STALE"),
+            "no stale marker should appear: {out}"
+        );
+    }
+
+    #[test]
+    fn render_injection_freshness_escapes_pipe_in_preview() {
+        let snap = IntrospectSnapshot {
+            current_round: 2,
+            injection_freshness: vec![ChannelFreshness {
+                channel: InjectionChannel::VolatilePending,
+                status: ChannelStatus::Fresh { rounds_alive: 0 },
+                preview: "pipe | char in content".into(),
+                first_seen_round: Some(2),
+            }],
+            ..Default::default()
+        };
+        let out = render_injection_freshness(&snap);
+        assert!(
+            out.contains("pipe \\| char"),
+            "pipe character in preview must be escaped so the markdown table renders correctly: {out}"
+        );
+    }
+
+    #[test]
+    fn render_injection_freshness_only_empty_channels_reports_no_injection() {
+        let snap = IntrospectSnapshot {
+            current_round: 5,
+            injection_freshness: vec![
+                ChannelFreshness {
+                    channel: InjectionChannel::Lessons,
+                    status: ChannelStatus::Empty {
+                        first_seen_round: 0,
+                    },
+                    preview: String::new(),
+                    first_seen_round: Some(0),
+                },
+                ChannelFreshness {
+                    channel: InjectionChannel::OutcomeBias,
+                    status: ChannelStatus::Untracked,
+                    preview: String::new(),
+                    first_seen_round: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let out = render_injection_freshness(&snap);
+        assert!(
+            out.contains("runtime has not injected anything"),
+            "no-injection summary missing: {out}"
+        );
     }
 }

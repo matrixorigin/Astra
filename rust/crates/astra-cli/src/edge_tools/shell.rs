@@ -2602,6 +2602,61 @@ fn sigkill_process_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+/// Publish / expire the `recent_failing_tests` channel on an
+/// [`ObservabilitySession`] based on a parsed build-or-test run.
+///
+/// Semantics:
+/// * **Failure path** — `parsed.tests_failed > 0` OR any
+///   `error_messages`: record the first 8 error-message first-lines
+///   (truncated to 120 chars, non-empty) into the session's failing-
+///   test ring. Dedup is handled by `record_failing_test_names`.
+/// * **Success path** — `parsed.passed` with no failures and no error
+///   messages: actively clear any prior failing-test entries. This is
+///   the **Tier 1 expiry rule** (session f85a02bb regression): a stale
+///   `could not find Cargo.toml` signal from a mis-cwd on round 0 was
+///   observed persisting for 58 consecutive rounds into every
+///   subsequent turn's self-awareness block, even after the agent
+///   fixed the cwd and all later cargo invocations succeeded.
+///   Clearing on success is **self-healing** — if other tests remain
+///   red in scopes not exercised by this run, the very next failing
+///   invocation re-populates the ring.
+/// * **Mixed path** (unlikely but possible: `tests_failed == 0` but
+///   `error_messages` non-empty — e.g., warnings parsed as errors):
+///   treated as the failure path by construction, since it is the
+///   outer branch.
+///
+/// Extracted as a pure function so the behaviour can be regression-
+/// tested without spawning a real `cargo`/`pytest` subprocess.
+pub(crate) fn apply_build_test_outcome_to_session(
+    session: &mut astra_runtime::observability_integration::ObservabilitySession,
+    parsed: &astra_tools::build_test::BuildTestResult,
+) {
+    if parsed.tests_failed > 0 || !parsed.error_messages.is_empty() {
+        let names: Vec<String> = parsed
+            .error_messages
+            .iter()
+            .take(8)
+            .map(|m| {
+                m.lines()
+                    .next()
+                    .unwrap_or(m)
+                    .trim()
+                    .chars()
+                    .take(120)
+                    .collect()
+            })
+            .filter(|s: &String| !s.is_empty())
+            .collect();
+        if !names.is_empty() {
+            session.record_failing_test_names(names);
+        }
+        return;
+    }
+    if parsed.passed && !session.recent_failing_tests.is_empty() {
+        session.clear_failing_tests();
+    }
+}
+
 /// Adaptive default bash timeout by command kind. Used when the caller
 /// omits the `timeout` field. Session 0e37eb46 regression: cargo builds
 /// on this workspace routinely take 40-90s and the previous
@@ -3441,30 +3496,16 @@ impl ToolExecutor {
                     if !parsed.error_locations.is_empty() {
                         parsed.enrich_with_scope(&self.project_root);
                     }
-                    // Gap 2: publish failing test / error messages to the
-                    // SelfModel surface so the agent perceives which tests
-                    // are currently red on its next turn.
-                    if parsed.tests_failed > 0 || !parsed.error_messages.is_empty() {
-                        if let Some(session_lock) = &self.observability_session
-                            && let Ok(mut session) = session_lock.write()
-                        {
-                            let names: Vec<String> = parsed
-                                .error_messages
-                                .iter()
-                                .take(8)
-                                .map(|m| {
-                                    m.lines()
-                                        .next()
-                                        .unwrap_or(m)
-                                        .trim()
-                                        .chars()
-                                        .take(120)
-                                        .collect()
-                                })
-                                .filter(|s: &String| !s.is_empty())
-                                .collect();
-                            session.record_failing_test_names(names);
-                        }
+                    // Gap 2 + Tier 1 expiry: apply the parsed build/test
+                    // outcome to the observability session so the
+                    // SelfModel surface stays current on the next turn.
+                    // See `apply_build_test_outcome_to_session` for the
+                    // full publish/expire semantics and the f85a02bb
+                    // regression context.
+                    if let Some(session_lock) = &self.observability_session
+                        && let Ok(mut session) = session_lock.write()
+                    {
+                        apply_build_test_outcome_to_session(&mut session, &parsed);
                     }
                     let delta = {
                         let mut tracker = self

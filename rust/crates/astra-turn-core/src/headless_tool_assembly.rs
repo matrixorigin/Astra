@@ -196,6 +196,14 @@ pub fn idempotency_cache_hit_message(cached_output: &str) -> String {
         return "(cached — identical call already executed; original output was empty)".to_string();
     }
     if trimmed.len() <= IDEMPOTENCY_INLINE_MAX_BYTES {
+        // If the cached output itself already starts with `(cached`
+        // (e.g. a replay across a compaction boundary where the stored
+        // value is an earlier cache-hit stub), don't double-wrap — the
+        // original stub already carries the sentinel that downstream
+        // detectors look for.
+        if trimmed.starts_with("(cached") {
+            return trimmed.to_string();
+        }
         return format!("(cached — identical call already executed)\n{trimmed}");
     }
     // Large: preview + pointer. Char boundary safe for UTF-8.

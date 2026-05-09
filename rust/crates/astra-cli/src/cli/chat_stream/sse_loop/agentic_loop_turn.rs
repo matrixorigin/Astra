@@ -766,6 +766,31 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                 .map(|hub| hub.tuning().recent_signals())
                 .unwrap_or_default();
             session.ingest_self_model_inputs(skills, tool_health_entries, scenario, recent_signals);
+
+            // Observe the prompt-injection lessons channel for this
+            // round so `introspect subtopic=noise` can report whether
+            // lessons have been re-rendered unchanged for many turns
+            // (the f85a02bb stale-signal case). Lessons are owned by
+            // the executor and reachable here.
+            //
+            // NOTE: the per-turn volatile lane is NOT observed from
+            // this CLI path — it is injected further downstream and
+            // is not visible here. Observing it with an empty string
+            // would falsely report `Empty` for every round and mask
+            // genuine staleness. The volatile-aware observation point
+            // lives in runtime/observability_integration.rs.
+            //
+            // Fingerprint uses `LessonKind::as_str()` (stable snake_case
+            // DB tag), NOT `Debug`, so enum-variant renames do not flip
+            // every channel from Stale→Fresh for one round.
+            let lessons_text = ctx
+                .executor
+                .session_lessons_snapshot()
+                .iter()
+                .map(|l| format!("{}:{}:{}", l.kind.as_str(), l.trigger_signal, l.action))
+                .collect::<Vec<_>>()
+                .join("|");
+            session.observe_lessons_only(&lessons_text);
         }
     }
     if let Some(self_model) = ctx.executor.build_self_model_snapshot() {

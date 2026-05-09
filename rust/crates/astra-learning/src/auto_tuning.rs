@@ -2622,7 +2622,7 @@ mod tests {
     }
 
     #[test]
-    fn high_tokens_reduce_budget_rule_cooldown_is_at_least_15min() {
+    fn high_tokens_reduce_budget_rule_cooldown_is_at_least_30min() {
         // 5-minute cooldown lets the rule fire every ~5 turns of a
         // long task. 15 minutes means at most 4 fires per hour — enough
         // time for a coherent task to finish before the next shrink.

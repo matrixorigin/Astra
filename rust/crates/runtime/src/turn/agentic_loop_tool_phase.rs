@@ -1707,6 +1707,13 @@ fn build_introspect_snapshot(
         forced_exploration_family_corrective: state.stall.forced_exploration_family_corrective,
     };
 
+    // Injection-freshness is session-scoped (lives on ObservabilitySession,
+    // not on the per-turn AgenticLoopState). The CLI edge_tools path
+    // overlays it on the snapshot just before rendering — see
+    // `build_self_model_for_agent` companion hook. Server-path builds of
+    // this snapshot (e.g., for server-side introspect API) leave it empty.
+    let current_round = state.current_round_index;
+
     astra_turn_core::introspect::IntrospectSnapshot {
         token_pressure: 0.0, // TODO: wire from pipeline_session.stats when available
         cache_hit_ratio: cache_ratio,
@@ -1723,6 +1730,8 @@ fn build_introspect_snapshot(
         recent_rounds,
         volatile_pending,
         stall_state,
+        injection_freshness: Vec::new(),
+        current_round,
     }
 }
 

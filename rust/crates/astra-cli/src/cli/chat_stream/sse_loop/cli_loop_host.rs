@@ -434,6 +434,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                         .stall
                         .forced_exploration_family_corrective,
                 },
+                // Injection freshness is session-scoped (filled by
+                // `handle_introspect` from `ObservabilitySession.injection_history`).
+                injection_freshness: Vec::new(),
+                current_round: state.current_round_index,
             });
 
         Ok(HostTurnResult {

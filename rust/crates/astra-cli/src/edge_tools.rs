@@ -700,6 +700,17 @@ impl ToolExecutor {
         }
     }
 
+    /// Snapshot the currently-stashed session lessons. Used by the
+    /// injection-freshness observer (`observe_injections`) so it can
+    /// fingerprint the same slice the next SelfModel snapshot will
+    /// project into the system prompt.
+    pub fn session_lessons_snapshot(&self) -> Vec<astra_runtime::self_model::LessonHint> {
+        self.session_lessons
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
     /// P3.3 seam: stash the latest auto-invoke diagnosis. Pass `None` to
     /// clear a stale diagnosis once the triggering condition resolves.
     /// The next `build_self_model_snapshot` picks it up.
@@ -981,7 +992,22 @@ impl ToolExecutor {
         // Fall back to a zero-state snapshot on the first turn (before the
         // host has had a chance to populate one) so the model always gets
         // structured output instead of an opaque "first turn" string.
-        let snap = snapshot.unwrap_or_default();
+        let mut snap = snapshot.unwrap_or_default();
+
+        // Overlay session-scoped injection freshness. The per-turn
+        // snapshot lives on `AgenticLoopState` (not session) so the
+        // runtime leaves this empty; we fill it here from the
+        // session-scoped history maintained via `observe_injections`.
+        // Subtopic-agnostic: `render_all` and `noise` both need it.
+        if let Some(obs) = self.observability_session.as_ref()
+            && let Ok(s) = obs.read()
+        {
+            snap.injection_freshness = astra_turn_core::injection_tracking::freshness_report(
+                &s.injection_history,
+                s.turn_number,
+            );
+            snap.current_round = s.turn_number;
+        }
 
         // Task #46: three new subtopics for fine-grained runtime
         // self-awareness. All read from `IntrospectSnapshot`, which the
@@ -995,6 +1021,9 @@ impl ToolExecutor {
             }
             "stall" | "stall_state" | "loop_guard" => {
                 return astra_turn_core::introspect::render_stall_state(&snap);
+            }
+            "noise" | "injection" | "injections" | "freshness" => {
+                return astra_turn_core::introspect::render_injection_freshness(&snap);
             }
             "all" => {
                 return astra_turn_core::introspect::render_all(&snap);

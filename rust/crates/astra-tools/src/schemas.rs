@@ -3,7 +3,7 @@
 //! Each schema is a JSON object following the OpenAI function-calling format:
 //! `{ "type": "function", "function": { "name": ..., "description": ..., "parameters": ... } }`
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 pub const DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "bash",
@@ -127,7 +127,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run"},
-                        "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites). Schema-code drift here costs a round when cargo times out unexpectedly."}
+                        "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."}
                     },
                     "required": ["command"]
                 }
@@ -548,7 +548,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "subtopic": {"type": "string", "enum": ["session","cache","recent","volatile","stall","all"], "description": "Which diagnostic to run (default: session)"},
+                        "subtopic": {"type": "string", "enum": ["session","cache","recent","volatile","stall","noise","all"], "description": "Which diagnostic to run (default: session). `noise`: per-channel freshness of runtime-injected prompt signals — flags channels re-rendered unchanged for many turns."},
                         "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Output detail level for the session topic (default: auto from budget). Ignored for other subtopics."}
                     }
                 }
