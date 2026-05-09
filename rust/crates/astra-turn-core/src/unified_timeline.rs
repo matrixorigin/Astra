@@ -132,7 +132,7 @@ pub fn build_timeline(events: &[serde_json::Value]) -> UnifiedTimeline {
                     },
                 });
             }
-            "agent_spawned" | "DelegationSubRunStarted" => {
+            "agent_spawned" | "AgentSpawned" | "DelegationSubRunStarted" => {
                 let child_agent_id = metadata
                     .and_then(|m| m.get("agent_id"))
                     .and_then(|v| v.as_str())
@@ -158,7 +158,7 @@ pub fn build_timeline(events: &[serde_json::Value]) -> UnifiedTimeline {
                     },
                 });
             }
-            "AgentTerminated" => {
+            "AgentTerminated" | "agent_terminated" | "DelegationSubRunCompleted" => {
                 let child_agent_id = metadata
                     .and_then(|m| m.get("agent_id"))
                     .and_then(|v| v.as_str())

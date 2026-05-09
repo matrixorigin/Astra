@@ -1847,13 +1847,31 @@ impl ToolExecutor {
                 "web_search" => self.web_search(args),
                 "ask_user" => self.ask_user(args),
                 "notify" => {
+                    const MAX_NOTIFY_MSG: usize = 4096;
                     let message = args.get("message").and_then(Value::as_str).unwrap_or("");
-                    let notification_type = args
+                    let raw_type = args
                         .get("notification_type")
                         .and_then(Value::as_str)
                         .unwrap_or("normal");
+                    // Enforce the schema enum — reject anything outside the
+                    // declared set rather than silently passing through.
+                    let notification_type = match raw_type {
+                        "normal" | "proactive" => raw_type,
+                        other => {
+                            return format!(
+                                "Error: 'notification_type' must be 'normal' or 'proactive' (got '{}')",
+                                other
+                            );
+                        }
+                    };
                     if message.is_empty() {
                         "Error: 'message' is required".to_string()
+                    } else if message.len() > MAX_NOTIFY_MSG {
+                        format!(
+                            "Error: 'message' exceeds {} bytes ({}). Notifications should be short.",
+                            MAX_NOTIFY_MSG,
+                            message.len()
+                        )
                     } else {
                         serde_json::json!({
                             "delivered": true,

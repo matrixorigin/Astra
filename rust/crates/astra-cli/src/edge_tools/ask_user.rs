@@ -57,8 +57,20 @@ impl ToolExecutor {
             let _ = io::stderr().flush();
 
             let mut response = String::new();
-            if io::stdin().read_line(&mut response).is_err() {
-                return "Error: failed to read user input".to_string();
+            match io::stdin().read_line(&mut response) {
+                Err(_) => return "Error: failed to read user input".to_string(),
+                Ok(0) => {
+                    // EOF — stdin closed (headless / piped / daemonized).
+                    // Silently substituting `default` would lie to the caller.
+                    return serde_json::json!({
+                        "error": "no_interactive_stdin",
+                        "message": "ask_user invoked in a non-interactive context (stdin closed/EOF); refusing to return a fabricated answer. Ask the human directly or reroute this decision through the caller.",
+                        "question": question,
+                        "default": default,
+                    })
+                    .to_string();
+                }
+                Ok(_) => {}
             }
             // Truncate if too long
             if response.len() > MAX_INPUT_LEN {
@@ -184,8 +196,21 @@ impl ToolExecutor {
             } else {
                 // Fallback: line-based input
                 let mut response = String::new();
-                if io::stdin().read_line(&mut response).is_err() {
-                    return "Error: failed to read user input".to_string();
+                match io::stdin().read_line(&mut response) {
+                    Err(_) => return "Error: failed to read user input".to_string(),
+                    Ok(0) => {
+                        // EOF / non-interactive — fail loud instead of
+                        // returning a fabricated default.
+                        return serde_json::json!({
+                            "error": "no_interactive_stdin",
+                            "message": "ask_user invoked in a non-interactive context (raw mode unavailable and stdin closed); refusing to return a fabricated answer.",
+                            "question": question,
+                            "choices": choices,
+                            "default": default,
+                        })
+                        .to_string();
+                    }
+                    Ok(_) => {}
                 }
                 if response.len() > MAX_INPUT_LEN {
                     response.truncate(response.floor_char_boundary(MAX_INPUT_LEN));

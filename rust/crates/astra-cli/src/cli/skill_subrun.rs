@@ -18,24 +18,23 @@ use astra_runtime::{
     turn::agentic_headless_round::HeadlessStderrStyle,
     turn::agentic_loop_finalization::run_agentic_loop_with_host,
     turn::agentic_loop_host::{
-        AgenticLoopHost, AgenticLoopState, CancellationState, HostTurnResult, SkillState,
-        StopHookState, TurnInteractionMode, TurnInteractionPolicy,
-        interaction_scoped_tool_restrictions,
+        interaction_scoped_tool_restrictions, AgenticLoopHost, AgenticLoopState, CancellationState,
+        HostTurnResult, SkillState, StopHookState, TurnInteractionMode, TurnInteractionPolicy,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::chat_turn_payload::{
-        ChatTurnBasePayloadInput, chat_turn_base_payload, set_payload_tool_results_if_non_empty,
+        chat_turn_base_payload, set_payload_tool_results_if_non_empty, ChatTurnBasePayloadInput,
     },
     turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
 };
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::edge_tools;
 use super::effects::ChatTurnPrepLineGuard;
 use super::permission_manager::{PermissionManager, PermissionMode};
-use super::stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse};
+use super::stream_render::{consume_turn_sse, EdgeSseContext, RenderPolicy};
 use crate::chat_stream::turn_policy_from_payload_edge_tools;
 
 const SUBRUN_MAX_TURNS: usize = 25;
@@ -369,15 +368,23 @@ impl AgenticLoopHost for SubRunHost {
             );
         }
 
-        // Unified timeline: emit per-round events tagged with agent_id
-        // to the parent's journal so the timeline renderer can
-        // interleave child rounds with parent rounds.
+        // Unified timeline: emit the LATEST round event tagged with
+        // agent_id to the parent's journal so the timeline renderer
+        // can interleave child rounds with parent rounds.
+        //
+        // NOTE: `state.recent_rounds` is a **ring buffer** (capacity
+        // RECENT_ROUNDS_RING_CAPACITY=32) that accumulates across
+        // turns. Iterating the whole ring here would re-journal every
+        // historical round on every turn end, causing duplicate
+        // entries and inflated token accounting in the parent
+        // timeline. Only the most recent entry — the round that just
+        // completed — should be emitted.
         if let Some(ref journal) = self.journal {
-            let mut buf = astra_services::session_journal::TurnEventBuffer::begin_turn(
-                state.current_session_id.as_deref(),
-                state.current_round_index.saturating_add(1),
-            );
-            for round_summary in &state.recent_rounds {
+            if let Some(round_summary) = state.recent_rounds.last() {
+                let mut buf = astra_services::session_journal::TurnEventBuffer::begin_turn(
+                    state.current_session_id.as_deref(),
+                    state.current_round_index.saturating_add(1),
+                );
                 buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
                     duration_ms: round_summary.duration_ms,
                     prompt_tokens: round_summary.prompt_tokens,
@@ -392,9 +399,9 @@ impl AgenticLoopHost for SubRunHost {
                     agent_id: Some(self.agent_id.clone()),
                     ..Default::default()
                 });
+                let events = buf.drain();
+                let _ = journal.append_bulk_no_sync(&events);
             }
-            let events = buf.drain();
-            let _ = journal.append_bulk_no_sync(&events);
         }
     }
 }

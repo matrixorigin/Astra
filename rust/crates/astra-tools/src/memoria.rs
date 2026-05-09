@@ -142,6 +142,32 @@ impl MemoriaClient {
         self.fail_count.load(Ordering::Relaxed) >= MAX_FAILS
     }
 
+    /// Whitelist of agent_type values the client will forward to the
+    /// Memoria backend. Kept in sync with the `agent_type` enum in the
+    /// `memory` tool schema (astra-cli edge_tools). Unknown values are
+    /// dropped client-side so that untrusted tool-call arguments from
+    /// an LLM cannot smuggle arbitrary strings (`"../admin"`,
+    /// `"' OR 1=1--"`, etc.) into request bodies even if the backend
+    /// filter is misconfigured.
+    const AGENT_TYPE_ALLOWLIST: &'static [&'static str] =
+        &["explore", "code-review", "task", "general-purpose"];
+
+    /// Pull an `agent_type` value out of tool args and apply the
+    /// client-side allowlist. Returns `None` if the value is missing,
+    /// empty, or not in [`AGENT_TYPE_ALLOWLIST`].
+    fn sanitized_agent_type(args: &Value) -> Option<&str> {
+        let v = args.get("agent_type").and_then(Value::as_str)?;
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if Self::AGENT_TYPE_ALLOWLIST.contains(&trimmed) {
+            Some(trimmed)
+        } else {
+            None
+        }
+    }
+
     /// Execute a memoria operation (store, retrieve, search, purge, correct, profile).
     pub async fn call(&self, op: &str, args: &Value) -> String {
         self.call_with_timeout(op, args, Duration::from_secs(10))
@@ -302,7 +328,7 @@ impl MemoriaClient {
                 if let Some(ics) = args.get("include_cross_session").and_then(Value::as_bool) {
                     pl["include_cross_session"] = json!(ics);
                 }
-                if let Some(at) = args.get("agent_type").and_then(Value::as_str) {
+                if let Some(at) = Self::sanitized_agent_type(args) {
                     pl["agent_type"] = json!(at);
                 }
                 (format!("{base}/v1/memories/retrieve"), pl, HttpMethod::Post)
@@ -318,7 +344,7 @@ impl MemoriaClient {
                 if let Some(tier) = args.get("trust_tier").and_then(Value::as_str) {
                     payload["trust_tier"] = json!(tier);
                 }
-                if let Some(at) = args.get("agent_type").and_then(Value::as_str) {
+                if let Some(at) = Self::sanitized_agent_type(args) {
                     payload["agent_type"] = json!(at);
                 }
                 inject_identity(&mut payload);
@@ -335,7 +361,7 @@ impl MemoriaClient {
                 if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
                     pl["session_id"] = json!(sid);
                 }
-                if let Some(at) = args.get("agent_type").and_then(Value::as_str) {
+                if let Some(at) = Self::sanitized_agent_type(args) {
                     pl["agent_type"] = json!(at);
                 }
                 if let Some(fs) = args.get("filter_session").and_then(Value::as_bool) {

@@ -3,7 +3,7 @@
 //! Each schema is a JSON object following the OpenAI function-calling format:
 //! `{ "type": "function", "function": { "name": ..., "description": ..., "parameters": ... } }`
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 pub const DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "bash",
@@ -608,13 +608,16 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "title": {"type": "string", "description": "(create/update) Brief imperative title"},
                         "description": {"type": "string", "description": "(create/update) What needs to be done"},
                         "task_id": {"type": "string", "description": "(update/get/stop) Task ID (e.g. 'task-1')"},
-                        "status": {"type": "string", "enum": ["pending","in_progress","completed","failed","deleted","all","active"], "description": "(update) New status — 'deleted' permanently removes; (list) Filter"},
+                        "new_status": {"type": "string", "enum": ["pending","in_progress","completed","failed","deleted"], "description": "(update) New status to assign. 'deleted' permanently removes the task."},
+                        "status_filter": {"type": "string", "enum": ["pending","in_progress","completed","failed","all","active"], "description": "(list) Restrict results. 'active' = pending+in_progress. Default 'all'."},
                         "subtask_id": {"type": "string", "description": "(update) Update a specific subtask"},
                         "active_form": {"type": "string", "description": "(create/update) Present-continuous form shown while in_progress (e.g. 'Running tests')"},
                         "owner": {"type": "string", "description": "(create/update) Agent or user that owns this task"},
                         "metadata": {"type": "object", "description": "(create/update) Arbitrary key-value pairs. On update: set key to null to delete it."},
                         "add_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Task IDs that THIS task blocks (they can't start until this completes)"},
                         "add_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Task IDs that must complete before THIS task can start"},
+                        "remove_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove entries from this task's blocks list"},
+                        "remove_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove entries from this task's blocked_by list"},
                         "subtasks": {
                             "type": "array",
                             "description": "(create) Optional sub-steps",

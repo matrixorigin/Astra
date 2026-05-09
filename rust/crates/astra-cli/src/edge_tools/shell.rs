@@ -118,23 +118,46 @@ fn last_pipeline_command(command: &str) -> &str {
 /// 4. Privilege escalation risk (sudo rm, sudo chmod, curl | sudo sh)
 /// 5. Shell injection via unquoted expansion ($(), backticks in pipes)
 pub(crate) fn check_dangerous_command(command: &str) -> Option<String> {
-    let lower = command.to_lowercase();
+    // Normalize runs of whitespace so tricks like `rm  -rf  /` or tabs don't
+    // bypass our substring matching.
+    let normalized: String = {
+        let mut out = String::with_capacity(command.len());
+        let mut prev_ws = false;
+        for ch in command.chars() {
+            if ch.is_whitespace() {
+                if !prev_ws {
+                    out.push(' ');
+                    prev_ws = true;
+                }
+            } else {
+                out.push(ch);
+                prev_ws = false;
+            }
+        }
+        out
+    };
+    let lower = normalized.to_lowercase();
     let trimmed = command.trim();
 
     // ── Category 1: Destructive filesystem ──
-    if (lower.contains("rm ") || lower.contains("rm\t"))
-        && (lower.contains(" -rf ")
-            || lower.contains(" -fr ")
-            || lower.contains(" -rf/")
-            || lower.contains("--no-preserve-root"))
+    // rm with -rf / -fr / combined short flags (-rfv etc.) applied to root.
+    let has_rm_token = lower.split(|c: char| c.is_whitespace() || c == ';' || c == '|' || c == '&')
+        .any(|tok| tok == "rm" || tok.ends_with("/rm"));
+    let has_recursive_force = lower.contains(" -rf")
+        || lower.contains(" -fr")
+        || lower.contains(" -r ") && lower.contains(" -f")
+        || lower.contains("--recursive") && lower.contains("--force")
+        || lower.contains("--no-preserve-root");
+    if has_rm_token && has_recursive_force
+        && (lower.contains(" /") || lower.contains(" /*") || lower.ends_with(" /"))
+        && !lower.contains(" ./")
+        && !lower.contains(" ../")
     {
-        if lower.contains(" /") && !lower.contains(" ./") && !lower.contains(" ../") {
-            return Some(
-                "⚠ DANGEROUS: `rm -rf /` or equivalent detected — this would delete the entire filesystem. \
-                 Refusing to execute. Use a more specific path."
-                    .to_string(),
-            );
-        }
+        return Some(
+            "⚠ DANGEROUS: `rm -rf /` or equivalent detected — this would delete the entire filesystem. \
+             Refusing to execute. Use a more specific path."
+                .to_string(),
+        );
     }
 
     if lower.contains("chmod") && lower.contains("777") && lower.contains("-r") {
@@ -145,7 +168,13 @@ pub(crate) fn check_dangerous_command(command: &str) -> Option<String> {
         );
     }
 
-    if lower.contains("mkfs") || lower.contains("dd if=") && lower.contains("of=/dev/") {
+    // mkfs as a command token (not just substring — avoids matching 'mkfs' in
+    // comments / variable names / paths). Operator precedence bug fixed with
+    // parentheses around the `dd` branch.
+    let mkfs_as_token = lower
+        .split(|c: char| c.is_whitespace() || c == ';' || c == '|' || c == '&')
+        .any(|tok| tok == "mkfs" || tok.starts_with("mkfs.") || tok.ends_with("/mkfs"));
+    if mkfs_as_token || (lower.contains("dd if=") && lower.contains("of=/dev/")) {
         return Some(
             "⚠ DANGEROUS: disk formatting or raw device write detected. Refusing to execute."
                 .to_string(),
@@ -209,13 +238,91 @@ pub(crate) fn check_dangerous_command(command: &str) -> Option<String> {
         );
     }
 
-    // ── Category 4: Privilege escalation ──
+    // ── Category 4: Privilege escalation / remote-code-execution ──
+    // `curl URL | sudo` / `wget URL | sudo`
     if (lower.contains("curl ") || lower.contains("wget ")) && lower.contains("| sudo") {
         return Some(
             "⚠ DANGEROUS: piping untrusted remote content to sudo — this is a common attack vector. \
              Download first, inspect, then execute separately."
                 .to_string(),
         );
+    }
+
+    // `curl ... | bash|sh|zsh|ksh|python|perl|ruby|node|php` and the
+    // `wget -O- ... | sh` family. This is the single most common LLM-targeted
+    // RCE pattern and was previously undetected.
+    let fetches_remote = lower.contains("curl ")
+        || lower.contains("wget ")
+        || lower.contains("fetch ")
+        || lower.contains("http ");
+    if fetches_remote {
+        // Look for a pipe into a shell/interpreter anywhere after the fetch.
+        const SHELLS: &[&str] = &[
+            "| bash", "|bash", "| sh", "|sh ", "|sh\n", "| zsh", "|zsh",
+            "| ksh", "|ksh", "| dash", "|dash",
+            "| python", "|python", "| perl", "|perl",
+            "| ruby", "|ruby", "| node", "|node", "| php", "|php",
+        ];
+        if SHELLS.iter().any(|needle| lower.contains(needle))
+            || lower.contains("|sh;")
+            || lower.ends_with("|sh")
+            || lower.ends_with("| sh")
+        {
+            return Some(
+                "⚠ DANGEROUS: piping remote content directly into a shell/interpreter \
+                 (`curl … | bash` and friends). This executes arbitrary unverified code. \
+                 Download to a file, inspect, then run separately."
+                    .to_string(),
+            );
+        }
+    }
+
+    // `base64 -d … | bash` / `base64 --decode … | sh` — a common obfuscation
+    // wrapper around the same RCE pattern.
+    if (lower.contains("base64 -d") || lower.contains("base64 --decode"))
+        && (lower.contains("| bash") || lower.contains("|bash")
+            || lower.contains("| sh") || lower.contains("|sh"))
+    {
+        return Some(
+            "⚠ DANGEROUS: decoding base64 and piping into a shell is a well-known obfuscated \
+             RCE pattern. Refusing to execute."
+                .to_string(),
+        );
+    }
+
+    // `eval` on an obviously-constructed dangerous string. This catches
+    // `eval "rm  -rf /"` (double space bypass of the literal " -rf " match above).
+    if lower.contains("eval ") || lower.contains("eval\"") || lower.contains("eval'") {
+        let after_eval = lower.split("eval").nth(1).unwrap_or("");
+        if after_eval.contains("rm ") && (after_eval.contains("-rf") || after_eval.contains("-fr"))
+            && after_eval.contains('/')
+        {
+            return Some(
+                "⚠ DANGEROUS: `eval` on a string containing `rm -rf /` — refusing to execute."
+                    .to_string(),
+            );
+        }
+    }
+
+    // `X=rm; $X -rf /` — simple variable-indirection bypass.
+    // Detect `NAME=rm` (or other destructive binaries) directly followed by
+    // a use of `$NAME` with recursive-force flags.
+    for dangerous in &["rm", "mkfs", "dd"] {
+        let assignment_marker = format!("={} ", dangerous);
+        let assignment_marker_eol = format!("={};", dangerous);
+        let assignment_marker_nl = format!("={}\n", dangerous);
+        if lower.contains(&assignment_marker)
+            || lower.contains(&assignment_marker_eol)
+            || lower.contains(&assignment_marker_nl)
+        {
+            if lower.contains("$") && (lower.contains("-rf") || lower.contains("-fr")) {
+                return Some(format!(
+                    "⚠ DANGEROUS: variable-indirection bypass detected (assignment to `{}` \
+                     followed by `$VAR -rf …`). Refusing to execute.",
+                    dangerous
+                ));
+            }
+        }
     }
 
     // ── Category 5: Shell injection patterns ──
