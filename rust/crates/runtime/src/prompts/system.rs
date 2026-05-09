@@ -194,7 +194,10 @@ pub fn build_pipeline_static_sections() -> astra_turn_core::context_sources::Sta
             CacheScope::Global,
         ),
         coding_discipline: PromptSection::stable(
-            resolve("coding_discipline", coding_discipline_section().to_string()),
+            resolve(
+                "coding_discipline",
+                format!("{}{}", resilience_section(), coding_discipline_section()),
+            ),
             CacheScope::Global,
         ),
         turn_discipline: PromptSection::stable(
@@ -281,6 +284,17 @@ fn planning_section() -> &'static str {
      7. **Build/test only AFTER your writes** — not for exploration, review, or Q&A.\n\
      8. **Open-ended loops** (\"keep going\", \"as many as you can\"): do one useful pass, then stop.\n\
      9. **Exploration cap**: ≤2 dir listings + ≤2 full-file reads unless user names a concrete target.\n"
+}
+
+/// Failure handling + resilience. Inspired by Claude Code's prompt contract.
+fn resilience_section() -> &'static str {
+    "\n## Failure Handling & Resilience\n\
+     - **Context window is not your concern**: the system automatically compresses prior messages as context approaches limits. Your conversation is not limited by the context window — keep working.\n\
+     - **If an approach fails, diagnose before switching**: read the error, check your assumptions, try a focused fix. Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either.\n\
+     - **Never self-terminate when the user said continue**: if the user explicitly asked you to proceed with an approach, DO NOT output \"I'll stop\" / \"let me be honest, this won't work\" / \"I'm giving up\". Either execute or ask_user with a specific blocker.\n\
+     - **Escalate only when genuinely stuck**: use ask_user ONLY after you've investigated the failure, not as a first response to friction. State what you tried, what failed, and what decision you need.\n\
+     - **Batch large refactors**: if a change spans 50+ sites, work in batches of 10-15 files. Verify each batch compiles before proceeding. Don't attempt all-at-once heroics that blow the token budget.\n\
+     - **On repeated str_replace failures**: if the same str_replace fails 2x, the file content has changed or your old_str is wrong. Re-read the file (targeted range), don't guess.\n"
 }
 
 /// Discovery + coding discipline. Pure static.
@@ -661,7 +675,10 @@ pub fn build_system_prompt_sections_with_style(
         PromptSection::stable(core_rules_section(), CacheScope::Global),
         PromptSection::stable(safety_section().to_string(), CacheScope::Global),
         PromptSection::stable(planning_section().to_string(), CacheScope::Global),
-        PromptSection::stable(coding_discipline_section().to_string(), CacheScope::Global),
+        PromptSection::stable(
+            format!("{}{}", resilience_section(), coding_discipline_section()),
+            CacheScope::Global,
+        ),
         PromptSection::stable(turn_discipline_section().to_string(), CacheScope::Global),
         PromptSection::stable(plan_execution_section().to_string(), CacheScope::Global),
         PromptSection::stable(output_format_section().to_string(), CacheScope::Global),

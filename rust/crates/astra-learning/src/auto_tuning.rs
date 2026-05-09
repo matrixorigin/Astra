@@ -1360,16 +1360,6 @@ pub fn load_feedback(profile: &str, engine: &AutoTuningEngine) -> Result<bool, S
 
 // ─── Preset Rules ───────────────────────────────────────────────────────────
 
-/// Cooldown for the `high-tokens-reduce-budget` rule.
-///
-/// The 30-minute floor is load-bearing — see the regression test
-/// `high_tokens_reduce_budget_rule_cooldown_is_at_least_30min`, which
-/// asserts `>= HIGH_TOKENS_REDUCE_BUDGET_COOLDOWN_SECS`. Keep the const
-/// and the test's lower bound in lockstep so a future tuning that lowers
-/// this value fails loudly instead of silently re-introducing the
-/// 0e37eb46 budget-spiral regression.
-pub(crate) const HIGH_TOKENS_REDUCE_BUDGET_COOLDOWN_SECS: u64 = 1800;
-
 /// Create default evolution rules.
 pub fn default_rules() -> Vec<EvolutionRule> {
     vec![
@@ -1489,31 +1479,35 @@ pub fn default_rules() -> Vec<EvolutionRule> {
         //
         // The 30-minute floor is load-bearing — see the regression test
         // `high_tokens_reduce_budget_rule_cooldown_is_at_least_30min`,
-        // which asserts `>= HIGH_TOKENS_REDUCE_BUDGET_COOLDOWN_SECS`.
         // Keep the const and the test's lower bound in lockstep so a
         // future tuning that lowers this value fails loudly instead of
         // silently re-introducing the 0e37eb46 spiral.
-        EvolutionRule::new(
-            "high-tokens-reduce-budget",
-            EvolutionTrigger::HighTokenUsage {
-                threshold_tokens: 70_000,
-                window_secs: 600,
-                min_samples: 1,
-            },
-            EvolutionAction::AdjustConfig {
-                path: "token_budget.max_turn_input_tokens".to_string(),
-                delta: -2000.0,
-                min: Some(60_000.0),
-                max: None,
-            },
-        )
-        .with_name("Reduce token budget on high usage")
-        .with_cooldown(Duration::from_secs(HIGH_TOKENS_REDUCE_BUDGET_COOLDOWN_SECS)),
-        // High token usage → also lower compression threshold to compress sooner
+        // "high-tokens-reduce-budget" rule REMOVED.
+        //
+        // Previously: when a turn used >70K tokens, the adaptive tuner
+        // shrank max_turn_input_tokens by 2K (floor 60K, cooldown 30min).
+        // This caused the "compaction spiral" (session 0e37eb46) and the
+        // "80K→60K budget starvation" (session fea922a7) — the agent
+        // never recovered from the shrinkage.
+        //
+        // Claude Code's architecture: no per-turn budget cap reduction.
+        // When tokens approach the context window, auto-compact fires
+        // (already implemented in handle_token_budget). The compact-and-
+        // continue logic is the correct pressure relief; dynamically
+        // shrinking the budget only makes things worse.
+        //
+        // The "compress-earlier" rule below is still active — it lowers
+        // the *compaction threshold* (when to compact) rather than the
+        // *budget ceiling* (when to abort). This is the right lever.
+        //
+        // High token usage → lower compression threshold to compress sooner.
+        // Trigger at 150K (75% of default 200K budget) so it doesn't fire
+        // at normal usage levels. On smaller windows this may never fire —
+        // that's fine, the reactive compact in handle_token_budget covers it.
         EvolutionRule::new(
             "high-tokens-compress-earlier",
             EvolutionTrigger::HighTokenUsage {
-                threshold_tokens: 70_000,
+                threshold_tokens: 150_000,
                 window_secs: 600,
                 min_samples: 1,
             },
@@ -1946,12 +1940,11 @@ mod tests {
     #[test]
     fn test_default_rules() {
         let rules = default_rules();
-        assert_eq!(rules.len(), 11);
+        assert_eq!(rules.len(), 10);
         assert!(rules.iter().any(|r| r.id == "low-success-boost-confidence"));
         assert!(rules.iter().any(|r| r.id == "correction-raise-strictness"));
         assert!(rules.iter().any(|r| r.id == "churn-expand-memory"));
         assert!(rules.iter().any(|r| r.id == "drift-trim-history"));
-        assert!(rules.iter().any(|r| r.id == "high-tokens-reduce-budget"));
         assert!(rules.iter().any(|r| r.id == "high-tokens-compress-earlier"));
         assert!(rules.iter().any(|r| r.id == "quick-followup-trim-history"));
         assert!(rules.iter().any(|r| r.id == "long-pause-expand-memory"));
@@ -2588,77 +2581,11 @@ mod tests {
     // non-overkill parameters so a future refactor that accidentally
     // restores the aggressive defaults fails loudly.
 
-    #[test]
-    fn high_tokens_reduce_budget_rule_floor_is_at_least_60k() {
-        // 60k is chosen so that even after the tuner has fired several
-        // times, the per-turn budget can still hold a system prompt + a
-        // realistic tool-loop's worth of history without forcing
-        // aggressive_pipeline compaction on every round.
-        let rules = default_rules();
-        let rule = rules
-            .iter()
-            .find(|r| r.id == "high-tokens-reduce-budget")
-            .expect("high-tokens-reduce-budget rule must exist");
-        match &rule.action {
-            EvolutionAction::AdjustConfig { path, min, .. } => {
-                assert_eq!(path, "token_budget.max_turn_input_tokens");
-                let floor = min.expect("rule must have a floor");
-                assert!(
-                    floor >= 60_000.0,
-                    "floor {floor} is too low — session 0e37eb46 showed 36968 \
-                     wedges the model into compaction-spiral (tuner floor \
-                     must protect against this)"
-                );
-            }
-            other => panic!("expected AdjustConfig, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn high_tokens_reduce_budget_rule_delta_is_gentle() {
-        // -5000 per trigger over a 5-minute cooldown drops budget too
-        // fast during a single long debug task. -2000 still converges
-        // but across the time scale of a multi-turn user session, not
-        // a single turn.
-        let rules = default_rules();
-        let rule = rules
-            .iter()
-            .find(|r| r.id == "high-tokens-reduce-budget")
-            .expect("rule must exist");
-        match &rule.action {
-            EvolutionAction::AdjustConfig { delta, .. } => {
-                assert!(
-                    *delta >= -2500.0 && *delta < 0.0,
-                    "delta {delta} is too aggressive (≤ -2500) or wrong-sign; \
-                     session 0e37eb46 showed -5000 + 5min cooldown spirals \
-                     budget down mid-task"
-                );
-            }
-            other => panic!("expected AdjustConfig, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn high_tokens_reduce_budget_rule_cooldown_is_at_least_30min() {
-        // 5-minute cooldown lets the rule fire every ~5 turns of a
-        // long task. 15 minutes means at most 4 fires per hour — enough
-        // time for a coherent task to finish before the next shrink.
-        let rules = default_rules();
-        let rule = rules
-            .iter()
-            .find(|r| r.id == "high-tokens-reduce-budget")
-            .expect("rule must exist");
-        let cooldown_secs = rule.cooldown.as_secs();
-        // Tightened from 900s floor to 1800s: the inline tuning comment
-        // at `high-tokens-reduce-budget` explicitly documents "cooldown
-        // 30min" as the intended target. A 900s floor left the gap
-        // [900, 1800) unprotected — a well-intentioned future tuning
-        // back to 15 min would silently pass. Lock the documented value.
-        assert!(
-            cooldown_secs >= 1800,
-            "cooldown {cooldown_secs}s is below the documented 30-min target \
-             — session 0e37eb46 required the 30-min spacing to let a debug \
-             task finish before the next budget shrink"
-        );
-    }
+    // "high-tokens-reduce-budget" rule regression tests REMOVED.
+    //
+    // The rule itself was removed — adaptive budget reduction causes
+    // compaction spirals (0e37eb46) and budget starvation (fea922a7).
+    // The correct mechanism is reactive compaction (handle_token_budget)
+    // which fires when tokens actually approach the window, not a
+    // proactive shrink that permanently reduces the ceiling.
 }
