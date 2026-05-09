@@ -357,8 +357,7 @@ mod tests {
 
     #[test]
     fn snapshot_response_multiline_80() {
-        let cell =
-            SystemCell::response("Set model to Opus 4.6\n(1M context, thinking enabled)");
+        let cell = SystemCell::response("Set model to Opus 4.6\n(1M context, thinking enabled)");
         insta::assert_snapshot!("system_response_multiline_80", render(&cell, 80, 2));
     }
 

@@ -200,7 +200,12 @@ mod tests {
         // separator for the `/cmd → ⎿ response` pair.
         let cell = UserCell::new("/model glm-5.1");
         let lines = cell.display_lines(60);
-        assert_eq!(lines.len(), 1, "slash UserCell is exactly one line: {:?}", lines);
+        assert_eq!(
+            lines.len(),
+            1,
+            "slash UserCell is exactly one line: {:?}",
+            lines
+        );
     }
 
     #[test]

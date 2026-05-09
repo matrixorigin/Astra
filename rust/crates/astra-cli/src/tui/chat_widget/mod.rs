@@ -828,7 +828,9 @@ mod tests {
                 "turn-1 assistant reply must be persisted after sid arrives"
             );
             assert!(
-                events.iter().any(|e| matches!(e, TurnEvent::TurnSummary { .. })),
+                events
+                    .iter()
+                    .any(|e| matches!(e, TurnEvent::TurnSummary { .. })),
                 "turn-1 summary must be persisted after sid arrives"
             );
         });
@@ -893,7 +895,8 @@ mod tests {
             w.handle_event(AppEvent::UserSubmit("new".into()));
             let after = super::super::transcript_jsonl::load(sid).len();
             assert_eq!(
-                after, before + 1,
+                after,
+                before + 1,
                 "only the new cell should persist; {before} → {after}"
             );
         });

@@ -159,8 +159,7 @@ impl AssistantCell {
             if let Some(close_rel) = after_open.find(close_tag) {
                 let think_inner = &after_open[..close_rel];
                 let leading_ws = source.len() - trimmed.len();
-                let body_start =
-                    leading_ws + open_tag.len() + close_rel + close_tag.len();
+                let body_start = leading_ws + open_tag.len() + close_rel + close_tag.len();
                 let body = source[body_start..].trim_start_matches('\n');
                 return (Some(think_inner), true, body);
             }
@@ -649,10 +648,7 @@ mod tests {
             out.contains("Thought"),
             "bare leading `</think>` should still collapse: {out}"
         );
-        assert!(
-            !out.contains("</think>"),
-            "tag must not appear raw: {out}"
-        );
+        assert!(!out.contains("</think>"), "tag must not appear raw: {out}");
     }
 
     #[test]

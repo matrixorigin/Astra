@@ -163,8 +163,7 @@ fn flush_chat_widget(
     for (i, cell) in new_cells.iter().enumerate() {
         batch.extend(cell.display_lines(width));
         let is_last = i + 1 == new_cells.len();
-        let next_is_response = !is_last
-            && is_response_cell(new_cells[i + 1].as_ref());
+        let next_is_response = !is_last && is_response_cell(new_cells[i + 1].as_ref());
         let this_is_slash_user = is_slash_user_cell(cell.as_ref());
         let this_is_response = is_response_cell(cell.as_ref());
 
@@ -174,8 +173,7 @@ fn flush_chat_widget(
         //   2. This cell is a response — its reply should stack
         //      tight onto whatever came next, and nothing in the
         //      current batch should push air below it.
-        let suppress_blank =
-            (this_is_slash_user && next_is_response) || this_is_response;
+        let suppress_blank = (this_is_slash_user && next_is_response) || this_is_response;
         if !suppress_blank {
             batch.push(ratatui::text::Line::default());
         }

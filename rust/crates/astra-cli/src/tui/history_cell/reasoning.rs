@@ -358,8 +358,7 @@ mod tests {
         // the remaining slots show the most recent rows (tail).
         let mut c = ReasoningCell::new_streaming();
         let total_rows = LIVE_PREVIEW_MAX_ROWS + 5;
-        let padding: Vec<String> =
-            (1..=total_rows).map(|i| format!("row {i}")).collect();
+        let padding: Vec<String> = (1..=total_rows).map(|i| format!("row {i}")).collect();
         c.push_delta(&padding.join("\n"));
 
         let lines = c.display_lines(60);
@@ -416,7 +415,10 @@ mod tests {
         let mut c = ReasoningCell::new_streaming();
         c.push_delta("alpha\nbeta\ngamma");
         let out = render(&c, 60, 5);
-        assert!(out.contains("alpha"), "early row must show under cap: {out}");
+        assert!(
+            out.contains("alpha"),
+            "early row must show under cap: {out}"
+        );
         assert!(out.contains("beta"), "middle row must show: {out}");
         assert!(out.contains("gamma"), "latest row must show: {out}");
     }

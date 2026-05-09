@@ -277,10 +277,7 @@ mod tests {
         c.cache_read_tokens = Some(18_000);
         let out = render(&c, 120);
         assert!(out.contains("💾"), "cache icon missing: {out}");
-        assert!(
-            out.contains("78%"),
-            "expected ~78% hit rate in: {out}"
-        );
+        assert!(out.contains("78%"), "expected ~78% hit rate in: {out}");
     }
 
     #[test]

@@ -224,7 +224,10 @@ mod tests {
         assert!(rendered.contains("⏸"), "header glyph missing");
         assert!(rendered.contains("rm -rf /tmp/x"), "detail missing");
         assert!(rendered.contains("destructive path"), "reason missing");
-        assert!(rendered.contains("▸"), "focus arrow missing on focused cell");
+        assert!(
+            rendered.contains("▸"),
+            "focus arrow missing on focused cell"
+        );
         assert!(
             rendered.contains("← → navigate"),
             "key-binding hint missing on focused cell"

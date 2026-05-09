@@ -659,16 +659,16 @@ fn wrap_row(
 /// marker from content, wrap the content with `initial_indent = ""`
 /// (the marker is the initial) and `subsequent_indent = ""` padded
 /// to the marker's display width.
-fn list_item_hang_wrap(
-    spans: &[Span<'static>],
-    width: usize,
-) -> Option<Vec<Line<'static>>> {
+fn list_item_hang_wrap(spans: &[Span<'static>], width: usize) -> Option<Vec<Line<'static>>> {
     if spans.is_empty() {
         return None;
     }
     // Total display width of the whole line — if it fits, skip
     // wrap machinery entirely.
-    let total_w: usize = spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
+    let total_w: usize = spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
     if total_w <= width {
         return None;
     }
@@ -983,20 +983,14 @@ mod polish_tests {
                   wrap onto a second and probably a third row.";
         let out = lines_at(md, 40);
         let non_empty: Vec<&String> = out.iter().filter(|l| !l.is_empty()).collect();
-        assert!(
-            non_empty.len() >= 2,
-            "long quote must wrap; got {out:?}"
-        );
+        assert!(non_empty.len() >= 2, "long quote must wrap; got {out:?}");
         for row in &non_empty {
             assert!(
                 row.starts_with("│ "),
                 "every wrapped row needs the │ bar: {row:?}"
             );
             let w = UnicodeWidthStr::width(row.trim_end());
-            assert!(
-                w <= 40,
-                "row width {w} exceeds 40-col budget: {row:?}"
-            );
+            assert!(w <= 40, "row width {w} exceeds 40-col budget: {row:?}");
         }
     }
 
@@ -1014,7 +1008,11 @@ mod polish_tests {
         let md = "A short sentence.";
         let out = lines_at(md, 60);
         let non_empty: Vec<&String> = out.iter().filter(|l| !l.is_empty()).collect();
-        assert_eq!(non_empty.len(), 1, "short paragraph stays on one row: {out:?}");
+        assert_eq!(
+            non_empty.len(),
+            1,
+            "short paragraph stays on one row: {out:?}"
+        );
     }
 
     #[test]

@@ -44,9 +44,7 @@ impl TranscriptView {
             // inside the view. 80% of the terminal is close to what
             // Codex uses for full-screen overlays.
             let budget = (terminal_height as u32 * 80 / 100) as u16;
-            budget
-                .saturating_sub(CHROME_LINES)
-                .max(MIN_VISIBLE_LINES)
+            budget.saturating_sub(CHROME_LINES).max(MIN_VISIBLE_LINES)
         };
         let scroll = lines.len().saturating_sub(max_visible as usize);
         Self {
@@ -241,7 +239,10 @@ mod tests {
         // PageDown pages by max_visible, not by a fixed 16.
         let mut v = TranscriptView::new(lines(200), 50);
         v.scroll = 0;
-        v.handle_key(KeyEvent::new(KeyCode::PageDown, crossterm::event::KeyModifiers::NONE));
+        v.handle_key(KeyEvent::new(
+            KeyCode::PageDown,
+            crossterm::event::KeyModifiers::NONE,
+        ));
         assert_eq!(v.scroll, v.max_visible as usize);
     }
 }

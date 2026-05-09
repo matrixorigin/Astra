@@ -255,9 +255,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }
                 "all" | "auto" => {
                     ctx.state.perm_manager.set_mode(PermissionMode::Auto);
-                    ctx.show_response(
-                        "Permission mode → auto (all tools auto-approved)".into(),
-                    );
+                    ctx.show_response("Permission mode → auto (all tools auto-approved)".into());
                     SlashResult::Handled
                 }
                 "prompt" => {
@@ -342,11 +340,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             ctx.bottom_pane.push_view(Box::new(
                 BusyView::new("Running SQL query…").with_title(" /table "),
             ));
-            let _ = crate::tui::do_draw(
-                ctx.guard,
-                crate::tui::ActiveView::Empty,
-                ctx.bottom_pane,
-            );
+            let _ = crate::tui::do_draw(ctx.guard, crate::tui::ActiveView::Empty, ctx.bottom_pane);
 
             // `mo_query` shells out to the mysql client (blocking IO) —
             // park it on a blocking thread so we don't freeze the async
@@ -647,9 +641,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     {
                         let lines = instructions.lines().count();
                         ctx.state.project_instructions = Some(instructions);
-                        ctx.show_response(format!(
-                            "Reloaded project instructions ({lines} lines)"
-                        ));
+                        ctx.show_response(format!("Reloaded project instructions ({lines} lines)"));
                     } else {
                         ctx.state.project_instructions = None;
                         ctx.show_info("No .astra/instructions.md found".into());
@@ -658,9 +650,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }
                 "off" => {
                     ctx.state.project_instructions = None;
-                    ctx.show_response(
-                        "Project instructions disabled for this session".into(),
-                    );
+                    ctx.show_response("Project instructions disabled for this session".into());
                     SlashResult::Handled
                 }
                 _ => {
@@ -754,9 +744,7 @@ pub(crate) fn handle_view_result(
         return;
     }
     if name == "Skill info" {
-        chat_widget.commit_system(SystemCell::info(
-            "Use /skill info <name> for details",
-        ));
+        chat_widget.commit_system(SystemCell::info("Use /skill info <name> for details"));
         return;
     }
 
