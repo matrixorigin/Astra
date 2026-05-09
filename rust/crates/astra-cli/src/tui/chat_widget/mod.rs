@@ -119,6 +119,10 @@ pub(crate) struct ChatWidget {
     session_id: String,
     history: Vec<Arc<dyn HistoryCell>>,
     active_cell: Option<Box<dyn HistoryCell>>,
+    /// Index into `history` marking cells that have already been
+    /// flushed to the terminal scrollback. `drain_new_committed`
+    /// returns everything past this index and advances it.
+    committed_watermark: usize,
 }
 
 impl ChatWidget {
@@ -127,6 +131,7 @@ impl ChatWidget {
             session_id: session_id.into(),
             history: Vec::new(),
             active_cell: None,
+            committed_watermark: 0,
         }
     }
 
@@ -140,6 +145,33 @@ impl ChatWidget {
 
     pub fn active_cell(&self) -> Option<&dyn HistoryCell> {
         self.active_cell.as_deref()
+    }
+
+    /// Drain cells added since the last call. The outer loop uses
+    /// this to know which cells to flush into the terminal
+    /// scrollback since the previous frame. Invariant: the
+    /// returned cells are in the same order they were committed.
+    ///
+    /// Keeping a "consumed" watermark rather than a queue avoids
+    /// copying; callers consume by iterating the returned slice.
+    pub fn drain_new_committed(&mut self) -> Vec<Arc<dyn HistoryCell>> {
+        let out = self.history[self.committed_watermark..].to_vec();
+        self.committed_watermark = self.history.len();
+        out
+    }
+
+    /// Reset the commit watermark to the current history length.
+    /// Used on resume so replayed cells don't get reflushed.
+    pub fn mark_all_flushed(&mut self) {
+        self.committed_watermark = self.history.len();
+    }
+
+    /// Swap the backing session id. Cells committed BEFORE the
+    /// swap stay where they were written; cells committed AFTER
+    /// are persisted under the new id. Used when the server
+    /// finally assigns an id after startup.
+    pub fn set_session_id(&mut self, sid: impl Into<String>) {
+        self.session_id = sid.into();
     }
 
     /// Replay a previously-persisted turn stream into `history`.
@@ -624,6 +656,54 @@ mod tests {
         assert_eq!(w.history.len(), 1);
         let ev = w.history[0].to_persist().unwrap();
         assert!(matches!(ev, TurnEvent::Assistant { .. }));
+    }
+
+    // ── Watermark / flush tracking ──────────────────────────────
+
+    #[test]
+    fn drain_new_committed_returns_only_unflushed_cells() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::UserSubmit("a".into()));
+        w.handle_event(AppEvent::UserSubmit("b".into()));
+        // First drain returns both new cells.
+        let first = w.drain_new_committed();
+        assert_eq!(first.len(), 2, "first drain covers all so far");
+
+        // Second drain returns nothing new.
+        let second = w.drain_new_committed();
+        assert!(second.is_empty(), "no new cells since first drain");
+
+        // After another commit, only the delta.
+        w.handle_event(AppEvent::UserSubmit("c".into()));
+        let third = w.drain_new_committed();
+        assert_eq!(third.len(), 1);
+    }
+
+    #[test]
+    fn mark_all_flushed_suppresses_existing_cells() {
+        // Used by resume: after loading history we don't want to
+        // reflush it into the terminal, the caller paints it once
+        // and advances the watermark.
+        let mut w = fresh();
+        w.handle_event(AppEvent::UserSubmit("existing".into()));
+        w.mark_all_flushed();
+        let out = w.drain_new_committed();
+        assert!(out.is_empty(), "marked-flushed cells must not redraw");
+
+        // New cells after the mark still surface.
+        w.handle_event(AppEvent::UserSubmit("new".into()));
+        let out = w.drain_new_committed();
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn set_session_id_swaps_without_losing_history() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::UserSubmit("before".into()));
+        assert_eq!(w.history().len(), 1);
+        w.set_session_id("new-sid");
+        assert_eq!(w.session_id(), "new-sid");
+        assert_eq!(w.history().len(), 1, "history survives sid swap");
     }
 
     // ── Replay ──────────────────────────────────────────────────

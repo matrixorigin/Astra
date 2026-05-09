@@ -58,6 +58,10 @@ mod wrapping;
 
 use app_event::TuiAppEvent;
 use bottom_pane::{BottomPane, BottomPaneAction};
+// ChatCell imports — narrowed to what's still touched by Phase-5
+// cleanup pending removal. Most cell types are unused here now
+// that ChatWidget is the scrollback owner.
+#[allow(unused_imports)]
 use chat_cell::{
     ChatCell, assistant_cell::AssistantChatCell, system_cell::SystemChatCell,
     tool_cell::ToolChatCell, user_cell::UserChatCell,
@@ -74,7 +78,57 @@ use tokio_stream::StreamExt;
 use event::{TuiEvent, TuiEventStream};
 use frame_requester::FrameRequester;
 
-/// Flush a completed cell to terminal scrollback with trailing blank lines.
+/// Build the lines shown in the viewport above the composer.
+/// Order of preference:
+/// 1. Live `active_cell` on the ChatWidget (assistant streaming,
+///    tool running, etc.) — use its own `display_lines`.
+/// 2. Otherwise the `StatusIndicator`'s render (one-line
+///    "✶ Thinking …" style signal when a turn is in progress).
+/// 3. Otherwise empty — idle REPL shows nothing above the
+///    composer.
+fn active_viewport_lines(
+    chat_widget: &chat_widget::ChatWidget,
+    status: &status_indicator::StatusIndicator,
+    width: u16,
+) -> Vec<ratatui::text::Line<'static>> {
+    if let Some(cell) = chat_widget.active_cell() {
+        let lines = cell.display_lines(width);
+        if !lines.is_empty() {
+            return lines;
+        }
+    }
+    if let Some(line) = status.render() {
+        return vec![line];
+    }
+    Vec::new()
+}
+
+/// Drain newly-committed cells from the widget and render each
+/// to the terminal scrollback. Single choke point for all
+/// "a cell just landed in history" writes — callers don't touch
+/// `guard.queue_history_lines` directly for chat content anymore.
+/// A trailing blank row separates cells visually.
+fn flush_chat_widget(
+    guard: &mut TerminalGuard,
+    chat_widget: &mut chat_widget::ChatWidget,
+    width: u16,
+) {
+    let new_cells = chat_widget.drain_new_committed();
+    if new_cells.is_empty() {
+        return;
+    }
+    let mut batch: Vec<ratatui::text::Line<'static>> = Vec::new();
+    for cell in new_cells {
+        batch.extend(cell.display_lines(width));
+        batch.push(ratatui::text::Line::default());
+    }
+    guard.queue_history_lines(batch);
+}
+
+/// Legacy helper — kept only so Phase-5 deletes are easier to
+/// grep. The new render pipeline does not call this; the chat
+/// widget's scrollback flush replaces it.
+#[allow(dead_code)]
 fn flush_cell_to_scrollback(
     guard: &mut TerminalGuard,
     cell: Box<dyn ChatCell>,
@@ -273,6 +327,7 @@ pub(crate) async fn run_tui_repl(
     let mut chat_widget = chat_widget::ChatWidget::new(
         state.session_id.clone().unwrap_or_default(),
     );
+    let mut status_indicator = status_indicator::StatusIndicator::new();
     let mut inject_submit: Option<String> = None;
 
     frame_requester.schedule_frame();
@@ -328,13 +383,13 @@ pub(crate) async fn run_tui_repl(
                                 chat_widget.handle_event(
                                     chat_widget::AppEvent::UserSubmit(text.clone()),
                                 );
-                                let user_cell = UserChatCell::new(text.clone());
-                                let user_lines = user_cell.display_lines(w);
-                                transcript.extend(user_cell.transcript_lines(w));
-                                transcript.push(ratatui::text::Line::default());
-                                guard.queue_history_lines(user_lines);
+                                flush_chat_widget(&mut guard, &mut chat_widget, w);
 
-                                do_draw(&mut guard, &active_cell, &mut bottom_pane)?;
+                                {
+                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                    do_draw(&mut guard, lines, &mut bottom_pane)?;
+                                }
 
                                 if text.starts_with('/') {
                                     let mut dctx = slash_dispatch::DispatchContext {
@@ -380,7 +435,7 @@ pub(crate) async fn run_tui_repl(
                                     let turn_start = std::time::Instant::now();
                                     let pre_prompt_tokens = state.total_prompt_tokens;
                                     let pre_completion_tokens = state.total_completion_tokens;
-                                    let pre_cost = state.total_session_cost;
+                                    let _pre_cost = state.total_session_cost;
                                     let pre_cache_read = state.total_cache_read_tokens;
                                     let pre_cache_creation = state.total_cache_creation_tokens;
                                     let mut turn_tool_count: u32 = 0;
@@ -425,10 +480,18 @@ pub(crate) async fn run_tui_repl(
                                                                 }
                                                             }
                                                             frame_requester.schedule_frame();
-                                                            let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
+                                                            {
+                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                    let _ = do_draw(&mut guard, lines, &mut bottom_pane);
+                                }
                                                         }
                                                         TuiEvent::Resize | TuiEvent::Draw => {
-                                                            let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
+                                                            {
+                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                    let _ = do_draw(&mut guard, lines, &mut bottom_pane);
+                                }
                                                         }
                                                         _ => {}
                                                     }
@@ -455,8 +518,13 @@ pub(crate) async fn run_tui_repl(
                                                     ) {
                                                         chat_widget.handle_event(new_ev);
                                                     }
-                                                    handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester, &mut transcript);
-                                                    let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
+                                                    handle_app_event(&ae, &mut bottom_pane, &mut status_indicator, &frame_requester);
+                                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                    {
+                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                    let _ = do_draw(&mut guard, lines, &mut bottom_pane);
+                                }
                                                 }
                                                 Some(req) = approval_rx.recv() => {
                                                     // Non-blocking: enqueue only. The live, interactive
@@ -471,11 +539,19 @@ pub(crate) async fn run_tui_repl(
                                                         req.response_tx,
                                                     );
                                                     frame_requester.schedule_frame();
-                                                    let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
+                                                    {
+                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                    let _ = do_draw(&mut guard, lines, &mut bottom_pane);
+                                }
                                                 }
                                                 _ = &mut itick => {
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80); drain_tick(&mut stream_controller, &mut guard, w, &mut transcript, &frame_requester);
-                                                    let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
+                                                    {
+                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                    let _ = do_draw(&mut guard, lines, &mut bottom_pane);
+                                }
                                                 }
                                             }
                                         };
@@ -505,31 +581,37 @@ pub(crate) async fn run_tui_repl(
                                                 ) {
                                                     chat_widget.handle_event(new_ev);
                                                 }
-                                                handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester, &mut transcript);
+                                                handle_app_event(&ae, &mut bottom_pane, &mut status_indicator, &frame_requester);
+                                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
                                             }
                                         }
                                     }
 
-                                    // Finalize stream — emit remaining mini-cell + trailing blanks
+                                    // Turn end — ChatWidget handles any
+                                    // remaining live cell on TurnComplete.
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                    finalize_stream(&mut stream_controller, &mut guard, w, &mut transcript);
-
-                                    // Flush any remaining active cell (thinking indicator, tool cell)
-                                    if let Some(mut cell) = active_cell.take() {
-                                        // If it's an assistant cell, mark the
-                                        // stream as complete so its display no
-                                        // longer paints the trailing cursor
-                                        // before being flushed to scrollback.
-                                        if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
-                                            ac.finalize();
-                                        }
-                                        flush_cell_to_scrollback(&mut guard, cell, w, &mut transcript);
-                                    }
+                                    // Legacy stream_controller is unused in
+                                    // the new path; keep the variable so
+                                    // shape matches until Phase 5 removes
+                                    // it. Same for `active_cell` below.
+                                    let _ = (&mut stream_controller, &mut transcript, &mut active_cell);
 
                                     bottom_pane.set_task_status(TaskStatus::Idle);
+                                    status_indicator.set_state(
+                                        status_indicator::IndicatorState::Idle,
+                                    );
+                                    // Session id may have been assigned by
+                                    // the server during the turn. Re-seat
+                                    // so subsequent turns persist under the
+                                    // correct id.
+                                    if let Some(ref sid) = state.session_id
+                                        && chat_widget.session_id() != sid
+                                    {
+                                        chat_widget.set_session_id(sid.clone());
+                                    }
                                     if let Err(ref e) = turn_result {
-                                        let err = SystemChatCell::error(e.clone());
-                                        guard.queue_history_lines(err.display_lines(w));
+                                        // ChatWidget renders the error cell
+                                        // into scrollback via the flush.
                                         if let Some(ev) = chat_widget::translate(
                                             TuiAppEvent::TurnError(e.clone()),
                                             chat_widget::TurnContext::default(),
@@ -549,33 +631,19 @@ pub(crate) async fn run_tui_repl(
                                     let used = state.total_prompt_tokens + state.total_completion_tokens;
                                     bottom_pane.footer.token_budget = Some((used, 200_000));
 
-                                    // Turn summary separator
+                                    // Turn summary: dispatch to ChatWidget,
+                                    // which builds the TurnSummaryCell and
+                                    // persists it. `flush_chat_widget` below
+                                    // paints it into scrollback.
                                     {
                                         let turn_prompt = state.total_prompt_tokens - pre_prompt_tokens;
                                         let turn_completion = state.total_completion_tokens - pre_completion_tokens;
-                                        let turn_cost = state.total_session_cost - pre_cost;
                                         let turn_cache_read = state.total_cache_read_tokens - pre_cache_read;
                                         let turn_cache_creation = state.total_cache_creation_tokens - pre_cache_creation;
                                         let elapsed = turn_start.elapsed();
                                         let ttft_ms = turn_ttft.map(|t| {
                                             t.duration_since(turn_start).as_millis() as u64
                                         });
-                                        let summary = format_turn_summary(
-                                            &state, turn_prompt, turn_completion,
-                                            turn_cache_read, turn_cache_creation,
-                                            turn_cost, elapsed, ttft_ms, turn_tool_count,
-                                        );
-                                        let dim = ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray);
-                                        let line = ratatui::text::Line::from(
-                                            ratatui::text::Span::styled(summary, dim),
-                                        );
-                                        guard.queue_history_lines(vec![line, ratatui::text::Line::default()]);
-
-                                        // Shadow TurnComplete into
-                                        // ChatWidget with full stats so
-                                        // the mirrored history ends with
-                                        // a TurnSummaryCell matching the
-                                        // legacy scrollback band.
                                         let ctx = chat_widget::TurnContext {
                                             elapsed_ms: Some(elapsed.as_millis() as u64),
                                             ttft_ms,
@@ -597,6 +665,11 @@ pub(crate) async fn run_tui_repl(
                                             chat_widget.handle_event(ev);
                                         }
                                     }
+                                    // Flush everything new from the widget
+                                    // (assistant cell + tool cells +
+                                    // possibly TurnSummary + SystemError) to
+                                    // scrollback in one shot.
+                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
 
                                     let new_tok = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
                                     tui_cancel_token = new_tok.clone();
@@ -731,10 +804,18 @@ pub(crate) async fn run_tui_repl(
                     }
                     TuiEvent::Resize => {
                         guard.terminal.invalidate_viewport();
-                        do_draw(&mut guard, &active_cell, &mut bottom_pane)?;
+                        {
+                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                    do_draw(&mut guard, lines, &mut bottom_pane)?;
+                                }
                     }
                     TuiEvent::Draw => {
-                        do_draw(&mut guard, &active_cell, &mut bottom_pane)?;
+                        {
+                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                    do_draw(&mut guard, lines, &mut bottom_pane)?;
+                                }
                     }
                     TuiEvent::Paste(text) => {
                         // BottomPane routes short pastes to the textarea
@@ -755,10 +836,17 @@ pub(crate) async fn run_tui_repl(
                 ) {
                     chat_widget.handle_event(new_ev);
                 }
-                handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester, &mut transcript);
+                handle_app_event(&ae, &mut bottom_pane, &mut status_indicator, &frame_requester);
+                                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
             }
             _ = &mut tick => {
-                let w = guard.terminal.size().map(|s| s.width).unwrap_or(80); drain_tick(&mut stream_controller, &mut guard, w, &mut transcript, &frame_requester);
+                let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                drain_tick(&mut stream_controller, &mut guard, w, &mut transcript, &frame_requester);
+                // Each tick also pulses the chat-widget scrollback so
+                // if any async event was handled since the last draw
+                // the new cells land promptly instead of waiting for
+                // the next event edge.
+                flush_chat_widget(&mut guard, &mut chat_widget, w);
             }
         }
     };
@@ -768,7 +856,7 @@ pub(crate) async fn run_tui_repl(
 
 pub(super) fn do_draw(
     guard: &mut TerminalGuard,
-    active_cell: &Option<Box<dyn ChatCell>>,
+    active_cell_lines: Vec<ratatui::text::Line<'static>>,
     bottom_pane: &mut BottomPane,
 ) -> Result<(), String> {
     use render::renderable::{FlexRenderable, Renderable, RenderableItem};
@@ -777,19 +865,17 @@ pub(super) fn do_draw(
 
     let width = guard.terminal.size().map(|s| s.width).unwrap_or(80);
 
-    let ac_renderable: RenderableItem<'_> = match active_cell {
-        Some(cell) => {
-            let lines = cell.display_lines(width);
-            let text = ratatui::text::Text::from(lines);
-            let para = ratatui::widgets::Paragraph::new(text);
-            // No top inset — the active cell butts up against the last
-            // scrollback line. A 1-row inset previously meant the
-            // running tool/thinking cell looked "floated" with a blank
-            // between it and scrollback, which then snapped closed once
-            // the cell flushed into scrollback (feeling janky).
-            RenderableItem::Owned(Box::new(para))
-        }
-        None => RenderableItem::Owned(Box::new(())),
+    let ac_renderable: RenderableItem<'_> = if active_cell_lines.is_empty() {
+        RenderableItem::Owned(Box::new(()))
+    } else {
+        let text = ratatui::text::Text::from(active_cell_lines);
+        let para = ratatui::widgets::Paragraph::new(text);
+        // No top inset — the active cell butts up against the last
+        // scrollback line. A 1-row inset previously meant the
+        // running tool/thinking cell looked "floated" with a blank
+        // between it and scrollback, which then snapped closed once
+        // the cell flushed into scrollback (feeling janky).
+        RenderableItem::Owned(Box::new(para))
     };
 
     // Thin dim separator between scrollback area and composer
@@ -823,169 +909,85 @@ pub(super) fn do_draw(
     Ok(())
 }
 
-/// Handle a TUI app event. When a cell transition occurs (tool→assistant or
-/// assistant→tool), the previous cell is flushed to scrollback automatically.
-#[allow(clippy::too_many_arguments)]
+/// Handle a TUI app event for BOTTOM-PANE state only.
+/// Scrollback mutations are handled independently by
+/// `chat_widget::handle_event` via the bridge translator; this
+/// function updates the task-status pill, the orbiter-equivalent
+/// `StatusIndicator`, and nothing else.
 fn handle_app_event(
-    ev: TuiAppEvent,
-    guard: &mut TerminalGuard,
-    width: u16,
-    sc: &mut Option<StreamController>,
-    active_cell: &mut Option<Box<dyn ChatCell>>,
+    ev: &TuiAppEvent,
     bottom_pane: &mut BottomPane,
+    status_indicator: &mut status_indicator::StatusIndicator,
     fr: &FrameRequester,
-    transcript: &mut Vec<ratatui::text::Line<'static>>,
 ) {
+    let now = std::time::Instant::now();
     match ev {
         TuiAppEvent::Token(text) => {
-            // If active cell is a ToolChatCell, flush it before streaming text
-            let need_new_stream = active_cell
-                .as_ref()
-                .map(|c| c.as_any_ref().is::<ToolChatCell>())
-                .unwrap_or(false);
-            if need_new_stream {
-                if let Some(cell) = active_cell.take() {
-                    flush_cell_to_scrollback(guard, cell, width, transcript);
-                }
-                *sc = Some(StreamController::new(Some(width as usize)));
-            }
-
-            // Clear thinking state — tokens are flowing.
-            // Save thinking content to transcript before discarding.
-            if let Some(cell) = active_cell.as_ref() {
-                if cell.as_any_ref().is::<AssistantChatCell>() {
-                    let trans = cell.transcript_lines(width);
-                    if !trans.is_empty() {
-                        transcript.extend(trans);
-                        transcript.push(ratatui::text::Line::default());
-                    }
-                    active_cell.take();
-                }
-            }
-
-            // Ensure stream controller exists
-            if sc.is_none() {
-                *sc = Some(StreamController::new(Some(width as usize)));
-            }
-
-            // Push delta and drain any ready lines as mini-cells to scrollback
-            if let Some(s) = sc {
-                if s.push_delta(&text) {
-                    // Newline crossed — drain catch-up batch
-                    let (cell, _idle) = s.on_commit_tick_batch(5);
-                    if let Some(cell) = cell {
-                        flush_mini_cell(guard, cell, width, transcript);
-                    }
-                }
-            }
+            // Bump the per-turn token approximation so the
+            // StatusIndicator shows `↓ N tokens` climbing.
+            status_indicator.bump_stream_chars(text.chars().count());
             bottom_pane.set_task_status(TaskStatus::TurnRunning {
-                started_at: std::time::Instant::now(),
+                started_at: now,
             });
-            fr.schedule_frame();
+            // Don't switch the indicator — it's set to Thinking at
+            // turn start and remains "Thinking" even once tokens
+            // arrive; the active_cell in ChatWidget takes over
+            // rendering from here.
         }
         TuiAppEvent::ThinkingStarted => {
-            // If active cell is a tool, flush it first
-            let is_tool = active_cell
-                .as_ref()
-                .map(|c| c.as_any_ref().is::<ToolChatCell>())
-                .unwrap_or(false);
-            if is_tool {
-                if let Some(cell) = active_cell.take() {
-                    flush_cell_to_scrollback(guard, cell, width, transcript);
-                }
-            }
-
-            // Create assistant cell if none exists
-            if active_cell.is_none() {
-                let mut ac = AssistantChatCell::from_rendered(vec![]);
-                ac.start_thinking();
-                *active_cell = Some(Box::new(ac));
-                *sc = Some(StreamController::new(Some(width as usize)));
-            } else if let Some(cell) = active_cell {
-                if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
-                    ac.start_thinking();
-                }
-            }
-            fr.schedule_frame();
+            status_indicator.set_state(
+                status_indicator::IndicatorState::Thinking { started_at: now },
+            );
         }
-        TuiAppEvent::ThinkingChunk(text) => {
-            if let Some(cell) = active_cell {
-                if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
-                    ac.push_thinking_chunk(&text);
-                }
-            } else {
-                // Active cell already taken (tokens flowing) — append to transcript
-                let dim_italic = ratatui::style::Style::default()
-                    .fg(ratatui::style::Color::DarkGray)
-                    .add_modifier(ratatui::style::Modifier::ITALIC);
-                for line in text.lines() {
-                    let preview: String = line.chars().take(width as usize - 6).collect();
-                    transcript.push(ratatui::text::Line::from(ratatui::text::Span::styled(
-                        format!("  │ {preview}"),
-                        dim_italic,
-                    )));
-                }
-            }
-            fr.schedule_frame();
+        TuiAppEvent::ThinkingChunk(_) => {
+            // ChatWidget handles the cell update; nothing to do
+            // in the bottom pane. The indicator stays `Thinking`.
         }
         TuiAppEvent::ThinkingStopped => {
-            if let Some(cell) = active_cell {
-                if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
-                    ac.finish_thinking();
-                }
-            }
-            // No action needed if active_cell is None — thinking already saved to transcript
-            fr.schedule_frame();
+            // Keep the indicator active — the model may still be
+            // generating the answer body. It flips to `Idle` on
+            // TurnComplete / TurnError.
         }
         TuiAppEvent::WaitingForModel => {
             bottom_pane.set_task_status(TaskStatus::WaitingModel);
-            fr.schedule_frame();
+            status_indicator.set_state(
+                status_indicator::IndicatorState::WaitingModel { started_at: now },
+            );
         }
         TuiAppEvent::ModelResponding => {
             bottom_pane.set_task_status(TaskStatus::TurnRunning {
-                started_at: std::time::Instant::now(),
+                started_at: now,
             });
-            fr.schedule_frame();
+            status_indicator.set_state(
+                status_indicator::IndicatorState::Thinking { started_at: now },
+            );
         }
-        TuiAppEvent::ToolStarted { name, description } => {
-            // Finalize any active stream — flush remaining mini-cell
-            finalize_stream(sc, guard, width, transcript);
-            // Flush any non-streaming active cell (thinking indicator, etc.)
-            if let Some(cell) = active_cell.take() {
-                flush_cell_to_scrollback(guard, cell, width, transcript);
-            }
-
-            *active_cell = Some(Box::new(ToolChatCell::new_running(
-                name.clone(),
-                description,
-            )));
+        TuiAppEvent::ToolStarted { name, .. } => {
             bottom_pane.set_task_status(TaskStatus::ToolExecuting {
-                name,
-                started_at: std::time::Instant::now(),
+                name: name.clone(),
+                started_at: now,
             });
-            fr.schedule_frame();
+            status_indicator.set_state(
+                status_indicator::IndicatorState::Tool {
+                    name: name.clone(),
+                    started_at: now,
+                },
+            );
         }
-        TuiAppEvent::ToolCompleted {
-            name: _,
-            description,
-            status,
-            duration_ms,
-            output_summary,
-            output,
-        } => {
-            if let Some(cell) = active_cell {
-                if let Some(tc) = cell.as_any_mut().downcast_mut::<ToolChatCell>() {
-                    tc.complete(&status, duration_ms, description, output_summary, output);
-                }
-            }
-            fr.schedule_frame();
+        TuiAppEvent::ToolCompleted { .. } => {
+            // Flip back to thinking; the ChatWidget committed the
+            // tool cell in its own event handler.
+            status_indicator.set_state(
+                status_indicator::IndicatorState::Thinking { started_at: now },
+            );
         }
         TuiAppEvent::StatusLine(_) => {}
         TuiAppEvent::TurnComplete | TuiAppEvent::TurnError(_) => {
             bottom_pane.set_task_status(TaskStatus::Idle);
-            fr.schedule_frame();
+            status_indicator.set_state(status_indicator::IndicatorState::Idle);
         }
     }
+    fr.schedule_frame();
 }
 
 /// Codex pattern: each tick drains queued lines into a mini-cell,
