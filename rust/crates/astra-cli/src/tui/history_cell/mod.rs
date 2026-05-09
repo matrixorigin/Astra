@@ -25,7 +25,9 @@
 //! (markdown parsing, syntax highlighting) should happen once, on
 //! mutation — not inside `display_lines`.
 
-#![allow(dead_code)] // phase 1: trait exists, no consumers yet.
+#![allow(dead_code)] // phase 2 still plumbing — consumers land with the event-loop swap.
+
+pub(crate) mod user;
 
 use std::any::Any;
 use std::fmt::Debug;
