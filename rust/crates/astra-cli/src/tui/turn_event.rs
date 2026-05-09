@@ -141,8 +141,16 @@ pub(crate) enum ToolStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SystemLevel {
+    /// Free-floating TUI notice (session resumed, etc.). Dim.
     Info,
+    /// Result of a slash command, styled to match Claude Code's
+    /// `  ⎿  Set model to …` callback line. Dim + corner glyph so
+    /// the eye can pair it with the trailing `› /cmd` prompt above.
+    #[serde(alias = "response")]
+    Response,
+    /// Non-fatal advisory — token budget near limit, etc. Yellow.
     Warning,
+    /// Fatal-ish: turn failed, tool denied, etc. Red.
     Error,
 }
 
@@ -222,7 +230,12 @@ mod tests {
 
     #[test]
     fn system_event_levels_roundtrip() {
-        for lv in [SystemLevel::Info, SystemLevel::Warning, SystemLevel::Error] {
+        for lv in [
+            SystemLevel::Info,
+            SystemLevel::Response,
+            SystemLevel::Warning,
+            SystemLevel::Error,
+        ] {
             assert_roundtrip(&TurnEvent::System {
                 ts: None,
                 level: lv,

@@ -31,6 +31,22 @@ impl SystemCell {
         }
     }
 
+    /// Response to a slash command. Renders with a `⎿` corner glyph
+    /// so the reply visually pairs with the `› /cmd` line above,
+    /// matching Claude Code's style:
+    ///
+    /// ```text
+    /// › /model
+    ///   ⎿  Set model to Opus 4.6
+    /// ```
+    pub fn response(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            level: SystemLevel::Response,
+            ts: None,
+        }
+    }
+
     #[allow(dead_code)]
     pub fn warning(message: impl Into<String>) -> Self {
         Self {
@@ -87,9 +103,28 @@ impl HistoryCell for SystemCell {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let style = match self.level {
             SystemLevel::Info => Style::default().dim(),
+            SystemLevel::Response => Style::default().dim(),
             SystemLevel::Warning => Style::default().yellow(),
             SystemLevel::Error => Style::default().red(),
         };
+
+        // `Response` gets the Claude-Code corner glyph on the first
+        // line and hanging-indent alignment on continuation lines,
+        // so multi-line responses read as one visual block paired
+        // with the `› /cmd` prompt above them:
+        //
+        //   › /model
+        //     ⎿  Set model to Opus 4.6
+        //        (1M context, thinking enabled)
+        if self.level == SystemLevel::Response {
+            let mut out: Vec<Line<'static>> = Vec::new();
+            for (i, l) in self.message.lines().enumerate() {
+                let prefix = if i == 0 { "  ⎿  " } else { "     " };
+                out.push(Line::from(Span::styled(format!("{prefix}{l}"), style)));
+            }
+            return out;
+        }
+
         self.message
             .lines()
             .map(|l| Line::from(Span::styled(format!("  {l}"), style)))
@@ -177,6 +212,41 @@ mod tests {
     }
 
     #[test]
+    fn response_gets_claude_code_corner_glyph_on_first_line() {
+        // Slash-command response must visually pair with the `›
+        // /cmd` prompt above it. Claude-Code uses `⎿` on the first
+        // content line.
+        let cell = SystemCell::response("Set model to Opus 4.6");
+        let out = render(&cell, 60, 1);
+        assert!(out.contains("⎿"), "⎿ glyph missing on response: {out:?}");
+        assert!(
+            out.contains("Set model to Opus 4.6"),
+            "body missing: {out:?}"
+        );
+    }
+
+    #[test]
+    fn response_continuation_lines_hang_indent() {
+        // Multi-line responses must keep the `⎿` only on row 0 and
+        // align continuation lines under the body so the block reads
+        // as one unit.
+        let cell = SystemCell::response("Set model to Opus 4.6\n(1M context, thinking enabled)");
+        let out = render(&cell, 80, 2);
+        let rows: Vec<&str> = out.lines().collect();
+        assert!(rows[0].contains("⎿"), "first row should have ⎿: {rows:?}");
+        assert!(
+            !rows[1].contains("⎿"),
+            "continuation must NOT repeat ⎿: {rows:?}"
+        );
+        // Continuation indent should match the depth of content
+        // after `  ⎿  ` so the eye reads them as aligned.
+        assert!(
+            rows[1].starts_with("     "),
+            "continuation row should hang-indent under body: {rows:?}"
+        );
+    }
+
+    #[test]
     fn multiline_rows_all_indent() {
         let cell = SystemCell::error("first line\nsecond line");
         let out = render(&cell, 40, 2);
@@ -191,6 +261,7 @@ mod tests {
     fn persist_roundtrip_for_each_level() {
         for (mk, lv) in [
             (SystemCell::info("a") as SystemCell, SystemLevel::Info),
+            (SystemCell::response("d"), SystemLevel::Response),
             (SystemCell::warning("b"), SystemLevel::Warning),
             (SystemCell::error("c"), SystemLevel::Error),
         ] {
@@ -274,6 +345,21 @@ mod tests {
             "system_info_40",
             render(&SystemCell::info("session resumed"), 40, 1)
         );
+    }
+
+    #[test]
+    fn snapshot_response_60() {
+        insta::assert_snapshot!(
+            "system_response_60",
+            render(&SystemCell::response("Set model to Opus 4.6"), 60, 1)
+        );
+    }
+
+    #[test]
+    fn snapshot_response_multiline_80() {
+        let cell =
+            SystemCell::response("Set model to Opus 4.6\n(1M context, thinking enabled)");
+        insta::assert_snapshot!("system_response_multiline_80", render(&cell, 80, 2));
     }
 
     #[test]

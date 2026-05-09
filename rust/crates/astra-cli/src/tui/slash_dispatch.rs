@@ -29,8 +29,21 @@ pub(crate) struct DispatchContext<'a> {
 }
 
 impl<'a> DispatchContext<'a> {
+    /// Free-floating informational line (dim, no corner glyph).
+    /// Use for passive state ("No history yet", "astra v0.1.0"),
+    /// NOT for command acknowledgements — those should visually pair
+    /// with the `› /cmd` prompt above them; see `show_response`.
     fn show_info(&mut self, msg: String) {
         let cell = SystemCell::info(msg);
+        self.guard
+            .queue_history_lines(cell.display_lines(self.width));
+    }
+
+    /// Slash-command response ("Set model to Opus 4.6", "Permission
+    /// mode → auto"). Rendered with Claude Code's `⎿` corner glyph
+    /// on the first line so the eye visually threads `› /cmd` → `⎿ …`.
+    fn show_response(&mut self, msg: String) {
+        let cell = SystemCell::response(msg);
         self.guard
             .queue_history_lines(cell.display_lines(self.width));
     }
@@ -94,7 +107,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 // /model <name> — set directly
                 ctx.state.model = Some(args.to_string());
                 ctx.bottom_pane.footer.model = Some(args.to_string());
-                ctx.show_info(format!("Model set to: {args}"));
+                ctx.show_response(format!("Set model to {args}"));
                 return SlashResult::Handled;
             }
             let token = crate::repl_runtime::current_access_token(ctx.profile);
@@ -242,17 +255,19 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }
                 "all" | "auto" => {
                     ctx.state.perm_manager.set_mode(PermissionMode::Auto);
-                    ctx.show_info("Permission mode → auto (all tools auto-approved)".into());
+                    ctx.show_response(
+                        "Permission mode → auto (all tools auto-approved)".into(),
+                    );
                     SlashResult::Handled
                 }
                 "prompt" => {
                     ctx.state.perm_manager.set_mode(PermissionMode::Prompt);
-                    ctx.show_info("Permission mode → prompt".into());
+                    ctx.show_response("Permission mode → prompt".into());
                     SlashResult::Handled
                 }
                 "deny" => {
                     ctx.state.perm_manager.set_mode(PermissionMode::Deny);
-                    ctx.show_info("Permission mode → deny".into());
+                    ctx.show_response("Permission mode → deny".into());
                     SlashResult::Handled
                 }
                 "rules" | "status" => {
@@ -456,7 +471,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     if crate::slash_info::copy_to_clipboard(resp) {
                         let preview: String = resp.chars().take(60).collect();
                         let suffix = if n > 60 { "…" } else { "" };
-                        ctx.show_info(format!("Copied {n} chars: {preview}{suffix}"));
+                        ctx.show_response(format!("Copied {n} chars: {preview}{suffix}"));
                     } else {
                         ctx.show_error("No clipboard tool found (install xclip or xsel)".into());
                     }
@@ -468,7 +483,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Version ─────────────────────────────────────────────────
         "/version" => {
-            ctx.show_info(format!("astra v{}", env!("CARGO_PKG_VERSION")));
+            ctx.show_response(format!("astra v{}", env!("CARGO_PKG_VERSION")));
             SlashResult::Handled
         }
 
@@ -628,7 +643,9 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     {
                         let lines = instructions.lines().count();
                         ctx.state.project_instructions = Some(instructions);
-                        ctx.show_info(format!("Reloaded project instructions ({lines} lines)"));
+                        ctx.show_response(format!(
+                            "Reloaded project instructions ({lines} lines)"
+                        ));
                     } else {
                         ctx.state.project_instructions = None;
                         ctx.show_info("No .astra/instructions.md found".into());
@@ -637,7 +654,9 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }
                 "off" => {
                     ctx.state.project_instructions = None;
-                    ctx.show_info("Project instructions disabled for this session".into());
+                    ctx.show_response(
+                        "Project instructions disabled for this session".into(),
+                    );
                     SlashResult::Handled
                 }
                 _ => {

@@ -685,7 +685,7 @@ pub(crate) async fn run_tui_repl(
                                         let password = parts.next().unwrap_or("").to_string();
                                         match crate::auth_flow::do_login(api, profile, &username, &password).await {
                                             Ok(_) => {
-                                                let info = history_cell::system::SystemCell::info(format!("Logged in as {username}"));
+                                                let info = history_cell::system::SystemCell::response(format!("Logged in as {username}"));
                                                 guard.queue_history_lines(info.display_lines(w));
                                                 crate::post_auth_cloud_resync(profile, &mut state).await;
                                             }
@@ -706,11 +706,11 @@ pub(crate) async fn run_tui_repl(
                                         let password = parts.next().unwrap_or("").to_string();
                                         match crate::auth_flow::do_register(api, &username, &email, &password).await {
                                             Ok(_) => {
-                                                let info = history_cell::system::SystemCell::info("Registered — logging in…");
+                                                let info = history_cell::system::SystemCell::response("Registered — logging in…");
                                                 guard.queue_history_lines(info.display_lines(w));
                                                 match crate::auth_flow::do_login(api, profile, &username, &password).await {
                                                     Ok(_) => {
-                                                        let info = history_cell::system::SystemCell::info(format!("Logged in as {username}"));
+                                                        let info = history_cell::system::SystemCell::response(format!("Logged in as {username}"));
                                                         guard.queue_history_lines(info.display_lines(w));
                                                         crate::post_auth_cloud_resync(profile, &mut state).await;
                                                     }
