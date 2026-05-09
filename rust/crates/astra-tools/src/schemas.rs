@@ -17,6 +17,7 @@ pub const DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "web_fetch",
     "web_search",
     "run_script",
+    "notify",
     "ask_user",
     "task",
 ];
@@ -41,6 +42,7 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "web_search",
     "symbols",
     "run_script",
+    "notify",
     "ask_user",
     "task",
 ];
@@ -455,7 +457,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Memory operations. Actions: store, retrieve, purge, correct, profile, search, feedback.",
+                "description": "Memory operations. Actions: store, retrieve, purge, correct, profile, search, feedback. Supports agent_type scoping for per-agent-type memory isolation.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -463,7 +465,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "content": {"type": "string", "description": "Content to store/correct"},
                         "query": {"type": "string", "description": "Query for retrieve/search"},
                         "memory_id": {"type": "string", "description": "ID for purge/correct/feedback"},
-                        "memory_type": {"type": "string", "description": "Type: semantic, profile, procedural, working, episodic"}
+                        "memory_type": {"type": "string", "description": "Type: semantic, profile, procedural, working, episodic"},
+                        "agent_type": {"type": "string", "description": "Scope to a specific agent type (explore, code-review, task, general-purpose). When set on store, tags the memory; on retrieve/search, filters to only that type's memories + unscoped globals."}
                     },
                     "required": ["action"]
                 }
@@ -555,6 +558,22 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "subtopic": {"type": "string", "enum": ["session","cache","recent","volatile","stall","noise","all"], "description": "Which diagnostic to run (default: session). `noise`: per-channel freshness of runtime-injected prompt signals — flags channels re-rendered unchanged for many turns."},
                         "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Output detail level for the session topic (default: auto from budget). Ignored for other subtopics."}
                     }
+                }
+            }
+        }),
+        // ── Notify (proactive notification for gateways) ─────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "notify",
+                "description": "Send a notification to the user. Use for proactive updates (background task done, blocker found, unsolicited insight). Gateways route based on notification_type: 'normal' = in-chat reply, 'proactive' = push notification. CLI mode: both render as text.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string", "description": "Notification content"},
+                        "notification_type": {"type": "string", "enum": ["normal","proactive"], "description": "Routing hint for gateway. 'proactive' = push even if user isn't looking at chat."}
+                    },
+                    "required": ["message"]
                 }
             }
         }),

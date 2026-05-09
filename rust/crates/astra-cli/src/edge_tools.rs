@@ -1846,6 +1846,23 @@ impl ToolExecutor {
                 "task_stop" => self.task_stop(args).await,
                 "web_search" => self.web_search(args),
                 "ask_user" => self.ask_user(args),
+                "notify" => {
+                    let message = args.get("message").and_then(Value::as_str).unwrap_or("");
+                    let notification_type = args
+                        .get("notification_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("normal");
+                    if message.is_empty() {
+                        "Error: 'message' is required".to_string()
+                    } else {
+                        serde_json::json!({
+                            "delivered": true,
+                            "notification_type": notification_type,
+                            "message": message,
+                        })
+                        .to_string()
+                    }
+                }
                 "share_context" => self.share_context(args),
                 "query_context" => self.query_context(args),
                 astra_runtime::turn::agentic_loop_host::DELEGATE_TOOL_NAME => {

@@ -302,6 +302,9 @@ impl MemoriaClient {
                 if let Some(ics) = args.get("include_cross_session").and_then(Value::as_bool) {
                     pl["include_cross_session"] = json!(ics);
                 }
+                if let Some(at) = args.get("agent_type").and_then(Value::as_str) {
+                    pl["agent_type"] = json!(at);
+                }
                 (format!("{base}/v1/memories/retrieve"), pl, HttpMethod::Post)
             }
             "store" => {
@@ -314,6 +317,9 @@ impl MemoriaClient {
                 let mut payload = json!({"content": content, "memory_type": memory_type});
                 if let Some(tier) = args.get("trust_tier").and_then(Value::as_str) {
                     payload["trust_tier"] = json!(tier);
+                }
+                if let Some(at) = args.get("agent_type").and_then(Value::as_str) {
+                    payload["agent_type"] = json!(at);
                 }
                 inject_identity(&mut payload);
                 (format!("{base}/v1/memories"), payload, HttpMethod::Post)
@@ -328,6 +334,9 @@ impl MemoriaClient {
                 inject_identity(&mut pl);
                 if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
                     pl["session_id"] = json!(sid);
+                }
+                if let Some(at) = args.get("agent_type").and_then(Value::as_str) {
+                    pl["agent_type"] = json!(at);
                 }
                 if let Some(fs) = args.get("filter_session").and_then(Value::as_bool) {
                     pl["filter_session"] = json!(fs);
