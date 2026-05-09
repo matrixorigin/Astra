@@ -12,7 +12,7 @@ use std::sync::{
 };
 
 /// A scratchpad task tracked within the current CLI session.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionTask {
     pub id: String,
     pub title: String,
@@ -21,10 +21,25 @@ pub struct SessionTask {
     pub subtasks: Vec<SessionSubtask>,
     pub created_at: String,
     pub updated_at: String,
+    /// Present-continuous form shown in spinner while in_progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_form: Option<String>,
+    /// Which agent owns this task (for multi-agent sessions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Arbitrary key-value metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Map<String, Value>>,
+    /// Task IDs that this task blocks (cannot start until this completes).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<String>,
+    /// Task IDs that must complete before this task can start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
 }
 
 /// A subtask within a SessionTask.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionSubtask {
     pub id: String,
     pub title: String,
@@ -129,6 +144,13 @@ impl TaskManager {
 
         let task_id = format!("task-{}", self.id_counter.fetch_add(1, Ordering::SeqCst));
 
+        let active_form = args
+            .get("active_form")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let owner = args.get("owner").and_then(Value::as_str).map(String::from);
+        let metadata = args.get("metadata").and_then(Value::as_object).cloned();
+
         let task = SessionTask {
             id: task_id.clone(),
             title: title.clone(),
@@ -137,6 +159,11 @@ impl TaskManager {
             subtasks,
             created_at: now.clone(),
             updated_at: now,
+            active_form,
+            owner,
+            metadata,
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
         };
 
         if let Ok(mut tasks) = self.tasks.lock() {
@@ -178,13 +205,20 @@ impl TaskManager {
                         .count();
                     format!(" [{}/{}]", done, t.subtasks.len())
                 };
-                json!({
+                let mut entry = json!({
                     "id": t.id,
                     "title": t.title,
                     "status": t.status,
                     "subtasks": subtask_summary,
                     "updated_at": t.updated_at,
-                })
+                });
+                if let Some(ref owner) = t.owner {
+                    entry["owner"] = json!(owner);
+                }
+                if !t.blocked_by.is_empty() {
+                    entry["blocked_by"] = json!(t.blocked_by);
+                }
+                entry
             })
             .collect();
 
@@ -265,6 +299,21 @@ impl TaskManager {
             }
         }
 
+        // Handle "deleted" — soft-remove from list (before taking &mut)
+        if new_status == Some("deleted") {
+            let previous_status = task.status.clone();
+            let task_id_owned = task_id.to_string();
+            tasks.retain(|t| t.id != task_id_owned);
+            return json!({
+                "success": true,
+                "task_id": task_id_owned,
+                "previous_status": previous_status,
+                "status": "deleted",
+                "message": format!("Task '{}' deleted", task_id_owned)
+            })
+            .to_string();
+        }
+
         // Update main task
         let previous_status = task.status.clone();
         if let Some(status) = new_status {
@@ -277,6 +326,56 @@ impl TaskManager {
                 err
             ));
         }
+
+        // Update title/description if provided
+        if let Some(title) = args.get("title").and_then(Value::as_str) {
+            task.title = title.to_string();
+        }
+        if let Some(desc) = args.get("description").and_then(Value::as_str) {
+            task.description = Some(desc.to_string());
+        }
+
+        // activeForm
+        if let Some(af) = args.get("active_form").and_then(Value::as_str) {
+            task.active_form = Some(af.to_string());
+        }
+
+        // Owner
+        if let Some(owner) = args.get("owner").and_then(Value::as_str) {
+            task.owner = Some(owner.to_string());
+        }
+
+        // Metadata (merge, not replace — set key to null to delete)
+        if let Some(meta_update) = args.get("metadata").and_then(Value::as_object) {
+            let meta = task.metadata.get_or_insert_with(serde_json::Map::new);
+            for (k, v) in meta_update {
+                if v.is_null() {
+                    meta.remove(k);
+                } else {
+                    meta.insert(k.clone(), v.clone());
+                }
+            }
+            if meta.is_empty() {
+                task.metadata = None;
+            }
+        }
+
+        // Blocking dependencies (additive)
+        if let Some(add_blocks) = args.get("add_blocks").and_then(Value::as_array) {
+            for id in add_blocks.iter().filter_map(Value::as_str) {
+                if !task.blocks.contains(&id.to_string()) {
+                    task.blocks.push(id.to_string());
+                }
+            }
+        }
+        if let Some(add_blocked_by) = args.get("add_blocked_by").and_then(Value::as_array) {
+            for id in add_blocked_by.iter().filter_map(Value::as_str) {
+                if !task.blocked_by.contains(&id.to_string()) {
+                    task.blocked_by.push(id.to_string());
+                }
+            }
+        }
+
         task.updated_at = now;
 
         // Auto-complete task if all subtasks are completed

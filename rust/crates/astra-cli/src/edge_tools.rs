@@ -1084,6 +1084,36 @@ impl ToolExecutor {
         if !current_goal.is_empty() {
             out.push_str(&format!("Current goal: {current_goal}\n"));
         }
+
+        // Task status nudge: if there are active tasks, remind the
+        // agent to update them (Claude Code parity: proactive nudge).
+        let tasks = self.task_manager.snapshot();
+        let active_tasks: Vec<_> = tasks
+            .iter()
+            .filter(|t| t.status == "pending" || t.status == "in_progress")
+            .collect();
+        if !active_tasks.is_empty() {
+            out.push_str(&format!("\nActive tasks: {}\n", active_tasks.len()));
+            for t in active_tasks.iter().take(5) {
+                let status_icon = if t.status == "in_progress" {
+                    "▶"
+                } else {
+                    "○"
+                };
+                let blocked = if !t.blocked_by.is_empty() {
+                    format!(" [blocked by: {}]", t.blocked_by.join(","))
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!(
+                    "  {status_icon} {} — {}{}\n",
+                    t.id, t.title, blocked
+                ));
+            }
+            out.push_str(
+                "Hint: update task status with `task(action=\"update\", task_id=\"...\", status=\"...\")` as you make progress.\n",
+            );
+        }
         out
     }
 

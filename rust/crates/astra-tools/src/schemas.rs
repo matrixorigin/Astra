@@ -561,16 +561,21 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task",
-                "description": "Track work progress for multi-step tasks. Actions: create, update, list, get, stop.",
+                "description": "Track work progress for multi-step tasks. Actions: create, update, list, get, stop. Supports blocking dependencies, ownership, and arbitrary metadata.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["create","update","list","get","stop"], "description": "Operation to perform"},
-                        "title": {"type": "string", "description": "(create) Brief imperative title"},
-                        "description": {"type": "string", "description": "(create) What needs to be done"},
+                        "title": {"type": "string", "description": "(create/update) Brief imperative title"},
+                        "description": {"type": "string", "description": "(create/update) What needs to be done"},
                         "task_id": {"type": "string", "description": "(update/get/stop) Task ID (e.g. 'task-1')"},
-                        "status": {"type": "string", "enum": ["pending","in_progress","completed","failed","all","active"], "description": "(update) New status; (list) Filter by status"},
+                        "status": {"type": "string", "enum": ["pending","in_progress","completed","failed","deleted","all","active"], "description": "(update) New status — 'deleted' permanently removes; (list) Filter"},
                         "subtask_id": {"type": "string", "description": "(update) Update a specific subtask"},
+                        "active_form": {"type": "string", "description": "(create/update) Present-continuous form shown while in_progress (e.g. 'Running tests')"},
+                        "owner": {"type": "string", "description": "(create/update) Agent or user that owns this task"},
+                        "metadata": {"type": "object", "description": "(create/update) Arbitrary key-value pairs. On update: set key to null to delete it."},
+                        "add_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Task IDs that THIS task blocks (they can't start until this completes)"},
+                        "add_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Task IDs that must complete before THIS task can start"},
                         "subtasks": {
                             "type": "array",
                             "description": "(create) Optional sub-steps",
