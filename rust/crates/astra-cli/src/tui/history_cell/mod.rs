@@ -25,6 +25,7 @@
 //! (markdown parsing, syntax highlighting) should happen once, on
 //! mutation — not inside `display_lines`.
 
+pub(crate) mod approval;
 pub(crate) mod assistant;
 pub(crate) mod reasoning;
 pub(crate) mod system;

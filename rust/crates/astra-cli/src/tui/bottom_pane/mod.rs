@@ -402,14 +402,14 @@ impl BottomPane {
         }
     }
 
-    /// Build a live `ApprovalChatCell` from the currently focused queue
+    /// Build a live `ApprovalCell` from the currently focused queue
     /// entry. `None` when nothing is pending.
     pub fn focused_approval_cell(
         &self,
-    ) -> Option<crate::tui::chat_cell::approval_cell::ApprovalChatCell> {
+    ) -> Option<crate::tui::history_cell::approval::ApprovalCell> {
         let view = self.approval_queue.focused_view()?;
         let buttons = self.approval_queue.focused_button_row()?.clone();
-        let mut cell = crate::tui::chat_cell::approval_cell::ApprovalChatCell::new(
+        let mut cell = crate::tui::history_cell::approval::ApprovalCell::new(
             view.id,
             view.tool,
             view.header,
@@ -427,7 +427,7 @@ impl BottomPane {
         let Some(cell) = self.focused_approval_cell() else {
             return 0;
         };
-        use crate::tui::chat_cell::ChatCell;
+        use crate::tui::history_cell::HistoryCell;
         cell.desired_height(width)
     }
 
@@ -841,7 +841,7 @@ impl BottomPane {
         let Some(cell) = self.focused_approval_cell() else {
             return;
         };
-        use crate::tui::chat_cell::ChatCell;
+        use crate::tui::history_cell::HistoryCell;
         use ratatui::widgets::{Paragraph, Widget, Wrap};
         let lines = cell.display_lines(area.width);
         Paragraph::new(lines)

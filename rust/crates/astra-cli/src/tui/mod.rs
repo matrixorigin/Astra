@@ -6,7 +6,6 @@ mod tests;
 mod app_event;
 mod approval;
 mod bottom_pane;
-mod chat_cell;
 mod context_panel;
 // Core (post-refactor): HistoryCell trait + TurnEvent schema +
 // single ChatWidget router + on-disk JSONL transcript. See
