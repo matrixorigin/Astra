@@ -953,6 +953,56 @@ impl ToolExecutor {
         .to_string()
     }
 
+    // ── Timeline tool: unified multi-agent trace ───────────────────────────────
+
+    fn render_session_timeline(&self, args: &Value) -> String {
+        let session_id = match self.active_session_id() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return "Error: no active session. Timeline requires a session.".to_string(),
+        };
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
+        let agent_filter = args.get("agent_id").and_then(Value::as_str);
+
+        let journal_path = std::path::PathBuf::from(
+            std::env::var("HOME")
+                .ok()
+                .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| ".".to_string()),
+        )
+        .join(".astra")
+        .join("sessions")
+        .join(format!("{session_id}.jsonl"));
+
+        if !journal_path.exists() {
+            return format!("Error: journal not found at {}", journal_path.display());
+        }
+
+        let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
+            Ok(content) => content
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect(),
+            Err(e) => return format!("Error reading journal: {e}"),
+        };
+
+        let mut timeline = astra_turn_core::unified_timeline::build_timeline(&events);
+
+        if let Some(filter) = agent_filter {
+            timeline.entries.retain(|e| {
+                e.agent_id.as_deref() == Some(filter)
+                    || matches!(&e.kind,
+                        astra_turn_core::unified_timeline::TimelineEntryKind::AgentSpawned { child_agent_id, .. }
+                        | astra_turn_core::unified_timeline::TimelineEntryKind::AgentCompleted { child_agent_id, .. }
+                        | astra_turn_core::unified_timeline::TimelineEntryKind::AgentFailed { child_agent_id, .. }
+                        if child_agent_id.contains(filter)
+                    )
+                    || e.agent_id.is_none() // always show parent rounds for context
+            });
+        }
+
+        astra_turn_core::unified_timeline::render_timeline(&timeline, limit)
+    }
+
     // ── Env tool: environment variable management ─────────────────────────────
 
     /// Environment variable management tool — delegated to `env_tools` module.
@@ -1557,7 +1607,8 @@ impl ToolExecutor {
                         "ask_user" => self.ask_user(args),
                         "sleep" => self.sleep_tool(args).await,
                         "tool_search" => self.tool_search(args),
-                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, tool_search".to_string(),
+                        "timeline" => self.render_session_timeline(args),
+                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, tool_search, timeline".to_string(),
                         other => format!("Unknown session action: '{other}'"),
                     }
                 }

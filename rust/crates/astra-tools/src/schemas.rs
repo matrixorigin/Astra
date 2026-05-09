@@ -471,11 +471,11 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle. Actions: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, tool_search.",
+                "description": "Session lifecycle. Actions: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, tool_search, timeline.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","rollback_edits","ask_user","sleep","tool_search"]},
+                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","rollback_edits","ask_user","sleep","tool_search","timeline"]},
                         "key": {"type": "string", "description": "Config key"},
                         "value": {"type": "string", "description": "Config value"},
                         "tool": {"type": "string", "description": "Tool name (prioritize/deprioritize)"},
