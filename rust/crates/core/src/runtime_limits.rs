@@ -118,7 +118,7 @@ impl RuntimeLimits {
         if let Some(window) = model.and_then(context_window_for_model) {
             // Reserve ~20% for output tokens + overhead
             let effective = (window as f64 * 0.80) as u64;
-            effective.max(self.max_turn_input_tokens)
+            effective.min(self.max_turn_input_tokens)
         } else {
             self.max_turn_input_tokens
         }

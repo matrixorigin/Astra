@@ -183,7 +183,8 @@ impl TaskManager {
     /// Prefers `status_filter`; legacy `status` is no longer accepted on list.
     pub async fn list(&self, args: &Value) -> String {
         let status_filter = args
-            .get("status_filter")
+            .get("status")
+            .or_else(|| args.get("status_filter"))
             .and_then(Value::as_str)
             .unwrap_or("all");
 
@@ -264,9 +265,9 @@ impl TaskManager {
             _ => return "Error: 'task_id' is required".to_string(),
         };
 
-        // Update accepts only `new_status`. The legacy `status` key
+        // `status` field from the unified task tool schema.
         // used to serve both list and update; schema is now split.
-        let new_status = args.get("new_status").and_then(Value::as_str);
+        let new_status = args.get("status").and_then(Value::as_str);
         // Reject terminal-only filters that used to share the enum.
         if matches!(new_status, Some("all") | Some("active")) {
             return format!(
@@ -313,11 +314,16 @@ impl TaskManager {
             }
         }
 
-        // Handle "deleted" — soft-remove from list (before taking &mut)
+        // Handle "deleted" — soft-remove from list + clean symmetric edges
         if new_status == Some("deleted") {
             let previous_status = task.status.clone();
             let task_id_owned = task_id.to_string();
             tasks.retain(|t| t.id != task_id_owned);
+            // Clean dangling references from other tasks
+            for t in tasks.iter_mut() {
+                t.blocks.retain(|id| id != &task_id_owned);
+                t.blocked_by.retain(|id| id != &task_id_owned);
+            }
             return json!({
                 "success": true,
                 "task_id": task_id_owned,

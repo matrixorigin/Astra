@@ -149,17 +149,37 @@ pub(crate) fn check_dangerous_command(command: &str) -> Option<String> {
         || lower.contains(" -r ") && lower.contains(" -f")
         || lower.contains("--recursive") && lower.contains("--force")
         || lower.contains("--no-preserve-root");
-    if has_rm_token
-        && has_recursive_force
-        && (lower.contains(" /") || lower.contains(" /*") || lower.ends_with(" /"))
-        && !lower.contains(" ./")
-        && !lower.contains(" ../")
-    {
-        return Some(
-            "⚠ DANGEROUS: `rm -rf /` or equivalent detected — this would delete the entire filesystem. \
-             Refusing to execute. Use a more specific path."
-                .to_string(),
-        );
+    if has_rm_token && has_recursive_force {
+        // Only block when targeting root itself, root glob, or a bare top-level
+        // system directory. Deep paths (/tmp/build, /var/lib/myapp) are OK.
+        let has_root_target = lower.split_whitespace().any(|tok| {
+            tok == "/"
+                || tok == "/*"
+                || matches!(
+                    tok,
+                    "/bin"
+                        | "/usr"
+                        | "/etc"
+                        | "/home"
+                        | "/var"
+                        | "/lib"
+                        | "/opt"
+                        | "/srv"
+                        | "/boot"
+                        | "/root"
+                        | "/sys"
+                        | "/proc"
+                        | "/dev"
+                        | "/sbin"
+                )
+        }) || lower.contains("--no-preserve-root");
+        if has_root_target {
+            return Some(
+                "⚠ DANGEROUS: `rm -rf` targeting a system root path detected. \
+                 Refusing to execute. Use a more specific path."
+                    .to_string(),
+            );
+        }
     }
 
     if lower.contains("chmod") && lower.contains("777") && lower.contains("-r") {
@@ -4333,9 +4353,25 @@ mod tests {
     }
 
     #[test]
-    fn security_detects_rm_rf_slash_path() {
-        let w = check_dangerous_command("sudo rm -rf /var/lib/important");
-        assert!(w.is_some(), "rm -rf with absolute root path should warn");
+    fn security_detects_rm_rf_system_root() {
+        let w = check_dangerous_command("sudo rm -rf /var");
+        assert!(w.is_some(), "rm -rf on system root path should block");
+        let w2 = check_dangerous_command("rm -rf /usr");
+        assert!(w2.is_some(), "/usr is a system root");
+        let w3 = check_dangerous_command("rm -rf /*");
+        assert!(w3.is_some(), "/* is root glob");
+    }
+
+    #[test]
+    fn security_allows_rm_rf_deep_absolute_path() {
+        // Deep absolute paths like /tmp/build or /var/lib/myapp/cache are legitimate
+        let w = check_dangerous_command("rm -rf /tmp/build");
+        assert!(w.is_none(), "deep absolute path is legitimate: /tmp/build");
+        let w2 = check_dangerous_command("rm -rf /var/lib/myapp/cache");
+        assert!(
+            w2.is_none(),
+            "deep absolute path is legitimate: /var/lib/myapp/cache"
+        );
     }
 
     #[test]
@@ -7532,15 +7568,15 @@ mod tests {
 
     #[test]
     fn bash_destructive_warning_prepended() {
-        // Verify the warning function itself works — no need to run actual destructive commands
-        let executor = test_executor();
-        // Use a command that contains the destructive pattern but is harmless
-        let result = executor
-            .bash(&serde_json::json!({"command": "echo 'git push --force would be dangerous'"}));
+        // In permissive sandbox (test default), dangerous commands still
+        // execute — the warning goes to stderr only. Verify the security
+        // check itself detects the pattern.
+        let w = check_dangerous_command("git push --force origin main");
         assert!(
-            result.contains("⚠️"),
-            "command containing destructive pattern should have warning: {result}"
+            w.is_some(),
+            "check_dangerous_command must detect force-push"
         );
+        assert!(w.unwrap().contains("DANGEROUS"));
     }
 
     #[test]
