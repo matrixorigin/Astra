@@ -158,23 +158,32 @@ impl Writer {
             return;
         }
 
-        // Inside a list item, pre-wrap the line so continuation rows
-        // hang-indent under the body text instead of wrapping back to
-        // column 0 (where they'd collide with the `• ` marker of the
-        // next bullet). The first span of a list item is always the
-        // marker (`• ` / `3. ` / nested ◦/▸/·); subsequent rows get a
-        // whitespace-only indent of matching display width.
+        // Pre-wrap to the known render width so the terminal's
+        // default wrap doesn't produce mid-line breaks with no
+        // indent. Two modes:
         //
-        // The width floor mirrors ratatui's own wrap trigger — below
-        // ~20 cols we just emit the raw line and let the terminal
-        // deal with it.
-        if !self.list_stack.is_empty()
-            && let Some(w) = self.width
+        // 1. List item: first span is the `• ` / `3. ` marker; wrap
+        //    with `initial_indent = marker`, `subsequent_indent =
+        //    spaces` so continuation rows hang under the body.
+        // 2. Free-standing paragraph (including `**bold label:**
+        //    rest of sentence` forms): wrap without any indent —
+        //    span styling is preserved.
+        //
+        // The width floor mirrors ratatui's own wrap trigger —
+        // below ~20 cols we just emit the raw line and let the
+        // terminal deal with it.
+        if let Some(w) = self.width
             && w >= 20
-            && let Some(wrapped) = list_item_hang_wrap(&spans, w)
         {
-            self.lines.extend(wrapped);
-            return;
+            if !self.list_stack.is_empty() {
+                if let Some(wrapped) = list_item_hang_wrap(&spans, w) {
+                    self.lines.extend(wrapped);
+                    return;
+                }
+            } else if let Some(wrapped) = paragraph_wrap(&spans, w) {
+                self.lines.extend(wrapped);
+                return;
+            }
         }
 
         self.lines.push(Line::from(spans));
@@ -681,6 +690,31 @@ fn list_item_hang_wrap(
     Some(wrapped.iter().map(line_to_static).collect())
 }
 
+/// Wrap a paragraph line (no list marker, no block quote) to the
+/// render width, preserving span styling. Returns `None` when the
+/// line fits on a single row so the caller can fast-path it as a
+/// single `Line`. No hang indent — paragraphs start at column 0 and
+/// wrap back to column 0.
+fn paragraph_wrap(spans: &[Span<'static>], width: usize) -> Option<Vec<Line<'static>>> {
+    if spans.is_empty() {
+        return None;
+    }
+    let total_w: usize = spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    if total_w <= width {
+        return None;
+    }
+    let body_line = Line::from(spans.to_vec());
+    let opts = super::wrapping::RtOptions::new(width);
+    let wrapped = super::wrapping::word_wrap_line(&body_line, opts);
+    if wrapped.is_empty() {
+        return None;
+    }
+    Some(wrapped.iter().map(line_to_static).collect())
+}
+
 fn wrap_cell(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
@@ -860,6 +894,41 @@ mod polish_tests {
         let out = lines_at(md, 40);
         let bullet_rows: Vec<&String> = out.iter().filter(|l| l.starts_with("• ")).collect();
         assert_eq!(bullet_rows.len(), 1, "one bullet row; got: {out:?}");
+    }
+
+    #[test]
+    fn paragraph_with_bold_label_wraps_at_word_boundary() {
+        // Regression: a paragraph starting with a `**label:**`
+        // prefix (e.g. commit-message descriptions, "Before:" /
+        // "After:" review callouts) used to render as one long
+        // logical line; ratatui's default Paragraph wrap would then
+        // split it mid-word or drop to column 0 with no indent.
+        // Pre-wrapping in markdown_render gives graceful word
+        // boundaries and predictable layout.
+        let md = "**Before:** total_prompt_tokens + total_completion_tokens \
+                  saturates within 3-4 turns, chip becomes noise.";
+        let out = lines_at(md, 40);
+        let non_empty: Vec<&String> = out.iter().filter(|l| !l.is_empty()).collect();
+        assert!(
+            non_empty.len() >= 2,
+            "long paragraph must wrap into multiple rows at 40 cols; got {out:?}"
+        );
+        // No row should exceed the width (allow +1 slack for trailing
+        // whitespace that pulldown-cmark sometimes emits).
+        for row in &non_empty {
+            assert!(
+                UnicodeWidthStr::width(row.as_str()) <= 41,
+                "row exceeds 40-col width: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_paragraph_is_single_line() {
+        let md = "A short sentence.";
+        let out = lines_at(md, 60);
+        let non_empty: Vec<&String> = out.iter().filter(|l| !l.is_empty()).collect();
+        assert_eq!(non_empty.len(), 1, "short paragraph stays on one row: {out:?}");
     }
 
     #[test]
