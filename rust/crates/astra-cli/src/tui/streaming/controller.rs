@@ -162,11 +162,115 @@ impl StreamController {
 
     fn sync_queue(&mut self) {
         let target_len = self.rendered_lines.len();
-        if self.enqueued_len < target_len {
-            let new_lines = self.rendered_lines[self.enqueued_len..target_len].to_vec();
+        // Tables are rendered atomically on `TagEnd::Table`, but their
+        // vertical position shifts as rows arrive: adding a body row
+        // pushes the `└┴┘` bottom border one line down. Once we've
+        // emitted the "empty" version of the table to scrollback, we
+        // can't un-emit it — the row arrives and gets dropped because
+        // `enqueued_len` already points past its slot.
+        //
+        // Defer every line at-or-after the first table boundary until
+        // `finalize()`. Non-table content before that still streams
+        // token-by-token (fast feedback); tables appear atomically at
+        // turn-end (correct structure). Matches Claude Code behavior.
+        let safe_end = first_table_line(&self.rendered_lines).unwrap_or(target_len);
+        if self.enqueued_len < safe_end {
+            let new_lines = self.rendered_lines[self.enqueued_len..safe_end].to_vec();
             self.state.enqueue(new_lines);
-            self.enqueued_len = target_len;
+            self.enqueued_len = safe_end;
         }
+    }
+}
+
+/// Find the first rendered line whose content starts (after whitespace)
+/// with a box-drawing glyph we use for tables. Returns `None` if none
+/// exist in the buffer — the whole output is safe to stream.
+fn first_table_line(lines: &[Line<'static>]) -> Option<usize> {
+    lines.iter().position(is_table_line)
+}
+
+fn is_table_line(line: &Line<'static>) -> bool {
+    // Join spans only as far as needed to peek the first non-space char.
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            if ch == ' ' || ch == '\t' {
+                continue;
+            }
+            return matches!(ch, '│' | '┌' | '┐' | '├' | '┤' | '└' | '┘' | '┬' | '┴' | '┼' | '─');
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod table_hold_tests {
+    use super::*;
+
+    fn drain_all(sc: &mut StreamController) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            let (cell, _idle) = sc.on_commit_tick_batch(20);
+            match cell {
+                Some(c) => out.push(cell_text(&c)),
+                None => break,
+            }
+        }
+        out
+    }
+
+    fn cell_text(cell: &Box<dyn ChatCell>) -> String {
+        let lines = cell.display_lines(80);
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn regular_text_streams_without_hold() {
+        let mut sc = StreamController::new(Some(80));
+        sc.push_delta("first paragraph\n\nsecond paragraph\n");
+        let emitted = drain_all(&mut sc);
+        // Both paragraphs should have reached scrollback via mini-cells.
+        let joined = emitted.join("\n");
+        assert!(joined.contains("first paragraph"));
+        assert!(joined.contains("second paragraph"));
+    }
+
+    #[test]
+    fn partial_table_is_held_until_finalize() {
+        // Feed a complete markdown table across multiple deltas. The
+        // borders must only appear in scrollback after finalize — not
+        // as partial frames during streaming that would leave a stale
+        // bottom border above the real rows.
+        let mut sc = StreamController::new(Some(80));
+        sc.push_delta("Intro line\n");
+        sc.push_delta("| a | b |\n");
+        sc.push_delta("|---|---|\n");
+        sc.push_delta("| 1 | 2 |\n");
+
+        // Mid-stream drain: intro only, no table glyphs.
+        let mid = drain_all(&mut sc).join("\n");
+        assert!(mid.contains("Intro line"));
+        assert!(
+            !mid.contains('┌') && !mid.contains('└'),
+            "table borders leaked mid-stream: {mid}"
+        );
+
+        // Finalize should release the full table.
+        let (final_cell, _source) = sc.finalize();
+        let final_text = final_cell
+            .map(|c| cell_text(&c))
+            .unwrap_or_default();
+        assert!(final_text.contains('┌'), "top border missing: {final_text}");
+        assert!(final_text.contains('└'), "bottom border missing: {final_text}");
+        assert!(final_text.contains("1"), "body row missing: {final_text}");
     }
 }
 
