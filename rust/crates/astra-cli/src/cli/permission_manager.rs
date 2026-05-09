@@ -66,13 +66,49 @@ pub(super) fn format_denied_message(reason: &str) -> String {
     }
 }
 
-/// Canonicalize a path, falling back to the raw form when the path
-/// does not exist (we still want to compare prefixes in that case).
-fn canonicalize_lossy(p: &Path) -> std::io::Result<PathBuf> {
-    match std::fs::canonicalize(p) {
-        Ok(cp) => Ok(cp),
-        Err(_) => Ok(p.to_path_buf()),
+/// Canonicalize an existing path, or a missing path whose parent chain
+/// resolves cleanly.
+///
+/// This deliberately fails closed for unresolved roots and lexical `..`
+/// segments. It lets a user trust an existing outside directory once and
+/// later create/read a new child beneath it, while avoiding raw-string
+/// prefix checks that can be bypassed with symlinks.
+fn canonicalize_existing_or_parent(p: &Path) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind};
+    use std::path::Component;
+
+    if let Ok(cp) = std::fs::canonicalize(p) {
+        return Ok(cp);
     }
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "path contains unresolved parent traversal",
+        ));
+    }
+
+    let mut cur = p;
+    let mut suffix = Vec::new();
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            suffix.push(name.to_os_string());
+        }
+        if let Ok(mut base) = std::fs::canonicalize(parent) {
+            for component in suffix.iter().rev() {
+                base.push(component);
+            }
+            return Ok(base);
+        }
+        if parent == cur {
+            break;
+        }
+        cur = parent;
+    }
+
+    Err(Error::new(
+        ErrorKind::NotFound,
+        "no existing parent could be canonicalized",
+    ))
 }
 
 /// Extract the `'{path}'` target from a sandbox-denied reason string.
@@ -1765,9 +1801,16 @@ impl PermissionManager {
     /// Add a trusted sandbox-escape root. Any later sandbox_expand
     /// request whose target path sits under this root (any tool) is
     /// auto-allowed within this session.
+    ///
+    /// Only canonical, existing paths are trusted. Non-existent paths
+    /// are ignored rather than remembered as raw strings because a path
+    /// can later appear as a symlink to a different subtree.
     pub(super) fn trust_sandbox_root(&mut self, root: PathBuf) {
-        if !self.trusted_sandbox_roots.iter().any(|r| r == &root) {
-            self.trusted_sandbox_roots.push(root);
+        let Ok(canonical) = std::fs::canonicalize(root) else {
+            return;
+        };
+        if !self.trusted_sandbox_roots.iter().any(|r| r == &canonical) {
+            self.trusted_sandbox_roots.push(canonical);
         }
     }
 
@@ -1782,15 +1825,12 @@ impl PermissionManager {
 
     /// Does the given path sit under any trusted sandbox root?
     fn path_under_trusted_root(&self, candidate: &Path) -> bool {
-        let Ok(abs) = canonicalize_lossy(candidate) else {
+        let Ok(abs) = canonicalize_existing_or_parent(candidate) else {
             return false;
         };
         self.trusted_sandbox_roots
             .iter()
-            .any(|root| match canonicalize_lossy(root) {
-                Ok(abs_root) => abs.starts_with(&abs_root),
-                Err(_) => abs.starts_with(root),
-            })
+            .any(|root| abs.starts_with(root))
     }
 
     /// Summary of current permission state for `/allow rules`.
@@ -2720,17 +2760,28 @@ mod tests {
 
     #[test]
     fn sandbox_expand_trust_covers_subtree_across_tools() {
-        // RED: this captures the user-visible bug.
-        // Scenario: the user approves "Always" for read_file on
-        // `/home/xupeng/claudecode/ink`. Later, a different tool
-        // (glob, bash, list_dir…) hits a path under the SAME root
-        // `/home/xupeng/claudecode/…` — it must not prompt again.
+        // Scenario: the user approves "Always" for read_file on an
+        // existing outside directory. Later, a different tool (glob,
+        // bash, list_dir…) hits a path under the SAME root — it must
+        // not prompt again.
         let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let trusted_root = outside.path().join("ink");
+        std::fs::create_dir(&trusted_root).unwrap();
+        let child_dir = trusted_root.join("screens");
+        std::fs::create_dir(&child_dir).unwrap();
+        let child_file = child_dir.join("REPL.tsx");
+        std::fs::write(&child_file, "component").unwrap();
+
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // Simulate pressing Always on a first prompt via read_file.
         let args_a = serde_json::json!({
-            "reason": "Path '/home/xupeng/claudecode/ink' is outside the project directory '/home/xupeng/astra'.",
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                trusted_root.display(),
+                dir.path().display()
+            ),
         });
         pm.trust_sandbox_root_from_reason(
             args_a.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
@@ -2738,7 +2789,11 @@ mod tests {
 
         // Second prompt: different tool, sub-path of the trusted root.
         let args_b = serde_json::json!({
-            "reason": "Path '/home/xupeng/claudecode/ink/screens/REPL.tsx' is outside the project directory '/home/xupeng/astra'.",
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                child_file.display(),
+                dir.path().display()
+            ),
         });
         let decision = pm.check_nonblocking("sandbox_expand:glob", &args_b);
         assert!(
@@ -2747,13 +2802,104 @@ mod tests {
         );
 
         // Third prompt: a DIFFERENT outside path — should still prompt.
+        let unrelated = outside.path().join("elsewhere.txt");
+        std::fs::write(&unrelated, "secret").unwrap();
         let args_c = serde_json::json!({
-            "reason": "Path '/etc/shadow' is outside the project directory '/home/xupeng/astra'.",
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                unrelated.display(),
+                dir.path().display()
+            ),
         });
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args_c);
         assert!(
             matches!(decision, PermissionDecision::NeedApproval { .. }),
             "an unrelated outside path must still prompt; got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn sandbox_expand_trust_allows_missing_child_under_existing_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let trusted_root = outside.path().join("scratch");
+        std::fs::create_dir(&trusted_root).unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        pm.trust_sandbox_root(trusted_root.clone());
+
+        let future_child = trusted_root.join("new").join("file.txt");
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                future_child.display(),
+                dir.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:write_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "missing descendants under a trusted existing directory should keep the Always UX"
+        );
+    }
+
+    #[test]
+    fn sandbox_expand_does_not_trust_nonexistent_root_later_created_as_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sensitive = tempfile::tempdir().unwrap();
+        let missing_root = outside.path().join("future-link");
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        pm.trust_sandbox_root(missing_root.clone());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(sensitive.path(), &missing_root).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(sensitive.path(), &missing_root).unwrap();
+
+        let escaped = missing_root.join("secret.txt");
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                escaped.display(),
+                dir.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "a non-existent approved path must not become trusted after it appears as a symlink"
+        );
+    }
+
+    #[test]
+    fn sandbox_expand_trusted_root_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let trusted_root = outside.path().join("trusted");
+        std::fs::create_dir(&trusted_root).unwrap();
+        let sensitive = tempfile::tempdir().unwrap();
+        let link = trusted_root.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(sensitive.path(), &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(sensitive.path(), &link).unwrap();
+
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        pm.trust_sandbox_root(trusted_root);
+
+        let escaped = link.join("secret.txt");
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                escaped.display(),
+                dir.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "canonicalized candidate should point at the symlink target, not the trusted root"
         );
     }
 

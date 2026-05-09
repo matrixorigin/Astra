@@ -285,14 +285,29 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
-/// Short relative age label. We parse the RFC3339 timestamp here to
-/// avoid depending on `SystemTime::now()` at render time (tests want
-/// deterministic output; discovery is expected to pre-compute).
+/// Short relative age label. Production renders relative to wall-clock
+/// now; tests use a fixed clock so snapshot output does not drift daily.
 fn short_age(iso: &str) -> String {
+    short_age_at(iso, age_clock_now())
+}
+
+fn age_clock_now() -> chrono::DateTime<chrono::Utc> {
+    #[cfg(test)]
+    {
+        chrono::DateTime::parse_from_rfc3339("2026-05-08T12:00:00Z")
+            .expect("valid fixed session-picker test clock")
+            .with_timezone(&chrono::Utc)
+    }
+    #[cfg(not(test))]
+    {
+        chrono::Utc::now()
+    }
+}
+
+fn short_age_at(iso: &str, now: chrono::DateTime<chrono::Utc>) -> String {
     let Ok(dt) = chrono::DateTime::parse_from_rfc3339(iso) else {
         return iso.chars().take(10).collect();
     };
-    let now = chrono::Utc::now();
     let secs = now
         .signed_duration_since(dt.with_timezone(&chrono::Utc))
         .num_seconds()

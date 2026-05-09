@@ -44,11 +44,15 @@ pub(crate) fn load(session_id: impl Into<String>) -> ChatWidget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app_event::TuiAppEvent;
+    use crate::tui::chat_widget::bridge::{TurnContext, translate};
     use crate::tui::history_cell::{
-        assistant::AssistantCell, turn_summary::TurnSummaryCell, user::UserCell,
+        HistoryCell, assistant::AssistantCell, turn_summary::TurnSummaryCell, user::UserCell,
     };
+    use crate::tui::testing::render::{buffer_to_string, draw_widget};
     use crate::tui::transcript_jsonl;
     use crate::tui::turn_event::TurnEvent;
+    use ratatui::text::Line;
 
     /// Run `f` with `$HOME` pointing at a fresh tempdir so the
     /// append+load test doesn't scribble into the dev's real
@@ -66,6 +70,20 @@ mod tests {
             Some(v) => unsafe { env::set_var("HOME", v) },
             None => unsafe { env::remove_var("HOME") },
         }
+    }
+
+    fn render_history(w: &ChatWidget, width: u16) -> String {
+        let mut all_lines: Vec<Line<'static>> = Vec::new();
+        for (i, cell) in w.history().iter().enumerate() {
+            if i > 0 {
+                all_lines.push(Line::default());
+            }
+            all_lines.extend(cell.display_lines(width));
+        }
+        let height = (all_lines.len() as u16).max(1);
+        let p = ratatui::widgets::Paragraph::new(all_lines)
+            .wrap(ratatui::widgets::Wrap { trim: false });
+        buffer_to_string(&draw_widget(p, width, height))
     }
 
     #[test]
@@ -120,6 +138,84 @@ mod tests {
             assert!(
                 w.history()[2].as_any_ref().is::<TurnSummaryCell>(),
                 "third cell is the turn summary"
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn translated_live_turn_survives_jsonl_resume_identically() {
+        with_tmp_home(|| {
+            let sid = "sess_live_resume_e2e";
+            let mut live = ChatWidget::new(sid);
+
+            live.handle_event(super::super::AppEvent::UserSubmit(
+                "inspect cache stats".into(),
+            ));
+            for ev in [
+                TuiAppEvent::ThinkingChunk("checking prior context".into()),
+                TuiAppEvent::ThinkingStopped,
+                TuiAppEvent::ToolStarted {
+                    name: "bash".into(),
+                    description: "echo cache".into(),
+                },
+                TuiAppEvent::ToolCompleted {
+                    name: "bash".into(),
+                    description: String::new(),
+                    status: "success".into(),
+                    duration_ms: 12,
+                    output_summary: Some("cache ok".into()),
+                    output: None,
+                },
+                TuiAppEvent::Token("Cache stats survived.".into()),
+                TuiAppEvent::TurnComplete,
+            ] {
+                let ctx = TurnContext {
+                    elapsed_ms: Some(1_500),
+                    ttft_ms: Some(250),
+                    tokens_in: Some(200),
+                    tokens_out: Some(50),
+                    cache_read_tokens: Some(150),
+                    tools: 1,
+                    cumulative_tokens: Some(250),
+                    cumulative_cost_usd: Some(0.002),
+                };
+                if let Some(app_ev) = translate(ev, ctx) {
+                    live.handle_event(app_ev);
+                }
+            }
+
+            let persisted = transcript_jsonl::load(sid);
+            assert_eq!(
+                persisted.len(),
+                live.history().len(),
+                "every committed live cell should be persisted"
+            );
+
+            let resumed = load(sid);
+            assert_eq!(resumed.history().len(), live.history().len());
+            assert_eq!(render_history(&resumed, 80), render_history(&live, 80));
+
+            let summary = resumed
+                .history()
+                .last()
+                .and_then(|cell| cell.as_any_ref().downcast_ref::<TurnSummaryCell>())
+                .expect("last resumed cell should be turn summary");
+            assert_eq!(summary.cache_read_tokens, Some(150));
+            let summary_text = summary
+                .display_lines(120)
+                .into_iter()
+                .map(|line| {
+                    line.spans
+                        .into_iter()
+                        .map(|span| span.content.into_owned())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                summary_text.contains("💾 75%"),
+                "cache-read stats must remain user-visible after resume"
             );
         });
     }

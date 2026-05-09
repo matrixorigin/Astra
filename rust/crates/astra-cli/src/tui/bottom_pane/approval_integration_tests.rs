@@ -8,6 +8,7 @@ use tokio::sync::oneshot;
 
 use super::{ApprovalActivation, BottomPane, BottomPaneAction};
 use crate::chat_stream::ApprovalResponse;
+use crate::tui::slash_menu::SlashItem;
 
 fn key(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -29,6 +30,19 @@ fn enqueue(bp: &mut BottomPane, tool: &str) -> oneshot::Receiver<ApprovalRespons
         tx,
     );
     rx
+}
+
+fn slash_items() -> Vec<SlashItem> {
+    vec![
+        SlashItem {
+            name: "/help",
+            description: "show help",
+        },
+        SlashItem {
+            name: "/history",
+            description: "browse history",
+        },
+    ]
 }
 
 fn type_string(bp: &mut BottomPane, s: &str) {
@@ -107,6 +121,24 @@ fn ctrl_enter_accepts_regardless_of_button_focus() {
     assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
 }
 
+#[test]
+fn ctrl_enter_accepts_even_with_nonempty_composer() {
+    let mut bp = BottomPane::new();
+    let rx = enqueue(&mut bp, "bash");
+    type_string(&mut bp, "hello");
+    let _ = bp.handle_key(special(KeyCode::Right));
+
+    let action = bp.handle_key(ctrl_special(KeyCode::Enter));
+
+    assert!(matches!(action, BottomPaneAction::ApprovalResolved { .. }));
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
+    assert_eq!(
+        bp.composer.text(),
+        "hello",
+        "quick approval should not destroy the user's draft"
+    );
+}
+
 // ─── Composer stays live ──────────────────────────────────────────
 
 #[test]
@@ -135,6 +167,50 @@ fn enter_with_text_in_composer_submits_instead_of_approving() {
         }
         other => panic!("expected SubmitInput, got {other:?}"),
     }
+}
+
+#[test]
+fn slash_menu_open_with_approval_pending_routes_enter_to_slash_selection() {
+    let mut bp = BottomPane::new();
+    bp.set_slash_items(slash_items());
+    let _rx = enqueue(&mut bp, "bash");
+    type_string(&mut bp, "/he");
+    assert!(bp.slash_menu_is_open());
+
+    let action = bp.handle_key(special(KeyCode::Enter));
+
+    match action {
+        BottomPaneAction::SubmitInput(text) => assert_eq!(text, "/help"),
+        other => panic!("expected slash command submission, got {other:?}"),
+    }
+    assert_eq!(
+        bp.footer.pending_approvals, 1,
+        "Enter in an open slash menu should not accidentally approve"
+    );
+}
+
+#[test]
+fn slash_menu_open_with_approval_pending_routes_tab_to_slash_selection() {
+    let mut bp = BottomPane::new();
+    bp.set_slash_items(slash_items());
+    let _rx_a = enqueue(&mut bp, "a");
+    let _rx_b = enqueue(&mut bp, "b");
+    type_string(&mut bp, "/he");
+    assert_eq!(bp.focused_approval_index(), Some(0));
+
+    let action = bp.handle_key(special(KeyCode::Tab));
+
+    assert!(matches!(action, BottomPaneAction::Consumed));
+    assert_eq!(
+        bp.composer.text(),
+        "/help ",
+        "Tab should complete the slash menu while it is open"
+    );
+    assert_eq!(
+        bp.focused_approval_index(),
+        Some(0),
+        "slash-menu Tab must not cycle approvals underneath the popup"
+    );
 }
 
 // ─── Multi-entry: Tab cycles, batch buttons work ──────────────────

@@ -141,7 +141,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         "/stats" => {
             if !args.is_empty() {
                 // Direct subcommand: /stats history, /stats tools, etc.
-                show_stats_view(args, ctx.state, ctx.guard, ctx.bottom_pane);
+                show_stats_view(args, ctx.state, ctx.bottom_pane);
                 return SlashResult::Handled;
             }
             let items = vec![
@@ -738,16 +738,9 @@ pub(crate) fn looks_like_session_id(s: &str) -> bool {
 pub(crate) fn handle_view_result(
     name: &str,
     state: &mut ReplState,
-    guard: &mut TerminalGuard,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
 ) {
-    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-    // Keep the legacy `w` binding above for call sites below that
-    // still take a width into their local helpers; unused when the
-    // whole function routes through `chat_widget`.
-    let _ = w;
-
     // Session picker result is handled by the outer event loop (it
     // needs to run the async resume pipeline); this sync fn just
     // lets it pass through — see `is_session_id` below.
@@ -784,7 +777,7 @@ pub(crate) fn handle_view_result(
         _ => None,
     };
     if let Some(sub) = stats_sub {
-        show_stats_view(sub, state, guard, bottom_pane);
+        show_stats_view(sub, state, bottom_pane);
         return;
     }
 
@@ -877,12 +870,7 @@ pub(crate) fn handle_view_result(
     chat_widget.commit_system(SystemCell::response(format!("Set model to {name}")));
 }
 
-fn show_stats_view(
-    sub: &str,
-    state: &ReplState,
-    _guard: &mut TerminalGuard,
-    bottom_pane: &mut BottomPane,
-) {
+fn show_stats_view(sub: &str, state: &ReplState, bottom_pane: &mut BottomPane) {
     use crate::tui::bottom_pane::info_view::InfoView;
     use astra_services::{session_analytics, session_journal};
 
@@ -1218,6 +1206,96 @@ mod panels_tests {
         insta::assert_snapshot!(
             "panels_cheat_sheet",
             build_panels_cheat_sheet_lines().join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod view_result_tests {
+    use super::handle_view_result;
+    use crate::permission_manager::PermissionMode;
+    use crate::repl_state::ReplState;
+    use crate::tui::bottom_pane::BottomPane;
+    use crate::tui::chat_widget::ChatWidget;
+    use crate::tui::history_cell::system::SystemCell;
+
+    fn last_system_message(widget: &ChatWidget) -> Option<String> {
+        widget
+            .history()
+            .last()
+            .and_then(|cell| cell.as_any_ref().downcast_ref::<SystemCell>())
+            .map(|cell| cell.message().to_string())
+    }
+
+    #[test]
+    fn session_picker_result_is_reserved_for_outer_resume_pipeline() {
+        let mut state = ReplState::default();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = ChatWidget::new("");
+
+        handle_view_result(
+            "sess_1234567890",
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+        );
+
+        assert!(chat_widget.history().is_empty());
+        assert!(bottom_pane.composer.is_empty());
+        assert_eq!(state.model, None);
+    }
+
+    #[test]
+    fn permission_selection_updates_state_and_commits_feedback() {
+        let mut state = ReplState::default();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = ChatWidget::new("");
+
+        handle_view_result("Auto", &mut state, &mut bottom_pane, &mut chat_widget);
+
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Auto);
+        assert_eq!(
+            last_system_message(&chat_widget).as_deref(),
+            Some("Permission mode → auto")
+        );
+    }
+
+    #[test]
+    fn slash_command_selection_returns_command_to_composer() {
+        let mut state = ReplState::default();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = ChatWidget::new("");
+
+        handle_view_result("/resume", &mut state, &mut bottom_pane, &mut chat_widget);
+
+        assert_eq!(bottom_pane.composer.text(), "/resume ");
+        assert!(
+            chat_widget.history().is_empty(),
+            "selecting a command hint should not emit scrollback noise"
+        );
+    }
+
+    #[test]
+    fn model_selection_updates_footer_and_commits_feedback() {
+        let mut state = ReplState::default();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = ChatWidget::new("");
+
+        handle_view_result(
+            "claude-sonnet-4.6",
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+        );
+
+        assert_eq!(state.model.as_deref(), Some("claude-sonnet-4.6"));
+        assert_eq!(
+            bottom_pane.footer.model.as_deref(),
+            Some("claude-sonnet-4.6")
+        );
+        assert_eq!(
+            last_system_message(&chat_widget).as_deref(),
+            Some("Set model to claude-sonnet-4.6")
         );
     }
 }

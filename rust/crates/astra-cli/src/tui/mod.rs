@@ -882,7 +882,9 @@ pub(crate) async fn run_tui_repl(
                                             .map(|s| s[..8.min(s.len())].to_string());
                                     } else {
                                         slash_dispatch::handle_view_result(
-                                            &name, &mut state, &mut guard, &mut bottom_pane,
+                                            &name,
+                                            &mut state,
+                                            &mut bottom_pane,
                                             &mut chat_widget,
                                         );
                                     }
