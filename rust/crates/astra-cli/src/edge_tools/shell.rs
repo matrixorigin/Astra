@@ -141,14 +141,16 @@ pub(crate) fn check_dangerous_command(command: &str) -> Option<String> {
 
     // ── Category 1: Destructive filesystem ──
     // rm with -rf / -fr / combined short flags (-rfv etc.) applied to root.
-    let has_rm_token = lower.split(|c: char| c.is_whitespace() || c == ';' || c == '|' || c == '&')
+    let has_rm_token = lower
+        .split(|c: char| c.is_whitespace() || c == ';' || c == '|' || c == '&')
         .any(|tok| tok == "rm" || tok.ends_with("/rm"));
     let has_recursive_force = lower.contains(" -rf")
         || lower.contains(" -fr")
         || lower.contains(" -r ") && lower.contains(" -f")
         || lower.contains("--recursive") && lower.contains("--force")
         || lower.contains("--no-preserve-root");
-    if has_rm_token && has_recursive_force
+    if has_rm_token
+        && has_recursive_force
         && (lower.contains(" /") || lower.contains(" /*") || lower.ends_with(" /"))
         && !lower.contains(" ./")
         && !lower.contains(" ../")
@@ -258,10 +260,9 @@ pub(crate) fn check_dangerous_command(command: &str) -> Option<String> {
     if fetches_remote {
         // Look for a pipe into a shell/interpreter anywhere after the fetch.
         const SHELLS: &[&str] = &[
-            "| bash", "|bash", "| sh", "|sh ", "|sh\n", "| zsh", "|zsh",
-            "| ksh", "|ksh", "| dash", "|dash",
-            "| python", "|python", "| perl", "|perl",
-            "| ruby", "|ruby", "| node", "|node", "| php", "|php",
+            "| bash", "|bash", "| sh", "|sh ", "|sh\n", "| zsh", "|zsh", "| ksh", "|ksh", "| dash",
+            "|dash", "| python", "|python", "| perl", "|perl", "| ruby", "|ruby", "| node",
+            "|node", "| php", "|php",
         ];
         if SHELLS.iter().any(|needle| lower.contains(needle))
             || lower.contains("|sh;")
@@ -280,8 +281,10 @@ pub(crate) fn check_dangerous_command(command: &str) -> Option<String> {
     // `base64 -d … | bash` / `base64 --decode … | sh` — a common obfuscation
     // wrapper around the same RCE pattern.
     if (lower.contains("base64 -d") || lower.contains("base64 --decode"))
-        && (lower.contains("| bash") || lower.contains("|bash")
-            || lower.contains("| sh") || lower.contains("|sh"))
+        && (lower.contains("| bash")
+            || lower.contains("|bash")
+            || lower.contains("| sh")
+            || lower.contains("|sh"))
     {
         return Some(
             "⚠ DANGEROUS: decoding base64 and piping into a shell is a well-known obfuscated \
@@ -294,7 +297,8 @@ pub(crate) fn check_dangerous_command(command: &str) -> Option<String> {
     // `eval "rm  -rf /"` (double space bypass of the literal " -rf " match above).
     if lower.contains("eval ") || lower.contains("eval\"") || lower.contains("eval'") {
         let after_eval = lower.split("eval").nth(1).unwrap_or("");
-        if after_eval.contains("rm ") && (after_eval.contains("-rf") || after_eval.contains("-fr"))
+        if after_eval.contains("rm ")
+            && (after_eval.contains("-rf") || after_eval.contains("-fr"))
             && after_eval.contains('/')
         {
             return Some(

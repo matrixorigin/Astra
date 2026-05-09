@@ -1,6 +1,6 @@
 //! Multi-agent runtime initialization for the interactive REPL.
 
-use super::{agent_loader, delegate_subrun, spawn_subrun, ReplState};
+use super::{ReplState, agent_loader, delegate_subrun, spawn_subrun};
 use std::path::PathBuf;
 
 /// Build a fully-wired [`DynamicAgentSpawner`] without mutating a

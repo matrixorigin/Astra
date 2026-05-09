@@ -5,10 +5,10 @@
 //! on for multi-turn continuity or resume.
 
 #![allow(dead_code)]
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
     Mutex,
+    atomic::{AtomicU32, Ordering},
 };
 
 /// A scratchpad task tracked within the current CLI session.

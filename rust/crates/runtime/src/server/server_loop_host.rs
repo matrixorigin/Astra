@@ -3254,7 +3254,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     );
                 }
             }
-            astra_turn_core::fork_capture::ForkCaptureOutcome::FeatureDisabled => {}
             astra_turn_core::fork_capture::ForkCaptureOutcome::Skipped { reason } => {
                 astra_core::agent_warn!(
                     "fork_prefix",
@@ -6177,47 +6176,19 @@ mod tests {
 
     // ── G2: server-side parent capture (on_turn_completed) ──
     //
-    // These tests pin three behaviors of the server host's capture
-    // path so a future refactor can't silently regress:
+    // These tests pin behaviors of the server host's capture path so
+    // a future refactor can't silently regress:
     //
     //  1. No store wired → no-op (zero overhead for callers that
     //     don't enable fork-prefix).
-    //  2. Store wired + feature flag off → capture returns
-    //     FeatureDisabled and nothing lands in the sink. This is the
-    //     dark-ship contract.
-    //  3. Store wired + flag on + non-empty run_id/messages →
-    //     prefix lands in the sink with the right run_id and the
-    //     tool_schemas are populated from the advertised edge_tools.
+    //  2. Store wired + non-empty run_id/messages → prefix lands in
+    //     the sink with the right run_id and the tool_schemas are
+    //     populated from the advertised edge_tools.
 
     mod fork_prefix_capture_g2 {
         use super::*;
-        use astra_turn_core::fork_capture::{
-            FORK_FLAG_TEST_MUTEX, restore_fork_flag_raw_for_tests, set_fork_flag_for_tests,
-        };
         use astra_turn_core::fork_prefix_store::{InMemoryPrefixStore, PrefixCaptureSink};
         use std::sync::Arc;
-
-        struct FlagGuard {
-            _lock: std::sync::MutexGuard<'static, ()>,
-            prev_raw: u8,
-        }
-        impl FlagGuard {
-            fn set(enabled: bool) -> Self {
-                let lock = FORK_FLAG_TEST_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let prev_raw = set_fork_flag_for_tests(enabled);
-                Self {
-                    _lock: lock,
-                    prev_raw,
-                }
-            }
-        }
-        impl Drop for FlagGuard {
-            fn drop(&mut self) {
-                restore_fork_flag_raw_for_tests(self.prev_raw);
-            }
-        }
 
         fn state_with_run(run_id: &str) -> AgenticLoopState {
             let mut state = crate::turn::agentic_loop_host::tests::make_state();
@@ -6243,9 +6214,8 @@ mod tests {
 
         #[test]
         fn on_turn_completed_is_noop_without_store() {
-            // No store wired, no flag touched — must not panic, must
-            // not affect any state the loop depends on.
-            let _guard = FlagGuard::set(false);
+            // No store wired — must not panic, must not affect any
+            // state the loop depends on.
             let mut host = build_host_with(None, sample_edge_tools());
             let state = state_with_run("run-1");
             host.on_turn_completed(&state);
@@ -6253,24 +6223,7 @@ mod tests {
         }
 
         #[test]
-        fn on_turn_completed_respects_feature_flag_off() {
-            let _guard = FlagGuard::set(false);
-            let store = Arc::new(InMemoryPrefixStore::new());
-            let store_arc: Arc<dyn PrefixCaptureSink> = store.clone();
-            let mut host = build_host_with(Some(store_arc), sample_edge_tools());
-            // Simulate that the loop completed one turn.
-            host.last_turn_tool_schemas = sample_edge_tools();
-            host.on_turn_completed(&state_with_run("run-off"));
-            assert_eq!(
-                store.tracked_count(),
-                0,
-                "flag off must not write to the store"
-            );
-        }
-
-        #[test]
-        fn on_turn_completed_captures_when_flag_on_and_store_wired() {
-            let _guard = FlagGuard::set(true);
+        fn on_turn_completed_captures_when_store_wired() {
             let store = Arc::new(InMemoryPrefixStore::new());
             let store_arc: Arc<dyn PrefixCaptureSink> = store.clone();
             let mut host = build_host_with(Some(store_arc), sample_edge_tools());
@@ -6280,7 +6233,7 @@ mod tests {
             assert_eq!(
                 store.tracked_count(),
                 1,
-                "flag on + store + valid run_id must produce one entry"
+                "store + valid run_id must produce one entry"
             );
             let pfx = store
                 .get_prefix("run-capture")
@@ -6298,7 +6251,6 @@ mod tests {
 
         #[test]
         fn on_turn_completed_skips_when_run_id_missing() {
-            let _guard = FlagGuard::set(true);
             let store = Arc::new(InMemoryPrefixStore::new());
             let store_arc: Arc<dyn PrefixCaptureSink> = store.clone();
             let mut host = build_host_with(Some(store_arc), sample_edge_tools());

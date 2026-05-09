@@ -7,8 +7,8 @@
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use astra_runtime::{
@@ -16,26 +16,26 @@ use astra_runtime::{
     tool_selector::ToolSelector,
     turn::agentic_headless_round::HeadlessStderrStyle,
     turn::agentic_loop_host::{
-        interaction_scoped_tool_restrictions, AgenticLoopHost, AgenticLoopState,
-        HostReflectionRequest, HostReflectionResult, HostTurnResult, TurnInteractionMode,
+        AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult,
+        HostTurnResult, TurnInteractionMode, interaction_scoped_tool_restrictions,
     },
     turn::chat_turn_api_error::CHAT_TURN_POST_MAX_RETRIES,
-    turn::chat_turn_payload::{chat_turn_base_payload, ChatTurnBasePayloadInput},
+    turn::chat_turn_payload::{ChatTurnBasePayloadInput, chat_turn_base_payload},
 };
 use async_trait::async_trait;
 use crossterm::style::Stylize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{
+    ExplainMode,
     edge_tools::ToolExecutor,
     effects::ChatTurnPrepLineGuard,
     permission_manager::{PermissionManager, PermissionMode},
-    stream_render::{consume_turn_sse, EdgeSseContext, RenderPolicy},
-    ExplainMode,
+    stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse},
 };
 
 use super::agentic_loop_turn::{
-    fetch_chat_turn_sse, ChatTurnSseFetchRequest, PrepareTurnTelemetry,
+    ChatTurnSseFetchRequest, PrepareTurnTelemetry, fetch_chat_turn_sse,
 };
 
 /// CLI host for the runtime agentic loop.

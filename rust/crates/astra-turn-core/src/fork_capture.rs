@@ -11,10 +11,10 @@
 //! ## Why this lives in turn-core, not runtime
 //!
 //! - Callers in `astra-runtime` and `astra-cli` will each have their
-//!   own turn loops. Both need the same invariants (feature flag
-//!   check, microcompact abort, cacheable-state check, deterministic
-//!   prefix construction). Putting the helper here forces a single
-//!   source of truth.
+//!   own turn loops. Both need the same invariants (microcompact
+//!   abort, cacheable-state check, deterministic prefix
+//!   construction). Putting the helper here forces a single source
+//!   of truth.
 //! - The helper is testable in isolation with a mock sink — no need
 //!   to spin up a runtime to assert capture-site behavior.
 //!
@@ -22,13 +22,11 @@
 //!
 //! - PR 1: [`ForkPrefix`] type
 //! - PR 2: [`PrefixCaptureSink`] trait + in-memory impl
-//! - **PR 3 (this)**: capture-site helper + feature flag + outcome
-//!   enum. Still NOT wired into any live turn loop.
+//! - **PR 3 (this)**: capture-site helper + outcome enum. Still NOT
+//!   wired into any live turn loop.
 //! - PR 3.5: runtime/cli call the helper from their turn-end path
 //!   (tiny 1–3-line change per caller).
 //! - PR 4+: spawn-time resolution, reconstructor, telemetry.
-//!
-//! ## Feature flag
 //!
 use std::sync::Arc;
 
@@ -112,6 +110,13 @@ pub enum ForkCaptureOutcome {
     /// The request was well-formed but the capture was deliberately
     /// skipped. See [`SkipReason`].
     Skipped { reason: SkipReason },
+}
+
+impl ForkCaptureOutcome {
+    /// Returns `true` when the capture actually wrote a prefix entry.
+    pub fn is_captured(&self) -> bool {
+        matches!(self, ForkCaptureOutcome::Captured { .. })
+    }
 }
 
 /// Hard upper limit on canonical prefix bytes accepted by the
@@ -217,41 +222,6 @@ mod tests {
     use crate::fork_prefix::hash_tool_schema;
     use crate::fork_prefix_store::InMemoryPrefixStore;
 
-    // All feature-flag-touching tests (here and in fork_resolve)
-    // share the crate-global FORK_FLAG_TEST_MUTEX so they don't
-    // race each other for flag state.
-
-    /// RAII guard: set flag to `enabled` for the test's duration,
-    /// restore on drop. Using drop-restore (not just "set true then
-    /// set false") is safer when a test panics — Rust still runs
-    /// destructors.
-    struct FlagGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        prev_raw: u8,
-    }
-
-    impl FlagGuard {
-        fn set(enabled: bool) -> Self {
-            let lock = FORK_FLAG_TEST_MUTEX
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let prev_raw = set_fork_flag_for_tests(enabled);
-            Self {
-                _lock: lock,
-                prev_raw,
-            }
-        }
-    }
-
-    impl Drop for FlagGuard {
-        fn drop(&mut self) {
-            // Restore the prior state exactly — including the
-            // "unread" state (0), which we mimic by storing 0
-            // directly rather than calling `set_fork_flag_for_tests`.
-            FORK_FLAG_CACHE.store(self.prev_raw, Ordering::Relaxed);
-        }
-    }
-
     /// Current wall-clock seconds since epoch. Capture tests use
     /// this for `captured_at_secs` so the default-configured store
     /// (10-minute TTL, wall-clock time source) treats the entry as
@@ -294,21 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn feature_disabled_returns_early() {
-        let _g = FlagGuard::set(false);
-        let sink = InMemoryPrefixStore::new();
-        let outcome = capture_parent_prefix(sample_request(), &sink);
-        assert_eq!(outcome, ForkCaptureOutcome::FeatureDisabled);
-        assert_eq!(
-            sink.tracked_count(),
-            0,
-            "disabled feature must not touch sink"
-        );
-    }
-
-    #[test]
     fn captured_writes_to_sink_and_returns_prefix_id() {
-        let _g = FlagGuard::set(true);
         let sink = InMemoryPrefixStore::new();
         let outcome = capture_parent_prefix(sample_request(), &sink);
         match outcome {
@@ -325,7 +281,6 @@ mod tests {
 
     #[test]
     fn microcompact_mid_turn_skips_capture() {
-        let _g = FlagGuard::set(true);
         let sink = InMemoryPrefixStore::new();
         let mut req = sample_request();
         req.microcompact_fired_in_turn = true;
@@ -345,7 +300,6 @@ mod tests {
 
     #[test]
     fn empty_state_skips_capture() {
-        let _g = FlagGuard::set(true);
         let sink = InMemoryPrefixStore::new();
         let mut req = sample_request();
         req.system_blocks.clear();
@@ -366,7 +320,6 @@ mod tests {
         // System-only turn (tools+bytes empty) — some providers
         // genuinely send this for system-heavy prompts. Must not be
         // misclassified as NoCacheableState.
-        let _g = FlagGuard::set(true);
         let sink = InMemoryPrefixStore::new();
         let mut req = sample_request();
         req.tool_schemas.clear();
@@ -380,7 +333,6 @@ mod tests {
 
     #[test]
     fn oversized_input_is_rejected_before_construction() {
-        let _g = FlagGuard::set(true);
         let sink = InMemoryPrefixStore::new();
         let mut req = sample_request();
         req.canonical_prefix_bytes = vec![b'x'; CAPTURE_BYTE_CAP + 1];
@@ -403,19 +355,9 @@ mod tests {
 
     #[test]
     fn capture_overwrites_prior_capture_for_same_parent() {
-        let _g = FlagGuard::set(true);
         let sink = InMemoryPrefixStore::new();
         let mut req = sample_request();
         let _ = capture_parent_prefix(req.clone(), &sink);
-
-        // Precondition: guard must still be in effect. If a future
-        // refactor drops `_g` early or moves the second capture to a
-        // helper that forgets the guard, this assert catches it
-        // before the real behavior assertion below.
-        assert!(
-            is_fork_inherit_prefix_enabled(),
-            "test harness must keep flag enabled across both captures"
-        );
 
         // Second capture on same run — different turn_seq, different
         // bytes. Must overwrite, not create a new entry.
@@ -433,7 +375,6 @@ mod tests {
         // The prefix_id must distinguish captures made at the same
         // (run_id, turn_seq) in the same process — it's used to
         // correlate telemetry events to specific captures.
-        let _g = FlagGuard::set(true);
         let sink = InMemoryPrefixStore::new();
         let mut ids = std::collections::HashSet::new();
         for _ in 0..10 {
@@ -451,7 +392,6 @@ mod tests {
         use crate::fork_prefix_store::PrefixStoreConfig;
         use std::time::Duration;
 
-        let _g = FlagGuard::set(true);
         let sink = InMemoryPrefixStore::with_config(PrefixStoreConfig {
             ttl: Duration::from_secs(600),
             max_entries: 1,
@@ -475,13 +415,6 @@ mod tests {
     }
 
     #[test]
-    fn flag_env_var_name_is_stable() {
-        // Tripwire: changing this is an observable operational
-        // change (deployment scripts reference it).
-        assert_eq!(FORK_INHERIT_PREFIX_ENV, "ASTRA_FORK_INHERIT_PREFIX");
-    }
-
-    #[test]
     fn capture_byte_cap_tracks_prefix_soft_cap() {
         // The two caps encode different policies (capture-time hard
         // rejection vs spawn-time soft flag) but currently share a
@@ -494,35 +427,5 @@ mod tests {
             "CAPTURE_BYTE_CAP and PREFIX_SOFT_CAP_BYTES are allowed to diverge, \
              but updating this assertion should force reviewers to confirm intent"
         );
-    }
-
-    #[test]
-    fn unread_flag_defaults_to_enabled() {
-        // After the default-enable change (fork subagent feature),
-        // state 0 (unread) is treated as enabled. Capture cost is
-        // negligible (one Arc per turn, DashMap with TTL+LRU).
-        // Only explicit `set_fork_inherit_prefix_enabled(false)` or
-        // env `ASTRA_FORK_INHERIT_PREFIX=0` disables.
-        let _lock = FORK_FLAG_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = FORK_FLAG_CACHE.swap(0, Ordering::Relaxed);
-        let observed = is_fork_inherit_prefix_enabled();
-        FORK_FLAG_CACHE.store(prev, Ordering::Relaxed);
-        assert!(
-            observed,
-            "unread flag (state 0) must default to enabled after the fork-subagent change"
-        );
-    }
-
-    #[test]
-    fn explicit_disable_returns_false() {
-        let _lock = FORK_FLAG_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = FORK_FLAG_CACHE.swap(1, Ordering::Relaxed);
-        let observed = is_fork_inherit_prefix_enabled();
-        FORK_FLAG_CACHE.store(prev, Ordering::Relaxed);
-        assert!(!observed, "state 1 (explicitly disabled) must return false");
     }
 }

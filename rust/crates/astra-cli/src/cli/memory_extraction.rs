@@ -385,12 +385,8 @@ fn resolve_prefix_for_extraction(
     prefix: Option<&Arc<ForkPrefix>>,
     params: &LlmConnParams,
 ) -> Option<Arc<ForkPrefix>> {
-    use astra_turn_core::fork_capture::is_fork_inherit_prefix_enabled;
     use astra_turn_core::fork_prefix::ProviderKind;
 
-    if !is_fork_inherit_prefix_enabled() {
-        return None;
-    }
     let prefix = prefix?;
 
     let selector_provider = ProviderKind::from_provider_hint(&params.provider);
@@ -1511,32 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_prefix_returns_none_when_feature_disabled() {
-        let _lock = astra_turn_core::fork_capture::FORK_FLAG_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = astra_turn_core::fork_capture::set_fork_flag_for_tests(false);
-
-        let prefix = make_test_prefix("m", "openai");
-        let params = LlmConnParams {
-            base_url: "http://x".into(),
-            api_key: "k".into(),
-            model_name: "m".into(),
-            provider: "openai".into(),
-        };
-        let result = resolve_prefix_for_extraction(Some(&prefix), &params);
-        assert!(result.is_none(), "feature disabled must return None");
-
-        astra_turn_core::fork_capture::restore_fork_flag_raw_for_tests(prev);
-    }
-
-    #[test]
     fn resolve_prefix_returns_none_when_no_prefix() {
-        let _lock = astra_turn_core::fork_capture::FORK_FLAG_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = astra_turn_core::fork_capture::set_fork_flag_for_tests(true);
-
         let params = LlmConnParams {
             base_url: "http://x".into(),
             api_key: "k".into(),
@@ -1545,17 +1516,10 @@ mod tests {
         };
         let result = resolve_prefix_for_extraction(None, &params);
         assert!(result.is_none(), "missing prefix must return None");
-
-        astra_turn_core::fork_capture::restore_fork_flag_raw_for_tests(prev);
     }
 
     #[test]
     fn resolve_prefix_returns_none_on_provider_mismatch() {
-        let _lock = astra_turn_core::fork_capture::FORK_FLAG_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = astra_turn_core::fork_capture::set_fork_flag_for_tests(true);
-
         // Prefix captured on anthropic, selector is openai.
         let prefix = make_test_prefix("m", "anthropic");
         let params = LlmConnParams {
@@ -1566,17 +1530,10 @@ mod tests {
         };
         let result = resolve_prefix_for_extraction(Some(&prefix), &params);
         assert!(result.is_none(), "provider mismatch must return None");
-
-        astra_turn_core::fork_capture::restore_fork_flag_raw_for_tests(prev);
     }
 
     #[test]
     fn resolve_prefix_returns_none_on_model_mismatch() {
-        let _lock = astra_turn_core::fork_capture::FORK_FLAG_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = astra_turn_core::fork_capture::set_fork_flag_for_tests(true);
-
         // Same provider, different model.
         let prefix = make_test_prefix("gpt-4o", "openai");
         let params = LlmConnParams {
@@ -1587,17 +1544,10 @@ mod tests {
         };
         let result = resolve_prefix_for_extraction(Some(&prefix), &params);
         assert!(result.is_none(), "model mismatch must return None");
-
-        astra_turn_core::fork_capture::restore_fork_flag_raw_for_tests(prev);
     }
 
     #[test]
     fn resolve_prefix_returns_some_when_model_and_provider_match() {
-        let _lock = astra_turn_core::fork_capture::FORK_FLAG_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = astra_turn_core::fork_capture::set_fork_flag_for_tests(true);
-
         let prefix = make_test_prefix("gpt-4o", "openai");
         let params = LlmConnParams {
             base_url: "http://x".into(),
@@ -1607,8 +1557,6 @@ mod tests {
         };
         let result = resolve_prefix_for_extraction(Some(&prefix), &params);
         assert!(result.is_some(), "matching model+provider must return Some");
-
-        astra_turn_core::fork_capture::restore_fork_flag_raw_for_tests(prev);
     }
 
     #[test]
@@ -1684,26 +1632,18 @@ mod tests {
         };
         let prefix = make_test_prefix("gpt-4o", "openai");
 
-        // Lock scope: flag set + maybe_extract (synchronous read).
-        let (prev, mut ext) = {
-            let _lock = astra_turn_core::fork_capture::FORK_FLAG_TEST_MUTEX
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let prev = astra_turn_core::fork_capture::set_fork_flag_for_tests(true);
-            let mut ext = MemoryExtractor::new();
-            let outcome = ext.maybe_extract(ExtractionContext {
-                turn: 1,
-                selector_params: Some(&params),
-                user_message: "set dark mode",
-                assistant_response: "done",
-                tools_used: &[],
-                session_id: None,
-                existing_manifest: "",
-                fork_prefix: Some(prefix),
-            });
-            assert_eq!(outcome.tag(), "started");
-            (prev, ext)
-        };
+        let mut ext = MemoryExtractor::new();
+        let outcome = ext.maybe_extract(ExtractionContext {
+            turn: 1,
+            selector_params: Some(&params),
+            user_message: "set dark mode",
+            assistant_response: "done",
+            tools_used: &[],
+            session_id: None,
+            existing_manifest: "",
+            fork_prefix: Some(prefix),
+        });
+        assert_eq!(outcome.tag(), "started");
 
         let _ = ext.drain(std::time::Duration::from_secs(3)).await;
 
@@ -1719,8 +1659,6 @@ mod tests {
             last_content.contains("durable memories"),
             "suffix must contain extraction instruction"
         );
-
-        astra_turn_core::fork_capture::restore_fork_flag_raw_for_tests(prev);
     }
 
     #[tokio::test]
@@ -1846,24 +1784,17 @@ mod tests {
             CacheMode::SkipWrite,
         ));
 
-        let (prev, mut ext) = {
-            let _lock = astra_turn_core::fork_capture::FORK_FLAG_TEST_MUTEX
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let prev = astra_turn_core::fork_capture::set_fork_flag_for_tests(true);
-            let mut ext = MemoryExtractor::new();
-            let _ = ext.maybe_extract(ExtractionContext {
-                turn: 1,
-                selector_params: Some(&params),
-                user_message: "test",
-                assistant_response: "ok",
-                tools_used: &[],
-                session_id: None,
-                existing_manifest: "",
-                fork_prefix: Some(prefix),
-            });
-            (prev, ext)
-        };
+        let mut ext = MemoryExtractor::new();
+        let _ = ext.maybe_extract(ExtractionContext {
+            turn: 1,
+            selector_params: Some(&params),
+            user_message: "test",
+            assistant_response: "ok",
+            tools_used: &[],
+            session_id: None,
+            existing_manifest: "",
+            fork_prefix: Some(prefix),
+        });
 
         let result = ext.drain(std::time::Duration::from_secs(3)).await;
 
@@ -1884,8 +1815,6 @@ mod tests {
             }
             other => panic!("expected Extracted, got: {other:?}"),
         }
-
-        astra_turn_core::fork_capture::restore_fork_flag_raw_for_tests(prev);
     }
 
     // ── Unhappy path: prefix with valid JSON but not an array ──────────
@@ -1984,24 +1913,17 @@ mod tests {
         };
         let prefix = make_test_prefix("gpt-4o", "openai");
 
-        let (prev, mut ext) = {
-            let _lock = astra_turn_core::fork_capture::FORK_FLAG_TEST_MUTEX
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let prev = astra_turn_core::fork_capture::set_fork_flag_for_tests(true);
-            let mut ext = MemoryExtractor::new();
-            let _ = ext.maybe_extract(ExtractionContext {
-                turn: 1,
-                selector_params: Some(&params),
-                user_message: "be concise",
-                assistant_response: "ok",
-                tools_used: &[],
-                session_id: None,
-                existing_manifest: "",
-                fork_prefix: Some(prefix),
-            });
-            (prev, ext)
-        };
+        let mut ext = MemoryExtractor::new();
+        let _ = ext.maybe_extract(ExtractionContext {
+            turn: 1,
+            selector_params: Some(&params),
+            user_message: "be concise",
+            assistant_response: "ok",
+            tools_used: &[],
+            session_id: None,
+            existing_manifest: "",
+            fork_prefix: Some(prefix),
+        });
 
         let result = ext.drain(std::time::Duration::from_secs(3)).await;
 
@@ -2014,8 +1936,6 @@ mod tests {
             }
             other => panic!("expected Extracted, got: {other:?}"),
         }
-
-        astra_turn_core::fork_capture::restore_fork_flag_raw_for_tests(prev);
     }
 
     // ── Unhappy path: extraction HTTP error with prefix still reports correctly ──
@@ -2030,24 +1950,17 @@ mod tests {
         };
         let prefix = make_test_prefix("gpt-4o", "openai");
 
-        let (prev, mut ext) = {
-            let _lock = astra_turn_core::fork_capture::FORK_FLAG_TEST_MUTEX
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let prev = astra_turn_core::fork_capture::set_fork_flag_for_tests(true);
-            let mut ext = MemoryExtractor::new();
-            let _ = ext.maybe_extract(ExtractionContext {
-                turn: 1,
-                selector_params: Some(&params),
-                user_message: "test",
-                assistant_response: "ok",
-                tools_used: &[],
-                session_id: None,
-                existing_manifest: "",
-                fork_prefix: Some(prefix),
-            });
-            (prev, ext)
-        };
+        let mut ext = MemoryExtractor::new();
+        let _ = ext.maybe_extract(ExtractionContext {
+            turn: 1,
+            selector_params: Some(&params),
+            user_message: "test",
+            assistant_response: "ok",
+            tools_used: &[],
+            session_id: None,
+            existing_manifest: "",
+            fork_prefix: Some(prefix),
+        });
 
         let result = ext.drain(std::time::Duration::from_secs(5)).await;
 
@@ -2060,8 +1973,6 @@ mod tests {
             }
             other => panic!("expected Error, got: {other:?}"),
         }
-
-        astra_turn_core::fork_capture::restore_fork_flag_raw_for_tests(prev);
     }
 
     // ── Verify prefix_reused=false in non-prefix path ──────────────────
