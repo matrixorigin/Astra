@@ -60,29 +60,80 @@ use tokio_stream::StreamExt;
 use event::{TuiEvent, TuiEventStream};
 use frame_requester::FrameRequester;
 
-/// Build the lines shown in the viewport above the composer.
-/// Order of preference:
-/// 1. Live `active_cell` on the ChatWidget (assistant streaming,
-///    tool running, etc.) — use its own `display_lines`.
-/// 2. Otherwise the `StatusIndicator`'s render (one-line
-///    "✶ Thinking …" style signal when a turn is in progress).
-/// 3. Otherwise empty — idle REPL shows nothing above the
+/// What the active-cell area should render this frame. Encodes the
+/// visual-hierarchy grammar that distinguishes the three layers the
+/// user sees at any moment:
+///
+/// - **Settled** (not represented here) — committed `HistoryCell`s
+///   already painted to terminal scrollback. Flat, no border.
+/// - **Active** — something's happening right now. Rendered inside
+///   a bordered box in the viewport so it's visually distinct from
+///   scrollback. `ActiveKind` picks the border colour by what's
+///   running: blue for a tool, pink for assistant streaming,
+///   dim-grey for a bare reasoning preview.
+/// - **Status** — a one-line indicator (`✶ Thinking …`) when we
+///   have a turn in flight but no cell content yet. No border —
+///   the cue is the spinner, not the frame.
+pub(crate) enum ActiveView {
+    Empty,
+    Status(ratatui::text::Line<'static>),
+    Active {
+        kind: ActiveKind,
+        lines: Vec<ratatui::text::Line<'static>>,
+    },
+}
+
+/// Pick the right border colour and title for the active cell.
+/// Mirrors the cell-type → palette mapping used elsewhere: tool
+/// output = blue (Cursor-style), assistant body = pink (the gutter
+/// colour). Reasoning gets the dim palette so thinking content
+/// doesn't visually compete with the tool / assistant it surrounds.
+pub(crate) enum ActiveKind {
+    Tool,
+    Assistant,
+    Reasoning,
+}
+
+/// Classify the active cell. `None` when the slot is empty.
+fn classify_active(cell: &dyn history_cell::HistoryCell) -> Option<ActiveKind> {
+    let any = cell.as_any_ref();
+    if any.is::<history_cell::tool::ToolCell>() {
+        Some(ActiveKind::Tool)
+    } else if any.is::<history_cell::assistant::AssistantCell>() {
+        Some(ActiveKind::Assistant)
+    } else if any.is::<history_cell::reasoning::ReasoningCell>() {
+        Some(ActiveKind::Reasoning)
+    } else {
+        None
+    }
+}
+
+/// Build the active-view description for the current frame. Order:
+///
+/// 1. `active_cell` present → `Active` with lines + kind so the
+///    caller can draw a bordered frame.
+/// 2. No active cell but the status indicator has content →
+///    `Status` line (spinner + short label, no frame).
+/// 3. Neither → `Empty`. Idle REPL shows nothing above the
 ///    composer.
-fn active_viewport_lines(
+fn active_viewport(
     chat_widget: &chat_widget::ChatWidget,
     status: &status_indicator::StatusIndicator,
     width: u16,
-) -> Vec<ratatui::text::Line<'static>> {
+) -> ActiveView {
     if let Some(cell) = chat_widget.active_cell() {
-        let lines = cell.display_lines(width);
+        // Reserve 2 cols for the frame border + 2 for padding.
+        let inner_w = width.saturating_sub(4).max(20);
+        let lines = cell.display_lines(inner_w);
         if !lines.is_empty() {
-            return lines;
+            let kind = classify_active(cell).unwrap_or(ActiveKind::Assistant);
+            return ActiveView::Active { kind, lines };
         }
     }
     if let Some(line) = status.render() {
-        return vec![line];
+        return ActiveView::Status(line);
     }
-    Vec::new()
+    ActiveView::Empty
 }
 
 /// Drain newly-committed cells from the widget and render each
@@ -420,7 +471,7 @@ pub(crate) async fn run_tui_repl(
 
                                 {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                    let lines = active_viewport(&chat_widget, &status_indicator, w);
                                     do_draw(&mut guard, lines, &mut bottom_pane)?;
                                 }
 
@@ -530,14 +581,14 @@ pub(crate) async fn run_tui_repl(
                                                             frame_requester.schedule_frame();
                                                             {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                    let lines = active_viewport(&chat_widget, &status_indicator, w);
                                     let _ = do_draw(&mut guard, lines, &mut bottom_pane);
                                 }
                                                         }
                                                         TuiEvent::Resize | TuiEvent::Draw => {
                                                             {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                    let lines = active_viewport(&chat_widget, &status_indicator, w);
                                     let _ = do_draw(&mut guard, lines, &mut bottom_pane);
                                 }
                                                         }
@@ -570,7 +621,7 @@ pub(crate) async fn run_tui_repl(
                                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                                                     {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                    let lines = active_viewport(&chat_widget, &status_indicator, w);
                                     let _ = do_draw(&mut guard, lines, &mut bottom_pane);
                                 }
                                                 }
@@ -589,13 +640,13 @@ pub(crate) async fn run_tui_repl(
                                                     frame_requester.schedule_frame();
                                                     {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                    let lines = active_viewport(&chat_widget, &status_indicator, w);
                                     let _ = do_draw(&mut guard, lines, &mut bottom_pane);
                                 }
                                                 }
                                                 _ = &mut itick => {
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                                    let lines = active_viewport(&chat_widget, &status_indicator, w);
                                                     let _ = do_draw(&mut guard, lines, &mut bottom_pane);
                                                 }
                                             }
@@ -863,14 +914,14 @@ pub(crate) async fn run_tui_repl(
                         guard.terminal.invalidate_viewport();
                         {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                    let lines = active_viewport(&chat_widget, &status_indicator, w);
                                     do_draw(&mut guard, lines, &mut bottom_pane)?;
                                 }
                     }
                     TuiEvent::Draw => {
                         {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                    let lines = active_viewport_lines(&chat_widget, &status_indicator, w);
+                                    let lines = active_viewport(&chat_widget, &status_indicator, w);
                                     do_draw(&mut guard, lines, &mut bottom_pane)?;
                                 }
                     }
@@ -912,26 +963,49 @@ pub(crate) async fn run_tui_repl(
 
 pub(super) fn do_draw(
     guard: &mut TerminalGuard,
-    active_cell_lines: Vec<ratatui::text::Line<'static>>,
+    active: ActiveView,
     bottom_pane: &mut BottomPane,
 ) -> Result<(), String> {
+    use ratatui::widgets::{Block, Borders, Paragraph};
     use render::renderable::{FlexRenderable, Renderable, RenderableItem};
 
     bottom_pane.pre_draw_tick(std::time::Instant::now());
 
     let width = guard.terminal.size().map(|s| s.width).unwrap_or(80);
 
-    let ac_renderable: RenderableItem<'_> = if active_cell_lines.is_empty() {
-        RenderableItem::Owned(Box::new(()))
-    } else {
-        let text = ratatui::text::Text::from(active_cell_lines);
-        let para = ratatui::widgets::Paragraph::new(text);
-        // No top inset — the active cell butts up against the last
-        // scrollback line. A 1-row inset previously meant the
-        // running tool/thinking cell looked "floated" with a blank
-        // between it and scrollback, which then snapped closed once
-        // the cell flushed into scrollback (feeling janky).
-        RenderableItem::Owned(Box::new(para))
+    let ac_renderable: RenderableItem<'_> = match active {
+        ActiveView::Empty => RenderableItem::Owned(Box::new(())),
+        // Status line (spinner + "Thinking…") renders flush with
+        // scrollback — no frame, the spinner itself carries the
+        // "something's happening" signal.
+        ActiveView::Status(line) => {
+            let para = Paragraph::new(ratatui::text::Text::from(vec![line]));
+            RenderableItem::Owned(Box::new(para))
+        }
+        // Active cell gets a rounded bordered box in a colour that
+        // matches the cell kind, so the user sees "this is the live
+        // thing" at a glance — as opposed to the flat scrollback
+        // above. Cursor/Kiro style.
+        ActiveView::Active { kind, lines } => {
+            let theme = crate::tui::theme::current();
+            let (border_color, title) = match kind {
+                ActiveKind::Tool => (theme.accent, " tool "),
+                ActiveKind::Assistant => (theme.gutter, " assistant "),
+                ActiveKind::Reasoning => (theme.dim, " thinking "),
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(ratatui::style::Style::default().fg(border_color))
+                .title(ratatui::text::Span::styled(
+                    title.to_string(),
+                    ratatui::style::Style::default()
+                        .fg(border_color)
+                        .add_modifier(ratatui::style::Modifier::DIM),
+                ));
+            let para = Paragraph::new(ratatui::text::Text::from(lines)).block(block);
+            RenderableItem::Owned(Box::new(para))
+        }
     };
 
     // Thin dim separator between scrollback area and composer

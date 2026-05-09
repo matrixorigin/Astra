@@ -342,7 +342,11 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             ctx.bottom_pane.push_view(Box::new(
                 BusyView::new("Running SQL query…").with_title(" /table "),
             ));
-            let _ = crate::tui::do_draw(ctx.guard, Vec::new(), ctx.bottom_pane);
+            let _ = crate::tui::do_draw(
+                ctx.guard,
+                crate::tui::ActiveView::Empty,
+                ctx.bottom_pane,
+            );
 
             // `mo_query` shells out to the mysql client (blocking IO) —
             // park it on a blocking thread so we don't freeze the async
