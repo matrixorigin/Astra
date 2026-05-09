@@ -31,6 +31,8 @@ mod bridge;
 #[cfg(test)]
 mod turn_driver;
 
+pub(crate) use bridge::{TurnContext, translate};
+
 use std::sync::Arc;
 
 use super::history_cell::{

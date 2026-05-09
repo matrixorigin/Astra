@@ -264,6 +264,15 @@ pub(crate) async fn run_tui_repl(
     let mut active_cell: Option<Box<dyn ChatCell>> = None;
     let mut stream_controller: Option<StreamController> = None;
     let mut transcript: Vec<ratatui::text::Line<'static>> = Vec::new();
+    // Shadow ChatWidget — Phase 3 migration scaffolding. Every
+    // legacy handle_app_event call also feeds the translated
+    // AppEvent into here, so by the time Phase 3e swaps rendering
+    // to this widget the state is already correct + persisted.
+    // The sid starts empty (persistence becomes a no-op); we
+    // re-seat it once state.session_id lands.
+    let mut chat_widget = chat_widget::ChatWidget::new(
+        state.session_id.clone().unwrap_or_default(),
+    );
     let mut inject_submit: Option<String> = None;
 
     frame_requester.schedule_frame();
@@ -310,6 +319,15 @@ pub(crate) async fn run_tui_repl(
                         match bottom_pane.handle_key(key) {
                             BottomPaneAction::SubmitInput(text) if active_cell.is_none() => {
                                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                // Shadow: mirror the user submit into
+                                // ChatWidget so its history stays in
+                                // sync with legacy scrollback. Does
+                                // persistence (when sid is non-empty)
+                                // even though rendering still runs
+                                // through the legacy path.
+                                chat_widget.handle_event(
+                                    chat_widget::AppEvent::UserSubmit(text.clone()),
+                                );
                                 let user_cell = UserChatCell::new(text.clone());
                                 let user_lines = user_cell.display_lines(w);
                                 transcript.extend(user_cell.transcript_lines(w));
@@ -428,6 +446,15 @@ pub(crate) async fn run_tui_repl(
                                                         _ => {}
                                                     }
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                                    // Shadow mirror into ChatWidget.
+                                                    // Clone the event because handle_app_event
+                                                    // consumes it by value on the legacy path.
+                                                    if let Some(new_ev) = chat_widget::translate(
+                                                        ae.clone(),
+                                                        chat_widget::TurnContext::default(),
+                                                    ) {
+                                                        chat_widget.handle_event(new_ev);
+                                                    }
                                                     handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester, &mut transcript);
                                                     let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
                                                 }
@@ -472,6 +499,12 @@ pub(crate) async fn run_tui_repl(
                                                     }
                                                     _ => {}
                                                 }
+                                                if let Some(new_ev) = chat_widget::translate(
+                                                    ae.clone(),
+                                                    chat_widget::TurnContext::default(),
+                                                ) {
+                                                    chat_widget.handle_event(new_ev);
+                                                }
                                                 handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester, &mut transcript);
                                             }
                                         }
@@ -494,9 +527,15 @@ pub(crate) async fn run_tui_repl(
                                     }
 
                                     bottom_pane.set_task_status(TaskStatus::Idle);
-                                    if let Err(e) = turn_result {
-                                        let err = SystemChatCell::error(e);
+                                    if let Err(ref e) = turn_result {
+                                        let err = SystemChatCell::error(e.clone());
                                         guard.queue_history_lines(err.display_lines(w));
+                                        if let Some(ev) = chat_widget::translate(
+                                            TuiAppEvent::TurnError(e.clone()),
+                                            chat_widget::TurnContext::default(),
+                                        ) {
+                                            chat_widget.handle_event(ev);
+                                        }
                                     }
 
                                     // Update footer
@@ -531,6 +570,32 @@ pub(crate) async fn run_tui_repl(
                                             ratatui::text::Span::styled(summary, dim),
                                         );
                                         guard.queue_history_lines(vec![line, ratatui::text::Line::default()]);
+
+                                        // Shadow TurnComplete into
+                                        // ChatWidget with full stats so
+                                        // the mirrored history ends with
+                                        // a TurnSummaryCell matching the
+                                        // legacy scrollback band.
+                                        let ctx = chat_widget::TurnContext {
+                                            elapsed_ms: Some(elapsed.as_millis() as u64),
+                                            ttft_ms,
+                                            tokens_in: Some(turn_prompt + turn_cache_read + turn_cache_creation),
+                                            tokens_out: Some(turn_completion),
+                                            tools: turn_tool_count,
+                                            cumulative_tokens: Some(
+                                                state.total_prompt_tokens
+                                                    + state.total_completion_tokens
+                                                    + state.total_cache_read_tokens
+                                                    + state.total_cache_creation_tokens,
+                                            ),
+                                            cumulative_cost_usd: Some(state.total_session_cost),
+                                        };
+                                        if let Some(ev) = chat_widget::translate(
+                                            TuiAppEvent::TurnComplete,
+                                            ctx,
+                                        ) {
+                                            chat_widget.handle_event(ev);
+                                        }
                                     }
 
                                     let new_tok = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
@@ -684,6 +749,12 @@ pub(crate) async fn run_tui_repl(
             }
             Some(ae) = tui_rx.recv() => {
                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                if let Some(new_ev) = chat_widget::translate(
+                    ae.clone(),
+                    chat_widget::TurnContext::default(),
+                ) {
+                    chat_widget.handle_event(new_ev);
+                }
                 handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester, &mut transcript);
             }
             _ = &mut tick => {
