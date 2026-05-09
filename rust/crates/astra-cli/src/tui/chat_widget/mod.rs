@@ -27,6 +27,9 @@
 
 #![allow(dead_code)] // phase 3 plumbing; full wiring lands with the event-loop swap.
 
+#[cfg(test)]
+mod turn_driver;
+
 use std::sync::Arc;
 
 use super::history_cell::{
