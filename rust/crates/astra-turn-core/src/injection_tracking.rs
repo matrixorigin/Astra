@@ -28,6 +28,7 @@
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 
+use fnv::FnvHasher;
 use serde::{Deserialize, Serialize};
 
 /// Stable channel identifier. Add variants when new injection sources
@@ -91,7 +92,13 @@ impl InjectionFingerprint {
                 is_empty: true,
             };
         }
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // Use FNV (deterministic, cross-process stable) instead of
+        // std::collections::hash_map::DefaultHasher — DefaultHasher's
+        // SipHash seed varies per process, so an `InjectionHistory`
+        // serialized in one process and deserialized in another would
+        // report every channel as Fresh for one round because the
+        // newly-computed fingerprint would not match the persisted one.
+        let mut hasher = FnvHasher::default();
         trimmed.hash(&mut hasher);
         Self {
             hash: hasher.finish(),

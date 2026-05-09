@@ -26,6 +26,7 @@ chrono = { workspace = true }
 dashmap = "6.1.0"
 dirs = "6.0.0"
 fastrand = "2"
+fnv = "1.0"
 futures-util = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }

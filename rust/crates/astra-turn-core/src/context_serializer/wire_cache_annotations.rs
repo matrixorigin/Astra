@@ -219,7 +219,7 @@ fn find_cache_breakpoint_targets(messages: &[Value]) -> Vec<usize> {
             // so fall through to just `[tail]`.
             let historical_candidate = tail.checked_sub(2);
             let historical =
-                historical_candidate.filter(|&h| h > last_user && is_non_system(h) && h != tail);
+                historical_candidate.filter(|&h| h >= last_user && is_non_system(h) && h != tail);
             return match historical {
                 Some(h) => vec![h, tail],
                 None => vec![tail],
@@ -731,6 +731,31 @@ mod tests {
     /// When ALL messages after the last user are system msgs, no
     /// meaningful non-system tail exists in the tool-loop branch. Fall
     /// through to the normal branch which picks `last_user - 1`.
+    /// C2 regression: when a tool loop has executed exactly one
+    /// `(assistant_tc, tool)` pair after the last user msg, `tail = 2`
+    /// and the historical candidate `tail - 2 = 0` equals `last_user`.
+    /// The previous `h > last_user` filter dropped it, yielding `[tail]`
+    /// only — so the R1→R2 transition paid cache-creation tokens on the
+    /// user msg every first step of a tool loop. Accepting `h == last_user`
+    /// (the user msg itself) recovers that round: the user msg is stable
+    /// across rounds just like any other historical non-system frame.
+    #[test]
+    fn cache_breakpoint_first_tool_round_emits_historical_on_user_msg() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": null,
+                   "tool_calls": [{"id":"c1", "function":{"name":"git"}}]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "r1"}),
+        ];
+        annotate_last_message_cache_breakpoint(&mut msgs);
+        let marks = marker_indices(&msgs);
+        assert!(
+            marks.contains(&0) && marks.contains(&2),
+            "first-tool-round must mark historical=user(0) AND tail=tool_result(2); \
+             dropping historical wastes one round of cache_read. got {marks:?}",
+        );
+    }
+
     #[test]
     fn cache_breakpoint_all_trailing_system_falls_through_to_normal_branch() {
         let mut msgs = vec![
