@@ -799,9 +799,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     .and_then(Value::as_str)
                     .is_some_and(|c| c.starts_with(WORKING_SET_HEADER))
         });
-        let working_set_text = state
-            .session_facts
-            .to_working_set_injection(&state.message);
+        let working_set_text = state.session_facts.to_working_set_injection(&state.message);
         state.push_volatile(
             super::agentic_loop_host::VolatileKind::WorkingSet,
             working_set_text,
@@ -848,10 +846,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     state.stall.nudge_count as usize,
                 );
                 let nudge = reflection.to_nudge_message();
-                state.push_volatile(
-                    super::agentic_loop_host::VolatileKind::StallNudge,
-                    nudge,
-                );
+                state.push_volatile(super::agentic_loop_host::VolatileKind::StallNudge, nudge);
                 state.stall.nudge_count += 1;
                 if !quiet {
                     host.emit_headless_line(
@@ -1167,7 +1162,11 @@ mod tests {
             working_sets[0].kind,
             super::super::agentic_loop_host::VolatileKind::WorkingSet,
         );
-        assert!(working_sets[0].content.contains("goal: continue fixing context continuity"));
+        assert!(
+            working_sets[0]
+                .content
+                .contains("goal: continue fixing context continuity")
+        );
         assert!(working_sets[0].content.contains("- src/main.rs [write t1]"));
         // And messages[] must stay clean of working-set content.
         let msg_working_sets: Vec<_> = state

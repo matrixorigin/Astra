@@ -88,7 +88,7 @@ pub fn all_tool_schemas_with_env<F: Fn(&str) -> Option<String>>(env: F) -> Vec<V
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "PowerShell command to run"},
-                    "timeout": {"type": "number", "description": "Timeout in seconds (default 30)"}
+                    "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."}
                 },
                 "required": ["command"]
             }
@@ -127,7 +127,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run"},
-                        "timeout": {"type": "number", "description": "Timeout in seconds (default 30)"}
+                        "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites). Schema-code drift here costs a round when cargo times out unexpectedly."}
                     },
                     "required": ["command"]
                 }
@@ -708,5 +708,83 @@ mod tests {
                 "default executor exposes `{name}` but server_executor_tool_schemas() omits it"
             );
         }
+    }
+
+    // ── Session 0e37eb46 regression: bash/powershell schema-advertised
+    //    timeout defaults must match the actual code defaults ─────────
+    //
+    // The bash schema previously advertised "default 30" while the code
+    // default is 120s. The LLM read "30" from the schema and either
+    // (a) explicitly set timeout:30 and was surprised when cargo build
+    // took 40s, or (b) expected cargo builds to finish within a 30s
+    // mental deadline. Result: session 0e37eb46 r9 timed out at 30s,
+    // model added `timeout: 180` at r11 — one round burned on a
+    // schema-doc mismatch.
+    //
+    // The schemas must not lie. Lock: bash & powershell schemas must
+    // document the ACTUAL default (120s), and the description must
+    // hint that long-running commands (cargo, make, pytest, go test)
+    // should pass a larger explicit timeout.
+
+    fn find_schema<'a>(schemas: &'a [Value], name: &str) -> Option<&'a Value> {
+        schemas.iter().find(|s| {
+            s.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                == Some(name)
+        })
+    }
+
+    fn timeout_description(schema: &Value) -> &str {
+        schema
+            .pointer("/function/parameters/properties/timeout/description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    }
+
+    #[test]
+    fn bash_schema_timeout_default_matches_code_default() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let bash = find_schema(&schemas, "bash").expect("bash schema must exist");
+        let desc = timeout_description(bash);
+        assert!(
+            desc.contains("120"),
+            "bash schema must document the REAL default timeout (120s) — got {desc:?}. \
+             Drift between schema and code burns a round per session when the LLM \
+             hits unexpected timeout (session 0e37eb46 r9)."
+        );
+        assert!(
+            !desc.contains("default 30"),
+            "bash schema must NOT advertise default=30 when the code default is 120s"
+        );
+    }
+
+    #[test]
+    fn bash_schema_hints_to_extend_timeout_for_long_commands() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let bash = find_schema(&schemas, "bash").expect("bash schema must exist");
+        let desc = timeout_description(bash);
+        // Presence of at least ONE of these signal tokens tells the
+        // model "bump timeout for slow commands" without the schema
+        // over-prescribing which tools are slow.
+        let has_hint = ["cargo", "build", "test", "long"]
+            .iter()
+            .any(|kw| desc.to_lowercase().contains(kw));
+        assert!(
+            has_hint,
+            "bash schema should hint that cargo/test/build-style commands \
+             need a larger explicit timeout — got {desc:?}"
+        );
+    }
+
+    #[test]
+    fn powershell_schema_timeout_default_matches_code_default() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let ps = find_schema(&schemas, "powershell").expect("powershell schema must exist");
+        let desc = timeout_description(ps);
+        assert!(
+            desc.contains("120"),
+            "powershell schema must document the REAL default (120s), got {desc:?}"
+        );
     }
 }

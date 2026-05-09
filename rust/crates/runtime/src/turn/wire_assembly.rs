@@ -1086,7 +1086,9 @@ mod tests {
         // turns remain.
         assert_eq!(msgs.len(), 6); // system + q1/a1/a2/a3 + latest user
         for m in &msgs {
-            let Some(c) = m.get("content").and_then(Value::as_str) else { continue };
+            let Some(c) = m.get("content").and_then(Value::as_str) else {
+                continue;
+            };
             assert!(
                 !c.starts_with("⚠ The following tools have failed"),
                 "no tool_health_warning msg may remain in-place: {c}",
@@ -1106,12 +1108,20 @@ mod tests {
             json!({"role": "system", "content": "## Already Fetched (do NOT re-read/re-grep these)\nsrc/main.rs"}),
         ];
         let preamble = consolidate_mid_history_volatile_injections(&mut msgs);
-        assert!(preamble.contains("[working-set:v1]"), "working-set preserved");
-        assert!(preamble.contains("## Already Fetched"), "already-fetched preserved");
+        assert!(
+            preamble.contains("[working-set:v1]"),
+            "working-set preserved"
+        );
+        assert!(
+            preamble.contains("## Already Fetched"),
+            "already-fetched preserved"
+        );
         // Trailing system msgs gone.
         assert_eq!(msgs.len(), 4);
         for m in &msgs {
-            let Some(c) = m.get("content").and_then(Value::as_str) else { continue };
+            let Some(c) = m.get("content").and_then(Value::as_str) else {
+                continue;
+            };
             assert!(
                 !c.starts_with("[working-set:v1]") && !c.starts_with("## Already Fetched"),
                 "runtime-injected system msgs must be stripped: {c}",
@@ -1128,8 +1138,14 @@ mod tests {
             json!({"role": "user", "content": "next"}),
         ];
         let preamble = consolidate_mid_history_volatile_injections(&mut msgs);
-        assert!(preamble.contains("✓ 2 tools executed"), "coaching preserved");
-        assert!(preamble.contains("⚠ You have been"), "stall nudge preserved");
+        assert!(
+            preamble.contains("✓ 2 tools executed"),
+            "coaching preserved"
+        );
+        assert!(
+            preamble.contains("⚠ You have been"),
+            "stall nudge preserved"
+        );
         assert_eq!(msgs.len(), 2); // q + next
     }
 
@@ -1144,7 +1160,10 @@ mod tests {
             json!({"role": "user", "content": "double check"}),
         ];
         let preamble = consolidate_mid_history_volatile_injections(&mut msgs);
-        assert!(preamble.is_empty(), "no volatile injections → empty preamble");
+        assert!(
+            preamble.is_empty(),
+            "no volatile injections → empty preamble"
+        );
         assert_eq!(msgs.len(), 5, "real conversation msgs preserved verbatim");
     }
 

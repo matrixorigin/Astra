@@ -310,14 +310,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 for name in host.valid_tool_names() {
                     state.restricted_tools.insert(name.clone());
                 }
-                let msg = round_budget_phase1_message(
-                    state.llm_rounds_completed,
-                    &state.message,
-                );
-                state.push_volatile(
-                    super::agentic_loop_host::VolatileKind::BudgetAdvisory,
-                    msg,
-                );
+                let msg = round_budget_phase1_message(state.llm_rounds_completed, &state.message);
+                state.push_volatile(super::agentic_loop_host::VolatileKind::BudgetAdvisory, msg);
                 tracing::warn!(
                     target: "astra::loop_guard",
                     tier = "circuit_breaker_correction",
@@ -392,10 +386,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     state.llm_rounds_completed,
                     consecutive_read_only,
                 );
-                state.push_volatile(
-                    super::agentic_loop_host::VolatileKind::CircuitBreaker,
-                    msg,
-                );
+                state.push_volatile(super::agentic_loop_host::VolatileKind::CircuitBreaker, msg);
                 tracing::info!(
                     target: "astra::loop_guard",
                     tier = "circuit_breaker_introspect",
@@ -417,14 +408,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             astra_turn_core::loop_circuit_breaker::BreakerAction::SoftStop if suppress_nudges => {}
             astra_turn_core::loop_circuit_breaker::BreakerAction::SoftStop => {
                 state.stall.forced_completion_soft_stop = true;
-                let msg = completion_soft_stop_message(
-                    state.llm_rounds_completed,
-                    &state.message,
-                );
-                state.push_volatile(
-                    super::agentic_loop_host::VolatileKind::CircuitBreaker,
-                    msg,
-                );
+                let msg = completion_soft_stop_message(state.llm_rounds_completed, &state.message);
+                state.push_volatile(super::agentic_loop_host::VolatileKind::CircuitBreaker, msg);
                 tracing::info!(
                     target: "astra::loop_guard",
                     tier = "completion_soft_stop",
@@ -455,10 +440,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     {
         state.stall.forced_exploration_family_phase2 = true;
         let msg = exploration_family_phase2_message(&family, &blocked_tools, &state.message);
-        state.push_volatile(
-            super::agentic_loop_host::VolatileKind::Corrective,
-            msg,
-        );
+        state.push_volatile(super::agentic_loop_host::VolatileKind::Corrective, msg);
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "exploration_family_phase2",
@@ -495,10 +477,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         );
         state.stall.forced_redundant_reads_corrective = true;
         let msg = redundant_reads_corrective_message(count, &state.message);
-        state.push_volatile(
-            super::agentic_loop_host::VolatileKind::Corrective,
-            msg,
-        );
+        state.push_volatile(super::agentic_loop_host::VolatileKind::Corrective, msg);
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "redundant_reads_corrective",
@@ -526,10 +505,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         let wasteful = cache_wasteful_tools(state, cache_waste_threshold);
         state.stall.forced_cache_waste_corrective = true;
         let msg = cache_waste_corrective_message(&wasteful, &state.message);
-        state.push_volatile(
-            super::agentic_loop_host::VolatileKind::Corrective,
-            msg,
-        );
+        state.push_volatile(super::agentic_loop_host::VolatileKind::Corrective, msg);
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "cache_waste_corrective",
@@ -561,11 +537,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     {
         let restricted = apply_exploration_family_restrictions(state, &family);
         state.stall.forced_exploration_family_corrective = true;
-        let msg = exploration_family_corrective_message(&family, streak, &restricted, &state.message);
-        state.push_volatile(
-            super::agentic_loop_host::VolatileKind::Corrective,
-            msg,
-        );
+        let msg =
+            exploration_family_corrective_message(&family, streak, &restricted, &state.message);
+        state.push_volatile(super::agentic_loop_host::VolatileKind::Corrective, msg);
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "exploration_family_corrective",
@@ -2289,6 +2263,31 @@ async fn handle_token_budget<H: AgenticLoopHost>(
             state
                 .compaction_effectiveness
                 .record_compaction(total_freed);
+            // Session 0e37eb46 regression: after compaction shreds the
+            // history, the model sees a much-shorter context and often
+            // misreads it as "I've been interrupted" → produces a
+            // progress summary instead of continuing. Inject a short
+            // directive that reframes it as "the runtime compressed
+            // your history; CONTINUE the task — do NOT summarize."
+            //
+            // Observable: stderr line above ("♻ Context pressure…")
+            // shows the compaction fired; this push_volatile adds the
+            // behavioural counter-directive to the volatile lane.
+            // Recoverable: if a future user wants the old behaviour,
+            // the volatile is singleton per turn and never persisted.
+            // Correctable: `compaction_injects_resume_directive_on_volatile_lane`
+            // test locks the contract.
+            state.push_volatile(
+                super::agentic_loop_host::VolatileKind::CompactResume,
+                "Context compacted: the runtime just compressed your older \
+                 conversation history to reduce token pressure. Your \
+                 original task and the most recent tool activity are \
+                 still above — CONTINUE the task where you left off. \
+                 Do NOT summarize progress or ask the user to restate \
+                 the goal. If the previous attempt left a failing test \
+                 or an error, FIX IT next. Treat this compaction as a \
+                 transparent runtime event, not an instruction to stop.",
+            );
             state.budget_wrapup_injected = true;
             try_write_heavy_checkpoint(state);
             return Some(TurnExecutionControl::ContinueLoop);

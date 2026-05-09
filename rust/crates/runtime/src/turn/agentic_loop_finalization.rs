@@ -538,6 +538,14 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     // Clear tool restrictions injected by exploration-family correctives so
     // they don't leak into the next user turn.
     state.restricted_tools.clear();
+    // Task #43 wrap-up state also belongs to the just-completed turn —
+    // next user turn starts fresh. Without this reset, the lockout/abort
+    // hybrid in `agentic_loop_tool_phase::execute_tool_phase` short-
+    // circuits on the first round of the new turn (because
+    // `budget_wrapup_injected` is still true from the previous turn),
+    // which was exactly the stale-state bug the code-review called out.
+    state.budget_wrapup_injected = false;
+    state.budget_wrapup_ignored_rounds = 0;
 }
 
 /// Build a synthetic JournalEvent from the current turn's tool_call_records
@@ -985,6 +993,11 @@ mod tests {
         state.stall.exploration_family_corrective_family = Some("diff".into());
         state.restricted_tools.insert("git_diff".into());
         state.restricted_tools.insert("git_log".into());
+        // Task #43 wrap-up hybrid state: must also reset across turns
+        // so the NEXT user turn doesn't see a stale "already-wrapped-up"
+        // shortcut. Code-review called this out as Important #3.
+        state.budget_wrapup_injected = true;
+        state.budget_wrapup_ignored_rounds = 2;
 
         finalize_and_render(&mut host, &mut state).await;
 
@@ -1009,6 +1022,17 @@ mod tests {
         assert!(
             state.restricted_tools.is_empty(),
             "restricted_tools must be cleared across turns"
+        );
+        assert!(
+            !state.budget_wrapup_injected,
+            "budget_wrapup_injected must reset after a turn finalizes — \
+             otherwise the NEXT turn's first round short-circuits on stale state"
+        );
+        assert_eq!(
+            state.budget_wrapup_ignored_rounds, 0,
+            "budget_wrapup_ignored_rounds must reset to 0 per turn; \
+             otherwise Task #43 hybrid abort triggers too early on the \
+             next turn"
         );
     }
 

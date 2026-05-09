@@ -2602,6 +2602,57 @@ fn sigkill_process_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+/// Adaptive default bash timeout by command kind. Used when the caller
+/// omits the `timeout` field. Session 0e37eb46 regression: cargo builds
+/// on this workspace routinely take 40-90s and the previous
+/// "everything else = 30s" catch-all guaranteed a first-call timeout
+/// that burned one LLM round per cargo/make/pytest invocation.
+///
+/// Tier ladder (matches the operator intuition "the longer a tool
+/// takes to produce useful output, the more patience we should give
+/// it before assuming it's stuck"):
+///
+///   * **5s**   — instant: `echo`, `pwd`, `whoami`, `date`, …
+///   * **10s**  — fast reads: `cat`, `head`, `tail`, `ls`, `stat`, …
+///   * **15s**  — search/traversal: `grep`, `find`, `rg`, `sed`, …
+///   * **120s** — build / test / compile / package-install commands
+///     (tier 5, added 2026-05-09). `cargo`, `make`, `go`, `mvn`,
+///     `gradle`, `pytest`, `pnpm`, `yarn`, `npm`, `pip`, `uv`, `cmake`,
+///     `tox`. Defaults high enough that typical clean builds on
+///     medium-sized workspaces complete; callers that KNOW a build
+///     will be longer pass an explicit `timeout`.
+///   * **30s**  — default for anything else (network, shell scripts
+///     the tiers don't recognize).
+pub(crate) fn default_bash_timeout_secs(command: &str) -> f64 {
+    let cmd_base = command.split_whitespace().next().unwrap_or("");
+    match cmd_base {
+        // Tier 1: instant — no real I/O
+        "echo" | "printf" | "true" | "false" | "pwd" | "whoami" | "date" | "basename"
+        | "dirname" | "which" | "env" | "hostname" | "uname" | "id" | "tty" | "nproc" | "arch"
+        | "yes" => 5.0,
+        // Tier 2: fast reads — single file or dir stat
+        "cat" | "head" | "tail" | "wc" | "stat" | "file" | "ls" | "readlink" | "realpath"
+        | "md5sum" | "sha256sum" | "du" | "df" | "touch" | "mkdir" | "cp" | "mv" | "rm" | "ln"
+        | "chmod" | "chown" => 10.0,
+        // Tier 3: search/traversal — scan many files but bounded
+        "grep" | "rg" | "find" | "fd" | "ag" | "awk" | "sed" | "sort" | "uniq" | "cut" | "tr"
+        | "diff" | "comm" | "xargs" | "tree" | "jq" | "yq" | "column" | "tee" => 15.0,
+        // Tier 5: build/test/package-install — compilation and full
+        // test suites on real workspaces routinely take 30s+. Pick
+        // 120s so the common case doesn't eat a wasted round on
+        // timeout-then-retry-with-larger-timeout.
+        "cargo" | "make" | "go" | "mvn" | "gradle" | "pytest" | "pnpm" | "yarn" | "npm" | "pip"
+        | "uv" | "cmake" | "tox" | "bazel" | "ninja" => 120.0,
+        // Tier 5b: container tooling — first-time image pulls / multi-stage
+        // builds routinely take 30s+ on cold caches. Same 120s floor so a
+        // `docker build`/`docker compose up` first run doesn't burn a
+        // round on timeout-then-retry.
+        "docker" | "podman" | "docker-compose" | "nerdctl" | "buildah" => 120.0,
+        // Tier 4: everything else (network, unrecognized scripts).
+        _ => 30.0,
+    }
+}
+
 /// Resolve the pipe-read timeout. Tests can shorten it via
 /// `set_test_bash_pipe_read_timeout` to avoid waiting the real 500ms.
 fn bash_pipe_read_timeout() -> Duration {
@@ -3290,33 +3341,11 @@ impl ToolExecutor {
         };
         let command: &str = &command;
 
-        // Use explicit timeout if provided, otherwise pick an adaptive default:
-        // Tier 1 (5s):  instant commands — no I/O beyond trivial reads
-        // Tier 2 (10s): fast read commands — cat, head, file stat
-        // Tier 3 (15s): search/traversal — grep, find, ripgrep
-        // Tier 4 (30s): everything else (build, test, network)
+        // Use explicit timeout if provided, otherwise pick an adaptive default.
         let timeout_secs = args
             .get("timeout")
             .and_then(Value::as_f64)
-            .unwrap_or_else(|| {
-                let cmd_base = command.split_whitespace().next().unwrap_or("");
-                match cmd_base {
-                    // Tier 1: instant — no real I/O
-                    "echo" | "printf" | "true" | "false" | "pwd" | "whoami" | "date"
-                    | "basename" | "dirname" | "which" | "env" | "hostname" | "uname" | "id"
-                    | "tty" | "nproc" | "arch" | "yes" => 5.0,
-                    // Tier 2: fast reads — single file or dir stat
-                    "cat" | "head" | "tail" | "wc" | "stat" | "file" | "ls" | "readlink"
-                    | "realpath" | "md5sum" | "sha256sum" | "du" | "df" | "touch" | "mkdir"
-                    | "cp" | "mv" | "rm" | "ln" | "chmod" | "chown" => 10.0,
-                    // Tier 3: search/traversal — scan many files but bounded
-                    "grep" | "rg" | "find" | "fd" | "ag" | "awk" | "sed" | "sort" | "uniq"
-                    | "cut" | "tr" | "diff" | "comm" | "xargs" | "tree" | "jq" | "yq"
-                    | "column" | "tee" => 15.0,
-                    // Tier 4: everything else (compilation, network, etc.)
-                    _ => 30.0,
-                }
-            });
+            .unwrap_or_else(|| default_bash_timeout_secs(command));
 
         // Sandbox path boundary check for bash commands.
         // If the sandbox is active, extract file path arguments from the command
@@ -4180,6 +4209,93 @@ mod tests {
         let executor = test_executor();
         let result = executor.bash(&serde_json::json!({"command": "sleep 10", "timeout": 0.2}));
         assert!(result.contains("timed out"), "got: {result}");
+    }
+
+    // ── Session 0e37eb46 regression: cargo/make/test commands must
+    //    get a generous default timeout, not the 30s fall-through ──
+
+    #[test]
+    fn default_bash_timeout_for_cargo_is_at_least_120s() {
+        // cargo builds on real Rust workspaces routinely take 40-90s.
+        // The previous 30s fall-through timed out r9 of session
+        // 0e37eb46 and burned one LLM round on a retry with explicit
+        // timeout. Minimum 120s keeps typical first-calls from timing
+        // out; callers that KNOW a build will be longer pass their own
+        // larger value.
+        assert!(
+            default_bash_timeout_secs("cargo build -p astra-runtime") >= 120.0,
+            "cargo builds need ≥ 120s default (session 0e37eb46 regression)"
+        );
+        assert!(default_bash_timeout_secs("cargo test --lib") >= 120.0);
+        assert!(default_bash_timeout_secs("cargo check") >= 120.0);
+        assert!(default_bash_timeout_secs("cargo clippy --workspace") >= 120.0);
+    }
+
+    #[test]
+    fn default_bash_timeout_for_build_commands_is_at_least_120s() {
+        // Same invariant for other common slow tools.
+        for cmd in [
+            "make check",
+            "make test",
+            "go build ./...",
+            "go test ./...",
+            "pytest tests/",
+            "pnpm build",
+            "yarn test",
+            "npm install",
+            "pip install -r requirements.txt",
+            "gradle build",
+            "mvn test",
+            "cmake --build .",
+        ] {
+            let t = default_bash_timeout_secs(cmd);
+            assert!(
+                t >= 120.0,
+                "`{cmd}` should get ≥ 120s default, got {t}s (session 0e37eb46 regression)"
+            );
+        }
+    }
+
+    #[test]
+    fn default_bash_timeout_for_quick_commands_stays_short() {
+        // Non-regression: we're raising build defaults, not globally
+        // loosening everything. Instant commands must still get 5s,
+        // reads 10s, search 15s. Too-long defaults on quick commands
+        // would mask infinite loops in trivial scripts.
+        assert_eq!(default_bash_timeout_secs("echo hello"), 5.0);
+        assert_eq!(default_bash_timeout_secs("pwd"), 5.0);
+        assert_eq!(default_bash_timeout_secs("ls -la"), 10.0);
+        assert_eq!(default_bash_timeout_secs("cat file.txt"), 10.0);
+        assert_eq!(default_bash_timeout_secs("grep -rn pattern ."), 15.0);
+        assert_eq!(default_bash_timeout_secs("find . -name '*.rs'"), 15.0);
+    }
+
+    #[test]
+    fn default_bash_timeout_for_container_tools_is_at_least_120s() {
+        // Docker/podman first-time pulls and multi-stage builds regularly
+        // exceed 30s. The previous 30s catch-all ate a round on every cold
+        // `docker build` / `docker compose up`.
+        for cmd in [
+            "docker build .",
+            "docker compose up -d",
+            "docker-compose up",
+            "podman build -t foo .",
+            "nerdctl run alpine",
+            "buildah bud -t img .",
+        ] {
+            let t = default_bash_timeout_secs(cmd);
+            assert!(t >= 120.0, "`{cmd}` should get ≥ 120s default, got {t}s");
+        }
+    }
+
+    #[test]
+    fn default_bash_timeout_catchall_still_30s() {
+        // Unrecognized commands continue to fall through to 30s. We
+        // don't want to over-broaden the "slow" tier to unknown
+        // shell scripts — those might be infinite loops.
+        assert_eq!(default_bash_timeout_secs("./my_custom_script.sh"), 30.0);
+        assert_eq!(default_bash_timeout_secs("curl https://example.com"), 30.0);
+        assert_eq!(default_bash_timeout_secs(""), 30.0);
     }
 
     #[test]

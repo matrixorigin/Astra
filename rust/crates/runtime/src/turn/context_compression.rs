@@ -168,6 +168,54 @@ fn affected_turn_indices(range: std::ops::Range<usize>) -> Vec<u32> {
     turns
 }
 
+/// True when `msg` is a real task-carrying user message — NOT an
+/// OpenAI/Anthropic-style synthetic tool_result frame that happens to
+/// use `role=user`.
+///
+/// Providers encode tool outputs two ways:
+///   1. `role=tool` with `tool_call_id` + string content (OpenAI native)
+///   2. `role=user` with `content` as an array of `{type:"tool_result"...}`
+///      blocks (Anthropic/Bedrock converse on the wire, and some adapters
+///      surface this shape in `messages[]`)
+///
+/// For task-pivot selection in compaction we MUST reject shape #2: picking
+/// a tool_result user frame as the "most recent user query" re-introduces
+/// session 15ac2cf5's loss-of-task-context bug on providers that emit it.
+/// Sentinel prefixes used by runtime-synthesized `role=user` messages that
+/// are NOT real user task queries. Picking one of these as the
+/// "most-recent user" pivot reintroduces 15ac2cf5's loss-of-context bug
+/// because the task-carrying msg earlier in the drop range gets
+/// silently dropped while a stub survives.
+///
+/// Keep in sync with:
+///   * `astra-turn-core::headless_tool_assembly` cache-hit rewriter
+///     (prefix: `(cached`)
+///   * duplicate-call stub (`(duplicate call`)
+const SYNTHETIC_USER_SENTINELS: &[&str] = &["(cached", "(duplicate call"];
+
+fn is_plain_user_task_message(msg: &Value) -> bool {
+    if msg.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    match msg.get("content") {
+        // Plain string content = real user message — but reject
+        // runtime-synthetic stubs (cache-hit replay / duplicate-call
+        // sentinels). See `SYNTHETIC_USER_SENTINELS` doc.
+        Some(v) if v.is_string() => v.as_str().is_some_and(|s| {
+            let t = s.trim_start();
+            !t.is_empty() && !SYNTHETIC_USER_SENTINELS.iter().any(|p| t.starts_with(p))
+        }),
+        // Array content: real only if NO block is a tool_result.
+        Some(v) if v.is_array() => v.as_array().is_some_and(|blocks| {
+            !blocks.is_empty()
+                && blocks
+                    .iter()
+                    .all(|b| b.get("type").and_then(Value::as_str) != Some("tool_result"))
+        }),
+        _ => false,
+    }
+}
+
 /// Seconds since UNIX epoch, for timestamp comparisons.
 fn epoch_secs_now() -> u64 {
     SystemTime::now()
@@ -479,9 +527,74 @@ impl CompressionLayer for TieredCompaction {
             return CompressionResult::default();
         }
 
-        let dropped = &messages[head_end..tail_start];
-        let removed_count = tail_start - head_end;
-        let affected_turns = affected_turn_indices(head_end..tail_start);
+        // Session 15ac2cf5 regression: in a multi-turn conversation where
+        // the current turn opens a long tool loop, keeping only
+        // `[system, first_user]` + `last keep_tail msgs` severs the link
+        // between tool activity and the user's actual question. The
+        // agent at r19 saw `[system, "hi"(turn 1), boundary, 4 tool
+        // scratch msgs]` with no clue what it was working on and
+        // hallucinated "bash 被吞了".
+        //
+        // Fix: also preserve the MOST RECENT user message in the drop
+        // range — BUT only when keep_tail's first msg is NOT already a
+        // plain user frame (otherwise inserting a user pivot right
+        // before another user frame would create consecutive-user-roles
+        // which Bedrock rejects). When keep_tail already starts with a
+        // real user msg, that msg IS effectively the current turn's
+        // opening — no separate pivot needed.
+        //
+        // Important: a leading `tool` frame is NOT a substitute for a
+        // user pivot (a tool_result cannot root the turn's user intent)
+        // and a `user` frame whose content is a synthetic cache-hit
+        // stub (`(cached …)` / `(duplicate call …)`) also cannot —
+        // otherwise we'd drop the real user query and leave the model
+        // anchored to a replay stub (regression from session
+        // `synthetic_cache_hit_user_stub_is_not_picked_as_pivot`).
+        let tail_starts_with_real_user = messages
+            .get(tail_start)
+            .is_some_and(is_plain_user_task_message);
+
+        let pivot_idx = if tail_starts_with_real_user {
+            None
+        } else {
+            messages[head_end..tail_start]
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, m)| is_plain_user_task_message(m))
+                .map(|(i, _)| head_end + i)
+        };
+
+        let dropped: Vec<&Value> = match pivot_idx {
+            Some(p) => messages[head_end..p]
+                .iter()
+                .chain(messages[p + 1..tail_start].iter())
+                .collect(),
+            None => messages[head_end..tail_start].iter().collect(),
+        };
+        let removed_count = dropped.len();
+        if removed_count == 0 {
+            return CompressionResult::default();
+        }
+        // When a pivot is preserved, its own turn index must NOT be
+        // counted as "removed" in the boundary metadata (code-review
+        // Important #2: the naive head_end..tail_start range includes
+        // the pivot and over-reports by one turn).
+        let affected_turns = match pivot_idx {
+            Some(p) => {
+                let pivot_turn = (p / 2) as u32;
+                let mut t = affected_turn_indices(head_end..p);
+                t.extend(affected_turn_indices(p + 1..tail_start));
+                // The pivot survives compaction — its turn index must
+                // NOT be reported as "removed" even if an adjacent
+                // dropped message shares the same turn bucket (idx/2).
+                t.retain(|&tidx| tidx != pivot_turn);
+                t.sort_unstable();
+                t.dedup();
+                t
+            }
+            None => affected_turn_indices(head_end..tail_start),
+        };
 
         let freed_tokens: usize = dropped
             .iter()
@@ -530,7 +643,31 @@ impl CompressionLayer for TieredCompaction {
             "_turns_removed": turns_removed,
         });
 
-        messages.splice(head_end..tail_start, std::iter::once(boundary));
+        match pivot_idx {
+            Some(p) => {
+                // Two-chunk splice: drop `[head_end..p)`, keep pivot,
+                // drop `[p+1..tail_start)`. Process HIGH-TO-LOW so the
+                // first splice doesn't shift the pivot index `p` used
+                // by the second splice.
+                //
+                // ⚠ ORDER-SENSITIVE: flipping these two lines makes the
+                // first splice at `head_end..p` shift indices right of
+                // `head_end` leftward, so `p+1..tail_start` then points
+                // at the wrong (or out-of-bounds) range and the pivot
+                // itself gets dropped / garbage gets kept. A
+                // regression test pins the post-compact shape; see
+                // `tiered_splice_order_preserves_pivot_content`.
+                debug_assert!(
+                    head_end <= p && p < tail_start,
+                    "splice ordering invariant broken: head_end={head_end}, p={p}, tail_start={tail_start}"
+                );
+                messages.splice(p + 1..tail_start, std::iter::empty::<Value>());
+                messages.splice(head_end..p, std::iter::once(boundary));
+            }
+            None => {
+                messages.splice(head_end..tail_start, std::iter::once(boundary));
+            }
+        }
 
         CompressionResult {
             messages_removed: removed_count,
@@ -581,9 +718,52 @@ impl CompressionLayer for ReactiveCompact {
             return CompressionResult::default();
         }
 
-        let dropped = &messages[head_end..tail_start];
-        let removed_count = tail_start - head_end;
-        let affected_turns = affected_turn_indices(head_end..tail_start);
+        // Same 15ac2cf5 pivot-preservation logic as TieredCompaction:
+        // keep the most-recent user msg so the model retains its task
+        // context. Skip when keep_tail already starts with a user/tool
+        // msg to avoid creating consecutive-user pairs.
+        let tail_starts_with_user_like = messages
+            .get(tail_start)
+            .and_then(|m| m.get("role"))
+            .and_then(Value::as_str)
+            .is_some_and(|r| r == "user" || r == "tool");
+        let pivot_idx = if tail_starts_with_user_like {
+            None
+        } else {
+            messages[head_end..tail_start]
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, m)| is_plain_user_task_message(m))
+                .map(|(i, _)| head_end + i)
+        };
+
+        let dropped: Vec<&Value> = match pivot_idx {
+            Some(p) => messages[head_end..p]
+                .iter()
+                .chain(messages[p + 1..tail_start].iter())
+                .collect(),
+            None => messages[head_end..tail_start].iter().collect(),
+        };
+        let removed_count = dropped.len();
+        if removed_count == 0 {
+            return CompressionResult::default();
+        }
+        // Same fix as TieredCompaction: the pivot's turn index must NOT
+        // be reported as "removed" when the pivot survives compaction
+        // (code-review Important #2).
+        let affected_turns = match pivot_idx {
+            Some(p) => {
+                let pivot_turn = (p / 2) as u32;
+                let mut t = affected_turn_indices(head_end..p);
+                t.extend(affected_turn_indices(p + 1..tail_start));
+                t.retain(|&tidx| tidx != pivot_turn);
+                t.sort_unstable();
+                t.dedup();
+                t
+            }
+            None => affected_turn_indices(head_end..tail_start),
+        };
         let turns_removed = affected_turns.len();
 
         let freed_tokens: usize = dropped
@@ -606,7 +786,21 @@ impl CompressionLayer for ReactiveCompact {
             "_turns_removed": turns_removed,
         });
 
-        messages.splice(head_end..tail_start, std::iter::once(boundary));
+        match pivot_idx {
+            Some(p) => {
+                // Same high-to-low splice ordering as TieredCompaction.
+                // See that method for the full rationale.
+                debug_assert!(
+                    head_end <= p && p < tail_start,
+                    "reactive splice ordering invariant broken: head_end={head_end}, p={p}, tail_start={tail_start}"
+                );
+                messages.splice(p + 1..tail_start, std::iter::empty::<Value>());
+                messages.splice(head_end..p, std::iter::once(boundary));
+            }
+            None => {
+                messages.splice(head_end..tail_start, std::iter::once(boundary));
+            }
+        }
 
         CompressionResult {
             messages_removed: removed_count,
@@ -1348,6 +1542,407 @@ mod tests {
     }
 
     #[test]
+    fn tiered_preserves_current_turn_user_query_in_multi_turn_session() {
+        // Session 15ac2cf5 regression: the user had 6 turns of conversation,
+        // compaction fired mid-turn-7 during a long tool loop, and dropped
+        // EVERY user query except the very first one ("hi" from turn 1).
+        // The agent at r19 lost its task context and gave up with
+        // "bash 被吞了" even though tool results had real content.
+        //
+        // Expectation: the CURRENT turn's user query (the most recent
+        // non-synthetic user msg) must survive compaction. Without this,
+        // the agent cannot know what it was working on after compaction.
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            // Turn 1: the original chat-opener ("hi"), kept by legacy
+            // first-user protection.
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "Hi! What's up?"}),
+            // Turns 2-6: prior questions. Legacy compaction loses these.
+            // That's OK — the conversation already moved on.
+            json!({"role": "user", "content": "review uncommitted changes"}),
+            json!({"role": "assistant", "content": "sure"}),
+            json!({"role": "user", "content": "follow up"}),
+            json!({"role": "assistant", "content": "ok"}),
+            json!({"role": "user", "content": "yes, do it all"}),
+            json!({"role": "assistant", "content": "doing"}),
+            json!({"role": "user", "content": "what went wrong earlier?"}),
+            json!({"role": "assistant", "content": "explaining"}),
+            json!({"role": "user", "content": "why?"}),
+            json!({"role": "assistant", "content": "because"}),
+            // Turn 7 (CURRENT): the task the agent is actually working on.
+            // This MUST survive compaction or the agent gives up at r19.
+            json!({"role": "user", "content": "CURRENT TURN TASK: diagnose the cache drop"}),
+        ];
+        // Add a long tool loop for the current turn, enough to force tiered
+        // compaction under pressure.
+        for i in 0..20 {
+            msgs.push(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call_{i}"),
+                    "function": {"name": "bash", "arguments": "{}"}
+                }]
+            }));
+            msgs.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("call_{i}"),
+                "content": format!("tool output {i} {}", "x".repeat(300)),
+            }));
+        }
+
+        let b = budget(80_000, 70_000);
+        // keep_recent_turns=2 in TieredCompaction = keep 4 tail msgs. With
+        // 20 tool-loop iterations (40 msgs) appended after the current
+        // turn's user query, the user query is 40 msgs from the tail —
+        // well outside keep_tail=4. Only legacy first-user protection
+        // (msg[1]="hi") keeps that one alive. The current task at msg[13]
+        // is in the drop range.
+        let result = TieredCompaction::new(2, 0.0).compress(&mut msgs, &b);
+        assert!(
+            result.messages_removed > 0,
+            "precondition: compaction must have dropped some messages"
+        );
+
+        // CRITICAL: the current turn's user query must still be present
+        // as an ACTUAL role=user message (not just quoted inside a
+        // compaction-boundary summary). The boundary summary has
+        // `role=system` and "Dropped user queries: - CURRENT TURN TASK…"
+        // text, which does NOT restore the agent's context — the LLM
+        // reads it as "this is what was dropped" and still can't proceed.
+        let has_current_task_as_user_msg = msgs.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("user")
+                && m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains("CURRENT TURN TASK"))
+        });
+        assert!(
+            has_current_task_as_user_msg,
+            "current turn's user query must survive compaction AS A role=user \
+             message (session 15ac2cf5 regression). Legacy behavior puts it \
+             inside the boundary summary's \"Dropped user queries\" list, \
+             which is cosmetic — the model still has no task context. \
+             msgs after compaction ({} msgs):\n{}",
+            msgs.len(),
+            msgs.iter()
+                .enumerate()
+                .map(|(i, m)| format!(
+                    "  [{i}] role={:?} content[:80]={:?}",
+                    m.get("role").and_then(Value::as_str),
+                    m.get("content")
+                        .and_then(Value::as_str)
+                        .map(|s| &s[..s.len().min(80)])
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn tiered_pivot_preservation_does_not_create_consecutive_user_msgs() {
+        // Edge case for the 15ac2cf5 fix: when keep_tail's first msg is
+        // already a user msg, naively inserting the pivot right before
+        // the tail would create user+user → Bedrock HTTP 400.
+        //
+        // Build a session where the most-recent user msg is IN the drop
+        // range AND keep_tail's first msg is also a user (turn just
+        // finishing: assistant,user). The pivot we pick should be the
+        // one adjacent to keep_tail (not producing a user+user pair).
+        // Easiest way to ensure this: pivot is the IMMEDIATELY-preceding
+        // user, and since the very next msg in keep_tail was an assistant
+        // reply to THAT pivot, we're fine.
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "original first user"}),
+            json!({"role": "assistant", "content": "a0"}),
+        ];
+        // Middle turns that will be compacted away.
+        for i in 0..8 {
+            msgs.push(json!({"role": "user", "content": format!("q{i}")}));
+            msgs.push(json!({"role": "assistant", "content": format!("a{i}")}));
+        }
+        // Recent turns forming keep_tail (keep_recent_turns=2 → last 4 msgs):
+        // Tail shape is user, assistant, user, assistant.
+        msgs.push(json!({"role": "user", "content": "tail q1"}));
+        msgs.push(json!({"role": "assistant", "content": "tail a1"}));
+        msgs.push(json!({"role": "user", "content": "tail q2"}));
+        msgs.push(json!({"role": "assistant", "content": "tail a2"}));
+
+        let b = budget(80_000, 70_000);
+        let result = TieredCompaction::new(2, 0.0).compress(&mut msgs, &b);
+        assert!(result.messages_removed > 0);
+
+        // No two consecutive user/tool msgs anywhere (Bedrock/Anthropic
+        // alternation rule). role=system in the boundary is OK — the
+        // Bedrock transport (`build_bedrock_messages`) hoists system out
+        // before sending, and the merge pass collapses any remaining
+        // user+user into one. But we want the pre-transport shape to
+        // already be clean so the matrix protocol assertion doesn't fire.
+        let roles: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| m.get("role").and_then(Value::as_str))
+            .collect();
+        for window in roles.windows(2) {
+            let both_user = (window[0] == "user" || window[0] == "tool")
+                && (window[1] == "user" || window[1] == "tool");
+            assert!(
+                !both_user,
+                "consecutive user/tool after compaction: roles={roles:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tiered_splice_order_preserves_pivot_content() {
+        // Regression pin for the ORDER-SENSITIVE two-chunk splice in
+        // `TieredCompaction::compress`:
+        //   messages.splice(p + 1..tail_start, empty);   // high range first
+        //   messages.splice(head_end..p, once(boundary)); // low range second
+        //
+        // If a future refactor flips these two lines, the first splice at
+        // `head_end..p` shifts every index > head_end leftward; the second
+        // splice at `p+1..tail_start` then operates on a wrong (or out-of-
+        // bounds) range. Net effect: pivot message gets dropped or garbage
+        // survives. Debug builds now additionally `debug_assert!` the
+        // invariant before splicing, but that fires on malformed input —
+        // this test pins the post-compact OUTPUT so a silent wrong-order
+        // refactor surfaces as a content assertion, not just a panic.
+        //
+        // Scenario: pivot carries a UNIQUE marker string. After compact,
+        // that marker must survive as a `role=user` plain-string message.
+        const PIVOT_MARKER: &str = "🔑PIVOT_UNIQUE_MARKER_DO_NOT_DROP🔑";
+
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "first user (protected)"}),
+            json!({"role": "assistant", "content": "hello"}),
+        ];
+        // Middle turns destined for the drop range. The LAST plain-string
+        // user message in this block is the pivot — it must survive with
+        // its marker intact.
+        for i in 0..6 {
+            msgs.push(json!({"role": "user", "content": format!("mid-q{i}")}));
+            msgs.push(json!({"role": "assistant", "content": format!("mid-a{i}")}));
+        }
+        // The pivot: most-recent plain-string user in the drop range.
+        msgs.push(json!({"role": "user", "content": PIVOT_MARKER}));
+        msgs.push(json!({"role": "assistant", "content": "ack"}));
+        // A tool loop between pivot and tail, so the drop range is
+        // non-trivial on BOTH sides of the pivot (head_end < p AND
+        // p+1 < tail_start). This is what exercises the two-splice path.
+        for i in 0..10 {
+            msgs.push(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call_{i}"),
+                    "function": {"name": "bash", "arguments": "{}"},
+                }],
+            }));
+            msgs.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("call_{i}"),
+                "content": format!("tool out {i} {}", "x".repeat(400)),
+            }));
+        }
+        // Recent tail (kept intact): 2 turn-pairs. Tail MUST NOT start
+        // with a user/tool msg — otherwise `tail_starts_with_user_like`
+        // short-circuits `pivot_idx` to None and we never exercise the
+        // ORDER-SENSITIVE two-splice branch this test is meant to pin.
+        // Start with assistant so the pivot-preservation path runs.
+        msgs.push(json!({"role": "assistant", "content": "tail a0"}));
+        msgs.push(json!({"role": "user", "content": "tail q1"}));
+        msgs.push(json!({"role": "assistant", "content": "tail a1"}));
+        msgs.push(json!({"role": "user", "content": "tail q2"}));
+
+        let b = budget(80_000, 70_000);
+        let result = TieredCompaction::new(2, 0.0).compress(&mut msgs, &b);
+        assert!(
+            result.messages_removed > 0,
+            "precondition: compaction must actually run"
+        );
+
+        // The pivot's unique marker MUST still be present as a
+        // role=user plain-string message. If splice order was flipped,
+        // the pivot itself got dropped and this marker disappears.
+        let pivot_survived = msgs.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("user")
+                && m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains(PIVOT_MARKER))
+        });
+        assert!(
+            pivot_survived,
+            "pivot content was dropped — splice ordering likely flipped. \
+             Surviving msgs:\n{}",
+            msgs.iter()
+                .enumerate()
+                .map(|(i, m)| format!(
+                    "  [{i}] role={:?} content={:?}",
+                    m.get("role").and_then(Value::as_str),
+                    match m.get("content") {
+                        Some(v) if v.is_string() => v
+                            .as_str()
+                            .map(|s| s.chars().take(50).collect::<String>())
+                            .unwrap_or_default(),
+                        Some(v) if v.is_array() => "<array>".into(),
+                        Some(v) if v.is_null() => "<null>".into(),
+                        _ => "<other>".into(),
+                    }
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        // And the pivot should appear EXACTLY once — flipping the splice
+        // order could also leave a stale copy behind in the tail region.
+        let marker_count = msgs
+            .iter()
+            .filter(|m| {
+                m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains(PIVOT_MARKER))
+            })
+            .count();
+        assert_eq!(
+            marker_count, 1,
+            "pivot marker must appear exactly once after compact, got {marker_count}"
+        );
+    }
+
+    #[test]
+    fn reactive_splice_order_preserves_pivot_content() {
+        // Mirror of `tiered_splice_order_preserves_pivot_content` for
+        // the ReactiveCompact emergency tier, which shares the same
+        // ORDER-SENSITIVE two-splice pattern. Flipping the two splice
+        // lines in `ReactiveCompact::compress` drops the pivot; this
+        // test pins the output shape.
+        const PIVOT_MARKER: &str = "🔑REACTIVE_PIVOT_MARKER🔑";
+
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "first user"}),
+            json!({"role": "assistant", "content": "hi"}),
+        ];
+        for i in 0..4 {
+            msgs.push(json!({"role": "user", "content": format!("mid-q{i}")}));
+            msgs.push(json!({"role": "assistant", "content": format!("mid-a{i}")}));
+        }
+        msgs.push(json!({"role": "user", "content": PIVOT_MARKER}));
+        msgs.push(json!({"role": "assistant", "content": "ack"}));
+        for i in 0..8 {
+            msgs.push(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("rc_call_{i}"),
+                    "function": {"name": "bash", "arguments": "{}"},
+                }],
+            }));
+            msgs.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("rc_call_{i}"),
+                "content": format!("rc tool out {i} {}", "x".repeat(400)),
+            }));
+        }
+        // ReactiveCompact keeps system + first_user + last 4 msgs.
+        // Tail's first msg MUST be non-user/tool so the pivot-
+        // preservation path actually runs (same reason as the tiered
+        // test above).
+        msgs.push(json!({"role": "assistant", "content": "tail a0"}));
+        msgs.push(json!({"role": "user", "content": "last q"}));
+        msgs.push(json!({"role": "assistant", "content": "last a"}));
+        msgs.push(json!({"role": "user", "content": "really last q"}));
+
+        let b = budget(80_000, 79_000); // force reactive to fire
+        let result = ReactiveCompact::new(0.0).compress(&mut msgs, &b);
+        assert!(
+            result.messages_removed > 0,
+            "precondition: reactive compaction must actually run"
+        );
+
+        let pivot_survived = msgs.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("user")
+                && m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains(PIVOT_MARKER))
+        });
+        assert!(
+            pivot_survived,
+            "reactive pivot dropped — splice ordering likely flipped"
+        );
+    }
+
+    #[test]
+    fn synthetic_cache_hit_user_stub_is_not_picked_as_pivot() {
+        // Regression pin for the `(cached …)` / `(duplicate call …)`
+        // sentinel filter in `is_plain_user_task_message`. The
+        // `headless_tool_assembly` rewriter emits plain-string user
+        // frames that start with these prefixes to represent a replayed
+        // cache hit. Those frames are NOT real user queries — picking
+        // one as the pivot would reintroduce 15ac2cf5's task-loss bug.
+        const REAL_TASK: &str = "CURRENT TASK: implement feature X";
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "first user (protected)"}),
+            json!({"role": "assistant", "content": "ok"}),
+            json!({"role": "user", "content": REAL_TASK}),
+            json!({"role": "assistant", "content": "starting"}),
+        ];
+        // Tool loop where each tool_result is followed by the
+        // synthetic `(cached …)` user stub (simulating replay).
+        for i in 0..10 {
+            msgs.push(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("cc_{i}"),
+                    "function": {"name": "bash", "arguments": "{}"},
+                }],
+            }));
+            msgs.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("cc_{i}"),
+                "content": format!("out {i}"),
+            }));
+            msgs.push(json!({
+                "role": "user",
+                "content": format!("(cached — replayed call #{i})"),
+            }));
+        }
+        // Tail = assistant-only continuation of the tool loop. We
+        // deliberately do NOT include a fresh non-synthetic user msg
+        // here — the scenario under test is exactly the one where the
+        // only non-synthetic user frame IS `REAL_TASK`, and every
+        // subsequent user-role entry is a `(cached …)` stub. If the
+        // sentinel filter regresses, `rev().find(...)` will latch onto
+        // the newest `(cached …)` frame, `REAL_TASK` will be spliced
+        // out, and the assertion below fires.
+        msgs.push(json!({"role": "assistant", "content": "tail a"}));
+        msgs.push(json!({"role": "assistant", "content": "tail a2"}));
+
+        let b = budget(80_000, 70_000);
+        let result = TieredCompaction::new(2, 0.0).compress(&mut msgs, &b);
+        assert!(result.messages_removed > 0);
+
+        // The real task must survive; the `(cached …)` stubs are not
+        // valid pivots.
+        let real_task_survived = msgs.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("user")
+                && m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains(REAL_TASK))
+        });
+        assert!(
+            real_task_survived,
+            "real user task was dropped in favour of a `(cached …)` \
+             synthetic stub — sentinel filter in \
+             is_plain_user_task_message regressed"
+        );
+    }
+
+    #[test]
     fn tiered_noop_when_too_few_messages() {
         let mut msgs = vec![
             json!({"role": "system", "content": "sys"}),
@@ -1363,7 +1958,9 @@ mod tests {
     fn tiered_keep_recent_turns_means_turn_pairs() {
         // keep_recent_turns=3 should keep 3 turn pairs (6 messages: 3 user + 3 assistant).
         // 10 turns = system(1) + first_user(1) + 10*(user+assistant) = 22 messages.
-        // After compaction: system(1) + first_user(1) + boundary(1) + 6 = 9.
+        // After compaction (post-15ac2cf5-fix): the most-recent user msg
+        // in the drop range is also preserved as a pivot.
+        //   system(1) + first_user(1) + boundary(1) + pivot_user(1) + 6 tail = 10
         let mut msgs = vec![
             json!({"role": "system", "content": "sys"}),
             json!({"role": "user", "content": "first task"}),
@@ -1375,11 +1972,10 @@ mod tests {
         let b = budget(80_000, 70_000);
         TieredCompaction::new(3, 0.0).compress(&mut msgs, &b);
 
-        // system + first_user + boundary + 3 turn pairs (6 messages) = 9
         assert_eq!(
             msgs.len(),
-            9,
-            "keep_recent_turns=3 should keep 3 turn pairs (6 msgs)"
+            10,
+            "expected system + first_user + boundary + pivot_user + 6 tail"
         );
     }
 
@@ -1401,7 +1997,8 @@ mod tests {
         let outcome = pipeline.compress_if_needed(&mut msgs, &b);
 
         // With default preserve_recent_turns=3, after TieredCompaction the
-        // tail should have 6 messages (3 turn pairs).
+        // tail should have 6 messages (3 turn pairs) PLUS 1 preserved
+        // pivot user msg (session 15ac2cf5 fix) = 7 total after boundary.
         let had_tiered = outcome
             .layer_results
             .iter()
@@ -1413,14 +2010,121 @@ mod tests {
                 .expect("boundary must exist");
             let tail_messages = msgs.len() - boundary_idx - 1;
             assert_eq!(
-                tail_messages, 6,
-                "default pipeline should keep 3 turn pairs (6 messages), got {}",
+                tail_messages, 7,
+                "default pipeline should keep 3 turn pairs (6 msgs) + 1 pivot user msg, got {}",
                 tail_messages
+            );
+            // Confirm the pivot msg sits immediately after the boundary.
+            assert_eq!(
+                msgs[boundary_idx + 1].get("role").and_then(Value::as_str),
+                Some("user"),
+                "pivot user msg must sit right after the boundary so the \
+                 agent sees its current task before tool scratch"
             );
         }
     }
 
     // ── Layer 4: ReactiveCompact ───────────────────────────────────────
+
+    #[test]
+    fn reactive_preserves_current_turn_user_query() {
+        // Mirror of `tiered_preserves_current_turn_user_query_in_multi_turn_session`
+        // for the ReactiveCompact emergency tier.
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hi back"}),
+            json!({"role": "user", "content": "review changes"}),
+            json!({"role": "assistant", "content": "sure"}),
+            json!({"role": "user", "content": "CURRENT TURN TASK"}),
+        ];
+        for i in 0..20 {
+            msgs.push(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("c_{i}"),
+                    "function": {"name": "bash", "arguments": "{}"}
+                }]
+            }));
+            msgs.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("c_{i}"),
+                "content": format!("out {i} {}", "x".repeat(300)),
+            }));
+        }
+        let b = budget(80_000, 85_000);
+        ReactiveCompact::new(0.95).compress(&mut msgs, &b);
+
+        let current_task_as_user = msgs.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("user")
+                && m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains("CURRENT TURN TASK"))
+        });
+        assert!(
+            current_task_as_user,
+            "ReactiveCompact must also preserve current-turn user query pivot"
+        );
+    }
+
+    #[test]
+    fn reactive_turns_removed_metadata_excludes_preserved_pivot_turn() {
+        // Twin of `tiered_turns_removed_metadata_excludes_preserved_pivot_turn`
+        // for the emergency-tier path. ReactiveCompact used to share
+        // the same `affected_turn_indices(head_end..tail_start)` bug —
+        // the pivot's own turn was double-counted as "removed".
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "a0"}),
+        ];
+        // Six middle turn pairs.
+        for i in 0..6 {
+            msgs.push(json!({"role": "user", "content": format!("q{i}")}));
+            msgs.push(json!({"role": "assistant", "content": format!("a{i}")}));
+        }
+        msgs.push(json!({"role": "user", "content": "PIVOT"}));
+        // Tool-loop tail: (assistant_tc, tool). ReactiveCompact's
+        // `keep_tail = 4` ⇒ tail_start = len - 4. Push 4 tail msgs,
+        // none of which start with role=user, so pivot preservation fires.
+        msgs.push(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id":"c1","function":{"name":"bash","arguments":"{}"}}]
+        }));
+        msgs.push(json!({"role": "tool", "tool_call_id": "c1", "content": "out1"}));
+        msgs.push(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id":"c2","function":{"name":"bash","arguments":"{}"}}]
+        }));
+        msgs.push(json!({"role": "tool", "tool_call_id": "c2", "content": "out2"}));
+
+        let b = budget(80_000, 85_000);
+        ReactiveCompact::new(0.0).compress(&mut msgs, &b);
+
+        let boundary = msgs
+            .iter()
+            .find(|m| m.get("_compact_boundary").is_some())
+            .expect("boundary must be inserted");
+        let reported = boundary
+            .get("_turns_removed")
+            .and_then(Value::as_u64)
+            .expect("_turns_removed");
+        let pivot_survived = msgs.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("user")
+                && m.get("content").and_then(Value::as_str) == Some("PIVOT")
+        });
+        assert!(pivot_survived, "precondition: pivot preserved");
+        // Naive over head_end..tail_start covers turns {1..=7} = 7.
+        // With pivot's turn removed → must be < 7.
+        assert!(
+            reported < 7,
+            "ReactiveCompact _turns_removed={reported} must exclude the \
+             preserved pivot's turn (naive=7)"
+        );
+    }
 
     #[test]
     fn reactive_keeps_system_first_user_and_last_4() {
@@ -1430,12 +2134,20 @@ mod tests {
 
         ReactiveCompact::new(0.95).compress(&mut msgs, &b);
 
-        // system(1) + first_user(1) + boundary(1) + last 4 = 7
-        assert_eq!(msgs.len(), 7, "expected 7 messages after reactive compact");
+        // system(1) + first_user(1) + boundary(1) + pivot_user(1) + last 4 = 8
+        // Pivot is the 15ac2cf5 fix: preserve most-recent user msg so the
+        // agent doesn't lose its current-task context.
+        assert_eq!(
+            msgs.len(),
+            8,
+            "expected 8 messages after reactive compact (system + first_user + boundary + pivot + 4 tail)"
+        );
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[1]["role"], "user");
         assert_eq!(msgs[1]["content"].as_str().unwrap(), original_first_user);
         assert!(msgs[2]["content"].as_str().unwrap().contains("EMERGENCY"));
+        // Pivot is the current-task user msg preserved by the fix.
+        assert_eq!(msgs[3]["role"], "user");
     }
 
     // ── Realistic end-to-end scenarios ─────────────────────────────────
@@ -1778,6 +2490,209 @@ mod tests {
         // Should still have system + first user + boundary + last 4
         assert!(msgs.len() >= 4);
         assert_eq!(msgs[0]["role"], "system");
+    }
+
+    #[test]
+    fn tiered_turns_removed_metadata_excludes_preserved_pivot_turn() {
+        // Code-review Important #2: `affected_turns` is computed over
+        // `head_end..tail_start`, which INCLUDES the pivot index. When
+        // we splice the pivot back in (it survives compaction), the
+        // boundary's `_turns_removed` / summary counts it as removed,
+        // which is wrong — the model will read "N turns removed" where
+        // one of those turns is literally still visible.
+        //
+        // Expectation: when a pivot is preserved, `_turns_removed` in
+        // the boundary metadata equals the dedup'd turn count of the
+        // ACTUALLY-dropped indices (head_end..p ∪ p+1..tail_start), NOT
+        // head_end..tail_start.
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "a0"}),
+        ];
+        // 6 middle turn pairs — these are the "naive" drop range.
+        for i in 0..6 {
+            msgs.push(json!({"role": "user", "content": format!("q{i}")}));
+            msgs.push(json!({"role": "assistant", "content": format!("a{i}")}));
+        }
+        // PIVOT must be the LAST plain-user msg in the drop range so
+        // `find().rev()` picks it. Place it BEFORE keep_tail so the
+        // pivot-preservation branch actually fires — keep_recent_turns=1
+        // ⇒ keep_tail=2 ⇒ tail_start = len-2, so the last 2 msgs are
+        // preserved as tail and the pivot must sit at the position
+        // right before them. With 1 tail pair (user+assistant) after
+        // PIVOT, the tail start lands on the tail user msg and
+        // `tail_starts_user_like` is true — exactly the branch where
+        // the fix needs the preserved pivot NOT double-counted.
+        msgs.push(json!({"role": "user", "content": "PIVOT"}));
+        msgs.push(json!({"role": "assistant", "content": "pivot-reply"}));
+        // One tail pair: this is what keep_recent_turns=1 preserves.
+        msgs.push(json!({"role": "user", "content": "tail-u0"}));
+        msgs.push(json!({"role": "assistant", "content": "tail-a0"}));
+
+        // Layout summary (indices):
+        //   0  system
+        //   1  user "hi"          (first_user, protected up to head_end=2)
+        //   2  assistant a0       ← head_end, first dropped idx
+        //   3..=14  six (user,assistant) pairs → naive turns {1..=7}
+        //   15 user "PIVOT"       ← selected pivot (turn = 15/2 = 7)
+        //   16 assistant pivot-reply
+        //   17 user "tail-u0"     ← tail_start (keep_tail = 1*2 = 2)
+        //   18 assistant tail-a0
+        // len = 19, tail_start = 19 - 2 = 17.
+        // msg[17].role == "user" → tail_starts_user_like = true, which
+        // SKIPS pivot preservation. To force pivot preservation we need
+        // the tail to start with role=assistant instead. Swap the tail
+        // layout.
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "a0"}),
+        ];
+        for i in 0..6 {
+            msgs.push(json!({"role": "user", "content": format!("q{i}")}));
+            msgs.push(json!({"role": "assistant", "content": format!("a{i}")}));
+        }
+        // PIVOT at odd index to match the "turn = idx/2" convention.
+        msgs.push(json!({"role": "user", "content": "PIVOT"}));
+        // A tool-loop continuation: keep_tail=2 msgs, BOTH non-user so
+        // `tail_starts_user_like` is false and pivot preservation fires.
+        // Shape `(assistant_tc, tool_result)` mimics real tool-loop tails.
+        msgs.push(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id":"c1","function":{"name":"bash","arguments":"{}"}}]
+        }));
+        msgs.push(json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}));
+
+        // Indices after restructure:
+        //   0  system
+        //   1  user "hi"          (first_user, head_end = 2)
+        //   2  assistant a0
+        //   3..=14  six (user,assistant) pairs
+        //   15 user "PIVOT"       ← pivot (turn = 7)
+        //   16 assistant (tc)     ← tail_start (keep_tail=2)
+        //   17 tool
+        // len = 18, tail_start = 18-2 = 16.
+        // msg[16].role = "assistant" → tail_starts_user_like = false →
+        // pivot preservation fires. Naive turns over [head_end=2, 16):
+        //   indices {2..=15} → turn buckets {1,2,3,4,5,6,7} = 7.
+        // Fix must drop turn 7 (the pivot) → 6.
+
+        let b = budget(80_000, 70_000);
+        let _ = TieredCompaction::new(1, 0.0).compress(&mut msgs, &b);
+
+        let boundary = msgs
+            .iter()
+            .find(|m| m.get("_compact_boundary").is_some())
+            .expect("boundary must be inserted");
+        let reported_turns_removed = boundary
+            .get("_turns_removed")
+            .and_then(Value::as_u64)
+            .expect("_turns_removed must be present");
+        let pivot_still_present = msgs.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("user")
+                && m.get("content").and_then(Value::as_str) == Some("PIVOT")
+        });
+        assert!(pivot_still_present, "precondition: pivot preserved");
+        let naive_count = 7u64; // turns covered by [head_end, tail_start)
+        assert!(
+            reported_turns_removed < naive_count,
+            "_turns_removed={reported_turns_removed} must exclude the preserved \
+             pivot's turn (naive={naive_count})"
+        );
+    }
+
+    #[test]
+    fn tiered_pivot_skips_openai_style_tool_result_user_frame() {
+        // Code-review Critical #1: OpenAI-style encodings (and some
+        // Anthropic-compatible frames) represent tool_results as
+        // `role=user` with `content` carrying a tool_result block. If
+        // the most-recent `role=user` message in the drop range is such
+        // a synthetic frame, the naive `find(role==user)` picks the
+        // tool_result as the pivot — and the REAL task query (a
+        // plain-string user message earlier in the same drop range)
+        // stays lost. That reintroduces session 15ac2cf5's
+        // "bash 被吞了" symptom on providers that emit tool_result
+        // user frames.
+        //
+        // Expectation: pivot selection must prefer a plain-string user
+        // message — tool_result-shape frames are NOT valid task pivots.
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "hi"}), // first_user protected
+            json!({"role": "assistant", "content": "Hi!"}),
+            // Real task query — a plain-string user message. MUST be
+            // selected as the pivot.
+            json!({"role": "user", "content": "CURRENT TURN TASK: diagnose the cache drop"}),
+            // Assistant decides to call a tool.
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "call_x", "function": {"name": "bash", "arguments": "{}"}}],
+            }),
+            // OpenAI-style tool_result: `role=user` carrying a
+            // structured tool_result block in `content`. A naive pivot
+            // selector would pick THIS as the "most recent user" and
+            // splice a tool_result back in as the pivot while losing
+            // the real task query above.
+            json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_x",
+                    "content": "synthetic tool output",
+                }],
+            }),
+        ];
+        // Long trailing tool loop to force the real task query well
+        // outside keep_tail.
+        for i in 0..20 {
+            msgs.push(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call_{i}"),
+                    "function": {"name": "bash", "arguments": "{}"},
+                }],
+            }));
+            msgs.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("call_{i}"),
+                "content": format!("tool output {i} {}", "y".repeat(300)),
+            }));
+        }
+
+        let b = budget(80_000, 70_000);
+        let result = TieredCompaction::new(2, 0.0).compress(&mut msgs, &b);
+        assert!(result.messages_removed > 0, "precondition: some removal");
+
+        let has_real_task_as_user_msg = msgs.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("user")
+                && m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains("CURRENT TURN TASK"))
+        });
+        assert!(
+            has_real_task_as_user_msg,
+            "pivot must prefer plain-string user query over tool_result \
+             user frame (code-review Critical #1). msgs:\n{}",
+            msgs.iter()
+                .enumerate()
+                .map(|(i, m)| format!(
+                    "  [{i}] role={:?} content-shape={}",
+                    m.get("role").and_then(Value::as_str),
+                    match m.get("content") {
+                        Some(v) if v.is_string() =>
+                            format!("str({:?})", v.as_str().map(|s| &s[..s.len().min(40)])),
+                        Some(v) if v.is_array() => "array".to_string(),
+                        Some(v) if v.is_null() => "null".to_string(),
+                        _ => "other".to_string(),
+                    }
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     #[test]

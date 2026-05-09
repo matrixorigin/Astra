@@ -855,7 +855,11 @@ mod tests {
         );
         assert_eq!(
             trailing_identical_sig_depth(&make_sigs(&[
-                &["bash"], &["bash"], &["bash"], &["bash"], &["bash"],
+                &["bash"],
+                &["bash"],
+                &["bash"],
+                &["bash"],
+                &["bash"],
             ])),
             5,
         );
@@ -865,9 +869,7 @@ mod tests {
     fn trailing_identical_sig_depth_resets_on_different_last() {
         // 3 identical then a different call → depth is 1 (just the last).
         assert_eq!(
-            trailing_identical_sig_depth(&make_sigs(&[
-                &["bash"], &["bash"], &["bash"], &["git"],
-            ])),
+            trailing_identical_sig_depth(&make_sigs(&[&["bash"], &["bash"], &["bash"], &["git"],])),
             1,
         );
     }

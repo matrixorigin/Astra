@@ -162,6 +162,18 @@ impl AgenticLoopHost for SubRunHost {
                 }
             }));
 
+        // Session c47c2dca regression fix: drain runtime volatile lane so
+        // stall nudges / circuit-breaker / budget advisories reach the
+        // LLM on subrun paths too. Using `_appended_to` keeps the
+        // outgoing payload protocol-valid (no consecutive role=user
+        // pairs → no Bedrock HTTP 400).
+        let augmented_messages: Option<Vec<serde_json::Value>> =
+            state.take_volatile_pending_appended_to(state.messages.clone());
+        let messages_slice: &[serde_json::Value] = match augmented_messages.as_ref() {
+            Some(vec) => vec.as_slice(),
+            None => state.messages.as_slice(),
+        };
+
         let effective_model = state
             .skills
             .model_override
@@ -175,7 +187,7 @@ impl AgenticLoopHost for SubRunHost {
             .extend(interaction_scoped_restrictions.iter().cloned());
 
         let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
-            messages: &state.messages,
+            messages: messages_slice,
             session_id: state.current_session_id.as_deref(),
             agent_id: Some(self.agent_id.as_str()),
             model: effective_model,
@@ -620,6 +632,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: SUBRUN_MAX_CUMULATIVE_TOKENS,
@@ -841,5 +854,38 @@ mod tests {
     #[test]
     fn cli_subrun_max_cumulative_tokens_is_exactly_120_000() {
         assert_eq!(SUBRUN_MAX_CUMULATIVE_TOKENS, 120_000);
+    }
+
+    // Session c47c2dca regression guard. Same invariant as
+    // `cli_loop_host::tests::execute_turn_drains_volatile_lane_into_outgoing_messages`
+    // but for the skill-subrun path (sub-agents also run the stall
+    // detection machinery and their nudges must reach their LLM too).
+    #[test]
+    fn subrun_execute_turn_drains_volatile_lane() {
+        // Session c47c2dca regression guard. Same shape as
+        // `cli_loop_host::tests::execute_turn_drains_volatile_lane_into_outgoing_messages`
+        // but for skill-subrun. Split the expected method name so this
+        // test's literals don't self-match.
+        let source = include_str!("skill_subrun.rs");
+        // Look for the protocol-safe call syntax (`.method(`) assembled
+        // via concat! so this test literal can't self-match. Do not
+        // quote the call form verbatim anywhere in this test body.
+        let safe_call = concat!(".take_volatile_pending", "_appended_to(");
+        assert!(
+            source.contains(safe_call),
+            "skill_subrun::execute_turn must invoke the protocol-safe \
+             drain method so runtime nudges reach the subrun LLM \
+             (session c47c2dca regression + consecutive-user guard)."
+        );
+        assert!(
+            source.contains("augmented.push(msg)"),
+            "skill_subrun::execute_turn must append the drained volatile \
+             msg to a local clone of state.messages"
+        );
+        assert!(
+            source.contains("messages_slice"),
+            "skill_subrun::execute_turn must pass an augmented messages_slice \
+             to chat_turn_base_payload, not raw &state.messages"
+        );
     }
 }

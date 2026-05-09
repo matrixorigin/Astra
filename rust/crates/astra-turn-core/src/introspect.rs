@@ -369,8 +369,7 @@ fn preview_line(text: &str, max: usize) -> String {
     let one_line: String = text
         .lines()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .next()
+        .find(|s| !s.is_empty())
         .unwrap_or("")
         .chars()
         .take(max)
@@ -517,35 +516,37 @@ mod tests {
 
     #[test]
     fn render_recent_rounds_tabulates_and_summarizes() {
-        let mut snap = IntrospectSnapshot::default();
-        snap.recent_rounds = vec![
-            RoundSnapshotEntry {
-                turn: 3,
-                round: 0,
-                provider: "anthropic".into(),
-                model: "claude".into(),
-                prompt_tokens: 100,
-                cache_read_tokens: 7000,
-                tool_calls_returned: 2,
-                tool_call_names: vec!["bash".into(), "read_file".into()],
-                duration_ms: 1500,
-                finish_reason: Some("tool_calls".into()),
-                ..Default::default()
-            },
-            RoundSnapshotEntry {
-                turn: 3,
-                round: 1,
-                provider: "anthropic".into(),
-                model: "claude".into(),
-                prompt_tokens: 200,
-                cache_read_tokens: 7300,
-                tool_calls_returned: 0,
-                tool_call_names: vec![],
-                duration_ms: 900,
-                finish_reason: Some("stop".into()),
-                ..Default::default()
-            },
-        ];
+        let snap = IntrospectSnapshot {
+            recent_rounds: vec![
+                RoundSnapshotEntry {
+                    turn: 3,
+                    round: 0,
+                    provider: "anthropic".into(),
+                    model: "claude".into(),
+                    prompt_tokens: 100,
+                    cache_read_tokens: 7000,
+                    tool_calls_returned: 2,
+                    tool_call_names: vec!["bash".into(), "read_file".into()],
+                    duration_ms: 1500,
+                    finish_reason: Some("tool_calls".into()),
+                    ..Default::default()
+                },
+                RoundSnapshotEntry {
+                    turn: 3,
+                    round: 1,
+                    provider: "anthropic".into(),
+                    model: "claude".into(),
+                    prompt_tokens: 200,
+                    cache_read_tokens: 7300,
+                    tool_calls_returned: 0,
+                    tool_call_names: vec![],
+                    duration_ms: 900,
+                    finish_reason: Some("stop".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
         let out = render_recent_rounds(&snap);
         assert!(out.contains("t3_r0"));
         assert!(out.contains("t3_r1"));
@@ -560,19 +561,21 @@ mod tests {
         let empty = IntrospectSnapshot::default();
         assert!(render_volatile_pending(&empty).contains("Empty"));
 
-        let mut snap = IntrospectSnapshot::default();
-        snap.volatile_pending = vec![
-            VolatileSnapshotEntry {
-                kind: "WorkingSet".into(),
-                content: "[working-set:v1]\ngoal: fix bug\nactive_files: src/foo.rs".into(),
-                round_index: 2,
-            },
-            VolatileSnapshotEntry {
-                kind: "StallNudge".into(),
-                content: "⚠ REFLECTION: same read_file 3 times in a row".into(),
-                round_index: 2,
-            },
-        ];
+        let snap = IntrospectSnapshot {
+            volatile_pending: vec![
+                VolatileSnapshotEntry {
+                    kind: "WorkingSet".into(),
+                    content: "[working-set:v1]\ngoal: fix bug\nactive_files: src/foo.rs".into(),
+                    round_index: 2,
+                },
+                VolatileSnapshotEntry {
+                    kind: "StallNudge".into(),
+                    content: "⚠ REFLECTION: same read_file 3 times in a row".into(),
+                    round_index: 2,
+                },
+            ],
+            ..Default::default()
+        };
         let out = render_volatile_pending(&snap);
         assert!(out.contains("WorkingSet"));
         assert!(out.contains("StallNudge"));

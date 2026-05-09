@@ -1463,6 +1463,19 @@ pub fn default_rules() -> Vec<EvolutionRule> {
         .with_cooldown(Duration::from_secs(600)),
         // ── Token/context-window surface ──
         // High token usage → reduce turn budget to prevent runaway
+        // cost. Session 0e37eb46 regression: the original parameters
+        // (−5000 per fire, 300s cooldown, 30k floor) spiraled the
+        // budget from 80k down to ~37k inside a single debug session,
+        // which fired compaction every few rounds and eventually
+        // left the model with too little working memory to continue.
+        //
+        // Tuned to be non-overkill:
+        //   • delta -2000: gentler descent, still converges.
+        //   • floor 60_000: leaves room for system + tool schemas +
+        //     a realistic tool-loop history even after the rule fires.
+        //   • cooldown 30min: prevents firing multiple times inside a
+        //     single long task, while still shrinking over a
+        //     multi-hour session with genuinely runaway usage.
         EvolutionRule::new(
             "high-tokens-reduce-budget",
             EvolutionTrigger::HighTokenUsage {
@@ -1472,13 +1485,13 @@ pub fn default_rules() -> Vec<EvolutionRule> {
             },
             EvolutionAction::AdjustConfig {
                 path: "token_budget.max_turn_input_tokens".to_string(),
-                delta: -5000.0,
-                min: Some(30_000.0),
+                delta: -2000.0,
+                min: Some(60_000.0),
                 max: None,
             },
         )
         .with_name("Reduce token budget on high usage")
-        .with_cooldown(Duration::from_secs(300)),
+        .with_cooldown(Duration::from_secs(1800)),
         // High token usage → also lower compression threshold to compress sooner
         EvolutionRule::new(
             "high-tokens-compress-earlier",
@@ -2541,5 +2554,94 @@ mod tests {
         engine.reset_streaming_speculation_stats();
         engine.record_streaming_speculation(25, 1, 0, 5);
         assert!(engine.should_disable_streaming_speculation());
+    }
+
+    // ── Session 0e37eb46 compaction-spiral regression guards ───────────
+    //
+    // Users hit a positive-feedback loop where repeated long turns fire
+    // `high-tokens-reduce-budget` enough times to shrink
+    // max_turn_input_tokens from 80k all the way to ~37k. At that point
+    // compaction fires every few rounds, the aggressive_pipeline keeps
+    // only 4 tail msgs, and the model loses enough working memory to
+    // give up with a "progress summary" instead of continuing.
+    //
+    // The rule MUST stay — runaway cost protection is real. But it has
+    // to be gentle enough that one heavy debug session doesn't wedge
+    // the user into an unrecoverable state. These tests lock the
+    // non-overkill parameters so a future refactor that accidentally
+    // restores the aggressive defaults fails loudly.
+
+    #[test]
+    fn high_tokens_reduce_budget_rule_floor_is_at_least_60k() {
+        // 60k is chosen so that even after the tuner has fired several
+        // times, the per-turn budget can still hold a system prompt + a
+        // realistic tool-loop's worth of history without forcing
+        // aggressive_pipeline compaction on every round.
+        let rules = default_rules();
+        let rule = rules
+            .iter()
+            .find(|r| r.id == "high-tokens-reduce-budget")
+            .expect("high-tokens-reduce-budget rule must exist");
+        match &rule.action {
+            EvolutionAction::AdjustConfig { path, min, .. } => {
+                assert_eq!(path, "token_budget.max_turn_input_tokens");
+                let floor = min.expect("rule must have a floor");
+                assert!(
+                    floor >= 60_000.0,
+                    "floor {floor} is too low — session 0e37eb46 showed 36968 \
+                     wedges the model into compaction-spiral (tuner floor \
+                     must protect against this)"
+                );
+            }
+            other => panic!("expected AdjustConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn high_tokens_reduce_budget_rule_delta_is_gentle() {
+        // -5000 per trigger over a 5-minute cooldown drops budget too
+        // fast during a single long debug task. -2000 still converges
+        // but across the time scale of a multi-turn user session, not
+        // a single turn.
+        let rules = default_rules();
+        let rule = rules
+            .iter()
+            .find(|r| r.id == "high-tokens-reduce-budget")
+            .expect("rule must exist");
+        match &rule.action {
+            EvolutionAction::AdjustConfig { delta, .. } => {
+                assert!(
+                    *delta >= -2500.0 && *delta < 0.0,
+                    "delta {delta} is too aggressive (≤ -2500) or wrong-sign; \
+                     session 0e37eb46 showed -5000 + 5min cooldown spirals \
+                     budget down mid-task"
+                );
+            }
+            other => panic!("expected AdjustConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn high_tokens_reduce_budget_rule_cooldown_is_at_least_15min() {
+        // 5-minute cooldown lets the rule fire every ~5 turns of a
+        // long task. 15 minutes means at most 4 fires per hour — enough
+        // time for a coherent task to finish before the next shrink.
+        let rules = default_rules();
+        let rule = rules
+            .iter()
+            .find(|r| r.id == "high-tokens-reduce-budget")
+            .expect("rule must exist");
+        let cooldown_secs = rule.cooldown.as_secs();
+        // Tightened from 900s floor to 1800s: the inline tuning comment
+        // at `high-tokens-reduce-budget` explicitly documents "cooldown
+        // 30min" as the intended target. A 900s floor left the gap
+        // [900, 1800) unprotected — a well-intentioned future tuning
+        // back to 15 min would silently pass. Lock the documented value.
+        assert!(
+            cooldown_secs >= 1800,
+            "cooldown {cooldown_secs}s is below the documented 30-min target \
+             — session 0e37eb46 required the 30-min spacing to let a debug \
+             task finish before the next budget shrink"
+        );
     }
 }

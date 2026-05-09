@@ -820,17 +820,75 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         turn_result,
     } = phase;
 
-    // ── Budget wrapup enforcement ─────────────────────────────────────
+    // ── Budget wrapup enforcement (Task #43 hybrid) ───────────────────
     // If the LLM was already told to wrap up (budget_wrapup_injected) but
-    // still returned tool calls, skip tool execution and force-complete.
-    // This prevents wasting tokens and time on tools that will be discarded.
-    if state.budget_wrapup_injected && !turn_result.accum.tool_calls.is_empty() {
+    // still returned tool calls, apply a two-tier response so we keep the
+    // wrap-up promise ("Do NOT call any more tools") without discarding
+    // any partial text that arrived alongside the tool_calls:
+    //
+    //   round 1 post-wrap-up: physical lockout — drop the tool_calls,
+    //     populate `restricted_tools` (same mechanism as
+    //     `round_budget_phase1_message`), inject a short terminal reminder,
+    //     and continue the loop so the model gets one more LLM call to
+    //     produce text.
+    //   round 2+ post-wrap-up: abort the turn with an interruption. One
+    //     lockout round is a fair chance; ignoring it twice means the
+    //     model is not going to comply.
+    //
+    // Counted in `state.budget_wrapup_ignored_rounds` so we can tell the
+    // two cases apart across tool-phase re-entries within the same turn.
+    // The model can ask for tool execution via two channels: server-side
+    // `accum.tool_calls` and edge-side `edge_tool_round`. The wrap-up
+    // promise covers BOTH, so check both.
+    let post_wrapup_tool_calls_present = state.budget_wrapup_injected
+        && (!turn_result.accum.tool_calls.is_empty() || !turn_result.edge_tool_round.is_empty());
+    if post_wrapup_tool_calls_present {
+        let dropped_count = turn_result.accum.tool_calls.len() + turn_result.edge_tool_round.len();
+        state.budget_wrapup_ignored_rounds = state.budget_wrapup_ignored_rounds.saturating_add(1);
+        if state.budget_wrapup_ignored_rounds == 1 {
+            if !prep.quiet {
+                host.emit_headless_line(
+                    super::agentic_headless_round::HeadlessStderrStyle::Yellow,
+                    format!(
+                        "⚠ Budget wrapup active — dropping {dropped_count} tool call(s) and restricting tools for one more round.",
+                    ),
+                );
+            }
+            // Physical lockout: tool_selector + policy.rs both consult
+            // `restricted_tools`. Any tool call the model emits on the
+            // next round will be filtered / blocked rather than executed.
+            for name in host.valid_tool_names() {
+                state.restricted_tools.insert(name.clone());
+            }
+            state.push_volatile(
+                super::agentic_loop_host::VolatileKind::BudgetAdvisory,
+                "Wrap-up lockout active: the runtime has dropped the tool \
+                 calls in your previous response and restricted tool access. \
+                 Any tool calls you emit next WILL BE DROPPED before \
+                 execution. Produce a final text-only answer now: summarize \
+                 progress, name what you verified, and flag anything that \
+                 remains unfinished.",
+            );
+            tracing::warn!(
+                target: "astra::loop_guard",
+                tier = "budget_wrapup_lockout",
+                round = state.llm_rounds_completed,
+                dropped_tool_calls = dropped_count,
+                "budget wrapup ignored — tool-call lockout engaged",
+            );
+            // NOTE: no `observe_turn_end_without_tools` here. The lockout
+            // round is an intra-turn continuation, not a turn boundary;
+            // the next iteration (either the normal no-tool branch below
+            // or the abort branch above on repeat) will emit the single
+            // turn-end observation. Emitting it here would double-count
+            // turn-end signals on the happy path (lockout → text reply).
+            return Ok(TurnToolPhaseControl::ContinueLoop);
+        }
         if !prep.quiet {
             host.emit_headless_line(
                 super::agentic_headless_round::HeadlessStderrStyle::Yellow,
                 format!(
-                    "⚠ Budget wrapup active — skipping {} tool call(s), force-completing.",
-                    turn_result.accum.tool_calls.len(),
+                    "⛔ Budget wrapup ignored twice — aborting turn after {dropped_count} tool call(s).",
                 ),
             );
         }
@@ -839,9 +897,20 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             astra_turn_core::interruption::ResumeAction::ContinueImmediately,
             super::agentic_loop_lifecycle::interruption_state_summary(
                 state,
-                Some("LLM ignored wrapup instruction and attempted tool calls".to_string()),
+                Some(
+                    "LLM ignored wrapup instruction and restricted-tools lockout; \
+                     attempted tool calls on two consecutive rounds"
+                        .to_string(),
+                ),
             ),
         ));
+        tracing::warn!(
+            target: "astra::loop_guard",
+            tier = "budget_wrapup_abort",
+            round = state.llm_rounds_completed,
+            ignored_rounds = state.budget_wrapup_ignored_rounds,
+            "budget wrapup ignored after lockout — aborting turn",
+        );
         observe_turn_end_without_tools(
             state,
             turn_index,
@@ -871,11 +940,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     // until `token_budget_exceeded`. Session 05e63cac t10 regression:
     // 4 identical `cargo clippy` calls tripped nudges, LLM ignored them
     // and continued for ~50 rounds before budget cutoff.
-    let force_stop_fired = state
-        .stall
-        .events
-        .iter()
-        .any(|(name, _)| name == astra_turn_core::agentic_stall_preflight::FORCE_STOP_CONSECUTIVE_EVENT);
+    let force_stop_fired = state.stall.events.iter().any(|(name, _)| {
+        name == astra_turn_core::agentic_stall_preflight::FORCE_STOP_CONSECUTIVE_EVENT
+    });
     if force_stop_fired {
         let last_sig = state
             .stall

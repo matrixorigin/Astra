@@ -183,6 +183,65 @@ async fn run_user_turn(
         .push(json!({ "role": "assistant", "content": reply_text }));
 }
 
+/// Assert that the captured LLM request payload satisfies the constraints
+/// every marker-isolated (Anthropic-dialect) provider imposes:
+///   1. `role=system` appears only at `msg[0]` (if at all).
+///   2. No two consecutive messages both have role in {user, tool} — in the
+///      Anthropic dialect a `role=tool` is collapsed to `role=user` on the
+///      wire, so adjacent `user+user`, `user+tool`, or `tool+tool` pairs
+///      all trigger HTTP 400 "expected role to alternate between 'user'
+///      and 'assistant'".
+///   3. The final message is `role=user` (or `role=tool`) — Bedrock Claude
+///      specifically rejects conversations ending with `role=assistant`
+///      ("This model does not support assistant message prefill. The
+///      conversation must end with a user message.", session 6f167b47).
+///
+/// Prefix-only providers (OpenAI / MiniMax) are more lenient but failing
+/// 2 and 3 is still a code smell, so we enforce the same rules across the
+/// whole matrix. Call this right after `run_one_mock_turn_for_test` in
+/// every new matrix test, threaded via the label so a failure names the
+/// offending provider row directly.
+fn assert_protocol_valid(label: &str, turn: usize, messages: &[Value]) {
+    // 1: role=system only at msg[0].
+    for (i, m) in messages.iter().enumerate().skip(1) {
+        let role = m.get("role").and_then(Value::as_str);
+        assert_ne!(
+            role,
+            Some("system"),
+            "[{label} t{turn}] msg[{i}] has role=system (only msg[0] may be system)"
+        );
+    }
+
+    // 2: no two adjacent user/tool pairs. In Anthropic dialect tool_result
+    // is a user-role block, so tool counts as user for alternation.
+    let roles: Vec<&str> = messages
+        .iter()
+        .filter_map(|m| m.get("role").and_then(Value::as_str))
+        .collect();
+    for (i, window) in roles.windows(2).enumerate() {
+        let left_is_user_like = window[0] == "user" || window[0] == "tool";
+        let right_is_user_like = window[1] == "user" || window[1] == "tool";
+        assert!(
+            !(left_is_user_like && right_is_user_like),
+            "[{label} t{turn}] consecutive user/tool roles at msg[{i}]=[{},{}]: Bedrock/Anthropic HTTP 400 territory",
+            window[0],
+            window[1],
+        );
+    }
+
+    // 3: last non-system message must be user or tool (NOT assistant).
+    // Bedrock Claude rejects assistant-prefill; other providers tolerate
+    // it but it's always wrong for our agentic loop.
+    let last_role = messages
+        .iter()
+        .rev()
+        .find_map(|m| m.get("role").and_then(Value::as_str));
+    assert!(
+        matches!(last_role, Some("user") | Some("tool")),
+        "[{label} t{turn}] conversation must end with role=user (or role=tool); got {last_role:?} — Bedrock HTTP 400 territory"
+    );
+}
+
 // ── Invariant 1: stable-prefix byte identity across rounds ──────────────────
 //
 // Session d0640d3d / c0905eab taught us that if the cacheable prefix
@@ -226,13 +285,15 @@ async fn matrix_stable_prefix_byte_identity_across_turns() {
             .map(|c| c.cacheable_prefix_sha256.as_str())
             .collect();
         assert_eq!(
-            hashes[0], hashes[1],
+            hashes[0],
+            hashes[1],
             "[{label}] prefix hash must be stable across turn 1→2 (got {:?})",
             hashes,
             label = case.label,
         );
         assert_eq!(
-            hashes[1], hashes[2],
+            hashes[1],
+            hashes[2],
             "[{label}] prefix hash must be stable across turn 2→3 (got {:?})",
             hashes,
             label = case.label,
@@ -345,7 +406,8 @@ async fn matrix_cache_control_marker_placement_matches_provider() {
             );
         } else {
             assert_eq!(
-                cap.system_cache_control_count, 0,
+                cap.system_cache_control_count,
+                0,
                 "[{label}] prefix-only provider must NOT emit cache_control on \
                  system (got {count})",
                 count = cap.system_cache_control_count,
@@ -382,7 +444,10 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
         let capture = Arc::new(Mutex::new(Vec::new()));
         let mut host = build_host_for(
             case,
-            vec![scripted_round("round 1 reply"), scripted_round("round 2 reply")],
+            vec![
+                scripted_round("round 1 reply"),
+                scripted_round("round 2 reply"),
+            ],
             capture.clone(),
         );
         let mut state = make_test_loop_state();
@@ -433,17 +498,20 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
         assert!(shared >= 3, "round 1 should produce at least 3 hashed msgs");
         for i in 0..shared {
             assert_eq!(
-                r1.message_sha256[i], r2.message_sha256[i],
+                r1.message_sha256[i],
+                r2.message_sha256[i],
                 "[{label}] msg[{i}] must be byte-identical across rounds after \
                  tool-loop growth (d0640d3d regression). r1 hashes={:?} \
                  r2 hashes={:?}",
-                r1.message_sha256, r2.message_sha256,
+                r1.message_sha256,
+                r2.message_sha256,
                 label = case.label,
             );
         }
         // Also: r1's full prefix hash equals r2's (system+tools unchanged).
         assert_eq!(
-            r1.cacheable_prefix_sha256, r2.cacheable_prefix_sha256,
+            r1.cacheable_prefix_sha256,
+            r2.cacheable_prefix_sha256,
             "[{label}] cacheable prefix bytes must be stable across \
              tool-loop rounds",
             label = case.label,
@@ -643,11 +711,7 @@ async fn matrix_volatile_lane_keeps_history_clean() {
 
         // And at least one of the lane contents should appear in the
         // final user message's prefix.
-        let last_text = cap
-            .messages
-            .last()
-            .map(flatten_content)
-            .unwrap_or_default();
+        let last_text = cap.messages.last().map(flatten_content).unwrap_or_default();
         assert!(
             last_text.contains("[working-set:v1]")
                 || last_text.contains("## Already Fetched")
@@ -796,4 +860,197 @@ async fn matrix_mid_history_runtime_injections_consolidated() {
             label = case.label,
         );
     }
+}
+
+// ── Invariant 7: protocol-shape validity across the full matrix ────────────
+//
+// Failing this is how prod-only regressions slip past green CI. My last
+// fix (bridge volatile preamble) satisfied every byte-level assertion in
+// this file but appended `[user, assistant: "Understood."]` at the tail,
+// which made the conversation end with `role=assistant` and broke
+// Bedrock Claude with HTTP 400 (session 6f167b47). No unit test caught
+// it because the matrix only hashed messages; it didn't validate the
+// provider protocol.
+//
+// This invariant closes that gap: for every provider in the matrix the
+// assembled wire payload must satisfy the rules in `assert_protocol_valid`
+// (system only at msg[0], no consecutive user/tool, last msg is user/tool).
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
+async fn matrix_assembled_wire_payload_is_protocol_valid() {
+    for case in PROVIDER_MATRIX.iter().copied() {
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        let mut host = build_host_for(
+            case,
+            vec![scripted_round("r1"), scripted_round("r2")],
+            capture.clone(),
+        );
+        let mut state = make_test_loop_state();
+        state.max_turn_input_tokens = 200_000;
+
+        // Turn 1: fresh user turn (tail is user msg before the call).
+        run_user_turn(&mut host, &mut state, "hi", "reply 1 echo").await;
+        // Turn 2: same shape, exercises multi-turn history paths.
+        run_user_turn(&mut host, &mut state, "again", "reply 2 echo").await;
+
+        let guard = capture.lock().unwrap();
+        assert_eq!(
+            guard.len(),
+            2,
+            "[{label}] expected 2 captures",
+            label = case.label
+        );
+        for (turn, cap) in guard.iter().enumerate() {
+            assert_protocol_valid(case.label, turn, &cap.messages);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
+async fn matrix_tool_loop_wire_payload_is_protocol_valid() {
+    // Simulates the shape that broke session 6f167b47: a turn mid-flight
+    // with `(assistant_tc, tool_result)` pairs appended to history. The
+    // wire layer must still produce a protocol-valid payload.
+    for case in PROVIDER_MATRIX.iter().copied() {
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        let mut host = build_host_for(
+            case,
+            vec![scripted_round("r1"), scripted_round("r2")],
+            capture.clone(),
+        );
+        let mut state = make_test_loop_state();
+        state.max_turn_input_tokens = 200_000;
+
+        // Round 1: user asks, agent issues tool call, tool result comes back.
+        state
+            .messages
+            .push(json!({"role": "user", "content": "look it up"}));
+        state.messages.push(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{}"}
+            }]
+        }));
+        state.messages.push(json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "result 1"
+        }));
+        host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+        // Round 2: another tool-loop iteration appended.
+        state.messages.push(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_2",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{}"}
+            }]
+        }));
+        state.messages.push(json!({
+            "role": "tool",
+            "tool_call_id": "call_2",
+            "content": "result 2"
+        }));
+        host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+        let guard = capture.lock().unwrap();
+        for (turn, cap) in guard.iter().enumerate() {
+            assert_protocol_valid(case.label, turn, &cap.messages);
+        }
+    }
+}
+
+// ── Self-test: assert_protocol_valid catches the exact shape that broke
+//    session 6f167b47. Without this, future changes to `assert_protocol_valid`
+//    could silently weaken the helper.
+
+#[test]
+fn assert_protocol_valid_catches_trailing_assistant() {
+    // Payload ending with role=assistant "Understood." — this is exactly
+    // what my bad bridge_inprocess fix produced, and what Bedrock HTTP
+    // 400'd on.
+    let bad = vec![
+        json!({"role": "system", "content": "sys"}),
+        json!({"role": "user", "content": "hi"}),
+        json!({"role": "assistant", "content": "Understood."}),
+    ];
+    let caught = std::panic::catch_unwind(|| assert_protocol_valid("self-test", 0, &bad));
+    assert!(
+        caught.is_err(),
+        "assert_protocol_valid must reject trailing role=assistant (the session 6f167b47 shape)"
+    );
+}
+
+#[test]
+fn assert_protocol_valid_catches_consecutive_user_tool() {
+    // user immediately after tool (treated as user+user on Anthropic
+    // wire → HTTP 400).
+    let bad = vec![
+        json!({"role": "user", "content": "q"}),
+        json!({"role": "assistant", "content": null, "tool_calls": [{"id":"1","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+        json!({"role": "tool", "tool_call_id": "1", "content": "r"}),
+        json!({"role": "user", "content": "volatile reminder"}),
+    ];
+    let caught = std::panic::catch_unwind(|| assert_protocol_valid("self-test", 0, &bad));
+    assert!(
+        caught.is_err(),
+        "assert_protocol_valid must reject consecutive tool+user roles"
+    );
+}
+
+#[test]
+fn assert_protocol_valid_catches_mid_history_system() {
+    let bad = vec![
+        json!({"role": "system", "content": "sys"}),
+        json!({"role": "user", "content": "q"}),
+        json!({"role": "system", "content": "[working-set:v1]"}),
+        json!({"role": "user", "content": "r"}),
+    ];
+    let caught = std::panic::catch_unwind(|| assert_protocol_valid("self-test", 0, &bad));
+    assert!(
+        caught.is_err(),
+        "assert_protocol_valid must reject mid-history role=system messages"
+    );
+}
+
+#[test]
+fn assert_protocol_valid_accepts_clean_payload() {
+    let good = vec![
+        json!({"role": "system", "content": "sys"}),
+        json!({"role": "user", "content": "q1"}),
+        json!({"role": "assistant", "content": "a1"}),
+        json!({"role": "user", "content": "q2"}),
+    ];
+    assert_protocol_valid("self-test", 0, &good);
+}
+
+#[test]
+fn assert_protocol_valid_accepts_tool_loop_shape() {
+    // user → assistant(tc) → tool → assistant(tc) → tool: alternation
+    // across the user/tool vs assistant boundary. The adjacent
+    // assistant-then-tool is fine (they're different classes).
+    let good = vec![
+        json!({"role": "system", "content": "sys"}),
+        json!({"role": "user", "content": "q"}),
+        json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id":"1","type":"function","function":{"name":"bash","arguments":"{}"}}]
+        }),
+        json!({"role": "tool", "tool_call_id": "1", "content": "r1"}),
+        json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id":"2","type":"function","function":{"name":"bash","arguments":"{}"}}]
+        }),
+        json!({"role": "tool", "tool_call_id": "2", "content": "r2"}),
+    ];
+    assert_protocol_valid("self-test", 0, &good);
 }

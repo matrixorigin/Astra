@@ -1244,7 +1244,8 @@ impl ServerAgenticLoopHost {
         // assertions we want just the message portion (post the canonical
         // system messages). Extract.
         let sys_count = system_msgs.len();
-        let annotated_messages: Vec<Value> = wire_messages.iter().skip(sys_count).cloned().collect();
+        let annotated_messages: Vec<Value> =
+            wire_messages.iter().skip(sys_count).cloned().collect();
         let mut capture_messages = system_msgs.clone();
         capture_messages.extend(annotated_messages.clone());
 
@@ -4648,6 +4649,7 @@ mod tests {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,

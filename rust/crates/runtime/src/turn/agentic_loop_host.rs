@@ -718,6 +718,12 @@ pub enum VolatileKind {
     BudgetAdvisory,
     /// Tactical adaptation hint.
     TacticalAdaptation,
+    /// "Context was just compacted — continue working, do not
+    /// summarize." Injected by `handle_token_budget` after a
+    /// successful compact+spill pass so the model resumes the task
+    /// instead of misreading the smaller context as an interruption
+    /// (session 0e37eb46 regression).
+    CompactResume,
     /// Circuit-breaker intermediate / soft-stop messages.
     CircuitBreaker,
     /// Error-budget-exhausted / redundant-reads-corrective /
@@ -748,7 +754,11 @@ impl VolatileKind {
     pub fn is_singleton(self) -> bool {
         matches!(
             self,
-            Self::WorkingSet | Self::AlreadyFetched | Self::ExplorationBudget | Self::Mailbox,
+            Self::WorkingSet
+                | Self::AlreadyFetched
+                | Self::ExplorationBudget
+                | Self::Mailbox
+                | Self::CompactResume,
         )
     }
 
@@ -767,6 +777,7 @@ impl VolatileKind {
             | Self::Corrective
             | Self::CircuitBreaker
             | Self::BudgetAdvisory
+            | Self::CompactResume
             | Self::ExecutionRetry
             | Self::ExplorationBudget
             | Self::BudgetReview => "user",
@@ -945,6 +956,14 @@ pub struct AgenticLoopState {
     /// Set to `true` once the budget-exceeded wrap-up message has been injected.
     /// The loop allows exactly one more LLM iteration after injection.
     pub budget_wrapup_injected: bool,
+    /// Counts how many post-wrap-up rounds still emitted tool_calls. Task #43
+    /// hybrid enforcement: the first such round triggers a physical lockout
+    /// (tool_calls dropped, `restricted_tools` populated, loop continues so the
+    /// model gets one more LLM call to produce text); the second aborts the
+    /// turn with an interruption. Without the counter, the only available
+    /// response to "model ignored wrap-up" was immediate abort, which lost
+    /// partial text that arrived alongside the tool_calls (session 05e63cac).
+    pub budget_wrapup_ignored_rounds: u32,
 
     /// Highest [`CompactionTier`] applied to this turn so far.
     ///
@@ -1144,6 +1163,112 @@ impl AgenticLoopState {
     #[must_use]
     pub fn take_volatile_pending(&mut self) -> Vec<VolatileInjection> {
         std::mem::take(&mut self.volatile_pending)
+    }
+
+    /// Drain the volatile lane and render it as a single `role=user`
+    /// message (or `None` when the lane is empty / whitespace-only).
+    ///
+    /// The CLI path (`cli_loop_host::execute_turn`) uses this to inject
+    /// runtime nudges into the outgoing HTTP payload right before
+    /// calling the bridge. Without it, 27 `push_volatile` sites —
+    /// including Task #42 force-stop, Task #43 wrap-up advisory,
+    /// circuit-breaker self-check, stall reflections, budget advisories,
+    /// and the corrective family — are silently dropped on `astra chat`
+    /// (session c47c2dca regression: 25-round churn where the model
+    /// never saw the Self-check prompt the stall system thought it
+    /// injected at round 12).
+    ///
+    /// `server_loop_host` has its own drain path via
+    /// `wire_assembly::assemble_llm_messages` and does NOT use this
+    /// method — callers should not double-drain.
+    ///
+    /// ⚠ **Callers that append this directly to an existing messages
+    /// vec** should prefer [`take_volatile_pending_appended_to`] instead,
+    /// which also handles the tail=role=user case (prepends rather
+    /// than appending to avoid consecutive-user protocol violations on
+    /// Bedrock/Anthropic).
+    #[must_use]
+    pub fn take_volatile_pending_as_message(&mut self) -> Option<serde_json::Value> {
+        let drained = self.take_volatile_pending();
+        if drained.is_empty() {
+            return None;
+        }
+        let mut rendered = String::new();
+        for inj in &drained {
+            let text = inj.content.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if !rendered.is_empty() {
+                rendered.push_str("\n\n");
+            }
+            rendered.push_str(text);
+        }
+        if rendered.is_empty() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "role": "user",
+            "content": rendered,
+        }))
+    }
+
+    /// Drain the volatile lane and splice its rendered text into a
+    /// copy of `base` that's protocol-safe for every provider we
+    /// support. Returns `None` when the lane is empty (caller can use
+    /// `base` as-is).
+    ///
+    /// Shape rule:
+    ///   * If `base` is empty or its tail is NOT `role=user`: append a
+    ///     fresh `role=user` msg carrying the rendered text.
+    ///   * If the tail IS already `role=user`: prepend the rendered
+    ///     text to that message's content (preserving the original
+    ///     query). This avoids creating consecutive-user-role messages,
+    ///     which Bedrock rejects with HTTP 400
+    ///     (`"expected role to alternate …"`).
+    ///
+    /// Prefer this over [`take_volatile_pending_as_message`] +
+    /// `push` in CLI paths — the latter produces invalid payloads for
+    /// any turn where the user has just typed a query (fresh turn
+    /// r0 state).
+    #[must_use]
+    pub fn take_volatile_pending_appended_to(
+        &mut self,
+        base: Vec<serde_json::Value>,
+    ) -> Option<Vec<serde_json::Value>> {
+        let volatile_msg = self.take_volatile_pending_as_message()?;
+        let volatile_text = volatile_msg
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let mut augmented = base;
+        let tail_is_user = augmented
+            .last()
+            .and_then(|m| m.get("role"))
+            .and_then(serde_json::Value::as_str)
+            == Some("user");
+        if tail_is_user && !volatile_text.is_empty() {
+            // Prepend into the last user msg so we don't create
+            // `[user, user]` which breaks Bedrock/Anthropic alternation.
+            let last = augmented.last_mut().expect("tail_is_user → non-empty");
+            let existing = last
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let merged = if existing.is_empty() {
+                volatile_text
+            } else {
+                format!("{volatile_text}\n\n{existing}")
+            };
+            last["content"] = serde_json::Value::String(merged);
+        } else {
+            // Safe to append — tail is assistant/tool (tool-loop case)
+            // or the base was empty.
+            augmented.push(volatile_msg);
+        }
+        Some(augmented)
     }
 
     /// Append an LLM-round summary to the in-memory ring (capped at
@@ -1695,6 +1820,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         pinned_tool_schema_tokens: 0,
         max_turn_input_tokens: 0,
         budget_wrapup_injected: false,
+        budget_wrapup_ignored_rounds: 0,
         compact_tier_applied: CompactionTier::Normal,
         skill_produced_output: false,
         max_cumulative_tokens: 0,
@@ -2089,6 +2215,7 @@ pub(crate) mod tests {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
@@ -4834,15 +4961,17 @@ pub(crate) mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
-        assert!(state.budget_wrapup_injected);
+        // `budget_wrapup_injected` is a PER-TURN flag and
+        // `finalize_and_render` resets it at turn boundary (Important
+        // #3: otherwise next user turn short-circuits on stale state).
+        // Assert wrap-up happened via observable outcomes instead:
+        //   - Final text made it back to the user (graceful wrapup).
+        //   - MockHost consumed 3 turns (r0 → wrapup @ r1 → text @ r2).
         assert_eq!(state.final_text, "Here is my summary.");
-        // Post-Task #45 volatile lane: budget wrapup rides
-        // volatile_pending, not state.messages.
-        let has_budget_msg = state
-            .volatile_pending
-            .iter()
-            .any(|inj| inj.content.contains("token budget limit"));
-        assert!(has_budget_msg, "expected budget wrapup in volatile lane");
+        assert_eq!(
+            host.current_turn, 3,
+            "wrapup path should still proceed through all 3 scripted rounds"
+        );
     }
 
     #[tokio::test]
@@ -4870,24 +4999,50 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn budget_hard_stop_on_second_breach() {
-        // Turn 1: prompt=90K → exceeds 80K budget → wrapup injected
-        // Turn 2: model still returns tool calls with prompt=95K → hard stop
+    async fn budget_wrapup_lockout_then_abort_on_repeat_ignore() {
+        // Task #43 hybrid enforcement:
+        //   round 1: 50K prompt (under budget) → proceeds normally
+        //   round 2: 90K prompt → exceeds 80K → wrap-up advisory injected,
+        //     tool_calls this round still execute (wrap-up is AFTER-measure)
+        //   round 3 (first ignored): tool_calls emitted with post-compact
+        //     50K prompt → physical lockout, restricted_tools populated,
+        //     tools dropped, loop continues
+        //   round 4 (second ignored): still tool_calls → abort with
+        //     TokenBudgetExceeded interruption
         let mut host = MockHost::new(vec![
             edge_tool_result(
-                vec![make_edge_tool("bash", "output1")],
+                vec![make_edge_tool("bash", "file list")],
+                50_000,
+                1000,
+                Some(200),
+            ),
+            edge_tool_result(
+                vec![make_edge_tool("read_file", "big content")],
                 90_000,
                 2000,
                 Some(100),
             ),
-            // After wrapup injection, model ignores instruction and returns tool calls again.
+            // round 3: under-budget post-compact; model still issues tools.
             edge_tool_result(
-                vec![make_edge_tool("bash", "output2")],
-                95_000,
+                vec![make_edge_tool("bash", "ignored1")],
+                50_000,
                 2500,
                 Some(50),
             ),
-        ]);
+            // round 4: model STILL issues tools after the lockout message.
+            edge_tool_result(
+                vec![make_edge_tool("bash", "ignored2")],
+                50_000,
+                2600,
+                Some(40),
+            ),
+        ])
+        .with_valid_tools(&["bash", "read_file"])
+        // Auto mode suppresses the circuit breaker's phase1 correction so
+        // the hybrid's abort path is observed in isolation. In production
+        // a concurrent circuit-breaker trip is also a valid termination
+        // signal; the hybrid just provides a narrower reason.
+        .with_interaction_mode(TurnInteractionMode::Auto);
         let mut state = make_state();
         state.max_turn_input_tokens = 80_000;
         state
@@ -4895,9 +5050,147 @@ pub(crate) mod tests {
             .push(json!({"role": "user", "content": "complex task"}));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        // Should complete (hard stop), not error.
+        assert!(outcome.is_ok(), "loop completes via interruption");
+        // Per-turn wrapup flags are reset by `finalize_and_render`
+        // (Important #3). Assert on the persistent `interruption`
+        // instead — it survives turn-boundary reset because it
+        // represents the OUTCOME, not transient mid-turn state.
+        assert!(
+            state.interruption.is_some(),
+            "second ignored round must record an interruption"
+        );
+        assert_eq!(
+            state.interruption.as_ref().unwrap().kind,
+            astra_turn_core::interruption::InterruptionKind::TokenBudgetExceeded,
+            "abort interruption must be TokenBudgetExceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_wrapup_lockout_lets_model_finish_with_text() {
+        // Task #43 hybrid — happy path for the lockout tier. Model emits a
+        // stray tool_call on the first post-wrap-up round, the runtime drops
+        // it and restricts tools; the model's next round is a plain text
+        // reply and the turn completes cleanly without an abort interruption.
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("bash", "file list")],
+                50_000,
+                1000,
+                Some(200),
+            ),
+            edge_tool_result(
+                vec![make_edge_tool("read_file", "big content")],
+                90_000,
+                2000,
+                Some(100),
+            ),
+            edge_tool_result(
+                vec![make_edge_tool("bash", "stray")],
+                50_000,
+                2500,
+                Some(50),
+            ),
+            text_result("Done — summary of progress.", 40_000, 200, None),
+        ])
+        .with_valid_tools(&["bash", "read_file"])
+        .with_interaction_mode(TurnInteractionMode::Auto);
+        let mut state = make_state();
+        state.max_turn_input_tokens = 80_000;
+        state
+            .messages
+            .push(json!({"role": "user", "content": "big task"}));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
-        assert!(state.budget_wrapup_injected);
+        // Per-turn flags reset by finalize (Important #3). Observable
+        // outcome: no interruption (model recovered with text) and
+        // final_text matches the scripted reply.
+        assert!(
+            state.interruption.is_none(),
+            "single-round ignore must NOT abort — the model recovered with text"
+        );
+        assert_eq!(state.final_text, "Done — summary of progress.");
+    }
+
+    // Session 0e37eb46 regression: after `handle_token_budget` runs
+    // compaction + spill and returns `ContinueLoop`, the model often
+    // produces a "progress summary" instead of resuming work —
+    // because its working memory was just shredded and without a
+    // counter-directive, the model reads the small post-compaction
+    // context as "I've been interrupted, time to report".
+    //
+    // Contract: when compaction-with-spill fires and succeeds (i.e.
+    // freed_tokens > 0), the volatile lane must carry a Resume
+    // directive telling the model to CONTINUE, not summarize. The
+    // directive rides the volatile lane (not `state.messages[]`) so
+    // it doesn't pollute history.
+    #[tokio::test]
+    async fn compaction_injects_resume_directive_on_volatile_lane() {
+        let session_id = format!(
+            "resume-directive-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let _guard =
+            SpillDirGuard(astra_services::session_journal::local_sessions_dir().join(&session_id));
+
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("bash", "large output")],
+                90_000, // exceeds budget → triggers handle_token_budget
+                2_000,
+                Some(100),
+            ),
+            text_result("Fix done.", 40_000, 500, None),
+        ]);
+        let mut state = make_state();
+        state.max_turn_input_tokens = 80_000;
+        state.current_session_id = Some(session_id.clone());
+        // Make sure tier-1 compression path fires (not tier-2 spill-only):
+        state.compact_tier_applied = CompactionTier::Normal;
+        state
+            .messages
+            .push(json!({"role": "user", "content": "diagnose and fix the failing test"}));
+        // Enough middle history to give compaction something to free.
+        for i in 0..16 {
+            state.messages.push(json!({
+                "role": "assistant",
+                "content": format!("step {i}: investigated something long {}", "x".repeat(200)),
+            }));
+            state.messages.push(json!({
+                "role": "user",
+                "content": format!("follow-up {i}"),
+            }));
+        }
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "loop must complete");
+
+        // The resume directive must ride the volatile lane. We inspect
+        // the lane AFTER the loop; MockHost's execute_turn never
+        // drains it, so fires accumulate there for tests to observe.
+        let has_resume_directive = state.volatile_pending.iter().any(|inj| {
+            inj.content.contains("Context compacted")
+                && inj.content.to_lowercase().contains("continue")
+        });
+        assert!(
+            has_resume_directive,
+            "after compaction fires, a volatile Resume directive must be \
+             queued so the model continues instead of producing a \
+             progress summary (session 0e37eb46 regression). \
+             Current volatile_pending: {:#?}",
+            state
+                .volatile_pending
+                .iter()
+                .map(|inj| (
+                    format!("{:?}", inj.kind),
+                    inj.content.chars().take(80).collect::<String>()
+                ))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
@@ -9193,6 +9486,229 @@ mod parallel_execution_tests {
         assert!(
             source.contains("state.max_turns.saturating_sub(state.remaining_turns)"),
             "expected saturating_sub in agentic_loop_host"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Session c47c2dca REGRESSION: bridge_inprocess path must drain the
+    // structured volatile lane so runtime nudges reach the LLM.
+    //
+    // 65606b95 migrated 27 runtime injection sites from
+    // `state.messages.push(...)` to `state.push_volatile(Kind, content)`.
+    // `server_loop_host` drains via `wire_assembly::assemble_llm_messages`,
+    // but the CLI `astra chat` path (bridge_inprocess) NEVER drained the
+    // lane — every Self-check, force-stop, budget-advisory, corrective,
+    // stall-nudge, working-set snapshot, etc. was silently dropped.
+    //
+    // Fix contract: `AgenticLoopState` must expose a single method the CLI
+    // can call right before it hands messages to the bridge HTTP request,
+    // which:
+    //   1. Drains `volatile_pending` (empty lane afterward).
+    //   2. Renders its contents into a single role=user message.
+    //   3. Returns `None` when the lane is empty (no-op callers).
+    //
+    // Without this test, the regression could silently return any time
+    // someone re-adds a `push_volatile` caller without realizing the CLI
+    // consumer-side plumbing is required.
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn take_volatile_pending_as_message_returns_none_when_lane_empty() {
+        let mut state = make_state();
+        assert!(state.volatile_pending.is_empty());
+        assert!(
+            state.take_volatile_pending_as_message().is_none(),
+            "empty lane must return None so callers can skip the injection"
+        );
+    }
+
+    #[test]
+    fn take_volatile_pending_as_message_drains_and_wraps_user_role() {
+        let mut state = make_state();
+        state.push_volatile(
+            VolatileKind::CircuitBreaker,
+            "[Self-check — round 12] You have been reading for 12 rounds. Decide and answer.",
+        );
+        state.push_volatile(
+            VolatileKind::ParallelBatchingForce,
+            "## ⚠ Parallel batching force: batch the next 3 independent calls together.",
+        );
+        assert_eq!(state.volatile_pending.len(), 2, "precondition: 2 queued");
+
+        let msg = state
+            .take_volatile_pending_as_message()
+            .expect("lane with content must produce a user message");
+
+        // Lane drained (next LLM call starts clean).
+        assert!(
+            state.volatile_pending.is_empty(),
+            "take_* must empty the lane"
+        );
+
+        // Wrapped as role=user so the bridge/provider treats it as a user turn.
+        assert_eq!(msg["role"], "user");
+
+        // Content includes BOTH nudges so the model sees every runtime
+        // signal queued this round.
+        let content = msg["content"].as_str().unwrap();
+        assert!(
+            content.contains("Self-check"),
+            "circuit-breaker nudge must appear: {content}"
+        );
+        assert!(
+            content.contains("Parallel batching force"),
+            "parallel-batching nudge must appear: {content}"
+        );
+    }
+
+    #[test]
+    fn take_volatile_pending_as_message_is_idempotent_second_call_none() {
+        let mut state = make_state();
+        state.push_volatile(VolatileKind::StallNudge, "⚠ REFLECTION");
+        assert!(state.take_volatile_pending_as_message().is_some());
+        assert!(
+            state.take_volatile_pending_as_message().is_none(),
+            "second take must be None — lane was drained"
+        );
+    }
+
+    #[test]
+    fn take_volatile_pending_appended_to_merges_into_tail_user() {
+        // Tail is role=user (fresh turn r0 pattern): appending a new
+        // role=user would be consecutive-user → Bedrock HTTP 400. The
+        // method must prepend into the existing user msg instead.
+        let mut state = make_state();
+        state.push_volatile(VolatileKind::StallNudge, "⚠ REFLECTION: stale reads");
+        let base = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "do the task"}),
+        ];
+        let out = state
+            .take_volatile_pending_appended_to(base)
+            .expect("lane non-empty → Some");
+        // Still two msgs — the pivot was merged, not appended.
+        assert_eq!(out.len(), 2, "no new msg appended when tail is user");
+        let last = &out[1];
+        assert_eq!(last["role"], "user");
+        let content = last["content"].as_str().unwrap();
+        assert!(
+            content.contains("⚠ REFLECTION"),
+            "volatile must be prepended to tail user content"
+        );
+        assert!(
+            content.contains("do the task"),
+            "original user content must be preserved"
+        );
+        assert!(
+            content.starts_with("⚠ REFLECTION"),
+            "volatile comes BEFORE existing user content"
+        );
+    }
+
+    #[test]
+    fn take_volatile_pending_appended_to_appends_when_tail_is_tool() {
+        // Tool-loop pattern: tail is role=tool (tool_result). Safe to
+        // append a fresh role=user msg — no alternation conflict.
+        let mut state = make_state();
+        state.push_volatile(VolatileKind::CircuitBreaker, "[Self-check — round 12]");
+        let base = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "original task"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id":"c1","function":{"name":"bash","arguments":"{}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}),
+        ];
+        let out = state.take_volatile_pending_appended_to(base).unwrap();
+        assert_eq!(out.len(), 5, "fresh msg appended after tool_result");
+        let last = out.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert!(last["content"].as_str().unwrap().contains("Self-check"));
+        // Historical task msg untouched.
+        assert_eq!(out[1]["content"], "original task");
+    }
+
+    #[test]
+    fn take_volatile_pending_appended_to_returns_none_when_lane_empty() {
+        let mut state = make_state();
+        let base = vec![json!({"role": "user", "content": "hi"})];
+        assert!(
+            state.take_volatile_pending_appended_to(base).is_none(),
+            "empty lane → caller uses its base as-is"
+        );
+    }
+
+    #[test]
+    fn take_volatile_pending_appended_to_appends_when_base_empty() {
+        let mut state = make_state();
+        state.push_volatile(VolatileKind::Corrective, "only nudge");
+        let out = state
+            .take_volatile_pending_appended_to(Vec::new())
+            .expect("lane non-empty");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], "user");
+        assert!(out[0]["content"].as_str().unwrap().contains("only nudge"));
+    }
+
+    #[test]
+    fn take_volatile_pending_appended_to_never_creates_consecutive_user_roles() {
+        // Explicit protocol invariant — the LLM-facing payload must
+        // alternate assistant/user. Violations → Bedrock HTTP 400.
+        // Regression guard: whatever the base shape, the output must
+        // not contain adjacent role=user pairs.
+        for base in [
+            // Fresh-turn (tail=user)
+            vec![
+                json!({"role": "system", "content": "sys"}),
+                json!({"role": "user", "content": "q"}),
+            ],
+            // Tool-loop (tail=tool)
+            vec![
+                json!({"role": "user", "content": "q"}),
+                json!({"role": "assistant", "content": null, "tool_calls": []}),
+                json!({"role": "tool", "tool_call_id": "c1", "content": "out"}),
+            ],
+            // Assistant-tail (rare — between rounds)
+            vec![
+                json!({"role": "user", "content": "q"}),
+                json!({"role": "assistant", "content": "a"}),
+            ],
+        ] {
+            let mut state = make_state();
+            state.push_volatile(VolatileKind::Corrective, "injected");
+            let out = state
+                .take_volatile_pending_appended_to(base.clone())
+                .expect("lane non-empty");
+            // Walk adjacent pairs; neither can be role=user twice.
+            for window in out.windows(2) {
+                let r0 = window[0].get("role").and_then(Value::as_str);
+                let r1 = window[1].get("role").and_then(Value::as_str);
+                assert!(
+                    !(r0 == Some("user") && r1 == Some("user")),
+                    "consecutive user-role messages created for base={base:?} → out={out:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn take_volatile_pending_as_message_skips_empty_entries() {
+        // `push_volatile` already trims empty; simulating the edge where
+        // we end up with whitespace-only content should still not crash.
+        let mut state = make_state();
+        state.push_volatile(VolatileKind::Corrective, "real content");
+        // whitespace-only skipped by push_volatile
+        state.push_volatile(VolatileKind::Other, "   ");
+        let msg = state
+            .take_volatile_pending_as_message()
+            .expect("non-empty content should produce a message");
+        let content = msg["content"].as_str().unwrap();
+        assert!(content.contains("real content"));
+        assert!(
+            !content.trim().is_empty(),
+            "rendered content must not be empty whitespace: {content:?}"
         );
     }
 
