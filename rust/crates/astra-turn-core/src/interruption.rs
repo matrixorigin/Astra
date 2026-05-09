@@ -443,11 +443,35 @@ pub fn interruption_from_error_kind(
 pub fn classify_error(error: &str) -> Option<(InterruptionKind, ResumeAction)> {
     let lower = error.to_lowercase();
 
-    // Auth / credential failures
+    // Auth / credential failures. Keep this list synced with the
+    // providers we ship (Bedrock / Anthropic direct / OpenAI / MiniMax).
+    // Session f5d6ef02 regression: Bedrock emits "Could not validate
+    // credentials" which none of the original patterns matched — five
+    // turn_errors in that session were labelled [unknown] with vacuous
+    // guidance.
+    //
+    // NOTE: `403` / `forbidden` also covers IAM/region-permission denials
+    // that aren't strictly a credential-refresh problem. The resume
+    // description below is worded generically ("invalid — please refresh")
+    // because for our UX both cases need user intervention, not a retry.
+    let has_token = lower.contains("token");
+    let has_expired = lower.contains("expired");
     if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("forbidden")
         || lower.contains("unauthorized")
         || lower.contains("authentication")
-        || lower.contains("invalid.*key")
+        // Tightened: require the verb context so we don't match benign
+        // strings like "credential helper not found" from git/keystore.
+        || lower.contains("validate credentials")
+        || lower.contains("invalid credentials")
+        || lower.contains("missing credentials")
+        || lower.contains("credentials are")
+        // AWS STS / OAuth session-token expiry — covers all shapes:
+        // "expired token", "token is expired", "token has expired",
+        // "security token ... is expired".
+        || (has_token && has_expired)
+        || (lower.contains("invalid") && lower.contains("key"))
         || lower.contains("api key")
     {
         return Some((
@@ -764,6 +788,41 @@ mod tests {
     #[test]
     fn classify_error_unknown_returns_none() {
         assert!(classify_error("some random error").is_none());
+    }
+
+    /// Session f5d6ef02 regression: Bedrock/AWS auth layers emit
+    /// "Could not validate credentials" which the classifier missed
+    /// — it contains neither "401", "unauthorized", "authentication",
+    /// nor "api key". Five consecutive turn_errors in one session were
+    /// labelled `[unknown]` with vacuous guidance, hiding what was
+    /// actually a recoverable credential-refresh situation.
+    #[test]
+    fn classify_error_bedrock_validate_credentials() {
+        let (kind, _) = classify_error("Error: Could not validate credentials").unwrap();
+        assert_eq!(
+            kind,
+            InterruptionKind::AuthFailure,
+            "Bedrock-style 'Could not validate credentials' must map to AuthFailure \
+             so the UI can surface 'please re-authenticate' instead of 'unknown error'"
+        );
+    }
+
+    #[test]
+    fn classify_error_aws_expired_token() {
+        // Another common AWS STS shape that ends up in the same
+        // code path when session tokens expire mid-run.
+        let (kind, _) =
+            classify_error("The security token included in the request is expired").unwrap();
+        assert_eq!(kind, InterruptionKind::AuthFailure);
+    }
+
+    #[test]
+    fn classify_error_forbidden_403_maps_to_auth() {
+        // 403 is closer to "auth" than to "server error" for our UX —
+        // it's a permissions/credentials problem the user can fix,
+        // not a transient outage.
+        let (kind, _) = classify_error("HTTP 403 Forbidden").unwrap();
+        assert_eq!(kind, InterruptionKind::AuthFailure);
     }
 
     #[test]
