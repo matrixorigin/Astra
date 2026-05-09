@@ -1,6 +1,6 @@
 //! Multi-agent runtime initialization for the interactive REPL.
 
-use super::{ReplState, agent_loader, delegate_subrun, spawn_subrun};
+use super::{agent_loader, delegate_subrun, spawn_subrun, ReplState};
 use std::path::PathBuf;
 
 /// Build a fully-wired [`DynamicAgentSpawner`] without mutating a
@@ -52,7 +52,6 @@ pub(crate) async fn build_one_shot_spawner(
 
     let runtime_cfg = astra_config::runtime_config::RuntimeConfig::load();
     let fork_cfg = &runtime_cfg.fork_prefix;
-    astra_turn_core::fork_capture::set_fork_inherit_prefix_enabled(fork_cfg.enabled);
     if fork_cfg.enabled {
         let sink: std::sync::Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink> =
             match fork_cfg.sink {
@@ -191,23 +190,14 @@ pub(crate) async fn initialize_multi_agent_runtime(
     }
 
     // Fork-prefix pipeline: driven entirely by RuntimeConfig (which
-    // already layers defaults → user TOML → project TOML → env
-    // override `ASTRA_FORK_INHERIT_PREFIX`). No separate observability
-    // flag — when the pipeline is on, the operator's chosen sink
+    // already layers defaults → user TOML → project TOML).
+    // When the pipeline is on, the operator's chosen sink
     // (Noop / Stderr) is installed. When off, the sink is never
-    // attached and the capture helper early-returns on every call.
+    // attached.
     //
-    // Keep the prefix store attached unconditionally: cheap to own,
-    // and the capture helper's flag check is the real gate — storing
-    // is a no-op when flag is off, so there's no behavior change for
-    // operators who haven't opted in.
+    // Keep the prefix store attached unconditionally: cheap to own.
     let runtime_cfg = astra_config::runtime_config::RuntimeConfig::load();
     let fork_cfg = &runtime_cfg.fork_prefix;
-    // Sync the process-global flag turn-core reads on the hot path
-    // with the config value. Must happen before any turn runs, and
-    // before any capture attempt on this process — so the startup
-    // path is the right place to call it exactly once.
-    astra_turn_core::fork_capture::set_fork_inherit_prefix_enabled(fork_cfg.enabled);
     if fork_cfg.enabled {
         let sink: std::sync::Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink> =
             match fork_cfg.sink {

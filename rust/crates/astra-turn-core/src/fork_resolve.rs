@@ -39,7 +39,6 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::fork_capture::is_fork_inherit_prefix_enabled;
 use crate::fork_prefix::{ForkPrefix, ForkValidationError, ProviderKind, SpawnValidationContext};
 use crate::fork_prefix_store::PrefixCaptureSink;
 use crate::orchestration_spawn_tool::InheritPrefixSpec;
@@ -56,13 +55,6 @@ use crate::orchestration_spawn_tool::InheritPrefixSpec;
 /// level (Failed vs Fallback wrapping the same `ResolveFailure`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolveFailure {
-    /// The fork-inherit-prefix feature flag is off.
-    ///
-    /// This fires **even when a captured prefix exists** in the
-    /// sink — the flag is a kill switch, not a "feature never
-    /// used" signal. Telemetry should treat this as an operator
-    /// decision to stop inheriting, not as a bug.
-    FeatureDisabled,
     /// No prefix captured for `run_id`. Either the parent never
     /// captured (skill-level choice), the capture was Skipped
     /// (microcompact, empty, oversized — see [`crate::fork_capture::SkipReason`]),
@@ -164,14 +156,6 @@ pub fn resolve_inherit_prefix(
         return PrefixResolveOutcome::Disabled;
     };
 
-    // Feature flag gate. Even if a prefix was captured when the flag
-    // was on, turning it off should stop resolution (mirror the
-    // capture-side contract). Caller's `required` still decides
-    // hard-fail vs fallback.
-    if !is_fork_inherit_prefix_enabled() {
-        return dispatch(spec.required, ResolveFailure::FeatureDisabled);
-    }
-
     // Determine which run's prefix to look up. Explicit non-empty
     // `from_run_id` wins; else fall back to caller's own run.
     // Empty strings in either slot are treated as "missing" because
@@ -238,11 +222,11 @@ fn dispatch(required: bool, reason: ResolveFailure) -> PrefixResolveOutcome {
 mod tests {
     use super::*;
     use crate::fork_capture::{
-        CaptureRequest, FORK_FLAG_TEST_MUTEX, FORK_INHERIT_PREFIX_ENV, ForkCaptureOutcome,
         capture_parent_prefix, restore_fork_flag_raw_for_tests, set_fork_flag_for_tests,
+        CaptureRequest, ForkCaptureOutcome, FORK_FLAG_TEST_MUTEX, FORK_INHERIT_PREFIX_ENV,
     };
     use crate::fork_prefix::{
-        CacheMode, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry, hash_tool_schema,
+        hash_tool_schema, CacheMode, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry,
     };
     use crate::fork_prefix_store::InMemoryPrefixStore;
 

@@ -30,14 +30,7 @@
 //!
 //! ## Feature flag
 //!
-//! The helper reads [`is_fork_inherit_prefix_enabled`] on every call.
-//! When disabled (default), it returns
-//! [`ForkCaptureOutcome::FeatureDisabled`] without touching the sink
-//! or constructing a `ForkPrefix`. This lets the feature ship dark
-//! and be flipped on via env var without code changes.
-
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -45,101 +38,6 @@ use crate::fork_prefix::{
     CacheMode, ForkPrefix, ProviderKind, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry,
 };
 use crate::fork_prefix_store::PrefixCaptureSink;
-
-// ---------------------------------------------------------------------
-// Feature flag
-// ---------------------------------------------------------------------
-
-/// Environment variable name that astra-config reads as an override
-/// for `RuntimeConfig.fork_prefix.enabled`. Kept here as a public
-/// constant so deployment scripts, tests, and docs can reference
-/// the same string without hard-coding it.
-///
-/// The variable is consumed by `RuntimeConfig::apply_env_overrides`
-/// (astra-config crate), NOT by turn-core. turn-core reads the
-/// resolved flag via [`is_fork_inherit_prefix_enabled`], which is
-/// populated by the CLI/server startup path.
-pub const FORK_INHERIT_PREFIX_ENV: &str = "ASTRA_FORK_INHERIT_PREFIX";
-
-/// Tri-state cache of the feature-flag evaluation.
-/// 0 = unread, 1 = disabled, 2 = enabled. Single `AtomicU8` + CAS
-/// avoids a `OnceLock<bool>` and keeps the hot path to a relaxed
-/// load on steady state.
-static FORK_FLAG_CACHE: AtomicU8 = AtomicU8::new(0);
-
-/// Returns whether the fork-inherit-prefix feature is enabled.
-///
-/// The flag is backed by a process-global `AtomicU8` that callers
-/// (the CLI / server startup path) explicitly set from
-/// `RuntimeConfig.fork_prefix.enabled` via
-/// [`set_fork_inherit_prefix_enabled`]. Keeping the flag separate
-/// from the config struct lets the hot path stay a single relaxed
-/// atomic load (thousands of times per turn) without locking
-/// `RuntimeConfig`.
-///
-/// State values:
-/// - 0 (unread) — no one has set the flag; reads as `false`.
-/// - 1 (disabled) — explicitly off.
-/// - 2 (enabled) — explicitly on.
-///
-/// Default: **enabled**. Fork-prefix capture has negligible cost
-/// (one `Arc<bytes>` write per turn into a DashMap with TTL + LRU
-/// eviction at cap=64). Enabling by default means `spawn_agent` with
-/// `inherit_prefix: {}` always has a prefix to resolve — operators no
-/// longer need to set `ASTRA_FORK_INHERIT_PREFIX=1` or
-/// `fork_prefix.enabled = true` to get cache-reusable fork children.
-///
-/// Set to `false` explicitly via `set_fork_inherit_prefix_enabled(false)`
-/// or env `ASTRA_FORK_INHERIT_PREFIX=0` to suppress capture entirely
-/// (e.g., in memory-constrained environments where even the DashMap
-/// overhead is unwanted).
-pub fn is_fork_inherit_prefix_enabled() -> bool {
-    match FORK_FLAG_CACHE.load(Ordering::Relaxed) {
-        1 => false, // explicitly disabled
-        // state 0 (unread) or 2 (enabled) — both treated as true.
-        _ => true,
-    }
-}
-
-/// Set the fork-inherit-prefix feature flag at runtime startup.
-///
-/// Intended to be called once from CLI/server bootstrap after
-/// loading `RuntimeConfig`. Can be called again to live-toggle —
-/// every subsequent `is_fork_inherit_prefix_enabled()` observes
-/// the new value (relaxed atomic — no cross-thread ordering
-/// guarantees needed for a feature flag).
-pub fn set_fork_inherit_prefix_enabled(enabled: bool) {
-    FORK_FLAG_CACHE.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
-}
-
-/// Test-only: force the feature flag to a specific value and bypass
-/// env lookup. The helper is `#[doc(hidden)]` — production callers
-/// should use the env var, not this function. Returns the previous
-/// cached value so tests can restore state.
-#[doc(hidden)]
-pub fn set_fork_flag_for_tests(enabled: bool) -> u8 {
-    FORK_FLAG_CACHE.swap(if enabled { 2 } else { 1 }, Ordering::Relaxed)
-}
-
-/// Test-only: restore the raw u8 state (including the "unread" 0)
-/// previously returned from `set_fork_flag_for_tests`. Needed by
-/// test `FlagGuard::Drop` implementations that must roll back to a
-/// value the bool-only setter can't express.
-#[doc(hidden)]
-pub fn restore_fork_flag_raw_for_tests(raw: u8) {
-    FORK_FLAG_CACHE.store(raw, Ordering::Relaxed);
-}
-
-/// Test-only: shared mutex that every test touching the feature
-/// flag must acquire. Lives here (at the definition site) so that
-/// tests in OTHER modules in the same crate — e.g. `fork_resolve`,
-/// and cross-crate callers like `astra-runtime::spawner` tests —
-/// share the same lock and don't race each other for flag state.
-///
-/// `#[doc(hidden)] pub` because cross-crate test reuse requires
-/// `pub`, but this is NOT part of the stable API surface.
-#[doc(hidden)]
-pub static FORK_FLAG_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ---------------------------------------------------------------------
 // Capture request + outcome types
@@ -211,8 +109,6 @@ pub enum ForkCaptureOutcome {
         prefix_id: String,
         evicted: Vec<String>,
     },
-    /// The feature flag was off; no work was done.
-    FeatureDisabled,
     /// The request was well-formed but the capture was deliberately
     /// skipped. See [`SkipReason`].
     Skipped { reason: SkipReason },
@@ -242,7 +138,7 @@ pub const CAPTURE_BYTE_CAP: usize = 2 * 1024 * 1024;
 /// sanitization happens here because the id is also used as a
 /// DashMap key and sanitizing would break key equality.
 fn next_prefix_id(parent_run_id: &str, turn_seq: u32) -> String {
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     format!("pfx-{parent_run_id}-{turn_seq}-{n:08x}")
@@ -263,10 +159,6 @@ pub fn capture_parent_prefix(
     request: CaptureRequest,
     sink: &dyn PrefixCaptureSink,
 ) -> ForkCaptureOutcome {
-    if !is_fork_inherit_prefix_enabled() {
-        return ForkCaptureOutcome::FeatureDisabled;
-    }
-
     if request.microcompact_fired_in_turn {
         return ForkCaptureOutcome::Skipped {
             reason: SkipReason::MicrocompactMidTurn,

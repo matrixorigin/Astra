@@ -7,8 +7,8 @@
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Instant;
 
 use astra_runtime::{
@@ -16,26 +16,26 @@ use astra_runtime::{
     tool_selector::ToolSelector,
     turn::agentic_headless_round::HeadlessStderrStyle,
     turn::agentic_loop_host::{
-        AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult,
-        HostTurnResult, TurnInteractionMode, interaction_scoped_tool_restrictions,
+        interaction_scoped_tool_restrictions, AgenticLoopHost, AgenticLoopState,
+        HostReflectionRequest, HostReflectionResult, HostTurnResult, TurnInteractionMode,
     },
     turn::chat_turn_api_error::CHAT_TURN_POST_MAX_RETRIES,
-    turn::chat_turn_payload::{ChatTurnBasePayloadInput, chat_turn_base_payload},
+    turn::chat_turn_payload::{chat_turn_base_payload, ChatTurnBasePayloadInput},
 };
 use async_trait::async_trait;
 use crossterm::style::Stylize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::{
-    ExplainMode,
     edge_tools::ToolExecutor,
     effects::ChatTurnPrepLineGuard,
     permission_manager::{PermissionManager, PermissionMode},
-    stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse},
+    stream_render::{consume_turn_sse, EdgeSseContext, RenderPolicy},
+    ExplainMode,
 };
 
 use super::agentic_loop_turn::{
-    ChatTurnSseFetchRequest, PrepareTurnTelemetry, fetch_chat_turn_sse,
+    fetch_chat_turn_sse, ChatTurnSseFetchRequest, PrepareTurnTelemetry,
 };
 
 /// CLI host for the runtime agentic loop.
@@ -640,9 +640,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // for prompt-cache reuse. No-op unless:
         //   - the `prefix_store` Arc was plumbed in (CLI startup
         //     sets this on every host when fork_prefix.enabled)
-        //   - feature flag is on (capture_parent_prefix
-        //     early-returns otherwise, preserving the
-        //     FeatureDisabled contract)
         //   - ingest populated the expected state fields
         let Some(store) = self.prefix_store.as_ref() else {
             return;

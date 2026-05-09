@@ -83,7 +83,8 @@ pub fn restore_selector_observability_for_tests(raw: u8) {
 
 /// Shared test mutex. Cross-crate selector-observability tests must
 /// share this so they don't race for flag state. Same pattern as
-/// `fork_capture::FORK_FLAG_TEST_MUTEX`.
+/// (was synchronized via `fork_capture::FORK_FLAG_TEST_MUTEX` when the
+/// fork-inherit-prefix kill switch still existed).
 #[doc(hidden)]
 pub static SELECTOR_OBS_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
