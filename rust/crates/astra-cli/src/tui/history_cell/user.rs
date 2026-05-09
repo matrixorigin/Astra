@@ -95,17 +95,17 @@ impl HistoryCell for UserCell {
             }
         }
 
-        // Slash commands pair visually with a `⎿ response` on the
-        // very next line (Claude-Code style), so we emit no trailing
-        // blank — the batch-level separator in `flush_chat_widget`
-        // is also suppressed for this pair. Prose user messages get
-        // one tinted + one plain blank for breathing room before
-        // the model's reply; matches the spacing contract §4 of the
-        // design doc.
-        if !self.text.trim_start().starts_with('/') {
-            lines.push(Line::styled("", bg));
-            lines.push(Line::default());
-        }
+        // No cell-local trailing blanks: `flush_chat_widget` adds
+        // exactly one blank row between committed cells, which
+        // matches Claude Code / Codex spacing (one visible gap
+        // between `› prose` and the next cell, zero between
+        // `› /cmd` and its `⎿ response` pair). The earlier
+        // `tinted-blank + plain-blank` pair over-indented every
+        // prose turn by ~2 rows of dead air before the model
+        // response, which pushed tool output off the fold.
+        //
+        // Slash commands continue to suppress even the batch-level
+        // separator — see `flush_chat_widget`.
         lines
     }
 
@@ -193,33 +193,30 @@ mod tests {
     }
 
     #[test]
-    fn slash_command_user_cell_omits_trailing_blanks() {
-        // Slash user messages pair visually with their `⎿ response`
-        // — the breathing-room blanks that prose user cells use
-        // would push the reply down with dead space. Verify that
-        // a `/model` UserCell renders exactly one line.
+    fn slash_command_user_cell_is_tight_one_content_line() {
+        // Same contract as prose now — no trailing blanks. The
+        // distinction between prose and slash lives in
+        // `flush_chat_widget`, which suppresses even the batch
+        // separator for the `/cmd → ⎿ response` pair.
         let cell = UserCell::new("/model glm-5.1");
+        let lines = cell.display_lines(60);
+        assert_eq!(lines.len(), 1, "slash UserCell is exactly one line: {:?}", lines);
+    }
+
+    #[test]
+    fn prose_user_cell_is_tight_one_content_line() {
+        // Prose used to emit 2 trailing blanks on top of the batch
+        // separator added by `flush_chat_widget` (3 blanks total
+        // between `› prose` and the next cell). That pushed the
+        // model's reply / tool output off-screen. Both prose and
+        // slash now render exactly the content rows; `flush_chat_widget`
+        // owns the single blank separator between committed cells.
+        let cell = UserCell::new("just a prose question");
         let lines = cell.display_lines(60);
         assert_eq!(
             lines.len(),
             1,
-            "slash UserCell should produce exactly one line (no trailing blanks); got {:?}",
-            lines
-        );
-    }
-
-    #[test]
-    fn prose_user_cell_keeps_trailing_blanks() {
-        // Regression: non-slash prose must keep its two trailing
-        // blanks (§4 of the design doc) so the model's reply has
-        // breathing room. Only `/` commands get the tight layout.
-        let cell = UserCell::new("just a prose question");
-        let lines = cell.display_lines(60);
-        // 1 content line + 2 trailing blanks = 3 total.
-        assert_eq!(
-            lines.len(),
-            3,
-            "prose UserCell should keep its 2 trailing blanks; got {:?}",
+            "UserCell should emit exactly its content rows, no trailing blanks; got {:?}",
             lines
         );
     }

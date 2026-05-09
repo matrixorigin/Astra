@@ -4,8 +4,6 @@ expression: "render_history(&w, 80)"
 ---
 › run ls
 
-
-
 • Ran bash (42ms)
   │ ls /tmp
   └ 3 entries

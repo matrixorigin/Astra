@@ -157,7 +157,10 @@ impl HistoryCell for ReasoningCell {
         // `LIVE_PREVIEW_MAX_ROWS` wrapped rows. This gives a
         // fixed-height scrolling window — new rows slide in at the
         // bottom, older rows fall off the top, the composer stays
-        // anchored. Finalised cells render no body at all.
+        // anchored. A `⋯ +N more` counter takes the first slot
+        // once overflow starts, so the user sees that there's
+        // thinking content above the window instead of it silently
+        // sliding away. Finalised cells render no body at all.
         if self.live {
             let inner_w = (width as usize).saturating_sub(2).max(20);
             let mut body_rows: Vec<String> = Vec::new();
@@ -166,8 +169,23 @@ impl HistoryCell for ReasoningCell {
                     body_rows.push(row);
                 }
             }
-            let tail_start = body_rows.len().saturating_sub(LIVE_PREVIEW_MAX_ROWS);
-            for row in body_rows.into_iter().skip(tail_start) {
+            let total = body_rows.len();
+            let visible = if total > LIVE_PREVIEW_MAX_ROWS {
+                // Reserve row 0 for the `⋯ +N more` counter; show
+                // the last `LIVE_PREVIEW_MAX_ROWS - 1` actual rows
+                // so the window stays exactly at N rows even as
+                // overflow grows.
+                let tail = LIVE_PREVIEW_MAX_ROWS - 1;
+                let hidden = total - tail;
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("⋯ +{hidden} more"), dim_italic),
+                ]));
+                total - tail
+            } else {
+                0
+            };
+            for row in body_rows.into_iter().skip(visible) {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(row, dim_italic),
@@ -333,42 +351,61 @@ mod tests {
     }
 
     #[test]
-    fn live_body_caps_at_preview_window_showing_tail() {
+    fn live_body_caps_at_preview_window_showing_tail_and_counter() {
         // Growing thinking must not push the composer off-screen.
         // Once more than `LIVE_PREVIEW_MAX_ROWS` rows have arrived
-        // only the most recent N are rendered — like Cursor's
-        // reasoning preview window.
+        // the first slot is reserved for a `⋯ +N more` counter and
+        // the remaining slots show the most recent rows (tail).
         let mut c = ReasoningCell::new_streaming();
-        // Push more body rows than the preview budget.
-        let padding: Vec<String> = (1..=LIVE_PREVIEW_MAX_ROWS + 5)
-            .map(|i| format!("row {i}"))
-            .collect();
+        let total_rows = LIVE_PREVIEW_MAX_ROWS + 5;
+        let padding: Vec<String> =
+            (1..=total_rows).map(|i| format!("row {i}")).collect();
         c.push_delta(&padding.join("\n"));
 
         let lines = c.display_lines(60);
-        // Header + at most LIVE_PREVIEW_MAX_ROWS body rows.
-        assert!(
-            lines.len() <= 1 + LIVE_PREVIEW_MAX_ROWS,
-            "live body must clamp to {} rows, got {}",
-            LIVE_PREVIEW_MAX_ROWS,
-            lines.len() - 1
+        // Header + counter + (LIVE_PREVIEW_MAX_ROWS - 1) body rows.
+        assert_eq!(
+            lines.len(),
+            1 + LIVE_PREVIEW_MAX_ROWS,
+            "live body must clamp to header + {LIVE_PREVIEW_MAX_ROWS} slots"
         );
 
-        // The tail — most recent rows — is what's shown. First row
-        // of `padding` must NOT appear; last row MUST.
         let rendered: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>()
             .join(" ");
+        let hidden = total_rows - (LIVE_PREVIEW_MAX_ROWS - 1);
+        assert!(
+            rendered.contains(&format!("⋯ +{hidden} more")),
+            "overflow counter must show hidden-row count: {rendered}"
+        );
         assert!(
             !rendered.contains("row 1 "),
-            "oldest row must have scrolled off the top: {rendered}"
+            "oldest row must have scrolled off: {rendered}"
         );
-        let last = format!("row {}", padding.len());
+        let last = format!("row {total_rows}");
         assert!(
             rendered.contains(&last),
             "most recent row must be visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn live_body_no_counter_when_under_window() {
+        // Below the cap there's no overflow — no counter line, just
+        // header + all rows.
+        let mut c = ReasoningCell::new_streaming();
+        c.push_delta("alpha\nbeta\ngamma");
+        let rendered: String = c
+            .display_lines(60)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !rendered.contains("⋯"),
+            "no counter when rows fit in window: {rendered}"
         );
     }
 
