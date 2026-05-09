@@ -149,8 +149,18 @@ impl Writer {
         // Blockquote lines get a `│ ` gutter in the quote colour
         // so they scan like a pull-quote rather than plain green
         // text. Body colour is already the blockquote style
-        // (pushed on start_tag).
+        // (pushed on start_tag). When the quoted content would
+        // overflow the render width we pre-wrap with the same bar
+        // on every continuation row so the quote reads as one
+        // continuous block — not "bar, text, bar, orphan-wrap, no-bar".
         if self.in_blockquote {
+            if let Some(w) = self.width
+                && w >= 20
+                && let Some(wrapped) = blockquote_wrap(&spans, w, self.styles.blockquote)
+            {
+                self.lines.extend(wrapped);
+                return;
+            }
             let mut with_bar: Vec<Span<'static>> = Vec::with_capacity(spans.len() + 1);
             with_bar.push(Span::styled("│ ", self.styles.blockquote));
             with_bar.extend(spans);
@@ -690,6 +700,42 @@ fn list_item_hang_wrap(
     Some(wrapped.iter().map(line_to_static).collect())
 }
 
+/// Wrap a blockquote line so every wrapped row carries the `│ `
+/// gutter. Returns `None` when the content fits on one row; the
+/// caller then prepends the bar itself in the fast path.
+///
+/// Width budget: the gutter costs 2 display cells, so the wrap
+/// budget is `width - 2`. Floor at 20 mirrors the paragraph path.
+fn blockquote_wrap(
+    spans: &[Span<'static>],
+    width: usize,
+    bar_style: Style,
+) -> Option<Vec<Line<'static>>> {
+    if spans.is_empty() {
+        return None;
+    }
+    let total_w: usize = spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    // +2 for the bar prefix. If the whole line (content + bar) fits,
+    // skip wrapping and let the caller prepend the bar.
+    if total_w + 2 <= width {
+        return None;
+    }
+    let body_width = width.saturating_sub(2).max(1);
+    let bar = || Line::from(Span::styled("│ ".to_string(), bar_style));
+    let opts = super::wrapping::RtOptions::new(body_width)
+        .initial_indent(bar())
+        .subsequent_indent(bar());
+    let body_line = Line::from(spans.to_vec());
+    let wrapped = super::wrapping::word_wrap_line(&body_line, opts);
+    if wrapped.is_empty() {
+        return None;
+    }
+    Some(wrapped.iter().map(line_to_static).collect())
+}
+
 /// Wrap a paragraph line (no list marker, no block quote) to the
 /// render width, preserving span styling. Returns `None` when the
 /// line fits on a single row so the caller can fast-path it as a
@@ -913,14 +959,54 @@ mod polish_tests {
             non_empty.len() >= 2,
             "long paragraph must wrap into multiple rows at 40 cols; got {out:?}"
         );
-        // No row should exceed the width (allow +1 slack for trailing
-        // whitespace that pulldown-cmark sometimes emits).
+        // Strict: no row's VISIBLE width (after trimming trailing
+        // whitespace the wrap lib occasionally leaves) may exceed
+        // the budget. Trimmed end only — leading whitespace can be
+        // an intentional indent.
         for row in &non_empty {
+            let w = UnicodeWidthStr::width(row.trim_end());
             assert!(
-                UnicodeWidthStr::width(row.as_str()) <= 41,
-                "row exceeds 40-col width: {row:?}"
+                w <= 40,
+                "row width {w} exceeds 40-col budget after trim: {row:?}"
             );
         }
+    }
+
+    #[test]
+    fn long_blockquote_wraps_with_bar_on_every_row() {
+        // Regression: a long `> …` quote used to dump to ratatui's
+        // default wrap, which dropped the `│ ` bar on continuation
+        // rows — half the quote read as blockquote, the other half
+        // as plain prose starting at column 0.
+        let md = "> This is a fairly long quote that exceeds the \
+                  available terminal width and therefore needs to \
+                  wrap onto a second and probably a third row.";
+        let out = lines_at(md, 40);
+        let non_empty: Vec<&String> = out.iter().filter(|l| !l.is_empty()).collect();
+        assert!(
+            non_empty.len() >= 2,
+            "long quote must wrap; got {out:?}"
+        );
+        for row in &non_empty {
+            assert!(
+                row.starts_with("│ "),
+                "every wrapped row needs the │ bar: {row:?}"
+            );
+            let w = UnicodeWidthStr::width(row.trim_end());
+            assert!(
+                w <= 40,
+                "row width {w} exceeds 40-col budget: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_blockquote_stays_one_row_with_bar() {
+        let md = "> short";
+        let out = lines_at(md, 40);
+        let non_empty: Vec<&String> = out.iter().filter(|l| !l.is_empty()).collect();
+        assert_eq!(non_empty.len(), 1, "short quote stays one row: {out:?}");
+        assert!(non_empty[0].starts_with("│ "));
     }
 
     #[test]
