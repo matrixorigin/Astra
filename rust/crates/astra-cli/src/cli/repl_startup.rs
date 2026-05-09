@@ -345,7 +345,7 @@ pub(crate) async fn complete_repl_startup(
 
     let mut edge_heartbeat_task: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(ref tok) = current_access_token(profile) {
-        edge_heartbeat_task = register_and_start_heartbeat(api, tok).await;
+        edge_heartbeat_task = register_and_start_heartbeat(api, tok, profile).await;
     }
     tracer.phase("edge_heartbeat");
 

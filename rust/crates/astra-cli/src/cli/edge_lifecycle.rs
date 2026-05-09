@@ -9,6 +9,7 @@ use astra_thin_client::{
 use crossterm::style::Stylize;
 
 use crate::chat_stream::edge_executor_instance_id;
+use crate::repl_runtime::{attempt_token_refresh, current_access_token};
 
 /// When `ASTRA_EDGE_REGISTRY` is `0`, `false`, or `off`, skip register and heartbeat.
 pub fn edge_cloud_registry_enabled() -> bool {
@@ -68,39 +69,106 @@ async fn send_heartbeat(api: &ThinClient, token: &str) -> Result<(), ThinClientE
     Ok(())
 }
 
-pub fn spawn_edge_heartbeat(api: ThinClient, token: String) -> Option<tokio::task::JoinHandle<()>> {
+pub fn spawn_edge_heartbeat(
+    api: ThinClient,
+    token: String,
+    profile: Option<String>,
+) -> Option<tokio::task::JoinHandle<()>> {
     let period = heartbeat_period()?;
     Some(tokio::spawn(async move {
         let mut interval = tokio::time::interval(period);
         interval.tick().await;
+        let mut token = token;
         loop {
             interval.tick().await;
-            let _ = send_heartbeat(&api, &token).await;
+            match send_heartbeat(&api, &token).await {
+                Ok(()) => {}
+                Err(e) if is_unauthorized(&e) => {
+                    // Background access token expired mid-session.
+                    // Try a single silent refresh; if it works, swap
+                    // in the new token and continue. On failure, bail
+                    // quietly — the noisy banner is for startup only.
+                    if attempt_token_refresh(&api, profile.as_deref()).await
+                        && let Some(fresh) = current_access_token(profile.as_deref())
+                    {
+                        token = fresh;
+                    } else {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    // Transient network/5xx: swallow and retry next tick.
+                }
+            }
         }
     }))
 }
 
 /// Register with the cloud (best-effort) and start a background heartbeat task.
 /// Returns `None` when registry is disabled, register failed, or heartbeat interval is `0`.
+///
+/// On a 401 from the first register attempt, silently refresh the
+/// token and retry once — the same recovery chat uses. Eliminates
+/// the noisy startup "Edge registry skipped (HTTP 401)" banner that
+/// was firing whenever `try_silent_auth` couldn't reach the refresh
+/// endpoint but the token happened to work later for chat.
 pub async fn register_and_start_heartbeat(
     api: &ThinClient,
     token: &str,
+    profile: Option<&str>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !edge_cloud_registry_enabled() {
         return None;
     }
-    if let Err(e) = register_edge_once(api, token).await {
+    let (final_token, success) = match register_edge_once(api, token).await {
+        Ok(()) => (token.to_string(), true),
+        Err(ref e) if is_unauthorized(e) => {
+            // Access token is stale. Try one silent refresh and retry.
+            if attempt_token_refresh(api, profile).await {
+                if let Some(fresh) = current_access_token(profile) {
+                    match register_edge_once(api, &fresh).await {
+                        Ok(()) => (fresh, true),
+                        Err(retry_err) => {
+                            print_skip_notice(&retry_err);
+                            return None;
+                        }
+                    }
+                } else {
+                    print_skip_notice(e);
+                    return None;
+                }
+            } else {
+                print_skip_notice(e);
+                return None;
+            }
+        }
+        Err(e) => {
+            print_skip_notice(&e);
+            return None;
+        }
+    };
+    if success {
         eprintln!(
             "{}",
-            format!("  · Edge registry skipped ({e}). Chat and tools still work.").dim()
+            "  · Edge node registered with cloud (heartbeat in background)".dim()
         );
-        return None;
     }
+    spawn_edge_heartbeat(api.clone(), final_token, profile.map(str::to_owned))
+}
+
+/// True when a `ThinClientError` represents a server-side 401.
+fn is_unauthorized(err: &ThinClientError) -> bool {
+    matches!(
+        err,
+        ThinClientError::Api { status, .. } if *status == reqwest::StatusCode::UNAUTHORIZED
+    )
+}
+
+fn print_skip_notice(e: &ThinClientError) {
     eprintln!(
         "{}",
-        "  · Edge node registered with cloud (heartbeat in background)".dim()
+        format!("  · Edge registry skipped ({e}). Chat and tools still work.").dim()
     );
-    spawn_edge_heartbeat(api.clone(), token.to_string())
 }
 
 #[cfg(test)]
