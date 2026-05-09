@@ -103,6 +103,15 @@ impl ReasoningCell {
     }
 }
 
+/// Max body rows shown beneath the `💭 Thinking` header while the
+/// cell is still streaming. Once the window fills up, new rows
+/// replace the oldest (fake scrolling) so the viewport stays at a
+/// fixed height — Cursor's reasoning-preview behaviour, rather
+/// than unbounded growth that pushes the composer off-screen on
+/// a 20-second think. On `finalize()` the whole body collapses
+/// away and only the header remains.
+const LIVE_PREVIEW_MAX_ROWS: usize = 6;
+
 impl HistoryCell for ReasoningCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         // Empty + still live → nothing to show yet. The widget's
@@ -121,8 +130,9 @@ impl HistoryCell for ReasoningCell {
         // wrapped rows of dim prose; scrollback-dumping all of it
         // crowds out the actual answer below. Claude Code's default
         // is collapse; users who want the detail can inspect the
-        // persisted transcript. Live cells still show content so
-        // the user sees progress during long thinks.
+        // persisted transcript. Live cells show the most recent
+        // few rows (see `LIVE_PREVIEW_MAX_ROWS`) so the user sees
+        // progress without the viewport growing unboundedly.
         let line_count = self.text.lines().count();
         let header_text = if self.live {
             match self.duration_label() {
@@ -143,19 +153,25 @@ impl HistoryCell for ReasoningCell {
 
         let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(header_text, dim_italic))];
 
-        // Body only while live: gives progress visibility during the
-        // often-20+-second reasoning phase. Once finalised we stop
-        // rendering it — the header + line count carry the signal
-        // that thinking happened.
+        // Live preview: render ONLY the most recent
+        // `LIVE_PREVIEW_MAX_ROWS` wrapped rows. This gives a
+        // fixed-height scrolling window — new rows slide in at the
+        // bottom, older rows fall off the top, the composer stays
+        // anchored. Finalised cells render no body at all.
         if self.live {
             let inner_w = (width as usize).saturating_sub(2).max(20);
+            let mut body_rows: Vec<String> = Vec::new();
             for logical in self.text.lines() {
                 for row in soft_wrap(logical, inner_w) {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(row, dim_italic),
-                    ]));
+                    body_rows.push(row);
                 }
+            }
+            let tail_start = body_rows.len().saturating_sub(LIVE_PREVIEW_MAX_ROWS);
+            for row in body_rows.into_iter().skip(tail_start) {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(row, dim_italic),
+                ]));
             }
         }
 
@@ -314,6 +330,58 @@ mod tests {
         for row in &body_rows {
             assert!(row.starts_with("  "), "body row must indent: {row:?}");
         }
+    }
+
+    #[test]
+    fn live_body_caps_at_preview_window_showing_tail() {
+        // Growing thinking must not push the composer off-screen.
+        // Once more than `LIVE_PREVIEW_MAX_ROWS` rows have arrived
+        // only the most recent N are rendered — like Cursor's
+        // reasoning preview window.
+        let mut c = ReasoningCell::new_streaming();
+        // Push more body rows than the preview budget.
+        let padding: Vec<String> = (1..=LIVE_PREVIEW_MAX_ROWS + 5)
+            .map(|i| format!("row {i}"))
+            .collect();
+        c.push_delta(&padding.join("\n"));
+
+        let lines = c.display_lines(60);
+        // Header + at most LIVE_PREVIEW_MAX_ROWS body rows.
+        assert!(
+            lines.len() <= 1 + LIVE_PREVIEW_MAX_ROWS,
+            "live body must clamp to {} rows, got {}",
+            LIVE_PREVIEW_MAX_ROWS,
+            lines.len() - 1
+        );
+
+        // The tail — most recent rows — is what's shown. First row
+        // of `padding` must NOT appear; last row MUST.
+        let rendered: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !rendered.contains("row 1 "),
+            "oldest row must have scrolled off the top: {rendered}"
+        );
+        let last = format!("row {}", padding.len());
+        assert!(
+            rendered.contains(&last),
+            "most recent row must be visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn live_body_under_window_shows_every_row() {
+        // With fewer body rows than the window, everything should
+        // still be visible — the cap kicks in only after overflow.
+        let mut c = ReasoningCell::new_streaming();
+        c.push_delta("alpha\nbeta\ngamma");
+        let out = render(&c, 60, 5);
+        assert!(out.contains("alpha"), "early row must show under cap: {out}");
+        assert!(out.contains("beta"), "middle row must show: {out}");
+        assert!(out.contains("gamma"), "latest row must show: {out}");
     }
 
     #[test]
