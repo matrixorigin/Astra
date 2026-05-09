@@ -1115,7 +1115,7 @@ pub struct TokenBudgetConfig {
 }
 
 fn default_max_turn_input_tokens() -> u32 {
-    80000
+    200_000
 }
 fn default_system_prompt_reserve() -> u32 {
     4000

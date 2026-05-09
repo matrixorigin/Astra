@@ -727,7 +727,7 @@ pub(crate) async fn stream_chat_sse(
         consecutive_context_window_errors: 0,
         compaction_effectiveness: Default::default(),
         pinned_tool_schema_tokens: pinned_schema_tokens,
-        max_turn_input_tokens: RuntimeLimits::global().max_turn_input_tokens,
+        max_turn_input_tokens: RuntimeLimits::global().effective_max_turn_input_tokens(p.model),
         budget_wrapup_injected: false,
         budget_wrapup_ignored_rounds: 0,
         compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
