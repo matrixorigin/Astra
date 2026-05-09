@@ -1,0 +1,6 @@
+---
+source: crates/astra-cli/src/tui/history_cell/tool.rs
+expression: "render(&err_tool(\"bash\", \"false\", 10), 80, 3)"
+---
+• Failed bash (10ms)
+  │ false

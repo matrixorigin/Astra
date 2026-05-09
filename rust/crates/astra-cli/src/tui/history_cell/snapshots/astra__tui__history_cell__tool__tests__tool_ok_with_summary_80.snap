@@ -1,0 +1,8 @@
+---
+source: crates/astra-cli/src/tui/history_cell/tool.rs
+expression: "render(&t, 80, 5)"
+---
+• Ran read (120ms)
+  │ Cargo.toml
+  └ [package]
+    name = "demo"
