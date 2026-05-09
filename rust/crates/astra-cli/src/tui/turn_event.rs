@@ -119,6 +119,12 @@ pub(crate) enum TurnEvent {
         tokens_in: Option<u64>,
         #[serde(default)]
         tokens_out: Option<u64>,
+        /// Of `tokens_in`, how many were served from the provider's
+        /// prompt cache. Drives the `💾 N%` segment. Absent on older
+        /// transcripts and on providers that don't surface cache
+        /// stats — `#[serde(default)]` keeps the schema additive.
+        #[serde(default)]
+        cache_read_tokens: Option<u64>,
         #[serde(default)]
         tools: u32,
         /// Session-cumulative totals at the moment this turn ended.
@@ -288,6 +294,7 @@ mod tests {
             ttft_ms: None,
             tokens_in: None,
             tokens_out: None,
+            cache_read_tokens: None,
             tools: 0,
             cumulative_tokens: None,
             cumulative_cost_usd: None,

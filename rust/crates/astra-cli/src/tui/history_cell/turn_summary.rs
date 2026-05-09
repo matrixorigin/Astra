@@ -27,6 +27,8 @@ pub(crate) struct TurnSummaryCell {
     pub ttft_ms: Option<u64>,
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
+    /// Cache-read portion of `tokens_in`. Drives the `💾 N%` band.
+    pub cache_read_tokens: Option<u64>,
     pub tools: u32,
     pub cumulative_tokens: Option<u64>,
     pub cumulative_cost_usd: Option<f64>,
@@ -48,6 +50,7 @@ impl TurnSummaryCell {
                 ttft_ms,
                 tokens_in,
                 tokens_out,
+                cache_read_tokens,
                 tools,
                 cumulative_tokens,
                 cumulative_cost_usd,
@@ -56,6 +59,7 @@ impl TurnSummaryCell {
                 ttft_ms,
                 tokens_in,
                 tokens_out,
+                cache_read_tokens,
                 tools,
                 cumulative_tokens,
                 cumulative_cost_usd,
@@ -94,6 +98,19 @@ impl HistoryCell for TurnSummaryCell {
 
         if self.tools > 0 {
             segments.push(format!("🛠 {}", self.tools));
+        }
+
+        // 💾 cache-hit percentage of input tokens. Only shown when
+        // the provider actually reported a non-zero `cache_read`
+        // this turn — first turn and non-caching providers elide
+        // the segment entirely so the band doesn't lie about 0%
+        // coverage when the cache just isn't participating yet.
+        if let (Some(cache_read), Some(tin)) = (self.cache_read_tokens, self.tokens_in)
+            && cache_read > 0
+            && tin > 0
+        {
+            let pct = ((cache_read as f64 / tin as f64) * 100.0).round() as u32;
+            segments.push(format!("💾 {pct}%"));
         }
 
         // Σ session totals — either the running cumulative token
@@ -138,6 +155,7 @@ impl HistoryCell for TurnSummaryCell {
             ttft_ms: self.ttft_ms,
             tokens_in: self.tokens_in,
             tokens_out: self.tokens_out,
+            cache_read_tokens: self.cache_read_tokens,
             tools: self.tools,
             cumulative_tokens: self.cumulative_tokens,
             cumulative_cost_usd: self.cumulative_cost_usd,
@@ -215,6 +233,7 @@ mod tests {
             ttft_ms: Some(1_757),
             tokens_in: Some(23_200),
             tokens_out: Some(408),
+            cache_read_tokens: None,
             tools: 2,
             cumulative_tokens: Some(145_000),
             cumulative_cost_usd: Some(0.014),
@@ -249,6 +268,40 @@ mod tests {
         let out = render(&c, 120);
         assert!(!out.contains("ttft"), "ttft=0 must not render: {out}");
         assert!(out.contains("⏱"));
+    }
+
+    #[test]
+    fn cache_segment_shows_hit_rate_percentage() {
+        let mut c = mk_full();
+        // 23.2k tokens in, 18k cache read → ~78%
+        c.cache_read_tokens = Some(18_000);
+        let out = render(&c, 120);
+        assert!(out.contains("💾"), "cache icon missing: {out}");
+        assert!(
+            out.contains("78%"),
+            "expected ~78% hit rate in: {out}"
+        );
+    }
+
+    #[test]
+    fn cache_segment_elided_when_unreported() {
+        // Many providers don't surface cache reads on first turn
+        // or when caching is disabled — absence should not render
+        // a misleading "0%" chip.
+        let mut c = mk_full();
+        c.cache_read_tokens = None;
+        let out = render(&c, 120);
+        assert!(!out.contains("💾"), "cache chip must be elided: {out}");
+    }
+
+    #[test]
+    fn cache_segment_elided_when_read_is_zero() {
+        // Provider reported but hit rate genuinely zero — still
+        // elide rather than show "0%", which reads as noise.
+        let mut c = mk_full();
+        c.cache_read_tokens = Some(0);
+        let out = render(&c, 120);
+        assert!(!out.contains("💾"), "zero-hit cache chip must elide: {out}");
     }
 
     #[test]

@@ -748,6 +748,15 @@ pub(crate) async fn run_tui_repl(
                                             ttft_ms,
                                             tokens_in: Some(turn_prompt + turn_cache_read + turn_cache_creation),
                                             tokens_out: Some(turn_completion),
+                                            // Drive the `💾 N%` segment:
+                                            // hit rate = cache_read / total_input.
+                                            // Only plumbed when the provider
+                                            // reported a cache_read value this
+                                            // turn — `None` keeps the segment
+                                            // off entirely (first turn, non-
+                                            // caching provider, etc.).
+                                            cache_read_tokens: (turn_cache_read > 0)
+                                                .then_some(turn_cache_read),
                                             tools: turn_tool_count,
                                             cumulative_tokens: Some(
                                                 state.total_prompt_tokens

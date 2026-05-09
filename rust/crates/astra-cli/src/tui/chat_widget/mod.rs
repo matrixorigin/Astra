@@ -95,6 +95,12 @@ pub(crate) struct TurnStats {
     pub ttft_ms: Option<u64>,
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
+    /// Of the `tokens_in` total, how many were served from the
+    /// provider's prompt cache. Drives the `💾 N%` segment in the
+    /// per-turn summary band. `None` when the provider didn't
+    /// report cache stats this turn (e.g. first turn, no cache
+    /// participation, DeepSeek with cache disabled).
+    pub cache_read_tokens: Option<u64>,
     pub tools: u32,
     pub cumulative_tokens: Option<u64>,
     pub cumulative_cost_usd: Option<f64>,
@@ -389,6 +395,7 @@ impl ChatWidget {
             ttft_ms: stats.ttft_ms,
             tokens_in: stats.tokens_in,
             tokens_out: stats.tokens_out,
+            cache_read_tokens: stats.cache_read_tokens,
             tools: stats.tools,
             cumulative_tokens: stats.cumulative_tokens,
             cumulative_cost_usd: stats.cumulative_cost_usd,
@@ -935,6 +942,7 @@ mod tests {
                 ttft_ms: None,
                 tokens_in: Some(10),
                 tokens_out: Some(5),
+                cache_read_tokens: None,
                 tools: 0,
                 cumulative_tokens: Some(15),
                 cumulative_cost_usd: None,

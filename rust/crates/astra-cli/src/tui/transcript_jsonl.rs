@@ -172,6 +172,7 @@ mod tests {
                     ttft_ms: Some(300),
                     tokens_in: Some(500),
                     tokens_out: Some(200),
+                    cache_read_tokens: None,
                     tools: 1,
                     cumulative_tokens: Some(700),
                     cumulative_cost_usd: Some(0.0012),
