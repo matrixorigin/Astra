@@ -650,6 +650,23 @@ impl DynamicAgentSpawner {
             inherited_prefix,
         };
 
+        // Emit agent_spawned journal event for unified timeline.
+        if let Some(ref sid) = self.session_id {
+            let evt = astra_services::session_journal::JournalEvent::agent_spawned(
+                Some(sid),
+                &agent_id,
+                &run_id,
+                &context.parent_run_id,
+                &run_config.agent_type,
+                &input.description,
+                &run_config.model,
+                run_config.inherited_prefix.is_some(),
+            );
+            if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
+                let _ = writer.append(&evt);
+            }
+        }
+
         // 8. Execute or launch
         if input.background {
             // Background mode: launch async and return immediately.

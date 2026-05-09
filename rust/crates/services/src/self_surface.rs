@@ -2117,6 +2117,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::DelegationRetry => "delegation_retry",
         JournalEventType::DelegationCompleted => "delegation_completed",
         JournalEventType::AdaptiveBaselinePromoted => "adaptive_baseline_promoted",
+        JournalEventType::AgentSpawned => "agent_spawned",
         JournalEventType::AgentTerminated => "agent_terminated",
         JournalEventType::VerificationCompleted => "verification_completed",
         JournalEventType::CompositeSnapshot => "composite_snapshot",

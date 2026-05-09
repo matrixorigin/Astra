@@ -795,6 +795,8 @@ pub enum JournalEventType {
     DelegationCompleted,
     /// Adaptive baseline promoted from a completed experiment winner.
     AdaptiveBaselinePromoted,
+    /// A child agent was spawned (via spawn_agent tool or delegation).
+    AgentSpawned,
     /// A spawned agent terminated (completed, failed, or cancelled).
     AgentTerminated,
     /// Subtask or plan verification completed (acceptance-criteria gate result).
@@ -2942,6 +2944,33 @@ impl JournalEvent {
             "variant_id": variant_id,
             "replaced_existing": replaced_existing,
             "config_keys": config_keys,
+        }));
+        evt
+    }
+
+    /// Agent spawned event — marks the exact moment a child agent starts.
+    /// Emitted by the spawner after successful registration so the unified
+    /// timeline can show when each child was created.
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_spawned(
+        session_id: Option<&str>,
+        agent_id: &str,
+        run_id: &str,
+        parent_run_id: &str,
+        agent_type: &str,
+        description: &str,
+        model: &str,
+        inherit_prefix: bool,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::AgentSpawned, session_id);
+        evt.metadata = Some(serde_json::json!({
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "parent_run_id": parent_run_id,
+            "agent_type": agent_type,
+            "description": description,
+            "model": model,
+            "inherit_prefix": inherit_prefix,
         }));
         evt
     }

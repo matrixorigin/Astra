@@ -1631,6 +1631,24 @@ pub(super) async fn handle_session_command(
                                     experiment.dim(),
                                 );
                             }
+                            session_journal::JournalEventType::AgentSpawned => {
+                                let m = evt.metadata.as_ref();
+                                let agent = m
+                                    .and_then(|x| x.get("agent_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let desc = m
+                                    .and_then(|x| x.get("description"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                eprintln!(
+                                    "  {} {} agent spawned: {} ({})",
+                                    ts_short.dim(),
+                                    "┌".cyan(),
+                                    agent.cyan(),
+                                    desc,
+                                );
+                            }
                             session_journal::JournalEventType::AgentTerminated => {
                                 let m = evt.metadata.as_ref();
                                 let agent = m
