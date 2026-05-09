@@ -113,29 +113,38 @@ impl AssistantCell {
     ///
     /// - `think_inner`: the aggregated thinking content (may come
     ///   from an explicit `<think>` tag OR from prose that precedes
-    ///   a bare `</think>` — see below). `None` iff the source has
-    ///   no thinking markers at all.
+    ///   a bare terminal `</think>` — see below). `None` iff the
+    ///   source has no thinking markers we recognise.
     /// - `think_closed`: `true` once `</think>` has arrived.
-    /// - `body`: everything after the LAST `</think>`, if any; the
-    ///   full source otherwise.
+    /// - `body`: everything after the close tag, if any; the full
+    ///   source otherwise.
     ///
-    /// The reason this is messier than it looks: MiniMax / DeepSeek
-    /// / GLM often strip the opening `<think>` before the edge
-    /// sees it (the server feeds the reasoning content via the
-    /// separate thinking channel, but the prose body still carries
-    /// a bare `</think>` to close the window). So we have to
-    /// handle:
+    /// The tricky case: MiniMax / DeepSeek / GLM strip the opening
+    /// `<think>` before the edge sees it (the server routes the
+    /// reasoning content via the separate thinking channel), but
+    /// the prose body still carries a bare `</think>` to close the
+    /// window. Cases handled:
     ///
     /// 1. Matched `<think>…</think>`: inner is between the tags.
-    /// 2. Bare leading `</think>`: empty inner, body is the rest.
-    /// 3. Prose `…</think>`: the prose WAS thinking that leaked;
-    ///    inner is the prose, body is whatever follows `</think>`.
-    /// 4. Only `<think>` (no close yet): streaming think.
-    /// 5. No tags: pure body.
+    ///    Leading-`<think>` only; a mid-body `<think>` is just a
+    ///    prose reference.
+    /// 2. Source ENDS with `</think>`: the whole prose is leaked
+    ///    thinking (inner = prose before the close, body = empty).
+    ///    The "ends with" test is the critical guard against
+    ///    false-positives — regular prose that mentions `</think>`
+    ///    mid-sentence (e.g. a code review of this very function)
+    ///    would otherwise get truncated at the last tag mention.
+    /// 3. Source has `<think>` without a matching close: streaming
+    ///    think.
+    /// 4. Source has `</think>` but doesn't end with it: treated as
+    ///    plain prose (the tag is a reference, not a terminator).
+    /// 5. No tags: plain prose.
     ///
-    /// A mid-body `<think>` / `</think>` that appears AFTER a real
-    /// body has started is left alone — prose occasionally mentions
-    /// the tag and collapsing there would mangle the reply.
+    /// Real-world MiniMax emits thinking-only cells that either
+    /// contain just `</think>` or end with `</think>` — the body
+    /// always lands in a later cell. So "ends with close" captures
+    /// every legitimate leaked-thinking pattern without mangling
+    /// prose that mentions the tag.
     fn split_think(&self) -> (Option<&str>, bool, &str) {
         let source = self.source.as_str();
         let trimmed = source.trim_start();
@@ -145,7 +154,7 @@ impl AssistantCell {
         let close_tag = "</think>";
         let open_tag = "<think>";
 
-        // Case 1 / 4: explicit `<think>` at the very start.
+        // Case 1 / 3: explicit `<think>` at the very start.
         if let Some(after_open) = trimmed.strip_prefix(open_tag) {
             if let Some(close_rel) = after_open.find(close_tag) {
                 let think_inner = &after_open[..close_rel];
@@ -159,24 +168,23 @@ impl AssistantCell {
             return (Some(after_open), false, "");
         }
 
-        // Cases 2 & 3: content precedes a bare `</think>`. We
-        // recognise this only when the source does not open with a
-        // `<think>` — otherwise case 1 above already handled it.
-        // The content before the close is treated as thinking; the
-        // body is whatever follows the LAST `</think>` (MiniMax
-        // sometimes emits several per reply as it re-opens thinking
-        // mid-turn).
-        if let Some(last_close) = source.rfind(close_tag) {
-            let think_inner = source[..last_close].trim();
-            let body_start = last_close + close_tag.len();
-            let body = source[body_start..].trim_start_matches('\n');
-            // Sanity: if the think region contains no content at
-            // all (pure `</think>` cell), still signal a closed
-            // thought so the header renders instead of raw tags.
-            return (Some(think_inner), true, body);
+        // Case 2: source ends with `</think>` → all of it is leaked
+        // thinking. Only ONE `</think>` position is considered (the
+        // trailing one); multiple `</think>` in prose is so unusual
+        // we don't try to be cleverer about it.
+        //
+        // The test has to handle trailing whitespace from the
+        // streaming wire (partial chunks often end in `\n`).
+        if source.trim_end().ends_with(close_tag) {
+            let trimmed_end = source.trim_end();
+            let last_close = trimmed_end.len() - close_tag.len();
+            let think_inner = trimmed_end[..last_close].trim();
+            return (Some(think_inner), true, "");
         }
 
-        // Case 5: no thinking markers anywhere.
+        // Cases 4 & 5: `</think>` mid-body is prose, NOT metadata.
+        // Don't collapse — the reply includes prose references to
+        // the tag (e.g. a code review discussing this function).
         (None, false, source)
     }
 }
@@ -601,17 +609,27 @@ mod tests {
     }
 
     #[test]
-    fn thinking_prose_then_close_then_body_splits_correctly() {
-        // Same pattern but with a real body after the close.
+    fn mid_body_close_tag_is_not_treated_as_thinking_terminator() {
+        // Regression: a code review of the `<think>` handling code
+        // literally contains the string `</think>` inline (e.g.
+        // `` `</think>` `` in backticks). If we collapsed on any
+        // `</think>` the review would get truncated mid-body.
+        // Real leaked-thinking cells END with `</think>`; prose
+        // references appear mid-sentence, so "ends with" is the
+        // discriminator.
         let c = AssistantCell::from_markdown(
-            "internal reasoning here</think>\n\nThe answer is 42.",
+            "The review of the `</think>` handler found a bug: the splitter\n\
+             treats bare `</think>` mentions as if they were real terminators,\n\
+             which truncates prose that discusses the tag.",
         );
-        let out = render(&c, 60, 4);
-        assert!(out.contains("Thought"), "header missing: {out}");
-        assert!(out.contains("The answer is 42"), "body missing: {out}");
+        let out = render(&c, 80, 4);
         assert!(
-            !out.contains("internal reasoning"),
-            "thinking leak: {out}"
+            !out.contains("Thought"),
+            "mid-body `</think>` must NOT trigger collapse: {out}"
+        );
+        assert!(
+            out.contains("truncates prose"),
+            "entire prose must render — no silent truncation: {out}"
         );
     }
 
@@ -634,18 +652,22 @@ mod tests {
     }
 
     #[test]
-    fn multiple_close_tags_take_body_after_last_one() {
-        // Some providers emit several `</think>` as the model
-        // re-opens thinking mid-turn. Body is what follows the
-        // LAST close.
+    fn thinking_cell_that_ends_with_close_tag_collapses_entirely() {
+        // Real MiniMax pattern: each thinking segment is its own
+        // assistant cell whose content ENDS with `</think>`. The
+        // body — if any — arrives in a later cell without tags.
         let c = AssistantCell::from_markdown(
-            "think A</think>\nthink B</think>\n\nFinal answer.",
+            "The user wants a commit review. Let me fetch the diff first.</think>",
         );
-        let out = render(&c, 60, 4);
-        assert!(out.contains("Thought"), "header missing: {out}");
-        assert!(out.contains("Final answer"), "body missing: {out}");
-        assert!(!out.contains("think A"), "first think leak: {out}");
-        assert!(!out.contains("think B"), "second think leak: {out}");
+        let out = render(&c, 80, 2);
+        assert!(
+            out.contains("Thought"),
+            "source that ends with `</think>` is fully leaked thinking: {out}"
+        );
+        assert!(
+            !out.contains("The user wants a commit review"),
+            "leaked thinking prose must not render: {out}"
+        );
     }
 
     #[test]
