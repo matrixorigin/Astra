@@ -1,0 +1,7 @@
+---
+source: crates/astra-cli/src/tui/history_cell/reasoning.rs
+expression: "render(&c, 60, 4)"
+---
+💭  Thought for 3s
+  The user wants X.
+  Plan: do Y, then Z.
