@@ -261,7 +261,11 @@ fn render_body_with_gutter(source: &str, width: u16, live: bool) -> Vec<Line<'st
     }
 
     let theme = crate::tui::theme::current();
-    let gutter_style = Style::default().fg(theme.accent).bold();
+    // Dedicated `theme.gutter` (soft pink) keeps assistant replies
+    // visually distinct from cyan-accented UI chrome (composer prefix,
+    // slash-response corners, selection highlights). Bold so the gutter
+    // reads even at 1-cell width.
+    let gutter_style = Style::default().fg(theme.gutter).bold();
     let last_idx = rendered.len() - 1;
 
     rendered

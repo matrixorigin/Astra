@@ -666,20 +666,28 @@ pub(crate) async fn run_tui_repl(
                                     bottom_pane.footer.token_usage = Some(format!("{}↑ {}↓", state.total_prompt_tokens, state.total_completion_tokens));
                                     bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
                                     bottom_pane.footer.cost_usd = Some(state.total_session_cost);
-                                    // Token budget for the status chip. Context window defaults
-                                    // to 200k (Opus/Sonnet 4.x) until wired to a per-model value.
-                                    let used = state.total_prompt_tokens + state.total_completion_tokens;
-                                    bottom_pane.footer.token_budget = Some((used, 200_000));
+                                    // Footer "N% (Mk)" chip shows the CONTEXT WINDOW for
+                                    // the most recent turn — i.e. how many input tokens
+                                    // the model saw this turn, not cumulative session
+                                    // totals. Cumulative would climb to 100% within a few
+                                    // turns on any non-trivial chat and the chip becomes
+                                    // meaningless. The default 200k budget covers
+                                    // Anthropic Opus/Sonnet 4.x; per-model limits will
+                                    // land in a later pass.
+                                    let turn_prompt = state.total_prompt_tokens - pre_prompt_tokens;
+                                    let turn_completion = state.total_completion_tokens - pre_completion_tokens;
+                                    let turn_cache_read = state.total_cache_read_tokens - pre_cache_read;
+                                    let turn_cache_creation = state.total_cache_creation_tokens - pre_cache_creation;
+                                    let turn_input_tokens =
+                                        turn_prompt + turn_cache_read + turn_cache_creation;
+                                    bottom_pane.footer.token_budget =
+                                        Some((turn_input_tokens, 200_000));
 
                                     // Turn summary: dispatch to ChatWidget,
                                     // which builds the TurnSummaryCell and
                                     // persists it. `flush_chat_widget` below
                                     // paints it into scrollback.
                                     {
-                                        let turn_prompt = state.total_prompt_tokens - pre_prompt_tokens;
-                                        let turn_completion = state.total_completion_tokens - pre_completion_tokens;
-                                        let turn_cache_read = state.total_cache_read_tokens - pre_cache_read;
-                                        let turn_cache_creation = state.total_cache_creation_tokens - pre_cache_creation;
                                         let elapsed = turn_start.elapsed();
                                         let ttft_ms = turn_ttft.map(|t| {
                                             t.duration_since(turn_start).as_millis() as u64

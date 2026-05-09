@@ -58,7 +58,12 @@ impl Theme {
             // Subtle blue-grey tint; ~20% of accent over a dark bg.
             selected_bg: Color::Rgb(27, 44, 56),
             selected_fg: Color::Rgb(220, 232, 245),
-            gutter: Color::Cyan,
+            // Soft pink for the assistant-reply gutter (`┃ `) — reads
+            // clearly on any dark terminal background while feeling
+            // warmer than the previous cyan accent and providing a
+            // visual break between the composer accent (cyan) and
+            // the model's output.
+            gutter: Color::Rgb(246, 168, 195),
             success: Color::Green,
             warn: Color::Yellow,
             error: Color::Red,
@@ -77,7 +82,9 @@ impl Theme {
             accent: Color::Rgb(22, 89, 148), // deep blue
             selected_bg: Color::Rgb(226, 238, 250),
             selected_fg: Color::Rgb(17, 24, 35),
-            gutter: Color::Rgb(22, 89, 148),
+            // Deeper pink on light backgrounds so the gutter stays
+            // legible without washing into white.
+            gutter: Color::Rgb(204, 76, 128),
             success: Color::Rgb(22, 115, 46),
             warn: Color::Rgb(135, 89, 0),
             error: Color::Rgb(170, 34, 34),
