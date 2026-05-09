@@ -142,22 +142,42 @@ impl Writer {
 
     fn flush_line(&mut self) {
         let spans = std::mem::take(&mut self.current_spans);
-        if !spans.is_empty() {
-            // Blockquote lines get a `│ ` gutter in the quote colour
-            // so they scan like a pull-quote rather than plain green
-            // text. Body colour is already the blockquote style
-            // (pushed on start_tag).
-            if self.in_blockquote {
-                let mut with_bar: Vec<Span<'static>> = Vec::with_capacity(spans.len() + 1);
-                with_bar.push(Span::styled("│ ", self.styles.blockquote));
-                with_bar.extend(spans);
-                self.lines.push(Line::from(with_bar));
-            } else {
-                self.lines.push(Line::from(spans));
-            }
-        } else {
+        if spans.is_empty() {
             self.lines.push(Line::default());
+            return;
         }
+        // Blockquote lines get a `│ ` gutter in the quote colour
+        // so they scan like a pull-quote rather than plain green
+        // text. Body colour is already the blockquote style
+        // (pushed on start_tag).
+        if self.in_blockquote {
+            let mut with_bar: Vec<Span<'static>> = Vec::with_capacity(spans.len() + 1);
+            with_bar.push(Span::styled("│ ", self.styles.blockquote));
+            with_bar.extend(spans);
+            self.lines.push(Line::from(with_bar));
+            return;
+        }
+
+        // Inside a list item, pre-wrap the line so continuation rows
+        // hang-indent under the body text instead of wrapping back to
+        // column 0 (where they'd collide with the `• ` marker of the
+        // next bullet). The first span of a list item is always the
+        // marker (`• ` / `3. ` / nested ◦/▸/·); subsequent rows get a
+        // whitespace-only indent of matching display width.
+        //
+        // The width floor mirrors ratatui's own wrap trigger — below
+        // ~20 cols we just emit the raw line and let the terminal
+        // deal with it.
+        if !self.list_stack.is_empty()
+            && let Some(w) = self.width
+            && w >= 20
+            && let Some(wrapped) = list_item_hang_wrap(&spans, w)
+        {
+            self.lines.extend(wrapped);
+            return;
+        }
+
+        self.lines.push(Line::from(spans));
     }
 
     fn emit_text(&mut self, text: &str) {
@@ -609,6 +629,58 @@ fn wrap_row(
     out
 }
 
+/// Wrap a list-item line so continuation rows hang-indent under the
+/// item's body text instead of colliding with the left margin.
+/// Returns `None` when the input would fit on one row (no wrap
+/// needed) so the caller can fast-path the common case.
+///
+/// Input shape: `spans[0]` is the list marker (`• ` / `3. ` / nested
+/// glyphs — see `Tag::Item` handler). The remaining spans are the
+/// item's body content with their styles already applied. We split
+/// marker from content, wrap the content with `initial_indent = ""`
+/// (the marker is the initial) and `subsequent_indent = ""` padded
+/// to the marker's display width.
+fn list_item_hang_wrap(
+    spans: &[Span<'static>],
+    width: usize,
+) -> Option<Vec<Line<'static>>> {
+    if spans.is_empty() {
+        return None;
+    }
+    // Total display width of the whole line — if it fits, skip
+    // wrap machinery entirely.
+    let total_w: usize = spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
+    if total_w <= width {
+        return None;
+    }
+
+    let marker = &spans[0];
+    let marker_text = marker.content.as_ref();
+    let marker_w = UnicodeWidthStr::width(marker_text);
+    if marker_w == 0 || marker_w >= width {
+        // Marker alone won't leave room for content; give up on the
+        // fancy wrap and let the caller emit the raw Line.
+        return None;
+    }
+
+    let body_line = Line::from(spans[1..].to_vec());
+    let hang = " ".repeat(marker_w);
+    let opts = super::wrapping::RtOptions::new(width)
+        .initial_indent(Line::from(Span::styled(
+            marker_text.to_string(),
+            marker.style,
+        )))
+        .subsequent_indent(Line::from(Span::raw(hang)));
+
+    let wrapped = super::wrapping::word_wrap_line(&body_line, opts);
+    if wrapped.is_empty() {
+        return None;
+    }
+    // `word_wrap_line` returns `Vec<Line<'a>>` tied to the input
+    // lifetimes; convert to `'static` via `line_to_static`.
+    Some(wrapped.iter().map(line_to_static).collect())
+}
+
 fn wrap_cell(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
@@ -747,6 +819,47 @@ mod polish_tests {
             .expect("middle line");
         // "  " per depth level, depth=1 → 2 spaces before the glyph.
         assert!(middle.starts_with("  ◦ "), "got: {middle:?}");
+    }
+
+    #[test]
+    fn list_item_wrap_hangs_under_bullet() {
+        // A bullet whose text exceeds the width must wrap with a
+        // 2-char hang-indent under the bullet body — continuation
+        // rows must NOT wrap back to column 0 where they'd collide
+        // visually with the `•` marker of the next item.
+        let md = "- Feature arc is coherent — each commit builds \
+                  on the previous one without zig-zags across the \
+                  whole series.";
+        let out = lines_at(md, 40);
+        // First row starts with the marker.
+        let first = out
+            .iter()
+            .find(|l| l.starts_with("• "))
+            .expect("bullet row present");
+        assert!(first.starts_with("• "), "first row marker: {first:?}");
+        // All continuation rows (rows between the first bullet and
+        // the next blank / end) must start with 2 spaces of hang
+        // indent. Find them by: non-empty, not starting with `•`.
+        let conts: Vec<&String> = out
+            .iter()
+            .filter(|l| !l.is_empty() && !l.starts_with("• "))
+            .collect();
+        assert!(!conts.is_empty(), "expected at least one continuation row");
+        for row in &conts {
+            assert!(
+                row.starts_with("  "),
+                "continuation must hang-indent under bullet: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_item_short_enough_is_not_split() {
+        // Below the wrap trigger, the item stays one row.
+        let md = "- tiny";
+        let out = lines_at(md, 40);
+        let bullet_rows: Vec<&String> = out.iter().filter(|l| l.starts_with("• ")).collect();
+        assert_eq!(bullet_rows.len(), 1, "one bullet row; got: {out:?}");
     }
 
     #[test]
