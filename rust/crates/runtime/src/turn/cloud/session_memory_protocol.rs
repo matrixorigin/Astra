@@ -951,12 +951,167 @@ pub fn injection_level_for_pressure_with_thresholds(
     l1_full_max: f64,
     l1_minimal_max: f64,
 ) -> InjectionLevel {
-    if pressure < l1_full_max {
+    // NaN degrades safely to the most-informative level (fail-open): a
+    // caller whose pressure computation div-by-zero'd should not silently
+    // lose all context. +∞ falls through the `<` comparisons naturally
+    // and correctly lands in L0Only. Negative values also fail-open —
+    // they indicate a computation bug, not genuinely low pressure, but
+    // L1Full is the safer default than L0Only when uncertain.
+    if pressure.is_nan() || pressure < l1_full_max {
         InjectionLevel::L1Full
     } else if pressure < l1_minimal_max {
         InjectionLevel::L1Minimal
     } else {
         InjectionLevel::L0Only
+    }
+}
+
+#[cfg(test)]
+mod injection_level_threshold_tests {
+    use super::*;
+
+    #[test]
+    fn below_l1_full_threshold_returns_full() {
+        assert_eq!(injection_level_for_pressure(0.0), InjectionLevel::L1Full);
+        assert_eq!(injection_level_for_pressure(0.5), InjectionLevel::L1Full);
+        assert_eq!(injection_level_for_pressure(0.7499), InjectionLevel::L1Full);
+    }
+
+    #[test]
+    fn at_l1_full_threshold_boundary_returns_minimal() {
+        // Strict `<` comparison: 0.75 exactly is NOT L1Full.
+        assert_eq!(
+            injection_level_for_pressure(DEFAULT_L1_FULL_THRESHOLD),
+            InjectionLevel::L1Minimal
+        );
+    }
+
+    #[test]
+    fn between_thresholds_returns_minimal() {
+        assert_eq!(
+            injection_level_for_pressure(0.80),
+            InjectionLevel::L1Minimal
+        );
+        assert_eq!(
+            injection_level_for_pressure(0.8499),
+            InjectionLevel::L1Minimal
+        );
+    }
+
+    #[test]
+    fn at_l1_minimal_threshold_boundary_returns_l0() {
+        // Strict `<` comparison: 0.85 exactly is NOT L1Minimal.
+        assert_eq!(
+            injection_level_for_pressure(DEFAULT_L1_MINIMAL_THRESHOLD),
+            InjectionLevel::L0Only
+        );
+    }
+
+    #[test]
+    fn above_l1_minimal_threshold_returns_l0() {
+        assert_eq!(injection_level_for_pressure(0.90), InjectionLevel::L0Only);
+        assert_eq!(injection_level_for_pressure(1.50), InjectionLevel::L0Only);
+    }
+
+    #[test]
+    fn non_finite_pressure_degrades_to_full_not_l0() {
+        // A miscomputed pressure (NaN from div-by-zero, -∞ from bug) must
+        // not silently strip all context — fail open to L1Full.
+        assert_eq!(
+            injection_level_for_pressure(f64::NAN),
+            InjectionLevel::L1Full
+        );
+        assert_eq!(
+            injection_level_for_pressure(f64::NEG_INFINITY),
+            InjectionLevel::L1Full
+        );
+        assert_eq!(
+            injection_level_for_pressure(f64::INFINITY),
+            InjectionLevel::L0Only
+        );
+        assert_eq!(injection_level_for_pressure(-0.1), InjectionLevel::L1Full);
+    }
+
+    #[test]
+    fn custom_thresholds_respected() {
+        assert_eq!(
+            injection_level_for_pressure_with_thresholds(0.50, 0.40, 0.60),
+            InjectionLevel::L1Minimal
+        );
+        assert_eq!(
+            injection_level_for_pressure_with_thresholds(0.30, 0.40, 0.60),
+            InjectionLevel::L1Full
+        );
+        assert_eq!(
+            injection_level_for_pressure_with_thresholds(0.70, 0.40, 0.60),
+            InjectionLevel::L0Only
+        );
+    }
+}
+
+#[cfg(test)]
+mod narrative_staleness_tests {
+    use super::*;
+
+    fn facts_with_errors(n: u32) -> SessionFacts {
+        let mut f = SessionFacts::default();
+        f.error_state.total_errors = n;
+        f
+    }
+
+    #[test]
+    fn no_errors_no_narrative_is_fresh() {
+        let facts = SessionFacts::default();
+        let s = narrative_staleness(&facts, None);
+        assert!(!s.any());
+        assert!(!s.missing_corrections);
+    }
+
+    #[test]
+    fn three_errors_no_narrative_flags_missing_corrections() {
+        // Regression guard for the "narrative=None" call site: when the
+        // caller can't fetch L1, staleness must still trigger so the next
+        // extraction runs. Two errors should NOT trigger (threshold is ≥3).
+        assert!(!narrative_staleness(&facts_with_errors(2), None).missing_corrections);
+        assert!(narrative_staleness(&facts_with_errors(3), None).missing_corrections);
+        assert!(narrative_staleness(&facts_with_errors(10), None).missing_corrections);
+    }
+
+    #[test]
+    fn three_errors_with_populated_corrections_is_fresh() {
+        let facts = facts_with_errors(3);
+        let narrative = SessionMemory::parse(
+            "[session-memory:v1]\n# User Corrections\n- user said no use X\n\n# Task Specification\n- foo\n",
+        )
+        .expect("parse test narrative");
+        let s = narrative_staleness(&facts, Some(&narrative));
+        assert!(!s.missing_corrections);
+    }
+
+    #[test]
+    fn three_errors_with_empty_corrections_section_flags_stale() {
+        let facts = facts_with_errors(3);
+        let narrative = SessionMemory::parse(
+            "[session-memory:v1]\n# User Corrections\n\n# Task Specification\n- foo\n",
+        )
+        .expect("parse test narrative");
+        assert!(narrative_staleness(&facts, Some(&narrative)).missing_corrections);
+    }
+
+    #[test]
+    fn any_aggregates_both_signals() {
+        let s = NarrativeStaleness {
+            task_contradicted: true,
+            missing_corrections: false,
+        };
+        assert!(s.any());
+        let s = NarrativeStaleness {
+            task_contradicted: false,
+            missing_corrections: true,
+        };
+        assert!(s.any());
+        let s = NarrativeStaleness::default();
+        assert!(!s.any());
     }
 }
 

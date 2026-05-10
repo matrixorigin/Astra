@@ -662,12 +662,19 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
     // stream will still surface `extracted` / `errored` with
     // `error_triggered` breadcrumb-free (the signal is implicit in
     // the early firing, not a new event variant).
+    // Narrative is not materialised on the finalization hot path (fetching
+    // L1 here would add a Memoria round-trip per turn). Pass `None` and let
+    // `narrative_staleness` degrade to the facts-only heuristic
+    // (`total_errors >= 3` ⇒ `missing_corrections`); the subsequent
+    // extraction run will re-evaluate against the real narrative. Both
+    // staleness signals (`missing_corrections` and `task_contradicted`)
+    // trigger the gate override — either one means the current narrative
+    // no longer reflects session truth.
     let staleness = crate::turn::cloud::session_memory_protocol::narrative_staleness(
         &state.session_facts,
-        None, // narrative not materialised here; flag based on facts alone
+        None,
     );
-    let had_error =
-        state.error_recovery.consecutive_same_error > 0 || staleness.missing_corrections;
+    let had_error = state.error_recovery.consecutive_same_error > 0 || staleness.any();
 
     // Total context size the model actually sees — uncached prompt +
     // cache reads + cache creation. Using `total_prompt` alone here

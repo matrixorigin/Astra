@@ -867,15 +867,13 @@ pub async fn compact_with_memoria(
         //  * pressure < 0.85 → facts only (~150t)
         //  * pressure ≥ 0.85 → empty here; L0 anchor in the system prompt
         //                      already carries minimal goal state.
-        // budget_chars is the compacted output budget; token pressure
-        // approximates `current_tokens / budget_tokens` using the usual
-        // 4-char-per-token ratio.
-        let budget_tokens = params.budget_chars.saturating_mul(1).max(1) / 4;
-        let pressure = if budget_tokens == 0 {
-            0.0
-        } else {
-            (params.current_tokens as f64) / (budget_tokens.max(1) as f64)
-        };
+        // `params.budget_chars` is the model's effective input budget in
+        // chars (constructed as `effective_input_limit * 4` by
+        // `wire_assembly.rs`). Convert back to tokens via the usual
+        // 4-char-per-token ratio to express pressure as
+        // `current_tokens / input_budget_tokens`.
+        let budget_tokens = (params.budget_chars / 4).max(1);
+        let pressure = (params.current_tokens as f64) / (budget_tokens as f64);
         let level = super::session_memory_protocol::injection_level_for_pressure(pressure);
         let injection = super::session_memory_protocol::build_facts_first_injection(
             facts,
