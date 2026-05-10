@@ -538,25 +538,133 @@ const STOP_WORDS: &[&str] = &[
     "她",
     "它",
     "们",
+    "我们",
+    "你们",
+    "他们",
+    "她们",
+    "它们",
+    "咱",
+    "咱们",
+    // Demonstratives — bare + compound forms.
+    // The CJK tokenizer glues consecutive CJK chars into a single
+    // token, so `这个` / `那些` etc. never get split down to `这` /
+    // `那`. Each compound MUST be listed explicitly; falling back
+    // to prefix-match logic would risk filtering legitimate entities
+    // like `这篇` if it appears in a proper noun.
     "这",
     "那",
     "哪",
+    "这个",
+    "那个",
+    "哪个",
+    "这些",
+    "那些",
+    "哪些",
+    "这里",
+    "那里",
+    "哪里",
+    "这儿",
+    "那儿",
+    "哪儿",
+    "这样",
+    "那样",
+    "怎样",
+    "这种",
+    "那种",
+    "哪种",
+    "这时",
+    "那时",
+    "该",
+    "某",
+    "各",
+    "此",
+    "其",
+    "其他",
+    "其它",
+    "自己",
+    // Interrogatives.
     "什么",
     "怎么",
     "如何",
     "为什么",
+    "多少",
+    "几",
+    // Copula + negation + modal verbs.
     "是",
+    "不是",
     "有",
+    "没",
     "没有",
     "不",
     "要",
+    "不要",
     "可以",
     "能",
+    "不能",
     "会",
+    "不会",
     "想",
+    "应该",
+    // Request verbs that routinely appear in prompts but carry no
+    // entity signal. User-reported examples plus neighbours
+    // commonly paired with them.
+    "看",
     "看看",
+    "看一下",
     "帮",
     "帮我",
+    "帮助",
+    "请",
+    "谢谢",
+    "感谢",
+    "告诉",
+    "告诉我",
+    "给",
+    "给我",
+    "让",
+    "让我",
+    "检查",
+    "查看",
+    "查询",
+    "找",
+    "找到",
+    "搜索",
+    "分析",
+    "执行",
+    "运行",
+    "解释",
+    "说明",
+    "修复",
+    "完成",
+    "开始",
+    "结束",
+    "继续",
+    "停止",
+    // Common connective / adverbial fillers.
+    "然后",
+    "而且",
+    "但是",
+    "所以",
+    "因为",
+    "因此",
+    "如果",
+    "虽然",
+    "例如",
+    "比如",
+    "已经",
+    "还是",
+    "或者",
+    "还有",
+    "这里面",
+    "里面",
+    "上面",
+    "下面",
+    "现在",
+    "目前",
+    "以及",
+    "最近",
+    "之前",
+    "之后",
 ];
 
 /// Extract entity candidates from a query.
@@ -881,6 +989,100 @@ mod tests {
     fn extract_preserves_hyphenated() {
         let entities = extract_entities("check mo-dev-agent status");
         assert!(entities.contains(&"mo-dev-agent".to_string()));
+    }
+
+    // ── Pronoun / demonstrative pollution (user-reported) ────────────────
+    //
+    // Observed in a real session: `Entity '这个' is associated with
+    // domain Git and tools [bash, read_file]`. The tokenizer glues
+    // consecutive CJK chars into one token, so bare demonstratives
+    // and their compound forms all have to be named in the stop-word
+    // set. These tests lock in the filter so pronouns never leak
+    // into the entity graph.
+
+    #[test]
+    fn extract_filters_bare_chinese_demonstratives() {
+        // Each word is a standalone CJK token → tokenizer produces
+        // it as-is → stop-word list must catch it.
+        for pronoun in ["这个", "那个", "哪个", "这些", "那些", "哪些"] {
+            let entities = extract_entities(pronoun);
+            assert!(
+                entities.is_empty(),
+                "bare demonstrative {pronoun:?} must be filtered; got {entities:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_filters_chinese_pronouns_and_aux_in_context() {
+        // Real-world phrasing: a sentence with both a demonstrative
+        // and a real entity. The demonstrative must be filtered; the
+        // real entity must survive.
+        let entities = extract_entities("这个 MatrixOne 问题");
+        assert!(
+            !entities.iter().any(|e| e == "这个"),
+            "demonstrative must be filtered; got {entities:?}"
+        );
+        assert!(
+            entities.iter().any(|e| e == "matrixone"),
+            "real entity must survive alongside a filtered demonstrative; got {entities:?}"
+        );
+    }
+
+    #[test]
+    fn extract_filters_chinese_place_and_manner_demonstratives() {
+        for word in ["这里", "那里", "哪里", "这样", "那样", "怎样"] {
+            let entities = extract_entities(word);
+            assert!(
+                entities.is_empty(),
+                "place/manner demonstrative {word:?} must be filtered; got {entities:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_filters_single_char_formal_demonstratives() {
+        // `该` / `某` / `各` / `此` / `其` are common in formal
+        // prose and task descriptions but never meaningful entities.
+        for word in ["该", "某", "各", "此", "其"] {
+            let entities = extract_entities(word);
+            assert!(
+                entities.is_empty(),
+                "single-char demonstrative {word:?} must be filtered; got {entities:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_filters_common_chinese_verbs_in_prompts() {
+        // User queries routinely start with these — they aren't
+        // entities. `帮我` was already in STOP_WORDS; make sure the
+        // surrounding verbs don't slip through.
+        for word in ["请", "谢谢", "告诉我", "给我", "帮助", "检查", "看看"] {
+            let entities = extract_entities(word);
+            assert!(
+                !entities.iter().any(|e| e == word),
+                "common request verb {word:?} must be filtered; got {entities:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_still_keeps_real_entities_near_pronouns() {
+        // End-to-end: a realistic user message containing a
+        // demonstrative next to a real entity. The demonstrative is
+        // gone; the project / tool name remains.
+        let entities = extract_entities("请帮我看看这个 MatrixOrigin PR");
+        assert!(
+            !entities
+                .iter()
+                .any(|e| e == "这个" || e == "帮我" || e == "请"),
+            "stop words must be filtered; got {entities:?}"
+        );
+        assert!(
+            entities.iter().any(|e| e == "matrixorigin"),
+            "real entity must survive; got {entities:?}"
+        );
     }
 
     // NOTE: entity_graph_improves_routing test moved to runtime integration tests
