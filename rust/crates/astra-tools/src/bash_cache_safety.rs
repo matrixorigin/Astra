@@ -83,11 +83,15 @@ pub fn bash_command_is_cache_safe(command: &str) -> bool {
         // stale output; the session TTL is the backstop.
         "find" | "grep" | "rg" | "ripgrep" | "ag" | "fd" | "fdfind" => true,
 
-        // Version queries: always safe.
+        // Version queries: only safe as a BARE two-token command
+        // (`node --version`, `python3 -V`). Trailing arguments could
+        // repurpose the tool as a real runner that incidentally
+        // prints its version first, and we can't prove the output
+        // still depends purely on installed version.
         "node" | "npm" | "pnpm" | "yarn" | "python" | "python3" | "pip" | "pip3" | "ruby"
-        | "go" | "deno" | "bun" | "rustc" | "rustup" | "cargo" | "java" | "javac" | "mvn"
-        | "gradle" | "kubectl" | "docker" | "podman"
-            if second == Some("--version") || second == Some("-V") =>
+        | "go" | "deno" | "bun" | "rustc" | "rustup" | "java" | "javac" | "mvn" | "gradle"
+        | "kubectl" | "docker" | "podman"
+            if (second == Some("--version") || second == Some("-V")) && tokens.next().is_none() =>
         {
             true
         }
@@ -120,17 +124,20 @@ pub fn bash_command_is_cache_safe(command: &str) -> bool {
 
         // cargo: only metadata / tree / check-style reads. build,
         // test, run, publish, install all mutate target/ or network.
-        "cargo" => matches!(
-            second,
+        //
+        // `-v`/`-V`/`--version` are version queries ONLY when they
+        // stand alone. `cargo -v build` / `cargo --verbose build`
+        // is a real BUILD with verbose output, not a query — these
+        // must NOT be cache-safe.
+        "cargo" => match second {
             Some("metadata")
-                | Some("tree")
-                | Some("pkgid")
-                | Some("locate-project")
-                | Some("search")
-                | Some("--version")
-                | Some("-V")
-                | Some("-v")
-        ),
+            | Some("tree")
+            | Some("pkgid")
+            | Some("locate-project")
+            | Some("search") => true,
+            Some("-V") | Some("-v") | Some("--version") => tokens.next().is_none(),
+            _ => false,
+        },
 
         _ => false,
     }
@@ -291,6 +298,51 @@ mod tests {
             "cargo metadata --format-version 1"
         ));
         assert!(bash_command_is_cache_safe("cargo tree"));
+    }
+
+    /// Regression: `-v` / `-V` must only be cache-safe when they are
+    /// the ENTIRE command (version query), not when they're a
+    /// verbose flag before a real subcommand like `cargo -v build`
+    /// or `cargo -v test`. Those actually build/test; returning a
+    /// cached output would replay a prior build's log while the
+    /// real target/ has already advanced.
+    #[test]
+    fn cargo_dash_v_with_subcommand_is_not_cache_safe() {
+        for cmd in [
+            "cargo -v build",
+            "cargo -v test",
+            "cargo -v run",
+            "cargo -V build",
+            "cargo --verbose build",
+            "cargo -v --release build",
+        ] {
+            assert!(
+                !bash_command_is_cache_safe(cmd),
+                "cargo -v/-V followed by a subcommand mutates; must NOT be cache-safe: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_bare_version_query_is_cache_safe() {
+        // These are pure version queries — safe.
+        for cmd in ["cargo -V", "cargo -v", "cargo --version"] {
+            assert!(
+                bash_command_is_cache_safe(cmd),
+                "bare version query must be cache-safe: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_version_query_requires_no_trailing_args() {
+        // `node --version` is the canonical pure query — safe.
+        assert!(bash_command_is_cache_safe("node --version"));
+        assert!(bash_command_is_cache_safe("python3 --version"));
+        // With trailing arg we can't prove the tool is still in
+        // query mode. Fail-closed: not cache-safe.
+        assert!(!bash_command_is_cache_safe("node --version extra"));
+        assert!(!bash_command_is_cache_safe("python3 --version foo.py"));
     }
 
     // ── Denylist: these MUST NOT be cacheable ──────────────────────
