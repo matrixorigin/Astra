@@ -235,6 +235,7 @@ impl AgenticLoopHost for SubRunHost {
             0.5,   // neutral confidence
             "",    // no learned context
             None,  // no learned task type
+            None,  // skill subruns have no attached user scenario context
         );
         state.last_turn_policy = turn_policy_from_payload_edge_tools(&payload, interaction_mode);
 
@@ -844,6 +845,7 @@ mod tests {
             None,
             0.5,
             "",
+            None,
             None,
         );
 

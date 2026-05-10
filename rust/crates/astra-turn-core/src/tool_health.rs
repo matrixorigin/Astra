@@ -8,7 +8,7 @@
 //! ends. It complements the cross-session `ToolQualityTracker` which
 //! tracks long-term tool reliability.
 
-use crate::action_compensation::{classify_execution_outcome, FailureCategory};
+use crate::action_compensation::{FailureCategory, classify_execution_outcome};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -1723,10 +1723,10 @@ mod tests {
         );
 
         let bias = tracker.outcome_bias_by_tool(3600);
-        assert!(bias.get("bash").copied().unwrap_or_default() > 0.0);
-        assert!(bias.get("read_file").copied().unwrap_or_default() < 0.0);
+        assert!(bias.get("bash").map(|e| e.score).unwrap_or(0.0) > 0.0);
+        assert!(bias.get("read_file").map(|e| e.score).unwrap_or(0.0) < 0.0);
         for value in bias.values() {
-            assert!((-0.16..=0.10).contains(value));
+            assert!((-0.16..=0.10).contains(&value.score));
         }
     }
 

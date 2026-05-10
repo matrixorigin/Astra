@@ -654,6 +654,20 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     );
     ctx.executor.set_budget_pressure(budget_pressure);
 
+    // User scenario for scenario-tagged hint filtering. We take a
+    // brief read lock on the observability session, extract the
+    // stable `{:?}` token, and drop the lock before the payload
+    // mutation — the hint-filter code only needs the token string.
+    let user_scenario_token: Option<String> = ctx
+        .executor
+        .observability_session
+        .as_ref()
+        .and_then(|lock| lock.read().ok())
+        .and_then(|s| {
+            s.current_scenario()
+                .map(|sc| format!("{sc:?}").to_ascii_lowercase())
+        });
+
     apply_selector_hints_then_attach_filtered_edge_tools(
         &mut payload,
         turn_schemas,
@@ -662,6 +676,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         selection_confidence,
         learned_context_hint.as_str(),
         learned_task_type.as_deref(),
+        user_scenario_token.as_deref(),
     );
     *ctx.turn_policy = turn_policy_from_payload_edge_tools(&payload, ctx.interaction_mode);
     log_chat_turn_timing_phase(timing, "skill_merge_attach_edge_tools", &mut mark);

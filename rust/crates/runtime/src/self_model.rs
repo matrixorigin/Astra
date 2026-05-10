@@ -2386,14 +2386,8 @@ mod tests {
                 last_failure_tag: Some("timeout".to_string()),
             },
         );
-        bias.insert(
-            "write_file".to_string(),
-            OutcomeBiasEntry::from_score(0.08),
-        );
-        bias.insert(
-            "read_file".to_string(),
-            OutcomeBiasEntry::from_score(0.02),
-        );
+        bias.insert("write_file".to_string(), OutcomeBiasEntry::from_score(0.08));
+        bias.insert("read_file".to_string(), OutcomeBiasEntry::from_score(0.02));
         let model = minimal_model().with_outcome_bias(bias);
         let rendered = model.to_system_prompt_section();
         assert!(
@@ -2421,10 +2415,7 @@ mod tests {
     fn outcome_bias_filters_near_zero_entries() {
         use astra_turn_core::tool_health::OutcomeBiasEntry;
         let mut bias = std::collections::BTreeMap::new();
-        bias.insert(
-            "noise".to_string(),
-            OutcomeBiasEntry::from_score(0.001),
-        );
+        bias.insert("noise".to_string(), OutcomeBiasEntry::from_score(0.001));
         let model = minimal_model().with_outcome_bias(bias);
         let rendered = model.to_system_prompt_section();
         assert!(
