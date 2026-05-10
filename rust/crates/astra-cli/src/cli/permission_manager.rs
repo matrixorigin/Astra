@@ -881,6 +881,47 @@ impl PermissionManager {
     ) -> Option<astra_thin_client::ApprovalDecision> {
         use astra_thin_client::ApprovalDecision;
 
+        // Compute the fingerprint up front so both the Explicit and
+        // Standard branches can honour a prior `Always` decision. The
+        // old code only consulted `session_overrides` on the Standard
+        // branch; Explicit tools (bash, shell_exec — anything
+        // unbounded+irreversible) ignored the overrides and always
+        // re-prompted, which is the user-reported "Always doesn't
+        // stick for bash" bug.
+        //
+        // Use `cloud_gated_tool_kind(tool)` (not the args-aware
+        // variant) here so the lookup fingerprint matches what
+        // `apply_cloud_approval_choice` stores. The args-aware
+        // classifier returns `None` for read-only bash commands like
+        // `git status`, which would drop the fingerprint to `bare` —
+        // that doesn't match the `shell`-keyed override the store
+        // path wrote, and the user gets re-prompted. Keeping both
+        // sides on the tool-name-only classifier keeps them in sync.
+        let kind = cloud_gated_tool_kind(tool);
+        let fp = match (kind, detail) {
+            (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
+                astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(tool, cmd, false)
+            }
+            (Some(CloudGatedToolKind::Write), d) => {
+                astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
+            }
+            _ => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool),
+        };
+
+        // Session override check — applies to every kind. A matched
+        // `Always` means the user has already made an informed
+        // decision on this exact fingerprint this session; don't
+        // re-ask regardless of `approval_kind` or `quiet`. This also
+        // means silent sub-runs can honour `Always` instead of
+        // auto-denying.
+        if let Some(allowed) = self.session_overrides.check(&fp) {
+            return Some(if allowed {
+                ApprovalDecision::Allow
+            } else {
+                ApprovalDecision::Deny
+            });
+        }
+
         if quiet {
             return Some(if self.mode == PermissionMode::Auto {
                 ApprovalDecision::Allow
@@ -903,24 +944,9 @@ impl PermissionManager {
             PermissionMode::Prompt => {}
         }
 
-        let synthetic_args = detail.map(|d| serde_json::json!({"command": d}));
-        let kind = cloud_gated_tool_kind_with_args(tool, synthetic_args.as_ref());
-        let fp = match (kind, detail) {
-            (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
-                astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(tool, cmd, false)
-            }
-            (Some(CloudGatedToolKind::Write), d) => {
-                astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
-            }
-            _ => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool),
-        };
-        if let Some(allowed) = self.session_overrides.check(&fp) {
-            return Some(if allowed {
-                ApprovalDecision::Allow
-            } else {
-                ApprovalDecision::Deny
-            });
-        }
+        // Standard-kind: consult the denial tracker. The session
+        // override check already ran at the top of the function, so
+        // here we only care about repeated-denial short-circuits.
         match self.denial_tracker.should_prompt(&fp) {
             astra_turn_core::approval_fingerprint::DenialAction::SkipTool => {
                 Some(ApprovalDecision::Deny)
@@ -4404,6 +4430,99 @@ mod tests {
         assert!(
             matches!(decision, PermissionDecision::Allow),
             "after restart, saved rule must still Allow; got {decision:?}"
+        );
+    }
+
+    // ── Explicit-kind `Always` must not re-prompt (user-reported) ──
+    //
+    // bash / shell_exec / other unbounded+irreversible tools go
+    // through `ApprovalKind::Explicit`. Previously
+    // `preflight_cloud_approval_decision` SKIPPED the session
+    // override check on Explicit — it only looked at `self.mode`.
+    // So even after the user pressed "Always" on a bash command and
+    // `apply_cloud_approval_choice('a')` recorded the fingerprint
+    // in `session_overrides`, the NEXT identical bash call would
+    // fall through to the interactive prompt again. Observationally
+    // identical to "Always doesn't work".
+    //
+    // Fix: preflight consults `session_overrides` on every path,
+    // including Explicit. These tests lock that in.
+
+    #[tokio::test]
+    async fn explicit_bash_always_is_honored_on_second_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        // First call: user presses "Always" on `cargo test --lib`.
+        let first = pm.apply_cloud_approval_choice("bash", Some("cargo test --lib"), 'a');
+        assert_eq!(first, astra_thin_client::ApprovalDecision::AllowSession);
+
+        // Second call: same bash command, Explicit approval kind.
+        // Preflight must short-circuit on the stored session
+        // override instead of returning None and forcing the
+        // caller to re-prompt.
+        let decision = pm
+            .resolve_cloud_approval_async(
+                "bash",
+                Some("cargo test --lib"),
+                ApprovalKind::Explicit,
+                // quiet=true is the TUI Silent policy; the point is
+                // that session_overrides wins even in Silent mode
+                // (otherwise the TUI would silently deny).
+                true,
+            )
+            .await;
+        assert_eq!(
+            decision,
+            astra_thin_client::ApprovalDecision::Allow,
+            "Explicit-kind second call must honour the prior `Always`; got {decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_kind_still_reprompts_when_no_session_override() {
+        // Companion: the fix must not accidentally blanket-allow
+        // Explicit tools. With no override in the map, a
+        // `Prompt`-mode + Explicit request should still return
+        // None so the caller falls through to the interactive
+        // prompt.
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        let decision = pm.preflight_cloud_approval_decision(
+            "bash",
+            Some("rm -rf /tmp/foo"),
+            ApprovalKind::Explicit,
+            false,
+        );
+        assert!(
+            decision.is_none(),
+            "no override + Prompt mode + Explicit → must fall through to prompt; got {decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_mode_honors_session_override_instead_of_auto_denying() {
+        // TUI sets `quiet=true` (Silent render policy). Pre-fix,
+        // this made preflight return Deny for anything except Auto
+        // mode, regardless of whether the user had pressed Always
+        // in the same session. Post-fix, session overrides win
+        // even under Silent.
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        pm.apply_cloud_approval_choice("bash", Some("git status"), 'a');
+
+        let decision = pm.preflight_cloud_approval_decision(
+            "bash",
+            Some("git status"),
+            ApprovalKind::Standard,
+            true, // quiet
+        );
+        assert_eq!(
+            decision,
+            Some(astra_thin_client::ApprovalDecision::Allow),
+            "quiet + session override must Allow; got {decision:?}"
         );
     }
 }

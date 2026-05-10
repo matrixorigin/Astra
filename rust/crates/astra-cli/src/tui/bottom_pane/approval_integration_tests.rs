@@ -296,3 +296,78 @@ fn activation_single_vs_batch_reports_correct_variant() {
     ));
     assert_eq!(bp.footer.pending_approvals, 0);
 }
+
+// ─── Arrow-key parity (user-reported UX bug) ─────────────────────
+//
+// Users reported pressing Up/Down on the approval card and seeing
+// no movement — they were stuck on Accept. The prior mapping only
+// bound Left/Right, which isn't a discoverable default when the
+// buttons render horizontally. Fix: accept Up/Down as aliases of
+// Left/Right. These tests lock the parity in.
+
+#[test]
+fn down_moves_focus_like_right() {
+    let mut bp = BottomPane::new();
+    let rx = enqueue(&mut bp, "bash");
+    // Down from Accept → Reject. Enter rejects.
+    let _ = bp.handle_key(special(KeyCode::Down));
+    let _ = bp.handle_key(special(KeyCode::Enter));
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
+}
+
+#[test]
+fn up_moves_focus_like_left_wrapping_to_skip() {
+    let mut bp = BottomPane::new();
+    let rx = enqueue(&mut bp, "bash");
+    // Up from Accept wraps to the last button (Skip).
+    let _ = bp.handle_key(special(KeyCode::Up));
+    let _ = bp.handle_key(special(KeyCode::Enter));
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Skip);
+}
+
+#[test]
+fn up_down_reach_always_button() {
+    // End-to-end: the user wants to pick "Always" via Up/Down only.
+    // From Accept (index 0), Down twice lands on Always (index 2).
+    let mut bp = BottomPane::new();
+    let rx = enqueue(&mut bp, "bash");
+    let _ = bp.handle_key(special(KeyCode::Down));
+    let _ = bp.handle_key(special(KeyCode::Down));
+    let _ = bp.handle_key(special(KeyCode::Enter));
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::AlwaysAllow);
+}
+
+#[test]
+fn tab_cycles_pending_approvals_even_with_composer_text() {
+    // The old guard required `composer.is_empty()` so a stray
+    // character in the composer would hand Tab to completion and
+    // the approval queue would never cycle. Users reported "Tab
+    // did nothing" in exactly this scenario.
+    let mut bp = BottomPane::new();
+    let _rx1 = enqueue(&mut bp, "alpha");
+    let _rx2 = enqueue(&mut bp, "beta");
+
+    // Stray whitespace in the composer — user may have typed
+    // ahead, or an accidental paste.
+    type_string(&mut bp, " ");
+    assert_eq!(bp.focused_approval_index(), Some(0));
+    let _ = bp.handle_key(special(KeyCode::Tab));
+    assert_eq!(
+        bp.focused_approval_index(),
+        Some(1),
+        "Tab must cycle to the next approval regardless of composer content"
+    );
+}
+
+#[test]
+fn shift_tab_cycles_pending_approvals_backward() {
+    let mut bp = BottomPane::new();
+    let _rx1 = enqueue(&mut bp, "alpha");
+    let _rx2 = enqueue(&mut bp, "beta");
+
+    // Move to second, then BackTab should go back to first.
+    let _ = bp.handle_key(special(KeyCode::Tab));
+    assert_eq!(bp.focused_approval_index(), Some(1));
+    let _ = bp.handle_key(special(KeyCode::BackTab));
+    assert_eq!(bp.focused_approval_index(), Some(0));
+}

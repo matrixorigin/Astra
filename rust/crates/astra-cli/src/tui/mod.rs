@@ -559,8 +559,17 @@ pub(crate) async fn run_tui_repl(
                                                             // During turn: composer stays usable.
                                                             // Enter queues message (shown as preview, not in scrollback).
                                                             // Up edits last queued. Ctrl+C interrupts.
-                                                            // Up arrow with queued messages → edit last
+                                                            //
+                                                            // Exception: if an approval is pending, Up
+                                                            // belongs to the approval button row — the
+                                                            // user is trying to pick a button, not edit
+                                                            // a queued message. Without this guard, the
+                                                            // queued-message edit path swallows arrow
+                                                            // keys while the approval cell is focused
+                                                            // and the user ends up stuck on the first
+                                                            // button (Accept).
                                                             if k.code == crossterm::event::KeyCode::Up
+                                                                && !bottom_pane.has_pending_approvals()
                                                                 && !bottom_pane.queued_messages.is_empty()
                                                                 && bottom_pane.composer.is_empty()
                                                             {

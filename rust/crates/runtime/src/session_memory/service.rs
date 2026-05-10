@@ -42,14 +42,14 @@ use crate::memory_relevance::LlmConnParams;
 use crate::turn::cloud::memoria_compact::MemoriaClient;
 
 use super::activity::{BackgroundActivity, BackgroundActivityBroker};
-use super::gate::{evaluate, GateDecision};
+use super::gate::{GateDecision, evaluate};
 use super::health::{MemoriaAdmit, MemoriaHealth, SelectorHealth};
 use super::observatory::{
-    clip_preview, ExtractionOutcome as ObsExtractionOutcome,
-    ExtractionRecord as ObsExtractionRecord, ExtractionTrigger, SessionMemoryObservatory,
+    ExtractionOutcome as ObsExtractionOutcome, ExtractionRecord as ObsExtractionRecord,
+    ExtractionTrigger, SessionMemoryObservatory, clip_preview,
 };
 use super::request::{ExtractionRequest, SpawnDecision};
-use super::runner::{run_extraction, ExtractionArtifacts};
+use super::runner::{ExtractionArtifacts, run_extraction};
 
 #[cfg(test)]
 type MaybeSpawnAfterGateHook = std::sync::Arc<dyn Fn(&ExtractionRequest) + Send + Sync + 'static>;
@@ -905,7 +905,7 @@ fn summarize_persisted_content(content: &str) -> (Vec<String>, String) {
 
 impl MemoryExtractionService {
     async fn load_current_memory(&self, session_id: &str) -> String {
-        use crate::turn::cloud::session_memory_protocol::{pick_latest_l1, SESSION_MEMORY_PREFIX};
+        use crate::turn::cloud::session_memory_protocol::{SESSION_MEMORY_PREFIX, pick_latest_l1};
         let Ok(memories) = self
             .memoria_client
             .retrieve_ext(
