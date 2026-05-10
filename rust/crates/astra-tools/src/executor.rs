@@ -1020,6 +1020,59 @@ mod tests {
         );
     }
 
+    /// Regression guard: a failed bash run (non-zero exit, sandbox
+    /// block, permission denied, timeout, cancellation) MUST NOT be
+    /// cached — otherwise after the user fixes the underlying
+    /// condition (chmod, install, whatever) the next call returns
+    /// the stale error for up to the TTL window.
+    ///
+    /// This covers the user-reported worry that "bash dedup caches
+    /// failures" — the insert path is guarded by `!result.is_error`
+    /// (see dispatch around line 295) and this test locks the
+    /// invariant in.
+    #[tokio::test]
+    async fn dispatch_bash_does_not_cache_failed_results() {
+        let (tmp, exec) = test_executor();
+        // Use a readonly command (`cat`) so it WOULD be classifier-
+        // admitted. First call reads a non-existent path → cat
+        // exits 1 → is_error=true. Second call targets the same
+        // path but the file now exists → must re-execute, not
+        // replay the "No such file" error.
+        let args = serde_json::json!({ "command": "cat missing.txt" });
+        let first = exec.execute("bash", &args).await;
+        assert!(
+            first.is_error,
+            "first call must surface the cat error: {}",
+            first.output
+        );
+
+        // Fix the condition: create the file.
+        std::fs::write(tmp.path().join("missing.txt"), "hello\n").unwrap();
+
+        // Second call — must re-execute and succeed, not return the
+        // cached error.
+        let second = exec.execute("bash", &args).await;
+        assert!(
+            !second.is_error,
+            "second call must not replay cached error (got: {})",
+            second.output
+        );
+        assert_ne!(
+            second
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "second call must not be served from cache"
+        );
+        assert!(
+            second.output.contains("hello"),
+            "second call must show the real file content: {}",
+            second.output
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_bash_non_zero_is_error() {
         let (_tmp, exec) = test_executor();
