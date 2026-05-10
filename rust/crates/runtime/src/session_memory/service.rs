@@ -115,7 +115,18 @@ pub struct MemoryExtractionService {
     user_id: Arc<str>,
     health: Arc<SelectorHealth>,
     memoria_health: Arc<MemoriaHealth>,
-    in_flight: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Set of session_ids currently being extracted. Guarded by a
+    /// **std** mutex, not tokio — the critical section is a
+    /// `HashSet::insert/remove` with no `.await` inside, so blocking
+    /// is bounded to a cache-line update. Using `tokio::sync::Mutex`
+    /// here was wrong: `maybe_spawn` is a sync entry point that used
+    /// `try_lock()`, which races with the async `release_in_flight`
+    /// holding `.lock().await` and spuriously fails — emitting
+    /// `InFlight` skips for sessions that were admissible and, worse,
+    /// consuming half-open breaker probe slots that should have
+    /// retried. std::sync::Mutex eliminates the sync/async boundary
+    /// and lets every caller use the same blocking `.lock()`.
+    in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     broker: Arc<BackgroundActivityBroker>,
     /// Counter of background workers that have been spawned but not yet
     /// finished. Callers (CLI `session_cleanup`, server drain) use this
@@ -171,7 +182,7 @@ impl MemoryExtractionService {
             user_id: user_id.into(),
             health: Arc::new(SelectorHealth::new()),
             memoria_health: Arc::new(MemoriaHealth::new()),
-            in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             broker,
             pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_done: Arc::new(tokio::sync::Notify::new()),
@@ -277,6 +288,12 @@ impl MemoryExtractionService {
         enum Admission {
             Spawn {
                 trigger: ExtractionTrigger,
+                /// Breaker admission outcome that let us spawn
+                /// (`Closed` or `HalfOpenProbe`). Carried into the
+                /// worker so a [`ProbeGuard`](super::health::ProbeGuard)
+                /// can auto-release the probe slot on any
+                /// early-return path.
+                memoria_admit: MemoriaAdmit,
             },
             Skip {
                 trigger: ExtractionTrigger,
@@ -353,38 +370,37 @@ impl MemoryExtractionService {
                         label: "memoria_unhealthy",
                     },
                     MemoriaAdmit::Closed | MemoriaAdmit::HalfOpenProbe => {
-                        // Try to claim the in-flight slot synchronously — if this
-                        // session already has an extraction running, skip.
-                        let in_flight = Arc::clone(&self.in_flight);
-                        match in_flight.try_lock() {
-                            Ok(mut set) => {
-                                if set.insert(req.session_id.clone()) {
-                                    let entry = map.entry(req.session_id.clone()).or_default();
-                                    entry
-                                        .mark_extracted(req.current_tokens, req.current_tool_calls);
-                                    Admission::Spawn { trigger: trig }
-                                } else {
-                                    if matches!(memoria_admit, MemoriaAdmit::HalfOpenProbe) {
-                                        self.memoria_health.record_probe_cancelled();
-                                    }
-                                    Admission::Skip {
-                                        trigger: trig,
-                                        reason: SessionMemoryExtractionSkipReason::InFlight,
-                                        label: "in_flight",
-                                    }
-                                }
+                        // Claim the in-flight slot synchronously. `in_flight`
+                        // is a std mutex guarding only a HashSet — the
+                        // critical section is short and `.await`-free, so
+                        // blocking is bounded. Poisoning is treated as
+                        // "someone panicked mid-update"; rather than refuse
+                        // the caller we recover the inner state (the set's
+                        // invariants don't depend on what the panicking
+                        // thread was doing).
+                        let mut set = self
+                            .in_flight
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if set.insert(req.session_id.clone()) {
+                            let entry = map.entry(req.session_id.clone()).or_default();
+                            entry.mark_extracted(req.current_tokens, req.current_tool_calls);
+                            Admission::Spawn {
+                                trigger: trig,
+                                memoria_admit,
                             }
-                            Err(_) => {
-                                // Someone else is holding the lock mid-check — treat as
-                                // in-flight rather than retrying or waiting.
-                                if matches!(memoria_admit, MemoriaAdmit::HalfOpenProbe) {
-                                    self.memoria_health.record_probe_cancelled();
-                                }
-                                Admission::Skip {
-                                    trigger: trig,
-                                    reason: SessionMemoryExtractionSkipReason::InFlight,
-                                    label: "in_flight",
-                                }
+                        } else {
+                            // HalfOpenProbe admitted but we're skipping
+                            // the spawn — release the probe slot so
+                            // the next eligible caller can still run
+                            // the recovery probe.
+                            if matches!(memoria_admit, MemoriaAdmit::HalfOpenProbe) {
+                                self.memoria_health.record_probe_cancelled();
+                            }
+                            Admission::Skip {
+                                trigger: trig,
+                                reason: SessionMemoryExtractionSkipReason::InFlight,
+                                label: "in_flight",
                             }
                         }
                     }
@@ -392,8 +408,11 @@ impl MemoryExtractionService {
             }
         };
 
-        let trigger = match admission {
-            Admission::Spawn { trigger } => trigger,
+        let (trigger, memoria_admit) = match admission {
+            Admission::Spawn {
+                trigger,
+                memoria_admit,
+            } => (trigger, memoria_admit),
             Admission::Skip {
                 trigger,
                 reason,
@@ -422,7 +441,7 @@ impl MemoryExtractionService {
         let pending = Arc::clone(&self.pending);
         let pending_done = Arc::clone(&self.pending_done);
         tokio::spawn(async move {
-            svc.run_one(req, trigger).await;
+            svc.run_one(req, trigger, memoria_admit).await;
             if pending.fetch_sub(1, Ordering::AcqRel) == 1 {
                 // Went from 1 → 0: wake every waiter.
                 pending_done.notify_waiters();
@@ -433,7 +452,29 @@ impl MemoryExtractionService {
 
     // ── internals ─────────────────────────────────────────────────────
 
-    async fn run_one(self: Arc<Self>, req: ExtractionRequest, trigger: ExtractionTrigger) {
+    async fn run_one(
+        self: Arc<Self>,
+        req: ExtractionRequest,
+        trigger: ExtractionTrigger,
+        memoria_admit: MemoriaAdmit,
+    ) {
+        // RAII guard: guarantees the breaker's probe slot (if any)
+        // is released on every exit path. Previously each early
+        // return had to remember to call `record_success` /
+        // `record_failure` / `record_probe_cancelled`; the selector-
+        // cooldown branch forgot, which stranded the breaker half-
+        // open forever after a flaky LLM selector.
+        //
+        // Held in an `Option` so terminal arms can `.take()` and move
+        // the guard into `record_success()` / `record_failure()`. If
+        // none fires (selector_cooldown early-return, panic, etc.)
+        // the guard is dropped here without disposition — which
+        // calls `record_probe_cancelled` for HalfOpenProbe and is a
+        // no-op for Closed.
+        let mut probe_guard = Some(super::health::ProbeGuard::new(
+            Arc::clone(&self.memoria_health),
+            memoria_admit,
+        ));
         let session_id = req.session_id.clone();
         let turn = req.turn_number;
         let messages_count = req.messages.len() as u32;
@@ -474,7 +515,7 @@ impl MemoryExtractionService {
                 "selector_cooldown",
                 model_name,
             );
-            self.release_in_flight(&session_id).await;
+            self.release_in_flight(&session_id);
             return;
         }
 
@@ -559,7 +600,9 @@ impl MemoryExtractionService {
             } => {
                 // Memoria accepted a write → breaker closes (or stays
                 // closed) and the consecutive-failure counter resets.
-                self.memoria_health.record_success();
+                if let Some(g) = probe_guard.take() {
+                    g.record_success();
+                }
                 self.broker.emit(BackgroundActivity::Finished {
                     session_id: session_id.clone(),
                     turn,
@@ -613,7 +656,9 @@ impl MemoryExtractionService {
                 // Memoria persist still succeeded on this branch, so
                 // the circuit breaker resets. Only the LLM selector
                 // model is marked unhealthy.
-                self.memoria_health.record_success();
+                if let Some(g) = probe_guard.take() {
+                    g.record_success();
+                }
                 // LLM failed but rule-based content did land. Record
                 // both the error (for observability) and the write (so
                 // the broker reflects that memory is up-to-date, just
@@ -650,7 +695,9 @@ impl MemoryExtractionService {
                 // Memoria persist failed → breaker counts it. Enough
                 // consecutive failures trip the breaker and skip
                 // future `maybe_spawn` until the cooldown elapses.
-                self.memoria_health.record_failure();
+                if let Some(g) = probe_guard.take() {
+                    g.record_failure();
+                }
                 let bc = SessionMemoryExtractionBreadcrumbs {
                     messages_count: Some(messages_count),
                     selector_model: selector_model_used.clone(),
@@ -682,7 +729,7 @@ impl MemoryExtractionService {
             }
         }
 
-        self.release_in_flight(&session_id).await;
+        self.release_in_flight(&session_id);
     }
 }
 
@@ -736,8 +783,16 @@ impl MemoryExtractionService {
             .unwrap_or_default()
     }
 
-    async fn release_in_flight(&self, session_id: &str) {
-        let mut set = self.in_flight.lock().await;
+    fn release_in_flight(&self, session_id: &str) {
+        // Sync — matching `maybe_spawn`'s use of `std::sync::Mutex`.
+        // Previously this was `async` with `.lock().await` while
+        // `maybe_spawn` used `try_lock()` on the same mutex; the two
+        // raced and caused spurious InFlight skips + probe-slot leaks.
+        // See `in_flight` field comment for the full story.
+        let mut set = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         set.remove(session_id);
     }
 
@@ -1066,7 +1121,7 @@ mod tests {
         let mut ctx = build_ctx(None);
         let sid = format!("in-flight-{}", nanos());
         {
-            let mut set = ctx.svc.in_flight.lock().await;
+            let mut set = ctx.svc.in_flight.lock().unwrap();
             set.insert(sid.clone());
         }
         let req = sample_req(&sid, 50_000, false);
@@ -2116,7 +2171,7 @@ mod tests {
 
         let skipped_sid = format!("busy-probe-{}", nanos());
         {
-            let mut set = svc.in_flight.lock().await;
+            let mut set = svc.in_flight.lock().unwrap();
             set.insert(skipped_sid.clone());
         }
         assert_eq!(
@@ -2125,7 +2180,7 @@ mod tests {
             "in-flight skip must not consume the half-open Memoria probe"
         );
         {
-            let mut set = svc.in_flight.lock().await;
+            let mut set = svc.in_flight.lock().unwrap();
             set.remove(&skipped_sid);
         }
 
@@ -2136,6 +2191,79 @@ mod tests {
             "the next eligible request must still be allowed to probe"
         );
         svc.wait_for_pending(Duration::from_secs(2)).await;
+    }
+
+    /// Regression for the probe-slot leak on the `selector_cooldown`
+    /// early-return inside `run_one`: if `admit()` returned
+    /// `HalfOpenProbe` (so `probe_in_flight = true`) and the worker
+    /// then bails because the LLM selector is cooling down, the
+    /// breaker must still release its probe slot so the next
+    /// eligible caller can perform the real recovery probe.
+    ///
+    /// Before the `ProbeGuard` RAII fix, the worker called only
+    /// `release_in_flight` on that branch — `probe_in_flight` stayed
+    /// true forever, `admit()` returned `Open` until process
+    /// restart.
+    #[tokio::test]
+    async fn half_open_probe_released_when_run_one_bails_on_selector_cooldown() {
+        // A successful-Memoria client so the trip below is exclusively
+        // driven by `record_failure` we call directly (no network in
+        // the test).
+        let memoria = Arc::new(CapturingMemoria::default());
+        let selector_params = LlmConnParams {
+            base_url: "https://nope.invalid".to_string(),
+            api_key: "k".to_string(),
+            model_name: "cheap-selector-leak".to_string(),
+            provider: "test".to_string(),
+        };
+        let (ingestion, _rx) = IngestionSender::for_tests(256);
+        let broker = Arc::new(BackgroundActivityBroker::new());
+        let mut svc = MemoryExtractionService::new(
+            Arc::new(ConstSelectorResolver(Some(selector_params.clone()))),
+            Arc::clone(&memoria) as Arc<dyn MemoriaClient>,
+            ingestion,
+            "probe-leak-test",
+            Arc::clone(&broker),
+        );
+        // Low threshold + fast cooldown so we can reach HalfOpenProbe
+        // in-test without sleeping seconds.
+        svc.memoria_health = Arc::new(crate::session_memory::health::MemoriaHealth::with_config(
+            1,
+            Duration::from_millis(50),
+        ));
+        let svc = Arc::new(svc);
+
+        // 1. Trip the breaker by marking one failure directly.
+        svc.memoria_health.record_failure();
+        assert!(
+            svc.memoria_health.state().tripped,
+            "fixture pre-condition: breaker must be tripped"
+        );
+
+        // 2. Mark the selector unhealthy so `run_one` will hit the
+        //    `selector_cooldown` branch.
+        svc.health.mark_failed(&selector_params.model_name);
+
+        // 3. Wait past cooldown so the next `admit()` returns
+        //    HalfOpenProbe.
+        tokio::time::sleep(Duration::from_millis(70)).await;
+
+        // 4. Fire maybe_spawn. The sync path admits (HalfOpenProbe),
+        //    spawns run_one; run_one hits selector_cooldown early
+        //    return. ProbeGuard::drop must release the probe slot.
+        let sid = format!("probe-leak-{}", nanos());
+        let req = sample_req(&sid, 20_000, false);
+        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
+        svc.wait_for_pending(Duration::from_secs(2)).await;
+
+        // 5. Assertion: the breaker must be back to admitting a
+        //    probe — the slot was released, not consumed.
+        let admit_after = svc.memoria_health.admit();
+        assert_eq!(
+            admit_after,
+            crate::session_memory::health::MemoriaAdmit::HalfOpenProbe,
+            "probe slot must be released after selector_cooldown early-return; got {admit_after:?}"
+        );
     }
 
     // ── Breadcrumb fields in emitted events ─────────────────────────

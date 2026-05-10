@@ -228,6 +228,72 @@ pub struct MemoriaHealthSnapshot {
     pub in_cooldown: bool,
 }
 
+/// RAII wrapper around one admission cycle. Guarantees that a
+/// `HalfOpenProbe` slot is *always* released — as `record_success`,
+/// `record_failure`, or (on drop without disposition)
+/// `record_probe_cancelled`. Every early-return path in the worker
+/// therefore correctly releases the probe without manual accounting.
+///
+/// A non-probe admission (`Closed`) still records success/failure on
+/// disposition (so `consecutive_failures` stays accurate), but drops
+/// silently if no disposition was given — cancelling a slot that was
+/// never claimed would be wrong.
+///
+/// This type exists because the earlier hand-rolled accounting leaked
+/// probe slots whenever `run_one` took an early-return path
+/// (`selector_cooldown`, panic, `?`) — the breaker then stayed
+/// half-open forever until process restart.
+pub struct ProbeGuard {
+    health: std::sync::Arc<MemoriaHealth>,
+    admit: MemoriaAdmit,
+    disposition: Option<ProbeDisposition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeDisposition {
+    Success,
+    Failure,
+}
+
+impl ProbeGuard {
+    /// Construct a guard from an admission result. The caller should
+    /// typically call [`MemoriaHealth::admit`] first, then pass both
+    /// the result and a cloned `Arc` into here.
+    pub fn new(health: std::sync::Arc<MemoriaHealth>, admit: MemoriaAdmit) -> Self {
+        Self {
+            health,
+            admit,
+            disposition: None,
+        }
+    }
+
+    /// Mark the endpoint call as successful. Takes `self` so the
+    /// guard is consumed and `Drop` runs with the disposition set.
+    pub fn record_success(mut self) {
+        self.disposition = Some(ProbeDisposition::Success);
+    }
+
+    /// Mark the endpoint call as failed.
+    pub fn record_failure(mut self) {
+        self.disposition = Some(ProbeDisposition::Failure);
+    }
+}
+
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        match (self.admit, self.disposition) {
+            (_, Some(ProbeDisposition::Success)) => self.health.record_success(),
+            (_, Some(ProbeDisposition::Failure)) => self.health.record_failure(),
+            // No disposition + half-open probe slot claimed → release
+            // it so the next caller can still probe.
+            (MemoriaAdmit::HalfOpenProbe, None) => self.health.record_probe_cancelled(),
+            // Non-probe admission and no disposition → nothing to do;
+            // the breaker has no state to update.
+            (MemoriaAdmit::Closed | MemoriaAdmit::Open, None) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +403,96 @@ mod tests {
 
         h.record_probe_cancelled();
         assert_eq!(h.admit(), MemoriaAdmit::HalfOpenProbe);
+    }
+
+    // ── ProbeGuard: auto-release on drop ────────────────────────────
+
+    use std::sync::Arc;
+
+    fn tripped_health() -> Arc<MemoriaHealth> {
+        let h = Arc::new(MemoriaHealth::with_config(1, Duration::from_millis(30)));
+        h.record_failure();
+        std::thread::sleep(Duration::from_millis(40));
+        // Sanity: next admit should be HalfOpenProbe.
+        h
+    }
+
+    #[test]
+    fn probe_guard_drop_without_disposition_cancels_probe_slot() {
+        let h = tripped_health();
+        let admit = h.admit();
+        assert_eq!(admit, MemoriaAdmit::HalfOpenProbe);
+        {
+            // Guard goes out of scope with no record_success/failure.
+            // This simulates an early-return path in run_one.
+            let _guard = ProbeGuard::new(Arc::clone(&h), admit);
+        }
+        // Slot must be released so the next caller can still probe.
+        assert_eq!(
+            h.admit(),
+            MemoriaAdmit::HalfOpenProbe,
+            "drop without disposition must release the probe slot"
+        );
+    }
+
+    #[test]
+    fn probe_guard_record_success_closes_breaker() {
+        let h = tripped_health();
+        let admit = h.admit();
+        let guard = ProbeGuard::new(Arc::clone(&h), admit);
+        guard.record_success();
+        // Breaker must now be closed (no trip, no cooldown).
+        let s = h.state();
+        assert!(!s.tripped, "success must close the breaker");
+        assert_eq!(s.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn probe_guard_record_failure_re_trips_on_threshold() {
+        let h = tripped_health();
+        let admit = h.admit();
+        let guard = ProbeGuard::new(Arc::clone(&h), admit);
+        guard.record_failure();
+        // Breaker should be tripped again with fresh tripped_at →
+        // admit returns Open.
+        assert_eq!(h.admit(), MemoriaAdmit::Open);
+    }
+
+    #[test]
+    fn probe_guard_drop_on_closed_admit_is_a_noop() {
+        // Fresh health → admit is Closed, no probe slot to release.
+        // Dropping the guard without disposition must NOT spuriously
+        // trigger record_success / record_failure / cancellation.
+        let h = Arc::new(MemoriaHealth::new());
+        let admit = h.admit();
+        assert_eq!(admit, MemoriaAdmit::Closed);
+        let before = h.state();
+        {
+            let _g = ProbeGuard::new(Arc::clone(&h), admit);
+        }
+        let after = h.state();
+        assert_eq!(
+            before, after,
+            "dropping a Closed-admit guard without disposition must leave state untouched"
+        );
+    }
+
+    #[test]
+    fn probe_guard_record_success_on_closed_resets_counter() {
+        // Closed admission + record_success is still meaningful:
+        // it zeroes consecutive_failures. Ensures the guard is a
+        // drop-in replacement for manual `record_success()` calls.
+        let h = Arc::new(MemoriaHealth::with_config(3, Duration::from_secs(30)));
+        h.record_failure();
+        h.record_failure(); // below threshold, just counter=2
+        let s = h.state();
+        assert_eq!(s.consecutive_failures, 2);
+        assert!(!s.tripped);
+
+        let admit = h.admit();
+        assert_eq!(admit, MemoriaAdmit::Closed);
+        let guard = ProbeGuard::new(Arc::clone(&h), admit);
+        guard.record_success();
+        assert_eq!(h.state().consecutive_failures, 0);
     }
 }
