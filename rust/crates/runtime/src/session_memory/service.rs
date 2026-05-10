@@ -320,6 +320,7 @@ impl MemoryExtractionService {
                 trigger: ExtractionTrigger,
                 reason: SessionMemoryExtractionSkipReason,
                 label: &'static str,
+                cancel_probe: bool,
             },
         }
 
@@ -370,6 +371,7 @@ impl MemoryExtractionService {
                     trigger: trig,
                     reason,
                     label: skip_reason_label(reason),
+                    cancel_probe: false,
                 }
             } else {
                 // Memoria circuit breaker: fail fast when the endpoint has
@@ -389,6 +391,7 @@ impl MemoryExtractionService {
                         trigger: trig,
                         reason: SessionMemoryExtractionSkipReason::MemoriaUnhealthy,
                         label: "memoria_unhealthy",
+                        cancel_probe: false,
                     },
                     MemoriaAdmit::Closed | MemoriaAdmit::HalfOpenProbe => {
                         // Claim the in-flight slot synchronously. `in_flight`
@@ -411,17 +414,15 @@ impl MemoryExtractionService {
                                 memoria_admit,
                             }
                         } else {
-                            // HalfOpenProbe admitted but we're skipping
-                            // the spawn — release the probe slot so
-                            // the next eligible caller can still run
-                            // the recovery probe.
-                            if matches!(memoria_admit, MemoriaAdmit::HalfOpenProbe) {
-                                self.memoria_health.record_probe_cancelled();
-                            }
                             Admission::Skip {
                                 trigger: trig,
                                 reason: SessionMemoryExtractionSkipReason::InFlight,
                                 label: "in_flight",
+                                // Defer the breaker mutation until after
+                                // `session_states` is unlocked to avoid a
+                                // session_states → memoria_health nested
+                                // lock edge.
+                                cancel_probe: matches!(memoria_admit, MemoriaAdmit::HalfOpenProbe),
                             }
                         }
                     }
@@ -438,7 +439,11 @@ impl MemoryExtractionService {
                 trigger,
                 reason,
                 label,
+                cancel_probe,
             } => {
+                if cancel_probe {
+                    self.memoria_health.record_probe_cancelled();
+                }
                 let sid_opt = if req.session_id.is_empty() {
                     None
                 } else {
@@ -461,12 +466,10 @@ impl MemoryExtractionService {
         let svc = Arc::clone(self);
         let pending = Arc::clone(&self.pending);
         let pending_done = Arc::clone(&self.pending_done);
+        let pending_guard = PendingGuard::new(pending, pending_done);
         tokio::spawn(async move {
+            let _pending_guard = pending_guard;
             svc.run_one(req, trigger, memoria_admit).await;
-            if pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-                // Went from 1 → 0: wake every waiter.
-                pending_done.notify_waiters();
-            }
         });
         SpawnDecision::Spawned
     }
@@ -497,6 +500,7 @@ impl MemoryExtractionService {
             memoria_admit,
         ));
         let session_id = req.session_id.clone();
+        let _in_flight_guard = InFlightGuard::new(Arc::clone(&self.in_flight), session_id.clone());
         let turn = req.turn_number;
         let messages_count = req.messages.len() as u32;
         let started = Instant::now();
@@ -536,7 +540,6 @@ impl MemoryExtractionService {
                 "selector_cooldown",
                 model_name,
             );
-            self.release_in_flight(&session_id);
             return;
         }
 
@@ -749,8 +752,64 @@ impl MemoryExtractionService {
                 );
             }
         }
+    }
+}
 
-        self.release_in_flight(&session_id);
+struct PendingGuard {
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    pending_done: Arc<tokio::sync::Notify>,
+}
+
+impl PendingGuard {
+    fn new(
+        pending: Arc<std::sync::atomic::AtomicUsize>,
+        pending_done: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            pending,
+            pending_done,
+        }
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.pending_done.notify_waiters();
+        }
+    }
+}
+
+/// RAII release of an entry in the in-flight `HashSet`. Decoupled
+/// from `MemoryExtractionService` so the guard doesn't keep the
+/// whole service alive just for one set-removal — it holds only the
+/// Arc to the set it needs to mutate, which is the same handle the
+/// service itself uses (and which is already `Arc`-shared).
+struct InFlightGuard {
+    set: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    session_id: String,
+}
+
+impl InFlightGuard {
+    fn new(
+        set: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+        session_id: String,
+    ) -> Self {
+        Self { set, session_id }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        // Mirrors `release_in_flight`: std mutex, no `.await`,
+        // poison-recover so a panicking prior holder doesn't strand
+        // future workers.
+        let mut set = self
+            .set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set.remove(&self.session_id);
     }
 }
 
@@ -802,19 +861,6 @@ impl MemoryExtractionService {
         pick_latest_l1(&memories)
             .map(|m| m.content.clone())
             .unwrap_or_default()
-    }
-
-    fn release_in_flight(&self, session_id: &str) {
-        // Sync — matching `maybe_spawn`'s use of `std::sync::Mutex`.
-        // Previously this was `async` with `.lock().await` while
-        // `maybe_spawn` used `try_lock()` on the same mutex; the two
-        // raced and caused spurious InFlight skips + probe-slot leaks.
-        // See `in_flight` field comment for the full story.
-        let mut set = self
-            .in_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set.remove(session_id);
     }
 
     // ── event emission helpers ────────────────────────────────────────
@@ -974,6 +1020,29 @@ mod tests {
     ) -> MaybeSpawnAfterGateHookGuard {
         svc.set_maybe_spawn_after_gate_hook(Some(hook));
         MaybeSpawnAfterGateHookGuard {
+            svc: Arc::clone(svc),
+        }
+    }
+
+    struct ProbeCancelHookGuard {
+        svc: Arc<MemoryExtractionService>,
+    }
+
+    impl Drop for ProbeCancelHookGuard {
+        fn drop(&mut self) {
+            self.svc
+                .memoria_health
+                .set_record_probe_cancelled_hook(None);
+        }
+    }
+
+    fn install_probe_cancel_hook(
+        svc: &Arc<MemoryExtractionService>,
+        hook: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> ProbeCancelHookGuard {
+        svc.memoria_health
+            .set_record_probe_cancelled_hook(Some(hook));
+        ProbeCancelHookGuard {
             svc: Arc::clone(svc),
         }
     }
@@ -1166,6 +1235,68 @@ mod tests {
             let m = e.metadata.as_ref().unwrap();
             m["outcome"] == "skipped" && m["reason"] == "in_flight"
         }));
+    }
+
+    #[tokio::test]
+    async fn worker_panic_releases_pending_and_in_flight_slot() {
+        struct PanickingMemoria;
+
+        #[async_trait]
+        impl MemoriaClient for PanickingMemoria {
+            async fn retrieve_ext(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: usize,
+                _: bool,
+            ) -> Result<Vec<MemoriaMemory>, String> {
+                panic!("intentional test panic in retrieve_ext")
+            }
+
+            async fn store(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> Result<String, String> {
+                Ok("unreachable".into())
+            }
+
+            async fn purge_working(&self, _: &str) -> Result<u64, String> {
+                Ok(0)
+            }
+        }
+
+        let (ingestion, _rx) = IngestionSender::for_tests(256);
+        let broker = Arc::new(BackgroundActivityBroker::new());
+        let svc = Arc::new(MemoryExtractionService::new(
+            Arc::new(ConstSelectorResolver(None)),
+            Arc::new(PanickingMemoria) as Arc<dyn MemoriaClient>,
+            ingestion,
+            "panic-cleanup-test",
+            broker,
+        ));
+        let sid = format!("panic-cleanup-{}", nanos());
+
+        assert_eq!(
+            svc.maybe_spawn(sample_req(&sid, 50_000, false)),
+            SpawnDecision::Spawned
+        );
+
+        // Generous timeout so CI runners under load don't misread a
+        // slow tokio-task dispatch + panic unwind as a cleanup bug.
+        // We expect zero leftover in milliseconds; the 2s bound is a
+        // safety valve, not the expected duration.
+        let leftover = svc.wait_for_pending(Duration::from_secs(2)).await;
+        assert_eq!(
+            leftover, 0,
+            "pending counter must be decremented even if the worker panics"
+        );
+        assert!(
+            !svc.in_flight.lock().unwrap().contains(&sid),
+            "in-flight slot must be released even if the worker panics"
+        );
     }
 
     #[tokio::test]
@@ -2230,6 +2361,44 @@ mod tests {
             "the next eligible request must still be allowed to probe"
         );
         svc.wait_for_pending(Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn half_open_in_flight_skip_cancels_probe_after_state_lock_is_released() {
+        let (svc, _rx, _broker) = build_breaker_ctx();
+
+        for i in 0..2 {
+            let sid = format!("trip-deferred-{i}-{}", nanos());
+            assert_eq!(
+                svc.maybe_spawn(sample_req(&sid, 20_000, false)),
+                SpawnDecision::Spawned
+            );
+            svc.wait_for_pending(Duration::from_secs(2)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let skipped_sid = format!("busy-probe-deferred-{}", nanos());
+        {
+            let mut set = svc.in_flight.lock().unwrap();
+            set.insert(skipped_sid.clone());
+        }
+
+        let observed_svc = Arc::clone(&svc);
+        let _guard = install_probe_cancel_hook(
+            &svc,
+            Arc::new(move || {
+                assert!(
+                    observed_svc.session_states.try_lock().is_ok(),
+                    "probe cancellation must happen after releasing session_states"
+                );
+            }),
+        );
+
+        assert_eq!(
+            svc.maybe_spawn(sample_req(&skipped_sid, 20_000, false)),
+            SpawnDecision::Skipped
+        );
     }
 
     /// Regression for the probe-slot leak on the `selector_cooldown`

@@ -97,11 +97,21 @@ pub const MEMORIA_TRIP_COOLDOWN: Duration = Duration::from_secs(60);
 /// here — if Memoria is down, every turn will pile on HTTP retries
 /// against the same unreachable host, which is (a) wasted CPU/network
 /// and (b) hides the real failure behind a flood of identical logs.
-#[derive(Debug)]
 pub struct MemoriaHealth {
     inner: Mutex<MemoriaHealthInner>,
     failure_threshold: u32,
     cooldown: Duration,
+    #[cfg(test)]
+    record_probe_cancelled_hook: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync + 'static>>>,
+}
+
+impl std::fmt::Debug for MemoriaHealth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoriaHealth")
+            .field("failure_threshold", &self.failure_threshold)
+            .field("cooldown", &self.cooldown)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -137,7 +147,17 @@ impl MemoriaHealth {
             inner: Mutex::new(MemoriaHealthInner::default()),
             failure_threshold,
             cooldown,
+            #[cfg(test)]
+            record_probe_cancelled_hook: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_record_probe_cancelled_hook(
+        &self,
+        hook: Option<std::sync::Arc<dyn Fn() + Send + Sync + 'static>>,
+    ) {
+        *self.record_probe_cancelled_hook.lock().unwrap() = hook;
     }
 
     /// Ask whether a caller may proceed to the Memoria endpoint right
@@ -214,6 +234,18 @@ impl MemoriaHealth {
     /// the probe slot is released so a later caller can perform the real
     /// recovery probe.
     pub fn record_probe_cancelled(&self) {
+        #[cfg(test)]
+        {
+            let hook = self
+                .record_probe_cancelled_hook
+                .lock()
+                .unwrap()
+                .as_ref()
+                .cloned();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         if let Ok(mut inner) = self.inner.lock() {
             inner.probe_in_flight = false;
         }
