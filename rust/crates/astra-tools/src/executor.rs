@@ -60,16 +60,52 @@ pub struct DefaultToolExecutor {
     progress_callback: Option<Arc<dyn ToolProgressCallback>>,
     github_client: Option<GitHubClient>,
     task_manager: Arc<TaskManager>,
-    bash_cache: Arc<Mutex<HashMap<BashCacheKey, ToolResult>>>,
+    bash_cache: Arc<Mutex<HashMap<BashCacheKey, BashCacheEntry>>>,
     workspace_generation: Arc<AtomicU64>,
+    bash_cache_ttl: std::time::Duration,
 }
 
+/// Key for the per-session bash dedup cache. Bumping ANY of these
+/// fields must invalidate prior entries — otherwise we'd return a
+/// result computed under a different precondition and the model would
+/// act on stale state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BashCacheKey {
     workspace_root: String,
+    /// Monotonic counter bumped whenever a mutation tool succeeds. A
+    /// newly-created key after `write_file` will miss the cache, so
+    /// prior `ls` / `grep` results don't leak across edits made
+    /// through the tool pipeline.
     workspace_generation: u64,
     command: String,
+    /// Fingerprint of env vars that meaningfully change command
+    /// output (`PATH`, `HOME`, `LANG`, locale vars, `TZ`). We hash
+    /// them rather than storing raw — the classifier already filters
+    /// the command set down to read-only tools, but their output can
+    /// still depend on locale / user home.
+    env_fingerprint: u64,
+    /// Hash of `args.stdin` when present. A `cat` invocation whose
+    /// stdin differs between calls must NOT share a cache entry.
+    stdin_hash: u64,
 }
+
+/// Cache entry with insertion timestamp. We use a TTL on top of
+/// `workspace_generation` because non-tool filesystem mutations
+/// (user's editor, git pull, external script) don't bump the
+/// generation — so `git status` / `ls` results could otherwise go
+/// stale indefinitely. The TTL is a coarse-grained safety net; tests
+/// can swap it via `with_bash_cache_ttl`.
+#[derive(Debug, Clone)]
+struct BashCacheEntry {
+    result: ToolResult,
+    inserted_at: std::time::Instant,
+}
+
+/// Default: cached bash output goes stale after 30 seconds of
+/// wall-clock time. Long enough that a tight `ls`/`ls`/`ls` loop
+/// benefits; short enough that an external `git pull` becomes
+/// visible on the next read-only probe.
+pub const DEFAULT_BASH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl DefaultToolExecutor {
     pub fn new(ctx: ToolContext) -> Self {
@@ -81,7 +117,16 @@ impl DefaultToolExecutor {
             task_manager: Arc::new(TaskManager::new()),
             bash_cache: Arc::new(Mutex::new(HashMap::new())),
             workspace_generation: Arc::new(AtomicU64::new(0)),
+            bash_cache_ttl: DEFAULT_BASH_CACHE_TTL,
         }
+    }
+
+    /// Override the bash cache TTL. Intended for tests; production
+    /// code uses [`DEFAULT_BASH_CACHE_TTL`].
+    #[cfg(test)]
+    pub(crate) fn with_bash_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.bash_cache_ttl = ttl;
+        self
     }
 
     /// Build a ready-to-use executor from workspace parameters.
@@ -190,11 +235,29 @@ impl ToolExecutor for DefaultToolExecutor {
             && !args.get("force").and_then(Value::as_bool).unwrap_or(false)
             && let Some(key) = self.bash_cache_key(args)
             && let Some(mut cached) = {
-                self.bash_cache
+                // Lookup + TTL check + stale eviction under one
+                // critical section. We clone the `ToolResult` out
+                // before returning so the lock is released before
+                // the progress callback runs.
+                let mut map = self
+                    .bash_cache
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&key)
-                    .cloned()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let now = std::time::Instant::now();
+                let ttl = self.bash_cache_ttl;
+                match map.get(&key) {
+                    Some(entry) if now.duration_since(entry.inserted_at) < ttl => {
+                        Some(entry.result.clone())
+                    }
+                    Some(_) => {
+                        // Stale — evict so future lookups don't keep
+                        // re-hitting a dead entry and so the next
+                        // real execution gets cached fresh.
+                        map.remove(&key);
+                        None
+                    }
+                    None => None,
+                }
             }
         {
             mark_result_cached(&mut cached);
@@ -235,7 +298,13 @@ impl ToolExecutor for DefaultToolExecutor {
             self.bash_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(key, result.clone());
+                .insert(
+                    key,
+                    BashCacheEntry {
+                        result: result.clone(),
+                        inserted_at: std::time::Instant::now(),
+                    },
+                );
         }
         if is_workspace_mutation_tool(name) && !result.is_error {
             self.workspace_generation.fetch_add(1, Ordering::Relaxed);
@@ -262,11 +331,61 @@ impl ToolExecutor for DefaultToolExecutor {
 
 impl DefaultToolExecutor {
     fn bash_cache_key(&self, args: &Value) -> Option<BashCacheKey> {
+        use crate::bash_cache_safety::bash_command_is_cache_safe;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
         let command = args.get("command")?.as_str()?.to_string();
+
+        // Readonly classifier: only commands whose output depends
+        // solely on fs + env may hit the cache. Anything with side
+        // effects (rm, cargo build, git commit, curl, …) or shell
+        // compound markers is rejected — returning None disables
+        // caching for this call entirely. See
+        // `bash_cache_safety.rs` for the full taxonomy.
+        if !bash_command_is_cache_safe(&command) {
+            return None;
+        }
+
+        // Env fingerprint: a subset of env vars meaningfully
+        // influences output of read-only tools. We hash rather than
+        // store to keep the key bounded. Absent vars hash as empty.
+        let env_fingerprint = {
+            const KEYS: &[&str] = &[
+                "PATH",
+                "HOME",
+                "LANG",
+                "LC_ALL",
+                "LC_CTYPE",
+                "LC_MESSAGES",
+                "TZ",
+            ];
+            let mut h = DefaultHasher::new();
+            for k in KEYS {
+                k.hash(&mut h);
+                std::env::var(k).unwrap_or_default().hash(&mut h);
+            }
+            h.finish()
+        };
+
+        // Stdin hash: `cat`, `grep`, etc. can be fed via stdin —
+        // same command string + different stdin must not collide.
+        let stdin_hash = {
+            let mut h = DefaultHasher::new();
+            let stdin = args
+                .get("stdin")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            stdin.hash(&mut h);
+            h.finish()
+        };
+
         Some(BashCacheKey {
             workspace_root: self.ctx.workspace_root.display().to_string(),
             workspace_generation: self.workspace_generation.load(Ordering::Relaxed),
             command,
+            env_fingerprint,
+            stdin_hash,
         })
     }
 
@@ -639,7 +758,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_bash_reuses_identical_successful_result() {
+    async fn dispatch_bash_reuses_identical_readonly_result() {
+        // Cache-safe command: `pwd` — pure readonly, output depends
+        // only on cwd. The classifier admits it; second call must
+        // short-circuit to cache.
+        let (_tmp, exec) = test_executor();
+        let args = serde_json::json!({ "command": "pwd" });
+
+        let first = exec.execute("bash", &args).await;
+        let second = exec.execute("bash", &args).await;
+
+        assert!(!first.is_error, "first failed: {}", first.output);
+        assert!(!second.is_error, "second failed: {}", second.output);
+        assert_eq!(first.output, second.output);
+        assert_eq!(
+            second
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "second call must be served from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_does_not_cache_unsafe_commands() {
+        // Compound command: cache MUST NOT fire. The classifier
+        // refuses any command containing shell metacharacters, so
+        // both calls re-execute.
         let (_tmp, exec) = test_executor();
         let args = serde_json::json!({
             "command": "n=$(cat dedup-count 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > dedup-count; cat dedup-count"
@@ -650,50 +797,196 @@ mod tests {
 
         assert!(!first.is_error, "first failed: {}", first.output);
         assert!(!second.is_error, "second failed: {}", second.output);
-        assert_eq!(first.output, second.output);
+        // Counter file went to 2 — proof that the second call really
+        // re-executed. Before the classifier, the cache would return
+        // the first call's output and the file would stay at 1.
         assert_eq!(
             std::fs::read_to_string(_tmp.path().join("dedup-count")).unwrap(),
-            "1\n",
-            "identical second bash call should not execute again"
+            "2\n",
+            "compound command must re-execute both times — never cache shell pipelines"
         );
-        assert_eq!(
+        assert_ne!(
             second
                 .metadata
                 .as_ref()
                 .and_then(|m| m.get("cached"))
                 .and_then(|v| v.as_bool()),
-            Some(true)
+            Some(true),
+            "second call must NOT be marked cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_does_not_cache_mutating_commands() {
+        // Even a single-token mutating command must bypass the cache
+        // — rm / mv / curl / cargo build / git commit / etc.
+        // Regression guard for the 🔴 critical bug: without the
+        // classifier, a second `rm foo` would return the first call's
+        // "file removed" success while the real filesystem has moved
+        // on and the file no longer exists.
+        let (tmp, exec) = test_executor();
+        std::fs::write(tmp.path().join("victim"), "x").unwrap();
+        let args = serde_json::json!({ "command": "rm victim" });
+
+        let first = exec.execute("bash", &args).await;
+        assert!(!first.is_error, "first rm failed: {}", first.output);
+        // File gone. Second invocation MUST re-run and therefore
+        // fail (no such file), not succeed-from-cache.
+        let second = exec.execute("bash", &args).await;
+        assert!(
+            second.is_error,
+            "second rm must re-execute and fail (file already gone); got output={}",
+            second.output
+        );
+        assert_ne!(
+            second
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "rm must never be marked cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_cache_expires_after_ttl() {
+        // External-mutation backstop: a cached readonly result must
+        // be evicted when older than the TTL so e.g. `ls` reflects
+        // files created by a user's editor (not bumping
+        // `workspace_generation`).
+        let dir = tempfile::tempdir().unwrap();
+        let exec = DefaultToolExecutor::new(ToolContext {
+            project_root: dir.path().to_path_buf(),
+            workspace_root: dir.path().to_path_buf(),
+            user_id: String::new(),
+            session_id: String::new(),
+            sandbox: crate::SandboxConfig::standard(dir.path()),
+            http_client: None,
+            logger: std::sync::Arc::new(crate::TracingLogger),
+            cancel_token: None,
+        })
+        .with_bash_cache_ttl(std::time::Duration::from_millis(30));
+
+        let args = serde_json::json!({ "command": "ls" });
+        let _first = exec.execute("bash", &args).await;
+
+        // Simulated external mutation: drop a file without touching
+        // the workspace_generation counter.
+        std::fs::write(dir.path().join("external.txt"), "hi").unwrap();
+
+        // Within TTL → still cached (shows the stale listing).
+        let cached = exec.execute("bash", &args).await;
+        assert_eq!(
+            cached
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "within TTL, cache should still hit"
+        );
+
+        // Sleep past TTL, try again — must re-execute and show the
+        // new file.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let fresh = exec.execute("bash", &args).await;
+        assert_ne!(
+            fresh
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "after TTL, cache must be evicted and re-executed"
+        );
+        assert!(
+            fresh.output.contains("external.txt"),
+            "fresh re-execution must see the new file: {}",
+            fresh.output
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_cache_key_includes_stdin_hash() {
+        // Same command text, different stdin → must hit different
+        // cache slots. A `cat` invocation fed two different stdins
+        // must never share a result.
+        let (_tmp, exec) = test_executor();
+
+        let args_a = serde_json::json!({
+            "command": "cat",
+            "stdin": "alpha",
+        });
+        let args_b = serde_json::json!({
+            "command": "cat",
+            "stdin": "beta",
+        });
+
+        let ra = exec.execute("bash", &args_a).await;
+        let rb = exec.execute("bash", &args_b).await;
+        // We don't assert on the actual shell output (cat behaviour
+        // with stdin depends on how the bash tool plumbs it). We
+        // only require that B did not serve A's cached result —
+        // the cached flag on B must not be set.
+        assert_ne!(
+            rb.metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "different stdin must not collide with a previous cache entry; ra={} rb={}",
+            ra.output,
+            rb.output
         );
     }
 
     #[tokio::test]
     async fn dispatch_bash_force_bypasses_dedup_cache() {
-        let (_tmp, exec) = test_executor();
-        let args = serde_json::json!({
-            "command": "n=$(cat force-count 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > force-count; cat force-count"
-        });
-        let forced_args = serde_json::json!({
-            "command": "n=$(cat force-count 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > force-count; cat force-count",
-            "force": true
-        });
-
+        // Use a classifier-admitted readonly command so the cache
+        // WOULD hit without `force`. Then `force=true` proves it's
+        // actually bypassing the hit (cached flag not set), rather
+        // than the classifier just never letting it hit in the
+        // first place.
+        let (tmp, exec) = test_executor();
+        // `ls` is cache-safe; first call sees the workspace empty.
+        let args = serde_json::json!({ "command": "ls" });
         let first = exec.execute("bash", &args).await;
-        let forced = exec.execute("bash", &forced_args).await;
+        assert!(!first.is_error);
 
-        assert!(!first.is_error, "first failed: {}", first.output);
-        assert!(!forced.is_error, "forced failed: {}", forced.output);
-        assert_ne!(first.output, forced.output);
+        // Normal second call — expected to hit the cache.
+        let cached = exec.execute("bash", &args).await;
         assert_eq!(
-            std::fs::read_to_string(_tmp.path().join("force-count")).unwrap(),
-            "2\n"
+            cached
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "sanity: second ls must hit cache"
         );
+
+        // External file appears — classifier doesn't see it (no
+        // mutation tool call) so the cache would still hit.
+        std::fs::write(tmp.path().join("appeared.txt"), "x").unwrap();
+
+        // Forced call must bypass cache AND see the fresh file.
+        let forced = exec
+            .execute("bash", &serde_json::json!({"command": "ls", "force": true}))
+            .await;
         assert_ne!(
             forced
                 .metadata
                 .as_ref()
                 .and_then(|m| m.get("cached"))
                 .and_then(|v| v.as_bool()),
-            Some(true)
+            Some(true),
+            "force=true must not return cached result"
+        );
+        assert!(
+            forced.output.contains("appeared.txt"),
+            "forced call must re-execute and see the fresh file: {}",
+            forced.output
         );
     }
 

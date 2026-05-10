@@ -12,6 +12,7 @@ pub mod schemas;
 pub mod web_fetch;
 pub mod web_search;
 
+pub mod bash_cache_safety;
 pub mod build_test;
 // run_script is the programmatic tool-calling / code execution RPC bridge.
 // It uses Unix domain sockets for the script↔host RPC channel. Windows
