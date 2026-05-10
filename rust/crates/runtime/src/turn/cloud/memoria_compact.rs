@@ -68,6 +68,31 @@ pub struct MemoriaCompactParams {
     /// When present, `build_facts_first_injection()` is used as the primary
     /// memory context, with Memoria narrative as supplement.
     pub session_facts: Option<astra_turn_types::session_facts::SessionFacts>,
+    /// Turn number used to tag observatory records. `0` is a valid
+    /// pre-turn value — compaction can fire before turn 1 on warm
+    /// sessions — so callers supply the current turn explicitly when
+    /// wiring observatory; callers that don't bother may leave it 0.
+    pub turn_number: u32,
+    /// Optional post-hoc observer. When `Some`, one
+    /// [`InjectionRecord`] per compaction lands in the ring. `None`
+    /// (the default for tests and offline call sites) is a
+    /// zero-overhead no-op — no clones, no mutex acquires.
+    pub observatory: Option<std::sync::Arc<crate::session_memory::SessionMemoryObservatory>>,
+}
+
+impl Default for MemoriaCompactParams {
+    fn default() -> Self {
+        Self {
+            budget_chars: 0,
+            keep_chars: 0,
+            tier: CompactionTier::Normal,
+            keep_recent_turns: 0,
+            current_tokens: 0,
+            session_facts: None,
+            turn_number: 0,
+            observatory: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +444,79 @@ impl MemoriaClient for HttpMemoriaClient {
 // ---------------------------------------------------------------------------
 // Compaction Logic
 // ---------------------------------------------------------------------------
+
+/// Build a post-hoc [`InjectionRecord`] and push it onto the shared
+/// observatory ring. Pure function — does not touch the LLM payload,
+/// the cache, or the compacted message stream. Called right after the
+/// facts-first injection is assembled so the recorded state matches
+/// the bytes that went onto the wire.
+#[allow(clippy::too_many_arguments)]
+fn record_injection_for_observatory(
+    observatory: &std::sync::Arc<crate::session_memory::SessionMemoryObservatory>,
+    session_id: &str,
+    turn: u32,
+    pressure: f64,
+    level: &super::session_memory_protocol::InjectionLevel,
+    injection: &str,
+    facts: &astra_turn_types::session_facts::SessionFacts,
+    narrative: Option<&super::session_memory_protocol::SessionMemory>,
+    memories: &[MemoriaMemory],
+) {
+    use crate::session_memory::observatory::{
+        FactsSummary, InjectionLevel as ObsInjectionLevel, InjectionRecord, RetrievedMemoryRef,
+        StalenessSignals, clip_preview,
+    };
+
+    let obs_level = match level {
+        super::session_memory_protocol::InjectionLevel::L1Full => ObsInjectionLevel::L1Full,
+        super::session_memory_protocol::InjectionLevel::L1Minimal => ObsInjectionLevel::L1Minimal,
+        super::session_memory_protocol::InjectionLevel::L0Only => ObsInjectionLevel::L0Only,
+    };
+    let plan = facts.plan_state.as_ref();
+    let last_error_preview = facts
+        .error_state
+        .last_error
+        .as_ref()
+        .map(|s| clip_preview(s));
+    let facts_summary = FactsSummary {
+        turn: facts.turn,
+        estimated_tokens: facts.estimated_tokens,
+        plan_completed: plan.map(|p| p.completed).unwrap_or(0),
+        plan_total: plan.map(|p| p.total).unwrap_or(0),
+        active_files_count: facts.active_files.len() as u32,
+        error_count: facts.error_state.total_errors,
+        last_error_preview,
+    };
+    let staleness_raw = super::session_memory_protocol::narrative_staleness(facts, narrative);
+    let staleness = StalenessSignals {
+        task_contradicted: staleness_raw.task_contradicted,
+        missing_corrections: staleness_raw.missing_corrections,
+    };
+    let retrieved = memories
+        .iter()
+        .map(|m| RetrievedMemoryRef {
+            memory_id: m.memory_id.clone(),
+            memory_type: m.memory_type.clone(),
+            score: m.retrieval_score,
+        })
+        .collect::<Vec<_>>();
+    let narrative_sections_kept = narrative
+        .map(|n| n.section_names().iter().map(|s| s.to_string()).collect())
+        .unwrap_or_default();
+
+    observatory.record_injection(InjectionRecord {
+        session_id: session_id.to_string(),
+        turn,
+        at: std::time::SystemTime::now(),
+        pressure,
+        level: obs_level,
+        injected_chars: injection.chars().count() as u32,
+        facts_summary,
+        staleness,
+        retrieved_memories: retrieved,
+        narrative_sections_kept,
+    });
+}
 
 /// Build a context summary from retrieved memories.
 fn build_memory_context(memories: &[MemoriaMemory], max_tokens: usize) -> String {
@@ -887,6 +985,23 @@ pub async fn compact_with_memoria(
             pressure,
             level,
         );
+        // Post-hoc: record injection shape for introspect. Purely a
+        // side-channel — zero effect on the LLM payload or cache
+        // hashing. Records skipped when observatory is None (tests,
+        // offline CLI) or session_id is missing.
+        if let (Some(obs), Some(sid)) = (params.observatory.as_ref(), session_id) {
+            record_injection_for_observatory(
+                obs,
+                sid,
+                params.turn_number,
+                pressure,
+                &level,
+                &injection,
+                facts,
+                narrative.as_ref(),
+                &memories,
+            );
+        }
         injection
     } else {
         build_memory_context(&memories, memory_max_tokens)
@@ -1264,6 +1379,8 @@ mod tests {
             keep_recent_turns: 4,
             current_tokens: 1000,
             session_facts: None,
+            turn_number: 0,
+            observatory: None,
         };
         let result = compact_with_memoria(
             &msgs,
@@ -1294,6 +1411,8 @@ mod tests {
             keep_recent_turns: 4,
             current_tokens: 1000, // Below threshold
             session_facts: None,
+            turn_number: 0,
+            observatory: None,
         };
 
         let result = compact_with_memoria(
@@ -1337,6 +1456,8 @@ mod tests {
             keep_recent_turns: 4,
             current_tokens: 6000, // Above threshold
             session_facts: None,
+            turn_number: 0,
+            observatory: None,
         };
 
         let result = compact_with_memoria(
@@ -1422,6 +1543,8 @@ mod tests {
             keep_recent_turns: 4,
             current_tokens: 6000,
             session_facts: Some(facts),
+            turn_number: 0,
+            observatory: None,
         };
 
         let result = compact_with_memoria(
@@ -1500,6 +1623,8 @@ mod tests {
             keep_recent_turns: 4,
             current_tokens: 6000,
             session_facts: Some(facts),
+            turn_number: 0,
+            observatory: None,
         };
 
         let result = compact_with_memoria(
@@ -1588,6 +1713,8 @@ mod tests {
             keep_recent_turns: 4,
             current_tokens: 6000,
             session_facts: None,
+            turn_number: 0,
+            observatory: None,
         };
 
         let compact_config = CompactConfig {
@@ -1643,6 +1770,8 @@ mod tests {
             keep_recent_turns: 4,
             current_tokens: 6000,
             session_facts: None,
+            turn_number: 0,
+            observatory: None,
         };
 
         let compact_config = CompactConfig {
@@ -1689,6 +1818,8 @@ mod tests {
             keep_recent_turns: 4,
             current_tokens: 6000,
             session_facts: None,
+            turn_number: 0,
+            observatory: None,
         };
 
         let compact_config = CompactConfig {
@@ -1735,6 +1866,8 @@ mod tests {
             keep_recent_turns: 4,
             current_tokens: 6000,
             session_facts: None,
+            turn_number: 0,
+            observatory: None,
         };
 
         let compact_config = CompactConfig {
@@ -2179,6 +2312,8 @@ mod tests {
             keep_recent_turns: 4,
             current_tokens: 6000,
             session_facts: None,
+            turn_number: 0,
+            observatory: None,
         };
         let compact_config = CompactConfig {
             enable_summary: true,
@@ -2333,6 +2468,8 @@ mod tests {
             keep_recent_turns: 4,
             current_tokens: 6000,
             session_facts: None,
+            turn_number: 0,
+            observatory: None,
         };
         let compact_config = CompactConfig {
             enable_summary: true,
@@ -2382,5 +2519,285 @@ mod tests {
             body.contains(".timeout("),
             "HttpMemoriaClient must set request timeout"
         );
+    }
+
+    // ── Observatory wiring (unhappy first) ──────────────────────────
+
+    fn obs_fixture_facts() -> astra_turn_types::session_facts::SessionFacts {
+        use astra_turn_types::session_facts::{ErrorFact, FileEntry, PlanFact, SessionFacts};
+        let mut facts = SessionFacts {
+            turn: 7,
+            estimated_tokens: 25_000,
+            ..Default::default()
+        };
+        facts.active_files.push(FileEntry {
+            path: "src/auth.rs".into(),
+            last_action: "write".into(),
+            turn: 6,
+        });
+        facts.set_plan_state(Some(PlanFact {
+            goal: "Add OAuth".into(),
+            completed: 2,
+            total: 5,
+            current_subtask: Some("wire refresh".into()),
+        }));
+        facts.error_state = ErrorFact {
+            total_errors: 1,
+            last_error: Some("compile error".into()),
+            last_error_turn: Some(6),
+        };
+        facts
+    }
+
+    #[tokio::test]
+    async fn observatory_records_injection_with_facts_summary_and_memories() {
+        use crate::session_memory::SessionMemoryObservatory;
+        use std::sync::Arc;
+        let mock = MockMemoriaClient::new(vec![MemoriaMemory {
+            memory_id: "m1".into(),
+            content: format!(
+                "{}\n# Task Specification\nAdd OAuth.\n# User Corrections\n- use PKCE\n",
+                super::super::session_memory_protocol::SESSION_MEMORY_PREFIX
+            ),
+            memory_type: "working".into(),
+            retrieval_score: Some(0.72),
+        }]);
+        let facts = obs_fixture_facts();
+        let observatory = Arc::new(SessionMemoryObservatory::new());
+        let params = MemoriaCompactParams {
+            budget_chars: 40_000, // pressure 0.6 → L1Full
+            keep_chars: 2_000,
+            tier: CompactionTier::CompactHistory,
+            keep_recent_turns: 4,
+            current_tokens: 6_000,
+            session_facts: Some(facts),
+            turn_number: 9,
+            observatory: Some(Arc::clone(&observatory)),
+        };
+        let msgs = vec![user("working on auth"), assistant("ack")];
+        let config = MemoriaCompactConfig {
+            min_tokens_for_retrieval: 100,
+            store_on_compact: false,
+            ..Default::default()
+        };
+        let _ = compact_with_memoria(
+            &msgs,
+            Some("sess-obs"),
+            &config,
+            &params,
+            Some(&mock),
+            None,
+            None,
+        )
+        .await;
+
+        let snap = observatory.injections_snapshot();
+        assert_eq!(snap.len(), 1, "expected one injection record");
+        let rec = &snap[0];
+        assert_eq!(rec.session_id, "sess-obs");
+        assert_eq!(rec.turn, 9);
+        assert_eq!(
+            rec.level,
+            crate::session_memory::observatory::InjectionLevel::L1Full
+        );
+        assert!(
+            (rec.pressure - 0.6).abs() < 1e-6,
+            "pressure {}",
+            rec.pressure
+        );
+        assert!(
+            rec.injected_chars > 0,
+            "L1Full must have produced non-empty injection"
+        );
+
+        // Facts summary carries ground-truth counters.
+        assert_eq!(rec.facts_summary.turn, 7);
+        assert_eq!(rec.facts_summary.plan_completed, 2);
+        assert_eq!(rec.facts_summary.plan_total, 5);
+        assert_eq!(rec.facts_summary.active_files_count, 1);
+        assert_eq!(rec.facts_summary.error_count, 1);
+        assert_eq!(
+            rec.facts_summary.last_error_preview.as_deref(),
+            Some("compile error")
+        );
+
+        // Retrieved memories metadata (no raw content) survives.
+        assert_eq!(rec.retrieved_memories.len(), 1);
+        assert_eq!(rec.retrieved_memories[0].memory_id, "m1");
+        assert_eq!(rec.retrieved_memories[0].memory_type, "working");
+
+        // Narrative sections get parsed.
+        assert!(
+            rec.narrative_sections_kept
+                .iter()
+                .any(|s| s == "Task Specification"),
+            "kept sections missing Task Specification: {:?}",
+            rec.narrative_sections_kept
+        );
+    }
+
+    #[tokio::test]
+    async fn observatory_records_empty_memories_under_retrieve_failure() {
+        use crate::session_memory::SessionMemoryObservatory;
+        use async_trait::async_trait;
+        use std::sync::Arc;
+
+        struct FailingRetrieveClient;
+        #[async_trait]
+        impl MemoriaClient for FailingRetrieveClient {
+            async fn retrieve_ext(
+                &self,
+                _q: &str,
+                _sid: Option<&str>,
+                _top_k: usize,
+                _filter: bool,
+            ) -> Result<Vec<MemoriaMemory>, String> {
+                Err("memoria down".into())
+            }
+            async fn store(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> Result<String, String> {
+                Err("down".into())
+            }
+            async fn purge_working(&self, _sid: &str) -> Result<u64, String> {
+                Err("down".into())
+            }
+        }
+
+        let facts = obs_fixture_facts();
+        let observatory = Arc::new(SessionMemoryObservatory::new());
+        let params = MemoriaCompactParams {
+            budget_chars: 40_000,
+            keep_chars: 2_000,
+            tier: CompactionTier::CompactHistory,
+            keep_recent_turns: 4,
+            current_tokens: 6_000,
+            session_facts: Some(facts),
+            turn_number: 3,
+            observatory: Some(Arc::clone(&observatory)),
+        };
+        let msgs = vec![user("hi"), assistant("hi")];
+        let config = MemoriaCompactConfig {
+            min_tokens_for_retrieval: 100,
+            store_on_compact: false,
+            ..Default::default()
+        };
+        let _ = compact_with_memoria(
+            &msgs,
+            Some("sess-fail"),
+            &config,
+            &params,
+            Some(&FailingRetrieveClient),
+            None,
+            None,
+        )
+        .await;
+
+        let snap = observatory.injections_snapshot();
+        // Retrieve failed → narrative is None, but facts-first injection
+        // still ran and a record must have been produced. Retrieved
+        // memories list must be empty.
+        assert_eq!(snap.len(), 1);
+        let rec = &snap[0];
+        assert!(
+            rec.retrieved_memories.is_empty(),
+            "retrieve failure → no retrieved memories recorded"
+        );
+        assert!(
+            rec.narrative_sections_kept.is_empty(),
+            "no narrative parsed when retrieve fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn observatory_is_silent_on_l0_only_pressure() {
+        // Extreme pressure → L0Only → empty injection. We still want a
+        // record (so introspect shows "injection was intentionally
+        // dropped"), but with injected_chars=0 and level=L0Only.
+        use crate::session_memory::SessionMemoryObservatory;
+        use std::sync::Arc;
+
+        let mock = MockMemoriaClient::new(vec![]);
+        let facts = obs_fixture_facts();
+        let observatory = Arc::new(SessionMemoryObservatory::new());
+        let params = MemoriaCompactParams {
+            // 10K chars → 2.5K tokens; current_tokens 10_000 → pressure
+            // 4.0 → L0Only.
+            budget_chars: 10_000,
+            keep_chars: 1_000,
+            tier: CompactionTier::AggressivePrune,
+            keep_recent_turns: 2,
+            current_tokens: 10_000,
+            session_facts: Some(facts),
+            turn_number: 42,
+            observatory: Some(Arc::clone(&observatory)),
+        };
+        let msgs = vec![user("high pressure"), assistant("ack")];
+        let config = MemoriaCompactConfig {
+            min_tokens_for_retrieval: 100,
+            store_on_compact: false,
+            ..Default::default()
+        };
+        let _ = compact_with_memoria(
+            &msgs,
+            Some("sess-hp"),
+            &config,
+            &params,
+            Some(&mock),
+            None,
+            None,
+        )
+        .await;
+
+        let snap = observatory.injections_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].level,
+            crate::session_memory::observatory::InjectionLevel::L0Only
+        );
+        assert_eq!(
+            snap[0].injected_chars, 0,
+            "L0Only must record injected_chars=0"
+        );
+    }
+
+    #[tokio::test]
+    async fn observatory_is_silent_when_not_wired() {
+        // No observatory attached → nothing to record, existing
+        // behaviour unchanged.
+        let mock = MockMemoriaClient::new(vec![]);
+        let facts = obs_fixture_facts();
+        let params = MemoriaCompactParams {
+            budget_chars: 40_000,
+            keep_chars: 2_000,
+            tier: CompactionTier::CompactHistory,
+            keep_recent_turns: 4,
+            current_tokens: 6_000,
+            session_facts: Some(facts),
+            turn_number: 0,
+            observatory: None,
+        };
+        let msgs = vec![user("hi"), assistant("ack")];
+        let config = MemoriaCompactConfig {
+            min_tokens_for_retrieval: 100,
+            store_on_compact: false,
+            ..Default::default()
+        };
+        // Must not panic; no assertions about rings beyond "it didn't
+        // crash" — the silence is the contract.
+        let _ = compact_with_memoria(
+            &msgs,
+            Some("sess-quiet"),
+            &config,
+            &params,
+            Some(&mock),
+            None,
+            None,
+        )
+        .await;
     }
 }

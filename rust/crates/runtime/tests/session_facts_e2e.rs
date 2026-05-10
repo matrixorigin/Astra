@@ -305,6 +305,8 @@ async fn e2e_full_session_lifecycle() {
         keep_recent_turns: 2,
         current_tokens: 50000,
         session_facts: None,
+        turn_number: 0,
+        observatory: None,
     };
     let result = compact_with_memoria(
         &messages,
@@ -621,6 +623,8 @@ async fn unhappy_memoria_down_during_compaction() {
         keep_recent_turns: 2,
         current_tokens: 50000,
         session_facts: None,
+        turn_number: 0,
+        observatory: None,
     };
 
     // Should NOT panic — falls back gracefully
@@ -704,6 +708,8 @@ async fn unhappy_empty_session_compaction() {
         keep_recent_turns: 2,
         current_tokens: 50000,
         session_facts: None,
+        turn_number: 0,
+        observatory: None,
     };
 
     let result = compact_with_memoria(
@@ -785,6 +791,8 @@ async fn unhappy_malformed_narrative_in_memoria() {
         keep_recent_turns: 2,
         current_tokens: 50000,
         session_facts: Some(facts.clone()),
+        turn_number: 0,
+        observatory: None,
     };
 
     let result = compact_with_memoria(

@@ -1756,6 +1756,8 @@ impl InProcessChatTurnBridge {
                     ),
                     tier: pipeline_tier,
                     session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
+                    turn_number: 0,
+                    observatory: None,
                 };
 
                 let compact_result = ctx.compact(&raw, &llm_messages, &edge_tools).await;
@@ -2079,6 +2081,8 @@ impl InProcessChatTurnBridge {
                                     .lock()
                                     .ok()
                                     .map(|f| f.clone()),
+                                turn_number: 0,
+                                observatory: None,
                             };
                             let overrides = crate::turn::wire_assembly::BudgetOverrides {
                                 budget_chars: Some(budget.effective_input_limit() * 3),
@@ -5389,6 +5393,8 @@ mod tests {
             keep_recent_turns: 2,
             current_tokens: 80000,
             session_facts: None,
+            turn_number: 0,
+            observatory: None,
         };
 
         let result = tokio::runtime::Runtime::new()
@@ -5440,6 +5446,8 @@ mod tests {
             keep_recent_turns: 2,
             current_tokens: 500,
             session_facts: None,
+            turn_number: 0,
+            observatory: None,
         };
 
         let result = tokio::runtime::Runtime::new()
@@ -5478,6 +5486,8 @@ mod tests {
             keep_recent_turns: 2,
             current_tokens: 80000,
             session_facts: None,
+            turn_number: 0,
+            observatory: None,
         };
 
         let result = tokio::runtime::Runtime::new()

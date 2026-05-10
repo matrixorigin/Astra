@@ -48,6 +48,12 @@ pub(crate) struct MemoriaContext<'a> {
     /// Optional pre-parsed session facts (bridge path provides these;
     /// server path does not yet).
     pub session_facts: Option<astra_turn_types::session_facts::SessionFacts>,
+    /// Current turn number used to tag observatory records. Defaults
+    /// to 0 for callers that don't wire observatory.
+    pub turn_number: u32,
+    /// Optional post-hoc observer. `None` when the host wasn't built
+    /// with an observatory (offline CLI, tests).
+    pub observatory: Option<std::sync::Arc<crate::session_memory::SessionMemoryObservatory>>,
 }
 
 /// Caller-side overrides for Memoria budget knobs that the context-window
@@ -149,6 +155,8 @@ impl<'a> MemoriaContext<'a> {
             keep_recent_turns: resolved.keep_recent_turns,
             current_tokens: resolved.current_tokens,
             session_facts: self.session_facts.clone(),
+            turn_number: self.turn_number,
+            observatory: self.observatory.clone(),
         };
 
         let compact_config = CompactConfig::from_env();

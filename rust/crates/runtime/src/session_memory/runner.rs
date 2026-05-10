@@ -37,6 +37,10 @@ pub enum ExtractionArtifacts {
         /// an event breadcrumb so operators can see retry incidence
         /// without grepping logs.
         store_attempt: u32,
+        /// Full persisted content — used by the observatory to extract
+        /// narrative section names and a truncated preview. Kept off
+        /// the hot read path (journal events only see bytes count).
+        content: String,
     },
     /// LLM attempted and failed; rule-based fallback was persisted
     /// successfully. Service records both the error and the write.
@@ -44,6 +48,7 @@ pub enum ExtractionArtifacts {
         error_reason: SessionMemoryExtractionErrorReason,
         bytes_written: u64,
         store_attempt: u32,
+        content: String,
     },
     /// Memoria persist failed. Nothing landed. Reason is one of
     /// `PurgeFailed` / `WriteFailed`.
@@ -123,11 +128,13 @@ pub async fn run_extraction(
             error_reason: reason,
             bytes_written,
             store_attempt: persist.store_attempt,
+            content,
         },
         None => ExtractionArtifacts::Persisted {
             source,
             bytes_written,
             store_attempt: persist.store_attempt,
+            content,
         },
     }
 }

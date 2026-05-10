@@ -44,6 +44,10 @@ use crate::turn::cloud::memoria_compact::MemoriaClient;
 use super::activity::{BackgroundActivity, BackgroundActivityBroker};
 use super::gate::{GateDecision, evaluate};
 use super::health::{MemoriaAdmit, MemoriaHealth, SelectorHealth};
+use super::observatory::{
+    ExtractionOutcome as ObsExtractionOutcome, ExtractionRecord as ObsExtractionRecord,
+    ExtractionTrigger, SessionMemoryObservatory, clip_preview,
+};
 use super::request::{ExtractionRequest, SpawnDecision};
 use super::runner::{ExtractionArtifacts, run_extraction};
 
@@ -112,6 +116,12 @@ pub struct MemoryExtractionService {
     /// branch of the gate unreachable. Entries are removed on
     /// [`Self::forget_session`] (session end).
     session_states: Arc<std::sync::Mutex<std::collections::HashMap<String, SessionMemoryState>>>,
+    /// Optional post-hoc ring for operator introspection. `None` when
+    /// the runtime boots without observability wiring (tests, minimal
+    /// CLI modes). Every `maybe_spawn` / `run_one` path writes a record
+    /// — including skips — when this is `Some`. No effect on LLM
+    /// payloads or cache hashes by construction.
+    observatory: Option<Arc<SessionMemoryObservatory>>,
 }
 
 impl std::fmt::Debug for MemoryExtractionService {
@@ -147,7 +157,34 @@ impl MemoryExtractionService {
             pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_done: Arc::new(tokio::sync::Notify::new()),
             session_states: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            observatory: None,
         }
+    }
+
+    /// Attach a post-hoc observatory. Callers wire one per-process and
+    /// share the `Arc` between the service and the compaction write
+    /// site so both surfaces populate a single ring set for introspect.
+    pub fn with_observatory(mut self, observatory: Arc<SessionMemoryObservatory>) -> Self {
+        self.observatory = Some(observatory);
+        self
+    }
+
+    /// Read-only handle to the observatory. `None` when the service
+    /// was built without one. Callers: `introspect`, tests.
+    pub fn observatory(&self) -> Option<&Arc<SessionMemoryObservatory>> {
+        self.observatory.as_ref()
+    }
+
+    /// Live circuit breaker snapshot, for introspect. Cheap — no locks
+    /// beyond the breaker's own.
+    pub fn memoria_breaker_state(&self) -> super::health::MemoriaHealthSnapshot {
+        self.memoria_health.state()
+    }
+
+    /// Number of background workers that have been spawned but not
+    /// finished yet.
+    pub fn pending_drain(&self) -> usize {
+        self.pending.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Release per-session debounce state. Callers invoke this at
@@ -213,7 +250,7 @@ impl MemoryExtractionService {
         // view; `mark_extracted` below happens under the same lock
         // acquire so two near-simultaneous calls don't both see
         // `!initialized` and both admit.
-        let decision = {
+        let (decision, trigger) = {
             let map = match self.session_states.lock() {
                 Ok(m) => m,
                 Err(p) => p.into_inner(),
@@ -227,14 +264,27 @@ impl MemoryExtractionService {
                     &default_state
                 }
             };
-            evaluate(
+            // Infer trigger for observatory records. Mirrors the gate's
+            // branches: error bypasses debounce regardless of init
+            // state; absent init state means the init gate is the
+            // first reason anything fires; otherwise a growth-delta
+            // crossing.
+            let trig = if req.had_error {
+                ExtractionTrigger::ErrorOverride
+            } else if !state.initialized {
+                ExtractionTrigger::InitGate
+            } else {
+                ExtractionTrigger::GrowthGate
+            };
+            let dec = evaluate(
                 state,
                 &req.session_id,
                 req.current_tokens,
                 req.current_tool_calls,
                 req.had_error,
                 &req.config,
-            )
+            );
+            (dec, trig)
         };
         // Breadcrumbs for sync-path skip events. `selector_model` and
         // `attempt` only make sense in the async worker after LLM
@@ -245,15 +295,18 @@ impl MemoryExtractionService {
             attempt: None,
         };
         if let GateDecision::Skip(reason) = decision {
-            self.emit_skip_event(
-                if req.session_id.is_empty() {
-                    None
-                } else {
-                    Some(&req.session_id)
-                },
+            let sid_opt = if req.session_id.is_empty() {
+                None
+            } else {
+                Some(req.session_id.as_str())
+            };
+            self.emit_skip_event(sid_opt, req.turn_number, reason, &skip_breadcrumbs);
+            self.record_skipped(
+                sid_opt,
                 req.turn_number,
-                reason,
-                &skip_breadcrumbs,
+                trigger,
+                skip_reason_label(reason),
+                None,
             );
             return SpawnDecision::Skipped;
         }
@@ -281,6 +334,13 @@ impl MemoryExtractionService {
                     SessionMemoryExtractionSkipReason::MemoriaUnhealthy,
                     &skip_breadcrumbs,
                 );
+                self.record_skipped(
+                    Some(&req.session_id),
+                    req.turn_number,
+                    trigger,
+                    "memoria_unhealthy",
+                    None,
+                );
                 return SpawnDecision::Skipped;
             }
         }
@@ -296,6 +356,13 @@ impl MemoryExtractionService {
                     SessionMemoryExtractionSkipReason::InFlight,
                     &skip_breadcrumbs,
                 );
+                self.record_skipped(
+                    Some(&req.session_id),
+                    req.turn_number,
+                    trigger,
+                    "in_flight",
+                    None,
+                );
                 return SpawnDecision::Skipped;
             }
         } else {
@@ -306,6 +373,13 @@ impl MemoryExtractionService {
                 req.turn_number,
                 SessionMemoryExtractionSkipReason::InFlight,
                 &skip_breadcrumbs,
+            );
+            self.record_skipped(
+                Some(&req.session_id),
+                req.turn_number,
+                trigger,
+                "in_flight",
+                None,
             );
             return SpawnDecision::Skipped;
         }
@@ -330,7 +404,7 @@ impl MemoryExtractionService {
         let pending = Arc::clone(&self.pending);
         let pending_done = Arc::clone(&self.pending_done);
         tokio::spawn(async move {
-            svc.run_one(req).await;
+            svc.run_one(req, trigger).await;
             if pending.fetch_sub(1, Ordering::AcqRel) == 1 {
                 // Went from 1 → 0: wake every waiter.
                 pending_done.notify_waiters();
@@ -341,7 +415,7 @@ impl MemoryExtractionService {
 
     // ── internals ─────────────────────────────────────────────────────
 
-    async fn run_one(self: Arc<Self>, req: ExtractionRequest) {
+    async fn run_one(self: Arc<Self>, req: ExtractionRequest, trigger: ExtractionTrigger) {
         let session_id = req.session_id.clone();
         let turn = req.turn_number;
         let messages_count = req.messages.len() as u32;
@@ -363,9 +437,10 @@ impl MemoryExtractionService {
         };
 
         if selector_params.is_some() && !selector_healthy {
+            let model_name = selector_params.as_ref().map(|p| p.model_name.clone());
             let bc = SessionMemoryExtractionBreadcrumbs {
                 messages_count: Some(messages_count),
-                selector_model: selector_params.as_ref().map(|p| p.model_name.clone()),
+                selector_model: model_name.clone(),
                 attempt: None,
             };
             self.emit_skip_event(
@@ -373,6 +448,13 @@ impl MemoryExtractionService {
                 turn,
                 SessionMemoryExtractionSkipReason::SelectorCooldown,
                 &bc,
+            );
+            self.record_skipped(
+                Some(&session_id),
+                turn,
+                trigger,
+                "selector_cooldown",
+                model_name,
             );
             self.release_in_flight(&session_id).await;
             return;
@@ -410,12 +492,14 @@ impl MemoryExtractionService {
         )
         .await;
         let duration_ms = started.elapsed().as_millis() as u64;
+        let latency = started.elapsed();
         if std::env::var("ASTRA_SESSION_MEMORY_TRACE").is_ok() {
             let tag = match &artifacts {
                 ExtractionArtifacts::Persisted {
                     source,
                     bytes_written,
                     store_attempt,
+                    ..
                 } => {
                     format!(
                         "Persisted{{source={source:?}, bytes={bytes_written}, attempt={store_attempt}}}"
@@ -425,6 +509,7 @@ impl MemoryExtractionService {
                     error_reason,
                     bytes_written,
                     store_attempt,
+                    ..
                 } => {
                     format!(
                         "LlmFailedPersistedFallback{{err={error_reason:?}, bytes={bytes_written}, attempt={store_attempt}}}"
@@ -452,6 +537,7 @@ impl MemoryExtractionService {
                 source,
                 bytes_written,
                 store_attempt,
+                content,
             } => {
                 // Memoria accepted a write → breaker closes (or stays
                 // closed) and the consecutive-failure counter resets.
@@ -478,11 +564,30 @@ impl MemoryExtractionService {
                     duration_ms,
                     &bc,
                 );
+                let (sections, preview) = summarize_persisted_content(&content);
+                self.record_extraction_outcome(
+                    &session_id,
+                    turn,
+                    trigger,
+                    match source {
+                        SessionMemoryExtractionSource::Llm => selector_model_used.clone(),
+                        SessionMemoryExtractionSource::RuleFallback => None,
+                    },
+                    ObsExtractionOutcome::Persisted {
+                        source: source.into(),
+                        bytes_written,
+                        store_attempt,
+                    },
+                    sections,
+                    preview,
+                    latency,
+                );
             }
             ExtractionArtifacts::LlmFailedPersistedFallback {
                 error_reason,
                 bytes_written,
                 store_attempt,
+                content,
             } => {
                 if let Some(name) = params_for_health.as_deref() {
                     self.health.mark_failed(name);
@@ -507,7 +612,21 @@ impl MemoryExtractionService {
                     source: SessionMemoryExtractionSource::RuleFallback,
                     duration_ms,
                 });
-                let _ = bytes_written;
+                let (sections, preview) = summarize_persisted_content(&content);
+                self.record_extraction_outcome(
+                    &session_id,
+                    turn,
+                    trigger,
+                    selector_model_used.clone(),
+                    ObsExtractionOutcome::LlmFailedFallbackPersisted {
+                        reason: error_reason.into(),
+                        bytes_written,
+                        store_attempt,
+                    },
+                    sections,
+                    preview,
+                    latency,
+                );
             }
             ExtractionArtifacts::PersistFailed { error_reason } => {
                 // Memoria persist failed → breaker counts it. Enough
@@ -530,12 +649,56 @@ impl MemoryExtractionService {
                     reason: error_reason,
                     duration_ms,
                 });
+                self.record_extraction_outcome(
+                    &session_id,
+                    turn,
+                    trigger,
+                    selector_model_used.clone(),
+                    ObsExtractionOutcome::PersistFailed {
+                        reason: error_reason.into(),
+                    },
+                    Vec::new(),
+                    String::new(),
+                    latency,
+                );
             }
         }
 
         self.release_in_flight(&session_id).await;
     }
+}
 
+/// Map a skip reason enum to a stable string label. Kept out of
+/// `MemoriaHealth` / `Gate` because observatory tags need to stay
+/// consistent across `session_journal` schema evolution.
+fn skip_reason_label(reason: SessionMemoryExtractionSkipReason) -> &'static str {
+    match reason {
+        SessionMemoryExtractionSkipReason::NoSessionId => "no_session_id",
+        SessionMemoryExtractionSkipReason::BelowInitGate => "below_init_gate",
+        SessionMemoryExtractionSkipReason::NoGrowth => "no_growth",
+        SessionMemoryExtractionSkipReason::InFlight => "in_flight",
+        SessionMemoryExtractionSkipReason::SelectorCooldown => "selector_cooldown",
+        SessionMemoryExtractionSkipReason::MemoriaUnhealthy => "memoria_unhealthy",
+    }
+}
+
+/// Extract narrative section titles + clipped preview from persisted
+/// L1 content. Safe on malformed content — returns empty sections and
+/// a whatever-is-there preview.
+fn summarize_persisted_content(content: &str) -> (Vec<String>, String) {
+    use crate::turn::cloud::session_memory_protocol::SessionMemory;
+    let sections = SessionMemory::parse(content)
+        .map(|m| {
+            m.section_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+    (sections, clip_preview(content))
+}
+
+impl MemoryExtractionService {
     async fn load_current_memory(&self, session_id: &str) -> String {
         use crate::turn::cloud::session_memory_protocol::{SESSION_MEMORY_PREFIX, pick_latest_l1};
         let Ok(memories) = self
@@ -565,6 +728,64 @@ impl MemoryExtractionService {
     fn enqueue(&self, event: JournalEvent) {
         let ingestion_event = IngestionEvent::from_journal_event(&event, &self.user_id);
         self.ingestion.enqueue(ingestion_event);
+    }
+
+    // ── observatory helpers (all no-op when observatory=None) ────────
+
+    fn record_skipped(
+        &self,
+        session_id: Option<&str>,
+        turn: u32,
+        trigger: ExtractionTrigger,
+        reason: &str,
+        selector_model: Option<String>,
+    ) {
+        let Some(obs) = self.observatory.as_ref() else {
+            return;
+        };
+        let Some(sid) = session_id else {
+            return;
+        };
+        obs.record_extraction(ObsExtractionRecord {
+            session_id: sid.to_string(),
+            turn,
+            at: std::time::SystemTime::now(),
+            trigger,
+            selector_model,
+            outcome: ObsExtractionOutcome::Skipped {
+                reason: reason.to_string(),
+            },
+            narrative_sections: Vec::new(),
+            content_preview: String::new(),
+            latency: Duration::ZERO,
+        });
+    }
+
+    fn record_extraction_outcome(
+        &self,
+        session_id: &str,
+        turn: u32,
+        trigger: ExtractionTrigger,
+        selector_model: Option<String>,
+        outcome: ObsExtractionOutcome,
+        narrative_sections: Vec<String>,
+        content_preview: String,
+        latency: Duration,
+    ) {
+        let Some(obs) = self.observatory.as_ref() else {
+            return;
+        };
+        obs.record_extraction(ObsExtractionRecord {
+            session_id: session_id.to_string(),
+            turn,
+            at: std::time::SystemTime::now(),
+            trigger,
+            selector_model,
+            outcome,
+            narrative_sections,
+            content_preview,
+            latency,
+        });
     }
 
     fn emit_skip_event(
@@ -1811,6 +2032,155 @@ mod tests {
         assert!(
             meta.get("selector_model").is_none(),
             "no selector resolved yet"
+        );
+    }
+
+    // ── Observatory wiring tests (unhappy first) ─────────────────────
+
+    /// Build a context with a wired observatory so each terminal path
+    /// can be asserted end-to-end.
+    fn build_ctx_with_obs() -> (
+        TestCtx,
+        Arc<crate::session_memory::SessionMemoryObservatory>,
+    ) {
+        let (ingestion, rx) = IngestionSender::for_tests(256);
+        let broker = Arc::new(BackgroundActivityBroker::new());
+        let memoria = Arc::new(CapturingMemoria::default());
+        let obs = Arc::new(crate::session_memory::SessionMemoryObservatory::new());
+        let svc = Arc::new(
+            MemoryExtractionService::new(
+                Arc::new(ConstSelectorResolver(None)),
+                Arc::clone(&memoria) as Arc<dyn MemoriaClient>,
+                ingestion,
+                "test-user",
+                Arc::clone(&broker),
+            )
+            .with_observatory(Arc::clone(&obs)),
+        );
+        (
+            TestCtx {
+                svc,
+                rx,
+                broker,
+                memoria,
+            },
+            obs,
+        )
+    }
+
+    #[tokio::test]
+    async fn observatory_records_skip_below_init_gate() {
+        let (ctx, obs) = build_ctx_with_obs();
+        let req = sample_req("obs-skip", 1_000, false); // below 10K init gate
+        assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Skipped);
+
+        let snap = obs.extractions_snapshot();
+        assert_eq!(snap.len(), 1);
+        let rec = &snap[0];
+        assert_eq!(rec.session_id, "obs-skip");
+        assert!(matches!(
+            rec.outcome,
+            crate::session_memory::ExtractionOutcome::Skipped { ref reason } if reason == "below_init_gate"
+        ));
+        assert_eq!(
+            rec.trigger,
+            crate::session_memory::ExtractionTrigger::InitGate
+        );
+        assert!(
+            rec.content_preview.is_empty(),
+            "skip record has no persisted content"
+        );
+    }
+
+    #[tokio::test]
+    async fn observatory_records_skip_as_error_override_when_had_error() {
+        let (ctx, obs) = build_ctx_with_obs();
+        // Below init gate + had_error=true → still skipped (error override
+        // only fires past init). Trigger tag must reflect the intent
+        // (ErrorOverride), not the debounce branch.
+        let req = sample_req("obs-err", 1_000, true);
+        assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Skipped);
+
+        let snap = obs.extractions_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].trigger,
+            crate::session_memory::ExtractionTrigger::ErrorOverride
+        );
+    }
+
+    #[tokio::test]
+    async fn observatory_records_persisted_after_rule_based_store() {
+        let (ctx, obs) = build_ctx_with_obs();
+        let sid = format!("obs-ok-{}", nanos());
+        let req = sample_req(&sid, 50_000, false); // past init gate, no selector
+        assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Spawned);
+        wait_for_memoria_store(&ctx.memoria).await;
+
+        // Wait for the async record — observatory writes after the
+        // persist returns, which can trail the store Mutex push by a
+        // scheduler tick on CI hosts.
+        for _ in 0..50 {
+            if !obs.extractions_snapshot().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let snap = obs.extractions_snapshot();
+        assert_eq!(snap.len(), 1, "expected one record");
+        let rec = &snap[0];
+        match &rec.outcome {
+            crate::session_memory::ExtractionOutcome::Persisted {
+                source,
+                bytes_written,
+                store_attempt,
+            } => {
+                assert_eq!(
+                    *source,
+                    crate::session_memory::ExtractionSource::RuleFallback
+                );
+                assert!(*bytes_written > 0);
+                assert!(*store_attempt >= 1);
+            }
+            other => panic!("expected Persisted, got {other:?}"),
+        }
+        assert!(
+            !rec.content_preview.is_empty(),
+            "persisted record must carry a preview"
+        );
+        assert!(
+            rec.content_preview
+                .starts_with(crate::turn::cloud::session_memory_protocol::SESSION_MEMORY_PREFIX),
+            "preview must include the v1 prefix; got {:.40}…",
+            rec.content_preview
+        );
+    }
+
+    #[tokio::test]
+    async fn observatory_is_silent_when_not_attached() {
+        // Default service has no observatory; verifies the `None` path
+        // is truly a no-op — no panic, no behaviour change.
+        let mut ctx = build_ctx(None);
+        let req = sample_req("no-obs", 1_000, false);
+        assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Skipped);
+        // Service has no observatory — nothing to check beyond the
+        // event stream still landing normally.
+        let events = collect_extraction_events(&mut ctx.rx);
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn observatory_skips_record_on_empty_session_id() {
+        // Sanity: NoSessionId + empty session_id must not create a
+        // phantom record with "" as the key. `record_skipped` guards
+        // with `Some(sid)`.
+        let (ctx, obs) = build_ctx_with_obs();
+        let req = sample_req("", 50_000, false);
+        assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Skipped);
+        let snap = obs.extractions_snapshot();
+        assert!(
+            snap.is_empty(),
+            "no session id means the record must be suppressed, not saved with empty id; got: {snap:?}",
         );
     }
 }

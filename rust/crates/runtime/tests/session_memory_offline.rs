@@ -265,6 +265,8 @@ async fn full_session_memory_lifecycle_glues_modules() {
         keep_recent_turns: 2,
         current_tokens: 8_000,
         session_facts: Some(facts.clone()),
+        turn_number: 0,
+        observatory: None,
     };
     let result = compact_with_memoria(
         &messages,
@@ -444,6 +446,8 @@ async fn compaction_degrades_gracefully_when_retrieve_errors() {
         keep_recent_turns: 2,
         current_tokens: 8_000,
         session_facts: None,
+        turn_number: 0,
+        observatory: None,
     };
 
     let result = compact_with_memoria(

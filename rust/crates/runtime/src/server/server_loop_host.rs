@@ -2145,6 +2145,13 @@ impl ServerAgenticLoopHost {
         };
         let memoria_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
 
+        // Observatory is owned by the memory_extraction_service; clone the
+        // Arc so both extraction (service) and injection (compaction) write
+        // into the same ring set.
+        let observatory = state
+            .memory_extraction_service
+            .as_ref()
+            .and_then(|svc| svc.observatory().cloned());
         let ctx = crate::turn::wire_assembly::MemoriaContext {
             session_id: &self.session_id,
             model_name: &llm_cfg.model_name,
@@ -2156,6 +2163,8 @@ impl ServerAgenticLoopHost {
             ),
             tier,
             session_facts: None,
+            turn_number: state.llm_rounds_completed,
+            observatory,
         };
         ctx.compact(&state.messages, system_messages, visible_tools)
             .await

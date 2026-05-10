@@ -186,7 +186,7 @@ pub struct StalenessSignals {
 pub struct RetrievedMemoryRef {
     pub memory_id: String,
     pub memory_type: String,
-    pub score: Option<f32>,
+    pub score: Option<f64>,
 }
 
 /// One compaction-time injection event, post-hoc.
@@ -447,9 +447,7 @@ mod tests {
         // And the whole thing must still be valid UTF-8 (implicit via
         // String, explicit via the round-trip).
         assert!(
-            clipped
-                .chars()
-                .all(|c| c == '🦀' || c == '…'),
+            clipped.chars().all(|c| c == '🦀' || c == '…'),
             "no partial codepoints"
         );
     }

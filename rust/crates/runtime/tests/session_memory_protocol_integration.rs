@@ -279,6 +279,8 @@ async fn compaction_uses_l1_when_available() {
         keep_recent_turns: 3,
         current_tokens: 50000,
         session_facts: None,
+        turn_number: 0,
+        observatory: None,
     };
 
     let result = compact_with_memoria(
@@ -331,6 +333,8 @@ async fn first_user_message_survives_compaction() {
         keep_recent_turns: 2,
         current_tokens: 60000,
         session_facts: None,
+        turn_number: 0,
+        observatory: None,
     };
 
     let result = compact_with_memoria(
@@ -535,6 +539,8 @@ async fn multi_compaction_preserves_goal_and_decisions() {
         keep_recent_turns: 3,
         current_tokens: 80000,
         session_facts: None,
+        turn_number: 0,
+        observatory: None,
     };
 
     let result1 = compact_with_memoria(
@@ -716,6 +722,8 @@ async fn tool_heavy_session_preserves_task() {
         keep_recent_turns: 2,
         current_tokens: 70000,
         session_facts: None,
+        turn_number: 0,
+        observatory: None,
     };
 
     let result = compact_with_memoria(
@@ -918,6 +926,8 @@ async fn measure_memoria_token_overhead() {
         keep_recent_turns: 3,
         current_tokens: 80000,
         session_facts: None,
+        turn_number: 0,
+        observatory: None,
     };
 
     // Without Memoria
@@ -1051,6 +1061,8 @@ async fn full_loop_l1_write_then_compaction_reads() {
         keep_recent_turns: 3,
         current_tokens: 80000,
         session_facts: None,
+        turn_number: 0,
+        observatory: None,
     };
 
     let result = compact_with_memoria(
@@ -1107,6 +1119,8 @@ async fn l2_fallback_when_memoria_unavailable() {
         keep_recent_turns: 3,
         current_tokens: 80000,
         session_facts: None,
+        turn_number: 0,
+        observatory: None,
     };
 
     // No Memoria client — should still compact without error
