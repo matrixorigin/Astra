@@ -2262,7 +2262,6 @@ impl AgenticRunLifecycleService {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
-            session_memory_state: Default::default(),
             memory_extraction_service: self.memory_extraction_service.clone(),
             continuity: runtime_continuity.unwrap_or_default(),
             compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
@@ -3019,6 +3018,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             tracing::warn!(session_id = %sid, error = %e, "session-end governance failed")
                         }
                     }
+                }
+            }
+            // Release per-session debounce state held by the extraction
+            // service so it doesn't accumulate an entry per session for
+            // the life of the process.
+            if let Some(svc) = loop_state.memory_extraction_service.as_ref() {
+                if let Some(sid) = loop_state.current_session_id.as_deref() {
+                    svc.forget_session(sid);
                 }
             }
         });
@@ -4054,7 +4061,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
-            session_memory_state: Default::default(),
             memory_extraction_service: self.memory_extraction_service.clone(),
             continuity: Default::default(),
             compact_strategy,

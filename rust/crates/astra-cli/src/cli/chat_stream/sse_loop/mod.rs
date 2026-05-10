@@ -755,7 +755,6 @@ pub(crate) async fn stream_chat_sse(
         server_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
-        session_memory_state: Default::default(),
         memory_extraction_service: p.session_memory_extractor.clone(),
         continuity: p.runtime_continuity.cloned().unwrap_or_default(),
         compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_and_model(

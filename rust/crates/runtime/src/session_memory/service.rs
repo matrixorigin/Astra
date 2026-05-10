@@ -103,6 +103,13 @@ pub struct MemoryExtractionService {
     /// Notifier the worker wakes when `pending` reaches zero. Pair with
     /// `pending` as a lightweight wait-for-empty primitive.
     pending_done: Arc<tokio::sync::Notify>,
+    /// Per-session debounce state. Owned by the service so it survives
+    /// the per-turn `AgenticLoopState` rebuild — the previous design
+    /// stored this on `AgenticLoopState` and lost `initialized` /
+    /// `tokens_at_last_extraction` every turn, making the growth-delta
+    /// branch of the gate unreachable. Entries are removed on
+    /// [`Self::forget_session`] (session end).
+    session_states: Arc<std::sync::Mutex<std::collections::HashMap<String, SessionMemoryState>>>,
 }
 
 impl std::fmt::Debug for MemoryExtractionService {
@@ -136,7 +143,26 @@ impl MemoryExtractionService {
             broker,
             pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_done: Arc::new(tokio::sync::Notify::new()),
+            session_states: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Release per-session debounce state. Callers invoke this at
+    /// session end so the service doesn't leak state across an unbounded
+    /// number of historical sessions. Idempotent.
+    pub fn forget_session(&self, session_id: &str) {
+        if let Ok(mut map) = self.session_states.lock() {
+            map.remove(session_id);
+        }
+    }
+
+    /// Test-only probe: inspect the per-session debounce state.
+    #[cfg(test)]
+    pub(crate) fn peek_state(&self, session_id: &str) -> Option<SessionMemoryState> {
+        self.session_states
+            .lock()
+            .ok()
+            .and_then(|m| m.get(session_id).cloned())
     }
 
     /// Block until every spawned worker has finished or `timeout` elapses.
@@ -173,24 +199,40 @@ impl MemoryExtractionService {
         Arc::clone(&self.broker)
     }
 
-    /// Synchronous entry point. Evaluates the gate, emits a skip event
-    /// inline when rejected, advances `state` and spawns the async
-    /// worker when admitted.
+    /// Synchronous entry point. Evaluates the gate against the service's
+    /// own per-session debounce state, emits a skip event inline when
+    /// rejected, advances the debounce state and spawns the async worker
+    /// when admitted.
     ///
     /// **Must run inside a Tokio runtime.**
-    pub fn maybe_spawn(
-        self: &Arc<Self>,
-        state: &mut SessionMemoryState,
-        req: ExtractionRequest,
-    ) -> SpawnDecision {
-        let decision = evaluate(
-            state,
-            &req.session_id,
-            req.current_tokens,
-            req.current_tool_calls,
-            req.had_error,
-            &req.config,
-        );
+    pub fn maybe_spawn(self: &Arc<Self>, req: ExtractionRequest) -> SpawnDecision {
+        // Snapshot state under lock so the gate evaluates a consistent
+        // view; `mark_extracted` below happens under the same lock
+        // acquire so two near-simultaneous calls don't both see
+        // `!initialized` and both admit.
+        let decision = {
+            let map = match self.session_states.lock() {
+                Ok(m) => m,
+                Err(p) => p.into_inner(),
+            };
+            let state_ref = map.get(&req.session_id);
+            let default_state;
+            let state = match state_ref {
+                Some(s) => s,
+                None => {
+                    default_state = SessionMemoryState::default();
+                    &default_state
+                }
+            };
+            evaluate(
+                state,
+                &req.session_id,
+                req.current_tokens,
+                req.current_tool_calls,
+                req.had_error,
+                &req.config,
+            )
+        };
         if let GateDecision::Skip(reason) = decision {
             self.emit_skip_event(
                 if req.session_id.is_empty() {
@@ -229,8 +271,11 @@ impl MemoryExtractionService {
 
         // Admitted. Advance debounce so the next turn doesn't re-trigger
         // on the same growth window even if this attempt falls back to
-        // rule-based content.
-        state.mark_extracted(req.current_tokens, req.current_tool_calls);
+        // rule-based content. Per-session state survives turn boundaries.
+        if let Ok(mut map) = self.session_states.lock() {
+            let entry = map.entry(req.session_id.clone()).or_default();
+            entry.mark_extracted(req.current_tokens, req.current_tool_calls);
+        }
 
         // Track in-flight workers so shutdown can drain them. The
         // counter is `fetch_add`'d synchronously BEFORE the spawn so a
@@ -605,9 +650,8 @@ mod tests {
     #[tokio::test]
     async fn skip_below_gate_emits_skipped_event_with_reason() {
         let mut ctx = build_ctx(None);
-        let mut state = SessionMemoryState::default();
         let req = sample_req("sess-below", 1_000, false);
-        assert_eq!(ctx.svc.maybe_spawn(&mut state, req), SpawnDecision::Skipped);
+        assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Skipped);
 
         let events = collect_extraction_events(&mut ctx.rx);
         assert_eq!(events.len(), 1);
@@ -620,10 +664,9 @@ mod tests {
     #[tokio::test]
     async fn no_selector_persists_rule_based_to_memoria() {
         let mut ctx = build_ctx(None);
-        let mut state = SessionMemoryState::default();
         let sid = format!("no-sel-{}", nanos());
         let req = sample_req(&sid, 50_000, false);
-        assert_eq!(ctx.svc.maybe_spawn(&mut state, req), SpawnDecision::Spawned);
+        assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Spawned);
         wait_for_memoria_store(&ctx.memoria).await;
 
         // Exactly one `store` call with memory_type=working, same session_id.
@@ -655,10 +698,9 @@ mod tests {
     #[tokio::test]
     async fn persist_purges_previous_l1_before_store() {
         let ctx = build_ctx(None);
-        let mut state = SessionMemoryState::default();
         let sid = format!("purge-{}", nanos());
         let req = sample_req(&sid, 50_000, false);
-        assert_eq!(ctx.svc.maybe_spawn(&mut state, req), SpawnDecision::Spawned);
+        assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Spawned);
         wait_for_memoria_store(&ctx.memoria).await;
 
         // persist_l1 calls `purge_working(sid)` before `store`.
@@ -669,14 +711,13 @@ mod tests {
     #[tokio::test]
     async fn in_flight_dedup_emits_skipped_in_flight() {
         let mut ctx = build_ctx(None);
-        let mut state = SessionMemoryState::default();
         let sid = format!("in-flight-{}", nanos());
         {
             let mut set = ctx.svc.in_flight.lock().await;
             set.insert(sid.clone());
         }
         let req = sample_req(&sid, 50_000, false);
-        assert_eq!(ctx.svc.maybe_spawn(&mut state, req), SpawnDecision::Skipped);
+        assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Skipped);
 
         let events = collect_extraction_events(&mut ctx.rx);
         assert!(events.iter().any(|e| {
@@ -689,10 +730,9 @@ mod tests {
     async fn broker_does_not_fire_started_for_rule_based_path() {
         let ctx = build_ctx(None);
         let mut sub = ctx.broker.subscribe();
-        let mut state = SessionMemoryState::default();
         let sid = format!("no-start-{}", nanos());
         let req = sample_req(&sid, 50_000, false);
-        assert_eq!(ctx.svc.maybe_spawn(&mut state, req), SpawnDecision::Spawned);
+        assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Spawned);
         wait_for_memoria_store(&ctx.memoria).await;
 
         let mut saw_started = false;
@@ -794,10 +834,9 @@ mod tests {
         });
         let (svc, mut rx, _broker) =
             build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let mut state = SessionMemoryState::default();
         let sid = format!("purge-fail-{}", nanos());
         let req = sample_req(&sid, 50_000, false);
-        assert_eq!(svc.maybe_spawn(&mut state, req), SpawnDecision::Spawned);
+        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
 
         // Wait for the error event to surface.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -831,10 +870,9 @@ mod tests {
         });
         let (svc, mut rx, _broker) =
             build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let mut state = SessionMemoryState::default();
         let sid = format!("store-fail-{}", nanos());
         let req = sample_req(&sid, 50_000, false);
-        assert_eq!(svc.maybe_spawn(&mut state, req), SpawnDecision::Spawned);
+        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut saw_write_failed = false;
@@ -865,10 +903,9 @@ mod tests {
         });
         let (svc, _rx, _broker) =
             build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let mut state = SessionMemoryState::default();
         let sid = format!("retrieve-fail-{}", nanos());
         let req = sample_req(&sid, 50_000, false);
-        assert_eq!(svc.maybe_spawn(&mut state, req), SpawnDecision::Spawned);
+        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
 
         // Extraction should still produce a store via rule-based path.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -888,10 +925,9 @@ mod tests {
         let memoria = Arc::new(CapturingMemoria::default());
         let (svc, _rx, _broker) =
             build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let mut state = SessionMemoryState::default();
         let sid = format!("drain-ok-{}", nanos());
         let req = sample_req(&sid, 50_000, false);
-        assert_eq!(svc.maybe_spawn(&mut state, req), SpawnDecision::Spawned);
+        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
 
         // Generous timeout — the worker writes to the in-memory mock
         // which returns synchronously; in practice it finishes in ms.
@@ -950,9 +986,8 @@ mod tests {
         });
         let (svc, _rx, _broker) =
             build_ctx_with_memoria(None, Arc::clone(&slow) as Arc<dyn MemoriaClient>);
-        let mut state = SessionMemoryState::default();
         let req = sample_req("slow-1", 50_000, false);
-        assert_eq!(svc.maybe_spawn(&mut state, req), SpawnDecision::Spawned);
+        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
 
         // `maybe_spawn` returned immediately (that's the whole point of
         // spawn-dedupe). The store is still in flight.
@@ -1007,9 +1042,8 @@ mod tests {
         }
         let (svc, _rx, _broker) =
             build_ctx_with_memoria(None, Arc::new(HangingMemoria) as Arc<dyn MemoriaClient>);
-        let mut state = SessionMemoryState::default();
         let req = sample_req("hang-1", 50_000, false);
-        assert_eq!(svc.maybe_spawn(&mut state, req), SpawnDecision::Spawned);
+        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
 
         // Short timeout — we expect leftover == 1 because the worker
         // never completes.
@@ -1057,10 +1091,9 @@ mod tests {
         // to actually hit the network.
         svc.health.mark_failed(&selector_params.model_name);
 
-        let mut state = SessionMemoryState::default();
         let sid = format!("cooldown-{}", nanos());
         let req = sample_req(&sid, 50_000, false);
-        assert_eq!(svc.maybe_spawn(&mut state, req), SpawnDecision::Spawned);
+        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut saw_cooldown = false;
@@ -1140,14 +1173,12 @@ mod tests {
         let sid = format!("race-{}", nanos());
 
         // First spawn.
-        let mut state1 = SessionMemoryState::default();
         let req1 = sample_req(&sid, 50_000, false);
-        let d1 = svc.maybe_spawn(&mut state1, req1);
+        let d1 = svc.maybe_spawn(req1);
 
         // Second spawn (same session, BEFORE first finishes).
-        let mut state2 = SessionMemoryState::default();
         let req2 = sample_req(&sid, 60_000, false);
-        let d2 = svc.maybe_spawn(&mut state2, req2);
+        let d2 = svc.maybe_spawn(req2);
 
         assert_eq!(d1, SpawnDecision::Spawned);
         assert_eq!(
@@ -1172,7 +1203,6 @@ mod tests {
         let memoria = Arc::new(CapturingMemoria::default());
         let (svc, _rx, _broker) =
             build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let mut state = SessionMemoryState::default();
         let sid = format!("empty-msg-{}", nanos());
         let req = ExtractionRequest {
             session_id: sid.clone(),
@@ -1183,7 +1213,7 @@ mod tests {
             turn_number: 0,
             config: SessionMemoryExtractConfig::default(),
         };
-        assert_eq!(svc.maybe_spawn(&mut state, req), SpawnDecision::Spawned);
+        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
         svc.wait_for_pending(Duration::from_secs(2)).await;
 
         let stored = memoria.stored.lock().unwrap().clone();
@@ -1206,7 +1236,6 @@ mod tests {
         let memoria = Arc::new(CapturingMemoria::default());
         let (svc, _rx, _broker) =
             build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let mut state = SessionMemoryState::default();
         let sid = format!("huge-{}", nanos());
 
         let mut messages = Vec::with_capacity(10_000);
@@ -1228,7 +1257,7 @@ mod tests {
         };
 
         let started = Instant::now();
-        assert_eq!(svc.maybe_spawn(&mut state, req), SpawnDecision::Spawned);
+        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
         let leftover = svc.wait_for_pending(Duration::from_secs(10)).await;
         assert_eq!(leftover, 0, "huge session must still complete within 10s");
         let elapsed = started.elapsed();
@@ -1259,9 +1288,8 @@ mod tests {
             build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
         let weird_sids = ["has space", "中文会话", "quote'inside", "path/with/slash"];
         for (i, sid) in weird_sids.iter().enumerate() {
-            let mut state = SessionMemoryState::default();
             let req = sample_req(sid, 50_000, false);
-            let d = svc.maybe_spawn(&mut state, req);
+            let d = svc.maybe_spawn(req);
             assert_eq!(d, SpawnDecision::Spawned, "sid[{i}]='{sid}' must spawn");
         }
         svc.wait_for_pending(Duration::from_secs(3)).await;
@@ -1275,5 +1303,146 @@ mod tests {
                 "session_id must reach Memoria unchanged"
             );
         }
+    }
+
+    // ── cross-turn state persistence (regression for turn-scoped state bug) ──
+
+    /// The critical fix: per-session debounce state must persist across
+    /// simulated turn boundaries. Previously state lived on
+    /// `AgenticLoopState` which got rebuilt every turn, so `initialized`
+    /// was always `false` at gate time and the growth-delta branch of
+    /// the gate was structurally unreachable. Now state lives in the
+    /// service itself, keyed by session_id.
+    #[tokio::test]
+    async fn debounce_state_persists_across_simulated_turns() {
+        let memoria = Arc::new(CapturingMemoria::default());
+        let (svc, _rx, _broker) =
+            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
+        let sid = format!("cross-turn-{}", nanos());
+
+        // Turn 1: past init gate → Run. Worker finishes and
+        // `mark_extracted` updates the service-internal state.
+        let req1 = ExtractionRequest {
+            session_id: sid.clone(),
+            messages: vec![json!({"role": "user", "content": "hi"})],
+            current_tokens: 20_000,
+            current_tool_calls: 2,
+            had_error: false,
+            turn_number: 1,
+            config: SessionMemoryExtractConfig::default(),
+        };
+        assert_eq!(svc.maybe_spawn(req1), SpawnDecision::Spawned);
+        svc.wait_for_pending(Duration::from_secs(2)).await;
+        // Confirm state actually recorded.
+        let state = svc
+            .peek_state(&sid)
+            .expect("state should be recorded after first extraction");
+        assert!(state.initialized);
+        assert_eq!(state.tokens_at_last_extraction, 20_000);
+        assert_eq!(state.tool_calls_at_last_extraction, 2);
+
+        // Turn 2: tiny growth. With the OLD turn-scoped state this
+        // would have reset `initialized = false` and seen `20_500 >
+        // min_tokens_to_init (10K)` → Run. With the new per-session
+        // state this should correctly debounce to `no_growth` because
+        // growth < 5K between updates.
+        let req2 = ExtractionRequest {
+            session_id: sid.clone(),
+            messages: vec![json!({"role": "user", "content": "hi again"})],
+            current_tokens: 20_500,
+            current_tool_calls: 3,
+            had_error: false,
+            turn_number: 2,
+            config: SessionMemoryExtractConfig::default(),
+        };
+        assert_eq!(
+            svc.maybe_spawn(req2),
+            SpawnDecision::Skipped,
+            "tiny growth on the next turn should debounce, not re-spawn"
+        );
+
+        // Turn 3: big growth → Run again.
+        let req3 = ExtractionRequest {
+            session_id: sid.clone(),
+            messages: vec![json!({"role": "user", "content": "big turn"})],
+            current_tokens: 30_000,
+            current_tool_calls: 8,
+            had_error: false,
+            turn_number: 3,
+            config: SessionMemoryExtractConfig::default(),
+        };
+        assert_eq!(
+            svc.maybe_spawn(req3),
+            SpawnDecision::Spawned,
+            "5K+ growth + 3+ tool call growth must re-admit extraction"
+        );
+        svc.wait_for_pending(Duration::from_secs(2)).await;
+
+        // Verify the service advanced its state to the turn-3 counters.
+        let state = svc.peek_state(&sid).unwrap();
+        assert_eq!(state.tokens_at_last_extraction, 30_000);
+        assert_eq!(state.tool_calls_at_last_extraction, 8);
+
+        // Two extractions landed in total (turns 1 and 3).
+        assert_eq!(memoria.stored.lock().unwrap().len(), 2);
+    }
+
+    /// Different sessions must not pollute each other's debounce state.
+    #[tokio::test]
+    async fn debounce_state_is_per_session() {
+        let memoria = Arc::new(CapturingMemoria::default());
+        let (svc, _rx, _broker) =
+            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
+        let sid_a = format!("iso-a-{}", nanos());
+        let sid_b = format!("iso-b-{}", nanos());
+
+        // Session A: one extraction.
+        let req_a = sample_req(&sid_a, 20_000, false);
+        assert_eq!(svc.maybe_spawn(req_a), SpawnDecision::Spawned);
+        svc.wait_for_pending(Duration::from_secs(2)).await;
+
+        // Session B on same service: fresh init gate applies.
+        let req_b = sample_req(&sid_b, 15_000, false);
+        assert_eq!(
+            svc.maybe_spawn(req_b),
+            SpawnDecision::Spawned,
+            "Session B must not inherit Session A's debounce state"
+        );
+        svc.wait_for_pending(Duration::from_secs(2)).await;
+
+        let a_state = svc.peek_state(&sid_a).unwrap();
+        let b_state = svc.peek_state(&sid_b).unwrap();
+        assert_eq!(a_state.tokens_at_last_extraction, 20_000);
+        assert_eq!(b_state.tokens_at_last_extraction, 15_000);
+    }
+
+    /// `forget_session` must clear the entry so a second extraction for
+    /// the same session_id after session-end starts fresh.
+    #[tokio::test]
+    async fn forget_session_clears_debounce_state() {
+        let memoria = Arc::new(CapturingMemoria::default());
+        let (svc, _rx, _broker) =
+            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
+        let sid = format!("forget-{}", nanos());
+
+        let req = sample_req(&sid, 20_000, false);
+        svc.maybe_spawn(req);
+        svc.wait_for_pending(Duration::from_secs(2)).await;
+        assert!(svc.peek_state(&sid).is_some());
+
+        svc.forget_session(&sid);
+        assert!(
+            svc.peek_state(&sid).is_none(),
+            "forget_session must remove the entry"
+        );
+
+        // A later reuse of the same sid should start fresh (below init
+        // gate now applies again if tokens < 10K).
+        let req2 = sample_req(&sid, 5_000, false);
+        assert_eq!(
+            svc.maybe_spawn(req2),
+            SpawnDecision::Skipped,
+            "after forget, the below-init-gate check should apply again"
+        );
     }
 }

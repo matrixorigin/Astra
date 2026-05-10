@@ -21,10 +21,11 @@ use super::session_guard::clear_panic_guard;
 /// Finalize a REPL session: journal end event, persist state, extract learnings.
 pub(super) async fn finalize_session(state: &mut ReplState) {
     // 0. Drain any background session-memory extraction worker still in
-    //    flight from the final turn. Without this, the tokio::spawn()
-    //    task gets killed when the CLI process exits: the gate said
-    //    Run, but Memoria never receives the L1 write and the
-    //    `session_memory_extraction` event never fires. 10s is
+    //    flight from the final turn, then forget per-session debounce
+    //    state so the service doesn't leak it. Without the drain, the
+    //    tokio::spawn() task gets killed when the CLI process exits:
+    //    the gate said Run, but Memoria never receives the L1 write
+    //    and the `session_memory_extraction` event never fires. 10s is
     //    generous — the worker's internal LLM_TIMEOUT is 30s but real
     //    selector calls return in well under 5s.
     if let Some(svc) = state.session_memory_extractor.as_ref() {
@@ -37,6 +38,9 @@ pub(super) async fn finalize_session(state: &mut ReplState) {
                 leftover,
                 "session-memory extraction still in flight after 10s — forcing shutdown"
             );
+        }
+        if let Some(sid) = state.session_id.as_deref() {
+            svc.forget_session(sid);
         }
     }
 

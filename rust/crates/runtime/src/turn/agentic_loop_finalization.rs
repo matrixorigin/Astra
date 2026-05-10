@@ -640,10 +640,9 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
 
 /// Bridge between turn finalization and
 /// [`crate::session_memory::MemoryExtractionService`]. Returns
-/// immediately — the service decides whether to spawn, emits the
-/// gate/skip/extracted/errored journal event inline, advances
-/// `state.session_memory_state` on admission, and owns the background
-/// worker.
+/// immediately — the service owns the per-session debounce state,
+/// decides whether to spawn, emits the gate/skip/extracted/errored
+/// journal event inline, and runs the background worker.
 fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
     let Some(svc) = state.memory_extraction_service.clone() else {
         return;
@@ -679,9 +678,7 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
         ),
     };
 
-    // Debounce state is mutated by the service on admission — caller
-    // doesn't need to do anything else.
-    let _ = svc.maybe_spawn(&mut state.session_memory_state, req);
+    let _ = svc.maybe_spawn(req);
 }
 
 fn complete_active_runtime_todo_if_finalized(

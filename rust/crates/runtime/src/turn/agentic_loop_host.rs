@@ -1078,18 +1078,19 @@ pub struct AgenticLoopState {
     pub session_facts: astra_turn_types::session_facts::SessionFacts,
 
     // ── Session-memory extraction (LLM-backed L1) ──
-    /// Debounce state for the background session-memory extractor that
-    /// writes `session-memory.md`. Persists across turns so
-    /// `should_extract` can compare growth deltas.
-    pub session_memory_state: astra_turn_core::cloud_session_memory_extract::SessionMemoryState,
-
     /// Coordinator for background session-memory extraction. When `Some`,
-    /// `finalize_and_render` calls `svc.maybe_spawn(&mut session_memory_state, req)`
-    /// after each turn; the service owns LLM selector resolution,
-    /// selector cooldown, in-flight dedup, the event stream, and the
-    /// UX broker. When `None` (tests, sub-runs that opt out), no
-    /// extraction happens and no events are emitted. Cloned from the
-    /// host service at state-build time.
+    /// `finalize_and_render` calls `svc.maybe_spawn(req)` after each
+    /// turn; the service owns LLM selector resolution, selector
+    /// cooldown, in-flight dedup, the event stream, the UX broker,
+    /// AND the per-session debounce state. When `None` (tests, sub-runs
+    /// that opt out), no extraction happens and no events are emitted.
+    /// Cloned from the host service at state-build time.
+    ///
+    /// Per-session debounce state (`initialized`, `tokens_at_last_extraction`,
+    /// …) deliberately lives *inside* the service — not here — because
+    /// `AgenticLoopState` is rebuilt every turn and would lose the
+    /// debounce across turns, making the "growth delta" branch of the
+    /// gate structurally unreachable.
     pub memory_extraction_service:
         Option<std::sync::Arc<crate::session_memory::MemoryExtractionService>>,
 
@@ -1860,7 +1861,6 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         server_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
-        session_memory_state: Default::default(),
         memory_extraction_service: None,
         continuity: Default::default(),
         compact_strategy: Default::default(),
@@ -2257,7 +2257,6 @@ pub(crate) mod tests {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
-            session_memory_state: Default::default(),
             memory_extraction_service: None,
             continuity: Default::default(),
             compact_strategy: Default::default(),
