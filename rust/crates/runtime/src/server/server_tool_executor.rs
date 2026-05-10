@@ -4201,7 +4201,10 @@ esac
             .await;
         assert!(result.contains("Successfully wrote"));
         let content = std::fs::read_to_string(dir.path().join("out.txt")).unwrap();
-        assert_eq!(content, "hello world");
+        // .txt is in TEXT_TRAILING_NEWLINE_EXTS — write pipeline adds a
+        // POSIX trailing newline automatically. Matches what an editor
+        // would save.
+        assert_eq!(content, "hello world\n");
     }
 
     #[tokio::test]
@@ -4251,7 +4254,8 @@ esac
             .await;
         assert!(result.contains("Successfully replaced"));
         let content = std::fs::read_to_string(dir.path().join("code.rs")).unwrap();
-        assert_eq!(content, "fn new_name() {}");
+        // .rs writes gain a trailing newline via normalize_content_before_write.
+        assert_eq!(content, "fn new_name() {}\n");
     }
 
     #[tokio::test]
@@ -4366,7 +4370,8 @@ esac
             )
             .await;
         assert!(edited.contains("Successfully applied"));
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "AAA bbb CCC");
+        // target is .txt → trailing newline added by write pipeline.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "AAA bbb CCC\n");
 
         let rollback = exec
             .execute(
@@ -4636,7 +4641,7 @@ esac
         assert!(result.contains("Successfully applied"), "{result}");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("edit.txt")).unwrap(),
-            "FOO bar BAZ"
+            "FOO bar BAZ\n"
         );
         assert!(!result.contains("not available in server-side execution mode"));
     }
