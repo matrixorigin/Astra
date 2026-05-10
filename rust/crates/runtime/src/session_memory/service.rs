@@ -51,6 +51,25 @@ use super::observatory::{
 use super::request::{ExtractionRequest, SpawnDecision};
 use super::runner::{ExtractionArtifacts, run_extraction};
 
+#[cfg(test)]
+type MaybeSpawnAfterGateHook = std::sync::Arc<dyn Fn(&ExtractionRequest) + Send + Sync + 'static>;
+
+#[cfg(test)]
+static MAYBE_SPAWN_AFTER_GATE_HOOK: std::sync::Mutex<Option<MaybeSpawnAfterGateHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_maybe_spawn_after_gate_hook(req: &ExtractionRequest) {
+    let hook = MAYBE_SPAWN_AFTER_GATE_HOOK
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned();
+    if let Some(hook) = hook {
+        hook(req);
+    }
+}
+
 /// Hard upper bound on one LLM call. Memory extraction is background
 /// work; a hung call must never linger past this.
 pub const LLM_TIMEOUT: Duration = Duration::from_secs(30);
@@ -246,12 +265,32 @@ impl MemoryExtractionService {
     ///
     /// **Must run inside a Tokio runtime.**
     pub fn maybe_spawn(self: &Arc<Self>, req: ExtractionRequest) -> SpawnDecision {
-        // Snapshot state under lock so the gate evaluates a consistent
-        // view; `mark_extracted` below happens under the same lock
-        // acquire so two near-simultaneous calls don't both see
-        // `!initialized` and both admit.
-        let (decision, trigger) = {
-            let map = match self.session_states.lock() {
+        // Breadcrumbs for sync-path skip events. `selector_model` and
+        // `attempt` only make sense in the async worker after LLM
+        // resolve / persist attempt.
+        let skip_breadcrumbs = SessionMemoryExtractionBreadcrumbs {
+            messages_count: Some(req.messages.len() as u32),
+            selector_model: None,
+            attempt: None,
+        };
+
+        enum Admission {
+            Spawn {
+                trigger: ExtractionTrigger,
+            },
+            Skip {
+                trigger: ExtractionTrigger,
+                reason: SessionMemoryExtractionSkipReason,
+                label: &'static str,
+            },
+        }
+
+        // Keep gate evaluation, external admission checks, and debounce
+        // advancement in one critical section. Otherwise two callers can
+        // both evaluate a stale pre-extraction state and the second can
+        // spawn after the first worker has already completed.
+        let admission = {
+            let mut map = match self.session_states.lock() {
                 Ok(m) => m,
                 Err(p) => p.into_inner(),
             };
@@ -284,113 +323,92 @@ impl MemoryExtractionService {
                 req.had_error,
                 &req.config,
             );
-            (dec, trig)
-        };
-        // Breadcrumbs for sync-path skip events. `selector_model` and
-        // `attempt` only make sense in the async worker after LLM
-        // resolve / persist attempt.
-        let skip_breadcrumbs = SessionMemoryExtractionBreadcrumbs {
-            messages_count: Some(req.messages.len() as u32),
-            selector_model: None,
-            attempt: None,
-        };
-        if let GateDecision::Skip(reason) = decision {
-            let sid_opt = if req.session_id.is_empty() {
-                None
+
+            #[cfg(test)]
+            run_maybe_spawn_after_gate_hook(&req);
+
+            if let GateDecision::Skip(reason) = dec {
+                Admission::Skip {
+                    trigger: trig,
+                    reason,
+                    label: skip_reason_label(reason),
+                }
             } else {
-                Some(req.session_id.as_str())
-            };
-            self.emit_skip_event(sid_opt, req.turn_number, reason, &skip_breadcrumbs);
-            self.record_skipped(
-                sid_opt,
-                req.turn_number,
-                trigger,
-                skip_reason_label(reason),
-                None,
-            );
-            return SpawnDecision::Skipped;
-        }
-
-        // Memoria circuit breaker: fail fast when the endpoint has
-        // tripped. Without this, every turn where the gate passes
-        // would still pile on HTTP attempts (two per turn in the worst
-        // case: retrieve + store with retry) against the unreachable
-        // Memoria host. The breaker keeps the work local and makes
-        // recovery automatic once the cooldown elapses.
-        //
-        // Placement: AFTER the gate (so pure-decision skips like
-        // `no_growth` continue to work as debounce signals even when
-        // Memoria is down) but BEFORE the in-flight claim (so we don't
-        // occupy the slot with a doomed attempt).
-        match self.memoria_health.admit() {
-            MemoriaAdmit::Closed | MemoriaAdmit::HalfOpenProbe => {
-                // Proceed. The spawn worker records success/failure
-                // after the persist attempt.
+                // Memoria circuit breaker: fail fast when the endpoint has
+                // tripped. Without this, every turn where the gate passes
+                // would still pile on HTTP attempts (two per turn in the worst
+                // case: retrieve + store with retry) against the unreachable
+                // Memoria host. The breaker keeps the work local and makes
+                // recovery automatic once the cooldown elapses.
+                //
+                // Placement: AFTER the gate (so pure-decision skips like
+                // `no_growth` continue to work as debounce signals even when
+                // Memoria is down) but BEFORE the in-flight claim (so we don't
+                // occupy the slot with a doomed attempt).
+                let memoria_admit = self.memoria_health.admit();
+                match memoria_admit {
+                    MemoriaAdmit::Open => Admission::Skip {
+                        trigger: trig,
+                        reason: SessionMemoryExtractionSkipReason::MemoriaUnhealthy,
+                        label: "memoria_unhealthy",
+                    },
+                    MemoriaAdmit::Closed | MemoriaAdmit::HalfOpenProbe => {
+                        // Try to claim the in-flight slot synchronously — if this
+                        // session already has an extraction running, skip.
+                        let in_flight = Arc::clone(&self.in_flight);
+                        match in_flight.try_lock() {
+                            Ok(mut set) => {
+                                if set.insert(req.session_id.clone()) {
+                                    let entry = map.entry(req.session_id.clone()).or_default();
+                                    entry
+                                        .mark_extracted(req.current_tokens, req.current_tool_calls);
+                                    Admission::Spawn { trigger: trig }
+                                } else {
+                                    if matches!(memoria_admit, MemoriaAdmit::HalfOpenProbe) {
+                                        self.memoria_health.record_probe_cancelled();
+                                    }
+                                    Admission::Skip {
+                                        trigger: trig,
+                                        reason: SessionMemoryExtractionSkipReason::InFlight,
+                                        label: "in_flight",
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                // Someone else is holding the lock mid-check — treat as
+                                // in-flight rather than retrying or waiting.
+                                if matches!(memoria_admit, MemoriaAdmit::HalfOpenProbe) {
+                                    self.memoria_health.record_probe_cancelled();
+                                }
+                                Admission::Skip {
+                                    trigger: trig,
+                                    reason: SessionMemoryExtractionSkipReason::InFlight,
+                                    label: "in_flight",
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            MemoriaAdmit::Open => {
-                self.emit_skip_event(
-                    Some(&req.session_id),
-                    req.turn_number,
-                    SessionMemoryExtractionSkipReason::MemoriaUnhealthy,
-                    &skip_breadcrumbs,
-                );
-                self.record_skipped(
-                    Some(&req.session_id),
-                    req.turn_number,
-                    trigger,
-                    "memoria_unhealthy",
-                    None,
-                );
+        };
+
+        let trigger = match admission {
+            Admission::Spawn { trigger } => trigger,
+            Admission::Skip {
+                trigger,
+                reason,
+                label,
+            } => {
+                let sid_opt = if req.session_id.is_empty() {
+                    None
+                } else {
+                    Some(req.session_id.as_str())
+                };
+                self.emit_skip_event(sid_opt, req.turn_number, reason, &skip_breadcrumbs);
+                self.record_skipped(sid_opt, req.turn_number, trigger, label, None);
                 return SpawnDecision::Skipped;
             }
-        }
-
-        // Try to claim the in-flight slot synchronously — if this
-        // session already has an extraction running, skip.
-        let in_flight = Arc::clone(&self.in_flight);
-        if let Ok(mut set) = in_flight.try_lock() {
-            if !set.insert(req.session_id.clone()) {
-                self.emit_skip_event(
-                    Some(&req.session_id),
-                    req.turn_number,
-                    SessionMemoryExtractionSkipReason::InFlight,
-                    &skip_breadcrumbs,
-                );
-                self.record_skipped(
-                    Some(&req.session_id),
-                    req.turn_number,
-                    trigger,
-                    "in_flight",
-                    None,
-                );
-                return SpawnDecision::Skipped;
-            }
-        } else {
-            // Someone else is holding the lock mid-check — treat as
-            // in-flight rather than retrying or waiting.
-            self.emit_skip_event(
-                Some(&req.session_id),
-                req.turn_number,
-                SessionMemoryExtractionSkipReason::InFlight,
-                &skip_breadcrumbs,
-            );
-            self.record_skipped(
-                Some(&req.session_id),
-                req.turn_number,
-                trigger,
-                "in_flight",
-                None,
-            );
-            return SpawnDecision::Skipped;
-        }
-
-        // Admitted. Advance debounce so the next turn doesn't re-trigger
-        // on the same growth window even if this attempt falls back to
-        // rule-based content. Per-session state survives turn boundaries.
-        if let Ok(mut map) = self.session_states.lock() {
-            let entry = map.entry(req.session_id.clone()).or_default();
-            entry.mark_extracted(req.current_tokens, req.current_tool_calls);
-        }
+        };
 
         // Track in-flight workers so shutdown can drain them. The
         // counter is `fetch_add`'d synchronously BEFORE the spawn so a
@@ -855,6 +873,21 @@ mod tests {
     use astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig;
     use serde_json::json;
     use std::sync::Mutex;
+
+    struct MaybeSpawnAfterGateHookGuard;
+
+    impl Drop for MaybeSpawnAfterGateHookGuard {
+        fn drop(&mut self) {
+            *MAYBE_SPAWN_AFTER_GATE_HOOK.lock().unwrap() = None;
+        }
+    }
+
+    fn install_maybe_spawn_after_gate_hook(
+        hook: MaybeSpawnAfterGateHook,
+    ) -> MaybeSpawnAfterGateHookGuard {
+        *MAYBE_SPAWN_AFTER_GATE_HOOK.lock().unwrap() = Some(hook);
+        MaybeSpawnAfterGateHookGuard
+    }
 
     /// Minimal capturing mock — records every `store` for assertion.
     #[derive(Default)]
@@ -1515,6 +1548,116 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_same_session_cannot_use_stale_gate_after_first_worker_finishes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingMemoria {
+            stored: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl MemoriaClient for CountingMemoria {
+            async fn retrieve_ext(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: usize,
+                _: bool,
+            ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String>
+            {
+                Ok(Vec::new())
+            }
+
+            async fn store(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> Result<String, String> {
+                self.stored.fetch_add(1, Ordering::AcqRel);
+                Ok("ok".into())
+            }
+
+            async fn purge_working(&self, _: &str) -> Result<u64, String> {
+                Ok(0)
+            }
+        }
+
+        let stored = Arc::new(AtomicUsize::new(0));
+        let memoria = Arc::new(CountingMemoria {
+            stored: Arc::clone(&stored),
+        });
+        let (svc, _rx, _broker) =
+            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
+        let sid = format!("stale-gate-{}", nanos());
+        let entered = Arc::new(AtomicUsize::new(0));
+
+        let hook_sid = sid.clone();
+        let hook_entered = Arc::clone(&entered);
+        let hook_stored = Arc::clone(&stored);
+        let _hook_guard = install_maybe_spawn_after_gate_hook(Arc::new(move |req| {
+            if req.session_id != hook_sid {
+                return;
+            }
+            match req.turn_number {
+                1 => {
+                    hook_entered.fetch_add(1, Ordering::AcqRel);
+                    let deadline = Instant::now() + Duration::from_millis(100);
+                    while hook_entered.load(Ordering::Acquire) < 2 && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                }
+                2 => {
+                    hook_entered.fetch_add(1, Ordering::AcqRel);
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    while hook_stored.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                _ => {}
+            }
+        }));
+
+        let mut req1 = sample_req(&sid, 50_000, false);
+        req1.turn_number = 1;
+        let mut req2 = sample_req(&sid, 50_000, false);
+        req2.turn_number = 2;
+
+        let svc1 = Arc::clone(&svc);
+        let first = tokio::spawn(async move { svc1.maybe_spawn(req1) });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while entered.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            entered.load(Ordering::Acquire),
+            1,
+            "first call must reach the test-controlled gate window"
+        );
+
+        let svc2 = Arc::clone(&svc);
+        let second = tokio::spawn(async move { svc2.maybe_spawn(req2) });
+
+        let d1 = first.await.unwrap();
+        let d2 = second.await.unwrap();
+
+        assert_eq!(d1, SpawnDecision::Spawned);
+        assert_eq!(
+            d2,
+            SpawnDecision::Skipped,
+            "second call must re-check updated debounce state instead of using a stale Run decision"
+        );
+
+        svc.wait_for_pending(Duration::from_secs(2)).await;
+        assert_eq!(
+            stored.load(Ordering::Acquire),
+            1,
+            "only the first extraction should store for the unchanged counters"
+        );
+    }
+
     /// Empty messages: service still persists the rule-based skeleton
     /// so the session has *something* at the L1 prefix — `find`
     /// queries downstream shouldn't crash on empty content.
@@ -1954,6 +2097,45 @@ mod tests {
 
         // Drain events so the channel isn't reported as leaking.
         while rx.try_recv().is_ok() {}
+    }
+
+    #[tokio::test]
+    async fn half_open_probe_not_consumed_when_spawn_is_skipped_in_flight() {
+        let (svc, _rx, _broker) = build_breaker_ctx();
+
+        for i in 0..2 {
+            let sid = format!("trip-{i}-{}", nanos());
+            assert_eq!(
+                svc.maybe_spawn(sample_req(&sid, 20_000, false)),
+                SpawnDecision::Spawned
+            );
+            svc.wait_for_pending(Duration::from_secs(2)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let skipped_sid = format!("busy-probe-{}", nanos());
+        {
+            let mut set = svc.in_flight.lock().await;
+            set.insert(skipped_sid.clone());
+        }
+        assert_eq!(
+            svc.maybe_spawn(sample_req(&skipped_sid, 20_000, false)),
+            SpawnDecision::Skipped,
+            "in-flight skip must not consume the half-open Memoria probe"
+        );
+        {
+            let mut set = svc.in_flight.lock().await;
+            set.remove(&skipped_sid);
+        }
+
+        let next_sid = format!("next-probe-{}", nanos());
+        assert_eq!(
+            svc.maybe_spawn(sample_req(&next_sid, 20_000, false)),
+            SpawnDecision::Spawned,
+            "the next eligible request must still be allowed to probe"
+        );
+        svc.wait_for_pending(Duration::from_secs(2)).await;
     }
 
     // ── Breadcrumb fields in emitted events ─────────────────────────

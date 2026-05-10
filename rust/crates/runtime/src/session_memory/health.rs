@@ -141,8 +141,9 @@ impl MemoriaHealth {
     }
 
     /// Ask whether a caller may proceed to the Memoria endpoint right
-    /// now. Must be paired with a subsequent `record_success` or
-    /// `record_failure` call.
+    /// now. A [`MemoriaAdmit::HalfOpenProbe`] must be paired with a
+    /// subsequent `record_success`, `record_failure`, or
+    /// `record_probe_cancelled` call.
     pub fn admit(&self) -> MemoriaAdmit {
         let Ok(mut inner) = self.inner.lock() else {
             return MemoriaAdmit::Closed; // fail-open on poison
@@ -183,6 +184,16 @@ impl MemoriaHealth {
             if inner.consecutive_failures >= self.failure_threshold {
                 inner.tripped_at = Some(Instant::now());
             }
+        }
+    }
+
+    /// Notify the breaker that a half-open probe was admitted but no
+    /// endpoint call was made after all. The breaker remains tripped, but
+    /// the probe slot is released so a later caller can perform the real
+    /// recovery probe.
+    pub fn record_probe_cancelled(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.probe_in_flight = false;
         }
     }
 
@@ -313,5 +324,18 @@ mod tests {
         // Probe fails → re-trip with fresh cooldown.
         h.record_failure();
         assert_eq!(h.admit(), MemoriaAdmit::Open);
+    }
+
+    #[test]
+    fn memoria_cancelled_half_open_probe_releases_probe_slot() {
+        let h = MemoriaHealth::with_config(1, Duration::from_millis(50));
+        h.record_failure();
+        std::thread::sleep(Duration::from_millis(70));
+
+        assert_eq!(h.admit(), MemoriaAdmit::HalfOpenProbe);
+        assert_eq!(h.admit(), MemoriaAdmit::Open);
+
+        h.record_probe_cancelled();
+        assert_eq!(h.admit(), MemoriaAdmit::HalfOpenProbe);
     }
 }
