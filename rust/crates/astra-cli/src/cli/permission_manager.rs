@@ -1225,21 +1225,52 @@ impl PermissionManager {
         match choice {
             'y' => ApprovalDecision::Allow,
             'a' => {
-                let synthetic_args = detail.map(|d| serde_json::json!({"command": d}));
-                let kind = cloud_gated_tool_kind_with_args(tool, synthetic_args.as_ref());
-                let fp = match (kind, detail) {
-                    (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
+                // Cloud "Always" has two halves:
+                //   1. In-session override, keyed on the approval
+                //      fingerprint — the same process won't re-prompt.
+                //   2. Persistent allow rule, written to
+                //      `.kiro/permissions.json` — survives restart.
+                // Before this branch was fixed, only (1) fired for the
+                // cloud path while the local path did both. Symptom:
+                // next `astra` invocation re-prompts the same tool.
+                //
+                // The synthetic args here only exist to reach
+                // `cloud_gated_tool_kind_with_args` — `detail` means
+                // different things per kind: a shell command for
+                // Execute, a path for Write. Build the allow-rule arg
+                // shape to match so `make_allow_rule` produces the
+                // right pattern (`Bash(cargo:*)` vs `write_file`).
+                let kind = cloud_gated_tool_kind(tool);
+                let (fp, rule_args) = match (kind, detail) {
+                    (Some(CloudGatedToolKind::Execute), Some(cmd)) => (
                         astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(
                             tool, cmd, false,
-                        )
-                    }
-                    (Some(CloudGatedToolKind::Write), d) => {
-                        astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
-                    }
-                    _ => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool),
+                        ),
+                        serde_json::json!({ "command": cmd }),
+                    ),
+                    (Some(CloudGatedToolKind::Write), d) => (
+                        astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(
+                            tool, d,
+                        ),
+                        match d {
+                            Some(p) => serde_json::json!({ "path": p }),
+                            None => serde_json::Value::Null,
+                        },
+                    ),
+                    _ => (
+                        astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool),
+                        serde_json::Value::Null,
+                    ),
                 };
                 self.session_overrides.insert(fp, true);
-                eprintln!("{}", format!("  ✓ {tool}: allowed for this session").dim());
+                let rule = Self::make_allow_rule(tool, &rule_args);
+                self.add_allow_rule(&rule);
+                let scope = if self.project_root.is_some() {
+                    "project"
+                } else {
+                    "session"
+                };
+                eprintln!("{}", format!("  ✓ {rule}: always allowed ({scope})").dim());
                 ApprovalDecision::AllowSession
             }
             '!' => {
@@ -4289,6 +4320,90 @@ mod tests {
         assert!(
             matches!(rf_decision, PermissionDecision::Allow),
             "read_file must still Allow, got {rf_decision:?}"
+        );
+    }
+
+    // ── Cloud "Always" persistence regression ───────────────────────
+    //
+    // Symptom: TUI user clicks "Always" on a cloud approval, next
+    // session the same prompt appears again. Root cause was
+    // `apply_cloud_approval_choice` only writing to the in-memory
+    // `session_overrides` cache without calling `add_allow_rule`. The
+    // local path did both; the cloud path forgot the disk write. These
+    // tests lock the invariant down at the `apply_cloud_approval_choice`
+    // level so any future refactor stays honest.
+
+    #[test]
+    fn cloud_always_persists_allow_rule_to_project_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let before = pm.settings.allow.clone();
+
+        let decision = pm.apply_cloud_approval_choice("bash", Some("cargo test --lib"), 'a');
+
+        // In-memory decision path
+        assert_eq!(
+            decision,
+            astra_thin_client::ApprovalDecision::AllowSession,
+            "'a' must return AllowSession so the current call proceeds"
+        );
+
+        // Rule was added to settings
+        assert!(
+            pm.settings.allow.len() > before.len(),
+            "Always must add an allow rule; before={before:?}, after={:?}",
+            pm.settings.allow
+        );
+        let new_rule = pm.settings.allow.last().cloned().unwrap_or_default();
+        assert!(
+            new_rule.starts_with("Bash(") || new_rule.starts_with("bash(") || new_rule == "bash",
+            "rule must be a bash pattern, got: {new_rule}"
+        );
+
+        // And persisted to disk — `PermissionSettings::save` writes to
+        // `<project>/.kiro/permissions.json` (see impl).
+        let settings_path = dir.path().join(".kiro").join("permissions.json");
+        assert!(
+            settings_path.exists(),
+            "permissions.json must be written to disk at {}",
+            settings_path.display()
+        );
+        let on_disk = std::fs::read_to_string(&settings_path).unwrap();
+        assert!(
+            on_disk.contains(&new_rule),
+            "saved rule must appear in {}: got {on_disk}",
+            settings_path.display()
+        );
+    }
+
+    #[test]
+    fn cloud_always_survives_fresh_manager_loaded_from_disk() {
+        // Process restart simulation: spin up a fresh manager pointing
+        // at the same project dir; the persisted allow rule must load
+        // and apply on the next `check_nonblocking`.
+        //
+        // We use `write_file` rather than `bash` because bash is an
+        // unbounded+irreversible tool governed by
+        // `explicit_approval_reason` — by protocol-level design those
+        // always re-prompt regardless of the allow list (safety
+        // invariant: unbounded actions can't be blanket pre-approved).
+        // That design is orthogonal to the "Always didn't persist to
+        // disk" bug this test regression-guards.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+            pm.apply_cloud_approval_choice("write_file", Some("src/main.rs"), 'a');
+        }
+        // Fresh manager — simulates a CLI restart. Session_overrides
+        // are gone; only the disk-persisted allow rule remains.
+        let mut reborn = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let decision = reborn.check_nonblocking(
+            "write_file",
+            &serde_json::json!({"path": "src/main.rs", "content": "hi"}),
+        );
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "after restart, saved rule must still Allow; got {decision:?}"
         );
     }
 }
