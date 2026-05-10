@@ -91,20 +91,6 @@ pub(crate) fn build_external_sources(
         if hint.is_empty() { None } else { Some(hint) }
     };
 
-    // 5. Learned context — routed to volatile lane because the quality
-    //    tracker's EMA updates every turn, producing byte-level drift that
-    //    would break the Session-scope cached prefix if placed in stable.
-    let learned_context_section = edge_profile
-        .get("learned_context_hint")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            crate::prompts::PromptSection::dynamic(
-                format!("\n\n## Learned Runtime Context\n{s}"),
-                crate::prompts::PromptTokenBucket::Environment,
-            )
-        });
-
     // 6. System override (delegation)
     let system_override = edge_profile
         .get("system_prompt_override")
@@ -224,19 +210,16 @@ pub(crate) fn build_external_sources(
         spill_backend,
 
         effort_hint,
-        // learned_context intentionally flows through extra_dynamic_sections
-        // (volatile lane) rather than ExternalSources.
         system_override,
         plan_context,
         tool_guidance,
         // Adapter path (ServerAgenticLoopHost) puts environment_static
         // here so it lands in the cached Session prefix.
         extra_stable_sections,
-        // Volatile lane: environment_volatile (git state), learned
-        // context, skill listing. None-scope so churn doesn't invalidate
-        // the cached prefix.
+        // Volatile lane: environment_volatile (git state), skill
+        // listing. None-scope so churn doesn't invalidate the cached
+        // prefix.
         extra_dynamic_sections: {
-            extra_dynamic_sections.extend(learned_context_section);
             extra_dynamic_sections.extend(skill_listing_extra);
             extra_dynamic_sections
         },

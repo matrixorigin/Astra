@@ -430,30 +430,6 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     // BEFORE the Session→None marker — now it participates in the cached
     // session prefix instead of being re-sent after the marker every turn.
     // See `context_pipeline_adapter::build_session_context` + `bind_project_context`.
-
-    if let Some(ref evo) = state.evolution_service {
-        let turn_id = state.current_run_id.as_deref().unwrap_or("unknown");
-        let prior_assistant = state
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-            .and_then(|m| m.get("content").and_then(|c| c.as_str()))
-            .map(String::from);
-        let active_skill: Option<String> = state
-            .skills
-            .invoked
-            .iter()
-            .max_by_key(|(_, v)| v.invoked_at_turn)
-            .map(|(name, _)| name.clone());
-        evo.on_user_message(
-            &state.message,
-            prior_assistant.as_deref(),
-            active_skill.as_deref(),
-            turn_id,
-        )
-        .await;
-    }
 }
 
 pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(

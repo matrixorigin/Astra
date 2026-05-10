@@ -34,7 +34,6 @@ use sqlx::Row;
 
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
-use crate::evolution::service::EvolutionService;
 use crate::observability_integration::ObservabilityHub;
 use crate::turn::agentic_loop_host::{
     AgenticLoopOutcome, AgenticLoopState, CancellationState, ContextTracePersistenceContext,
@@ -48,9 +47,8 @@ use crate::{
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_turn_core::contracts::{
     TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnDecisionAuditRecord,
-    TurnHookDbPersistPlan, TurnHookDbWriter, TurnLearningOutcome, TurnLearningWriter,
-    TurnObserverRequest, TurnObserverWorker, TurnSkillSelectionRecord, TurnToolEventPersistPlan,
-    TurnToolEventRecord, TurnToolEventWriter,
+    TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
+    TurnSkillSelectionRecord, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
 };
 
 use astra_core::{
@@ -60,7 +58,6 @@ use astra_core::{
 
 use super::run_engine::RunEngine;
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
-use super::state_builder::PipelineLearningStack;
 
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 const LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE: &str = "runtime_llm_trusted_domains";
@@ -527,56 +524,20 @@ fn build_runtime_evaluation_service(
     }
 }
 
-fn seed_restricted_tools_from_blocked_patterns(
-    loop_state: &mut AgenticLoopState,
-    pattern_library: &astra_pipeline::pattern::PatternLibrary,
-) {
-    for name in pattern_library.blocked_tool_names() {
-        if !astra_turn_core::tool_registry_meta::is_pinned_tool(&name) {
-            loop_state.restricted_tools.insert(name);
-        }
-    }
-}
-
 async fn initialize_runtime_controllers(
     loop_state: &mut AgenticLoopState,
     user_id: &str,
     session_id: &str,
     evaluation_persistence: Option<EvaluationPersistenceContext>,
     context_trace_persistence: Option<ContextTracePersistenceContext>,
-) -> super::state_builder::PipelineLearningStack {
-    let learning_stack = super::state_builder::build_pipeline_learning_stack(Some("default"));
+) {
     let hub = Arc::new(ObservabilityHub::new());
-    hub.attach_pattern_library(learning_stack.pattern_library.clone());
     let session = hub.start_session(user_id, session_id);
-
-    // Seed restricted_tools from evolution-blocked patterns so the LLM never
-    // sees schemas for tools that cross-session learning has identified as
-    // persistently failing (deny-at-assembly).
-    if let Ok(lib) = learning_stack.pattern_library.lock() {
-        seed_restricted_tools_from_blocked_patterns(loop_state, &lib);
-    }
-
-    let evolution_service = Arc::new(
-        EvolutionService::new()
-            .with_pattern_library(learning_stack.pattern_library.clone())
-            .with_calibrator(learning_stack.calibrator.clone()),
-    );
-    if let Some(active_canary) = learning_stack.active_canary.clone()
-        && let Err(err) = evolution_service.restore_active_canary(active_canary).await
-    {
-        astra_core::agent_warn!(
-            "evolution",
-            "Failed to restore persisted active canary: {err}"
-        );
-    }
 
     loop_state.telemetry.observability_hub = Some(hub);
     loop_state.telemetry.observability_session = Some(session);
     loop_state.telemetry.evaluation_persistence = evaluation_persistence;
     loop_state.telemetry.context_trace_persistence = context_trace_persistence;
-    loop_state.evolution_service = Some(evolution_service);
-    learning_stack
 }
 
 async fn configure_runtime_controllers(
@@ -585,7 +546,7 @@ async fn configure_runtime_controllers(
     loop_state: &mut AgenticLoopState,
     user_id: &str,
     session_id: &str,
-) -> super::state_builder::PipelineLearningStack {
+) {
     let evaluation_persistence = shared_pool.map(|pool| EvaluationPersistenceContext {
         user_id: user_id.to_string(),
         evaluation_service: build_runtime_evaluation_service(matrixone, Some(pool)),
@@ -710,12 +671,8 @@ impl PostLoopPersistContext {
     ///
     /// The `loop_success` flag comes from `outcome.is_ok()` (before consuming
     /// the outcome in `finalize_run_events`).
-    async fn run(
-        &self,
-        state: &AgenticLoopState,
-        learning_stack: &PipelineLearningStack,
-        loop_success: bool,
-    ) {
+    async fn run(&self, state: &AgenticLoopState, loop_success: bool) {
+        let _ = loop_success;
         // 0. Persist CSL via CslManager.
         if let Some(ref mgr) = self.csl_manager {
             let mut mgr = mgr.lock().await;
@@ -776,15 +733,6 @@ impl PostLoopPersistContext {
                 .await;
         }
 
-        // 5. Record pipeline learning outcome (PatternLibrary / EntityGraph).
-        record_server_loop_learning_outcome(
-            learning_stack.writer.as_ref(),
-            &self.user_message,
-            state,
-            loop_success,
-        )
-        .await;
-
         // 6. Fire SessionEnd hooks.
         crate::skills::hooks::fire_session_end(
             &state.skills.session_event_hooks,
@@ -802,13 +750,6 @@ impl PostLoopPersistContext {
             &state.telemetry.promotion_events,
         )
         .await;
-
-        // 8. Save cross-session learning state.
-        let active_canary = match state.evolution_service.as_ref() {
-            Some(evolution_service) => evolution_service.export_active_canary().await,
-            None => None,
-        };
-        learning_stack.save_with_active_canary(active_canary);
     }
 }
 
@@ -1147,55 +1088,10 @@ fn truncate_for_audit(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// Record a pipeline learning outcome from the server-driven loop so the
-/// PatternLibrary / EntityGraph / ProgressiveCalibrator can learn across
-/// sessions.  This mirrors what the bridge path does via
-/// `PipelineLearningWriter.record_outcome()` in `side_effects.rs`.
-///
-/// Correction detection: the server agentic loop previously hardcoded
-/// `was_corrected=false`, which left the ProgressiveCalibrator's three-axis
-/// formula `threshold = 0.70 - 0×0.15 - 0×0.10 - 0×0.10 = 0.70` frozen. This
-/// function now runs implicit-feedback detection on the user's turn against
-/// the most recent assistant message pulled from `state.messages`, matching
-/// the CLI/bridge behavior (`repl_turn.rs::record_selector_turn_outcome`,
-/// `bridge_inprocess.rs::build_turn_hook_args`).
-async fn record_server_loop_learning_outcome(
-    writer: &dyn TurnLearningWriter,
-    user_message: &str,
-    state: &AgenticLoopState,
-    success: bool,
-) {
-    let tools_used: Vec<String> = state.telemetry.all_tools_used.iter().cloned().collect();
-    let prev_assistant_text = extract_prev_assistant_text(&state.messages);
-    let signal = astra_turn_types::detect_implicit_feedback_signal(
-        user_message,
-        prev_assistant_text.as_deref(),
-    );
-    let was_corrected = matches!(signal.signal_type.as_str(), "correction" | "frustration");
-    let outcome = TurnLearningOutcome {
-        query: user_message.to_string(),
-        tools_selected: tools_used.clone(),
-        tools_used,
-        success,
-        quality: if success { 0.7 } else { 0.2 },
-        was_corrected,
-        task_type_label: None,
-        domain_hint_label: None,
-        user_feedback_score: None,
-        reward_hacking_risk: 0.0,
-        reward_hacking_flags: Vec::new(),
-        causal_support_score: if success { 0.8 } else { 0.3 },
-        causal_support_flags: Vec::new(),
-    };
-    if let Err(e) = writer.record_outcome(outcome).await {
-        astra_core::agent_error!("server-loop", "failed to record learning outcome: {e}");
-    }
-}
-
 /// Walk `messages` (chronological) and return the content of the latest
-/// assistant entry, if any. Used by implicit-feedback detection so the
-/// "user said `that's wrong` after the assistant answered `X`" pattern can
-/// score higher confidence.
+/// assistant entry, if any. Kept for tests that exercise implicit-feedback
+/// detection against assistant history.
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_prev_assistant_text(messages: &[serde_json::Value]) -> Option<String> {
     for msg in messages.iter().rev() {
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
@@ -2238,7 +2134,6 @@ impl AgenticRunLifecycleService {
             delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
-            evolution_service: None,
             rate_limit_cooldown: Default::default(),
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -2259,7 +2154,6 @@ impl AgenticRunLifecycleService {
             tactical_adapter: None,
             step_signal_collector: None,
             tool_budget_override: None,
-            pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
@@ -2711,7 +2605,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &pause_flag,
             &llm_cancel_token,
         );
-        let learning_stack = configure_runtime_controllers(
+        configure_runtime_controllers(
             &self.matrixone,
             self.shared_pool.as_ref(),
             &mut loop_state,
@@ -2965,10 +2859,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
 
             // Best-effort post-loop persistence (core events, tool events,
-            // hook DB, observer, learning, session-end hooks, promotion events).
-            persist_ctx
-                .run(&loop_state, &learning_stack, loop_success)
-                .await;
+            // hook DB, observer, session-end hooks, promotion events).
+            persist_ctx.run(&loop_state, loop_success).await;
 
             // Session-end governance: extract learnings, store to Memoria, purge working memory.
             // This is create_run-specific (background runs are long-lived sessions).
@@ -3197,7 +3089,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &pause_flag,
             &llm_cancel_token,
         );
-        let learning_stack = configure_runtime_controllers(
+        configure_runtime_controllers(
             &self.matrixone,
             self.shared_pool.as_ref(),
             &mut state,
@@ -3270,8 +3162,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let loop_success = loop_result.is_ok();
 
             // Best-effort post-loop persistence (core events, tool events,
-            // hook DB, observer, learning, session-end hooks, promotion events).
-            persist_ctx.run(&state, &learning_stack, loop_success).await;
+            // hook DB, observer, session-end hooks, promotion events).
+            persist_ctx.run(&state, loop_success).await;
 
             let (mut final_events, final_status, error_msg) =
                 Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
@@ -4039,7 +3931,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: config.checkpoint_gate.clone(),
-            evolution_service: None,
             rate_limit_cooldown: Default::default(),
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -4060,7 +3951,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             tactical_adapter: None,
             step_signal_collector: None,
             tool_budget_override: None,
-            pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
@@ -4127,7 +4017,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             loop_state.server_tool_executor = Some(std::sync::Arc::new(executor));
         }
 
-        let learning_stack = configure_runtime_controllers(
+        configure_runtime_controllers(
             &self.matrixone,
             self.shared_pool.as_ref(),
             &mut loop_state,
@@ -4168,13 +4058,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             config.agent_profile.model_override.as_deref(),
         )
         .await;
-
-        // Persist cross-session learning state.
-        let active_canary = match loop_state.evolution_service.as_ref() {
-            Some(evolution_service) => evolution_service.export_active_canary().await,
-            None => None,
-        };
-        learning_stack.save_with_active_canary(active_canary);
 
         match outcome {
             Ok(AgenticLoopOutcome::Completed) => {
@@ -4877,33 +4760,6 @@ mod tests {
         assert_eq!(metadata["tool_call_count"], 1);
         assert!(metadata["quality"].as_f64().unwrap() < 0.8);
         assert_eq!(metadata["signals"][0]["kind"], "tool_error_rate");
-    }
-
-    #[test]
-    fn seed_restricted_tools_from_blocked_patterns_adds_blocked_tools() {
-        let svc = test_service();
-        let request = test_request("inspect blocked tools");
-        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
-        let mut pattern_library = astra_pipeline::pattern::PatternLibrary::new();
-
-        // One success so the pattern exists, then Block adds 5 failures.
-        // Total: success=1, failure=5, rate=5/6=0.833 > 0.8 → blocked.
-        pattern_library.record_outcome(
-            &["some_custom_tool".to_string()],
-            crate::pipeline::routing::TaskType::Code,
-            None,
-            true,
-            0.8,
-            None,
-        );
-        pattern_library.apply_evolution_action(
-            "some_custom_tool",
-            astra_evolution::types::PatternAction::Block,
-        );
-
-        seed_restricted_tools_from_blocked_patterns(&mut state, &pattern_library);
-
-        assert!(state.restricted_tools.contains("some_custom_tool"));
     }
 
     #[test]

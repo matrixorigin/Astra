@@ -26,8 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop_host::{
-    AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult, HostTurnResult,
-    TurnInteractionMode, TurnInteractionPolicy, interaction_scoped_tool_restrictions,
+    AgenticLoopHost, AgenticLoopState, HostTurnResult, TurnInteractionMode, TurnInteractionPolicy,
+    interaction_scoped_tool_restrictions,
 };
 use crate::turn::agentic_loop_tool_support::edge_tool_status_exit_code;
 use crate::turn::bridge_llm_stream::rate_limit_cooldown;
@@ -2848,222 +2848,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         })
     }
 
-    fn supports_auto_reflection(&self) -> bool {
-        true
-    }
-
-    async fn execute_reflection(
-        &mut self,
-        state: &mut AgenticLoopState,
-        request: HostReflectionRequest<'_>,
-    ) -> Result<Option<HostReflectionResult>, astra_core::ClassifiedError> {
-        let effective_model_override = state
-            .skills
-            .model_override
-            .as_deref()
-            .or(self.model_override.as_deref());
-        let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
-        let mut llm_cfg = match resolve_llm_model_for_turn(
-            &self.matrixone,
-            self.encryptor.as_ref(),
-            effective_model_override,
-            pool_ref,
-            self.llm_token_service.as_ref(),
-            &state.hooks.forward_headers,
-        )
-        .await
-        {
-            Ok(m) => m,
-            Err(e) => return Err(format!("Model resolution failed: {e}").into()),
-        };
-        let has_fallback = !llm_cfg.fallback_chain.is_empty();
-
-        match rate_limit_cooldown().with(&llm_cfg.model_name, |c| c.check_request(has_fallback)) {
-            RateLimitAction::Proceed => {}
-            RateLimitAction::WaitAndRetry { delay_ms } => {
-                sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
-            }
-            RateLimitAction::UseFallback { reason } => {
-                let cooldown = rate_limit_cooldown();
-                let mut resolved = false;
-                for fb_name in &llm_cfg.fallback_chain {
-                    let fb_ok = cooldown.with(fb_name, |c| c.check_request(false));
-                    if !matches!(
-                        fb_ok,
-                        RateLimitAction::Proceed | RateLimitAction::WaitAndRetry { .. }
-                    ) {
-                        continue;
-                    }
-                    if let Ok(fb) = resolve_llm_model_for_turn(
-                        &self.matrixone,
-                        self.encryptor.as_ref(),
-                        Some(fb_name.as_str()),
-                        pool_ref,
-                        self.llm_token_service.as_ref(),
-                        &state.hooks.forward_headers,
-                    )
-                    .await
-                    {
-                        llm_cfg = fb;
-                        resolved = true;
-                        break;
-                    }
-                }
-                if !resolved && !llm_cfg.fallback_chain.is_empty() {
-                    astra_core::agent_warn!(
-                        "llm",
-                        "reflection fallback: all {} models exhausted ({})",
-                        llm_cfg.fallback_chain.len(),
-                        reason.as_str()
-                    );
-                }
-            }
-            RateLimitAction::Reject {
-                reason,
-                reset_in_ms,
-            } => {
-                return Err(astra_core::ClassifiedError::new(
-                    astra_core::ErrorKind::RateLimit,
-                    format!(
-                        "Rate limit cooldown active ({}). Resets in {}s.",
-                        reason.as_str(),
-                        reset_in_ms / 1000
-                    ),
-                ));
-            }
-        }
-
-        let reflection_messages = vec![
-            json!({"role": "system", "content": request.system_prompt}),
-            json!({"role": "user", "content": request.user_prompt}),
-        ];
-        let result = match call_llm_and_collect_with_request_overrides(
-            &reflection_messages,
-            &[],
-            &llm_cfg.model_name,
-            llm_cfg.wire_model_name.as_deref(),
-            &llm_cfg.api_key,
-            &llm_cfg.base_url,
-            &llm_cfg.provider,
-            request.max_output_tokens,
-            has_fallback,
-            llm_cancel_for_state(state),
-            (!llm_cfg.header_overrides.is_empty()).then_some(&llm_cfg.header_overrides),
-            llm_cfg.completions_url_override.as_deref(),
-            llm_cfg.request_timeout,
-            &ThinkingConfig::Off,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                if !self.session_id.is_empty() {
-                    let mut artifact_store =
-                        astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone());
-                    if let Some(pool) = self.shared_pool.clone() {
-                        artifact_store = artifact_store.with_pool(pool);
-                    }
-                    let dump = astra_turn_core::llm_request_dump::build_llm_request_dump(
-                        &self.session_id,
-                        None,
-                        &llm_cfg.model_name,
-                        &llm_cfg.provider,
-                        &error.message,
-                        &reflection_messages,
-                        &[],
-                        i64::from(state.llm_rounds_completed),
-                        request.max_output_tokens,
-                    );
-                    if let Err(error) = dump.persist_remote(&self.user_id, &artifact_store).await {
-                        astra_core::agent_error!(
-                            "llm-dump",
-                            "server_loop_reflection error dump persist failed: {error}"
-                        );
-                    }
-                    crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
-                        "server_loop_reflection error capture",
-                        self.full_llm_capture,
-                        Some(&artifact_store),
-                        &self.session_id,
-                        &self.user_id,
-                        state.session_turn,
-                        state.llm_rounds_completed,
-                        None,
-                        "server_loop_reflection",
-                        &llm_cfg.model_name,
-                        &llm_cfg.provider,
-                        &reflection_messages,
-                        &[],
-                        request.max_output_tokens,
-                        "error",
-                        llm_capture_error_response(&error),
-                        Some(crate::turn::llm_exchange_capture::CaptureTrace {
-                            session_turn_source: Some("state"),
-                            turn_chain_id: None,
-                            user_query_event_id: None,
-                        }),
-                    )
-                    .await;
-                }
-                return Err(error);
-            }
-        };
-        if !self.session_id.is_empty() {
-            let mut artifact_store =
-                astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone());
-            if let Some(pool) = self.shared_pool.clone() {
-                artifact_store = artifact_store.with_pool(pool);
-            }
-            crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
-                "server_loop_reflection success capture",
-                self.full_llm_capture,
-                Some(&artifact_store),
-                &self.session_id,
-                &self.user_id,
-                state.session_turn,
-                state.llm_rounds_completed,
-                None,
-                "server_loop_reflection",
-                &llm_cfg.model_name,
-                &llm_cfg.provider,
-                &reflection_messages,
-                &[],
-                request.max_output_tokens,
-                "success",
-                json!({
-                    "finish_reason": result.finish_reason.clone(),
-                    "full_text": result.full_text.clone(),
-                    "reasoning": result.reasoning.clone(),
-                    "tool_calls": result.tool_calls.clone(),
-                    "usage": result.usage.clone(),
-                }),
-                Some(crate::turn::llm_exchange_capture::CaptureTrace {
-                    session_turn_source: Some("state"),
-                    turn_chain_id: None,
-                    user_query_event_id: None,
-                }),
-            )
-            .await;
-        }
-        let accum = Self::result_to_accum(&result);
-
-        if accum.has_tool_calls {
-            return Err(astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::InvalidRequest,
-                "auto-reflection unexpectedly returned tool calls",
-            ));
-        }
-
-        Ok(Some(HostReflectionResult {
-            full_text: accum.full_text.trim().to_string(),
-            prompt_tokens: accum.prompt_tokens,
-            completion_tokens: accum.completion_tokens,
-            cache_read_tokens: accum.cache_read_tokens,
-            cache_creation_tokens: accum.cache_creation_tokens,
-            has_usage: accum.has_usage,
-        }))
-    }
-
     fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
         self.emit_event(json!({
             "type": "headless_line",
@@ -3541,7 +3325,6 @@ mod tests {
         for context in [
             "server_loop_host context window dump persist failed",
             "server_loop_host error dump persist failed",
-            "server_loop_reflection error dump persist failed",
         ] {
             let start = production
                 .find(context)
@@ -3617,7 +3400,6 @@ mod tests {
         for context in [
             "server_loop_host context window capture",
             "server_loop_host error capture",
-            "server_loop_reflection error capture",
         ] {
             let start = production
                 .find(context)
@@ -4648,7 +4430,6 @@ mod tests {
             delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
-            evolution_service: None,
             rate_limit_cooldown: Default::default(),
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -4669,7 +4450,6 @@ mod tests {
             tactical_adapter: None,
             step_signal_collector: None,
             tool_budget_override: None,
-            pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,

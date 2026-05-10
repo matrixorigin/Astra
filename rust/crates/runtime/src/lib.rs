@@ -72,7 +72,6 @@ pub mod auto_invoke_handler;
 pub mod bash_intent;
 pub mod bridge;
 pub mod evaluation;
-pub mod evolution;
 pub mod guardrail_tuning;
 pub mod introspection;
 pub mod lesson_checkpoint;
@@ -86,10 +85,6 @@ pub mod pipeline;
 pub use astra_plan as plan;
 pub use astra_plan as plan_decompose;
 pub use astra_sandbox as tool_sandbox;
-pub use astra_sync_adapters as sync_adapters;
-pub mod liquid {
-    pub use astra_evolution::reflection;
-}
 pub mod prompts;
 pub mod self_model;
 pub mod server;
@@ -259,11 +254,11 @@ pub(crate) use astra_turn_core::contracts::TurnReflectionLessonRequest;
 pub use astra_turn_core::contracts::{
     TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnCoreEventRecord, TurnCoreEventWriter,
     TurnCorePersistOutcome, TurnCorePersistPlan, TurnDecisionAuditRecord, TurnHookDbPersistPlan,
-    TurnHookDbWriter, TurnImplicitFeedbackRecord, TurnLearningOutcome, TurnLearningWriter,
-    TurnObserverRequest, TurnObserverWorker, TurnReflectionLessonRecord,
-    TurnReflectionLessonWriter, TurnReflectionMark, TurnReflectionStateStore,
-    TurnSessionActivityWriter, TurnSkillSelectionRecord, TurnSkillSelectorMetricRecord,
-    TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
+    TurnHookDbWriter, TurnImplicitFeedbackRecord, TurnObserverRequest, TurnObserverWorker,
+    TurnReflectionLessonRecord, TurnReflectionLessonWriter, TurnReflectionMark,
+    TurnReflectionStateStore, TurnSessionActivityWriter, TurnSkillSelectionRecord,
+    TurnSkillSelectorMetricRecord, TurnToolEventPersistPlan, TurnToolEventRecord,
+    TurnToolEventWriter,
 };
 
 pub use turn::services::{
@@ -362,6 +357,4 @@ pub use astra_text_utils::semantic_dedup;
 pub use astra_text_utils::text_tokenize;
 pub use astra_turn_core::cloud_session_facts::update_from_journal_event;
 pub use astra_turn_types::session_facts::{ErrorFact, FileEntry, PlanFact, SessionFacts, ToolFact};
-pub use matrix_cloud_runtime::{
-    MatrixCloudRuntime, build_sync_orchestrator_with_adapters, matrix_settings_from_env,
-};
+pub use matrix_cloud_runtime::{MatrixCloudRuntime, matrix_settings_from_env};

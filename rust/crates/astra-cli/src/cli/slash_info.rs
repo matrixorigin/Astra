@@ -1268,7 +1268,6 @@ pub(super) async fn handle_info_command(
                 task_manager: None,
                 runtime_continuity: None,
                 turn_index: 0,
-                evolution_service: state.evolution_service.clone(),
                 pipeline_state: None,
                 pre_loaded_messages: None,
                 append_system_prompt: None,
@@ -2376,7 +2375,6 @@ pub(super) fn render_whoami(state: &ReplState) -> String {
     let _ = writeln!(out, "  turn           : {}", state.turn);
     let _ = writeln!(out, "  exchanges      : {}", state.history.len());
     let _ = writeln!(out, "  skills_loaded  : {skills}");
-    let _ = writeln!(out, "  auto_reflection: on");
     match pending {
         Some(name) => {
             let _ = writeln!(out, "  pending_improve: {name}");
@@ -2670,7 +2668,6 @@ mod tests {
         assert!(out.contains("turn           : 3"), "got: {out}");
         assert!(out.contains("exchanges      : 1"), "got: {out}");
         assert!(out.contains("skills_loaded"), "got: {out}");
-        assert!(out.contains("auto_reflection: on"), "got: {out}");
         assert!(out.contains("pending_improve: <none>"), "got: {out}");
     }
 

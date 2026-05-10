@@ -339,19 +339,7 @@ pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
         Vec::new(),
     );
     let user_id = session_guard.user_id.clone();
-    let pattern_library = hub.pattern_library();
-    let pattern_library = match pattern_library.as_ref() {
-        Some(pattern_library) => match pattern_library.lock() {
-            Ok(guard) => Some(guard),
-            Err(err) => {
-                eprintln!("[adaptive-exec] failed to lock pattern library: {err}");
-                None
-            }
-        },
-        None => None,
-    };
-    let experiments_unused = &();
-    let _ = experiments_unused;
+    let _ = hub;
 
     // Snapshot config before profile application for attribution.
     let old_config = session_guard.config.clone();
@@ -370,9 +358,6 @@ pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     }
 
     let mut boosts = routing.boost_terms.clone();
-    if let Some(library) = pattern_library.as_deref() {
-        boosts.extend(library.boost_terms_for(routing.task_type, routing.domain_hint));
-    }
     if !boosts.is_empty() {
         boosts.sort();
         boosts.dedup();
@@ -515,7 +500,6 @@ pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
 
     // Release session lock before writing journal.
     drop(session_guard);
-    drop(pattern_library);
     sync_liquid_tactical_runtime(state, adaptive_enabled, turn_token_budget);
 
     // Emit journal event for adaptive profile selection.
@@ -707,144 +691,6 @@ pub(crate) fn apply_per_turn_adaptation(state: &mut AgenticLoopState, turn_token
             sid, turn, changes, triggers,
         );
         write_session_journal_event(state, event);
-    }
-}
-
-fn runtime_promotion_recommendation(
-    recommendation: astra_evolution::types::ProposalPromotionRecommendation,
-) -> RuntimePromotionRecommendation {
-    match recommendation {
-        astra_evolution::types::ProposalPromotionRecommendation::Promote => {
-            RuntimePromotionRecommendation::Promote
-        }
-        astra_evolution::types::ProposalPromotionRecommendation::Canary => {
-            RuntimePromotionRecommendation::Canary
-        }
-        astra_evolution::types::ProposalPromotionRecommendation::Hold => {
-            RuntimePromotionRecommendation::Hold
-        }
-    }
-}
-
-fn record_runtime_promotion_event(state: &mut AgenticLoopState, event: RuntimePromotionEventData) {
-    let already_recorded = state.telemetry.promotion_events.iter().any(|existing| {
-        existing.controller == event.controller
-            && existing.outcome == event.outcome
-            && existing.subject_id == event.subject_id
-    });
-    if !already_recorded {
-        state.telemetry.promotion_events.push(event);
-    }
-}
-
-fn record_evolution_proposal_event(
-    state: &mut AgenticLoopState,
-    outcome: RuntimePromotionOutcome,
-    proposal: &astra_evolution::types::EvolutionProposal,
-) {
-    let Some(verdict) = proposal.promotion_verdict.as_ref() else {
-        return;
-    };
-    record_runtime_promotion_event(
-        state,
-        RuntimePromotionEventData {
-            controller: RuntimePromotionController::Evolution,
-            outcome,
-            recommendation: runtime_promotion_recommendation(verdict.recommendation),
-            subject_id: proposal.id.clone(),
-            summary: proposal.reasoning.clone(),
-            turn: None,
-            confidence_score: verdict.confidence_score,
-            support_score: verdict.support_score,
-            safety_score: verdict.safety_score,
-            overall_score: verdict.overall_score,
-            blockers: verdict.blockers.clone(),
-            evidence: verdict.evidence.clone(),
-            rollback_hint: verdict.rollback_hint.clone(),
-            run_id: state.current_run_id.clone(),
-        },
-    );
-}
-
-pub(crate) async fn snapshot_evolution_promotion_ids(
-    evo: &crate::evolution::service::EvolutionService,
-) -> (
-    HashSet<String>,
-    HashSet<String>,
-    HashMap<String, astra_evolution::types::EvolutionProposal>,
-    HashSet<String>,
-) {
-    let pending = evo
-        .pending()
-        .await
-        .into_iter()
-        .map(|proposal| proposal.id)
-        .collect::<HashSet<_>>();
-    let applied = evo
-        .applied()
-        .await
-        .into_iter()
-        .map(|proposal| proposal.id)
-        .collect::<HashSet<_>>();
-    let canary = evo
-        .active_canaries()
-        .await
-        .into_iter()
-        .map(|proposal| (proposal.id.clone(), proposal))
-        .collect::<HashMap<_, _>>();
-    let resolved = evo
-        .resolved_canaries()
-        .await
-        .into_iter()
-        .map(|proposal| proposal.id)
-        .collect::<HashSet<_>>();
-    (pending, applied, canary, resolved)
-}
-
-pub(crate) async fn record_new_evolution_promotion_events(
-    state: &mut AgenticLoopState,
-    evo: &crate::evolution::service::EvolutionService,
-    pending_before: &HashSet<String>,
-    applied_before: &HashSet<String>,
-    canary_before: &HashMap<String, astra_evolution::types::EvolutionProposal>,
-    resolved_before: &HashSet<String>,
-) {
-    for proposal in evo.pending().await {
-        if !pending_before.contains(&proposal.id) {
-            record_evolution_proposal_event(state, RuntimePromotionOutcome::Queued, &proposal);
-        }
-    }
-    let applied_after = evo.applied().await;
-    for proposal in applied_after {
-        if applied_before.contains(&proposal.id) || canary_before.contains_key(&proposal.id) {
-            continue;
-        }
-        record_evolution_proposal_event(state, RuntimePromotionOutcome::AutoApplied, &proposal);
-    }
-    let active_after = evo.active_canaries().await;
-    for proposal in active_after {
-        if !canary_before.contains_key(&proposal.id) {
-            record_evolution_proposal_event(
-                state,
-                RuntimePromotionOutcome::CanaryStarted,
-                &proposal,
-            );
-        }
-    }
-    for proposal in evo.resolved_canaries().await {
-        if resolved_before.contains(&proposal.id) {
-            continue;
-        }
-        let outcome = match proposal.status {
-            astra_evolution::types::ApprovalStatus::CanaryPromoted => {
-                RuntimePromotionOutcome::CanaryPromoted
-            }
-            astra_evolution::types::ApprovalStatus::CanaryRolledBack => {
-                RuntimePromotionOutcome::CanaryRolledBack
-            }
-            _ => continue,
-        };
-        record_evolution_proposal_event(state, outcome, &proposal);
     }
 }
 
@@ -1058,9 +904,20 @@ pub(crate) fn record_loop_completion_feedback(
             .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
         if has_prior_assistant && !state.message.is_empty() {
             let lower = state.message.to_lowercase();
-            let is_correction = astra_evolution::signal_collector::CORRECTION_KEYWORDS
-                .iter()
-                .any(|kw| lower.contains(kw));
+            const CORRECTION_KEYWORDS: &[&str] = &[
+                "no, ",
+                "not ",
+                "wrong",
+                "incorrect",
+                "actually,",
+                "instead",
+                "try again",
+                "不对",
+                "错了",
+                "不是",
+                "重新",
+            ];
+            let is_correction = CORRECTION_KEYWORDS.iter().any(|kw| lower.contains(kw));
             if !is_correction {
                 hub.record_feedback(enrich_signal(
                     FeedbackSignal::new(SignalType::Acceptance).with_turn(&turn_id),

@@ -37,7 +37,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncDomain {
-    /// EntityGraph + PatternLibrary + Calibrator + ToolHealth
+    /// Tool health + tool quality persistence
     Learning,
     /// JournalEvent batch → agent_events
     Events,

@@ -4855,7 +4855,6 @@ async fn context_meta_exposes_builder_supplied_context_signals() {
             "context": {
                 "edge_profile": {
                     "active_skills": ["concise"],
-                    "learned_context_hint": "matrixorigin => github",
                     "system_prompt_override": "You are operating under a delegated reviewer contract."
                 },
                 "test_llm_rounds": [{ "full_text": "Stored." }]

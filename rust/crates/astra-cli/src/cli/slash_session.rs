@@ -4798,8 +4798,10 @@ fn history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(String, S
 
 /// Baseline row for a blocked tool when we have no persisted health metrics yet (same defaults as
 /// cloud preference seeding in `cloud_sync.rs`).
-fn blocked_tool_health_entry(name: String) -> astra_evolution::persistence::ToolHealthEntry {
-    astra_evolution::persistence::ToolHealthEntry {
+fn blocked_tool_health_entry(
+    name: String,
+) -> astra_turn_core::tool_health_persistence::ToolHealthEntry {
+    astra_turn_core::tool_health_persistence::ToolHealthEntry {
         name,
         total_calls: 0,
         total_failures: 0,
@@ -5200,7 +5202,6 @@ async fn apply_restored_session(
                 )),
                 Err(_) => None,
             };
-        let learning = build_learning_bridge(state);
 
         let lifecycle = if let Some(pool) = state
             .matrix_runtime
@@ -5214,7 +5215,6 @@ async fn apply_restored_session(
                 Some(&restored.session_id),
                 state.ingestion_user_id.as_deref(),
                 cloud_judge,
-                learning,
                 server_proxy_judge,
             )
         } else {
@@ -5227,7 +5227,6 @@ async fn apply_restored_session(
                 Some(&restored.session_id),
                 state.ingestion_user_id.as_deref(),
                 cloud_judge,
-                learning,
                 server_proxy_judge,
             )
         };

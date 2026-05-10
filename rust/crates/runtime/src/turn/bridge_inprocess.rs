@@ -718,8 +718,6 @@ pub struct InProcessChatTurnBridge {
     /// Shared DB pool — avoids creating a new connection per turn.
     /// When `None`, falls back to ephemeral single-connection pool.
     pub shared_pool: Option<SharedPool>,
-    /// Pipeline learning writer — auto-updates EntityGraph/PatternLibrary/Calibrator.
-    pub turn_learning_writer: Option<Arc<dyn crate::TurnLearningWriter>>,
     /// Same `Arc` as [`crate::AppState::edge_callback_ledger`] — bridge takes tool callbacks here.
     pub edge_callback_ledger: Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     /// Session-scoped structured feedback store — accumulates correction rules
@@ -741,7 +739,6 @@ impl InProcessChatTurnBridge {
             matrixone,
             encryptor,
             shared_pool: None,
-            turn_learning_writer: None,
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feedback_store: Arc::new(astra_pipeline::feedback_store::FeedbackStore::new()),
             memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env(),
@@ -752,11 +749,6 @@ impl InProcessChatTurnBridge {
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
-        self
-    }
-
-    pub fn with_learning_writer(mut self, writer: Arc<dyn crate::TurnLearningWriter>) -> Self {
-        self.turn_learning_writer = Some(writer);
         self
     }
 
@@ -892,7 +884,6 @@ impl InProcessChatTurnBridge {
         };
         let root_runtime_owns_turn_journal =
             bridge_root_turn_journal_owned(headers, &payload, bridge_e2e_authorized);
-        let turn_learning_writer = self.turn_learning_writer.clone();
         let _edge_callback_ledger = self.edge_callback_ledger.clone();
 
         #[cfg(feature = "bridge-e2e-hooks")]
@@ -1258,16 +1249,6 @@ impl InProcessChatTurnBridge {
                 .and_then(|m| m.get("content").and_then(Value::as_str))
                 .unwrap_or("");
 
-            let learned_context_text = edge_profile
-                .get("learned_context_hint")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .unwrap_or_default();
-            let learned_context_hint = if learned_context_text.is_empty() {
-                String::new()
-            } else {
-                format!("\n\n## Learned Runtime Context\n{learned_context_text}")
-            };
             let task_type = edge_profile
                 .get("selection_task_type")
                 .and_then(Value::as_str)
@@ -1465,7 +1446,6 @@ impl InProcessChatTurnBridge {
             //
             // VOLATILE (change each turn by design):
             //   environment_volatile (git branch dirty/diff/recent commits),
-            //   learned_context_hint (EMA tracker — byte-level changes break prefix cache),
             //   feedback_rules_hint (accumulates on each user correction),
             //   skill_hint (active skill/tool selection),
             //   self_awareness_hint (turn/token/outcome signals),
@@ -1508,21 +1488,6 @@ impl InProcessChatTurnBridge {
                     .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
                         context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                             active_output_skills: true,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-                );
-            }
-            if !learned_context_hint.is_empty() {
-                dynamic_sections.push(
-                    prompts::PromptSection::dynamic(
-                        learned_context_hint.clone(),
-                        prompts::PromptTokenBucket::UserPreferences,
-                    )
-                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            learned_runtime_context: true,
                             ..Default::default()
                         },
                         ..Default::default()
@@ -3200,8 +3165,6 @@ impl InProcessChatTurnBridge {
                     &all_round_tool_calls,
                     skill_selector_shortlist.as_ref(),
                 );
-                // Propagate correction signal and routing metadata so pipeline
-                // learning can update ProgressiveCalibrator with actual data.
                 if is_correction_turn {
                     hook_payload.insert(
                         "is_correction".to_string(),
@@ -3223,7 +3186,6 @@ impl InProcessChatTurnBridge {
                     turn_reflection_state_store.clone(),
                     turn_reflection_lesson_writer.clone(),
                     turn_observer_worker.clone(),
-                    turn_learning_writer.clone(),
                 );
             }
 
@@ -4144,7 +4106,6 @@ mod tests {
     #[test]
     fn pipeline_assembly_records_bridge_context_signals() {
         let active_skill_names = vec!["concise"];
-        let learned_context_text = "matrixorigin => github";
         // memory_signal_hint removed — LLM-driven via system prompt rules
         let implicit_feedback_hint =
             "\n\n## Implicit Feedback\nThe user is correcting the previous attempt.";
@@ -4166,20 +4127,6 @@ mod tests {
                     context_signals:
                         astra_turn_core::context_assembly_trace::PromptContextSignals {
                             active_output_skills: !active_skill_names.is_empty(),
-                            ..Default::default()
-                        },
-                    ..Default::default()
-                },
-            ),
-            prompts::PromptSection::dynamic(
-                "learned context payload".to_string(),
-                prompts::PromptTokenBucket::UserPreferences,
-            )
-            .with_trace_signals(
-                astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals:
-                        astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            learned_runtime_context: !learned_context_text.is_empty(),
                             ..Default::default()
                         },
                     ..Default::default()
@@ -4286,7 +4233,6 @@ mod tests {
         let breakdown = prompts::build_system_prompt_trace(&prompt_sections, vec![], vec![]);
 
         assert!(breakdown.context_signals.active_output_skills);
-        assert!(breakdown.context_signals.learned_runtime_context);
         assert!(
             !breakdown.context_signals.memory_signal_detected,
             "memory signal detection removed — LLM-driven"

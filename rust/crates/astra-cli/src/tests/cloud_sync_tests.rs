@@ -290,16 +290,7 @@ async fn try_cloud_pull_returns_empty_without_matrixone() {
     unsafe {
         std::env::remove_var("MATRIXONE_HOST");
     }
-    let eg = std::sync::Arc::new(std::sync::Mutex::new(
-        astra_pipeline::entity::EntityGraph::new(),
-    ));
-    let pl = std::sync::Arc::new(std::sync::Mutex::new(
-        astra_pipeline::pattern::PatternLibrary::new(),
-    ));
-    let cal = std::sync::Arc::new(std::sync::Mutex::new(
-        astra_pipeline::calibration::ProgressiveCalibrator::new(0.15),
-    ));
-    let result = try_cloud_pull("default", &eg, &pl, &cal).await;
+    let result = try_cloud_pull("default").await;
     assert!(
         result.tool_health.is_empty(),
         "Without MatrixOne, cloud pull should return empty tool health"
@@ -319,42 +310,8 @@ async fn try_cloud_push_is_noop_without_matrixone() {
     unsafe {
         std::env::remove_var("MATRIXONE_HOST");
     }
-    let eg = std::sync::Arc::new(std::sync::Mutex::new(
-        astra_pipeline::entity::EntityGraph::new(),
-    ));
-    let pl = std::sync::Arc::new(std::sync::Mutex::new(
-        astra_pipeline::pattern::PatternLibrary::new(),
-    ));
-    let cal = std::sync::Arc::new(std::sync::Mutex::new(
-        astra_pipeline::calibration::ProgressiveCalibrator::new(0.15),
-    ));
-    // Should not panic (was the original bug)
-    // Use versioned API (None = new snapshot or unconditional push)
-    let _result = try_cloud_push_versioned("default", &eg, &pl, &cal, &[], None).await;
-}
-
-#[tokio::test]
-async fn try_cloud_push_delta_is_noop_without_matrixone() {
-    unsafe {
-        std::env::remove_var("MATRIXONE_HOST");
-    }
-    let eg = std::sync::Arc::new(std::sync::Mutex::new(
-        astra_pipeline::entity::EntityGraph::new(),
-    ));
-    let pl = std::sync::Arc::new(std::sync::Mutex::new(
-        astra_pipeline::pattern::PatternLibrary::new(),
-    ));
-    let cal = std::sync::Arc::new(std::sync::Mutex::new(
-        astra_pipeline::calibration::ProgressiveCalibrator::new(0.15),
-    ));
-    let mut synced = Vec::new();
-    eg.lock().unwrap().learn(
-        "rust",
-        astra_turn_core::routing_engine::DomainHint::Code,
-        &[],
-        None,
-    );
-    let _result = try_cloud_push_delta("default", &eg, &pl, &cal, &[], &mut synced, None).await;
+    // Should not panic — reduces to a no-op without MatrixOne reachable.
+    let _result = try_cloud_push_versioned("default", &[], None).await;
 }
 
 #[tokio::test]

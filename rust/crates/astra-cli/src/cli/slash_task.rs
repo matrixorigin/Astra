@@ -237,7 +237,6 @@ pub(super) async fn handle_task_command(
             let bg_delegation_engine = state.delegation_engine.clone();
             let bg_observability_hub = state.observability_hub.clone();
             let bg_observability_session = state.observability_session.clone();
-            let bg_evolution_service = state.evolution_service.clone();
             #[cfg(feature = "harness")]
             let bg_harness_sink = state.harness_sink.clone();
             #[cfg(feature = "harness")]
@@ -324,7 +323,6 @@ pub(super) async fn handle_task_command(
                     task_manager: None,
                     runtime_continuity: None,
                     turn_index: 0,
-                    evolution_service: bg_evolution_service.clone(),
                     pipeline_state: None,
                     pre_loaded_messages: None,
                     append_system_prompt: None,

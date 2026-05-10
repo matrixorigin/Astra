@@ -1081,16 +1081,8 @@ fn show_stats_view(sub: &str, state: &ReplState, bottom_pane: &mut BottomPane) {
 
         "learn" => {
             let mut pairs: Vec<(&str, String)> = Vec::new();
-            if let Some(ref eg) = state.entity_graph {
-                if let Ok(g) = eg.lock() {
-                    pairs.push(("entities", g.len().to_string()));
-                }
-            }
-            if let Some(ref pl) = state.pattern_library {
-                if let Ok(p) = pl.lock() {
-                    pairs.push(("patterns", p.len().to_string()));
-                }
-            }
+            // Entity graph + pattern library panes removed along with the
+            // self-evolution subsystem. Skill quality + drift metrics remain.
             pairs.push((
                 "skills tracked",
                 state.skill_quality_tracker.all_entries().len().to_string(),

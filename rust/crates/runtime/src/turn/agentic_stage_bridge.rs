@@ -347,9 +347,7 @@ mod tests {
             record("flaky_http", false, Some("timeout")),
         ];
         let diag = diagnose_from_signals(&records, &[]);
-        // Diagnosis should recommend blocking the failing tool; the concrete
-        // end-to-end application against AgenticLoopState is exercised in the
-        // `auto_reflection_injects_pipeline_diagnosis_into_prompt` e2e test.
+        // Diagnosis should recommend blocking the failing tool.
         assert!(!diag.strategy.block_tools.is_empty());
         assert!(
             diag.strategy

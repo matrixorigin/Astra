@@ -1,5 +1,4 @@
 pub mod agentic_adaptive_tuning;
-pub mod agentic_auto_reflection;
 pub mod agentic_delegate_interception;
 pub mod agentic_headless_round;
 pub mod agentic_loop_execution_phase;

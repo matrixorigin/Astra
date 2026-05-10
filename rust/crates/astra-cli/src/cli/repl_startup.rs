@@ -130,7 +130,7 @@ pub(crate) async fn complete_repl_startup(
     // Seed from prior session snapshot (if any) so boost factors don't reset.
     let profile_name_for_quality = profile.unwrap_or("default");
     let persisted_quality =
-        astra_evolution::persistence::load_tool_quality(profile_name_for_quality);
+        astra_turn_core::tool_health_persistence::load_tool_quality(profile_name_for_quality);
     let quality_tracker = {
         let mut tracker = tool_registry::ToolQualityTracker::new();
         if !persisted_quality.is_empty() {
@@ -159,26 +159,13 @@ pub(crate) async fn complete_repl_startup(
     );
     tracer.phase("tool_selector");
 
-    // Load cross-session learning state (entity graph, patterns, calibration, tool health)
+    // Load cross-session tool-health state (entity/pattern/calibration state has been removed).
     let profile_name = profile.unwrap_or("default");
     let (cross_session_health_entries, cloud_pull_result, pref_keys_after_pull) = {
-        let loaded = astra_evolution::persistence::load_learning_state(
-            profile_name,
-            &pipeline_modules.entity_graph,
-            &pipeline_modules.pattern_library,
-            &pipeline_modules.calibrator,
-        );
-        if loaded {
-            eprintln!(
-                "  {} {}",
-                theme::icon_ok(),
-                "Loaded learning state from prior sessions".dim()
-            );
-        }
         let mut cross_session_health_entries =
-            astra_evolution::persistence::load_tool_health(profile_name);
+            astra_turn_core::tool_health_persistence::load_tool_health(profile_name);
         state.synced_tool_health_entries =
-            astra_evolution::persistence::load_synced_tool_health(profile_name);
+            astra_turn_core::tool_health_persistence::load_synced_tool_health(profile_name);
         if !cross_session_health_entries.is_empty() {
             eprintln!(
                 "{}",
@@ -189,19 +176,14 @@ pub(crate) async fn complete_repl_startup(
                 .dim()
             );
         }
-        let cloud_pull_result = try_cloud_pull(
-            profile_name,
-            &pipeline_modules.entity_graph,
-            &pipeline_modules.pattern_library,
-            &pipeline_modules.calibrator,
-        )
-        .await;
+        let cloud_pull_result = try_cloud_pull(profile_name).await;
         state.cloud_learning_version = cloud_pull_result.version;
         if !cloud_pull_result.tool_health.is_empty() {
-            let (merged, cloud_wins, cloud_only) = astra_evolution::persistence::merge_tool_health(
-                &cross_session_health_entries,
-                &cloud_pull_result.tool_health,
-            );
+            let (merged, cloud_wins, cloud_only) =
+                astra_turn_core::tool_health_persistence::merge_tool_health(
+                    &cross_session_health_entries,
+                    &cloud_pull_result.tool_health,
+                );
             cross_session_health_entries = merged;
             if cloud_wins > 0 || cloud_only > 0 {
                 let mut parts = Vec::new();
@@ -234,18 +216,11 @@ pub(crate) async fn complete_repl_startup(
         state.matrix_runtime = match SharedPool::new(&settings).await {
             Ok(pool) => {
                 let user_id = astra_core::cli_user_id();
-                let th =
-                    std::sync::Arc::new(std::sync::Mutex::new(state.tool_health_entries.clone()));
                 let lease = std::sync::Arc::new(astra_services::TaskLeaseHoldCache::default());
                 let mut runtime = astra_runtime::MatrixCloudRuntime::attach(
                     pool,
                     profile.unwrap_or("default"),
                     &user_id,
-                    pipeline_modules.entity_graph.clone(),
-                    pipeline_modules.pattern_library.clone(),
-                    pipeline_modules.calibrator.clone(),
-                    th,
-                    state.cloud_learning_version,
                     lease,
                 );
                 if let Ok(enc) = astra_services::FernetTokenEncryptor::from_env() {
@@ -283,12 +258,6 @@ pub(crate) async fn complete_repl_startup(
     }
     tracer.phase("matrix_pool");
 
-    state.pattern_library = Some(pipeline_modules.pattern_library.clone());
-    state.entity_graph = Some(pipeline_modules.entity_graph.clone());
-    state.calibrator = Some(pipeline_modules.calibrator.clone());
-    if let Some(hub) = &state.observability_hub {
-        hub.attach_pattern_library(pipeline_modules.pattern_library.clone());
-    }
     state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 

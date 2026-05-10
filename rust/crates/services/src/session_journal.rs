@@ -6404,10 +6404,12 @@ mod turn_event_buffer_tests {
         assert_eq!(events[0].tool_calls_returned, Some(0));
     }
 
-    /// Regression: auto-reflection LLM calls must record llm_round events
-    /// so turn.tokens_in breakdown is complete.
+    /// Regression: sub-call LLM rounds (e.g. headless/sub-run) must record
+    /// their finish_reason + source + run_id in the journal metadata so the
+    /// per-round token breakdown can be attributed back to the originating
+    /// sub-call.
     #[test]
-    fn auto_reflection_round_has_finish_reason() {
+    fn llm_round_preserves_finish_reason_and_source_metadata() {
         let mut buf = TurnEventBuffer::begin_turn(Some("sess-refl"), 2);
         // Normal round
         buf.record_llm_round(LlmRoundRecord {
@@ -6426,7 +6428,7 @@ mod turn_event_buffer_tests {
             tool_calls: None,
             ..Default::default()
         });
-        // Auto-reflection round
+        // Tagged sub-call round
         buf.record_llm_round(LlmRoundRecord {
             ttft_ms: None,
             duration_ms: 0,
@@ -6436,23 +6438,22 @@ mod turn_event_buffer_tests {
             cache_creation_tokens: 0,
             tool_calls_returned: 0,
             tool_call_names: vec![],
-            finish_reason: Some("auto_reflection".into()),
+            finish_reason: Some("sub_call".into()),
             agentic_step: None,
-            source: Some("auto_reflection".into()),
-            run_id: Some("run-reflect".into()),
+            source: Some("sub_call".into()),
+            run_id: Some("run-subcall".into()),
             tool_calls: None,
             ..Default::default()
         });
         assert_eq!(buf.current_round(), 2);
         let events = buf.drain();
         assert_eq!(events.len(), 2);
-        // Verify auto-reflection round has the finish_reason in metadata
         let refl = &events[1];
         assert_eq!(refl.round, Some(1));
         assert_eq!(refl.tokens_in, Some(54000));
         let refl_meta = refl.metadata.as_ref().unwrap();
-        assert_eq!(refl_meta["source"], "auto_reflection");
-        assert_eq!(refl_meta["run_id"], "run-reflect");
+        assert_eq!(refl_meta["source"], "sub_call");
+        assert_eq!(refl_meta["run_id"], "run-subcall");
     }
 
     /// Regression: rate-limited early exit must record an llm_round with

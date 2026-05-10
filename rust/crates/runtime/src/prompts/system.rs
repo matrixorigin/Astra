@@ -884,10 +884,6 @@ pub fn build_system_prompt_trace(
         total_tokens += tokens;
         context_signals.active_output_skills |=
             section.trace_signals.context_signals.active_output_skills;
-        context_signals.learned_runtime_context |= section
-            .trace_signals
-            .context_signals
-            .learned_runtime_context;
         context_signals.memory_signal_detected |=
             section.trace_signals.context_signals.memory_signal_detected;
         context_signals.system_prompt_override |=
@@ -2662,7 +2658,6 @@ mod tests {
             .with_trace_signals(PromptTraceSignals {
                 context_signals: PromptContextSignals {
                     active_output_skills: true,
-                    learned_runtime_context: true,
                     memory_signal_detected: true,
                     effort_hint: true,
                     agent_type_hint: true,
@@ -2678,7 +2673,6 @@ mod tests {
 
         let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
         assert!(breakdown.context_signals.active_output_skills);
-        assert!(breakdown.context_signals.learned_runtime_context);
         assert!(breakdown.context_signals.memory_signal_detected);
         assert!(!breakdown.context_signals.system_prompt_override);
         assert!(breakdown.context_signals.effort_hint);

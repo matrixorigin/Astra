@@ -1980,239 +1980,6 @@ pub struct SubtaskDeliverySummary {
     pub retry_count: u32,
 }
 
-// ─── Task Learning Bridge ────────────────────────────────────────────────────
-
-/// Outcome of a completed durable task, used to feed learning signals.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskOutcomeSignal {
-    pub task_id: String,
-    pub contract_id: String,
-    pub goal: String,
-    /// Whether the task was successfully completed (all required criteria passed)
-    pub success: bool,
-    /// User-provided rating 0–100 (None if no feedback)
-    pub user_rating: Option<u8>,
-    /// Tools used across all subtasks
-    pub tools_used: Vec<String>,
-    /// Per-subtask outcome summaries
-    pub subtask_outcomes: Vec<SubtaskOutcomeSignal>,
-    /// Total verification attempts
-    pub total_verification_attempts: u32,
-    /// Total retries across subtasks
-    pub total_retries: u32,
-    /// Execution turns
-    pub total_turns: u32,
-    /// Free-form domain hint (e.g., "code", "database", "github")
-    pub domain_hint: Option<String>,
-    /// Task classification (e.g., "code", "fetch", "mutate")
-    pub task_type: Option<String>,
-}
-
-/// Per-subtask learning signal.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubtaskOutcomeSignal {
-    pub subtask_id: String,
-    pub title: String,
-    pub success: bool,
-    pub retry_count: u32,
-    /// Tools specifically used for this subtask
-    pub tools_used: Vec<String>,
-    /// Verification pass rate: passed / total criteria
-    pub verification_pass_rate: Option<f64>,
-    /// Files modified (for entity extraction)
-    pub files_modified: Vec<String>,
-}
-
-/// Trait for feeding task outcomes into a learning system.
-///
-/// Defined in `services` to keep durable_task decoupled from the concrete
-/// learning pipeline types (EntityGraph, PatternLibrary, ProgressiveCalibrator)
-/// which live in the `runtime` crate. The runtime implements this trait and
-/// injects it into the lifecycle service.
-#[async_trait]
-pub trait TaskLearningBridge: Send + Sync {
-    /// Record a completed task's outcome as a learning signal.
-    ///
-    /// Implementations should:
-    /// 1. Extract entities from goal/titles → EntityGraph::learn()
-    /// 2. Record tool chain patterns → PatternLibrary::record_outcome()
-    /// 3. Calibrate routing thresholds → ProgressiveCalibrator::record()
-    /// 4. Extract reusable templates from successful contracts
-    async fn learn_from_task_outcome(&self, signal: &TaskOutcomeSignal) -> Result<(), String>;
-
-    /// Record a real-time verification result for incremental learning.
-    ///
-    /// Called after each subtask verification (not just at delivery). Allows the
-    /// learning system to detect failure patterns early and adjust tool routing
-    /// before the task completes.
-    ///
-    /// Default: no-op (override in real implementations).
-    async fn learn_from_verification(
-        &self,
-        _signal: &VerificationLearningSignal,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Extract a reusable plan template from a successful task contract.
-    ///
-    /// If the contract's pattern is novel enough, store it for future plan generation.
-    async fn extract_template(
-        &self,
-        contract: &TaskContract,
-        report: &TaskDeliveryReport,
-    ) -> Result<Option<String>, String>;
-
-    /// Suggest tools for an upcoming subtask based on learned patterns.
-    ///
-    /// Returns tool names sorted by relevance (most relevant first).
-    async fn suggest_tools(
-        &self,
-        goal: &str,
-        domain_hint: Option<&str>,
-        task_type: Option<&str>,
-    ) -> Result<Vec<String>, String>;
-
-    /// Query historical performance for a given task pattern.
-    ///
-    /// Returns (success_rate, avg_retries, avg_turns) or None if no data.
-    async fn task_pattern_stats(
-        &self,
-        goal_pattern: &str,
-    ) -> Result<Option<TaskPatternStats>, String>;
-}
-
-/// Signal emitted after each subtask verification for incremental learning.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerificationLearningSignal {
-    pub task_id: String,
-    pub subtask_id: String,
-    pub subtask_title: String,
-    pub goal: String,
-    /// True if all required criteria passed.
-    pub all_passed: bool,
-    /// Number of criteria that passed / total criteria.
-    pub pass_rate: f64,
-    /// Which attempt this was (1-based).
-    pub attempt: u32,
-    /// Individual criterion results for fine-grained pattern learning.
-    pub criteria_results: Vec<CriterionLearningResult>,
-    /// Files involved in the subtask (for entity extraction).
-    pub files: Vec<String>,
-    /// Domain hint from the task contract (e.g. "github", "code").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub domain_hint: Option<String>,
-    /// Task type from the task contract (e.g. "code", "fetch").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_type: Option<String>,
-}
-
-/// Per-criterion result for learning.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CriterionLearningResult {
-    pub criterion_id: String,
-    pub verifier_kind: String,
-    pub passed: bool,
-    pub duration_ms: u64,
-}
-
-/// Historical performance stats for a task pattern.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskPatternStats {
-    pub pattern: String,
-    pub total_attempts: u32,
-    pub success_rate: f64,
-    /// Average retries per task. Currently 0.0 — requires per-task retry tracking
-    /// in the pattern library (future: record from TaskOutcomeSignal.total_retries).
-    pub avg_retries: f64,
-    /// Average turns per task. Currently 0.0 — requires per-task turn tracking
-    /// in the pattern library (future: record from TaskOutcomeSignal.total_turns).
-    pub avg_turns: f64,
-    pub avg_verification_pass_rate: f64,
-}
-
-/// No-op implementation when learning is not available.
-pub struct NoopTaskLearningBridge;
-
-#[async_trait]
-impl TaskLearningBridge for NoopTaskLearningBridge {
-    async fn learn_from_task_outcome(&self, _signal: &TaskOutcomeSignal) -> Result<(), String> {
-        Ok(()) // silently ignore
-    }
-    async fn extract_template(
-        &self,
-        _contract: &TaskContract,
-        _report: &TaskDeliveryReport,
-    ) -> Result<Option<String>, String> {
-        Ok(None)
-    }
-    async fn suggest_tools(
-        &self,
-        _goal: &str,
-        _domain: Option<&str>,
-        _task_type: Option<&str>,
-    ) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
-    }
-    async fn task_pattern_stats(&self, _pattern: &str) -> Result<Option<TaskPatternStats>, String> {
-        Ok(None)
-    }
-}
-
-/// Helper to build a TaskOutcomeSignal from a completed contract + delivery report.
-pub fn build_outcome_signal(
-    contract: &TaskContract,
-    report: &TaskDeliveryReport,
-    tools_used: Vec<String>,
-    user_rating: Option<u8>,
-    domain_hint: Option<String>,
-    task_type: Option<String>,
-) -> TaskOutcomeSignal {
-    let subtask_outcomes: Vec<SubtaskOutcomeSignal> = contract
-        .subtasks
-        .iter()
-        .map(|s| {
-            let summary = report.subtask_summaries.iter().find(|sum| sum.id == s.id);
-            let pass_rate = if s.criteria.is_empty() {
-                None
-            } else {
-                let total = s.criteria.len() as f64;
-                let passed = summary.map(|sm| sm.criteria_passed as f64).unwrap_or(0.0);
-                Some(passed / total)
-            };
-            SubtaskOutcomeSignal {
-                subtask_id: s.id.clone(),
-                title: s.title.clone(),
-                success: s.stage.is_success(),
-                retry_count: s.retry_count,
-                tools_used: s.tools_used.clone(),
-                verification_pass_rate: pass_rate,
-                files_modified: s.files.clone(),
-            }
-        })
-        .collect();
-
-    let total_retries: u32 = contract.subtasks.iter().map(|s| s.retry_count).sum();
-
-    TaskOutcomeSignal {
-        task_id: report.task_id.clone(),
-        contract_id: report.contract_id.clone(),
-        goal: contract.goal.clone(),
-        success: report
-            .subtask_summaries
-            .iter()
-            .all(|s| s.stage == "verified" || s.stage == "completed" || s.stage == "skipped"),
-        user_rating,
-        tools_used,
-        subtask_outcomes,
-        total_verification_attempts: report.total_verifications,
-        total_retries,
-        total_turns: report.total_turns,
-        domain_hint,
-        task_type,
-    }
-}
-
 // ─── DurableTaskLifecycle Trait ──────────────────────────────────────────────
 
 /// Context returned when beginning a subtask execution.
@@ -2326,8 +2093,6 @@ pub struct MatrixOneDurableTaskLifecycle {
     session_id: String,
     /// User ID for event attribution.
     user_id: String,
-    /// Learning bridge for feeding verification patterns into the learning system.
-    learning_bridge: Option<Arc<dyn TaskLearningBridge>>,
     /// Optional callback that receives live command output lines during verification.
     output_sink: Option<OutputSink>,
 }
@@ -2346,7 +2111,6 @@ impl MatrixOneDurableTaskLifecycle {
             event_sender: None,
             session_id: String::new(),
             user_id: String::new(),
-            learning_bridge: None,
             output_sink: None,
         }
     }
@@ -2368,7 +2132,6 @@ impl MatrixOneDurableTaskLifecycle {
             event_sender: None,
             session_id: String::new(),
             user_id: String::new(),
-            learning_bridge: None,
             output_sink: None,
         }
     }
@@ -2387,11 +2150,6 @@ impl MatrixOneDurableTaskLifecycle {
     pub fn set_session_context(&mut self, session_id: &str, user_id: &str) {
         self.session_id = session_id.to_string();
         self.user_id = user_id.to_string();
-    }
-
-    /// Set the learning bridge for feeding verification patterns into the learning system.
-    pub fn set_learning_bridge(&mut self, bridge: Arc<dyn TaskLearningBridge>) {
-        self.learning_bridge = Some(bridge);
     }
 
     /// Set the output sink for live command output during verification.
@@ -3096,43 +2854,6 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             }),
         );
 
-        // Feed verification result into learning system for real-time pattern detection
-        if let Some(bridge) = &self.learning_bridge {
-            let criteria_results: Vec<CriterionLearningResult> = durable_st
-                .criteria
-                .iter()
-                .zip(report.results.iter())
-                .map(|(c, r)| CriterionLearningResult {
-                    criterion_id: c.id.clone(),
-                    verifier_kind: format!("{:?}", c.verifier)
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    passed: r.passed,
-                    duration_ms: r.duration_ms,
-                })
-                .collect();
-            let signal = VerificationLearningSignal {
-                task_id: task_id.to_string(),
-                subtask_id: subtask_id.to_string(),
-                subtask_title: durable_st.title.clone(),
-                goal: contract.goal.clone(),
-                all_passed: report.all_required_passed,
-                pass_rate: if total_count > 0 {
-                    passed_count as f64 / total_count as f64
-                } else {
-                    1.0
-                },
-                attempt: durable_st.retry_count + 1,
-                criteria_results,
-                files: durable_st.files.clone(),
-                domain_hint: contract.domain_hint.clone(),
-                task_type: contract.task_type.clone(),
-            };
-            let _ = bridge.learn_from_verification(&signal).await;
-        }
-
         Ok(report)
     }
 
@@ -3325,30 +3046,6 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             "global_checks_total": report.global_verification.len(),
         }));
 
-        // Feed completed task into learning system for pattern extraction
-        if let Some(bridge) = &self.learning_bridge {
-            let all_tools: Vec<String> = contract
-                .subtasks
-                .iter()
-                .flat_map(|s| s.tools_used.iter().cloned())
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-            let outcome = build_outcome_signal(
-                &contract,
-                &report,
-                all_tools,
-                None,
-                contract.domain_hint.clone(),
-                contract.task_type.clone(),
-            );
-            let _ = bridge.learn_from_task_outcome(&outcome).await;
-
-            if contract.status == ContractStatus::Completed {
-                let _ = bridge.extract_template(&contract, &report).await;
-            }
-        }
-
         Ok(report)
     }
 
@@ -3379,8 +3076,6 @@ pub struct LocalDurableTaskLifecycle {
     event_sender: Option<IngestionSender>,
     session_id: String,
     user_id: String,
-    /// Learning bridge for feeding verification patterns into the learning system.
-    learning_bridge: Option<Arc<dyn TaskLearningBridge>>,
     /// Optional callback that receives live command output lines during verification.
     output_sink: Option<OutputSink>,
 }
@@ -3404,7 +3099,6 @@ impl LocalDurableTaskLifecycle {
             event_sender: None,
             session_id: String::new(),
             user_id: String::new(),
-            learning_bridge: None,
             output_sink: None,
         }
     }
@@ -3423,7 +3117,6 @@ impl LocalDurableTaskLifecycle {
             event_sender: None,
             session_id: String::new(),
             user_id: String::new(),
-            learning_bridge: None,
             output_sink: None,
         }
     }
@@ -3442,11 +3135,6 @@ impl LocalDurableTaskLifecycle {
     pub fn set_session_context(&mut self, session_id: &str, user_id: &str) {
         self.session_id = session_id.to_string();
         self.user_id = user_id.to_string();
-    }
-
-    /// Set the learning bridge for feeding verification patterns into learning.
-    pub fn set_learning_bridge(&mut self, bridge: Arc<dyn TaskLearningBridge>) {
-        self.learning_bridge = Some(bridge);
     }
 
     /// Set the output sink for streaming live command output during verification.
@@ -3835,45 +3523,6 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         }
         self.save_local(&contract)?;
 
-        // Feed verification result into learning system for real-time pattern detection
-        if let Some(bridge) = &self.learning_bridge {
-            let passed_count = report.results.iter().filter(|r| r.passed).count();
-            let total_count = report.results.len();
-            let criteria_results: Vec<CriterionLearningResult> = durable_st
-                .criteria
-                .iter()
-                .zip(report.results.iter())
-                .map(|(c, r)| CriterionLearningResult {
-                    criterion_id: c.id.clone(),
-                    verifier_kind: format!("{:?}", c.verifier)
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    passed: r.passed,
-                    duration_ms: r.duration_ms,
-                })
-                .collect();
-            let signal = VerificationLearningSignal {
-                task_id: task_id.to_string(),
-                subtask_id: subtask_id.to_string(),
-                subtask_title: durable_st.title.clone(),
-                goal: contract.goal.clone(),
-                all_passed: report.all_required_passed,
-                pass_rate: if total_count > 0 {
-                    passed_count as f64 / total_count as f64
-                } else {
-                    1.0
-                },
-                attempt: durable_st.retry_count + 1,
-                criteria_results,
-                files: durable_st.files.clone(),
-                domain_hint: contract.domain_hint.clone(),
-                task_type: contract.task_type.clone(),
-            };
-            let _ = bridge.learn_from_verification(&signal).await;
-        }
-
         Ok(report)
     }
 
@@ -3908,47 +3557,6 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         // Persist global results on contract so deliver_task() can include them
         contract.last_global_results = results.clone();
         let _ = self.save_local(&contract);
-
-        // Feed global verification into learning system
-        if !results.is_empty()
-            && let Some(bridge) = &self.learning_bridge
-        {
-            let passed_count = results.iter().filter(|r| r.passed).count();
-            let total_count = results.len();
-            let criteria_results: Vec<CriterionLearningResult> = contract
-                .global_verification
-                .iter()
-                .zip(results.iter())
-                .map(|(c, r)| CriterionLearningResult {
-                    criterion_id: c.id.clone(),
-                    verifier_kind: format!("{:?}", c.verifier)
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    passed: r.passed,
-                    duration_ms: r.duration_ms,
-                })
-                .collect();
-            let signal = VerificationLearningSignal {
-                task_id: task_id.to_string(),
-                subtask_id: "__global__".to_string(),
-                subtask_title: "Global verification".to_string(),
-                goal: contract.goal.clone(),
-                all_passed,
-                pass_rate: if total_count > 0 {
-                    passed_count as f64 / total_count as f64
-                } else {
-                    1.0
-                },
-                attempt: 1,
-                criteria_results,
-                files: Vec::new(),
-                domain_hint: contract.domain_hint.clone(),
-                task_type: contract.task_type.clone(),
-            };
-            let _ = bridge.learn_from_verification(&signal).await;
-        }
 
         Ok(results)
     }
@@ -4076,32 +3684,6 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
             risks: Vec::new(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
-
-        // Feed completed task into learning system for pattern extraction
-        if let Some(bridge) = &self.learning_bridge {
-            // Collect all tools used across subtasks for task-level signal.
-            let all_tools: Vec<String> = contract
-                .subtasks
-                .iter()
-                .flat_map(|s| s.tools_used.iter().cloned())
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-            let outcome = build_outcome_signal(
-                &contract,
-                &report,
-                all_tools,
-                None, // user_rating — populated post-delivery feedback
-                contract.domain_hint.clone(),
-                contract.task_type.clone(),
-            );
-            let _ = bridge.learn_from_task_outcome(&outcome).await;
-
-            // Extract reusable template from successful contracts
-            if contract.status == ContractStatus::Completed {
-                let _ = bridge.extract_template(&contract, &report).await;
-            }
-        }
 
         Ok(report)
     }
@@ -5178,178 +4760,6 @@ mod tests {
         assert!(svc.deliver_task("x").await.is_err());
     }
 
-    // ── Learning Bridge Tests ──
-
-    #[tokio::test]
-    async fn noop_learning_bridge_is_safe() {
-        let bridge = NoopTaskLearningBridge;
-        let signal = TaskOutcomeSignal {
-            task_id: "t1".into(),
-            contract_id: "c1".into(),
-            goal: "test".into(),
-            success: true,
-            user_rating: Some(85),
-            tools_used: vec!["read_file".into(), "bash".into()],
-            subtask_outcomes: vec![],
-            total_verification_attempts: 1,
-            total_retries: 0,
-            total_turns: 5,
-            domain_hint: Some("code".into()),
-            task_type: Some("code".into()),
-        };
-        assert!(bridge.learn_from_task_outcome(&signal).await.is_ok());
-        assert!(
-            bridge
-                .suggest_tools("test", None, None)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(bridge.task_pattern_stats("test").await.unwrap().is_none());
-    }
-
-    #[test]
-    fn build_outcome_signal_from_contract_and_report() {
-        let contract = TaskContract {
-            contract_id: "c1".into(),
-            task_id: "t1".into(),
-            goal: "Implement auth".into(),
-            scope: TaskScope::default(),
-            subtasks: vec![
-                DurableSubtask {
-                    id: "s1".into(),
-                    title: "Add JWT".into(),
-                    stage: SubtaskStage::Verified,
-                    criteria: vec![VerificationCriterion {
-                        id: "v1".into(),
-                        description: "tests pass".into(),
-                        verifier: VerifierKind::Command {
-                            cmd: "cargo test".into(),
-                            expected_exit: 0,
-                        },
-                        required: true,
-                        timeout_sec: 60,
-                        global_only: false,
-                    }],
-                    retry_count: 1,
-                    files: vec!["src/auth.rs".into()],
-                    ..Default::default()
-                },
-                DurableSubtask {
-                    id: "s2".into(),
-                    title: "Add routes".into(),
-                    stage: SubtaskStage::Completed,
-                    retry_count: 0,
-                    ..Default::default()
-                },
-            ],
-            global_verification: vec![],
-            version: 1,
-            status: ContractStatus::Completed,
-            created_at: "2026-04-01".into(),
-            updated_at: "2026-04-01".into(),
-            domain_hint: None,
-            task_type: None,
-            last_global_results: Vec::new(),
-        };
-
-        let report = TaskDeliveryReport {
-            task_id: "t1".into(),
-            contract_id: "c1".into(),
-            goal: "Implement auth".into(),
-            subtask_summaries: vec![
-                SubtaskDeliverySummary {
-                    id: "s1".into(),
-                    title: "Add JWT".into(),
-                    stage: "verified".into(),
-                    criteria_passed: 1,
-                    criteria_total: 1,
-                    retry_count: 1,
-                },
-                SubtaskDeliverySummary {
-                    id: "s2".into(),
-                    title: "Add routes".into(),
-                    stage: "completed".into(),
-                    criteria_passed: 0,
-                    criteria_total: 0,
-                    retry_count: 0,
-                },
-            ],
-            global_verification: vec![],
-            total_turns: 10,
-            total_tokens: 50000,
-            total_verifications: 2,
-            risks: vec![],
-            timestamp: "2026-04-01".into(),
-        };
-
-        let signal = build_outcome_signal(
-            &contract,
-            &report,
-            vec!["read_file".into(), "bash".into(), "str_replace".into()],
-            Some(90),
-            Some("code".into()),
-            Some("code".into()),
-        );
-
-        assert!(signal.success);
-        assert_eq!(signal.user_rating, Some(90));
-        assert_eq!(signal.tools_used.len(), 3);
-        assert_eq!(signal.total_retries, 1);
-        assert_eq!(signal.subtask_outcomes.len(), 2);
-        assert!(signal.subtask_outcomes[0].success);
-        assert_eq!(signal.subtask_outcomes[0].retry_count, 1);
-        // s1 has 1 criterion, 1 passed → rate = 1.0
-        assert_eq!(signal.subtask_outcomes[0].verification_pass_rate, Some(1.0));
-        // s2 has 0 criteria → None
-        assert!(signal.subtask_outcomes[1].verification_pass_rate.is_none());
-    }
-
-    #[test]
-    fn task_outcome_signal_serde() {
-        let signal = TaskOutcomeSignal {
-            task_id: "t1".into(),
-            contract_id: "c1".into(),
-            goal: "test".into(),
-            success: true,
-            user_rating: None,
-            tools_used: vec!["bash".into()],
-            subtask_outcomes: vec![SubtaskOutcomeSignal {
-                subtask_id: "s1".into(),
-                title: "sub".into(),
-                success: true,
-                retry_count: 0,
-                tools_used: vec![],
-                verification_pass_rate: Some(1.0),
-                files_modified: vec!["a.rs".into()],
-            }],
-            total_verification_attempts: 1,
-            total_retries: 0,
-            total_turns: 3,
-            domain_hint: None,
-            task_type: None,
-        };
-        let json = serde_json::to_string(&signal).unwrap();
-        let parsed: TaskOutcomeSignal = serde_json::from_str(&json).unwrap();
-        assert!(parsed.success);
-        assert_eq!(parsed.subtask_outcomes.len(), 1);
-    }
-
-    #[test]
-    fn task_pattern_stats_serde() {
-        let stats = TaskPatternStats {
-            pattern: "rust-feature".into(),
-            total_attempts: 10,
-            success_rate: 0.8,
-            avg_retries: 0.5,
-            avg_turns: 12.0,
-            avg_verification_pass_rate: 0.95,
-        };
-        let json = serde_json::to_string(&stats).unwrap();
-        let parsed: TaskPatternStats = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.total_attempts, 10);
-    }
-
     // ── MockBranchOps for git4data integration tests ──
 
     use std::sync::Mutex;
@@ -6335,196 +5745,6 @@ mod tests {
         assert!(ctx.session_id.is_none());
     }
 
-    // ─── Learning Bridge Integration Tests ──────────────────────────────────
-
-    /// A mock learning bridge that records all calls for assertion.
-    struct RecordingLearningBridge {
-        verification_calls: std::sync::Mutex<Vec<VerificationLearningSignal>>,
-        outcome_calls: std::sync::Mutex<Vec<TaskOutcomeSignal>>,
-        template_calls: std::sync::Mutex<Vec<String>>,
-    }
-
-    impl RecordingLearningBridge {
-        fn new() -> Self {
-            Self {
-                verification_calls: std::sync::Mutex::new(Vec::new()),
-                outcome_calls: std::sync::Mutex::new(Vec::new()),
-                template_calls: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl TaskLearningBridge for RecordingLearningBridge {
-        async fn learn_from_task_outcome(&self, signal: &TaskOutcomeSignal) -> Result<(), String> {
-            self.outcome_calls
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(signal.clone());
-            Ok(())
-        }
-        async fn extract_template(
-            &self,
-            contract: &TaskContract,
-            _report: &TaskDeliveryReport,
-        ) -> Result<Option<String>, String> {
-            self.template_calls
-                .lock()
-                .unwrap()
-                .push(contract.goal.clone());
-            Ok(Some("mock-template".into()))
-        }
-        async fn suggest_tools(
-            &self,
-            _: &str,
-            _: Option<&str>,
-            _: Option<&str>,
-        ) -> Result<Vec<String>, String> {
-            Ok(vec![])
-        }
-        async fn task_pattern_stats(&self, _: &str) -> Result<Option<TaskPatternStats>, String> {
-            Ok(None)
-        }
-        async fn learn_from_verification(
-            &self,
-            signal: &VerificationLearningSignal,
-        ) -> Result<(), String> {
-            self.verification_calls
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(signal.clone());
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn verify_subtask_invokes_learning_bridge() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let work = tmp.path().join("work");
-        std::fs::create_dir_all(&work).unwrap();
-        let mut svc = LocalDurableTaskLifecycle::new(tmp.path().join("data"), work.clone());
-
-        let recorder = std::sync::Arc::new(RecordingLearningBridge::new());
-        svc.set_learning_bridge(recorder.clone());
-
-        // Create contract with a FileExists criterion
-        let plan = make_test_plan();
-        let mut contract = svc
-            .create_contract("u", "s", "test learning", &plan, TaskScope::default())
-            .await
-            .unwrap();
-
-        // Add a criterion that will pass
-        let target = work.join("output.txt");
-        std::fs::write(&target, "hello").unwrap();
-        // Also create test.txt — now generated from acceptance_checks
-        std::fs::write(work.join("test.txt"), "").unwrap();
-        contract.subtasks[0].criteria.push(VerificationCriterion {
-            id: "file-check".into(),
-            description: "output.txt exists".into(),
-            verifier: VerifierKind::FileExists {
-                paths: vec![target.to_string_lossy().to_string()],
-            },
-            required: true,
-            timeout_sec: 30,
-            global_only: false,
-        });
-        svc.save_local(&contract).unwrap();
-
-        // Execute subtask lifecycle
-        svc.begin_subtask(&contract.task_id, "sub-1").await.unwrap();
-        svc.complete_subtask_execution(&contract.task_id, "sub-1")
-            .await
-            .unwrap();
-
-        // Verify should trigger learning
-        let report = svc
-            .verify_subtask(&contract.task_id, "sub-1")
-            .await
-            .unwrap();
-        assert!(report.all_required_passed);
-
-        // Check that learning bridge was called
-        let calls = recorder
-            .verification_calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(calls.len(), 1, "learning bridge should be called once");
-        assert_eq!(calls[0].subtask_id, "sub-1");
-        assert!(calls[0].all_passed);
-        assert_eq!(calls[0].attempt, 1);
-        assert!(!calls[0].criteria_results.is_empty());
-    }
-
-    #[tokio::test]
-    async fn deliver_task_invokes_learning_bridge() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let work = tmp.path().join("work");
-        std::fs::create_dir_all(&work).unwrap();
-        let mut svc = LocalDurableTaskLifecycle::new(tmp.path().join("data"), work.clone());
-
-        let recorder = std::sync::Arc::new(RecordingLearningBridge::new());
-        svc.set_learning_bridge(recorder.clone());
-
-        let plan = make_test_plan();
-        let contract = svc
-            .create_contract(
-                "u",
-                "s",
-                "deliver learning test",
-                &plan,
-                TaskScope::default(),
-            )
-            .await
-            .unwrap();
-
-        // Create test.txt so sub-1's FileExists criterion passes
-        std::fs::write(work.join("test.txt"), "").unwrap();
-
-        // Complete sub-1 and verify (has criteria from acceptance_checks)
-        svc.begin_subtask(&contract.task_id, "sub-1").await.unwrap();
-        svc.complete_subtask_execution(&contract.task_id, "sub-1")
-            .await
-            .unwrap();
-        let _ = svc
-            .verify_subtask(&contract.task_id, "sub-1")
-            .await
-            .unwrap();
-
-        // Complete sub-2 (no criteria → auto-verified)
-        svc.begin_subtask(&contract.task_id, "sub-2").await.unwrap();
-        svc.complete_subtask_execution(&contract.task_id, "sub-2")
-            .await
-            .unwrap();
-
-        let report = svc.deliver_task(&contract.task_id).await.unwrap();
-        assert_eq!(report.goal, "deliver learning test");
-
-        // Check that outcome learning was called
-        let outcome_calls = recorder
-            .outcome_calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(
-            outcome_calls.len(),
-            1,
-            "learn_from_task_outcome should be called"
-        );
-        assert!(outcome_calls[0].success);
-        assert_eq!(outcome_calls[0].goal, "deliver learning test");
-
-        // Check that template extraction was called
-        let template_calls = recorder
-            .template_calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(
-            template_calls.len(),
-            1,
-            "extract_template should be called for completed contracts"
-        );
-    }
-
     // ─── parse_test_output tests ────────────────────────────────────────────
 
     #[test]
@@ -7053,183 +6273,6 @@ Time:        3.456 s
         let text = "This is just a plain description with no file references";
         let paths = extract_paths_from_text(text);
         assert!(paths.is_empty());
-    }
-
-    // ─── build_outcome_signal tests ─────────────────────────────────────────
-
-    #[test]
-    fn build_outcome_signal_basic() {
-        let contract = TaskContract {
-            contract_id: "c1".into(),
-            task_id: "t1".into(),
-            goal: "Implement auth".into(),
-            scope: TaskScope::default(),
-            subtasks: vec![
-                DurableSubtask {
-                    id: "s1".into(),
-                    title: "Auth module".into(),
-                    stage: SubtaskStage::Completed,
-                    criteria: vec![VerificationCriterion {
-                        id: "cr1".into(),
-                        description: "build passes".into(),
-                        verifier: VerifierKind::BuildPass { cmd: "true".into() },
-                        required: true,
-                        timeout_sec: 30,
-                        global_only: false,
-                    }],
-                    files: vec!["src/auth.rs".into()],
-                    ..DurableSubtask::default()
-                },
-                DurableSubtask {
-                    id: "s2".into(),
-                    title: "Tests".into(),
-                    stage: SubtaskStage::Completed,
-                    criteria: vec![],
-                    ..DurableSubtask::default()
-                },
-            ],
-            global_verification: vec![],
-            version: 1,
-            status: ContractStatus::Completed,
-            created_at: "now".into(),
-            updated_at: "now".into(),
-            domain_hint: None,
-            task_type: None,
-            last_global_results: Vec::new(),
-        };
-        let report = TaskDeliveryReport {
-            task_id: "t1".into(),
-            contract_id: "c1".into(),
-            goal: "Implement auth".into(),
-            subtask_summaries: vec![
-                SubtaskDeliverySummary {
-                    id: "s1".into(),
-                    title: "Auth module".into(),
-                    stage: "completed".into(),
-                    criteria_passed: 1,
-                    criteria_total: 1,
-                    retry_count: 0,
-                },
-                SubtaskDeliverySummary {
-                    id: "s2".into(),
-                    title: "Tests".into(),
-                    stage: "completed".into(),
-                    criteria_passed: 0,
-                    criteria_total: 0,
-                    retry_count: 0,
-                },
-            ],
-            global_verification: vec![],
-            total_turns: 5,
-            total_tokens: 10000,
-            total_verifications: 1,
-            risks: vec![],
-            timestamp: "now".into(),
-        };
-
-        let signal =
-            build_outcome_signal(&contract, &report, vec!["bash".into()], None, None, None);
-        assert!(signal.success);
-        assert_eq!(signal.goal, "Implement auth");
-        assert_eq!(signal.subtask_outcomes.len(), 2);
-        assert_eq!(signal.tools_used, vec!["bash"]);
-        assert_eq!(signal.total_turns, 5);
-
-        // s1 has 1 criterion, all passed → pass_rate = 1.0
-        let s1 = &signal.subtask_outcomes[0];
-        assert!(s1.success);
-        assert!((s1.verification_pass_rate.unwrap() - 1.0).abs() < 0.001);
-        assert_eq!(s1.files_modified, vec!["src/auth.rs"]);
-
-        // s2 has no criteria → pass_rate = None
-        let s2 = &signal.subtask_outcomes[1];
-        assert!(s2.verification_pass_rate.is_none());
-    }
-
-    #[test]
-    fn build_outcome_signal_failure_case() {
-        let contract = TaskContract {
-            contract_id: "c2".into(),
-            task_id: "t2".into(),
-            goal: "Fix bug".into(),
-            scope: TaskScope::default(),
-            subtasks: vec![DurableSubtask {
-                id: "s1".into(),
-                title: "Fix".into(),
-                stage: SubtaskStage::Abandoned {
-                    reason: "too hard".into(),
-                },
-                retry_count: 2,
-                criteria: vec![
-                    VerificationCriterion {
-                        id: "cr1".into(),
-                        description: "build".into(),
-                        verifier: VerifierKind::BuildPass { cmd: "true".into() },
-                        required: true,
-                        timeout_sec: 30,
-                        global_only: false,
-                    },
-                    VerificationCriterion {
-                        id: "cr2".into(),
-                        description: "test".into(),
-                        verifier: VerifierKind::TestPass {
-                            cmd: "true".into(),
-                            min_pass_rate: 1.0,
-                        },
-                        required: true,
-                        timeout_sec: 30,
-                        global_only: false,
-                    },
-                ],
-                ..DurableSubtask::default()
-            }],
-            global_verification: vec![],
-            version: 1,
-            status: ContractStatus::Active,
-            created_at: "now".into(),
-            updated_at: "now".into(),
-            domain_hint: None,
-            task_type: None,
-            last_global_results: Vec::new(),
-        };
-        let report = TaskDeliveryReport {
-            task_id: "t2".into(),
-            contract_id: "c2".into(),
-            goal: "Fix bug".into(),
-            subtask_summaries: vec![SubtaskDeliverySummary {
-                id: "s1".into(),
-                title: "Fix".into(),
-                stage: "abandoned".into(),
-                criteria_passed: 1,
-                criteria_total: 2,
-                retry_count: 2,
-            }],
-            global_verification: vec![],
-            total_turns: 10,
-            total_tokens: 20000,
-            total_verifications: 3,
-            risks: vec![],
-            timestamp: "now".into(),
-        };
-
-        let signal = build_outcome_signal(
-            &contract,
-            &report,
-            vec![],
-            Some(30),
-            Some("code".into()),
-            None,
-        );
-        assert!(!signal.success, "abandoned task should not be success");
-        assert_eq!(signal.total_retries, 2);
-        assert_eq!(signal.user_rating, Some(30));
-        assert_eq!(signal.domain_hint, Some("code".into()));
-
-        let s1 = &signal.subtask_outcomes[0];
-        assert!(!s1.success);
-        assert_eq!(s1.retry_count, 2);
-        // 1 passed out of 2 criteria → 0.5
-        assert!((s1.verification_pass_rate.unwrap() - 0.5).abs() < 0.001);
     }
 
     // ─── truncate tests ─────────────────────────────────────────────────────

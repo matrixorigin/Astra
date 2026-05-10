@@ -484,12 +484,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         &boost_terms,
     );
 
-    let learned_context = ctx
-        .selector
-        .learned_context(semantic_query_str, ctx.recent_tools);
-    let learned_context_hint = learned_context.prompt_fragment();
-    let learned_task_type = learned_context.task_archetype_payload_token();
-
     // Skill activation is handled exclusively by the `skill` tool in the agentic loop
     // (see turn/skill_tool.rs + partition_and_execute_skills). The model decides when
     // to invoke skills by calling the tool, rather than having skills pre-injected by
@@ -522,10 +516,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             ctx.previous_confidence_fallback.clone(),
         );
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Thinking…");
-        let sel_result = ctx
-            .selector
-            .select_with_learned_context(&sel_ctx, &learned_context)
-            .await;
+        let sel_result = ctx.selector.select(&sel_ctx).await;
         let sel_latency_ms = sel_start.elapsed().as_millis() as u64;
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Loading schemas…");
         record_first_selector_latency_and_strategy(
@@ -580,10 +571,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         );
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Thinking…");
         let sel_start = Instant::now();
-        let sel_result = ctx
-            .selector
-            .select_with_learned_context(&sel_ctx, &learned_context)
-            .await;
+        let sel_result = ctx.selector.select(&sel_ctx).await;
         let sel_latency_ms = sel_start.elapsed().as_millis() as u64;
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Loading schemas…");
         accumulate_selector_token_usage(
@@ -654,29 +642,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     );
     ctx.executor.set_budget_pressure(budget_pressure);
 
-    // User scenario for scenario-tagged hint filtering. We take a
-    // brief read lock on the observability session, extract the
-    // stable `{:?}` token, and drop the lock before the payload
-    // mutation — the hint-filter code only needs the token string.
-    let user_scenario_token: Option<String> = ctx
-        .executor
-        .observability_session
-        .as_ref()
-        .and_then(|lock| lock.read().ok())
-        .and_then(|s| {
-            s.current_scenario()
-                .map(|sc| format!("{sc:?}").to_ascii_lowercase())
-        });
-
     apply_selector_hints_then_attach_filtered_edge_tools(
         &mut payload,
         turn_schemas,
         ctx.restricted_tools,
         ctx.telem.first_selection_report.as_ref(),
         selection_confidence,
-        learned_context_hint.as_str(),
-        learned_task_type.as_deref(),
-        user_scenario_token.as_deref(),
+        None,
     );
     *ctx.turn_policy = turn_policy_from_payload_edge_tools(&payload, ctx.interaction_mode);
     log_chat_turn_timing_phase(timing, "skill_merge_attach_edge_tools", &mut mark);

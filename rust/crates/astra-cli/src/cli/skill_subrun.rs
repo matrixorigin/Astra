@@ -233,9 +233,7 @@ impl AgenticLoopHost for SubRunHost {
             &mut state.restricted_tools,
             None,  // no selection report
             0.5,   // neutral confidence
-            "",    // no learned context
             None,  // no learned task type
-            None,  // skill subruns have no attached user scenario context
         );
         state.last_turn_policy = turn_policy_from_payload_edge_tools(&payload, interaction_mode);
 
@@ -668,7 +666,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
-            evolution_service: None,
             rate_limit_cooldown: Default::default(),
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -689,7 +686,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             tactical_adapter: None,
             step_signal_collector: None,
             tool_budget_override: None,
-            pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
@@ -846,8 +842,6 @@ mod tests {
             &mut restricted_tools,
             None,
             0.5,
-            "",
-            None,
             None,
         );
 

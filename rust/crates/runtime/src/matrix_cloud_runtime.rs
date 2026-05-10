@@ -12,19 +12,10 @@ use tokio::task::JoinSet;
 
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::{
-    CloudTransport, SyncOrchestrator, SyncPolicy, TaskLeaseHoldCache, TaskRecord,
+    CloudTransport, SyncOrchestrator, TaskLeaseHoldCache, TaskRecord,
     event_ingestion::{self, IngestionConfig, IngestionEvent},
     session_journal::JournalEvent,
-    state_sync::{MatrixOneSyncService, PlanTemplateSyncRow, StateSyncService},
-};
-
-use crate::sync_adapters::{
-    EventAdapter, LearningAdapter, MatrixOneTransport, PreferenceAdapter, TaskAdapter,
-    TemplateAdapter,
-};
-use astra_evolution::persistence::ToolHealthEntry;
-use astra_pipeline::{
-    calibration::ProgressiveCalibrator, entity::EntityGraph, pattern::PatternLibrary,
+    state_sync::MatrixOneSyncService,
 };
 
 /// Max time to wait for the ingestion worker to finish during shutdown.
@@ -104,15 +95,11 @@ pub struct MatrixCloudRuntime {
     /// Live ingestion stats (events_received, events_flushed, errors).
     ingestion_stats: Arc<std::sync::Mutex<astra_services::event_ingestion::IngestionStats>>,
     sync_orchestrator: TokioMutex<SyncOrchestrator>,
-    /// Edge preference map (same `Arc` as [`PreferenceAdapter`] inside the orchestrator).
-    preference_store: Arc<Mutex<BTreeMap<String, String>>>,
-    /// Cached plan templates from last `pull_domain(Templates)`.
-    template_cache: Arc<Mutex<Vec<PlanTemplateSyncRow>>>,
-    /// Phase 3: shared with HTTP lease handlers and [`TaskAdapter`] (process-local export filter).
+    /// Phase 3: shared with HTTP lease handlers (process-local export filter).
     pub lease_hold_cache: Arc<TaskLeaseHoldCache>,
-    /// Phase 3: local task mirror, shared with [`TaskAdapter`] for push sync.
+    /// Phase 3: local task mirror.
     pub task_mirror: Arc<Mutex<BTreeMap<String, TaskRecord>>>,
-    /// Phase 3: dirty task IDs pending sync, shared with [`TaskAdapter`].
+    /// Phase 3: dirty task IDs pending sync.
     pub task_dirty: Arc<Mutex<HashSet<String>>>,
     edge_agent_id: Arc<str>,
     sync_service: Arc<MatrixOneSyncService>,
@@ -132,17 +119,14 @@ pub struct MatrixCloudRuntime {
 }
 
 impl MatrixCloudRuntime {
-    /// Wire ingestion worker and sync domains to an existing [`SharedPool`].
-    #[allow(clippy::too_many_arguments)]
+    /// Wire ingestion worker to an existing [`SharedPool`]. The
+    /// [`SyncOrchestrator`] is constructed bare (no adapters) since the
+    /// per-domain sync adapters (learning, events, templates, preferences,
+    /// tasks) were removed along with the self-evolution subsystem.
     pub fn attach(
         shared_pool: SharedPool,
-        profile: &str,
+        _profile: &str,
         user_id: &str,
-        entity_graph: Arc<Mutex<EntityGraph>>,
-        pattern_library: Arc<Mutex<PatternLibrary>>,
-        calibrator: Arc<Mutex<ProgressiveCalibrator>>,
-        tool_health: Arc<Mutex<Vec<ToolHealthEntry>>>,
-        cloud_learning_version: Option<i64>,
         lease_hold_cache: Arc<TaskLeaseHoldCache>,
     ) -> Self {
         let edge_agent_id: Arc<str> = std::env::var("ASTRA_EDGE_AGENT_ID")
@@ -159,44 +143,8 @@ impl MatrixCloudRuntime {
             pool,
             audit_flusher.writer.clone(),
         ));
-        let transport: Arc<dyn CloudTransport> = Arc::new(MatrixOneTransport::new(
-            sync_svc.clone() as Arc<dyn StateSyncService>,
-            profile.to_string(),
-            edge_agent_id.as_ref(),
-        ));
-        let mut orch = SyncOrchestrator::new(transport, user_id.to_string());
-        let learning_adapter =
-            LearningAdapter::new(entity_graph, pattern_library, calibrator, tool_health);
-        // NOTE: Do NOT mark_pulled without actually fetching and merging data.
-        // The cloud_learning_version hint is ignored here; proper sync should
-        // happen via the orchestrator's pull cycle after initialization.
-        let _ = cloud_learning_version; // suppress unused warning
-        orch.register(Box::new(learning_adapter), SyncPolicy::learning());
-
-        let preference_store = Arc::new(Mutex::new(BTreeMap::new()));
-        let template_cache = Arc::new(Mutex::new(Vec::<PlanTemplateSyncRow>::new()));
-
-        orch.register(
-            Box::new(EventAdapter::new(sender.clone())),
-            SyncPolicy::events(),
-        );
-        orch.register(
-            Box::new(TemplateAdapter::new(Arc::clone(&template_cache))),
-            SyncPolicy::templates(),
-        );
-        orch.register(
-            Box::new(PreferenceAdapter::new(Arc::clone(&preference_store))),
-            SyncPolicy::preferences(),
-        );
-        orch.register(
-            Box::new(TaskAdapter::new(
-                Arc::clone(&task_mirror),
-                Arc::clone(&task_dirty),
-                Arc::clone(&edge_agent_id),
-                Arc::clone(&lease_hold_cache),
-            )),
-            SyncPolicy::tasks(),
-        );
+        let transport: Arc<dyn CloudTransport> = Arc::new(astra_services::NoopTransport);
+        let orch = SyncOrchestrator::new(transport, user_id.to_string());
 
         Self {
             shared_pool,
@@ -206,8 +154,6 @@ impl MatrixCloudRuntime {
             session_sync_tasks: Mutex::new(JoinSet::new()),
             ingestion_stats,
             sync_orchestrator: TokioMutex::new(orch),
-            preference_store,
-            template_cache,
             lease_hold_cache,
             task_mirror,
             task_dirty,
@@ -288,14 +234,6 @@ impl MatrixCloudRuntime {
             model_name: resolved.model_name,
             provider: resolved.provider,
         })
-    }
-
-    pub fn preference_store(&self) -> Arc<Mutex<BTreeMap<String, String>>> {
-        Arc::clone(&self.preference_store)
-    }
-
-    pub fn template_cache(&self) -> Arc<Mutex<Vec<PlanTemplateSyncRow>>> {
-        Arc::clone(&self.template_cache)
     }
 
     pub fn edge_agent_id(&self) -> &str {
@@ -465,53 +403,9 @@ impl BridgePersistTracker for MatrixCloudRuntime {
     }
 }
 
-/// Build a [`SyncOrchestrator`] with all edge sync domains (tests / harness).
-#[allow(clippy::too_many_arguments)]
-pub fn build_sync_orchestrator_with_adapters(
-    transport: Arc<dyn CloudTransport>,
-    user_id: &str,
-    entity_graph: Arc<Mutex<EntityGraph>>,
-    pattern_library: Arc<Mutex<PatternLibrary>>,
-    calibrator: Arc<Mutex<ProgressiveCalibrator>>,
-    tool_health: Arc<Mutex<Vec<ToolHealthEntry>>>,
-    ingestion: astra_services::event_ingestion::IngestionSender,
-    lease_hold_cache: Arc<TaskLeaseHoldCache>,
-    task_mirror: Arc<Mutex<BTreeMap<String, TaskRecord>>>,
-    task_dirty: Arc<Mutex<HashSet<String>>>,
-    edge_agent_id: impl Into<Arc<str>>,
-) -> SyncOrchestrator {
-    let edge_agent_id: Arc<str> = edge_agent_id.into();
-    let mut orch = SyncOrchestrator::new(transport, user_id.to_string());
-    let learning_adapter =
-        LearningAdapter::new(entity_graph, pattern_library, calibrator, tool_health);
-    orch.register(Box::new(learning_adapter), SyncPolicy::learning());
-    let preference_store = Arc::new(Mutex::new(BTreeMap::new()));
-    let template_cache = Arc::new(Mutex::new(Vec::<PlanTemplateSyncRow>::new()));
-    orch.register(Box::new(EventAdapter::new(ingestion)), SyncPolicy::events());
-    orch.register(
-        Box::new(TemplateAdapter::new(Arc::clone(&template_cache))),
-        SyncPolicy::templates(),
-    );
-    orch.register(
-        Box::new(PreferenceAdapter::new(preference_store)),
-        SyncPolicy::preferences(),
-    );
-    orch.register(
-        Box::new(TaskAdapter::new(
-            Arc::clone(&task_mirror),
-            Arc::clone(&task_dirty),
-            Arc::clone(&edge_agent_id),
-            Arc::clone(&lease_hold_cache),
-        )),
-        SyncPolicy::tasks(),
-    );
-    orch
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_services::{NoopTransport, SyncDomain, event_ingestion::IngestionSender};
 
     #[test]
     fn matrix_settings_from_env_non_empty() {
@@ -522,37 +416,6 @@ mod tests {
         assert!(s.port > 0);
         assert!(!s.database.is_empty());
         unsafe { std::env::remove_var("MATRIXONE_PASSWORD") };
-    }
-
-    #[test]
-    fn noop_transport_orchestrator_registers_learning_and_events() {
-        let transport: Arc<dyn CloudTransport> = Arc::new(NoopTransport);
-        let lease = Arc::new(TaskLeaseHoldCache::default());
-        let mirror = Arc::new(Mutex::new(BTreeMap::new()));
-        let dirty = Arc::new(Mutex::new(HashSet::new()));
-        let eg = Arc::new(Mutex::new(EntityGraph::new()));
-        let pl = Arc::new(Mutex::new(PatternLibrary::new()));
-        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.7)));
-        let th = Arc::new(Mutex::new(vec![]));
-        let orch = build_sync_orchestrator_with_adapters(
-            transport,
-            "user-1",
-            eg,
-            pl,
-            cal,
-            th,
-            IngestionSender::disconnected(),
-            Arc::clone(&lease),
-            Arc::clone(&mirror),
-            Arc::clone(&dirty),
-            "test-edge",
-        );
-        let domains: Vec<SyncDomain> = orch.status_summary().into_iter().map(|(d, _)| d).collect();
-        assert!(domains.contains(&SyncDomain::Learning));
-        assert!(domains.contains(&SyncDomain::Events));
-        assert!(domains.contains(&SyncDomain::Templates));
-        assert!(domains.contains(&SyncDomain::Preferences));
-        assert!(domains.contains(&SyncDomain::Tasks));
     }
 
     #[test]

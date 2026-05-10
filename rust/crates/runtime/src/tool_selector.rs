@@ -38,17 +38,12 @@
 
 use crate::pipeline::routing::{DomainHint, RoutingEngine, TaskType, domain_hint_to_label};
 use crate::tool_registry::{self, TOOL_CATALOG, ToolQualityTracker, ToolRegistry};
-use astra_pipeline::calibration::ProgressiveCalibrator;
-use astra_pipeline::entity::{EntityGraph, extract_entities};
-use astra_pipeline::pattern::PatternLibrary;
 use astra_thin_client::ThinClient;
 use astra_turn_core::routing_metrics::ConfidenceCalibrator;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-const MIN_LEARNED_ENTITY_CONFIDENCE: f64 = 0.30;
 
 /// Timeout for LLM-based tool selection requests.
 const TOOL_SELECT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -98,56 +93,6 @@ pub struct SelectionContext<'a> {
         Option<astra_turn_core::confidence_contract::ConfidenceFallback>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LearnedContext {
-    pub task_archetype: Option<TaskType>,
-    pub entity_hints: Vec<String>,
-    pub pattern_hints: Vec<String>,
-    pub calibration_hints: Vec<String>,
-    pub tool_hints: Vec<String>,
-}
-
-impl LearnedContext {
-    pub fn is_empty(&self) -> bool {
-        self.task_archetype.is_none()
-            && self.entity_hints.is_empty()
-            && self.pattern_hints.is_empty()
-            && self.calibration_hints.is_empty()
-            && self.tool_hints.is_empty()
-    }
-
-    /// Lowercase `Debug` token for `/chat` payload (`learned_task_type` hint).
-    #[must_use]
-    pub fn task_archetype_payload_token(&self) -> Option<String> {
-        self.task_archetype.map(|t| format!("{t:?}").to_lowercase())
-    }
-
-    pub fn prompt_fragment(&self) -> String {
-        if self.is_empty() {
-            return String::new();
-        }
-
-        let mut parts = Vec::new();
-        if let Some(task_type) = self.task_archetype {
-            parts.push(format!("Task:{task_type:?}"));
-        }
-        // Limit entity/pattern/calibration hints to 2 each for token efficiency
-        for entity in self.entity_hints.iter().take(2) {
-            parts.push(entity.clone());
-        }
-        for pattern in self.pattern_hints.iter().take(2) {
-            parts.push(pattern.clone());
-        }
-        for hint in self.calibration_hints.iter().take(2) {
-            parts.push(hint.clone());
-        }
-        for hint in self.tool_hints.iter().take(2) {
-            parts.push(hint.clone());
-        }
-        format!("Context hints: {}", parts.join(" | "))
-    }
-}
-
 /// Result of tool selection.
 #[derive(Debug, Clone)]
 pub struct SelectionResult {
@@ -191,18 +136,6 @@ impl Default for SelectionResult {
 pub trait ToolSelector: Send + Sync {
     async fn select(&self, ctx: &SelectionContext<'_>) -> SelectionResult;
 
-    async fn select_with_learned_context(
-        &self,
-        ctx: &SelectionContext<'_>,
-        _learned_context: &LearnedContext,
-    ) -> SelectionResult {
-        self.select(ctx).await
-    }
-
-    fn learned_context(&self, _query: &str, _recent_tools: &[String]) -> LearnedContext {
-        LearnedContext::default()
-    }
-
     /// Access the underlying tool registry for schema/cost queries.
     /// Returns the default registry if the selector doesn't own one.
     fn registry(&self) -> &ToolRegistry {
@@ -212,7 +145,7 @@ pub trait ToolSelector: Send + Sync {
     }
 
     /// Record the outcome of a turn for progressive learning.
-    /// Default is no-op — only TfIdfSelector (with pipeline modules) learns.
+    /// Default is no-op.
     #[allow(clippy::too_many_arguments)]
     fn record_outcome(
         &self,
@@ -232,10 +165,6 @@ pub trait ToolSelector: Send + Sync {
 
 /// Fast heuristic selector using TF-IDF scoring. No LLM call.
 /// Wraps [`ToolRegistry`] — ConversationState is an internal detail.
-///
-/// When pipeline modules are present (EntityGraph, PatternLibrary,
-/// ProgressiveCalibrator), uses RoutingEngine for enriched routing
-/// that improves over time.
 pub struct TfIdfSelector {
     registry: ToolRegistry,
     /// Session-scoped quality tracker. When present, historical tool effectiveness
@@ -244,15 +173,6 @@ pub struct TfIdfSelector {
     /// Session-scoped confidence calibrator. When present, adjusts score thresholds
     /// based on historical correction rates per intent type.
     confidence_calibrator: Option<Arc<ConfidenceCalibrator>>,
-    /// Entity knowledge graph. When present, extracts entities from queries and
-    /// uses learned domain associations to boost relevant tools.
-    entity_graph: Option<Arc<Mutex<EntityGraph>>>,
-    /// Tool chain pattern library. When present, suggests tools from historically
-    /// successful patterns for the detected task type.
-    pattern_library: Option<Arc<Mutex<PatternLibrary>>>,
-    /// Progressive 3-axis calibrator. When present, replaces the single-axis
-    /// ConfidenceCalibrator with per-intent × per-domain × per-task calibration.
-    progressive_calibrator: Option<Arc<Mutex<ProgressiveCalibrator>>>,
 }
 
 fn routing_memory_hints_for_selection(
@@ -283,9 +203,6 @@ impl TfIdfSelector {
             registry,
             quality_tracker: None,
             confidence_calibrator: None,
-            entity_graph: None,
-            pattern_library: None,
-            progressive_calibrator: None,
         }
     }
 
@@ -299,24 +216,6 @@ impl TfIdfSelector {
         self
     }
 
-    pub fn with_entity_graph(mut self, graph: Arc<Mutex<EntityGraph>>) -> Self {
-        self.entity_graph = Some(graph);
-        self
-    }
-
-    pub fn with_pattern_library(mut self, library: Arc<Mutex<PatternLibrary>>) -> Self {
-        self.pattern_library = Some(library);
-        self
-    }
-
-    pub fn with_progressive_calibrator(
-        mut self,
-        calibrator: Arc<Mutex<ProgressiveCalibrator>>,
-    ) -> Self {
-        self.progressive_calibrator = Some(calibrator);
-        self
-    }
-
     pub fn registry(&self) -> &ToolRegistry {
         &self.registry
     }
@@ -326,274 +225,22 @@ impl TfIdfSelector {
         self.quality_tracker.as_ref()
     }
 
-    /// Compute entity boost terms from the EntityGraph.
-    fn entity_boost_terms(&self, query: &str) -> Vec<String> {
-        let graph = match &self.entity_graph {
-            Some(eg) => match eg.lock() {
-                Ok(g) => g,
-                Err(e) => e.into_inner(),
-            },
-            None => return Vec::new(),
-        };
-
-        let entities = extract_entities(query);
-        let mut terms = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for entity in &entities {
-            for term in graph.boost_for(entity) {
-                if seen.insert(term.clone()) {
-                    terms.push(term);
-                }
-            }
-        }
-        terms
-    }
-
-    /// Compute pattern boost terms from the PatternLibrary.
-    fn pattern_boost_terms(&self, task_type: TaskType, domain: Option<DomainHint>) -> Vec<String> {
-        let lib = match &self.pattern_library {
-            Some(pl) => match pl.lock() {
-                Ok(l) => l,
-                Err(e) => e.into_inner(),
-            },
-            None => return Vec::new(),
-        };
-        lib.boost_terms_for(task_type, domain)
-    }
-
-    fn summarize_learned_context(&self, query: &str) -> LearnedContext {
-        let entity_boost = self.entity_boost_terms(query);
-        let routing = RoutingEngine::analyze(query, 1, &[], &[], entity_boost);
-        let mut learned = LearnedContext {
-            task_archetype: Some(routing.task_type),
-            entity_hints: Vec::new(),
-            pattern_hints: Vec::new(),
-            calibration_hints: Vec::new(),
-            tool_hints: Vec::new(),
-        };
-
-        if let Some(graph) = &self.entity_graph {
-            let graph = match graph.lock() {
-                Ok(g) => g,
-                Err(e) => e.into_inner(),
-            };
-            for entity in extract_entities(query).into_iter().take(3) {
-                if let Some(knowledge) = graph.get(&entity) {
-                    let confidence = knowledge.decayed_confidence();
-                    if confidence < MIN_LEARNED_ENTITY_CONFIDENCE {
-                        continue;
-                    }
-                    let domain = knowledge
-                        .domain
-                        .map(|d| format!("{d:?}"))
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let tools = if knowledge.associated_tools.is_empty() {
-                        "no learned tools yet".to_string()
-                    } else {
-                        knowledge
-                            .associated_tools
-                            .iter()
-                            .take(3)
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    };
-                    learned.entity_hints.push(format!(
-                        "Entity '{entity}' is associated with domain {domain} and tools [{tools}] (confidence {:.2})",
-                        confidence
-                    ));
-                }
-            }
-        }
-
-        if let Some(patterns) = &self.pattern_library {
-            let patterns = match patterns.lock() {
-                Ok(p) => p,
-                Err(e) => e.into_inner(),
-            };
-            for pattern in patterns.top_patterns(routing.task_type, routing.domain_hint, 2) {
-                learned.pattern_hints.push(format!(
-                    "Successful tool chain for {:?}/{:?}: {} (success {:.0}%, quality {:.2})",
-                    pattern.task_type,
-                    pattern.domain,
-                    pattern.tools.join(" -> "),
-                    pattern.success_rate() * 100.0,
-                    pattern.avg_quality()
-                ));
-            }
-        }
-
-        if let Some(calibrator) = &self.progressive_calibrator {
-            let calibrator = match calibrator.lock() {
-                Ok(c) => c,
-                Err(e) => e.into_inner(),
-            };
-            let intent = format!("{:?}", routing.task_type).to_lowercase();
-            let mut calibration_candidates = Vec::new();
-
-            if let Some(stats) = calibrator.intent_stats(&intent)
-                && stats.has_enough_data()
-                && stats.correction_rate() >= 0.30
-            {
-                calibration_candidates.push((
-                    stats.correction_rate(),
-                    format!(
-                        "Calibration risk: intent '{intent}' needed correction {:.0}% of the time across {} observations",
-                        stats.correction_rate() * 100.0,
-                        stats.total
-                    ),
-                ));
-            }
-            if let Some(domain) = routing.domain_hint
-                && let Some(stats) = calibrator.domain_stats(domain)
-                && stats.has_enough_data()
-                && stats.correction_rate() >= 0.30
-            {
-                calibration_candidates.push((
-                    stats.correction_rate(),
-                    format!(
-                        "Calibration risk: domain {domain:?} needed correction {:.0}% of the time across {} observations",
-                        stats.correction_rate() * 100.0,
-                        stats.total
-                    ),
-                ));
-            }
-            if let Some(stats) = calibrator.task_stats(routing.task_type)
-                && stats.has_enough_data()
-                && stats.correction_rate() >= 0.30
-            {
-                calibration_candidates.push((
-                    stats.correction_rate(),
-                    format!(
-                        "Calibration risk: task {:?} needed correction {:.0}% of the time across {} observations",
-                        routing.task_type,
-                        stats.correction_rate() * 100.0,
-                        stats.total
-                    ),
-                ));
-            }
-            calibration_candidates
-                .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            learned.calibration_hints.extend(
-                calibration_candidates
-                    .into_iter()
-                    .take(2)
-                    .map(|(_, hint)| hint),
-            );
-        }
-
-        if let Some(tracker) = &self.quality_tracker {
-            let tracker = match tracker.lock() {
-                Ok(t) => t,
-                Err(e) => e.into_inner(),
-            };
-            let mut entries: Vec<_> = tracker
-                .all_entries()
-                .iter()
-                .filter(|(_, entry)| entry.selections >= 3)
-                .map(|(tool, entry)| (tool.as_str(), entry.boost_factor(), entry))
-                .collect();
-            entries.sort_by(|a, b| {
-                let lhs = (a.1 - 1.0).abs();
-                let rhs = (b.1 - 1.0).abs();
-                rhs.partial_cmp(&lhs).unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            let mut pushed_positive = false;
-            let mut pushed_negative = false;
-            for (tool, boost, entry) in entries {
-                if !pushed_positive && boost > 1.05 {
-                    learned.tool_hints.push(format!(
-                        "Tool history: prefer '{tool}' (use-rate {:.0}%, avg quality {:.2})",
-                        entry.use_rate() * 100.0,
-                        entry.avg_quality()
-                    ));
-                    pushed_positive = true;
-                } else if !pushed_negative && boost < 0.95 {
-                    learned.tool_hints.push(format!(
-                        "Tool history: be cautious with '{tool}' (use-rate {:.0}%, avg quality {:.2})",
-                        entry.use_rate() * 100.0,
-                        entry.avg_quality()
-                    ));
-                    pushed_negative = true;
-                }
-
-                if pushed_positive && pushed_negative {
-                    break;
-                }
-            }
-        }
-
-        if learned.entity_hints.is_empty()
-            && learned.pattern_hints.is_empty()
-            && learned.calibration_hints.is_empty()
-            && learned.tool_hints.is_empty()
-        {
-            learned.task_archetype = None;
-        }
-
-        learned
-    }
-
     /// Record the outcome of a turn for learning.
     ///
-    /// Call this after a turn completes to update:
-    /// - EntityGraph: entity → domain → tools associations
-    /// - PatternLibrary: tool chain success/failure patterns
-    /// - ProgressiveCalibrator: per-intent/domain/task correction rates
+    /// Updates the [`ToolQualityTracker`] (if wired) with per-tool success/
+    /// quality scores. Entity/pattern/calibration learning has been removed.
     #[allow(clippy::too_many_arguments)]
     pub fn record_turn_outcome(
         &self,
-        query: &str,
+        _query: &str,
         tools_used: &[String],
-        task_type: TaskType,
-        domain: Option<DomainHint>,
+        _task_type: TaskType,
+        _domain: Option<DomainHint>,
         success: bool,
         quality: f64,
-        was_corrected: bool,
-        user_feedback_score: Option<i64>,
+        _was_corrected: bool,
+        _user_feedback_score: Option<i64>,
     ) {
-        // Learn entity → domain → tools associations
-        if success
-            && let Some(eg) = &self.entity_graph
-            && let Ok(mut graph) = eg.lock()
-        {
-            let entities = extract_entities(query);
-            if let Some(d) = domain {
-                for entity in &entities {
-                    graph.learn(entity, d, tools_used, user_feedback_score);
-                }
-            }
-        }
-
-        // Record tool chain pattern
-        if let Some(pl) = &self.pattern_library
-            && let Ok(mut lib) = pl.lock()
-        {
-            lib.record_outcome(
-                tools_used,
-                task_type,
-                domain,
-                success,
-                quality,
-                user_feedback_score,
-            );
-        }
-
-        // Record calibration data
-        if let Some(pc) = &self.progressive_calibrator
-            && let Ok(mut cal) = pc.lock()
-        {
-            let intent = format!("{task_type:?}").to_lowercase();
-            cal.record(
-                &intent,
-                domain,
-                task_type,
-                was_corrected,
-                user_feedback_score,
-            );
-        }
-
         // Record tool usage feedback → ToolQualityTracker
         if let Some(qt) = &self.quality_tracker
             && let Ok(mut guard) = qt.lock()
@@ -626,10 +273,6 @@ impl ToolSelector for TfIdfSelector {
         &self.registry
     }
 
-    fn learned_context(&self, query: &str, _recent_tools: &[String]) -> LearnedContext {
-        self.summarize_learned_context(query)
-    }
-
     async fn select(&self, ctx: &SelectionContext<'_>) -> SelectionResult {
         // Fast path: with all tools pinned (0 dynamic), skip the entire
         // scoring/ranking pipeline and return all schemas directly.
@@ -646,14 +289,8 @@ impl ToolSelector for TfIdfSelector {
             };
         }
 
-        // ── Phase 1: Gather boost terms from pipeline modules ──
-        let entity_boost = self.entity_boost_terms(ctx.query);
-        let all_boost: Vec<String> = ctx
-            .boost_terms
-            .iter()
-            .chain(entity_boost.iter())
-            .cloned()
-            .collect();
+        // ── Phase 1: Gather boost terms from the caller-provided context ──
+        let all_boost: Vec<String> = ctx.boost_terms.clone();
         let routing_memory_hints = routing_memory_hints_for_selection(ctx, &all_boost);
 
         // ── Phase 2: Compute unified routing decision ──
@@ -665,23 +302,13 @@ impl ToolSelector for TfIdfSelector {
             all_boost.clone(),
         );
 
-        // ── Phase 3: Add pattern boost terms (needs task_type from routing) ──
-        let pattern_boost = self.pattern_boost_terms(routing.task_type, routing.domain_hint);
-
-        // ── Phase 3b: Compute co-occurrence scores from learned patterns ──
-        let co_occurrence = self
-            .pattern_library
-            .as_ref()
-            .and_then(|pl| pl.lock().ok())
-            .map(|lib| {
-                lib.co_occurrence_scores(
-                    &ctx.recent_tools
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .unwrap_or_default();
+        // Pattern-boost / co-occurrence hint slots — currently unused.
+        // `SelectionContext::boost_terms` is the live boost channel; these
+        // two were once populated from runtime learning and are now empty
+        // placeholders preserved for the scoring function signature.
+        let pattern_boost: Vec<String> = Vec::new();
+        let co_occurrence: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
 
         // ── Phase 4: Select tools via RoutingDecision path ──
         // Apply budget pressure: reduce effective budget under token pressure.
@@ -850,19 +477,11 @@ Return ONLY a JSON array of tool names. Select 1-5 items total. Do not explain.
 Pinned tools (bash, read_file, str_replace) are always available — do NOT include them.
 Only select from the dynamic tools listed below. The list is executable registry tools only — never output Agent Skill names (skills use the separate `skill` tool in the main agent loop).";
 
-fn build_tool_select_prompt(
-    query: &str,
-    recent_tools: &[String],
-    learned_context: &LearnedContext,
-    catalog: &str,
-) -> Vec<Value> {
+fn build_tool_select_prompt(query: &str, recent_tools: &[String], catalog: &str) -> Vec<Value> {
     let system = format!("{}\n\nDynamic tools:\n{}", TOOL_SELECT_SYSTEM, catalog);
     let mut user_msg = format!("Query: {}", query);
     if !recent_tools.is_empty() {
         user_msg.push_str(&format!("\nRecently used: {:?}", recent_tools));
-    }
-    if !learned_context.is_empty() {
-        user_msg.push_str(&format!("\n{}", learned_context.prompt_fragment()));
     }
     vec![
         serde_json::json!({"role": "system", "content": system}),
@@ -1005,21 +624,7 @@ impl LlmToolSelector {
 #[async_trait]
 impl ToolSelector for LlmToolSelector {
     async fn select(&self, ctx: &SelectionContext<'_>) -> SelectionResult {
-        self.select_with_learned_context(ctx, &LearnedContext::default())
-            .await
-    }
-
-    async fn select_with_learned_context(
-        &self,
-        ctx: &SelectionContext<'_>,
-        learned_context: &LearnedContext,
-    ) -> SelectionResult {
-        let messages = build_tool_select_prompt(
-            ctx.query,
-            ctx.recent_tools,
-            learned_context,
-            &self.catalog_summary,
-        );
+        let messages = build_tool_select_prompt(ctx.query, ctx.recent_tools, &self.catalog_summary);
 
         match self.call_llm(messages).await {
             Ok((text, tin, tout)) => {
@@ -1082,25 +687,11 @@ impl ToolSelector for LlmToolSelector {
 pub struct FallbackSelector {
     primary: Box<dyn ToolSelector>,
     fallback: Box<dyn ToolSelector>,
-    /// Optional progressive calibrator for dynamic confidence thresholds.
-    progressive_calibrator: Option<Arc<Mutex<ProgressiveCalibrator>>>,
 }
 
 impl FallbackSelector {
     pub fn new(primary: Box<dyn ToolSelector>, fallback: Box<dyn ToolSelector>) -> Self {
-        Self {
-            primary,
-            fallback,
-            progressive_calibrator: None,
-        }
-    }
-
-    pub fn with_progressive_calibrator(
-        mut self,
-        calibrator: Arc<Mutex<ProgressiveCalibrator>>,
-    ) -> Self {
-        self.progressive_calibrator = Some(calibrator);
-        self
+        Self { primary, fallback }
     }
 }
 
@@ -1110,26 +701,9 @@ impl ToolSelector for FallbackSelector {
         self.fallback.registry()
     }
 
-    fn learned_context(&self, query: &str, recent_tools: &[String]) -> LearnedContext {
-        self.fallback.learned_context(query, recent_tools)
-    }
-
     async fn select(&self, ctx: &SelectionContext<'_>) -> SelectionResult {
-        let learned_context = self.fallback.learned_context(ctx.query, ctx.recent_tools);
-        self.select_with_learned_context(ctx, &learned_context)
-            .await
-    }
-
-    async fn select_with_learned_context(
-        &self,
-        ctx: &SelectionContext<'_>,
-        learned_context: &LearnedContext,
-    ) -> SelectionResult {
-        // Fast path: if TF-IDF with learned context is confident, skip LLM call.
-        let fast_result = self
-            .fallback
-            .select_with_learned_context(ctx, learned_context)
-            .await;
+        // Fast path: run the TF-IDF fallback first.
+        let fast_result = self.fallback.select(ctx).await;
 
         let has_dynamic_tools = fast_result.tool_names.iter().any(|n| {
             !crate::tool_registry::TOOL_CATALOG
@@ -1138,33 +712,8 @@ impl ToolSelector for FallbackSelector {
         });
 
         // High confidence with dynamic tools → trust TF-IDF.
-        // Use calibrated threshold if available, otherwise default 0.5.
-        let threshold = self
-            .progressive_calibrator
-            .as_ref()
-            .and_then(|cal| cal.lock().ok())
-            .map(|locked| {
-                let task_type = learned_context
-                    .task_archetype
-                    .unwrap_or(crate::pipeline::routing::TaskType::Unknown);
-                let intent = format!("{task_type:?}").to_lowercase();
-                let domain = learned_context
-                    .entity_hints
-                    .first()
-                    .and_then(|h| match h.as_str() {
-                        "github" => Some(crate::pipeline::routing::DomainHint::GitHub),
-                        "git" => Some(crate::pipeline::routing::DomainHint::Git),
-                        "code" => Some(crate::pipeline::routing::DomainHint::Code),
-                        "memory" => Some(crate::pipeline::routing::DomainHint::Memory),
-                        "web" => Some(crate::pipeline::routing::DomainHint::Web),
-                        "system" => Some(crate::pipeline::routing::DomainHint::System),
-                        "database" => Some(crate::pipeline::routing::DomainHint::Database),
-                        _ => None,
-                    });
-                locked.calibrated_threshold(&intent, domain, task_type)
-            })
-            .unwrap_or(0.5);
-        if fast_result.confidence >= threshold && has_dynamic_tools {
+        const CONFIDENCE_THRESHOLD: f64 = 0.5;
+        if fast_result.confidence >= CONFIDENCE_THRESHOLD && has_dynamic_tools {
             return fast_result;
         }
 
@@ -1174,10 +723,7 @@ impl ToolSelector for FallbackSelector {
         }
 
         // Low/mid confidence with dynamic tools → ask the primary (LLM) selector.
-        let result = self
-            .primary
-            .select_with_learned_context(ctx, learned_context)
-            .await;
+        let result = self.primary.select(ctx).await;
         if !result.failed && !result.tool_names.is_empty() {
             result
         } else {
@@ -1200,7 +746,6 @@ impl ToolSelector for FallbackSelector {
         was_corrected: bool,
         user_feedback_score: Option<i64>,
     ) {
-        // Forward to fallback (TfIdfSelector) — it has the pipeline modules.
         self.fallback.record_outcome(
             query,
             tools_used,
@@ -1482,203 +1027,11 @@ mod tests {
 
     #[test]
     fn prompt_includes_recent_tools() {
-        let messages = build_tool_select_prompt(
-            "matrixone呢？",
-            &["github".to_string()],
-            &LearnedContext::default(),
-            "catalog",
-        );
+        let messages =
+            build_tool_select_prompt("matrixone呢？", &["github".to_string()], "catalog");
         let user_msg = messages[1]["content"].as_str().unwrap();
         assert!(user_msg.contains("github"));
         assert!(user_msg.contains("matrixone"));
-    }
-
-    #[test]
-    fn prompt_includes_learned_runtime_context() {
-        let messages = build_tool_select_prompt(
-            "matrixone呢？",
-            &[],
-            &LearnedContext {
-                task_archetype: Some(TaskType::Fetch),
-                entity_hints: vec!["Entity 'matrixorigin' is associated with domain GitHub".into()],
-                pattern_hints: vec![
-                    "Successful tool chain for Fetch/Some(GitHub): github_search -> github".into(),
-                ],
-                calibration_hints: vec![
-                    "Calibration risk: domain GitHub needed correction 60% of the time".into(),
-                ],
-                tool_hints: vec!["Tool history: prefer 'github'".into()],
-            },
-            "catalog",
-        );
-        let user_msg = messages[1]["content"].as_str().unwrap();
-        assert!(user_msg.contains("Context hints:"));
-        assert!(user_msg.contains("matrixorigin"));
-        assert!(user_msg.contains("github"));
-        assert!(user_msg.contains("Calibration risk"));
-        assert!(user_msg.contains("Tool history"));
-    }
-
-    #[test]
-    fn learned_context_task_archetype_payload_token_lowercase() {
-        let lc = LearnedContext {
-            task_archetype: Some(TaskType::Fetch),
-            ..Default::default()
-        };
-        assert_eq!(lc.task_archetype_payload_token().as_deref(), Some("fetch"));
-        assert!(
-            LearnedContext::default()
-                .task_archetype_payload_token()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn tfidf_selector_surfaces_learned_context_from_entity_and_pattern_memory() {
-        let mut graph = EntityGraph::new();
-        graph.learn(
-            "matrixorigin",
-            DomainHint::GitHub,
-            &["github_search".into(), "github".into()],
-            None,
-        );
-
-        let mut patterns = PatternLibrary::new();
-        for _ in 0..2 {
-            patterns.record_outcome(
-                &["github_search".into(), "github".into()],
-                TaskType::Fetch,
-                Some(DomainHint::GitHub),
-                true,
-                0.95,
-                None,
-            );
-        }
-
-        let selector = TfIdfSelector::new(mock_registry())
-            .with_entity_graph(Arc::new(Mutex::new(graph)))
-            .with_pattern_library(Arc::new(Mutex::new(patterns)));
-
-        let learned = selector.learned_context("matrixorigin 最新 pr", &[]);
-        assert_eq!(learned.task_archetype, Some(TaskType::Fetch));
-        assert!(
-            learned
-                .entity_hints
-                .iter()
-                .any(|hint| hint.contains("matrixorigin") && hint.contains("GitHub"))
-        );
-        assert!(
-            learned
-                .pattern_hints
-                .iter()
-                .any(|hint| hint.contains("github_search -> github"))
-        );
-    }
-
-    #[test]
-    fn learned_context_filters_low_confidence_entity_hints() {
-        let mut graph = EntityGraph::new();
-        graph.merge(&[astra_pipeline::entity::EntityKnowledge {
-            name: "stale-org".into(),
-            aliases: vec![],
-            domain: Some(DomainHint::GitHub),
-            associated_tools: vec!["github".into()],
-            confidence: 0.2,
-            observation_count: 1,
-            last_observed_at: chrono::Utc::now().timestamp() as u64,
-        }]);
-
-        let selector =
-            TfIdfSelector::new(mock_registry()).with_entity_graph(Arc::new(Mutex::new(graph)));
-        let learned = selector.learned_context("stale-org 最新 pr", &[]);
-        assert!(
-            learned.entity_hints.is_empty(),
-            "low-confidence entity should be filtered"
-        );
-    }
-
-    #[test]
-    fn learned_context_keeps_high_confidence_entity_hints() {
-        let mut graph = EntityGraph::new();
-        graph.learn(
-            "matrixorigin",
-            DomainHint::GitHub,
-            &["github_search".into(), "github".into()],
-            None,
-        );
-        graph.learn(
-            "matrixorigin",
-            DomainHint::GitHub,
-            &["github_search".into(), "github".into()],
-            None,
-        );
-
-        let selector =
-            TfIdfSelector::new(mock_registry()).with_entity_graph(Arc::new(Mutex::new(graph)));
-        let learned = selector.learned_context("matrixorigin 最新 pr", &[]);
-        assert!(
-            learned
-                .entity_hints
-                .iter()
-                .any(|hint| hint.contains("matrixorigin") && hint.contains("confidence"))
-        );
-    }
-
-    #[test]
-    fn tfidf_selector_surfaces_calibration_and_tool_history_hints() {
-        let tracker = Arc::new(Mutex::new(ToolQualityTracker::new()));
-        {
-            let mut tracker = tracker.lock().unwrap();
-            for _ in 0..5 {
-                tracker.record_selection(&["github".into()]);
-                tracker.record_feedback(&crate::tool_registry::SelectionFeedback {
-                    tools_used: vec!["github".into()],
-                    unused_count: 0,
-                    precision: 1.0,
-                    recall: 1.0,
-                });
-                tracker.record_quality("github", 0.95);
-                tracker.record_selection(&["glob".into()]);
-            }
-        }
-
-        let calibrator = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.7)));
-        {
-            let mut calibrator = calibrator.lock().unwrap();
-            for _ in 0..5 {
-                calibrator.record(
-                    "fetch",
-                    Some(DomainHint::GitHub),
-                    TaskType::Fetch,
-                    true,
-                    None,
-                );
-            }
-        }
-
-        let selector = TfIdfSelector::new(mock_registry())
-            .with_quality_tracker(tracker)
-            .with_progressive_calibrator(calibrator);
-
-        let learned = selector.learned_context("matrixorigin 最新 pr", &[]);
-        assert!(
-            learned
-                .calibration_hints
-                .iter()
-                .any(|hint| hint.contains("Calibration risk") && hint.contains("GitHub"))
-        );
-        assert!(
-            learned
-                .tool_hints
-                .iter()
-                .any(|hint| hint.contains("prefer 'github'"))
-        );
-        assert!(
-            learned
-                .tool_hints
-                .iter()
-                .any(|hint| hint.contains("cautious with 'glob'"))
-        );
     }
 
     // ── TfIdfSelector ──
@@ -1879,250 +1232,6 @@ mod tests {
             FallbackSelector::new(Box::new(NeverCalledPrimary), Box::new(PinnedOnlySelector));
         let result = selector.select(&make_ctx("something")).await;
         assert_eq!(result.strategy, "tfidf_conversational");
-    }
-
-    #[tokio::test]
-    async fn fallback_select_with_learned_context_reuses_provided_context() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct EmptyPrimary;
-        #[async_trait]
-        impl ToolSelector for EmptyPrimary {
-            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
-                SelectionResult {
-                    tool_names: vec![],
-                    strategy: "empty_primary",
-                    budget_used: 0,
-                    failed: true,
-                    confidence: 0.0,
-                    selector_tokens_in: 0,
-                    selector_tokens_out: 0,
-                    selected_skills: vec![],
-                }
-            }
-        }
-
-        struct SpyFallback {
-            learned_calls: Arc<AtomicUsize>,
-        }
-
-        #[async_trait]
-        impl ToolSelector for SpyFallback {
-            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
-                SelectionResult {
-                    tool_names: vec![],
-                    strategy: "spy_fallback_plain",
-                    budget_used: 0,
-                    failed: true,
-                    confidence: 0.0,
-                    selector_tokens_in: 0,
-                    selector_tokens_out: 0,
-                    selected_skills: vec![],
-                }
-            }
-
-            fn learned_context(&self, _query: &str, _recent_tools: &[String]) -> LearnedContext {
-                self.learned_calls.fetch_add(1, Ordering::SeqCst);
-                LearnedContext::default()
-            }
-
-            async fn select_with_learned_context(
-                &self,
-                _ctx: &SelectionContext<'_>,
-                learned_context: &LearnedContext,
-            ) -> SelectionResult {
-                if learned_context
-                    .tool_hints
-                    .iter()
-                    .any(|hint| hint.contains("github"))
-                {
-                    SelectionResult {
-                        tool_names: vec!["github".into()],
-                        strategy: "spy_fallback_learned",
-                        budget_used: 0,
-                        failed: false,
-                        confidence: 0.8,
-                        selector_tokens_in: 0,
-                        selector_tokens_out: 0,
-                        selected_skills: vec![],
-                    }
-                } else {
-                    SelectionResult {
-                        tool_names: vec![],
-                        strategy: "spy_fallback_plain",
-                        budget_used: 0,
-                        failed: true,
-                        confidence: 0.0,
-                        selector_tokens_in: 0,
-                        selector_tokens_out: 0,
-                        selected_skills: vec![],
-                    }
-                }
-            }
-        }
-
-        let learned_calls = Arc::new(AtomicUsize::new(0));
-        let selector = FallbackSelector::new(
-            Box::new(EmptyPrimary),
-            Box::new(SpyFallback {
-                learned_calls: learned_calls.clone(),
-            }),
-        );
-        let ctx = SelectionContext {
-            query: "matrixorigin 最新 pr",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-
-        let provided = LearnedContext {
-            task_archetype: Some(TaskType::Fetch),
-            entity_hints: vec![],
-            pattern_hints: vec![],
-            calibration_hints: vec![],
-            tool_hints: vec!["Tool history: prefer 'github'".into()],
-        };
-        let result = selector.select_with_learned_context(&ctx, &provided).await;
-        assert_eq!(result.strategy, "spy_fallback_learned");
-        assert_eq!(result.tool_names, vec!["github"]);
-        assert_eq!(
-            learned_calls.load(Ordering::SeqCst),
-            0,
-            "provided learned context should be reused without recomputing fallback context"
-        );
-    }
-
-    #[tokio::test]
-    async fn fallback_learned_context_can_improve_primary_selection() {
-        struct LearnedAwarePrimary;
-
-        #[async_trait]
-        impl ToolSelector for LearnedAwarePrimary {
-            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
-                SelectionResult {
-                    tool_names: vec![],
-                    strategy: "learned_primary_empty",
-                    budget_used: 0,
-                    failed: true,
-                    confidence: 0.0,
-                    selector_tokens_in: 0,
-                    selector_tokens_out: 0,
-                    selected_skills: vec![],
-                }
-            }
-
-            async fn select_with_learned_context(
-                &self,
-                _ctx: &SelectionContext<'_>,
-                learned_context: &LearnedContext,
-            ) -> SelectionResult {
-                let has_github_entity = learned_context
-                    .entity_hints
-                    .iter()
-                    .any(|hint| hint.contains("matrixorigin") && hint.contains("GitHub"));
-                let has_pr_pattern = learned_context
-                    .pattern_hints
-                    .iter()
-                    .any(|hint| hint.contains("github_search -> github"));
-                if has_github_entity && has_pr_pattern {
-                    SelectionResult {
-                        tool_names: vec!["github".into()],
-                        strategy: "learned_primary",
-                        budget_used: 0,
-                        failed: false,
-                        confidence: 0.9,
-                        selector_tokens_in: 0,
-                        selector_tokens_out: 0,
-                        selected_skills: vec![],
-                    }
-                } else {
-                    SelectionResult {
-                        tool_names: vec![],
-                        strategy: "learned_primary_empty",
-                        budget_used: 0,
-                        failed: true,
-                        confidence: 0.0,
-                        selector_tokens_in: 0,
-                        selector_tokens_out: 0,
-                        selected_skills: vec![],
-                    }
-                }
-            }
-        }
-
-        let ctx = SelectionContext {
-            query: "matrixorigin 最新 pr",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-
-        let baseline = LearnedAwarePrimary.select(&ctx).await;
-        assert!(
-            baseline.failed,
-            "without learned context, learned-aware primary should fail closed"
-        );
-
-        let mut graph = EntityGraph::new();
-        graph.learn(
-            "matrixorigin",
-            DomainHint::GitHub,
-            &["github_search".into(), "github".into()],
-            None,
-        );
-        graph.learn(
-            "matrixorigin",
-            DomainHint::GitHub,
-            &["github_search".into(), "github".into()],
-            None,
-        );
-
-        let mut patterns = PatternLibrary::new();
-        for _ in 0..2 {
-            patterns.record_outcome(
-                &["github_search".into(), "github".into()],
-                TaskType::Fetch,
-                Some(DomainHint::GitHub),
-                true,
-                0.95,
-                None,
-            );
-        }
-
-        let fallback = TfIdfSelector::new(mock_registry())
-            .with_entity_graph(Arc::new(Mutex::new(graph)))
-            .with_pattern_library(Arc::new(Mutex::new(patterns)));
-
-        let selector = FallbackSelector::new(Box::new(LearnedAwarePrimary), Box::new(fallback));
-        let result = selector.select(&ctx).await;
-
-        // With learned context, either TF-IDF is confident enough (fast path)
-        // or primary gets the learned context and succeeds.
-        // Either way, github should be selected.
-        assert!(
-            result.tool_names.contains(&"github".to_string()),
-            "learned context should help select github, got: {:?} (strategy: {})",
-            result.tool_names,
-            result.strategy
-        );
-        assert!(
-            !result.failed,
-            "fallback selector should improve selection with learned context"
-        );
     }
 
     // ── Quality Tracker integration ──
@@ -2474,122 +1583,6 @@ mod tests {
         );
     }
 
-    // ── Pipeline Wiring Integration Tests ──
-
-    #[tokio::test]
-    async fn wiring_entity_graph_boosts_known_entity() {
-        let graph = EntityGraph::new();
-        let graph = Arc::new(Mutex::new(graph));
-
-        // Teach the entity graph that "matrixorigin" is GitHub domain
-        {
-            let mut g = graph.lock().unwrap();
-            g.learn(
-                "matrixorigin",
-                DomainHint::GitHub,
-                &["github".into(), "github_search_repos".into()],
-                None,
-            );
-            g.learn("matrixorigin", DomainHint::GitHub, &["github".into()], None);
-        }
-
-        let selector = TfIdfSelector::new(mock_registry()).with_entity_graph(graph.clone());
-
-        // Without entity graph knowledge, "matrixorigin" triggers 0 signals
-        let baseline = TfIdfSelector::new(mock_registry());
-        let ctx = SelectionContext {
-            query: "matrixorigin的PR情况",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-
-        let r_baseline = baseline.select(&ctx).await;
-        let r_enriched = selector.select(&ctx).await;
-
-        // Enriched selector should have higher confidence because entity graph
-        // adds "github", "repository" etc. as boost terms
-        assert!(
-            r_enriched.confidence >= r_baseline.confidence,
-            "entity-enriched confidence ({}) should be >= baseline ({})",
-            r_enriched.confidence,
-            r_baseline.confidence
-        );
-    }
-
-    #[tokio::test]
-    async fn wiring_record_turn_outcome_updates_all_modules() {
-        let graph = Arc::new(Mutex::new(EntityGraph::new()));
-        let lib = Arc::new(Mutex::new(PatternLibrary::new()));
-        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
-
-        let selector = TfIdfSelector::new(mock_registry())
-            .with_entity_graph(graph.clone())
-            .with_pattern_library(lib.clone())
-            .with_progressive_calibrator(cal.clone());
-
-        // Record a successful turn outcome (twice — PatternLibrary needs ≥2 observations)
-        selector.record_turn_outcome(
-            "check matrixorigin PRs",
-            &["github".into(), "github_search_repos".into()],
-            TaskType::Fetch,
-            Some(DomainHint::GitHub),
-            true,  // success
-            0.85,  // quality
-            false, // not corrected
-            None,
-        );
-        selector.record_turn_outcome(
-            "check matrixorigin issues",
-            &["github".into(), "github_search_repos".into()],
-            TaskType::Fetch,
-            Some(DomainHint::GitHub),
-            true,
-            0.9,
-            false,
-            None,
-        );
-
-        // Verify EntityGraph learned the association
-        {
-            let g = graph.lock().unwrap();
-            let boost = g.boost_for("matrixorigin");
-            assert!(
-                !boost.is_empty(),
-                "entity graph should have learned 'matrixorigin' → GitHub"
-            );
-        }
-
-        // Verify PatternLibrary recorded the outcome
-        {
-            let l = lib.lock().unwrap();
-            let suggestions = l.top_patterns(TaskType::Fetch, Some(DomainHint::GitHub), 5);
-            assert!(
-                !suggestions.is_empty(),
-                "pattern library should have recorded the outcome"
-            );
-        }
-
-        // Record correction to verify calibrator
-        selector.record_turn_outcome(
-            "check matrixorigin issues",
-            &["github".into()],
-            TaskType::Fetch,
-            Some(DomainHint::GitHub),
-            true,
-            0.7,
-            true, // was corrected
-            None,
-        );
-    }
-
     #[tokio::test]
     async fn record_turn_outcome_updates_quality_tracker() {
         let tracker = Arc::new(Mutex::new(ToolQualityTracker::new()));
@@ -2641,218 +1634,6 @@ mod tests {
         assert!(
             (bash.quality_sum - 0.9).abs() < 0.01,
             "failed turn adds 0.0 quality"
-        );
-    }
-
-    #[tokio::test]
-    async fn record_turn_outcome_without_domain_records_pattern_not_entity_graph() {
-        let graph = Arc::new(Mutex::new(EntityGraph::new()));
-        let lib = Arc::new(Mutex::new(PatternLibrary::new()));
-        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
-
-        let selector = TfIdfSelector::new(mock_registry())
-            .with_entity_graph(graph.clone())
-            .with_pattern_library(lib.clone())
-            .with_progressive_calibrator(cal.clone());
-
-        let tools = vec!["github".to_string()];
-        for _ in 0..2 {
-            selector.record_turn_outcome(
-                "check matrixorigin PRs",
-                &tools,
-                TaskType::Fetch,
-                None,
-                true,
-                0.88,
-                false,
-                None,
-            );
-        }
-
-        {
-            let g = graph.lock().unwrap();
-            assert!(
-                g.boost_for("matrixorigin").is_empty(),
-                "entity graph must not learn without routing domain"
-            );
-        }
-        {
-            let l = lib.lock().unwrap();
-            let suggestions = l.top_patterns(TaskType::Fetch, None, 5);
-            assert!(
-                !suggestions.is_empty(),
-                "pattern library should still record chains without domain"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn wiring_entity_graph_learning_loop_improves_over_time() {
-        let graph = Arc::new(Mutex::new(EntityGraph::new()));
-        let lib = Arc::new(Mutex::new(PatternLibrary::new()));
-
-        let selector = TfIdfSelector::new(mock_registry())
-            .with_entity_graph(graph.clone())
-            .with_pattern_library(lib.clone());
-
-        let ctx = SelectionContext {
-            query: "matrixorigin的issue有哪些",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-
-        // First selection: no learned knowledge
-        let r1 = selector.select(&ctx).await;
-
-        // Simulate learning from 3 successful turns
-        for _ in 0..3 {
-            selector.record_turn_outcome(
-                "matrixorigin issues",
-                &["github".into(), "github_search_repos".into()],
-                TaskType::Fetch,
-                Some(DomainHint::GitHub),
-                true,
-                0.9,
-                false,
-                None,
-            );
-        }
-
-        // Second selection: should benefit from learned entity associations
-        let r2 = selector.select(&ctx).await;
-
-        assert!(
-            r2.confidence >= r1.confidence,
-            "after learning, confidence ({}) should be >= initial ({})",
-            r2.confidence,
-            r1.confidence
-        );
-    }
-
-    #[tokio::test]
-    async fn wiring_failed_outcome_not_learned_to_entity_graph() {
-        let graph = Arc::new(Mutex::new(EntityGraph::new()));
-
-        let selector = TfIdfSelector::new(mock_registry()).with_entity_graph(graph.clone());
-
-        // Record a FAILED turn outcome
-        selector.record_turn_outcome(
-            "check kubernetes status",
-            &["github".into()],
-            TaskType::Fetch,
-            Some(DomainHint::GitHub),
-            false, // FAILED
-            0.2,
-            false,
-            None,
-        );
-
-        // Entity graph should NOT learn from failures
-        {
-            let g = graph.lock().unwrap();
-            let boost = g.boost_for("kubernetes");
-            assert!(
-                boost.is_empty(),
-                "failed outcomes should not be learned by entity graph, got: {:?}",
-                boost
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn wiring_conversational_query_returns_pinned_only() {
-        let selector = TfIdfSelector::new(mock_registry())
-            .with_entity_graph(Arc::new(Mutex::new(EntityGraph::new())))
-            .with_pattern_library(Arc::new(Mutex::new(PatternLibrary::new())));
-
-        let ctx = SelectionContext {
-            query: "谢谢你的帮助",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-
-        let result = selector.select(&ctx).await;
-        // Conversational queries should return minimal (pinned) tools
-        // Budget used should be 0 for pinned-only
-        assert_eq!(result.budget_used, 0);
-    }
-
-    // ── Trait-level record_outcome tests ──────────────────────────────────
-
-    #[test]
-    fn trait_record_outcome_on_tfidf_updates_entity_graph() {
-        let graph = Arc::new(Mutex::new(EntityGraph::new()));
-        let selector = TfIdfSelector::new(mock_registry()).with_entity_graph(graph.clone());
-
-        // Before: no boost terms for "matrixorigin"
-        let boost_before = graph.lock().unwrap().boost_for("matrixorigin");
-        assert!(boost_before.is_empty());
-
-        // Use trait method (not concrete record_turn_outcome)
-        let sel: &dyn ToolSelector = &selector;
-        sel.record_outcome(
-            "matrixorigin PR review",
-            &["github_search".to_string()],
-            TaskType::Code,
-            Some(DomainHint::GitHub),
-            true,
-            0.8,
-            false,
-            None,
-        );
-
-        // After: entity graph learned the association
-        let boost_after = graph.lock().unwrap().boost_for("matrixorigin");
-        assert!(
-            !boost_after.is_empty(),
-            "entity graph should learn from trait-level record_outcome"
-        );
-    }
-
-    #[tokio::test]
-    async fn trait_record_outcome_on_fallback_forwards_to_tfidf() {
-        let graph = Arc::new(Mutex::new(EntityGraph::new()));
-        let tfidf = TfIdfSelector::new(mock_registry()).with_entity_graph(graph.clone());
-
-        let fallback_selector = FallbackSelector::new(
-            Box::new(TfIdfSelector::new(mock_registry())), // primary (no modules)
-            Box::new(tfidf),                               // fallback (has modules)
-        );
-
-        // Use trait method on FallbackSelector
-        let sel: &dyn ToolSelector = &fallback_selector;
-        sel.record_outcome(
-            "matrixorigin deployment",
-            &["bash".to_string()],
-            TaskType::Code,
-            Some(DomainHint::GitHub),
-            true,
-            0.7,
-            false,
-            None,
-        );
-
-        // Verify it forwarded to fallback's TfIdfSelector
-        let boost = graph.lock().unwrap().boost_for("matrixorigin");
-        assert!(
-            !boost.is_empty(),
-            "FallbackSelector should forward record_outcome to fallback"
         );
     }
 

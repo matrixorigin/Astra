@@ -79,9 +79,6 @@ pub struct AppState {
         Option<Arc<crate::turn::bridge_inprocess::InProcessChatTurnBridge>>,
     pub(crate) chat_turn_bridge_secret: String,
     pub(crate) chat_turn_bridge_cache: Arc<tokio::sync::Mutex<SessionCache>>,
-    /// Pipeline learning writer — shared across all turns, auto-updates
-    /// EntityGraph/PatternLibrary/ProgressiveCalibrator from turn outcomes.
-    pub(crate) turn_learning_writer: Option<Arc<dyn TurnLearningWriter>>,
     pub memoria_base_url: String,
     pub memoria_master_key: Option<String>,
     pub memoria_forwarder: Arc<dyn MemoriaForwarder>,
@@ -193,7 +190,6 @@ impl AppState {
             chat_turn_bridge: None,
             chat_turn_bridge_secret: "dev-bridge-secret-change-me".to_string(),
             chat_turn_bridge_cache,
-            turn_learning_writer: None,
             memoria_base_url: default_memoria.base_url,
             memoria_master_key: default_memoria.master_key,
             memoria_forwarder: Arc::new(NoopMemoriaForwarder),
@@ -569,10 +565,6 @@ impl AppState {
         self.chat_turn_bridge_secret = chat_turn_bridge_secret.into();
         self
     }
-    pub fn with_turn_learning_writer(mut self, writer: Arc<dyn TurnLearningWriter>) -> Self {
-        self.turn_learning_writer = Some(writer);
-        self
-    }
 
     pub fn with_shared_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
@@ -779,41 +771,6 @@ impl HealthChecker for MatrixOneHealthChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_pipeline::{
-        calibration::ProgressiveCalibrator, entity::EntityGraph, pattern::PatternLibrary,
-    };
-    use astra_turn_core::pipeline_learning::PipelineLearningWriter;
-    use std::sync::Mutex;
-
-    fn make_test_learning_writer() -> Arc<dyn TurnLearningWriter> {
-        let graph = Arc::new(Mutex::new(EntityGraph::new()));
-        let patterns = Arc::new(Mutex::new(PatternLibrary::new()));
-        let calibrator = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
-        Arc::new(
-            PipelineLearningWriter::new()
-                .with_entity_graph(graph)
-                .with_pattern_library(patterns)
-                .with_progressive_calibrator(calibrator),
-        )
-    }
-
-    #[test]
-    fn app_state_with_turn_learning_writer() {
-        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker));
-        assert!(state.turn_learning_writer.is_none());
-
-        let writer = make_test_learning_writer();
-        let state = state.with_turn_learning_writer(writer);
-        assert!(state.turn_learning_writer.is_some());
-    }
-
-    struct TestHealthChecker;
-    #[async_trait]
-    impl HealthChecker for TestHealthChecker {
-        async fn database_healthy(&self) -> bool {
-            true
-        }
-    }
 
     /// audit-A1: ReqwestMemoriaForwarder must set connect_timeout and timeout
     /// so a hung Memoria server cannot block the Axum handler indefinitely.

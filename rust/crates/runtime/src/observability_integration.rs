@@ -26,7 +26,6 @@ use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, User
 use astra_learning::auto_tuning::{
     AutoTuningEngine, DelegationOutcomeTracker, FeedbackSignal, SignalType,
 };
-use astra_pipeline::pattern::PatternLibrary;
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use astra_turn_core::decision_explainer::{DecisionExplanation, DriftDetector, FocusDriftAnalysis};
 use astra_turn_core::goal_tracker::{GoalProgress, GoalTracker};
@@ -882,9 +881,6 @@ pub struct ObservabilityHub {
     /// Delegation outcome tracker for coordination auto-select.
     delegation_outcomes: DelegationOutcomeTracker,
 
-    /// Shared pattern library for adaptive routing and exploration.
-    pattern_library: RwLock<Option<Arc<Mutex<PatternLibrary>>>>,
-
     /// Active sessions.
     sessions: RwLock<HashMap<String, Arc<RwLock<ObservabilitySession>>>>,
 
@@ -906,7 +902,6 @@ impl ObservabilityHub {
             profile_manager: UserProfileManager::new(profile_store),
             tuning_engine: AutoTuningEngine::new(),
             delegation_outcomes: DelegationOutcomeTracker::new(),
-            pattern_library: RwLock::new(None),
             sessions: RwLock::new(HashMap::new()),
             low_confidence_tools: Mutex::new(Vec::new()),
         }
@@ -928,7 +923,6 @@ impl ObservabilityHub {
             profile_manager: UserProfileManager::new(profile_store),
             tuning_engine: AutoTuningEngine::with_storage(tuning_path),
             delegation_outcomes: DelegationOutcomeTracker::with_storage(outcomes_path),
-            pattern_library: RwLock::new(None),
             sessions: RwLock::new(HashMap::new()),
             low_confidence_tools: Mutex::new(Vec::new()),
         }
@@ -1095,20 +1089,8 @@ impl ObservabilityHub {
     // ─── Auto-Tuning Cycle ──────────────────────────────────────────────────
 
     /// Run one auto-tuning cycle and return executed rules.
-    ///
-    /// Uses pattern library (if attached) for drift detection triggers.
     pub fn run_tuning_cycle(&self, config: &mut RuntimeConfig) -> Vec<String> {
-        // Get pattern library reference for drift detection
-        let pattern_lib_guard = self.pattern_library();
-        let pattern_lib_lock = pattern_lib_guard.as_ref().map(|arc| arc.lock().ok());
-        let pattern_lib_ref = pattern_lib_lock
-            .as_ref()
-            .and_then(|opt| opt.as_deref())
-            .map(|pl| pl as &dyn astra_learning::DriftSource);
-
-        let executions = self
-            .tuning_engine
-            .run_cycle_with_patterns(config, pattern_lib_ref);
+        let executions = self.tuning_engine.run_cycle_with_patterns(config, None);
 
         // Persist aggregator state after tuning cycle.
         if !executions.is_empty() {
@@ -1169,22 +1151,6 @@ impl ObservabilityHub {
     /// Get the auto-tuning engine.
     pub fn tuning(&self) -> &AutoTuningEngine {
         &self.tuning_engine
-    }
-
-    /// Attach the shared pattern library used by the active tool-selection stack.
-    pub fn attach_pattern_library(&self, pattern_library: Arc<Mutex<PatternLibrary>>) {
-        *self
-            .pattern_library
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = Some(pattern_library);
-    }
-
-    /// Get the shared pattern library, if one has been attached.
-    pub fn pattern_library(&self) -> Option<Arc<Mutex<PatternLibrary>>> {
-        self.pattern_library
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
     }
 
     /// Get the profile manager.

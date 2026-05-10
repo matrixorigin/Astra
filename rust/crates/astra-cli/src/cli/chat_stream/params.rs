@@ -194,8 +194,6 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) runtime_continuity: Option<&'a astra_turn_types::continuity::ContinuityState>,
     /// Current REPL turn number — used to tag journal entries for undo.
     pub(crate) turn_index: u32,
-    /// Shared evolution service for multi-axis self-evolution.
-    pub(crate) evolution_service: Option<Arc<astra_runtime::evolution::service::EvolutionService>>,
     /// Pre-loaded CSL messages (from CslManager.load() in repl_turn).
     /// Restored pipeline state from a checkpoint (enables warm-start on resume).
     pub(crate) pipeline_state: Option<serde_json::Value>,
@@ -318,7 +316,6 @@ impl<'a> ChatTurnParams<'a> {
             task_manager: None,
             runtime_continuity: None,
             turn_index: 0,
-            evolution_service: None,
             pipeline_state: None,
             pre_loaded_messages: None,
             append_system_prompt: None,

@@ -374,7 +374,6 @@ pub(super) async fn handle_state_command(
                     task_manager: None,
                     runtime_continuity: None,
                     turn_index: 0,
-                    evolution_service: state.evolution_service.clone(),
                 pipeline_state: None,
             pre_loaded_messages: None,
                     append_system_prompt: None,
@@ -493,7 +492,6 @@ pub(super) async fn handle_state_command(
                             task_manager: None,
                             runtime_continuity: None,
                             turn_index: 0,
-                            evolution_service: state.evolution_service.clone(),
                             pipeline_state: None,
                             pre_loaded_messages: None,
                             append_system_prompt: None,
@@ -593,7 +591,6 @@ pub(super) async fn handle_state_command(
                                     task_manager: None,
                                     runtime_continuity: None,
                                     turn_index: 0,
-                                    evolution_service: state.evolution_service.clone(),
                                     pipeline_state: None,
                                     pre_loaded_messages: None,
                                     append_system_prompt: None,
@@ -893,7 +890,7 @@ pub(super) fn render_reflect_diff(state: &super::repl_state::ReplState) -> Strin
     let sep = "─".repeat(38);
     let _ = writeln!(out, "\n  ─── reflect diff {sep}");
 
-    let synced: HashMap<&str, &astra_evolution::persistence::ToolHealthEntry> = state
+    let synced: HashMap<&str, &astra_turn_core::tool_health_persistence::ToolHealthEntry> = state
         .synced_tool_health_entries
         .iter()
         .map(|e| (e.name.as_str(), e))
@@ -1288,7 +1285,7 @@ mod tests {
 
     #[test]
     fn render_reflect_diff_surfaces_new_and_drifting_tools() {
-        use astra_evolution::persistence::ToolHealthEntry;
+        use astra_turn_core::tool_health_persistence::ToolHealthEntry;
         let mut state = super::super::repl_state::ReplState::default();
         // Baseline had "grep" at 10 calls / 10% fail.
         state.synced_tool_health_entries = vec![ToolHealthEntry {

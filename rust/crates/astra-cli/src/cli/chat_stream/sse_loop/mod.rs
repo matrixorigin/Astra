@@ -133,19 +133,12 @@ async fn finalize_root_mailbox(
 }
 
 fn extend_restricted_with_blocked_tools(
-    restricted: &mut HashSet<String>,
-    observability_hub: Option<&Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    _restricted: &mut HashSet<String>,
+    _observability_hub: Option<&Arc<astra_runtime::observability_integration::ObservabilityHub>>,
 ) {
-    if let Some(hub) = observability_hub
-        && let Some(pattern_library) = hub.pattern_library()
-        && let Ok(lib) = pattern_library.lock()
-    {
-        for name in lib.blocked_tool_names() {
-            if !astra_turn_core::tool_registry_meta::is_pinned_tool(&name) {
-                restricted.insert(name);
-            }
-        }
-    }
+    // Pattern-library / evolution-driven tool blocking was removed along with
+    // the self-evolution subsystem. The function is retained as a no-op so
+    // callers don't need signature changes; add future block sources here.
 }
 
 pub(crate) async fn stream_chat_sse(
@@ -731,7 +724,6 @@ pub(crate) async fn stream_chat_sse(
         delegations_this_turn: 0,
         project_context,
         checkpoint_gate: None,
-        evolution_service: p.evolution_service.clone(),
         rate_limit_cooldown: Default::default(),
         data_snapshot_provider: None,
         last_composite_snapshot: None,
@@ -752,7 +744,6 @@ pub(crate) async fn stream_chat_sse(
         tactical_adapter: None,
         step_signal_collector: None,
         tool_budget_override: None,
-        pending_reflection_signals: Vec::new(),
         recent_tactical_actions: Vec::new(),
         server_tool_executor: None,
         interruption: None,
@@ -950,14 +941,11 @@ mod tests {
     use super::circuit_breaker_config_from_tool_selection;
     use super::detect_turn_hook_sets;
     use super::extend_restricted_with_blocked_tools;
-    use astra_pipeline::pattern::PatternLibrary;
-    use astra_runtime::evolution::types::PatternAction;
     use astra_runtime::observability_integration::ObservabilityHub;
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
-    use astra_turn_core::routing_engine::TaskType;
     use std::collections::HashSet;
     use std::path::Path;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
@@ -1132,25 +1120,13 @@ hooks:
 
     #[test]
     fn blocked_patterns_do_not_restrict_pinned_tools() {
-        // All tools are pinned after consolidation, so pattern-library
-        // blocks have no effect on tool restrictions. Only non-pinned
-        // (dynamic) tools can be blocked.
-        let pattern_library = Arc::new(Mutex::new(PatternLibrary::new()));
-        {
-            let mut lib = pattern_library.lock().unwrap();
-            let tools = vec!["grep".to_string()];
-            lib.record_outcome(&tools, TaskType::Code, None, true, 0.8, None);
-            lib.apply_evolution_action("grep", PatternAction::Block);
-        }
-
+        // After the pattern-library subsystem was removed, the blocked-tools
+        // set is always empty — verify `extend_restricted_with_blocked_tools`
+        // is a safe no-op on an ObservabilityHub without any evolution inputs.
         let hub = Arc::new(ObservabilityHub::new());
-        hub.attach_pattern_library(pattern_library);
-
         let mut restricted = HashSet::new();
         extend_restricted_with_blocked_tools(&mut restricted, Some(&hub));
-
-        // grep is pinned → not restricted even when blocked
-        assert!(!restricted.contains("grep"));
+        assert!(restricted.is_empty());
     }
 
     // ── G3: spawn_agent visibility gate ──

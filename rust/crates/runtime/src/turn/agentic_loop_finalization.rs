@@ -3,10 +3,7 @@ use astra_pipeline::step_checkpoint;
 use astra_pipeline::step_protocol::StepCheckpoint;
 use astra_services::SessionArtifactStore;
 
-use super::agentic_adaptive_tuning::{
-    record_loop_completion_feedback, record_new_evolution_promotion_events,
-    snapshot_evolution_promotion_ids,
-};
+use super::agentic_adaptive_tuning::record_loop_completion_feedback;
 use super::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_impl,
 };
@@ -449,27 +446,6 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     guard.previous_turn_user_cancelled = true;
                 }
             }
-        }
-    }
-
-    if let Some(evo) = state.evolution_service.clone() {
-        let (pending_before, applied_before, canary_before, resolved_before) =
-            snapshot_evolution_promotion_ids(&evo).await;
-        let (auto_applied, _llm_signals) = evo.flush().await;
-        record_new_evolution_promotion_events(
-            state,
-            &evo,
-            &pending_before,
-            &applied_before,
-            &canary_before,
-            &resolved_before,
-        )
-        .await;
-        if !auto_applied.is_empty() {
-            eprintln!(
-                "[evolution] auto-applied {} fast-path proposals",
-                auto_applied.len()
-            );
         }
     }
 
@@ -1173,64 +1149,6 @@ mod tests {
         assert!(
             source.contains("persist_remote_composite_snapshot_index"),
             "composite snapshot writes should publish a remote index artifact"
-        );
-    }
-
-    // ─── E2E: auto-reflection is wired into run_agentic_loop_impl ──────────
-    // Verifies the production loop path drains pending reflection signals
-    // and invokes host.execute_reflection after a tool phase — previously
-    // this was only covered by unit tests calling maybe_trigger_auto_reflection
-    // directly, and the production loop never called it.
-    #[tokio::test]
-    async fn auto_reflection_fires_from_production_loop() {
-        use crate::turn::agentic_loop_host::AUTO_REFLECTION_SIGNAL_THRESHOLD;
-
-        let reflection_response = r#"{
-            "proposals": [
-                {
-                    "axis": "pattern",
-                    "description": "Demote stalled chain",
-                    "confidence": 0.8,
-                    "details": { "signature": "grep", "action": "demote" }
-                }
-            ],
-            "summary": "Stall detected."
-        }"#;
-        let mut host = MockHost::new(vec![
-            edge_tool_result(vec![make_edge_tool("grep", "results...")], 20, 10, Some(50)),
-            text_result("Final answer", 15, 8, Some(30)),
-        ])
-        .with_valid_tools(&["grep"])
-        .with_reflection_text(reflection_response);
-
-        let mut state = make_state();
-        let evo = std::sync::Arc::new(crate::evolution::service::EvolutionService::new());
-        state.evolution_service = Some(evo.clone());
-
-        for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
-            state.pending_reflection_signals.push(
-                astra_evolution::types::EvolutionSignal::RepeatedStall {
-                    tool_chain: vec![format!("tool_{i}")],
-                    stall_count: 3,
-                    turn_id: format!("t{i}"),
-                },
-            );
-        }
-        assert_eq!(
-            state.pending_reflection_signals.len(),
-            AUTO_REFLECTION_SIGNAL_THRESHOLD
-        );
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok(), "loop should complete: {:?}", outcome);
-
-        assert!(
-            state.pending_reflection_signals.is_empty(),
-            "run_agentic_loop_impl must drain pending_reflection_signals"
-        );
-        assert!(
-            host.last_reflection_prompt.is_some(),
-            "host.execute_reflection must be called from production loop"
         );
     }
 

@@ -122,7 +122,6 @@ pub struct PromptGuidanceSignals {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptContextSignals {
     pub active_output_skills: bool,
-    pub learned_runtime_context: bool,
     pub memory_signal_detected: bool,
     pub system_prompt_override: bool,
     pub effort_hint: bool,

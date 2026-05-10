@@ -106,14 +106,12 @@ pub use decisions::{
 };
 pub use durable_task::OutputSink;
 pub use durable_task::{
-    CloudLlmConfig, CloudLlmJudge, ContractAmendment, ContractStatus, CriterionLearningResult,
-    DiffSummary, DurableSubtask, DurableTaskLifecycle, LlmJudge, LocalDurableTaskLifecycle,
-    MatrixOneDurableTaskLifecycle, NoopBranchOps, NoopTaskLearningBridge, SubtaskDeliverySummary,
-    SubtaskExecutionContext, SubtaskOutcomeSignal, SubtaskStage, SubtaskVerificationReport,
-    TaskBranchService, TaskContract, TaskDeliveryReport, TaskLearningBridge, TaskOutcomeSignal,
-    TaskPatternStats, TaskResumeContext, TaskScope, UnconfiguredDurableTaskLifecycle,
-    VerificationCriterion, VerificationLearningSignal, VerificationResult, VerificationRunner,
-    VerifierKind, build_outcome_signal,
+    CloudLlmConfig, CloudLlmJudge, ContractAmendment, ContractStatus, DiffSummary, DurableSubtask,
+    DurableTaskLifecycle, LlmJudge, LocalDurableTaskLifecycle, MatrixOneDurableTaskLifecycle,
+    NoopBranchOps, SubtaskDeliverySummary, SubtaskExecutionContext, SubtaskStage,
+    SubtaskVerificationReport, TaskBranchService, TaskContract, TaskDeliveryReport,
+    TaskResumeContext, TaskScope, UnconfiguredDurableTaskLifecycle, VerificationCriterion,
+    VerificationResult, VerificationRunner, VerifierKind,
 };
 pub use edge_context::{EdgeContext, EdgeProfile, EdgeSkillRef};
 pub use evaluation::{DatabaseEvaluationService, EvaluationService, UnconfiguredEvaluationService};

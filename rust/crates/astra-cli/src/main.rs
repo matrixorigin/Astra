@@ -296,7 +296,6 @@ use plan_monitor::{
     sync_plan_run_task_progress,
 };
 pub(crate) use plan_monitor::{format_duration_short, format_plan_progress};
-pub(crate) use plan_runtime::build_learning_bridge;
 use plan_runtime::start_and_monitor_plan;
 pub(crate) use repl_state::{ExplainMode, ReplState, SkillDevState};
 
@@ -307,9 +306,8 @@ pub(crate) use repl_state::{ExplainMode, ReplState, SkillDevState};
 
 pub(crate) use cloud_sync::post_auth_cloud_resync;
 use cloud_sync::{
-    append_cloud_pull_sync_journal, merge_learning_snapshot, try_cloud_pull,
-    try_cloud_pull_preferences, try_cloud_push_delta, try_cloud_push_preferences,
-    try_cloud_push_versioned,
+    append_cloud_pull_sync_journal, try_cloud_pull, try_cloud_pull_preferences,
+    try_cloud_push_preferences, try_cloud_push_versioned,
 };
 
 // ═══════════════════════════════════════════════════════ Task Commands ════
@@ -392,7 +390,7 @@ async fn run_chat_repl(
 
     let repl_startup::ReplStartupArtifacts {
         selector,
-        pipeline_modules,
+        pipeline_modules: _pipeline_modules,
         profile_name_str,
         mut edge_heartbeat_task,
         skill_quality_path,
@@ -573,15 +571,10 @@ async fn run_chat_repl(
                         if should_exit {
                             break ReplExit::Command;
                         }
-                        // Merge learning snapshot if /resume deposited one
-                        if let Some(json) = state.learning_snapshot.take() {
-                            merge_learning_snapshot(
-                                &json,
-                                &pipeline_modules.entity_graph,
-                                &pipeline_modules.pattern_library,
-                                &pipeline_modules.calibrator,
-                            );
-                        }
+                        // Legacy learning-snapshot merge was a no-op here now that
+                        // entity/pattern/calibration state has been removed. Drop the
+                        // deposited snapshot if `/resume` attached one.
+                        state.learning_snapshot = None;
 
                         // /ask (and future slash commands) can queue a message for
                         // immediate dispatch — send it as if the user typed it.
@@ -636,14 +629,10 @@ async fn run_chat_repl(
                                 if should_exit {
                                     break ReplExit::Command;
                                 }
-                                if let Some(json) = state.learning_snapshot.take() {
-                                    merge_learning_snapshot(
-                                        &json,
-                                        &pipeline_modules.entity_graph,
-                                        &pipeline_modules.pattern_library,
-                                        &pipeline_modules.calibrator,
-                                    );
-                                }
+                                // Legacy learning-snapshot merge was a no-op here now that
+                                // entity/pattern/calibration state has been removed. Drop the
+                                // deposited snapshot if `/resume` attached one.
+                                state.learning_snapshot = None;
                                 if state.executing_plan.is_some() && state.plan_mode.is_none() {
                                     start_and_monitor_plan(
                                         &mut state,
@@ -858,7 +847,7 @@ async fn run_chat_repl(
                             update_panic_guard(sid, state.turn);
                         }
 
-                        // Periodic learning sync: push to cloud at checkpoint boundaries
+                        // Periodic tool-health sync: push to cloud at checkpoint boundaries
                         // to prevent data loss on crash (every CHECKPOINT_INTERVAL turns)
                         if state.matrix_runtime.is_some()
                             && state.turn > 0
@@ -866,20 +855,16 @@ async fn run_chat_repl(
                                 astra_services::session_checkpoint::CHECKPOINT_INTERVAL,
                             )
                         {
-                            // Use delta push at checkpoints to reduce sync bandwidth.
-                            // Final session-end sync still uses full push for convergence.
-                            if let Some(new_version) = try_cloud_push_delta(
+                            if let Some(new_version) = try_cloud_push_versioned(
                                 &profile_name_str,
-                                &pipeline_modules.entity_graph,
-                                &pipeline_modules.pattern_library,
-                                &pipeline_modules.calibrator,
                                 &state.tool_health_entries,
-                                &mut state.synced_tool_health_entries,
                                 state.cloud_learning_version,
                             )
                             .await
                             {
                                 state.cloud_learning_version = Some(new_version);
+                                state.synced_tool_health_entries =
+                                    state.tool_health_entries.clone();
                                 // Update orchestrator envelope to reflect the push
                                 if let Some(ref mc) = state.matrix_runtime {
                                     let orch = mc.sync_orchestrator_lock().await;
@@ -1000,60 +985,15 @@ async fn run_chat_repl(
             .as_ref()
             .and_then(|t| t.lock().ok().map(|g| g.export()))
             .unwrap_or_default();
-        if let Err(e) = astra_evolution::persistence::save_learning_state_full(
+        if let Err(e) = astra_turn_core::tool_health_persistence::save_learning_state(
             profile_name,
-            &pipeline_modules.entity_graph,
-            &pipeline_modules.pattern_library,
-            &pipeline_modules.calibrator,
             &state.tool_health_entries,
             &tool_quality_entries,
-            None,
         ) {
             eprintln!(
                 "{}",
                 format!("  ⚠ Learning state not saved (will retry next session): {e}").yellow()
             );
-        }
-        // Push learning to cloud with versioned API (conflict resolution loop)
-        // On conflict: pull fresh data, merge, retry push (max 3 attempts)
-        const MAX_SYNC_RETRIES: u32 = 3;
-        let mut expected_version = state.cloud_learning_version;
-        for attempt in 0..MAX_SYNC_RETRIES {
-            if try_cloud_push_versioned(
-                profile_name,
-                &pipeline_modules.entity_graph,
-                &pipeline_modules.pattern_library,
-                &pipeline_modules.calibrator,
-                &state.tool_health_entries,
-                expected_version,
-            )
-            .await
-            .is_some()
-            {
-                // Success — done
-                break;
-            }
-            // Conflict or failure — pull fresh, merge, retry
-            if attempt + 1 < MAX_SYNC_RETRIES {
-                eprintln!("{}", "  ↻ Pulling fresh cloud state for merge...".dim());
-                let pull_result = try_cloud_pull(
-                    profile_name,
-                    &pipeline_modules.entity_graph,
-                    &pipeline_modules.pattern_library,
-                    &pipeline_modules.calibrator,
-                )
-                .await;
-                expected_version = pull_result.version;
-                // Merge tool health from cloud pull
-                if !pull_result.tool_health.is_empty() {
-                    let (merged, _, _) = astra_evolution::persistence::merge_tool_health(
-                        &state.tool_health_entries,
-                        &pull_result.tool_health,
-                    );
-                    // Update tool health in memory (though session is ending)
-                    state.tool_health_entries = merged;
-                }
-            }
         }
         // Push preferences to cloud (best-effort)
         try_cloud_push_preferences(&state).await;
@@ -1711,7 +1651,7 @@ mod tests {
         ));
         let mut state = ReplState {
             tool_health_entries: vec![
-                astra_evolution::persistence::ToolHealthEntry {
+                astra_turn_core::tool_health_persistence::ToolHealthEntry {
                     name: "bash".into(),
                     total_calls: 15,
                     total_failures: 3,
@@ -1719,7 +1659,7 @@ mod tests {
                     last_updated_epoch: 0,
                     recent_outcomes: vec![],
                 },
-                astra_evolution::persistence::ToolHealthEntry {
+                astra_turn_core::tool_health_persistence::ToolHealthEntry {
                     name: "grep".into(),
                     total_calls: 8,
                     total_failures: 0,
@@ -1743,7 +1683,7 @@ mod tests {
             edge_tools::all_tool_schemas(),
         ));
         let mut state = ReplState {
-            tool_health_entries: vec![astra_evolution::persistence::ToolHealthEntry {
+            tool_health_entries: vec![astra_turn_core::tool_health_persistence::ToolHealthEntry {
                 name: "bash".into(),
                 total_calls: 10,
                 total_failures: 5,
@@ -2354,183 +2294,9 @@ total_tokens_out: 500
         assert!(ckpts.is_empty(), "no checkpoints created yet");
     }
 
-    // ── merge_learning_snapshot ───────────────────────────────────────────────
-
-    #[test]
-    fn merge_learning_valid_snapshot() {
-        use astra_pipeline::{calibration, entity, pattern};
-
-        let json = serde_json::json!({
-            "version": 1,
-            "entities": [{
-                "name": "rust",
-                "aliases": ["rs"],
-                "domain": null,
-                "associated_tools": ["cargo"],
-                "confidence": 0.8,
-                "observation_count": 5
-            }],
-            "patterns": [{
-                "signature": "cargo",
-                "tools": ["cargo"],
-                "task_type": "Code",
-                "domain": null,
-                "success_count": 3,
-                "failure_count": 0,
-                "quality_sum": 2.4
-            }],
-            "calibration": null
-        })
-        .to_string();
-
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            calibration::ProgressiveCalibrator::default(),
-        ));
-
-        merge_learning_snapshot(&json, &eg, &pl, &cal);
-
-        // Verify entity content, not just count
-        let entities = eg.lock().unwrap().export();
-        assert_eq!(entities.len(), 1);
-        let e = &entities[0];
-        assert_eq!(e.name, "rust");
-        assert_eq!(e.aliases, vec!["rs"]);
-        assert_eq!(e.associated_tools, vec!["cargo"]);
-        assert!((e.confidence - 0.8).abs() < 1e-6);
-        assert_eq!(e.observation_count, 5);
-
-        // Verify pattern content, not just count
-        let patterns = pl.lock().unwrap().export();
-        assert_eq!(patterns.len(), 1);
-        let p = &patterns[0];
-        assert_eq!(p.signature, "cargo");
-        assert_eq!(p.tools, vec!["cargo"]);
-        assert_eq!(p.success_count, 3);
-        assert_eq!(p.failure_count, 0);
-    }
-
-    #[test]
-    fn merge_learning_invalid_json_does_not_panic() {
-        use astra_pipeline::{calibration, entity, pattern};
-
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            calibration::ProgressiveCalibrator::default(),
-        ));
-
-        // Invalid JSON — should not panic, just print warning
-        merge_learning_snapshot("not valid json", &eg, &pl, &cal);
-
-        // Modules should remain empty
-        assert!(eg.lock().unwrap().export().is_empty());
-        assert!(pl.lock().unwrap().export().is_empty());
-    }
-
-    #[test]
-    fn merge_learning_empty_snapshot() {
-        use astra_pipeline::{calibration, entity, pattern};
-
-        let json = serde_json::json!({
-            "version": 1,
-            "entities": [],
-            "patterns": [],
-            "calibration": null
-        })
-        .to_string();
-
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            calibration::ProgressiveCalibrator::default(),
-        ));
-
-        merge_learning_snapshot(&json, &eg, &pl, &cal);
-
-        assert!(eg.lock().unwrap().export().is_empty());
-        assert!(pl.lock().unwrap().export().is_empty());
-    }
-
-    #[test]
-    fn merge_learning_idempotent() {
-        use astra_pipeline::{calibration, entity, pattern};
-
-        let json = serde_json::json!({
-            "version": 1,
-            "entities": [{"name": "rust", "aliases": [], "domain": null,
-                "associated_tools": ["cargo"], "confidence": 0.8, "observation_count": 5}],
-            "patterns": [{"signature": "cargo", "tools": ["cargo"], "task_type": "Code",
-                "domain": null, "success_count": 3, "failure_count": 0, "quality_sum": 2.4}],
-            "calibration": null
-        })
-        .to_string();
-
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            calibration::ProgressiveCalibrator::default(),
-        ));
-
-        // Merge twice — should not duplicate
-        merge_learning_snapshot(&json, &eg, &pl, &cal);
-        merge_learning_snapshot(&json, &eg, &pl, &cal);
-
-        assert_eq!(
-            eg.lock().unwrap().export().len(),
-            1,
-            "entities should not duplicate"
-        );
-        assert_eq!(
-            pl.lock().unwrap().export().len(),
-            1,
-            "patterns should not duplicate"
-        );
-    }
-
-    #[test]
-    fn merge_learning_multiple_entities_and_patterns() {
-        use astra_pipeline::{calibration, entity, pattern};
-
-        let json = serde_json::json!({
-            "version": 1,
-            "entities": [
-                {"name": "rust", "aliases": [], "domain": null,
-                    "associated_tools": ["cargo"], "confidence": 0.9, "observation_count": 10},
-                {"name": "matrixone", "aliases": ["mo"], "domain": "Database",
-                    "associated_tools": ["sql_query"], "confidence": 0.7, "observation_count": 3}
-            ],
-            "patterns": [
-                {"signature": "cargo|grep", "tools": ["cargo", "grep"], "task_type": "Code",
-                    "domain": null, "success_count": 5, "failure_count": 1, "quality_sum": 4.0},
-                {"signature": "sql_query", "tools": ["sql_query"], "task_type": "Fetch",
-                    "domain": "Database", "success_count": 2, "failure_count": 0, "quality_sum": 1.8}
-            ],
-            "calibration": null
-        })
-        .to_string();
-
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            calibration::ProgressiveCalibrator::default(),
-        ));
-
-        merge_learning_snapshot(&json, &eg, &pl, &cal);
-
-        let entities = eg.lock().unwrap().export();
-        assert_eq!(entities.len(), 2);
-        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"rust"));
-        assert!(names.contains(&"matrixone"));
-
-        let patterns = pl.lock().unwrap().export();
-        assert_eq!(patterns.len(), 2);
-        let sigs: Vec<&str> = patterns.iter().map(|p| p.signature.as_str()).collect();
-        assert!(sigs.contains(&"cargo|grep"));
-        assert!(sigs.contains(&"sql_query"));
-    }
+    // merge_learning_snapshot tests removed: the entity/pattern/calibration
+    // learning subsystem has been deleted. Tool-health sync is exercised in
+    // the tests below.
 
     // ── handle_stats_command ─────────────────────────────────────────────────
 
@@ -3068,16 +2834,7 @@ total_tokens_out: 500
         unsafe {
             std::env::remove_var("MATRIXONE_HOST");
         }
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::entity::EntityGraph::new(),
-        ));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::pattern::PatternLibrary::new(),
-        ));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::calibration::ProgressiveCalibrator::new(0.15),
-        ));
-        let result = try_cloud_pull("default", &eg, &pl, &cal).await;
+        let result = try_cloud_pull("default").await;
         assert!(
             result.tool_health.is_empty(),
             "Without MatrixOne, cloud pull should return empty tool health"
@@ -3097,42 +2854,9 @@ total_tokens_out: 500
         unsafe {
             std::env::remove_var("MATRIXONE_HOST");
         }
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::entity::EntityGraph::new(),
-        ));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::pattern::PatternLibrary::new(),
-        ));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::calibration::ProgressiveCalibrator::new(0.15),
-        ));
         // Should not panic (was the original bug)
         // Use versioned API (None = new snapshot or unconditional push)
-        let _result = try_cloud_push_versioned("default", &eg, &pl, &cal, &[], None).await;
-    }
-
-    #[tokio::test]
-    async fn try_cloud_push_delta_is_noop_without_matrixone() {
-        unsafe {
-            std::env::remove_var("MATRIXONE_HOST");
-        }
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::entity::EntityGraph::new(),
-        ));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::pattern::PatternLibrary::new(),
-        ));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::calibration::ProgressiveCalibrator::new(0.15),
-        ));
-        let mut synced = Vec::new();
-        eg.lock().unwrap().learn(
-            "rust",
-            astra_turn_core::routing_engine::DomainHint::Code,
-            &[],
-            None,
-        );
-        let _result = try_cloud_push_delta("default", &eg, &pl, &cal, &[], &mut synced, None).await;
+        let _result = try_cloud_push_versioned("default", &[], None).await;
     }
 
     #[tokio::test]

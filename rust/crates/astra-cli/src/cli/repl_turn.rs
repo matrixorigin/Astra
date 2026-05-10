@@ -175,31 +175,6 @@ pub(super) fn detect_correction_signal(message: &str) -> bool {
     CORRECTION_PATTERNS.iter().any(|p| msg_lower.contains(p))
 }
 
-/// Emit an `EvolutionSignal::UserCorrection` (if evolution service is wired)
-/// from the current conversation context. Extracted from `run_chat_turn` for
-/// unit-testability; production code path is unchanged.
-async fn emit_user_correction_signal(state: &ReplState, correction_text: &str) {
-    let Some(evo) = state.evolution_service.as_ref() else {
-        return;
-    };
-    let prior_assistant_text = state
-        .history
-        .last()
-        .map(|(_u, a)| a.clone())
-        .unwrap_or_default();
-    let skill_context = state.recent_tools.last().cloned();
-    let turn_id = format!("turn-{}", state.turn);
-    evo.add_signal(
-        astra_runtime::evolution::types::EvolutionSignal::UserCorrection {
-            correction_text: correction_text.to_string(),
-            prior_assistant_text,
-            skill_context,
-            turn_id,
-        },
-    )
-    .await;
-}
-
 enum TurnAttempt {
     Completed(Box<Result<StreamResult, crate::TurnFailure>>),
     Interrupted,
@@ -1074,12 +1049,6 @@ async fn run_chat_turn(
         let correction_turn = state.history.len() as u32;
         state.drift_user_corrections.push(correction_turn);
 
-        // Also emit an EvolutionSignal::UserCorrection so the evolution
-        // service / auto-reflection pipeline can learn from it. Previously
-        // only drift_user_corrections was recorded and no signal was ever
-        // produced for user corrections in the production path.
-        emit_user_correction_signal(state, message).await;
-
         // Incremental lesson checkpoint: user correction is a high-value
         // breakpoint — extract any new lessons NOW rather than waiting for
         // session end. Fire-and-forget: never blocks the user's turn.
@@ -1143,7 +1112,6 @@ async fn run_chat_turn(
             task_manager: Some(state.task_manager.clone()),
             runtime_continuity: state.runtime_continuity.as_ref(),
             turn_index: state.turn,
-            evolution_service: state.evolution_service.clone(),
             pipeline_state: None,
             pre_loaded_messages: None,
             append_system_prompt: None,
@@ -5400,57 +5368,6 @@ mod tests {
         let unchanged = std::fs::read_to_string(&skill_md).unwrap();
         assert_eq!(unchanged, original, "SKILL.md must not be modified");
         assert!(state.skill_improvement_tracker.pending_proposal.is_none());
-    }
-
-    // ─── E2E: user correction → EvolutionSignal::UserCorrection emission ───
-    #[tokio::test]
-    async fn emit_user_correction_pushes_signal_to_evolution_service() {
-        let evo = std::sync::Arc::new(astra_runtime::evolution::service::EvolutionService::new());
-        let state = ReplState {
-            evolution_service: Some(evo.clone()),
-            history: vec![(
-                "write a function".to_string(),
-                "here is the function".to_string(),
-            )],
-            recent_tools: vec!["filesystem".to_string()],
-            turn: 3,
-            ..Default::default()
-        };
-
-        emit_user_correction_signal(&state, "no, that's wrong, do it differently").await;
-
-        let (_fast, llm_routed) = evo.flush().await;
-        // UserCorrection is LLM-routed by needs_llm (contains skill_context).
-        let found = llm_routed.iter().any(|s| {
-            matches!(
-                s,
-                astra_runtime::evolution::types::EvolutionSignal::UserCorrection {
-                    skill_context: Some(sc),
-                    correction_text,
-                    prior_assistant_text,
-                    turn_id,
-                } if sc == "filesystem"
-                    && correction_text.starts_with("no, that's wrong")
-                    && prior_assistant_text == "here is the function"
-                    && turn_id == "turn-3"
-            )
-        });
-        assert!(
-            found,
-            "UserCorrection signal not found in flushed llm_routed: {:?}",
-            llm_routed
-        );
-    }
-
-    #[tokio::test]
-    async fn emit_user_correction_noop_without_evolution_service() {
-        let state = ReplState {
-            evolution_service: None,
-            history: vec![("u".to_string(), "a".to_string())],
-            ..Default::default()
-        };
-        // Must not panic.
-        emit_user_correction_signal(&state, "no, that's wrong").await;
     }
 
     // ─── E2E: LLM-driven skill improvement ───────────────────────────────

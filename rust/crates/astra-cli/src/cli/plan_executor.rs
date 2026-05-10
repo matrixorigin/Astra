@@ -545,7 +545,7 @@ fn has_any_unresolved_verification_failure(
 /// generic "try something different" message. Returns `None` when no
 /// tool crosses the `min_calls` bar.
 fn high_failure_tool_evidence(
-    entries: &[astra_evolution::persistence::ToolHealthEntry],
+    entries: &[astra_turn_core::tool_health_persistence::ToolHealthEntry],
     top_k: usize,
 ) -> Option<String> {
     const MIN_CALLS: usize = 2;
@@ -976,13 +976,13 @@ impl PlanExecutorHandle {
 // ─── Background Plan Execution ───────────────────────────────────────────────
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use astra_evolution::persistence::ToolHealthEntry;
 use astra_runtime::plan_decompose;
 use astra_runtime::tool_selector::ToolSelector;
 use astra_services::session_journal;
 use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
+use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 
 use crate::StreamResult;
 
@@ -1130,7 +1130,6 @@ pub(super) struct BackgroundPlanContext {
     pub session_state_journal:
         Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>,
     pub task_manager: Arc<crate::edge_tools::TaskManager>,
-    pub evolution_service: Option<Arc<astra_runtime::evolution::service::EvolutionService>>,
 
     // ─── Harness (test observability) ────────────────────────────────────
     /// Shared harness snapshot sink for /inspect command.
@@ -1140,12 +1139,9 @@ pub(super) struct BackgroundPlanContext {
     #[cfg(feature = "harness")]
     pub harness_trace: Option<std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>>,
 
-    // ─── Cloud + Learning Integration ────────────────────────────────────
+    // ─── Cloud Integration ──────────────────────────────────────────────
     pub ingestion_user_id: Option<String>,
     pub matrix_runtime: Option<Arc<astra_runtime::MatrixCloudRuntime>>,
-    pub entity_graph: Option<Arc<Mutex<astra_pipeline::entity::EntityGraph>>>,
-    pub pattern_library: Option<Arc<Mutex<astra_pipeline::pattern::PatternLibrary>>>,
-    pub calibrator: Option<Arc<Mutex<astra_pipeline::calibration::ProgressiveCalibrator>>>,
 
     // ─── Execution Config ────────────────────────────────────────────────
     pub plan_execution_config: Option<plan_decompose::PlanExecutionConfig>,
@@ -1220,24 +1216,6 @@ async fn plan_executor_task(
     let plan_start = std::time::Instant::now();
     let mut subtask_durations: Vec<Duration> = Vec::new();
     let sink = ChannelSink::new(update_tx.clone());
-
-    // Build learning bridge from Arc-wrapped shared state (Send + Sync).
-    let learning_bridge: Option<std::sync::Arc<dyn astra_services::TaskLearningBridge>> = (|| {
-        let eg = ctx.entity_graph.as_ref()?;
-        let pl = ctx.pattern_library.as_ref()?;
-        let cal = ctx.calibrator.as_ref()?;
-        let mut bridge = astra_pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
-            eg.clone(),
-            pl.clone(),
-            cal.clone(),
-        );
-        if let Some(mc) = &ctx.matrix_runtime {
-            let pool = mc.shared_pool().get().clone();
-            let user_id = ctx.ingestion_user_id.as_deref().unwrap_or("anonymous");
-            bridge = bridge.with_cloud_pool(pool, user_id);
-        }
-        Some(std::sync::Arc::new(bridge) as std::sync::Arc<dyn astra_services::TaskLearningBridge>)
-    })();
 
     // Helper: emit a journal event via the channel (REPL thread writes it)
     // and enqueue cloud ingestion event.
@@ -1365,30 +1343,6 @@ async fn plan_executor_task(
                     total,
                 );
                 emit_event(&update_tx, &ctx, event);
-
-                // Learning: record task outcome signal
-                if let Some(ref bridge) = learning_bridge {
-                    let (task_id, contract_id) = ctx
-                        .durable_task_state
-                        .as_ref()
-                        .map(|d| (d.contract.task_id.clone(), d.contract.contract_id.clone()))
-                        .unwrap_or_default();
-                    let signal = astra_services::durable_task::TaskOutcomeSignal {
-                        task_id,
-                        contract_id,
-                        goal: ctx.plan_goal.clone().unwrap_or_default(),
-                        success: global_passed,
-                        user_rating: None,
-                        tools_used: ctx.recent_tools.clone(),
-                        subtask_outcomes: vec![],
-                        total_verification_attempts: 0,
-                        total_retries: 0,
-                        total_turns: ctx.turn,
-                        domain_hint: None,
-                        task_type: Some("plan".into()),
-                    };
-                    let _ = bridge.learn_from_task_outcome(&signal).await;
-                }
 
                 // Return durable state so re-runs can reuse the contract
                 if let Some(durable) = ctx.durable_task_state.take() {
@@ -1787,7 +1741,6 @@ async fn plan_executor_task(
                     task_manager: Some(ctx.task_manager.clone()),
                     runtime_continuity: None,
                     turn_index: ctx.turn,
-                    evolution_service: ctx.evolution_service.clone(),
                     pipeline_state: None,
                     pre_loaded_messages: None,
                     append_system_prompt: None,
@@ -2298,19 +2251,9 @@ async fn plan_executor_task(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-
-    use astra_pipeline::calibration::ProgressiveCalibrator;
-    use astra_pipeline::entity::EntityGraph;
-    use astra_pipeline::pattern::PatternLibrary;
     use astra_runtime::tool_selector::SelectionContext;
-    use astra_turn_core::routing_engine::{DomainHint, TaskType};
 
-    fn test_background_plan_context(
-        entity_graph: Option<Arc<Mutex<EntityGraph>>>,
-        pattern_library: Option<Arc<Mutex<PatternLibrary>>>,
-        calibrator: Option<Arc<Mutex<ProgressiveCalibrator>>>,
-    ) -> BackgroundPlanContext {
+    fn test_background_plan_context() -> BackgroundPlanContext {
         let mut reg = astra_runtime::skills::UnifiedSkillRegistry::new();
         reg.add_provider(Box::new(
             astra_skills::providers::LocalSkillProvider::standard(),
@@ -2364,16 +2307,12 @@ mod tests {
                 crate::edge_tools::SessionStateRollbackJournal::default(),
             )),
             task_manager: Arc::new(crate::edge_tools::TaskManager::new()),
-            evolution_service: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
             #[cfg(feature = "harness")]
             harness_trace: None,
             ingestion_user_id: None,
             matrix_runtime: None,
-            entity_graph,
-            pattern_library,
-            calibrator,
             plan_execution_config: None,
             turn: 0,
             turn_retry_counts: std::collections::HashMap::new(),
@@ -2500,54 +2439,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_selector_shares_entity_graph_with_plan_context() {
-        let eg = Arc::new(Mutex::new(EntityGraph::new()));
-        let pl = Arc::new(Mutex::new(PatternLibrary::new()));
-        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
-
-        let ctx =
-            test_background_plan_context(Some(eg.clone()), Some(pl.clone()), Some(cal.clone()));
-
-        let selector = crate::repl_runtime::create_background_plan_selector(&ctx);
-
-        selector.record_outcome(
-            "show matrixorigin issues",
-            &["github_list_issues".to_string()],
-            TaskType::Fetch,
-            Some(DomainHint::GitHub),
-            true,
-            0.9,
-            false,
-            None,
-        );
-
-        let boost = eg.lock().unwrap().boost_for("matrixorigin");
-        assert!(
-            !boost.is_empty(),
-            "outcome recording should update the same EntityGraph Arc as the plan context"
-        );
-
-        let sel_ctx = SelectionContext {
-            query: "matrixorigin help",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-        let res = selector.select(&sel_ctx).await;
-        assert!(!res.tool_names.is_empty());
-        assert!(!res.failed);
-    }
-
-    #[tokio::test]
     async fn background_selector_without_pipeline_modules_still_selects() {
-        let ctx = test_background_plan_context(None, None, None);
+        let ctx = test_background_plan_context();
         let selector = crate::repl_runtime::create_background_plan_selector(&ctx);
         let sel_ctx = SelectionContext {
             query: "list files in current directory",
@@ -2594,7 +2487,7 @@ mod tests {
 
     #[test]
     fn high_failure_tool_evidence_surfaces_repeat_offenders() {
-        use astra_evolution::persistence::ToolHealthEntry;
+        use astra_turn_core::tool_health_persistence::ToolHealthEntry;
         let entries = vec![
             ToolHealthEntry {
                 name: "flaky_tool".into(),
@@ -2638,7 +2531,7 @@ mod tests {
 
     #[test]
     fn high_failure_tool_evidence_returns_none_when_no_signal() {
-        use astra_evolution::persistence::ToolHealthEntry;
+        use astra_turn_core::tool_health_persistence::ToolHealthEntry;
         let entries = vec![ToolHealthEntry {
             name: "steady".into(),
             total_calls: 5,
@@ -3161,7 +3054,7 @@ All acceptance checks pass:
         )
         .await
         .expect("mock llm server");
-        let mut ctx = test_background_plan_context(None, None, None);
+        let mut ctx = test_background_plan_context();
         ctx.api = astra_thin_client::ThinClient::new(&mock.base_url, None).expect("thin client");
         ctx.plan = TaskPlan {
             subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
@@ -3247,7 +3140,7 @@ All acceptance checks pass:
         )
         .await
         .expect("mock llm server");
-        let mut ctx = test_background_plan_context(None, None, None);
+        let mut ctx = test_background_plan_context();
         ctx.api = astra_thin_client::ThinClient::new(&mock.base_url, None).expect("thin client");
         ctx.plan = TaskPlan {
             subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
@@ -3308,7 +3201,7 @@ All acceptance checks pass:
         )
         .await
         .expect("mock llm server");
-        let mut ctx = test_background_plan_context(None, None, None);
+        let mut ctx = test_background_plan_context();
         ctx.api = astra_thin_client::ThinClient::new(&mock.base_url, None).expect("thin client");
         ctx.plan = TaskPlan {
             subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
@@ -3370,7 +3263,7 @@ All acceptance checks pass:
         )
         .await
         .expect("mock llm server");
-        let mut ctx = test_background_plan_context(None, None, None);
+        let mut ctx = test_background_plan_context();
         ctx.api = astra_thin_client::ThinClient::new(&mock.base_url, None).expect("thin client");
         ctx.plan = TaskPlan {
             subtasks: vec![
@@ -3449,7 +3342,7 @@ All acceptance checks pass:
 
     #[test]
     fn turn_retry_counts_in_context_starts_empty() {
-        let ctx = test_background_plan_context(None, None, None);
+        let ctx = test_background_plan_context();
         assert!(
             ctx.turn_retry_counts.is_empty(),
             "fresh context should have no retry counts"

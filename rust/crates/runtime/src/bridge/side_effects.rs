@@ -24,7 +24,6 @@ pub fn run_bridge_hook_side_effects(
     turn_reflection_state_store: Arc<dyn TurnReflectionStateStore>,
     turn_reflection_lesson_writer: Arc<dyn TurnReflectionLessonWriter>,
     turn_observer_worker: Arc<dyn TurnObserverWorker>,
-    turn_learning_writer: Option<Arc<dyn TurnLearningWriter>>,
 ) {
     let Some(payload) = payload else {
         return;
@@ -55,14 +54,6 @@ pub fn run_bridge_hook_side_effects(
             && let Err(error) = turn_observer_worker.run(observer_request).await
         {
             record_persist_failure("observer_run", &error);
-        }
-        // Pipeline learning: extract turn outcome and update EntityGraph/PatternLibrary/Calibrator
-        if let Some(writer) = turn_learning_writer
-            && let Some(outcome) =
-                astra_turn_core::pipeline_learning::build_learning_outcome_from_payload(&payload)
-            && let Err(error) = writer.record_outcome(outcome).await
-        {
-            record_persist_failure("pipeline_learning", &error);
         }
         record_persist_ok();
     });
@@ -276,9 +267,8 @@ fn build_hook_db_persist_from_payload(
             serde_json::Value::Object(action_profile)
         })
         .collect::<Vec<_>>();
-    let mutation_objective_score =
-        astra_turn_core::pipeline_learning::build_learning_outcome_from_payload(payload)
-            .and_then(|outcome| serde_json::to_value(outcome.mutation_objective_score()).ok());
+    // mutation_objective_score previously derived from pipeline learning; subsystem removed.
+    let mutation_objective_score: Option<serde_json::Value> = None;
     let turn_number = valid_turn_number(hook_payload.get("turn_count"));
     let decision_audit = Some(TurnDecisionAuditRecord {
         decision_id: Uuid::now_v7().to_string(),
@@ -1355,7 +1345,6 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store),
             Arc::new(lesson_writer),
             Arc::new(observer),
-            None,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1397,7 +1386,7 @@ mod inprocess_hook_contract_tests {
             audit.decision_output["action_profiles"][0]["profile"]["bounded"],
             false
         );
-        assert!(audit.decision_output["mutation_objective_score"].is_object());
+        assert!(audit.decision_output["mutation_objective_score"].is_null());
 
         let selection = plan
             .skill_selection
@@ -1422,7 +1411,6 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store),
             Arc::new(lesson_writer),
             Arc::new(observer),
-            None,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1451,7 +1439,6 @@ mod inprocess_hook_contract_tests {
             Arc::new(RecordingReflectionStateStore::default()),
             Arc::new(RecordingReflectionLessonWriter::default()),
             Arc::new(RecordingObserverWorker::default()),
-            None,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1485,7 +1472,6 @@ mod inprocess_hook_contract_tests {
             Arc::new(RecordingReflectionStateStore::default()),
             Arc::new(RecordingReflectionLessonWriter::default()),
             Arc::new(RecordingObserverWorker::default()),
-            None,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1515,7 +1501,6 @@ mod inprocess_hook_contract_tests {
             Arc::new(RecordingReflectionStateStore::default()),
             Arc::new(RecordingReflectionLessonWriter::default()),
             Arc::new(RecordingObserverWorker::default()),
-            None,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1540,7 +1525,6 @@ mod inprocess_hook_contract_tests {
             Arc::new(RecordingReflectionStateStore::default()),
             Arc::new(RecordingReflectionLessonWriter::default()),
             Arc::new(RecordingObserverWorker::default()),
-            None,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1571,7 +1555,6 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store),
             Arc::new(lesson_writer),
             Arc::new(observer),
-            None,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1629,7 +1612,6 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store),
             Arc::new(lesson_writer),
             Arc::new(observer),
-            None,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1670,7 +1652,6 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store),
             Arc::new(lesson_writer),
             Arc::new(observer),
-            None,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1704,7 +1685,6 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store),
             Arc::new(lesson_writer),
             Arc::new(observer),
-            None,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1750,7 +1730,6 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store),
             Arc::new(lesson_writer),
             Arc::new(observer),
-            None,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1820,7 +1799,6 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store.clone()),
             Arc::new(lesson_writer),
             Arc::new(observer),
-            None,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1848,7 +1826,6 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store),
             Arc::new(lesson_writer),
             Arc::new(observer),
-            None,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1892,7 +1869,6 @@ mod inprocess_hook_contract_tests {
             Arc::new(reflection_store),
             Arc::new(lesson_writer),
             Arc::new(observer),
-            None,
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1904,343 +1880,5 @@ mod inprocess_hook_contract_tests {
             assert!(fb.rating < 3, "negative signal should produce low rating");
             assert!(fb.comment.as_deref().unwrap_or("").contains("implicit:"));
         }
-    }
-
-    // ─── E2E: correction signal chain through run_bridge_hook_side_effects ───
-    //
-    // These tests exercise the REAL production path including tokio::spawn:
-    //   build_turn_hook_args() → inject is_correction + routing_meta
-    //   → run_bridge_hook_side_effects() [spawns async task]
-    //   → build_learning_outcome_from_payload() → PipelineLearningWriter.record_outcome()
-    //   → ProgressiveCalibrator.record(was_corrected=true)
-
-    /// Full e2e: user says "不对" → implicit feedback detected → is_correction
-    /// injected into hook payload → spawned side_effects task updates Calibrator.
-    #[tokio::test]
-    async fn e2e_correction_flows_through_side_effects_to_calibrator() {
-        use std::sync::{Arc, Mutex as StdMutex};
-
-        let cal = Arc::new(StdMutex::new(
-            astra_pipeline::calibration::ProgressiveCalibrator::new(0.70),
-        ));
-        let writer: Arc<dyn crate::TurnLearningWriter> = Arc::new(
-            astra_turn_core::pipeline_learning::PipelineLearningWriter::new()
-                .with_progressive_calibrator(cal.clone()),
-        );
-
-        let initial = cal.lock().unwrap().calibrated_threshold(
-            "fetch",
-            None,
-            crate::pipeline::routing::TaskType::Fetch,
-        );
-
-        for i in 0..6 {
-            // Step 1: detect implicit feedback (same as bridge_inprocess.rs line 1864)
-            let user_input = format!("不对，这完全错了 {i}");
-            let prev_assistant = "Here are the PRs.";
-            let signal = crate::turn::implicit_feedback::detect_implicit_feedback_signal(
-                &user_input,
-                Some(prev_assistant),
-            );
-            let is_correction = matches!(signal.signal_type.as_str(), "correction" | "frustration");
-            assert!(
-                is_correction,
-                "turn {i}: '不对' should be detected as correction"
-            );
-
-            // Step 2: build hook payload (same as bridge_inprocess.rs line 2939)
-            let messages = vec![
-                json!({"role": "assistant", "content": prev_assistant}),
-                json!({"role": "user", "content": &user_input}),
-            ];
-            let tool_calls = vec![json!({
-                "id": format!("call-{i}"),
-                "function": {"name": "github_list_prs", "arguments": "{}"}
-            })];
-            let tool_results = vec![json!({
-                "tool_call_id": format!("call-{i}"),
-                "name": "github_list_prs",
-                "result": "{\"prs\": []}"
-            })];
-            let mut payload = build_turn_hook_args(
-                "user-1",
-                "session-1",
-                &messages,
-                &tool_results,
-                prev_assistant,
-                &tool_calls,
-                None,
-                Some("gpt-4"),
-                None,
-                Some("evt-1"),
-                (i + 1) as i64,
-                None,
-                false,
-                false,
-                false,
-                false,
-            );
-
-            // Step 3: inject correction + routing (same as bridge_inprocess.rs line 2960+)
-            if is_correction {
-                payload.insert("is_correction".to_string(), json!(true));
-            }
-            payload
-                .entry("routing_meta".to_string())
-                .or_insert_with(|| json!({}))
-                .as_object_mut()
-                .unwrap()
-                .insert("task_type".to_string(), json!("fetch"));
-
-            // Step 4: fire through real run_bridge_hook_side_effects (with tokio::spawn)
-            run_bridge_hook_side_effects(
-                Some(Value::Object(payload)),
-                Arc::new(RecordingHookDbWriter::default()),
-                Arc::new(RecordingReflectionStateStore::default()),
-                Arc::new(RecordingReflectionLessonWriter::default()),
-                Arc::new(RecordingObserverWorker::default()),
-                Some(writer.clone()),
-            );
-        }
-
-        // Wait for all 6 spawned tasks
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-        let final_threshold = cal.lock().unwrap().calibrated_threshold(
-            "fetch",
-            None,
-            crate::pipeline::routing::TaskType::Fetch,
-        );
-
-        assert!(
-            final_threshold < initial,
-            "calibrated threshold should decrease after corrections: \
-             initial={initial}, final={final_threshold}"
-        );
-    }
-
-    /// Same real path but normal turns (no correction) — threshold must not change.
-    #[tokio::test]
-    async fn e2e_no_correction_through_side_effects_leaves_calibrator_unchanged() {
-        use std::sync::{Arc, Mutex as StdMutex};
-
-        let cal = Arc::new(StdMutex::new(
-            astra_pipeline::calibration::ProgressiveCalibrator::new(0.70),
-        ));
-        let writer: Arc<dyn crate::TurnLearningWriter> = Arc::new(
-            astra_turn_core::pipeline_learning::PipelineLearningWriter::new()
-                .with_progressive_calibrator(cal.clone()),
-        );
-
-        let initial = cal.lock().unwrap().calibrated_threshold(
-            "code",
-            None,
-            crate::pipeline::routing::TaskType::Code,
-        );
-
-        for i in 0..6 {
-            let user_input = format!("show me the implementation {i}");
-            let signal =
-                crate::turn::implicit_feedback::detect_implicit_feedback_signal(&user_input, None);
-            assert!(
-                !matches!(signal.signal_type.as_str(), "correction" | "frustration"),
-                "normal input should not be correction"
-            );
-
-            let messages = vec![json!({"role": "user", "content": &user_input})];
-            let tool_calls = vec![json!({
-                "id": format!("call-{i}"),
-                "function": {"name": "write_file", "arguments": "{}"}
-            })];
-            let tool_results = vec![json!({
-                "tool_call_id": format!("call-{i}"),
-                "name": "write_file",
-                "result": "ok"
-            })];
-            let mut payload = build_turn_hook_args(
-                "user-1",
-                "session-2",
-                &messages,
-                &tool_results,
-                "Done.",
-                &tool_calls,
-                None,
-                Some("gpt-4"),
-                None,
-                Some("evt-2"),
-                (i + 1) as i64,
-                None,
-                false,
-                false,
-                false,
-                false,
-            );
-            // No is_correction — bridge would not inject it
-            payload
-                .entry("routing_meta".to_string())
-                .or_insert_with(|| json!({}))
-                .as_object_mut()
-                .unwrap()
-                .insert("task_type".to_string(), json!("code"));
-
-            run_bridge_hook_side_effects(
-                Some(Value::Object(payload)),
-                Arc::new(RecordingHookDbWriter::default()),
-                Arc::new(RecordingReflectionStateStore::default()),
-                Arc::new(RecordingReflectionLessonWriter::default()),
-                Arc::new(RecordingObserverWorker::default()),
-                Some(writer.clone()),
-            );
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-        let final_threshold = cal.lock().unwrap().calibrated_threshold(
-            "code",
-            None,
-            crate::pipeline::routing::TaskType::Code,
-        );
-
-        assert_eq!(
-            initial, final_threshold,
-            "threshold should not change without correction signal"
-        );
-    }
-
-    /// learning_writer=None → spawned task completes without panic.
-    #[tokio::test]
-    async fn e2e_no_learning_writer_graceful_noop() {
-        let mut payload = build_turn_hook_args(
-            "user-1",
-            "session-3",
-            &[json!({"role": "user", "content": "wrong"})],
-            &[json!({"tool_call_id": "c1", "name": "bash", "result": "err"})],
-            "Failed.",
-            &[json!({"id": "c1", "function": {"name": "bash", "arguments": "{}"}})],
-            None,
-            Some("gpt-4"),
-            None,
-            Some("evt-3"),
-            1,
-            None,
-            false,
-            false,
-            false,
-            false,
-        );
-        payload.insert("is_correction".to_string(), json!(true));
-
-        run_bridge_hook_side_effects(
-            Some(Value::Object(payload)),
-            Arc::new(RecordingHookDbWriter::default()),
-            Arc::new(RecordingReflectionStateStore::default()),
-            Arc::new(RecordingReflectionLessonWriter::default()),
-            Arc::new(RecordingObserverWorker::default()),
-            None, // no learning writer
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        // No panic = success
-    }
-
-    /// Mixed scenario: 5 corrections + 5 normal → threshold decreases.
-    /// Normal turns need tool_quality_assessments to pass the ambiguous quality gate.
-    #[tokio::test]
-    async fn e2e_mixed_corrections_and_normal_partial_threshold_decrease() {
-        use std::sync::{Arc, Mutex as StdMutex};
-
-        let cal = Arc::new(StdMutex::new(
-            astra_pipeline::calibration::ProgressiveCalibrator::new(0.70),
-        ));
-        let writer: Arc<dyn crate::TurnLearningWriter> = Arc::new(
-            astra_turn_core::pipeline_learning::PipelineLearningWriter::new()
-                .with_progressive_calibrator(cal.clone()),
-        );
-
-        let initial = cal.lock().unwrap().calibrated_threshold(
-            "fetch",
-            None,
-            crate::pipeline::routing::TaskType::Fetch,
-        );
-
-        for i in 0..10 {
-            let is_correction_turn = i < 5;
-            let user_input = if is_correction_turn {
-                format!("不对，重新来 {i}")
-            } else {
-                format!("show me the PRs for project {i}")
-            };
-            let messages = vec![
-                json!({"role": "assistant", "content": "Previous response."}),
-                json!({"role": "user", "content": &user_input}),
-            ];
-            let tool_calls = vec![json!({
-                "id": format!("call-{i}"),
-                "function": {"name": "github_list_prs", "arguments": "{}"}
-            })];
-            let tool_results = vec![json!({
-                "tool_call_id": format!("call-{i}"),
-                "name": "github_list_prs",
-                "result": "{\"prs\": [{\"title\": \"fix\"}]}"
-            })];
-            let mut payload = build_turn_hook_args(
-                "user-1",
-                "session-4",
-                &messages,
-                &tool_results,
-                "Here.",
-                &tool_calls,
-                None,
-                Some("gpt-4"),
-                None,
-                Some("evt-4"),
-                (i + 1) as i64,
-                None,
-                false,
-                false,
-                false,
-                false,
-            );
-            if is_correction_turn {
-                payload.insert("is_correction".to_string(), json!(true));
-            }
-            // Add quality assessments so normal turns pass the ambiguous quality gate
-            payload.insert(
-                "tool_quality_assessments".to_string(),
-                json!([
-                    {"tool_name": "github_list_prs", "quality_score": 0.85}
-                ]),
-            );
-            payload
-                .entry("routing_meta".to_string())
-                .or_insert_with(|| json!({}))
-                .as_object_mut()
-                .unwrap()
-                .insert("task_type".to_string(), json!("fetch"));
-
-            run_bridge_hook_side_effects(
-                Some(Value::Object(payload)),
-                Arc::new(RecordingHookDbWriter::default()),
-                Arc::new(RecordingReflectionStateStore::default()),
-                Arc::new(RecordingReflectionLessonWriter::default()),
-                Arc::new(RecordingObserverWorker::default()),
-                Some(writer.clone()),
-            );
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        let final_threshold = cal.lock().unwrap().calibrated_threshold(
-            "fetch",
-            None,
-            crate::pipeline::routing::TaskType::Fetch,
-        );
-
-        // 5/10 corrections = 50% correction rate → threshold should decrease
-        assert!(
-            final_threshold < initial,
-            "threshold should decrease with 50% correction rate: \
-             initial={initial}, final={final_threshold}"
-        );
     }
 }

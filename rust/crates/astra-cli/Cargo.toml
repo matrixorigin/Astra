@@ -21,7 +21,6 @@ astra-runtime.workspace = true
 astra-pipeline.workspace = true
 astra-messaging.workspace = true
 astra-skills.workspace = true
-astra-evolution.workspace = true
 astra-learning.workspace = true
 astra-config.workspace = true
 astra-turn-core.workspace = true

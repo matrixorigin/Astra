@@ -8,7 +8,6 @@ use astra_services::evaluation::SessionQualityAssessmentRequest;
 use super::agentic_adaptive_tuning::{
     apply_per_turn_adaptation, apply_tactical_actions, maybe_run_tuning_cycle,
 };
-use super::agentic_auto_reflection::maybe_trigger_auto_reflection;
 use super::agentic_delegate_interception::{
     DelegationInterceptionResult, intercept_delegations, tool_call_name,
 };
@@ -99,6 +98,7 @@ fn tool_record_result_text(rec: &astra_services::session_journal::ToolCallRecord
         .unwrap_or("")
 }
 
+#[cfg(test)]
 fn tool_record_was_rejected(rec: &astra_services::session_journal::ToolCallRecord) -> bool {
     rec.error
         .as_deref()
@@ -1232,72 +1232,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .await;
     }
 
-    if let Some(ref evo) = state.evolution_service {
-        let turn_id = state.current_run_id.as_deref().unwrap_or("unknown");
-        let active_skill: Option<String> = state
-            .skills
-            .invoked
-            .iter()
-            .max_by_key(|(_, v)| v.invoked_at_turn)
-            .map(|(name, _)| name.clone());
-        let active_skill_ref = active_skill.as_deref();
-        for rec in &state.stall.tool_call_records[evo_records_before..] {
-            if rec.is_synthetic_placeholder() {
-                continue;
-            }
-            let result_text = tool_record_result_text(rec);
-            let classification = astra_turn_core::action_compensation::classify_execution_outcome(
-                result_text,
-                !rec.ok,
-                rec.ms,
-                tool_record_was_rejected(rec),
-            );
-            let ctx = astra_evolution::types::ToolResultContext {
-                tool_name: &rec.name,
-                tool_args: rec.args_preview.as_deref().unwrap_or(""),
-                result: result_text,
-                is_error: !rec.ok,
-                failure_category: classification.failure_category,
-                duration_ms: rec.ms,
-                active_skill: active_skill_ref,
-                turn_id,
-            };
-            evo.on_tool_result(&ctx).await;
-        }
-
-        if !state.stall.turn_sigs.is_empty() {
-            let sigs = &state.stall.turn_sigs;
-            let n = sigs.len();
-            if n >= 3 && sigs[n - 1] == sigs[n - 2] && sigs[n - 2] == sigs[n - 3] {
-                let chain: Vec<String> = sigs[n - 1].iter().cloned().collect();
-                evo.add_signal(astra_evolution::types::EvolutionSignal::RepeatedStall {
-                    tool_chain: chain,
-                    stall_count: 3,
-                    turn_id: turn_id.to_string(),
-                })
-                .await;
-            }
-        }
-
-        let this_turn = &state.stall.tool_call_records[evo_records_before..];
-        let mut fail_counts: std::collections::HashMap<&str, u32> =
-            std::collections::HashMap::new();
-        for rec in this_turn {
-            if !rec.ok {
-                *fail_counts.entry(rec.name.as_str()).or_default() += 1;
-            }
-        }
-        for (tool, count) in &fail_counts {
-            if *count >= 3 {
-                evo.add_signal(astra_evolution::types::EvolutionSignal::RepeatedStall {
-                    tool_chain: vec![(*tool).to_string()],
-                    stall_count: *count,
-                    turn_id: turn_id.to_string(),
-                })
-                .await;
-            }
-        }
-    }
+    let _ = evo_records_before;
 
     if state.step_signal_collector.is_some() || state.tactical_adapter.is_some() {
         let new_records = &state.stall.tool_call_records[evo_records_before..];
@@ -1609,7 +1544,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             refresh_runtime_promotion_signals_from_db(state).await;
             state.telemetry.completed_turns_for_tuning += 1;
             maybe_run_tuning_cycle(state);
-            maybe_trigger_auto_reflection(host, state).await;
             let turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
             apply_per_turn_adaptation(state, turn_tokens);
 

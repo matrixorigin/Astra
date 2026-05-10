@@ -448,10 +448,11 @@ fn tool_relevance_score(
     }
 
     // ── Phase 5: Tool co-occurrence boost ──
-    // When PatternLibrary has learned that certain tools succeed together,
-    // boost tools that frequently co-occur with recently-used tools.
-    // Max boost: +0.10 — enough to tip marginal tools into selection
-    // but not enough to override strong textual/intent signals.
+    // Callers may supply a static co-occurrence hint map (tool name →
+    // score in [0,1]) to boost tools that historically succeed alongside
+    // recently-used tools. Max boost: +0.10 — enough to tip marginal
+    // tools into selection but not enough to override strong textual or
+    // intent signals. Empty map (the current default) is a no-op.
     if let Some(&co_score) = co_occurrence.get(tool.name) {
         score += co_score * 0.10;
     }
@@ -594,9 +595,9 @@ pub fn pre_filter_dynamic_with_pressure(
     )
 }
 
-/// Full pre-filter with pressure, memory hints, AND tool co-occurrence learning.
-/// Co-occurrence scores come from PatternLibrary::co_occurrence_scores() and
-/// boost tools that historically succeed alongside recently-used tools.
+/// Full pre-filter with pressure, memory hints, AND tool co-occurrence boost.
+/// Callers pass the co-occurrence score map directly; tools with a positive
+/// score are nudged up to favour historically-paired tool chains.
 pub fn pre_filter_dynamic_with_cooccurrence(
     state: &ConversationState,
     query: &str,

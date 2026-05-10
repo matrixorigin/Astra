@@ -12,29 +12,6 @@ use crate::repl_state::ReplState;
 use crate::theme;
 use crossterm::style::Stylize;
 
-/// Build a [`TaskLearningBridge`] from ReplState's shared pipeline components.
-///
-/// Returns `None` if any of the required learning modules (entity_graph,
-/// pattern_library, calibrator) are not yet initialized.
-pub(crate) fn build_learning_bridge(
-    state: &ReplState,
-) -> Option<std::sync::Arc<dyn astra_services::TaskLearningBridge>> {
-    let eg = state.entity_graph.as_ref()?;
-    let pl = state.pattern_library.as_ref()?;
-    let cal = state.calibrator.as_ref()?;
-    let mut bridge = astra_pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
-        eg.clone(),
-        pl.clone(),
-        cal.clone(),
-    );
-    if let Some(mc) = &state.matrix_runtime {
-        let pool = mc.shared_pool().get().clone();
-        let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
-        bridge = bridge.with_cloud_pool(pool, user_id);
-    }
-    Some(std::sync::Arc::new(bridge))
-}
-
 fn build_fallback_delegation_engine()
 -> std::sync::Arc<astra_runtime::server::delegation_engine::DelegationEngine> {
     let mut registry = astra_services::AgentProfileRegistry::new();
@@ -98,16 +75,12 @@ fn take_plan_context(
         git_worktree_journal: state.git_worktree_journal.clone(),
         session_state_journal: state.session_state_journal.clone(),
         task_manager: state.task_manager.clone(),
-        evolution_service: state.evolution_service.clone(),
         #[cfg(feature = "harness")]
         harness_sink: Some(state.harness_sink.clone()),
         #[cfg(feature = "harness")]
         harness_trace: Some(state.harness_trace.clone()),
         ingestion_user_id: state.ingestion_user_id.clone(),
         matrix_runtime: state.matrix_runtime.clone(),
-        entity_graph: state.entity_graph.clone(),
-        pattern_library: state.pattern_library.clone(),
-        calibrator: state.calibrator.clone(),
         plan_execution_config: state.plan_execution_config.clone(),
         turn: state.turn,
         turn_retry_counts: std::collections::HashMap::new(),
@@ -228,7 +201,6 @@ async fn ensure_durable_task_state(
     // Judge runs server-side via server_proxy_judge (the server resolves the reasoning model
     // from admin_config + infra_llm_models). No local cloud judge.
     let cloud_judge: Option<std::sync::Arc<dyn astra_services::LlmJudge>> = None;
-    let learning = build_learning_bridge(state);
 
     let lifecycle = if let Some(pool) = state
         .matrix_runtime
@@ -242,7 +214,6 @@ async fn ensure_durable_task_state(
             Some(session_id),
             Some(user_id),
             cloud_judge,
-            learning,
             server_proxy_judge,
         )
     } else {
@@ -258,7 +229,6 @@ async fn ensure_durable_task_state(
             Some(session_id),
             Some(user_id),
             cloud_judge,
-            learning,
             server_proxy_judge,
         )
     };
@@ -298,11 +268,8 @@ mod tests {
         let hub =
             std::sync::Arc::new(astra_runtime::observability_integration::ObservabilityHub::new());
         let session = hub.start_session("user-1", "sess-plan");
-        let evolution =
-            std::sync::Arc::new(astra_runtime::evolution::service::EvolutionService::new());
         state.observability_hub = Some(hub.clone());
         state.observability_session = Some(session.clone());
-        state.evolution_service = Some(evolution.clone());
 
         let file_journal = state.file_journal.clone();
         let database_snapshot_journal = state.database_snapshot_journal.clone();
@@ -345,10 +312,6 @@ mod tests {
             &session_state_journal
         ));
         assert!(std::sync::Arc::ptr_eq(&ctx.task_manager, &task_manager));
-        assert!(std::sync::Arc::ptr_eq(
-            ctx.evolution_service.as_ref().unwrap(),
-            &evolution
-        ));
     }
 
     #[tokio::test]
