@@ -217,6 +217,45 @@ pub struct QueryBehavior {
     pub correction_detected: bool,
 }
 
+/// Raw per-turn text for every caller-supplied
+/// [`astra_turn_core::injection_tracking::InjectionChannel`]. Built by
+/// the bridge / CLI and passed to
+/// [`ObservabilitySession::observe_bridge_injections`] so the
+/// freshness tracker fingerprints every live channel, not just the 4
+/// legacy ones.
+///
+/// Empty `""` for a field means "this channel is tracked this turn but
+/// rendered nothing" — the distinction between `Empty` (known-silent)
+/// and `Untracked` (never-observed) depends on being explicit here.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BridgeInjectionTexts<'a> {
+    pub lessons: &'a str,
+    pub volatile: &'a str,
+    pub memoria_insights: &'a str,
+    pub memoria_prefetch: &'a str,
+    pub self_awareness: &'a str,
+    pub feedback_rules: &'a str,
+    pub implicit_feedback: &'a str,
+    pub recent_arg_hints: &'a str,
+    pub skill_listing: &'a str,
+    pub tool_round_guidance: &'a str,
+}
+
+impl BridgeInjectionTexts<'_> {
+    pub const EMPTY: Self = Self {
+        lessons: "",
+        volatile: "",
+        memoria_insights: "",
+        memoria_prefetch: "",
+        self_awareness: "",
+        feedback_rules: "",
+        implicit_feedback: "",
+        recent_arg_hints: "",
+        skill_listing: "",
+        tool_round_guidance: "",
+    };
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnTiming {
     pub turn: u32,
@@ -351,17 +390,35 @@ impl ObservabilitySession {
         self.profile.current_scenario
     }
 
-    /// Observe the four tracked prompt-injection channels for the
-    /// current turn. Idempotent per fingerprint — calling this multiple
-    /// times in the same turn with identical content only bumps the
+    /// Observe every tracked prompt-injection channel for the current
+    /// turn. Idempotent per fingerprint — calling this multiple times
+    /// in the same turn with identical content only bumps the
     /// `last_seen_round` of the current run. A content change opens a
     /// new run so the freshness report reports `rounds_alive=0` and
     /// clears a stale status.
+    ///
+    /// The self-model channels (`RecentFailingTests`, `OutcomeBias`)
+    /// are read off this session's own state. Everything else comes
+    /// from the caller because only the bridge / CLI sees what actually
+    /// landed in `edge_profile` / `dynamic_sections` this turn.
     ///
     /// Call site: CLI's `build_self_model_for_agent` (edge_tools.rs)
     /// after the session has been repopulated with the per-turn signals
     /// but before the SelfModel snapshot is built.
     pub fn observe_injections(&mut self, lessons_text: &str, volatile_text: &str) {
+        self.observe_bridge_injections(BridgeInjectionTexts {
+            lessons: lessons_text,
+            volatile: volatile_text,
+            ..BridgeInjectionTexts::EMPTY
+        });
+    }
+
+    /// Structured variant of [`Self::observe_injections`]. Callers that
+    /// have visibility into the full `dynamic_sections` list (bridge,
+    /// full CLI turn path) should use this so every live channel gets
+    /// fingerprinted — the older two-arg form leaves 8 channels
+    /// permanently `Untracked` in the freshness report.
+    pub fn observe_bridge_injections(&mut self, texts: BridgeInjectionTexts<'_>) {
         use astra_turn_core::injection_tracking::{InjectionChannel, InjectionFingerprint};
         let round = self.turn_number;
 
@@ -384,17 +441,40 @@ impl ObservabilitySession {
             InjectionFingerprint::from_content(&bias_text),
         );
 
-        self.injection_history.observe(
-            round,
-            InjectionChannel::Lessons,
-            InjectionFingerprint::from_content(lessons_text),
-        );
+        // Caller-supplied channels. Order matches
+        // `InjectionChannel::all()` ordering for stable introspect output.
+        let BridgeInjectionTexts {
+            lessons,
+            volatile,
+            memoria_insights,
+            memoria_prefetch,
+            self_awareness,
+            feedback_rules,
+            implicit_feedback,
+            recent_arg_hints,
+            skill_listing,
+            tool_round_guidance,
+        } = texts;
 
-        self.injection_history.observe(
-            round,
-            InjectionChannel::VolatilePending,
-            InjectionFingerprint::from_content(volatile_text),
-        );
+        let pairs = [
+            (InjectionChannel::Lessons, lessons),
+            (InjectionChannel::VolatilePending, volatile),
+            (InjectionChannel::MemoriaInsights, memoria_insights),
+            (InjectionChannel::MemoriaPrefetch, memoria_prefetch),
+            (InjectionChannel::SelfAwareness, self_awareness),
+            (InjectionChannel::FeedbackRules, feedback_rules),
+            (InjectionChannel::ImplicitFeedback, implicit_feedback),
+            (InjectionChannel::RecentArgHints, recent_arg_hints),
+            (InjectionChannel::SkillListing, skill_listing),
+            (InjectionChannel::ToolRoundGuidance, tool_round_guidance),
+        ];
+        for (channel, text) in pairs {
+            self.injection_history.observe(
+                round,
+                channel,
+                InjectionFingerprint::from_content(text),
+            );
+        }
     }
 
     /// Partial observation for call sites that cannot see the per-turn

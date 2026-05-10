@@ -757,32 +757,27 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                 .unwrap_or_default();
             session.ingest_self_model_inputs(skills, tool_health_entries, scenario, recent_signals);
 
-            // Observe the prompt-injection lessons channel for this
-            // round so `introspect subtopic=noise` can report whether
-            // lessons have been re-rendered unchanged for many turns
-            // (the f85a02bb stale-signal case). Lessons are owned by
-            // the executor and reachable here.
-            //
-            // NOTE: the per-turn volatile lane is NOT observed from
-            // this CLI path — it is injected further downstream and
-            // is not visible here. Observing it with an empty string
-            // would falsely report `Empty` for every round and mask
-            // genuine staleness. The volatile-aware observation point
-            // lives in runtime/observability_integration.rs.
-            //
-            // Fingerprint uses `LessonKind::as_str()` (stable snake_case
-            // DB tag), NOT `Debug`, so enum-variant renames do not flip
-            // every channel from Stale→Fresh for one round.
-            let lessons_text = ctx
-                .executor
-                .session_lessons_snapshot()
-                .iter()
-                .map(|l| format!("{}:{}:{}", l.kind.as_str(), l.trigger_signal, l.action))
-                .collect::<Vec<_>>()
-                .join("|");
-            session.observe_lessons_only(&lessons_text);
+            // Injection-freshness observation is deferred to the end of
+            // this fn (see `injection_observation_texts` below) so every
+            // channel the CLI actually writes into edge_profile this turn
+            // — memoria insights, self-awareness, recent-arg hints, skill
+            // listing — gets fingerprinted in a single place. Observing
+            // here would see only `lessons` and leave 8 channels
+            // permanently `Untracked` in introspect's freshness report.
         }
     }
+    // Lessons are owned by the executor and read here; capture once so
+    // the end-of-fn observation call has a stable string. Fingerprint
+    // uses `LessonKind::as_str()` (stable snake_case DB tag), NOT
+    // `Debug`, so enum-variant renames do not flip every channel from
+    // Stale→Fresh for one round.
+    let lessons_text_for_observation = ctx
+        .executor
+        .session_lessons_snapshot()
+        .iter()
+        .map(|l| format!("{}:{}:{}", l.kind.as_str(), l.trigger_signal, l.action))
+        .collect::<Vec<_>>()
+        .join("|");
     if let Some(self_model) = ctx.executor.build_self_model_snapshot() {
         // Gate on signal content, not raw length. A bare `Turn: N\nTokens: …`
         // header easily passes a length threshold but carries no actionable
@@ -829,6 +824,53 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         }
     }
     log_chat_turn_timing_phase(timing, "self_awareness_inject", &mut mark);
+
+    // ─── Injection freshness: fingerprint every live channel ─────────────────
+    // Deferred to here so we observe AFTER all edge_profile writes.
+    // Extracts the canonical text from each `edge_profile.*` key — this is
+    // the same string the bridge will lift out and push into the system
+    // prompt, so the fingerprint matches what the model actually sees.
+    //
+    // Every channel the bridge consumes must be listed here. When a new
+    // injection source is added, add both:
+    //   1. A variant in `astra_turn_core::injection_tracking::InjectionChannel`.
+    //   2. A read-out below.
+    // Tests in `astra-turn-core/tests/injection_channel_coverage.rs` fail
+    // if (1) is missed; this block silently under-reports if (2) is missed.
+    if let Some(session_lock) = &ctx.executor.observability_session {
+        if let Ok(mut session) = session_lock.write() {
+            let ep_str = |key: &str| -> &str {
+                payload
+                    .as_object()
+                    .and_then(|p| p.get("edge_profile"))
+                    .and_then(|ep| ep.as_object())
+                    .and_then(|obj| obj.get(key))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            };
+            let memoria_insights = ep_str("memoria_insights_text");
+            let self_awareness = ep_str("self_awareness_text");
+            let recent_arg_hints = ep_str("recent_arg_hints_text");
+            let skill_listing = ep_str(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_SKILL_LISTING_TEXT,
+            );
+            // Volatile + memoria_prefetch + implicit_feedback +
+            // feedback_rules + tool_round_guidance are all built inside
+            // the bridge and not visible from here. They stay as the
+            // struct default (empty) — the bridge can layer a deeper
+            // call later if needed.
+            session.observe_bridge_injections(
+                astra_runtime::observability_integration::BridgeInjectionTexts {
+                    lessons: &lessons_text_for_observation,
+                    memoria_insights,
+                    self_awareness,
+                    recent_arg_hints,
+                    skill_listing,
+                    ..astra_runtime::observability_integration::BridgeInjectionTexts::EMPTY
+                },
+            );
+        }
+    }
 
     // ─── Record token budget estimate to trace collector (M1 observability) ───
     if let Some(collector) = ctx.telem.trace_collector {
