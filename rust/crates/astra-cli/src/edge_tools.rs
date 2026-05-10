@@ -298,6 +298,48 @@ fn parse_grep_file_line(line: &str) -> Option<(&str, usize)> {
 ///
 /// Examines the content after the `file:line:` prefix for language-specific
 /// patterns to determine the kind of reference.
+/// One-line label for an extraction outcome. Matches the
+/// [`ExtractionOutcome`] variants but renders terse strings suitable
+/// for a bullet list in the introspect output.
+fn render_extraction_outcome_label(
+    outcome: &astra_runtime::session_memory::observatory::ExtractionOutcome,
+) -> String {
+    use astra_runtime::session_memory::observatory::ExtractionOutcome;
+    match outcome {
+        ExtractionOutcome::Persisted {
+            source,
+            bytes_written,
+            store_attempt,
+        } => format!("persisted({source:?},bytes={bytes_written},attempt={store_attempt})"),
+        ExtractionOutcome::LlmFailedFallbackPersisted {
+            reason,
+            bytes_written,
+            store_attempt,
+        } => {
+            format!("llm_failed_fallback({reason:?},bytes={bytes_written},attempt={store_attempt})")
+        }
+        ExtractionOutcome::PersistFailed { reason } => format!("persist_failed({reason:?})"),
+        ExtractionOutcome::Skipped { reason } => format!("skipped({reason})"),
+    }
+}
+
+/// Compact staleness display: `-` when clean, else a slash-separated
+/// list of flags that fired. Keeps the injection line short.
+fn render_staleness(s: &astra_runtime::session_memory::observatory::StalenessSignals) -> String {
+    let mut tags = Vec::new();
+    if s.task_contradicted {
+        tags.push("task_contradicted");
+    }
+    if s.missing_corrections {
+        tags.push("missing_corrections");
+    }
+    if tags.is_empty() {
+        "-".to_string()
+    } else {
+        tags.join("/")
+    }
+}
+
 fn categorize_reference(line: &str, _symbol: &str) -> &'static str {
     // Extract content after file:line: prefix
     let content = if let Some(first_colon) = line.find(':') {
@@ -464,6 +506,13 @@ pub struct ToolExecutor {
     /// state to the model.
     introspect_snapshot:
         std::sync::Arc<std::sync::RwLock<Option<astra_turn_core::introspect::IntrospectSnapshot>>>,
+    /// Session-memory observatory shared with
+    /// [`MemoryExtractionService`] and the compaction path. `None` in
+    /// tests and offline modes — `introspect subtopic=session_memory`
+    /// then renders a short placeholder telling the model the
+    /// observatory isn't wired rather than silently returning empty.
+    session_memory_observatory:
+        Option<std::sync::Arc<astra_runtime::session_memory::SessionMemoryObservatory>>,
     /// Session id for persisting self-modification state and serving `astra self`
     /// compatible diagnostics from inside the live agent loop.
     active_session_id: std::sync::Mutex<Option<String>>,
@@ -549,6 +598,7 @@ impl ToolExecutor {
             send_message_context: std::sync::Mutex::new(None),
             observability_session: None,
             introspect_snapshot: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            session_memory_observatory: None,
             active_session_id: std::sync::Mutex::new(None),
             self_mod_pinned_tools: std::sync::Mutex::new(Vec::new()),
             self_mod_deprioritized_tools: std::sync::Mutex::new(Vec::new()),
@@ -605,6 +655,17 @@ impl ToolExecutor {
         >,
     ) -> Self {
         self.observability_session = Some(session);
+        self
+    }
+
+    /// Attach the shared session-memory observatory so
+    /// `introspect subtopic=session_memory` can read the rings. Callers
+    /// supply the same `Arc` they gave to `MemoryExtractionService`.
+    pub fn with_session_memory_observatory(
+        mut self,
+        observatory: std::sync::Arc<astra_runtime::session_memory::SessionMemoryObservatory>,
+    ) -> Self {
+        self.session_memory_observatory = Some(observatory);
         self
     }
 
@@ -1286,6 +1347,9 @@ impl ToolExecutor {
             "noise" | "injection" | "injections" | "freshness" => {
                 return astra_turn_core::introspect::render_injection_freshness(&snap);
             }
+            "session_memory" | "session-memory" | "memory" | "extraction" | "extractions" => {
+                return self.render_session_memory_introspect();
+            }
             "all" => {
                 return astra_turn_core::introspect::render_all(&snap);
             }
@@ -1293,6 +1357,128 @@ impl ToolExecutor {
         }
 
         astra_turn_core::introspect::render_introspect(&snap, detail)
+    }
+
+    /// Render `introspect subtopic=session_memory`. Answers the
+    /// recurring question "what did astra extract this session, and
+    /// what did the last compaction inject?" without dumping enough
+    /// content to pressure context.
+    ///
+    /// Output cap: the last 8 extractions + last 4 injections are
+    /// included verbatim; older rings are summarised as counts. Each
+    /// record renders in one line plus an optional short preview,
+    /// keeping the total under ~400 tokens even when both rings are
+    /// full.
+    fn render_session_memory_introspect(&self) -> String {
+        use std::fmt::Write as _;
+
+        let Some(obs) = self.session_memory_observatory.as_ref() else {
+            return "# session-memory observatory\n\n\
+                No observatory attached to this runtime. This is expected \
+                for offline CLI or legacy test modes; production servers \
+                attach one so extractions + injections are traceable here."
+                .to_string();
+        };
+
+        let ext = obs.extractions_snapshot();
+        let inj = obs.injections_snapshot();
+        let mut out = String::from("# session-memory observatory\n\n");
+
+        writeln!(
+            out,
+            "extractions_ring: {} / {}    injections_ring: {} / {}\n",
+            ext.len(),
+            astra_runtime::session_memory::observatory::EXTRACTION_RING_CAPACITY,
+            inj.len(),
+            astra_runtime::session_memory::observatory::INJECTION_RING_CAPACITY,
+        )
+        .ok();
+
+        // ── Extractions: last 8, newest-last ────────────────────────
+        out.push_str("## extractions (newest last)\n");
+        if ext.is_empty() {
+            out.push_str("(none recorded this session)\n\n");
+        } else {
+            let tail = ext.iter().rev().take(8).collect::<Vec<_>>();
+            for rec in tail.iter().rev() {
+                writeln!(
+                    out,
+                    "- t{turn} {trigger:?} {outcome} model={model} sections={sections:?}",
+                    turn = rec.turn,
+                    trigger = rec.trigger,
+                    outcome = render_extraction_outcome_label(&rec.outcome),
+                    model = rec.selector_model.as_deref().unwrap_or("-"),
+                    sections = rec.narrative_sections,
+                )
+                .ok();
+                if !rec.content_preview.is_empty() {
+                    // Preview is already capped to PREVIEW_CHAR_CAP by
+                    // the observatory; further truncate for display.
+                    let line = rec.content_preview.replace('\n', " ⏎ ");
+                    let short: String = line.chars().take(120).collect();
+                    writeln!(out, "    preview: {short}").ok();
+                }
+            }
+            if ext.len() > 8 {
+                writeln!(out, "… ({} older records elided)", ext.len() - 8).ok();
+            }
+            out.push('\n');
+        }
+
+        // ── Injections: last 4, newest-last ─────────────────────────
+        out.push_str("## compaction injections (newest last)\n");
+        if inj.is_empty() {
+            out.push_str("(none recorded this session)\n");
+        } else {
+            let tail = inj.iter().rev().take(4).collect::<Vec<_>>();
+            for rec in tail.iter().rev() {
+                writeln!(
+                    out,
+                    "- t{turn} level={level:?} pressure={pressure:.2} chars={chars} plan={cmp}/{tot} files={files} errs={errs} staleness={stale}",
+                    turn = rec.turn,
+                    level = rec.level,
+                    pressure = rec.pressure,
+                    chars = rec.injected_chars,
+                    cmp = rec.facts_summary.plan_completed,
+                    tot = rec.facts_summary.plan_total,
+                    files = rec.facts_summary.active_files_count,
+                    errs = rec.facts_summary.error_count,
+                    stale = render_staleness(&rec.staleness),
+                )
+                .ok();
+                if !rec.narrative_sections_kept.is_empty() {
+                    writeln!(
+                        out,
+                        "    narrative_sections: {:?}",
+                        rec.narrative_sections_kept
+                    )
+                    .ok();
+                }
+                if !rec.retrieved_memories.is_empty() {
+                    let mems = rec
+                        .retrieved_memories
+                        .iter()
+                        .map(|m| {
+                            format!(
+                                "{}[{}]{}",
+                                m.memory_type,
+                                // Truncate id to 8 chars so the line
+                                // doesn't balloon with UUIDs.
+                                m.memory_id.chars().take(8).collect::<String>(),
+                                m.score.map(|s| format!("={s:.2}")).unwrap_or_default(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    writeln!(out, "    retrieved: {mems}").ok();
+                }
+            }
+            if inj.len() > 4 {
+                writeln!(out, "… ({} older records elided)", inj.len() - 4).ok();
+            }
+        }
+
+        out
     }
 
     /// `introspect(subtopic="cache")` — scan recent `llm_capture_*.json`
@@ -3068,6 +3254,186 @@ mod tests {
             || {
                 let _ = ToolExecutor::new(dir.path());
             },
+        );
+    }
+
+    // ── introspect subtopic=session_memory (unhappy first) ────────────
+
+    fn attach_empty_observatory(
+        executor: ToolExecutor,
+    ) -> (
+        ToolExecutor,
+        std::sync::Arc<astra_runtime::session_memory::SessionMemoryObservatory>,
+    ) {
+        let obs =
+            std::sync::Arc::new(astra_runtime::session_memory::SessionMemoryObservatory::new());
+        (
+            executor.with_session_memory_observatory(std::sync::Arc::clone(&obs)),
+            obs,
+        )
+    }
+
+    #[test]
+    fn introspect_session_memory_missing_observatory_returns_placeholder() {
+        // Offline executor never wires the observatory — output must be
+        // a short, honest placeholder rather than silently empty so the
+        // model knows the tool works but isn't wired.
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        assert!(
+            out.contains("No observatory attached"),
+            "expected placeholder, got: {out}"
+        );
+    }
+
+    #[test]
+    fn introspect_session_memory_empty_rings_renders_cleanly() {
+        let (executor, _obs) = attach_empty_observatory(test_executor());
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        assert!(out.contains("extractions_ring: 0"));
+        assert!(out.contains("injections_ring: 0"));
+        assert!(out.contains("(none recorded this session)"));
+    }
+
+    #[test]
+    fn introspect_session_memory_renders_extraction_and_injection() {
+        use astra_runtime::session_memory::observatory::{
+            ExtractionOutcome, ExtractionRecord, ExtractionSource, ExtractionTrigger, FactsSummary,
+            InjectionLevel, InjectionRecord, RetrievedMemoryRef, StalenessSignals,
+        };
+        use std::time::{Duration, SystemTime};
+
+        let (executor, obs) = attach_empty_observatory(test_executor());
+        obs.record_extraction(ExtractionRecord {
+            session_id: "s1".into(),
+            turn: 3,
+            at: SystemTime::UNIX_EPOCH,
+            trigger: ExtractionTrigger::GrowthGate,
+            selector_model: Some("mini-judge".into()),
+            outcome: ExtractionOutcome::Persisted {
+                source: ExtractionSource::Llm,
+                bytes_written: 1234,
+                store_attempt: 2,
+            },
+            narrative_sections: vec!["Task Specification".into(), "Learnings".into()],
+            content_preview: "[session-memory:v1] full\ndetails".into(),
+            latency: Duration::from_millis(120),
+        });
+        obs.record_injection(InjectionRecord {
+            session_id: "s1".into(),
+            turn: 4,
+            at: SystemTime::UNIX_EPOCH,
+            pressure: 0.82,
+            level: InjectionLevel::L1Minimal,
+            injected_chars: 140,
+            facts_summary: FactsSummary {
+                turn: 4,
+                plan_completed: 2,
+                plan_total: 5,
+                active_files_count: 3,
+                error_count: 1,
+                last_error_preview: Some("compile error".into()),
+                ..Default::default()
+            },
+            staleness: StalenessSignals {
+                task_contradicted: false,
+                missing_corrections: true,
+            },
+            retrieved_memories: vec![RetrievedMemoryRef {
+                memory_id: "abcdef12-3456".into(),
+                memory_type: "working".into(),
+                score: Some(0.71),
+            }],
+            narrative_sections_kept: vec!["Task Specification".into()],
+        });
+
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        // Extraction line
+        assert!(
+            out.contains("t3 GrowthGate persisted(Llm,bytes=1234,attempt=2)"),
+            "extraction line missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("preview:"),
+            "preview line missing; got:\n{out}"
+        );
+        // Newline in preview must be collapsed so one record stays one
+        // visual line (the arrow-return marker keeps it debuggable).
+        assert!(out.contains(" ⏎ "), "expected newline marker; got:\n{out}");
+        // Injection line
+        assert!(
+            out.contains("level=L1Minimal pressure=0.82"),
+            "injection line missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("plan=2/5 files=3 errs=1 staleness=missing_corrections"),
+            "injection summary missing; got:\n{out}"
+        );
+        // Retrieved memories show short id + score
+        assert!(
+            out.contains("retrieved: working[abcdef12]=0.71"),
+            "retrieved line missing; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn introspect_session_memory_output_size_is_bounded_under_full_ring() {
+        // Under capacity, output must stay under 4KB (a comfortable
+        // upper bound well below any reasonable context concern).
+        // Guards against accidental regressions that would dump the
+        // full injection content.
+        use astra_runtime::session_memory::observatory::{
+            ExtractionOutcome, ExtractionRecord, ExtractionSource, ExtractionTrigger, FactsSummary,
+            InjectionLevel, InjectionRecord, StalenessSignals,
+        };
+        use std::time::{Duration, SystemTime};
+
+        let (executor, obs) = attach_empty_observatory(test_executor());
+        let big = "x".repeat(1000); // > PREVIEW_CHAR_CAP on purpose
+        for i in 0..64u32 {
+            obs.record_extraction(ExtractionRecord {
+                session_id: format!("s{i}"),
+                turn: i,
+                at: SystemTime::UNIX_EPOCH,
+                trigger: ExtractionTrigger::GrowthGate,
+                selector_model: Some("m".into()),
+                outcome: ExtractionOutcome::Persisted {
+                    source: ExtractionSource::Llm,
+                    bytes_written: 42,
+                    store_attempt: 1,
+                },
+                narrative_sections: vec!["Task Specification".into()],
+                content_preview: big.clone(), // test overrides; real path clips
+                latency: Duration::from_millis(10),
+            });
+        }
+        for i in 0..32u32 {
+            obs.record_injection(InjectionRecord {
+                session_id: format!("s{i}"),
+                turn: i,
+                at: SystemTime::UNIX_EPOCH,
+                pressure: 0.6,
+                level: InjectionLevel::L1Full,
+                injected_chars: 500,
+                facts_summary: FactsSummary::default(),
+                staleness: StalenessSignals::default(),
+                retrieved_memories: vec![],
+                narrative_sections_kept: vec![],
+            });
+        }
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        assert!(
+            out.len() < 8_000,
+            "introspect output must stay bounded; got {} bytes",
+            out.len()
+        );
+        // Last 8 extractions visible — the oldest must be hidden.
+        assert!(out.contains("t63"), "newest extraction missing");
+        assert!(!out.contains("t0 GrowthGate"), "oldest must be elided");
+        // Elision breadcrumb present.
+        assert!(
+            out.contains("older records elided"),
+            "must indicate elision; got:\n{out}"
         );
     }
 }

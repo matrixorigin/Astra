@@ -244,13 +244,21 @@ impl MatrixCloudRuntime {
             let broker = Arc::new(crate::session_memory::BackgroundActivityBroker::new());
             let memoria_client: Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient> =
                 Arc::new(memoria);
-            let svc = Arc::new(crate::session_memory::MemoryExtractionService::new(
-                resolver,
-                memoria_client,
-                ingestion,
-                Arc::clone(&self.user_id),
-                broker,
-            ));
+            // Shared observatory: extraction service writes extraction
+            // records; `compact_with_memoria` (reached via `state.
+            // memory_extraction_service.observatory()`) writes injection
+            // records. `introspect subtopic=session_memory` reads both.
+            let observatory = Arc::new(crate::session_memory::SessionMemoryObservatory::new());
+            let svc = Arc::new(
+                crate::session_memory::MemoryExtractionService::new(
+                    resolver,
+                    memoria_client,
+                    ingestion,
+                    Arc::clone(&self.user_id),
+                    broker,
+                )
+                .with_observatory(Arc::clone(&observatory)),
+            );
             self.memory_extraction_service = Some(svc);
         }
         self
