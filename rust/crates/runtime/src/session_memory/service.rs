@@ -54,22 +54,6 @@ use super::runner::{ExtractionArtifacts, run_extraction};
 #[cfg(test)]
 type MaybeSpawnAfterGateHook = std::sync::Arc<dyn Fn(&ExtractionRequest) + Send + Sync + 'static>;
 
-#[cfg(test)]
-static MAYBE_SPAWN_AFTER_GATE_HOOK: std::sync::Mutex<Option<MaybeSpawnAfterGateHook>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-fn run_maybe_spawn_after_gate_hook(req: &ExtractionRequest) {
-    let hook = MAYBE_SPAWN_AFTER_GATE_HOOK
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned();
-    if let Some(hook) = hook {
-        hook(req);
-    }
-}
-
 /// Hard upper bound on one LLM call. Memory extraction is background
 /// work; a hung call must never linger past this.
 pub const LLM_TIMEOUT: Duration = Duration::from_secs(30);
@@ -152,6 +136,19 @@ pub struct MemoryExtractionService {
     /// — including skips — when this is `Some`. No effect on LLM
     /// payloads or cache hashes by construction.
     observatory: Option<Arc<SessionMemoryObservatory>>,
+    /// Per-service test hook fired right after the gate evaluates
+    /// inside `maybe_spawn`, BEFORE the breaker/in-flight/spawn
+    /// decision lands. Scoped to one service so parallel tests
+    /// cannot pollute each other's critical-section timing.
+    ///
+    /// Previously this lived as a `static` — any parallel
+    /// `#[tokio::test]` installing a hook (especially one with a
+    /// deliberate `thread::sleep`) would fire against every other
+    /// concurrent `maybe_spawn` call across unrelated tests, giving
+    /// flaky failures and invalidating the very TOCTOU regression
+    /// test the hook was added to support.
+    #[cfg(test)]
+    maybe_spawn_after_gate_hook: std::sync::Mutex<Option<MaybeSpawnAfterGateHook>>,
 }
 
 impl std::fmt::Debug for MemoryExtractionService {
@@ -188,6 +185,30 @@ impl MemoryExtractionService {
             pending_done: Arc::new(tokio::sync::Notify::new()),
             session_states: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             observatory: None,
+            #[cfg(test)]
+            maybe_spawn_after_gate_hook: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Per-service test hook install / clear.
+    /// Only available in test builds. Replacing any previously-set
+    /// hook.
+    #[cfg(test)]
+    pub(super) fn set_maybe_spawn_after_gate_hook(&self, hook: Option<MaybeSpawnAfterGateHook>) {
+        *self.maybe_spawn_after_gate_hook.lock().unwrap() = hook;
+    }
+
+    /// Fire the per-service test hook if one is installed.
+    #[cfg(test)]
+    fn run_maybe_spawn_after_gate_hook(&self, req: &ExtractionRequest) {
+        let hook = self
+            .maybe_spawn_after_gate_hook
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned();
+        if let Some(hook) = hook {
+            hook(req);
         }
     }
 
@@ -342,7 +363,7 @@ impl MemoryExtractionService {
             );
 
             #[cfg(test)]
-            run_maybe_spawn_after_gate_hook(&req);
+            self.run_maybe_spawn_after_gate_hook(&req);
 
             if let GateDecision::Skip(reason) = dec {
                 Admission::Skip {
@@ -929,19 +950,32 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
 
-    struct MaybeSpawnAfterGateHookGuard;
+    /// Drop-guard that clears the hook on the specific service it
+    /// was installed on. Owning an `Arc` to the service keeps the
+    /// service alive for the guard's lifetime, so there's no dangling-
+    /// reference hazard even if the test future drops early.
+    struct MaybeSpawnAfterGateHookGuard {
+        svc: Arc<MemoryExtractionService>,
+    }
 
     impl Drop for MaybeSpawnAfterGateHookGuard {
         fn drop(&mut self) {
-            *MAYBE_SPAWN_AFTER_GATE_HOOK.lock().unwrap() = None;
+            self.svc.set_maybe_spawn_after_gate_hook(None);
         }
     }
 
+    /// Install a hook that fires after the gate evaluates but
+    /// before breaker/in-flight/spawn, on this specific service
+    /// only. Parallel tests operating on other services are
+    /// unaffected.
     fn install_maybe_spawn_after_gate_hook(
+        svc: &Arc<MemoryExtractionService>,
         hook: MaybeSpawnAfterGateHook,
     ) -> MaybeSpawnAfterGateHookGuard {
-        *MAYBE_SPAWN_AFTER_GATE_HOOK.lock().unwrap() = Some(hook);
-        MaybeSpawnAfterGateHookGuard
+        svc.set_maybe_spawn_after_gate_hook(Some(hook));
+        MaybeSpawnAfterGateHookGuard {
+            svc: Arc::clone(svc),
+        }
     }
 
     /// Minimal capturing mock — records every `store` for assertion.
@@ -1652,28 +1686,33 @@ mod tests {
         let hook_sid = sid.clone();
         let hook_entered = Arc::clone(&entered);
         let hook_stored = Arc::clone(&stored);
-        let _hook_guard = install_maybe_spawn_after_gate_hook(Arc::new(move |req| {
-            if req.session_id != hook_sid {
-                return;
-            }
-            match req.turn_number {
-                1 => {
-                    hook_entered.fetch_add(1, Ordering::AcqRel);
-                    let deadline = Instant::now() + Duration::from_millis(100);
-                    while hook_entered.load(Ordering::Acquire) < 2 && Instant::now() < deadline {
-                        std::thread::yield_now();
-                    }
+        let _hook_guard = install_maybe_spawn_after_gate_hook(
+            &svc,
+            Arc::new(move |req| {
+                if req.session_id != hook_sid {
+                    return;
                 }
-                2 => {
-                    hook_entered.fetch_add(1, Ordering::AcqRel);
-                    let deadline = Instant::now() + Duration::from_secs(1);
-                    while hook_stored.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
-                        std::thread::sleep(Duration::from_millis(1));
+                match req.turn_number {
+                    1 => {
+                        hook_entered.fetch_add(1, Ordering::AcqRel);
+                        let deadline = Instant::now() + Duration::from_millis(100);
+                        while hook_entered.load(Ordering::Acquire) < 2 && Instant::now() < deadline
+                        {
+                            std::thread::yield_now();
+                        }
                     }
+                    2 => {
+                        hook_entered.fetch_add(1, Ordering::AcqRel);
+                        let deadline = Instant::now() + Duration::from_secs(1);
+                        while hook_stored.load(Ordering::Acquire) == 0 && Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-        }));
+            }),
+        );
 
         let mut req1 = sample_req(&sid, 50_000, false);
         req1.turn_number = 1;
@@ -2403,19 +2442,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observatory_records_skip_as_error_override_when_had_error() {
+    async fn observatory_records_error_override_when_had_error_below_init() {
+        // First-turn error below the init gate MUST extract. Before
+        // the gate fix (commit for #42) the init gate swallowed all
+        // first-turn failures — the most diagnostically valuable
+        // sessions never got captured. Now had_error always triggers
+        // Run regardless of tokens, and the observatory tags the
+        // record as ErrorOverride.
         let (ctx, obs) = build_ctx_with_obs();
-        // Below init gate + had_error=true → still skipped (error override
-        // only fires past init). Trigger tag must reflect the intent
-        // (ErrorOverride), not the debounce branch.
-        let req = sample_req("obs-err", 1_000, true);
-        assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Skipped);
+        let sid = format!("obs-err-{}", nanos());
+        let req = sample_req(&sid, 1_000, true);
+        assert_eq!(
+            ctx.svc.maybe_spawn(req),
+            SpawnDecision::Spawned,
+            "below-init error must bypass init gate"
+        );
+        ctx.svc.wait_for_pending(Duration::from_secs(2)).await;
 
         let snap = obs.extractions_snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(
             snap[0].trigger,
-            crate::session_memory::ExtractionTrigger::ErrorOverride
+            crate::session_memory::ExtractionTrigger::ErrorOverride,
+            "trigger must reflect the error-driven bypass"
         );
     }
 

@@ -91,6 +91,17 @@ fn evaluate_inner(
         return GateDecision::Skip(SessionMemoryExtractionSkipReason::NoSessionId);
     }
 
+    // Errors always bypass the init gate. First-turn failures carry
+    // debuggable context (stack trace, offending args) that the
+    // session-memory L1 is specifically meant to capture — gating them
+    // on "has the conversation reached 10K tokens yet?" silently drops
+    // exactly the cases operators most want to postmortem. The prior
+    // inline implementation always persisted on error, so this also
+    // restores that behaviour.
+    if had_error {
+        return GateDecision::Run;
+    }
+
     // The init gate fires before any growth delta can matter.
     if !state.initialized && current_tokens < config.min_tokens_to_init {
         return GateDecision::Skip(SessionMemoryExtractionSkipReason::BelowInitGate);
@@ -179,5 +190,40 @@ mod tests {
         // Only +1K tokens and +1 tool call — normally debounced.
         let decision = evaluate(&state, "sess-1", 12_000, 5, true, &cfg());
         assert_eq!(decision, GateDecision::Run);
+    }
+
+    /// Regression: a first-turn failure below `min_tokens_to_init`
+    /// used to be silently dropped by the init gate — the `had_error`
+    /// override was only evaluated inside
+    /// `should_extract_with_error_trigger`, which came AFTER the
+    /// `BelowInitGate` early return. That regressed the pre-
+    /// refactor inline behaviour (which always persisted L1 on
+    /// error) and meant the most diagnostically valuable sessions
+    /// never got captured. This test locks in the invariant that
+    /// errors always run extraction, regardless of token count.
+    #[test]
+    fn had_error_on_uninitialized_session_bypasses_init_gate() {
+        let state = SessionMemoryState::default();
+        // Tokens well below min_tokens_to_init (10_000 default) and
+        // state is uninitialized — normally BelowInitGate.
+        let decision = evaluate(&state, "sess-1", 500, 0, true, &cfg());
+        assert_eq!(
+            decision,
+            GateDecision::Run,
+            "first-turn error must trigger extraction even below init gate"
+        );
+    }
+
+    /// Companion: with `had_error=false`, the init gate still holds
+    /// — the error bypass must not accidentally loosen the
+    /// no-error debounce.
+    #[test]
+    fn no_error_below_init_still_skips() {
+        let state = SessionMemoryState::default();
+        let decision = evaluate(&state, "sess-1", 500, 0, false, &cfg());
+        assert_eq!(
+            decision,
+            GateDecision::Skip(SessionMemoryExtractionSkipReason::BelowInitGate)
+        );
     }
 }

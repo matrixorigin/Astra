@@ -175,14 +175,36 @@ impl MemoriaHealth {
     }
 
     /// Notify the breaker that a call failed. Trips once the threshold
-    /// is reached; stays open for [`Self::cooldown`] from the failure
-    /// instant.
+    /// is reached; stays open for [`Self::cooldown`] from the trip
+    /// instant — **not** refreshed on every post-trip failure.
+    ///
+    /// Before this fix, `tripped_at` was set to `Instant::now()` on
+    /// every call past the threshold. Under concurrent failure load
+    /// (stale callers who entered the critical path before the trip
+    /// still calling `record_failure`) the cooldown kept resetting,
+    /// so recovery was indefinitely delayed — the exact scenario the
+    /// breaker is supposed to bound.
+    ///
+    /// New rule: the trip time is set exactly once, when we cross the
+    /// threshold. It's cleared by `record_success`; subsequent
+    /// `record_failure` calls increment the counter but leave the
+    /// clock alone. After a half-open probe fails we also re-arm
+    /// `tripped_at` (the transition point is meaningful there) — but
+    /// we can detect that with `probe_in_flight`.
     pub fn record_failure(&self) {
         if let Ok(mut inner) = self.inner.lock() {
+            let was_probe = inner.probe_in_flight;
             inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
             inner.probe_in_flight = false;
             if inner.consecutive_failures >= self.failure_threshold {
-                inner.tripped_at = Some(Instant::now());
+                // Set the trip instant only on the Closed→Tripped
+                // transition or when a half-open probe just failed
+                // (both are legitimate "reset the cooldown" moments).
+                // Stale calls after a trip already set `tripped_at`
+                // will hit the else branch and leave it alone.
+                if inner.tripped_at.is_none() || was_probe {
+                    inner.tripped_at = Some(Instant::now());
+                }
             }
         }
     }
@@ -475,6 +497,64 @@ mod tests {
             before, after,
             "dropping a Closed-admit guard without disposition must leave state untouched"
         );
+    }
+
+    /// Regression: stale callers calling `record_failure` after the
+    /// breaker already tripped must NOT extend the cooldown window.
+    /// Before the fix, every post-trip failure reset `tripped_at =
+    /// now`, so under concurrent failure load recovery was delayed
+    /// indefinitely.
+    #[test]
+    fn memoria_record_failure_past_trip_does_not_refresh_cooldown() {
+        // Short cooldown so the test can verify the half-open
+        // transition lands at the original trip instant, not the
+        // stale ones.
+        let h = MemoriaHealth::with_config(1, Duration::from_millis(60));
+
+        // Trip at t0.
+        h.record_failure();
+        assert!(h.state().tripped);
+        assert!(h.state().in_cooldown);
+
+        // Simulated stale callers arriving post-trip. Before the
+        // fix, each of these would reset `tripped_at = now` and
+        // extend the window by another 60ms.
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(15));
+            h.record_failure();
+        }
+
+        // After sleeping past the ORIGINAL cooldown (60ms) plus the
+        // small stall above (~75ms total), admit must return
+        // HalfOpenProbe — proof that the clock wasn't reset.
+        std::thread::sleep(Duration::from_millis(5));
+        let admit = h.admit();
+        assert_eq!(
+            admit,
+            MemoriaAdmit::HalfOpenProbe,
+            "stale record_failure calls must not extend the cooldown; admit={admit:?}"
+        );
+    }
+
+    /// Companion: a failed half-open probe IS allowed to re-arm the
+    /// clock — that's a legitimate "the endpoint is still down"
+    /// transition. Without this, recovery behaviour on flaky
+    /// endpoints degrades to "one probe failure → breaker falls
+    /// through to Closed on the next admit".
+    #[test]
+    fn memoria_half_open_probe_failure_resets_cooldown_clock() {
+        let h = MemoriaHealth::with_config(1, Duration::from_millis(40));
+        h.record_failure();
+        std::thread::sleep(Duration::from_millis(50));
+
+        assert_eq!(h.admit(), MemoriaAdmit::HalfOpenProbe);
+        // The probe itself fails — this SHOULD re-arm the trip clock.
+        h.record_failure();
+
+        // Immediately after: breaker must be open again with a fresh
+        // cooldown, not auto-transitioning straight back to
+        // HalfOpenProbe.
+        assert_eq!(h.admit(), MemoriaAdmit::Open);
     }
 
     #[test]
