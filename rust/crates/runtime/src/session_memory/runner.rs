@@ -33,12 +33,17 @@ pub enum ExtractionArtifacts {
     Persisted {
         source: SessionMemoryExtractionSource,
         bytes_written: u64,
+        /// How many store attempts were needed (1 or 2). Surfaced as
+        /// an event breadcrumb so operators can see retry incidence
+        /// without grepping logs.
+        store_attempt: u32,
     },
     /// LLM attempted and failed; rule-based fallback was persisted
     /// successfully. Service records both the error and the write.
     LlmFailedPersistedFallback {
         error_reason: SessionMemoryExtractionErrorReason,
         bytes_written: u64,
+        store_attempt: u32,
     },
     /// Memoria persist failed. Nothing landed. Reason is one of
     /// `PurgeFailed` / `WriteFailed`.
@@ -96,28 +101,33 @@ pub async fn run_extraction(
         ),
     };
 
-    if let Err(e) = persist_l1(memoria.as_ref(), &content, session_id).await {
-        tracing::debug!(
-            session_id = %session_id,
-            error = %e,
-            "session-memory extraction: Memoria persist failed"
-        );
-        let error_reason = match e {
-            PersistL1Error::PurgeFailed(_) => SessionMemoryExtractionErrorReason::PurgeFailed,
-            PersistL1Error::StoreFailed(_) => SessionMemoryExtractionErrorReason::WriteFailed,
-        };
-        return ExtractionArtifacts::PersistFailed { error_reason };
-    }
+    let persist = match persist_l1(memoria.as_ref(), &content, session_id).await {
+        Ok(success) => success,
+        Err(e) => {
+            tracing::debug!(
+                session_id = %session_id,
+                error = %e,
+                "session-memory extraction: Memoria persist failed"
+            );
+            let error_reason = match e {
+                PersistL1Error::PurgeFailed(_) => SessionMemoryExtractionErrorReason::PurgeFailed,
+                PersistL1Error::StoreFailed(_) => SessionMemoryExtractionErrorReason::WriteFailed,
+            };
+            return ExtractionArtifacts::PersistFailed { error_reason };
+        }
+    };
 
     let bytes_written = content.len() as u64;
     match llm_error {
         Some(reason) => ExtractionArtifacts::LlmFailedPersistedFallback {
             error_reason: reason,
             bytes_written,
+            store_attempt: persist.store_attempt,
         },
         None => ExtractionArtifacts::Persisted {
             source,
             bytes_written,
+            store_attempt: persist.store_attempt,
         },
     }
 }

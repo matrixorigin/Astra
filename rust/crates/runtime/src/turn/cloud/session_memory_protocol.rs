@@ -918,6 +918,16 @@ impl std::fmt::Display for PersistL1Error {
     }
 }
 
+/// Successful [`persist_l1`] return — carries attempt-count breadcrumbs
+/// so callers can surface `attempt=1|2` to operational events without
+/// reproducing the retry logic.
+#[derive(Debug, Clone)]
+pub struct PersistL1Success {
+    pub memory_id: String,
+    /// 1 on first-try success, 2 when the store had to retry.
+    pub store_attempt: u32,
+}
+
 /// Purge old L1 for this session (with retry), then store the new one.
 ///
 /// The write side of session memory MUST keep Memoria's prefix index
@@ -929,7 +939,7 @@ pub async fn persist_l1(
     client: &dyn crate::turn::cloud::memoria_compact::MemoriaClient,
     l1_content: &str,
     session_id: &str,
-) -> Result<String, PersistL1Error> {
+) -> Result<PersistL1Success, PersistL1Error> {
     // Purge with one retry. A permanent failure here blocks the store.
     if let Err(first_err) = client.purge_working(session_id).await {
         tracing::warn!(
@@ -955,7 +965,10 @@ pub async fn persist_l1(
         .store(l1_content, "working", Some(session_id), Some("T2"))
         .await
     {
-        Ok(id) => Ok(id),
+        Ok(id) => Ok(PersistL1Success {
+            memory_id: id,
+            store_attempt: 1,
+        }),
         Err(e) => {
             tracing::warn!(
                 session_id = %session_id,
@@ -967,6 +980,10 @@ pub async fn persist_l1(
             client
                 .store(l1_content, "working", Some(session_id), Some("T2"))
                 .await
+                .map(|id| PersistL1Success {
+                    memory_id: id,
+                    store_attempt: 2,
+                })
                 .map_err(|e2| {
                     tracing::warn!(
                         session_id = %session_id,
@@ -2231,8 +2248,11 @@ mod tests {
         #[tokio::test]
         async fn persist_l1_purges_then_stores() {
             let mock = Arc::new(MockMemoria::new(0));
-            let result = persist_l1(&*mock, "L1 content", "sess-1").await;
-            assert!(result.is_ok());
+            let result = persist_l1(&*mock, "L1 content", "sess-1").await.unwrap();
+            assert_eq!(
+                result.store_attempt, 1,
+                "first-try success must report attempt=1"
+            );
             assert_eq!(
                 mock.purge_calls.load(Ordering::SeqCst),
                 1,
@@ -2251,8 +2271,11 @@ mod tests {
         #[tokio::test]
         async fn persist_l1_retries_on_first_failure() {
             let mock = Arc::new(MockMemoria::new(1)); // fail first store, succeed second
-            let result = persist_l1(&*mock, "L1 retry", "sess-2").await;
-            assert!(result.is_ok(), "should succeed on retry");
+            let result = persist_l1(&*mock, "L1 retry", "sess-2").await.unwrap();
+            assert_eq!(
+                result.store_attempt, 2,
+                "retry success must report attempt=2 so events can carry it"
+            );
             assert_eq!(
                 mock.store_calls.load(Ordering::SeqCst),
                 2,
@@ -2383,8 +2406,9 @@ mod tests {
             let mock = TransientPurgeMock {
                 purge_attempts: AtomicUsize::new(0),
             };
-            let result = persist_l1(&mock, "L1", "s").await;
-            assert_eq!(result.unwrap(), "mem-1");
+            let result = persist_l1(&mock, "L1", "s").await.unwrap();
+            assert_eq!(result.memory_id, "mem-1");
+            assert_eq!(result.store_attempt, 1);
             assert_eq!(mock.purge_attempts.load(Ordering::Relaxed), 2);
         }
     }

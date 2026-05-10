@@ -870,6 +870,10 @@ pub enum SessionMemoryExtractionSkipReason {
     NoGrowth,
     InFlight,
     SelectorCooldown,
+    /// Memoria endpoint tripped the circuit breaker after consecutive
+    /// failures. Emitted synchronously — no spawn, no retry attempted
+    /// until the cooldown TTL elapses.
+    MemoriaUnhealthy,
 }
 
 /// Why an attempt errored during the LLM/write phase.
@@ -911,6 +915,28 @@ pub enum SessionMemoryExtractionOutcome {
     },
 }
 
+/// Operational breadcrumbs merged into the session-memory extraction
+/// event's metadata. None-valued fields are omitted from the JSON so
+/// skip events (which carry no LLM state) don't emit nonsense keys.
+///
+/// These fields exist for operator debugging (`SELECT ... FROM
+/// agent_events WHERE event_type='session_memory_extraction'` on a
+/// puzzling session) and must not drive any runtime behaviour — the
+/// logic-bearing fields are `outcome` / `reason` / `source`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionMemoryExtractionBreadcrumbs {
+    /// Number of messages fed into the extractor. Helps triage
+    /// "why does this session have no L1" (possibly 0 messages).
+    pub messages_count: Option<u32>,
+    /// Selector model that was actually used (or would have been, if
+    /// the call failed before dispatch). Absent on pure-gate skips
+    /// and on rule-based fallbacks.
+    pub selector_model: Option<String>,
+    /// Final attempt count (1 = succeeded first try, 2 = recovered
+    /// after one retry). Absent when no persist attempt occurred.
+    pub attempt: Option<u32>,
+}
+
 impl SessionMemoryExtractionOutcome {
     /// Short tag matching the top-level `outcome` field. Cheap enough to
     /// call from log lines and UX bridges that don't want to match the
@@ -923,8 +949,8 @@ impl SessionMemoryExtractionOutcome {
         }
     }
 
-    fn to_json(&self) -> serde_json::Value {
-        match self {
+    fn to_json(&self, bc: &SessionMemoryExtractionBreadcrumbs) -> serde_json::Value {
+        let mut obj = match self {
             Self::Extracted {
                 source,
                 bytes_written,
@@ -941,7 +967,19 @@ impl SessionMemoryExtractionOutcome {
                 "outcome": "errored",
                 "reason": reason,
             }),
+        };
+        if let Some(map) = obj.as_object_mut() {
+            if let Some(n) = bc.messages_count {
+                map.insert("messages_count".into(), serde_json::json!(n));
+            }
+            if let Some(ref m) = bc.selector_model {
+                map.insert("selector_model".into(), serde_json::json!(m));
+            }
+            if let Some(a) = bc.attempt {
+                map.insert("attempt".into(), serde_json::json!(a));
+            }
         }
+        obj
     }
 }
 
@@ -3388,11 +3426,12 @@ impl JournalEvent {
         turn: u32,
         duration_ms: u64,
         outcome: SessionMemoryExtractionOutcome,
+        breadcrumbs: &SessionMemoryExtractionBreadcrumbs,
     ) -> Self {
         let mut evt = Self::base(JournalEventType::SessionMemoryExtraction, session_id);
         evt.turn = Some(turn);
         evt.duration_ms = Some(duration_ms);
-        evt.metadata = Some(outcome.to_json());
+        evt.metadata = Some(outcome.to_json(breadcrumbs));
         evt
     }
 
