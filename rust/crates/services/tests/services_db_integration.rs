@@ -141,6 +141,7 @@ async fn skills_registry_index_list_order_and_get_skill_definition() {
     let id_a = Uuid::new_v4().to_string();
     let id_b = Uuid::new_v4().to_string();
     let id_c = Uuid::new_v4().to_string();
+    let owner_id = format!("test-user-{}", Uuid::new_v4());
 
     for (sid, ts) in [
         (&id_a, "2026-04-01 10:00:00.000000"),
@@ -150,12 +151,13 @@ async fn skills_registry_index_list_order_and_get_skill_definition() {
         sqlx::query(
             "INSERT INTO skills_registry \
              (skill_id, skill_name, version, description, skill_definition, \
-              is_active, status, source, category, created_at, updated_at) \
-             VALUES (?, ?, '1.0', 'd', CAST(? AS JSON), 1, 'active', 'user', 'c', ?, ?)",
+              is_active, status, source, category, created_by, created_at, updated_at) \
+             VALUES (?, ?, '1.0', 'd', CAST(? AS JSON), 1, 'active', 'user', 'c', ?, ?, ?)",
         )
         .bind(sid)
         .bind(sid)
         .bind(serde_json::json!({"marker": sid, "blob": "x".repeat(4000)}).to_string())
+        .bind(&owner_id)
         .bind(ts)
         .bind(ts)
         .execute(&pool)
@@ -164,7 +166,10 @@ async fn skills_registry_index_list_order_and_get_skill_definition() {
     }
 
     let svc = DatabaseSkillService::new(settings.clone()).with_pool(shared.clone());
-    let page = svc.list_skills(u32::MAX, 0).await.expect("list_skills");
+    let page = svc
+        .list_skills(owner_id.clone(), u32::MAX, 0)
+        .await
+        .expect("list_skills");
     assert_eq!(page.limit, MAX_API_LIST_LIMIT);
     assert_eq!(page.offset, 0);
 
@@ -181,20 +186,100 @@ async fn skills_registry_index_list_order_and_get_skill_definition() {
     assert_eq!(ours[1].skill_id, id_c);
     assert_eq!(ours[2].skill_id, id_a);
 
-    let detail = svc.get_skill(id_b.clone(), None).await.expect("get_skill");
+    let detail = svc
+        .get_skill(owner_id.clone(), id_b.clone(), None)
+        .await
+        .expect("get_skill");
     assert!(
         detail.metadata.is_some(),
         "detail path must still read skill_definition / metadata"
     );
 
     let deep = svc
-        .list_skills(10, MAX_API_LIST_OFFSET + 1)
+        .list_skills(owner_id, 10, MAX_API_LIST_OFFSET + 1)
         .await
         .expect("list_skills offset clamp");
     assert_eq!(deep.offset, MAX_API_LIST_OFFSET);
     assert_eq!(deep.limit, 10);
 
     cleanup_skills_by_ids(&pool, &[id_a, id_b, id_c]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn skills_registry_visibility_is_user_owned_union_public() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let owner_id = format!("owner-{}", Uuid::new_v4());
+    let other_id = format!("other-{}", Uuid::new_v4());
+    let owner_private = format!("owner-private-{}", Uuid::new_v4());
+    let other_private = format!("other-private-{}", Uuid::new_v4());
+    let public_skill = format!("public-{}", Uuid::new_v4());
+    let skill_ids = vec![
+        format!("{owner_private}@1.0"),
+        format!("{other_private}@1.0"),
+        format!("{public_skill}@1.0"),
+    ];
+
+    for (skill_name, created_by, is_public) in [
+        (&owner_private, &owner_id, 0_i16),
+        (&other_private, &other_id, 0_i16),
+        (&public_skill, &other_id, 1_i16),
+    ] {
+        sqlx::query(
+            "INSERT INTO skills_registry \
+             (skill_id, skill_name, version, description, skill_definition, \
+              is_active, status, source, is_public, created_by, created_at, updated_at) \
+             VALUES (?, ?, '1.0', 'visibility test', CAST(? AS JSON), \
+                     1, 'active', 'user', ?, ?, NOW(6), NOW(6))",
+        )
+        .bind(format!("{skill_name}@1.0"))
+        .bind(skill_name)
+        .bind(serde_json::json!({"instructions": skill_name}).to_string())
+        .bind(is_public)
+        .bind(created_by)
+        .execute(&pool)
+        .await
+        .expect("insert visibility skill row");
+    }
+
+    let svc = DatabaseSkillService::new(settings).with_pool(shared);
+    let owner_page = svc
+        .list_skills(owner_id.clone(), 100, 0)
+        .await
+        .expect("owner list_skills should succeed");
+    let owner_names: HashSet<_> = owner_page
+        .skills
+        .iter()
+        .map(|skill| skill.skill_name.as_str())
+        .collect();
+    assert!(
+        owner_names.contains(owner_private.as_str()),
+        "owner must see their private skill"
+    );
+    assert!(
+        owner_names.contains(public_skill.as_str()),
+        "owner must see public skills"
+    );
+    assert!(
+        !owner_names.contains(other_private.as_str()),
+        "owner must not see another user's private skill"
+    );
+
+    let hidden = svc
+        .get_skill(owner_id.clone(), format!("{other_private}@1.0"), None)
+        .await
+        .expect_err("private skill owned by another user must be hidden");
+    assert_eq!(hidden.0, axum::http::StatusCode::NOT_FOUND);
+
+    let public_detail = svc
+        .get_skill(owner_id, format!("{public_skill}@1.0"), None)
+        .await
+        .expect("public skill detail should be visible");
+    assert_eq!(public_detail.skill_name, public_skill);
+
+    cleanup_skills_by_ids(&pool, &skill_ids).await;
 }
 
 #[tokio::test]

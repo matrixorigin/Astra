@@ -32,7 +32,8 @@ use crate::turn::agentic_loop_host::{
 use crate::turn::agentic_loop_tool_support::edge_tool_status_exit_code;
 use crate::turn::bridge_llm_stream::rate_limit_cooldown;
 use crate::turn::llm_client::{
-    LlmCallResult, LlmCancel, call_llm_and_collect_with_request_overrides,
+    LlmCallResult, LlmCancel, LlmStreamUpdate, call_llm_and_collect_with_request_overrides,
+    call_llm_and_collect_with_request_overrides_and_stream_callback,
     call_llm_nonstream_fallback_with_request_overrides, llm_connect_timeout, llm_fallback_timeout,
     sleep_ms_or_llm_cancel,
 };
@@ -2467,6 +2468,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // with a higher max_output_tokens (up to 4× the initial budget).
         let mut effective_max_output = max_output_tokens;
         let mut attempt_in_round = 0_u32;
+        let mut streamed_text = String::new();
+        let mut streamed_reasoning = String::new();
         let result = loop {
             record_full_llm_request_event(
                 state,
@@ -2481,22 +2484,71 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 Some(effective_max_output),
             );
             let llm_cancel = llm_cancel_for_state(state);
-            let r = call_llm_and_collect_with_request_overrides(
-                &llm_messages,
-                &final_tools,
-                &llm_cfg.model_name,
-                &llm_cfg.api_key,
-                &llm_cfg.base_url,
-                &llm_cfg.provider,
-                Some(effective_max_output),
-                has_fallback,
-                llm_cancel,
-                (!llm_cfg.header_overrides.is_empty()).then_some(&llm_cfg.header_overrides),
-                llm_cfg.completions_url_override.as_deref(),
-                llm_cfg.request_timeout,
-                &state.thinking,
-            )
-            .await;
+            let r = {
+                let mut attempt_text = String::new();
+                let mut attempt_reasoning = String::new();
+                let mut on_stream_update = |update: LlmStreamUpdate| match update {
+                    LlmStreamUpdate::TextDelta(content) => {
+                        attempt_text.push_str(&content);
+                        if streamed_text.starts_with(&attempt_text) {
+                            return;
+                        }
+                        if let Some(suffix) = attempt_text.strip_prefix(&streamed_text)
+                            && !suffix.is_empty()
+                        {
+                            self.emit_event(json!({
+                                "type": "text_delta",
+                                "content": suffix,
+                            }));
+                            streamed_text.push_str(suffix);
+                        } else if streamed_text.is_empty() {
+                            self.emit_event(json!({
+                                "type": "text_delta",
+                                "content": content,
+                            }));
+                            streamed_text.push_str(&content);
+                        }
+                    }
+                    LlmStreamUpdate::ReasoningDelta(content) => {
+                        attempt_reasoning.push_str(&content);
+                        if streamed_reasoning.starts_with(&attempt_reasoning) {
+                            return;
+                        }
+                        if let Some(suffix) = attempt_reasoning.strip_prefix(&streamed_reasoning)
+                            && !suffix.is_empty()
+                        {
+                            self.emit_event(json!({
+                                "type": "reasoning_delta",
+                                "content": suffix,
+                            }));
+                            streamed_reasoning.push_str(suffix);
+                        } else if streamed_reasoning.is_empty() {
+                            self.emit_event(json!({
+                                "type": "reasoning_delta",
+                                "content": content,
+                            }));
+                            streamed_reasoning.push_str(&content);
+                        }
+                    }
+                };
+                call_llm_and_collect_with_request_overrides_and_stream_callback(
+                    &llm_messages,
+                    &final_tools,
+                    &llm_cfg.model_name,
+                    &llm_cfg.api_key,
+                    &llm_cfg.base_url,
+                    &llm_cfg.provider,
+                    Some(effective_max_output),
+                    has_fallback,
+                    llm_cancel,
+                    (!llm_cfg.header_overrides.is_empty()).then_some(&llm_cfg.header_overrides),
+                    llm_cfg.completions_url_override.as_deref(),
+                    llm_cfg.request_timeout,
+                    &state.thinking,
+                    Some(&mut on_stream_update),
+                )
+                .await
+            };
 
             // Context-window errors flow through the accum so the agentic loop's
             // Fatal handler can trigger auto-compaction + retry.
@@ -2728,12 +2780,43 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         // ── 4. Emit SSE events for client ───────────────────────────────
         if !result.full_text.is_empty() {
-            self.emit_event(json!({
-                "type": "text_delta",
-                "content": result.full_text,
-            }));
+            if streamed_text.is_empty() {
+                self.emit_event(json!({
+                    "type": "text_delta",
+                    "content": result.full_text,
+                }));
+                streamed_text = result.full_text.clone();
+            } else if let Some(suffix) = result.full_text.strip_prefix(&streamed_text)
+                && !suffix.is_empty()
+            {
+                self.emit_event(json!({
+                    "type": "text_delta",
+                    "content": suffix,
+                }));
+                streamed_text.push_str(suffix);
+            }
         }
-        self.push_reasoning_events(&result.reasoning);
+        if result.reasoning.is_empty() {
+            if !streamed_reasoning.is_empty() {
+                self.emit_event(json!({ "type": "reasoning_done" }));
+            }
+        } else if streamed_reasoning.is_empty() {
+            self.push_reasoning_events(&result.reasoning);
+        } else {
+            if let Some(suffix) = result.reasoning.strip_prefix(&streamed_reasoning)
+                && !suffix.is_empty()
+            {
+                self.emit_event(json!({
+                    "type": "reasoning_delta",
+                    "content": suffix,
+                }));
+                streamed_reasoning.push_str(suffix);
+            }
+            self.emit_event(json!({ "type": "reasoning_done" }));
+        }
+        if !result.full_text.is_empty() && streamed_text == result.full_text {
+            state.final_text_streamed = true;
+        }
         if !result.usage.is_empty() {
             let u = crate::turn::token_usage::TokenUsage::from_json_map(&result.usage);
             self.emit_event(json!({

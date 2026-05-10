@@ -164,15 +164,17 @@ impl DatabaseResourceGovernor {
         Ok(())
     }
 
-    /// Count sessions that still "hold" the concurrent cap — open or idle, can be resumed
-    /// or listed, but not finished. **`ended` must be excluded**: runs are persisted with
-    /// `status = 'ended'` (see `event_ingestion`, `session_reaper`); counting those rows
-    /// made the limit hit (e.g. 19/5) as soon as the user had completed past runs.
+    /// Count sessions that currently hold execution capacity.
+    ///
+    /// Web sessions are durable and resumable, so historical/open chat sessions must
+    /// not consume the concurrent cap. The cap is enforced on sessions with an
+    /// active run only; otherwise a user who has more than five persisted chats
+    /// would be unable to start a new turn.
     async fn count_active_sessions(&self, user_id: &str) -> u32 {
         let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT COUNT(*) FROM agent_sessions \
+            "SELECT COUNT(DISTINCT session_id) FROM agent_runs \
              WHERE user_id = ? \
-               AND status NOT IN ('ended', 'closed', 'cancelled')",
+               AND status IN ('running', 'paused', 'waiting')",
         )
         .bind(user_id)
         .fetch_optional(self.pool.get())

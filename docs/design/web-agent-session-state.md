@@ -290,6 +290,8 @@ pub trait SessionStateService: Send + Sync {
     async fn begin_turn(&self, input: BeginTurnInput) -> Result<TurnHandle, SessionStateError>;
     async fn load_display_state(&self, session_id: &str) -> Result<DisplaySessionState, SessionStateError>;
     async fn load_transcript_page(&self, query: TranscriptQuery) -> Result<TranscriptPage, SessionStateError>;
+    async fn search_session_history(&self, query: SessionHistorySearch) -> Result<SessionHistoryMatches, SessionStateError>;
+    async fn load_session_history_window(&self, query: SessionHistoryWindow) -> Result<TranscriptPage, SessionStateError>;
     async fn load_context_candidates(&self, input: ContextCandidateInput) -> Result<Vec<ContextCandidate>, SessionStateError>;
     async fn save_context_manifest(&self, manifest: ContextManifest) -> Result<(), SessionStateError>;
     async fn append_audit_event(&self, event: AgentEventInput) -> Result<String, SessionStateError>;
@@ -302,6 +304,13 @@ pub trait SessionStateService: Send + Sync {
 Key rule: `ContextAssembler` consumes `load_context_candidates()` and writes
 `save_context_manifest()`. It should not know whether candidates came from local
 files, SQLite, MatrixOne, or a remote HTTP API.
+
+Second key rule: display transcript rows are not an automatic runtime fallback
+for prompt reconstruction. If the LLM needs old details that are outside the
+CSL/recent-tail/context manifest, it must use explicit read-only history tools:
+`session_history_page`, `session_history_search`, and
+`session_history_around`. Those tools are current-session scoped, token-bounded,
+and must validate `user_id` after loading rows from MatrixOne.
 
 ### Backend Modes
 
@@ -430,6 +439,19 @@ Scroll-up flow:
 SSE/WS stream flow:
 
 - User message is shown optimistically in the browser.
+- The web client sends an explicit `context.thinking` request hint with the
+  turn, and the server resolves it into the run's `ThinkingConfig` before the
+  first LLM call. Provider SSE deltas are forwarded while they arrive instead
+  of waiting for aggregate collection.
+- While an assistant turn is streaming, the browser shows a Thinking placeholder.
+  Provider-emitted `reasoning_delta`, `thinking_delta`, and model-emitted
+  `<think>` / `<thinking>` text are normalized into a bounded, collapsible
+  assistant-local Thinking timeline so live reasoning does not displace the
+  main transcript. If the provider/model does not expose reasoning content, the
+  placeholder is removed after completion rather than persisted as fake detail.
+  The open timeline is capped to a small scroll region; long reasoning blocks
+  are clamped with an explicit "Show more" affordance, and completed turns
+  collapse to a short Thinking summary / Done row.
 - Server assigns canonical `item_seq`, `run_id`, and event indexes.
 - Stream events update IndexedDB as canonical rows arrive.
 - On reconnect, browser sends last seen run event index and transcript
@@ -2514,12 +2536,26 @@ The design supports three reconstruction modes:
 | --- | --- | --- | --- |
 | Web display history | `session_transcript_items` + payload refs | Infinite scroll, export display transcript | Cursor pages by `item_seq` |
 | Runtime resume | latest CSL snapshot + deltas + `session_state_items` | Continue agent work | Bounded materialization |
+| LLM old-topic recall | `session_transcript_items` pages plus indexed `session_history_chunks` where available | Answer "we discussed X earlier" without loading the full transcript | `session_history_search` -> `session_history_around`, or `session_history_page` by cursor |
 | Audit replay | `conversation_log`, `agent_events`, artifacts | Debug/replay/compliance | Background streaming by `seq`/time |
 | Delegation tree drill-down | `agent_runs(parent_run_id)` + `session_delegations` + `delegation_state` items | Inspect a child/leaf run or superseded retry branch | Index lookup by `root_run_id`/`parent_run_id`, then fetch summary/artifact refs |
 
 The Web UI must use display history mode. Runtime resume must not replay a 10GB
 session. Audit replay is allowed to read everything, but it should run as a
 background/export/debug task, not as part of opening the session.
+
+LLM recall flow for "long ago we discussed X":
+
+1. The current turn starts with CSL + bounded recent tail + active projections.
+2. If those inputs do not contain the requested detail, the LLM calls
+   `session_history_search({query: "X", limit, scan_limit})`.
+3. The tool returns compact item_seq anchors and cursor hints, not raw pages of
+   the whole transcript.
+4. The LLM calls `session_history_around({item_seq, radius})` for the most
+   likely anchor before continuing the task.
+5. If topic search is ambiguous, the LLM can page with
+   `session_history_page({before_seq, limit})` or ask the user to choose among
+   returned anchors.
 
 ### 8. MatrixOne Load Model
 
@@ -2628,11 +2664,27 @@ Publish flow:
 1. User edits a skill in web UI.
 2. Server validates `SKILL.md` manifest and content.
 3. Server creates an immutable `user_skill_versions` row.
-4. Active version is registered into `skills_registry` with `owner_user_id`,
-   `source_type='user'`, `visibility='private'`, and `content_hash`.
+4. Active version is registered into `skills_registry` with `created_by`,
+   `source='user'`, `is_public`, and `content_hash`.
 5. `skill_installations` marks it installed for the same user.
 6. Skill selection uses the same selector, but filters by user ownership,
    installation, workspace bindings, and token budget.
+
+Runtime visibility contract:
+
+- CLI-local filesystem skills are only discovered by local CLI flows. They are
+  not mounted in the web/runtime resolver unless they have been imported into
+  `skills_registry`.
+- Web/runtime skill catalog queries return active rows where
+  `created_by = current_user OR is_public = 1`. The same predicate is used by
+  HTTP list/detail/version endpoints and the runtime `allow_skills` resolver.
+- Runtime turns do not enumerate the full database skill catalog by default.
+  The server constructs a skill resolver only when the request carries an
+  explicit non-empty `allow_skills` list, keeping ordinary turns from scanning
+  large personal catalogs.
+- If a user-owned and public skill share a logical name, "latest by name"
+  resolution prefers the user-owned row before comparing `created_at`. This
+  prevents a newly published public skill from shadowing a user's private skill.
 
 Future MatrixOne full-text/vector indexes can be added for skill retrieval. Use
 append-only versions; do not update historical skill content in place.

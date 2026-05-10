@@ -209,6 +209,9 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("memory_search", RO, ME),
     tool("memory_retrieve", RO, ME),
     tool("memory_profile", RO, ME),
+    tool("session_history_page", RO, ME),
+    tool("session_history_search", RO, ME),
+    tool("session_history_around", RO, ME),
     // ── MatrixOne read-only ──────────────────────────────────────────
     tool("mo_query", RO, MO),
     // ── Agent info / reflection (read-only) ──────────────────────────

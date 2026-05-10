@@ -273,6 +273,14 @@ pub(crate) struct LlmCallResult {
     pub finish_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LlmStreamUpdate {
+    TextDelta(String),
+    ReasoningDelta(String),
+}
+
+pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
+
 fn llm_result_has_partial_signal(result: &LlmCallResult) -> bool {
     !result.full_text.is_empty()
         || !result.reasoning.is_empty()
@@ -1892,6 +1900,42 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
     request_timeout: Option<std::time::Duration>,
     thinking: &ThinkingConfig,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    call_llm_and_collect_with_request_overrides_and_stream_callback(
+        messages,
+        tools,
+        model_name,
+        api_key,
+        base_url,
+        provider,
+        max_output_tokens,
+        has_fallback,
+        cancel,
+        header_overrides,
+        completions_url_override,
+        request_timeout,
+        thinking,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callback(
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    api_key: &str,
+    base_url: &str,
+    provider: &str,
+    max_output_tokens: Option<usize>,
+    has_fallback: bool,
+    cancel: LlmCancel<'_>,
+    header_overrides: Option<&HashMap<String, String>>,
+    completions_url_override: Option<&str>,
+    request_timeout: Option<std::time::Duration>,
+    thinking: &ThinkingConfig,
+    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let cooldown = rate_limit_cooldown();
     let model_key = model_name;
 
@@ -2022,7 +2066,12 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
             cooldown.with(model_key, |c| c.record_success());
             if provider_uses_bedrock_converse(provider) {
                 match crate::turn::bedrock_transport::collect_bedrock_stream(
-                    response, model_name, started, cancel, idle_pre,
+                    response,
+                    model_name,
+                    started,
+                    cancel,
+                    idle_pre,
+                    stream_callback.as_deref_mut(),
                 )
                 .await
                 {
@@ -2076,6 +2125,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
                     cancel,
                     idle_pre,
                     idle_post,
+                    stream_callback.as_deref_mut(),
                 )
                 .await
             } else {
@@ -2086,6 +2136,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
                     cancel,
                     idle_pre,
                     idle_post,
+                    stream_callback.as_deref_mut(),
                 )
                 .await
             };
@@ -2356,6 +2407,7 @@ async fn collect_llm_stream(
     cancel: LlmCancel<'_>,
     idle_pre: std::time::Duration,
     idle_post: std::time::Duration,
+    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
@@ -2490,6 +2542,9 @@ async fn collect_llm_stream(
                 });
             }
             full_text.push_str(content);
+            if let Some(callback) = stream_callback.as_deref_mut() {
+                callback(LlmStreamUpdate::TextDelta(content.to_string()));
+            }
             made_progress = true;
         }
 
@@ -2513,6 +2568,9 @@ async fn collect_llm_stream(
                 });
             }
             reasoning.push_str(r);
+            if let Some(callback) = stream_callback.as_deref_mut() {
+                callback(LlmStreamUpdate::ReasoningDelta(r.to_string()));
+            }
             made_progress = true;
         }
 
@@ -2642,6 +2700,7 @@ async fn collect_anthropic_llm_stream(
     cancel: LlmCancel<'_>,
     idle_pre: std::time::Duration,
     idle_post: std::time::Duration,
+    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
@@ -2796,6 +2855,9 @@ async fn collect_anthropic_llm_stream(
                                 });
                             }
                             full_text.push_str(text);
+                            if let Some(callback) = stream_callback.as_deref_mut() {
+                                callback(LlmStreamUpdate::TextDelta(text.to_string()));
+                            }
                             made_progress = true;
                         }
                     }
@@ -2817,6 +2879,9 @@ async fn collect_anthropic_llm_stream(
                                 });
                             }
                             reasoning.push_str(text);
+                            if let Some(callback) = stream_callback.as_deref_mut() {
+                                callback(LlmStreamUpdate::ReasoningDelta(text.to_string()));
+                            }
                             made_progress = true;
                         }
                     }
@@ -4076,6 +4141,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await;
         assert!(
@@ -4096,6 +4162,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect_err("transport error");
@@ -4128,6 +4195,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("collect");
@@ -4152,6 +4220,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_invokes_incremental_callback() {
+        let d1 = json!({"choices":[{"delta":{"content":"Hi ","reasoning_content":"R"}}]});
+        let d2 = json!({"choices":[{"delta":{"content":"there"}}]});
+        let body = format!("data: {d1}\n\ndata: {d2}\n\n");
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let mut updates = Vec::new();
+        let mut callback = |update| updates.push(update);
+        let res = collect_llm_stream(
+            stream,
+            "gpt-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            Some(&mut callback),
+        )
+        .await
+        .expect("collect");
+        assert_eq!(res.full_text, "Hi there");
+        assert_eq!(
+            updates,
+            vec![
+                LlmStreamUpdate::TextDelta("Hi ".to_string()),
+                LlmStreamUpdate::ReasoningDelta("R".to_string()),
+                LlmStreamUpdate::TextDelta("there".to_string()),
+            ],
+            "callback should receive deltas before aggregate completion",
+        );
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_extracts_finish_reason_stop() {
         let d1 = json!({"choices":[{"delta":{"content":"Hello"}}]});
         let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
@@ -4164,6 +4263,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("collect");
@@ -4184,6 +4284,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("collect");
@@ -4203,6 +4304,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("collect");
@@ -4227,6 +4329,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await;
         assert!(
@@ -4254,6 +4357,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await;
         match res.expect_err("idle timeout after partial output") {
@@ -4283,6 +4387,7 @@ mod tests {
                 LlmCancel::Flag(flag.as_ref()),
                 stream_idle_timeout(),
                 stream_idle_timeout_after_progress(),
+                None,
             )
             .await
         });
@@ -4309,6 +4414,7 @@ mod tests {
                 LlmCancel::Token(&token_for_stream),
                 stream_idle_timeout(),
                 stream_idle_timeout_after_progress(),
+                None,
             )
             .await
         });
@@ -4337,6 +4443,7 @@ mod tests {
                 LlmCancel::FlagAndToken(flag.as_ref(), &token_signal),
                 stream_idle_timeout(),
                 stream_idle_timeout_after_progress(),
+                None,
             )
             .await
         });
@@ -4603,6 +4710,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("collect");
@@ -4637,6 +4745,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("stream should succeed");
@@ -4689,6 +4798,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("stream should succeed");
@@ -4732,6 +4842,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("stream should succeed");
@@ -4760,6 +4871,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("stream should succeed");
@@ -4789,6 +4901,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await;
         assert!(
@@ -4811,6 +4924,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await;
         match r {
@@ -5249,6 +5363,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("collect");
@@ -6349,6 +6464,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("collect")

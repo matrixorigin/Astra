@@ -77,55 +77,63 @@ type ServerSkillResolverBundle = (
     Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
 );
 
-/// Build skill registry + resolver for server-side agentic loops.
+/// Build a user-scoped skill registry + resolver for server-side web runs.
 ///
-/// Returns `(registry_for_activation, resolver)` using runtime providers
-/// (Local + Bundled + optional Database provider).
+/// This path intentionally does **not** mount `LocalSkillProvider::standard()`.
+/// Local filesystem skills belong to CLI-only execution until they are imported
+/// into `skills_registry`. Web/runtime turns must resolve skills through the
+/// database provider so visibility is enforceable by `(created_by = user OR
+/// is_public = 1)` and a cloud session cannot accidentally see skills from the
+/// server operator's home directory.
 fn build_server_skill_resolver(
     skill_service: Option<Arc<dyn SkillService>>,
-    cache: &std::sync::OnceLock<ServerSkillResolverBundle>,
+    user_id: &str,
+    allow_skills: Option<&HashSet<String>>,
 ) -> ServerSkillResolverBundle {
     use crate::turn::skill_tool::SkillResolver as _;
 
-    let bundle = cache.get_or_init(|| {
-        let mut registry = crate::skills::UnifiedSkillRegistry::new();
-        registry.add_provider(Box::new(crate::skills::LocalSkillProvider::standard()));
-        registry.add_provider(Box::new(
-            crate::skills::BundledSkillProvider::with_defaults(),
-        ));
-        if let Some(service) = skill_service {
-            registry.add_provider(Box::new(crate::skills::DatabaseSkillProvider::new(service)));
-        }
-        let registry = Arc::new(registry);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let r = Arc::clone(&registry);
-            match handle.runtime_flavor() {
-                tokio::runtime::RuntimeFlavor::MultiThread => {
-                    let _ = tokio::task::block_in_place(|| handle.block_on(r.discover_all()));
-                }
-                _ => {
-                    let _ = std::thread::scope(|s| {
-                        s.spawn(|| handle.block_on(r.discover_all())).join().ok()
-                    });
-                }
+    let Some(allow_skills) = allow_skills else {
+        return (None, None);
+    };
+    if allow_skills.is_empty() {
+        return (None, None);
+    }
+    let Some(service) = skill_service else {
+        return (None, None);
+    };
+
+    let mut registry = crate::skills::UnifiedSkillRegistry::new();
+    registry.add_provider(Box::new(crate::skills::DatabaseSkillProvider::new(
+        service,
+        user_id.to_string(),
+    )));
+    let registry = Arc::new(registry);
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let r = Arc::clone(&registry);
+        match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                let _ = tokio::task::block_in_place(|| handle.block_on(r.discover_all()));
+            }
+            _ => {
+                let _ = std::thread::scope(|s| {
+                    s.spawn(|| handle.block_on(r.discover_all())).join().ok()
+                });
             }
         }
-        if registry.is_empty() {
-            return (None, None);
-        }
-        let resolver_impl = Arc::new(crate::skills::UnifiedSkillResolver::new(Arc::clone(
-            &registry,
-        )));
-        let skills = resolver_impl.available_skills();
-        let resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>> = if skills.is_empty()
-        {
-            None
-        } else {
-            Some(resolver_impl)
-        };
-        (Some(registry), resolver)
-    });
-    bundle.clone()
+    }
+    if registry.is_empty() {
+        return (None, None);
+    }
+    let resolver_impl = Arc::new(crate::skills::UnifiedSkillResolver::new(Arc::clone(
+        &registry,
+    )));
+    let skills = resolver_impl.available_skills();
+    let resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>> = if skills.is_empty() {
+        None
+    } else {
+        Some(resolver_impl)
+    };
+    (Some(registry), resolver)
 }
 
 fn normalize_allowlist_entry(entry: &str, field: &str) -> Result<String, String> {
@@ -721,8 +729,9 @@ impl PostLoopPersistContext {
         if let Some(ref mgr) = self.csl_manager {
             let mut mgr = mgr.lock().await;
             let session_state = extract_session_state_compact(state);
+            let messages = messages_for_csl_persist(state);
             if let Err(e) = mgr
-                .persist_turn(state.session_turn, &state.messages, &session_state)
+                .persist_turn(state.session_turn, &messages, &session_state)
                 .await
             {
                 tracing::warn!(
@@ -983,6 +992,68 @@ fn extract_session_state_compact(
         delegation: None,
         compaction_tracker: Some(state.compaction_effectiveness.to_json()),
     }
+}
+
+fn restore_session_state_compact(
+    ss: astra_turn_core::conversation_log::SessionStateCompact,
+    loop_state: &mut AgenticLoopState,
+) {
+    if let Some(c) = ss.continuity
+        && loop_state.continuity == astra_turn_types::continuity::ContinuityState::default()
+    {
+        loop_state.continuity = c;
+    }
+    if !ss.blocked_tools.is_empty() {
+        loop_state.restricted_tools.extend(ss.blocked_tools);
+    }
+    if !ss.recent_tools.is_empty() {
+        loop_state.recent_tools = ss.recent_tools;
+    }
+    if let Some(ao_value) = ss.approval_overrides
+        && loop_state.approval_overrides.is_none()
+        && let Ok(ao) = serde_json::from_value(ao_value)
+    {
+        loop_state.approval_overrides = Some(ao);
+    }
+    if let Some(intr_value) = ss.interruption
+        && loop_state.interruption.is_none()
+        && let Ok(intr) = serde_json::from_value(intr_value)
+    {
+        loop_state.interruption = Some(intr);
+    }
+    if ss.budget_remaining_tokens > 0 {
+        loop_state.max_turn_input_tokens = ss.budget_remaining_tokens;
+    }
+    if ss.budget_remaining_rounds > 0 {
+        loop_state.remaining_turns = ss.budget_remaining_rounds as usize;
+    }
+    if ss.consecutive_ctx_errors > 0 {
+        loop_state.consecutive_context_window_errors = ss.consecutive_ctx_errors;
+    }
+}
+
+fn messages_for_csl_persist(state: &AgenticLoopState) -> Vec<Value> {
+    let mut messages = state.messages.clone();
+    let final_text = state.final_text.trim();
+    if final_text.is_empty() {
+        return messages;
+    }
+
+    let already_has_final = messages
+        .last()
+        .and_then(|message| {
+            let role = message.get("role")?.as_str()?;
+            let content = message.get("content")?.as_str()?;
+            Some(role == "assistant" && content.trim() == final_text)
+        })
+        .unwrap_or(false);
+    if !already_has_final {
+        messages.push(json!({
+            "role": "assistant",
+            "content": final_text,
+        }));
+    }
+    messages
 }
 
 fn server_loop_causal_chain_id(kind: &str) -> String {
@@ -1688,8 +1759,6 @@ pub struct AgenticRunLifecycleService {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     /// Optional database skill provider for runtime skill resolution.
     skill_service: Option<Arc<dyn SkillService>>,
-    /// Lazily initialized server skill registry + resolver bundle.
-    server_skill_resolver_cache: std::sync::OnceLock<ServerSkillResolverBundle>,
     /// Per-run approval request channel receivers (Phase E).
     /// Key: run_id → receiver that the WS handler drains.
     approval_channels: Arc<TokioMutex<HashMap<String, mpsc::UnboundedReceiver<serde_json::Value>>>>,
@@ -1732,7 +1801,6 @@ impl AgenticRunLifecycleService {
             resource_governor: None,
             edge_connection_pool: None,
             skill_service: None,
-            server_skill_resolver_cache: std::sync::OnceLock::new(),
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
             user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
@@ -1790,7 +1858,6 @@ impl AgenticRunLifecycleService {
 
     pub fn with_skill_service(mut self, service: Arc<dyn SkillService>) -> Self {
         self.skill_service = Some(service);
-        self.server_skill_resolver_cache = std::sync::OnceLock::new();
         self
     }
 
@@ -1838,51 +1905,12 @@ impl AgenticRunLifecycleService {
         };
         mgr.set_trace_id(run_id.to_string());
 
+        let mut restored_messages = Vec::new();
+
         match mgr.load().await {
             Ok(Some(mat)) => {
-                let mut restored = mat.messages;
-                if !loop_state.messages.is_empty() {
-                    restored.push(loop_state.messages.remove(0));
-                }
-                loop_state.messages = restored;
-
-                let ss = mat.session_state;
-                if let Some(c) = ss.continuity {
-                    if loop_state.continuity
-                        == astra_turn_types::continuity::ContinuityState::default()
-                    {
-                        loop_state.continuity = c;
-                    }
-                }
-                if !ss.blocked_tools.is_empty() {
-                    loop_state.restricted_tools.extend(ss.blocked_tools);
-                }
-                if !ss.recent_tools.is_empty() {
-                    loop_state.recent_tools = ss.recent_tools;
-                }
-                if let Some(ao_value) = ss.approval_overrides {
-                    if loop_state.approval_overrides.is_none() {
-                        if let Ok(ao) = serde_json::from_value(ao_value) {
-                            loop_state.approval_overrides = Some(ao);
-                        }
-                    }
-                }
-                if let Some(intr_value) = ss.interruption {
-                    if loop_state.interruption.is_none() {
-                        if let Ok(intr) = serde_json::from_value(intr_value) {
-                            loop_state.interruption = Some(intr);
-                        }
-                    }
-                }
-                if ss.budget_remaining_tokens > 0 {
-                    loop_state.max_turn_input_tokens = ss.budget_remaining_tokens;
-                }
-                if ss.budget_remaining_rounds > 0 {
-                    loop_state.remaining_turns = ss.budget_remaining_rounds as usize;
-                }
-                if ss.consecutive_ctx_errors > 0 {
-                    loop_state.consecutive_context_window_errors = ss.consecutive_ctx_errors;
-                }
+                restored_messages = mat.messages;
+                restore_session_state_compact(mat.session_state, loop_state);
             }
             Ok(None) => {
                 self.record_runtime_retrieval_degrade(
@@ -1925,6 +1953,13 @@ impl AgenticRunLifecycleService {
                 )
                 .await;
             }
+        }
+
+        if !restored_messages.is_empty() {
+            if !loop_state.messages.is_empty() {
+                restored_messages.push(loop_state.messages.remove(0));
+            }
+            loop_state.messages = restored_messages;
         }
 
         mgr.mark_turn_start(loop_state.messages.len());
@@ -2298,6 +2333,7 @@ impl AgenticRunLifecycleService {
 
     async fn validate_request_constraints(
         &self,
+        user_id: &str,
         request: &ChatRequestData,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         if request.llm_token_service.is_some() {
@@ -2307,13 +2343,14 @@ impl AgenticRunLifecycleService {
         }
         normalize_request_allowlist(request.allow_tools.as_deref(), "allow_tools")
             .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
-        let (_, resolver) = build_server_skill_resolver(
-            self.skill_service.clone(),
-            &self.server_skill_resolver_cache,
-        );
         let allowed_skills =
             normalize_request_allowlist(request.allow_skills.as_deref(), "allow_skills")
                 .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        let (_, resolver) = build_server_skill_resolver(
+            self.skill_service.clone(),
+            user_id,
+            allowed_skills.as_ref(),
+        );
         apply_normalized_skill_allowlist(resolver, allowed_skills.as_ref())
             .map(|_| ())
             .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))
@@ -2384,6 +2421,7 @@ impl AgenticRunLifecycleService {
     /// from the provisioned directory instead of requiring `edge_profile.cwd`.
     fn build_initial_state(
         &self,
+        user_id: &str,
         request: &ChatRequestData,
         session_id: &str,
         run_id: &str,
@@ -2397,15 +2435,16 @@ impl AgenticRunLifecycleService {
             detect_turn_hook_sets, is_plan_subtask_from_chat_context, project_root_for_stop_hooks,
         };
 
-        let (skill_registry, raw_skill_resolver) = build_server_skill_resolver(
-            self.skill_service.clone(),
-            &self.server_skill_resolver_cache,
-        );
         let request_constraints = RequestConstraints::new(
             normalize_request_allowlist(request.allow_tools.as_deref(), "allow_tools")
                 .expect("request allow_tools should be validated before state build"),
             normalize_request_allowlist(request.allow_skills.as_deref(), "allow_skills")
                 .expect("request allow_skills should be validated before state build"),
+        );
+        let (skill_registry, raw_skill_resolver) = build_server_skill_resolver(
+            self.skill_service.clone(),
+            user_id,
+            request_constraints.allowed_skills.as_ref(),
         );
         let skill_resolver = apply_normalized_skill_allowlist(
             raw_skill_resolver,
@@ -2460,6 +2499,8 @@ impl AgenticRunLifecycleService {
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
         let runtime_continuity = Self::continuity_from_chat_context(&request.context);
+        let thinking_config =
+            Self::thinking_from_chat_context(&request.context, request.model.as_deref());
 
         // Create harness sink early so sub-run executors can share it.
         #[cfg(feature = "harness")]
@@ -2598,7 +2639,7 @@ impl AgenticRunLifecycleService {
             budget_wrapup_injected: false,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
-            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+            thinking: thinking_config,
             recent_file_reads: Vec::new(),
             permission_context: None,
             permission_handler: None,
@@ -2688,6 +2729,18 @@ impl AgenticRunLifecycleService {
             .as_ref()
             .and_then(|ctx| ctx.get("continuity_state"))
             .and_then(|value| Self::parse_runtime_continuity_value(value, "chat request context"))
+    }
+
+    fn thinking_from_chat_context(
+        context: &Option<Map<String, Value>>,
+        model: Option<&str>,
+    ) -> astra_turn_core::thinking_config::ThinkingConfig {
+        if let Some(value) = context.as_ref().and_then(|ctx| ctx.get("thinking")) {
+            return astra_turn_core::thinking_config::ThinkingConfig::from_payload_value(value);
+        }
+        model
+            .map(|name| astra_turn_core::thinking_config::resolve_model_thinking(name).1)
+            .unwrap_or_default()
     }
 
     async fn restore_continuity_from_session_checkpoint(
@@ -2912,7 +2965,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         request: ChatRequestData,
     ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.validate_request_constraints(&request).await?;
+        self.validate_request_constraints(&user_id, &request)
+            .await?;
 
         // ── Resource governance check (Phase 5) ─────────────────────
         if let Some(ref gov) = self.resource_governor {
@@ -2989,6 +3043,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             plan_resume_hint,
         );
         let mut loop_state = self.build_initial_state(
+            &user_id,
             &request,
             &session_id,
             &run_id,
@@ -2996,8 +3051,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             Some(llm_cancel_token.clone()),
         );
         loop_state.context_manifest_user_id = Some(user_id.clone());
-        // Inject user_id into harness sink for DB persistence (deferred
-        // because build_initial_state does not receive user_id).
+        // Inject user_id into the harness sink used by DB-persistence tests.
         #[cfg(feature = "harness")]
         loop_state.harness.set_user_id(&user_id);
 
@@ -3362,7 +3416,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         request: ChatRequestData,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.validate_request_constraints(&request).await?;
+        self.validate_request_constraints(&user_id, &request)
+            .await?;
 
         // ── Resource governance check ────────────────────────────────
         if let Some(ref gov) = self.resource_governor {
@@ -3413,6 +3468,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         run_state.live_tx = Some(live_tx.clone());
 
         let mut state = self.build_initial_state(
+            &user_id,
             &request,
             &session_id,
             &run_id,
@@ -3420,8 +3476,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             Some(llm_cancel_token.clone()),
         );
         state.context_manifest_user_id = Some(user_id.clone());
-        // Inject user_id into harness sink for DB persistence (deferred
-        // because build_initial_state does not receive user_id).
+        // Inject user_id into the harness sink used by DB-persistence tests.
         #[cfg(feature = "harness")]
         state.harness.set_user_id(&user_id);
 
@@ -4218,7 +4273,6 @@ pub struct ServerSubRunExecutor {
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     skill_service: Option<Arc<dyn SkillService>>,
-    skill_resolver_cache: std::sync::OnceLock<ServerSkillResolverBundle>,
 }
 
 impl ServerSubRunExecutor {
@@ -4234,7 +4288,6 @@ impl ServerSubRunExecutor {
             edge_callback_ledger,
             edge_connection_pool: None,
             skill_service: None,
-            skill_resolver_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -4253,7 +4306,6 @@ impl ServerSubRunExecutor {
 
     pub fn with_skill_service(mut self, service: Arc<dyn SkillService>) -> Self {
         self.skill_service = Some(service);
-        self.skill_resolver_cache = std::sync::OnceLock::new();
         self
     }
 }
@@ -4369,8 +4421,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
 
-        let (skill_registry, raw_skill_resolver) =
-            build_server_skill_resolver(self.skill_service.clone(), &self.skill_resolver_cache);
+        let (skill_registry, raw_skill_resolver) = build_server_skill_resolver(
+            self.skill_service.clone(),
+            &config.user_id,
+            config.request_constraints.allowed_skills.as_ref(),
+        );
         let skill_resolver = apply_normalized_skill_allowlist(
             raw_skill_resolver,
             config.request_constraints.allowed_skills.as_ref(),
@@ -4950,7 +5005,8 @@ mod tests {
             Arc::new(TokioMutex::new(HashMap::new())),
         );
         let request = test_request("deploy the service");
-        let mut state = service.build_initial_state(&request, &session_id, "run-1", None, None);
+        let mut state =
+            service.build_initial_state("test-user", &request, &session_id, "run-1", None, None);
         state.final_text = "deployment finished".to_string();
         state.session_turn = 7;
         state.telemetry.all_tools_used.insert("skill".to_string());
@@ -5082,6 +5138,7 @@ mod tests {
 
             async fn list_skills(
                 &self,
+                _user_id: String,
                 limit: u32,
                 offset: u32,
             ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
@@ -5112,6 +5169,7 @@ mod tests {
 
             async fn get_skill(
                 &self,
+                _user_id: String,
                 skill_id: String,
                 _version: Option<String>,
             ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
@@ -5148,6 +5206,7 @@ mod tests {
             async fn list_skill_versions(
                 &self,
                 _: String,
+                _: String,
             ) -> Result<Vec<SkillVersionRecord>, (StatusCode, Json<ErrorResponse>)> {
                 unimplemented!()
             }
@@ -5178,8 +5237,10 @@ mod tests {
         }
 
         let svc = test_service().with_skill_service(Arc::new(MockSkillService));
+        let mut request = test_request("hello");
+        request.allow_skills = Some(vec!["remote-db".to_string()]);
         let state =
-            svc.build_initial_state(&test_request("hello"), "session-1", "run-1", None, None);
+            svc.build_initial_state("test-user", &request, "session-1", "run-1", None, None);
         let resolver = state
             .skills
             .resolver
@@ -5213,8 +5274,14 @@ mod tests {
 
         let mut filtered_request = test_request("hello");
         filtered_request.allow_skills = Some(vec!["remote-db".to_string()]);
-        let filtered_state =
-            svc.build_initial_state(&filtered_request, "session-1", "run-1", None, None);
+        let filtered_state = svc.build_initial_state(
+            "test-user",
+            &filtered_request,
+            "session-1",
+            "run-1",
+            None,
+            None,
+        );
         assert!(
             filtered_state.skills.registry_for_activation.is_none(),
             "request-scoped allow_skills should disable automatic conditional activation"
@@ -5253,7 +5320,8 @@ mod tests {
     fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
         let svc = test_service();
         let request = test_request("git status");
-        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
+        let mut state =
+            svc.build_initial_state("test-user", &request, "session-1", "run-1", None, None);
         state.recent_tools = vec!["git_status".into()];
         state.telemetry.first_budget_pressure = 0.27;
         state.stall.events.push(("repetition_stall".into(), 1));
@@ -5307,7 +5375,8 @@ mod tests {
     fn seed_restricted_tools_from_blocked_patterns_adds_blocked_tools() {
         let svc = test_service();
         let request = test_request("inspect blocked tools");
-        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
+        let mut state =
+            svc.build_initial_state("test-user", &request, "session-1", "run-1", None, None);
         let mut pattern_library = astra_pipeline::pattern::PatternLibrary::new();
 
         // One success so the pattern exists, then Block adds 5 failures.
@@ -5334,7 +5403,8 @@ mod tests {
     fn finalize_run_events_appends_run_finished_for_failures() {
         let svc = test_service();
         let request = test_request("boom");
-        let state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
+        let state =
+            svc.build_initial_state("test-user", &request, "session-1", "run-1", None, None);
 
         let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
             Ok(AgenticLoopOutcome::Error("boom".into())),
@@ -5353,7 +5423,8 @@ mod tests {
     fn finalize_run_events_cancellation_beats_completed_outcome() {
         let svc = test_service();
         let request = test_request("done");
-        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
+        let mut state =
+            svc.build_initial_state("test-user", &request, "session-1", "run-1", None, None);
         let cancel_flag = Arc::new(AtomicBool::new(true));
         let cancel_token = Arc::new(CancellationToken::new());
         cancel_token.cancel();
@@ -5377,7 +5448,8 @@ mod tests {
     fn finalize_run_events_interrupted_completed_outcome_is_partial_not_completed() {
         let svc = test_service();
         let request = test_request("partial");
-        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
+        let mut state =
+            svc.build_initial_state("test-user", &request, "session-1", "run-1", None, None);
         state.final_text = "[Round budget hard-limit reached]".to_string();
         state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
             astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
@@ -5912,7 +5984,7 @@ mod tests {
             astra_core::RuntimeLimits::global().max_turns,
             None,
         );
-        let state = svc.build_initial_state(&req, "sess-1", "run-1", None, None);
+        let state = svc.build_initial_state("test-user", &req, "sess-1", "run-1", None, None);
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0]["role"], "user");
         assert_eq!(state.messages[0]["content"], "write a test");
@@ -5938,7 +6010,7 @@ mod tests {
         );
         req.context = Some(context);
 
-        let state = svc.build_initial_state(&req, "sess-1", "run-1", None, None);
+        let state = svc.build_initial_state("test-user", &req, "sess-1", "run-1", None, None);
 
         assert_eq!(state.continuity, continuity);
     }
@@ -5951,7 +6023,7 @@ mod tests {
         context.insert("continuity_state".to_string(), serde_json::json!({}));
         req.context = Some(context);
 
-        let state = svc.build_initial_state(&req, "sess-1", "run-1", None, None);
+        let state = svc.build_initial_state("test-user", &req, "sess-1", "run-1", None, None);
 
         assert_eq!(
             state.continuity,
@@ -5967,7 +6039,7 @@ mod tests {
             initial_turns: Some(4),
             hard_turn_limit: Some(9),
         });
-        let state = svc.build_initial_state(&req, "s", "r", None, None);
+        let state = svc.build_initial_state("test-user", &req, "s", "r", None, None);
         assert_eq!(state.max_turns, 4);
         assert_eq!(state.remaining_turns, 4);
         assert_eq!(state.agentic_turn_budget.hard_turn_limit, 9);
@@ -5981,7 +6053,7 @@ mod tests {
             initial_turns: Some(0),
             hard_turn_limit: Some(0),
         });
-        let state = svc.build_initial_state(&req, "s", "r", None, None);
+        let state = svc.build_initial_state("test-user", &req, "s", "r", None, None);
         assert_eq!(state.max_turns, 1);
         assert_eq!(state.agentic_turn_budget.hard_turn_limit, 1);
     }
@@ -6008,7 +6080,7 @@ mod tests {
             .clone(),
         );
 
-        let state = svc.build_initial_state(&req, "s", "r", None, None);
+        let state = svc.build_initial_state("test-user", &req, "s", "r", None, None);
         assert_eq!(state.hooks.stop_hooks.len(), 1);
         assert_eq!(state.hooks.stop_hooks[0].label, "cloud_hook");
         assert_eq!(
@@ -6031,7 +6103,7 @@ mod tests {
         let svc = test_service();
         // Request with NO edge_profile.cwd — simulates web-agent mode.
         let req = test_request("fix a bug");
-        let state = svc.build_initial_state(&req, "s", "r", Some(dir.path()), None);
+        let state = svc.build_initial_state("test-user", &req, "s", "r", Some(dir.path()), None);
         assert_eq!(state.hooks.stop_hooks.len(), 1);
         assert_eq!(state.hooks.stop_hooks[0].label, "server_hook");
         assert_eq!(
@@ -6072,7 +6144,8 @@ mod tests {
             .clone(),
         );
 
-        let state = svc.build_initial_state(&req, "s", "r", Some(override_dir.path()), None);
+        let state =
+            svc.build_initial_state("test-user", &req, "s", "r", Some(override_dir.path()), None);
         // Edge profile's cwd wins over the workspace override.
         assert_eq!(state.hooks.stop_hooks.len(), 1);
         assert_eq!(state.hooks.stop_hooks[0].label, "edge_hook");
@@ -7267,12 +7340,43 @@ mod tests {
     }
 
     #[test]
+    fn persist_context_writes_assistant_final_text_to_csl() {
+        let source = include_str!("run_lifecycle.rs");
+        let persist_ctx = source
+            .find("struct PostLoopPersistContext")
+            .expect("PostLoopPersistContext must exist");
+        let persist_body = &source[persist_ctx..persist_ctx + 1800];
+        assert!(
+            persist_body.contains("messages_for_csl_persist(state)"),
+            "CSL persistence must include assistant final_text, not only state.messages"
+        );
+
+        let helper = source
+            .find("fn messages_for_csl_persist")
+            .expect("messages_for_csl_persist must exist");
+        let helper_body = &source[helper..helper + 1200];
+        assert!(
+            helper_body.contains("\"role\": \"assistant\"")
+                && helper_body.contains("\"content\": final_text"),
+            "messages_for_csl_persist must append the assistant final text"
+        );
+    }
+
+    #[test]
     fn restore_csl_recovers_all_session_state_fields() {
         let source = include_str!("run_lifecycle.rs");
         let restore_fn = source
             .find("async fn restore_csl_history")
             .expect("restore_csl_history must exist");
         let restore_body = &source[restore_fn..restore_fn + 3000];
+        assert!(
+            restore_body.contains("restore_session_state_compact"),
+            "restore_csl_history must apply compact session state"
+        );
+        let restore_helper = source
+            .find("fn restore_session_state_compact")
+            .expect("restore_session_state_compact must exist");
+        let restore_state_body = &source[restore_helper..restore_helper + 2000];
         let required_fields = [
             "continuity",
             "blocked_tools",
@@ -7285,10 +7389,32 @@ mod tests {
         ];
         for field in &required_fields {
             assert!(
-                restore_body.contains(field),
-                "restore_csl_history must restore {field} from SessionStateCompact"
+                restore_state_body.contains(field),
+                "restore_session_state_compact must restore {field} from SessionStateCompact"
             );
         }
+    }
+
+    #[test]
+    fn restore_csl_does_not_auto_fallback_to_transcript() {
+        let source = include_str!("run_lifecycle.rs");
+        let restore_fn = source
+            .find("async fn restore_csl_history")
+            .expect("restore_csl_history must exist");
+        let restore_body = &source[restore_fn..restore_fn + 5000];
+        assert!(
+            !restore_body.contains("load_recent_transcript_messages")
+                && !restore_body.contains("session_transcript_items"),
+            "restore_csl_history must not silently load transcript rows into the LLM prompt"
+        );
+        assert!(
+            !source.contains("\n    async fn load_recent_transcript_messages"),
+            "old transcript fallback helper must stay removed; history lookup is an explicit LLM tool"
+        );
+        assert!(
+            restore_body.contains("mgr.load().await") && restore_body.contains("mat.messages"),
+            "restore_csl_history should restore only the CSL materialized history"
+        );
     }
 
     #[test]

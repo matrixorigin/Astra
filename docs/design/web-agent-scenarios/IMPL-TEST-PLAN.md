@@ -334,7 +334,7 @@ Sprint A-D 历经 4 轮 "patch → 回归"，19 gap review + 10 端到端推演 
 - [ ] 登录 + 权限（auth_sessions 已有）
 - [ ] Session 列表（按更新时间排序）
 - [ ] 对话框（新开 session / 继续 session）
-- [ ] 基本 SSE 流式回复
+- [ ] 基本 SSE 流式回复：chat shell 只有 transcript pane 可滚动，composer 始终锚定在 chat viewport 底部；用户消息 optimistic render，Web turn 携带 `context.thinking`，runtime 在 provider SSE 到达时实时转发 `text_delta` / `reasoning_delta` / `thinking_delta`，assistant 气泡在 streaming 期间显示 Thinking 占位，将 provider reasoning 与 `<think>` / `<thinking>` 规范化为有界可折叠 Thinking 时间线，时间线限制在小滚动区域并对长块提供 "Show more"；若 provider/model 没有暴露 reasoning，完成后隐藏占位而不是展示伪详情；随 `text_delta` 更新正文，完成后 composer 重新获得焦点。
 - [ ] cold-start hydration（G24）
 - [ ] 设备 lease 显式 revoke 按钮（G25 被动过期由 SDK 处理）
 
@@ -392,5 +392,11 @@ Sprint A-D 历经 4 轮 "patch → 回归"，19 gap review + 10 端到端推演 
 
 **只有当所有 Phase 1-6 的 L1 + L2 + E2E-1..5 全绿**，才能发布 v1。
 **任何一个红灯都要追溯到哪个 gap 的实现偏离了设计**，然后修正。
+
+## v1 发布前新增回归项
+
+- [ ] Web-agent resume 必须从服务端持久化状态恢复历史：`conversation_log` snapshot probe 使用 `COUNT(*)`，不能把 SQL decode/query error 当作空历史。
+- [ ] Runtime resume 不允许把 `session_transcript_items` 自动兜底塞进本轮 LLM history；display transcript 只是 UI/audit projection。旧话题细节必须由 LLM 显式调用 `session_history_page` / `session_history_search` / `session_history_around`，按当前 session、游标分页、模糊检索或命中点展开，且工具端在 Rust 中校验 `user_id`。
+- [ ] CSL 持久化必须包含 assistant final text；用户连续多轮对话后询问“刚刚聊了什么”，LLM 看到的是完整 user/assistant 历史，而不是只有第一条 user message。
 
 这就是"花了这么多功夫做推演，不让它浪费"的契约。

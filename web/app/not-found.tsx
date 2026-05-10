@@ -9,10 +9,10 @@ export default function NotFound() {
         The page you are looking for does not exist or has been moved.
       </p>
       <Link
-        href="/overview"
+        href="/"
         className="mt-4 rounded-xl bg-sky-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-sky-500"
       >
-        Go to overview
+        Go home
       </Link>
     </div>
   );

@@ -2,6 +2,9 @@
 
 > Date: 2026-05-08
 > Status: v1.0.0 implementation complete; E2E joint verification PASS; known residuals are non-blocking v1.0.1 quality follow-ups.
+> Post-E2E hotfix: CSL snapshot loading now uses a MatrixOne-stable `COUNT(*)` probe and assistant final text is included in CSL persistence. Runtime resume does **not** silently rebuild the prompt from `session_transcript_items`; old details are exposed to the LLM through explicit, read-only `session_history_page` / `session_history_search` / `session_history_around` tools so retrieval stays user-scoped, cursor-based, and token-bounded.
+> Web UI test hotfix: the resource governor now interprets `max_concurrent_sessions` as sessions with active runs (`agent_runs.status IN ('running','paused','waiting')`), not all durable/resumable historical `agent_sessions`; persisted web chats must not consume execution concurrency after their run completes.
+> Web UI usability patch: chats can now be archived into a default-collapsed sidebar section, unarchived, or permanently deleted from the chat menu/sidebar menu. Archived chats are read-only until unarchived. Archive/unarchive persists `agent_sessions.status='archived'/'active'` for sessions with a runtime ID. Permanent delete and clear-archive actions use local inline confirmation near the action and call the runtime `DELETE /sessions/{session_id}` hard-delete path for persisted sessions before removing the Web UI record.
 
 ## §1 Design to Implementation Closure
 
@@ -133,6 +136,8 @@ Runtime/server:
 - `rust/crates/runtime/src/server/user_skill_handlers.rs`
 - `rust/crates/runtime/src/server/session_handlers.rs` extended for state, transcript, devices, artifacts, and anchor memory.
 - `rust/crates/runtime/src/server/run_handlers.rs` extended for durable run stream/input/cancel.
+- `rust/crates/runtime/src/server/run_lifecycle.rs` restores web-agent history from CSL and persists completed assistant text back into CSL. Transcript display rows remain an audit/UI projection, not an automatic prompt source.
+- `rust/crates/runtime/src/server/server_tool_executor.rs` exposes read-only session history tools so the LLM can page, search, and expand old transcript details on demand without loading the full session.
 - `rust/crates/runtime/src/server/delegation_engine.rs` wired to state projection and bubble-up.
 - `rust/crates/runtime/src/server/state_builder.rs` starts device lease and artifact retention sweepers.
 
@@ -200,10 +205,12 @@ Web UI MVP items:
 
 1. Login page backed by existing auth sessions.
 2. Session list sorted by `updated_at` with pagination.
-3. Session chat view: create/open session, send message, stream SSE reply.
+3. Session chat view: create/open session, keep the composer anchored to the chat viewport while only the transcript pane scrolls, optimistically render the user message, send the turn's `context.thinking` hint to the runtime, forward provider SSE `text_delta` / `reasoning_delta` / `thinking_delta` while they arrive, show a Thinking placeholder while streaming, normalize provider reasoning plus `<think>` / `<thinking>` into a bounded collapsible Thinking timeline with small-region scrolling and per-block "Show more", hide the placeholder after completion if no reasoning was exposed, and return focus to the composer after completion.
 4. IndexedDB session cache with atomic run-event and watermark writes.
 5. Stop button wired to run/session cancellation endpoint.
 6. Device revoke UI in settings/device list.
+7. Archived chats section plus read-only archived sessions and inline-confirmed permanent delete/clear-archive actions for chat lifecycle cleanup.
+8. Composer Skills picker: paginated/searchable skill selection for large skill catalogs; selected skills are sent as `allow_skills` and mirrored into `context.edge_profile.active_skills` for the runtime turn. The picker and runtime resolver read only database skills visible to the current user (`created_by = current_user OR is_public = 1`); CLI-local filesystem skills remain CLI-only until imported. Runtime does not enumerate the full skill catalog unless `allow_skills` is non-empty.
 
 Incremental v1 UI additions:
 

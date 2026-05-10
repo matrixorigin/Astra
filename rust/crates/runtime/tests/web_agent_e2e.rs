@@ -244,6 +244,7 @@ impl SkillService for TestSkillService {
 
     async fn list_skills(
         &self,
+        _user_id: String,
         limit: u32,
         offset: u32,
     ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
@@ -275,6 +276,7 @@ impl SkillService for TestSkillService {
 
     async fn get_skill(
         &self,
+        _user_id: String,
         skill_id: String,
         _version: Option<String>,
     ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
@@ -309,6 +311,7 @@ impl SkillService for TestSkillService {
 
     async fn list_skill_versions(
         &self,
+        _: String,
         _: String,
     ) -> Result<Vec<SkillVersionRecord>, (StatusCode, Json<ErrorResponse>)> {
         unimplemented!()

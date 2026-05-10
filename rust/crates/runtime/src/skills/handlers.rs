@@ -43,10 +43,10 @@ pub async fn list_skills_handler(
     Query(query): Query<SkillListQuery>,
     headers: HeaderMap,
 ) -> Result<Json<SkillListRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
+    let user = state.auth_service.current_user(&headers).await?;
     let result = state
         .skill_service
-        .list_skills(query.limit, query.offset)
+        .list_skills(user.user_id, query.limit, query.offset)
         .await?;
     Ok(Json(result))
 }
@@ -112,10 +112,10 @@ pub async fn get_skill_handler(
     Query(query): Query<SkillGetQuery>,
     headers: HeaderMap,
 ) -> Result<Json<SkillRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
+    let user = state.auth_service.current_user(&headers).await?;
     let skill = state
         .skill_service
-        .get_skill(skill_id, query.version)
+        .get_skill(user.user_id, skill_id, query.version)
         .await?;
     Ok(Json(skill))
 }
@@ -125,9 +125,12 @@ pub async fn list_skill_versions_handler(
     Path(skill_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SkillVersionRecord>>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
+    let user = state.auth_service.current_user(&headers).await?;
     let name = skill_id.split('@').next().unwrap_or(&skill_id).to_string();
-    let versions = state.skill_service.list_skill_versions(name).await?;
+    let versions = state
+        .skill_service
+        .list_skill_versions(user.user_id, name)
+        .await?;
     Ok(Json(versions))
 }
 

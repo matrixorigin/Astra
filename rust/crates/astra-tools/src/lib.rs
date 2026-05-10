@@ -872,6 +872,9 @@ mod tests {
         assert!(names.contains(&"glob".into()));
         assert!(names.contains(&"memory_store".into()));
         assert!(names.contains(&"memory_retrieve".into()));
+        assert!(names.contains(&"session_history_page".into()));
+        assert!(names.contains(&"session_history_search".into()));
+        assert!(names.contains(&"session_history_around".into()));
         assert!(
             !names.contains(&"memory_search".into()),
             "memory_search removed — use memory_retrieve"

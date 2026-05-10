@@ -1547,7 +1547,16 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    // Skills registry — master catalog for registered/marketplace skills.
+    // Skills registry — master catalog for database-backed skills.
+    //
+    // Important visibility contract:
+    // - Local filesystem skills discovered by the CLI stay local to the CLI.
+    // - Web/runtime skills must live in this table.
+    // - Query paths expose only `created_by = current_user OR is_public = 1`.
+    //
+    // The paired visibility indexes below support that union without forcing
+    // MatrixOne to scan every active skill when a user has many private skills
+    // and the public catalog is also large.
     query(
         "CREATE TABLE IF NOT EXISTS skills_registry (
             skill_id VARCHAR(64) PRIMARY KEY,
@@ -1576,6 +1585,9 @@ pub async fn ensure_core_schema(
             UNIQUE KEY uq_skill_name_version (skill_name, version),
             INDEX idx_skill_active_name (is_active, status, skill_name),
             INDEX idx_skill_active_created_at (is_active, created_at),
+            INDEX idx_skill_visible_owner (is_active, created_by, created_at),
+            INDEX idx_skill_visible_public (is_active, is_public, created_at),
+            INDEX idx_skill_visible_name_owner (is_active, skill_name, created_by, is_public, created_at),
             INDEX idx_skill_source_name (source, skill_name),
             INDEX idx_skill_active_name_ver (is_active, skill_name, version)
         )",

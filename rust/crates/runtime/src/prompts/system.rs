@@ -204,7 +204,7 @@ fn parallel_and_efficiency_section() -> &'static str {
       **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\
       **Anti-pattern**: Don't call one tool, wait for results, then call the next independent tool — batch them.\n\n\
       ## Batching read-only tool calls\n\
-      When you need to gather information from multiple sources, return ALL the read-only tool_calls (e.g. read_file / grep / glob / list_dir / git_show / git_log / git_diff / git_status / web_fetch / memory_retrieve / find_definition / find_references) in a single assistant message — they execute in parallel. Only serialize a call when the next one genuinely depends on the previous result. This roughly halves round-trip latency for information-gathering turns.\n\
+      When you need to gather information from multiple sources, return ALL the read-only tool_calls (e.g. read_file / grep / glob / list_dir / git_show / git_log / git_diff / git_status / web_fetch / memory_retrieve / session_history_search / find_definition / find_references) in a single assistant message — they execute in parallel. Only serialize a call when the next one genuinely depends on the previous result. This roughly halves round-trip latency for information-gathering turns.\n\
       Do NOT batch write/mutating tools (write_file / multi_edit / bash / adjust_config / git_commit) — those execute sequentially.\n\n\
       ## Token Efficiency\n\
      - Prefer targeted reads (line ranges) over full-file reads.\n\
@@ -335,6 +335,9 @@ fn tool_conditional_section(
     let has_git_worktree = tool_names.contains(&"git_worktree");
     let has_session_state_rollback = tool_names.contains(&"rollback_session_state");
     let has_turn_rollback = tool_names.contains(&"rollback_turn_actions");
+    let has_session_history = tool_names.contains(&"session_history_search")
+        || tool_names.contains(&"session_history_page")
+        || tool_names.contains(&"session_history_around");
 
     let mut s = String::new();
 
@@ -468,6 +471,14 @@ fn tool_conditional_section(
         if !memory_section.is_empty() {
             s.push_str(&memory_section);
         }
+    }
+    if has_session_history {
+        s.push_str(
+            "\n## Session History Recall\n\
+             - Use **session_history_search** when the user references an earlier topic in this chat and the current context is insufficient.\n\
+             - Use **session_history_around** on a returned item_seq to recover exact surrounding details before continuing old work.\n\
+             - Use **session_history_page** for time-ordered browsing with before_seq/after_seq cursors. Do not ask the user to repeat details until these tools fail or return ambiguous results.\n",
+        );
     }
     if selection_confidence < LOW_CONFIDENCE_THRESHOLD {
         s.push_str(

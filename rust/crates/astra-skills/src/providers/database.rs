@@ -17,11 +17,12 @@ use crate::traits::{SkillError, SkillProvider};
 /// so this adapter maps between the two representations.
 pub struct DatabaseSkillProvider {
     service: Arc<dyn SkillService>,
+    user_id: String,
 }
 
 impl DatabaseSkillProvider {
-    pub fn new(service: Arc<dyn SkillService>) -> Self {
-        Self { service }
+    pub fn new(service: Arc<dyn SkillService>, user_id: String) -> Self {
+        Self { service, user_id }
     }
 
     fn get_str<'a>(
@@ -72,6 +73,21 @@ impl DatabaseSkillProvider {
     }
 }
 
+/// Number of catalog rows fetched per DB round trip.
+///
+/// The web composer can expose large personal catalogs. Fetching in pages keeps
+/// each query bounded while still allowing selected skills outside the first
+/// page to participate in runtime allowlist validation.
+const DATABASE_SKILL_DISCOVERY_PAGE_SIZE: u32 = 500;
+
+/// Hard cap for a single runtime resolver snapshot.
+///
+/// This is not a visibility fallback: if a user grows beyond this size, the
+/// resolver design should move to direct name lookups for allowlisted skills.
+/// The cap protects prompt construction from accidentally materializing an
+/// unbounded catalog in one turn.
+const DATABASE_SKILL_DISCOVERY_MAX_ROWS: u32 = 5_000;
+
 #[async_trait]
 impl SkillProvider for DatabaseSkillProvider {
     fn source_kind(&self) -> SkillSourceKind {
@@ -79,17 +95,27 @@ impl SkillProvider for DatabaseSkillProvider {
     }
 
     async fn discover(&self) -> Result<Vec<SkillManifest>, SkillError> {
-        let result = self.service.list_skills(200, 0).await.map_err(|(_, err)| {
-            SkillError::Internal(format!(
-                "failed to list skills from database: {}",
-                err.0.detail
-            ))
-        })?;
+        let mut offset = 0;
+        let mut manifests = Vec::new();
+        loop {
+            let remaining = DATABASE_SKILL_DISCOVERY_MAX_ROWS.saturating_sub(offset);
+            if remaining == 0 {
+                break;
+            }
+            let limit = remaining.min(DATABASE_SKILL_DISCOVERY_PAGE_SIZE);
+            let result = self
+                .service
+                .list_skills(self.user_id.clone(), limit, offset)
+                .await
+                .map_err(|(_, err)| {
+                    SkillError::Internal(format!(
+                        "failed to list skills from database for user '{}': {}",
+                        self.user_id, err.0.detail
+                    ))
+                })?;
 
-        let manifests = result
-            .skills
-            .into_iter()
-            .map(|item| {
+            let page_len = result.skills.len() as u32;
+            manifests.extend(result.skills.into_iter().map(|item| {
                 let version = item.version.parse().unwrap_or_default();
 
                 SkillManifest {
@@ -100,8 +126,13 @@ impl SkillProvider for DatabaseSkillProvider {
                     category: item.category,
                     ..Default::default()
                 }
-            })
-            .collect();
+            }));
+
+            offset = offset.saturating_add(page_len);
+            if page_len < limit || offset as i64 >= result.total {
+                break;
+            }
+        }
 
         Ok(manifests)
     }
@@ -109,7 +140,7 @@ impl SkillProvider for DatabaseSkillProvider {
     async fn load(&self, name: &str) -> Result<LoadedSkill, SkillError> {
         let record = self
             .service
-            .get_skill(name.to_string(), None)
+            .get_skill(self.user_id.clone(), name.to_string(), None)
             .await
             .map_err(|(status, err)| {
                 if status == axum::http::StatusCode::NOT_FOUND {
@@ -200,6 +231,7 @@ mod tests {
 
         async fn list_skills(
             &self,
+            _user_id: String,
             limit: u32,
             offset: u32,
         ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
@@ -215,6 +247,7 @@ mod tests {
 
         async fn get_skill(
             &self,
+            _user_id: String,
             skill_id: String,
             _version: Option<String>,
         ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
@@ -279,6 +312,7 @@ mod tests {
 
         async fn list_skill_versions(
             &self,
+            _: String,
             _: String,
         ) -> Result<Vec<SkillVersionRecord>, (StatusCode, Json<ErrorResponse>)> {
             unimplemented!()
@@ -348,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn discover_lists_all_skills() {
-        let provider = DatabaseSkillProvider::new(mock_service());
+        let provider = DatabaseSkillProvider::new(mock_service(), "user-1".to_string());
         let manifests = provider.discover().await.unwrap();
         assert_eq!(manifests.len(), 3);
 
@@ -366,7 +400,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_returns_instructions() {
-        let provider = DatabaseSkillProvider::new(mock_service());
+        let provider = DatabaseSkillProvider::new(mock_service(), "user-1".to_string());
         let loaded = provider.load("review").await.unwrap();
         assert_eq!(loaded.manifest.name, "review");
         assert_eq!(loaded.instructions, "DB skill instructions.");
@@ -375,14 +409,14 @@ mod tests {
 
     #[tokio::test]
     async fn load_not_found() {
-        let provider = DatabaseSkillProvider::new(mock_service());
+        let provider = DatabaseSkillProvider::new(mock_service(), "user-1".to_string());
         let result = provider.load("nonexistent").await;
         assert!(matches!(result, Err(SkillError::NotFound(_))));
     }
 
     #[tokio::test]
     async fn load_remote_skill_maps_remote_url_and_schema() {
-        let provider = DatabaseSkillProvider::new(mock_service());
+        let provider = DatabaseSkillProvider::new(mock_service(), "user-1".to_string());
         let loaded = provider.load("remote-http").await.unwrap();
         assert_eq!(loaded.manifest.name, "remote-http");
         assert_eq!(

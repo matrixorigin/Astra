@@ -75,6 +75,9 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "web_fetch",
     "web_search",
     "ask_user",
+    "session_history_page",
+    "session_history_search",
+    "session_history_around",
     "memory_retrieve",
     "memory_store",
     // memory_search removed — duplicate of memory_retrieve (same endpoint).
@@ -1030,6 +1033,59 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "include_cross_session": {"type": "boolean", "description": "Legacy flag. false is equivalent to filter_session=true when session_id is set. Default true."}
                     },
                     "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "session_history_page",
+                "description": "Page through the current session transcript by item_seq cursor. Use when the user refers to earlier turns in this same chat and you need chronological context without loading the whole session. Returns compact snippets plus before/after cursors.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "before_seq": {"type": "integer", "description": "Return transcript rows older than this item_seq. Omit for the newest page."},
+                        "after_seq": {"type": "integer", "description": "Return transcript rows newer than this item_seq. Use for forward paging after an older page."},
+                        "limit": {"type": "integer", "description": "Max rows to return, 1-50. Default 20."},
+                        "order": {"type": "string", "enum": ["asc", "desc"], "description": "Output order. asc is useful for reading a recovered range; desc is useful for browsing backwards. Default desc."},
+                        "role": {"type": "string", "enum": ["all", "user", "assistant", "system"], "description": "Optional role filter. Default all."}
+                    },
+                    "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "session_history_search",
+                "description": "Search the current session transcript and indexed history chunks for an old topic using compact keyword/fuzzy matching. Use for requests like 'we discussed X a long time ago' before answering from memory. Returns ranked item_seq anchors; call session_history_around on a returned item_seq when exact surrounding details are needed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Topic, phrase, filename, error text, decision, or Chinese/English keywords to find in the current session."},
+                        "limit": {"type": "integer", "description": "Max matching anchors to return, 1-20. Default 8."},
+                        "scan_limit": {"type": "integer", "description": "Max recent transcript rows to scan when ranking fuzzy matches, 50-1000. Default 400."},
+                        "before_seq": {"type": "integer", "description": "Search only rows older than this item_seq."},
+                        "after_seq": {"type": "integer", "description": "Search only rows newer than this item_seq."},
+                        "role": {"type": "string", "enum": ["all", "user", "assistant", "system"], "description": "Optional role filter. Default all."}
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "session_history_around",
+                "description": "Load exact transcript context around a known item_seq in the current session. Use after session_history_search returns a likely anchor, or when you need the details before continuing a previously discussed task.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "item_seq": {"type": "integer", "description": "Transcript item_seq anchor returned by session_history_search or session_history_page."},
+                        "radius": {"type": "integer", "description": "Rows before and after item_seq to include, 0-10. Default 3."},
+                        "role": {"type": "string", "enum": ["all", "user", "assistant", "system"], "description": "Optional role filter. Default all."}
+                    },
+                    "required": ["item_seq"]
                 }
             }
         }),
@@ -2127,6 +2183,9 @@ mod tests {
         assert!(names.contains(&"git_stash"));
         assert!(names.contains(&"github_create_issue"));
         assert!(names.contains(&"web_fetch"));
+        assert!(names.contains(&"session_history_page"));
+        assert!(names.contains(&"session_history_search"));
+        assert!(names.contains(&"session_history_around"));
         assert!(names.contains(&"memory_retrieve"));
         assert!(names.contains(&"symbols"));
         assert!(names.contains(&"memory_store"));

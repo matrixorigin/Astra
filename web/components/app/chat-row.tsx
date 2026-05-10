@@ -1,0 +1,79 @@
+'use client';
+
+import Link from 'next/link';
+import { CheckSquare, MessageSquare, MoreHorizontal, Square } from 'lucide-react';
+import { ChatActionsMenu } from '@/components/app/chat-actions-menu';
+import { cn } from '@/lib/utils/cn';
+
+export function ChatRow({
+  chatId,
+  title,
+  subtitle,
+  href,
+  archived,
+  afterMutationHref,
+  selectable,
+  selected,
+  onSelectChange,
+}: {
+  chatId: string;
+  title: string;
+  subtitle: string;
+  href: string;
+  archived?: boolean;
+  afterMutationHref?: string;
+  selectable?: boolean;
+  selected?: boolean;
+  onSelectChange?: (selected: boolean) => void;
+}) {
+  const content = (
+    <>
+      <MessageSquare className="mt-0.5 size-4 shrink-0 text-text-muted" />
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium">{title}</span>
+        <span className="block truncate text-xs text-text-muted">{subtitle}</span>
+      </span>
+    </>
+  );
+
+  if (selectable) {
+    return (
+      <button
+        type="button"
+        onClick={() => onSelectChange?.(!selected)}
+        className={cn(
+          'flex w-full items-start gap-3 rounded-control border border-transparent px-3 py-3 text-left text-text-secondary hover:border-border hover:bg-surface-muted hover:text-text',
+          selected && 'border-accent/30 bg-accent-soft text-accent',
+        )}
+      >
+        {content}
+        <span className="text-text-muted">
+          {selected ? <CheckSquare className="size-4" /> : <Square className="size-4" />}
+        </span>
+      </button>
+    );
+  }
+
+  return (
+    <div className="group flex items-start gap-2 rounded-control border border-transparent pr-1 text-text-secondary hover:border-border hover:bg-surface-muted hover:text-text">
+      <Link href={href} className="flex min-w-0 flex-1 items-start gap-3 px-3 py-3">
+        {content}
+      </Link>
+      <ChatActionsMenu
+        chatId={chatId}
+        archived={archived}
+        afterMutationHref={afterMutationHref}
+        variant="compact"
+        trigger={(
+          <button
+            type="button"
+            aria-label={`Open actions for ${title}`}
+            className="mt-2 flex size-8 shrink-0 items-center justify-center rounded-control text-text-muted hover:bg-surface hover:text-text"
+          >
+            <MoreHorizontal className="size-4" />
+          </button>
+        )}
+      />
+    </div>
+  );
+}

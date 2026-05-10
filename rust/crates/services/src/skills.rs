@@ -161,6 +161,28 @@ const SKILL_REGISTRY_LIST_SELECT: &str = "\
     status, source, category, \
     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
 
+/// Visibility rule for database-backed skills.
+///
+/// Astra has two skill worlds:
+/// - CLI-local filesystem skills, which are discovered directly from local paths
+///   and are intentionally not visible to the web runtime until imported.
+/// - Database skills in `skills_registry`, which are the only skills shared by
+///   web sessions and remote runtime execution.
+///
+/// A database skill is visible to a caller when it is active and either public
+/// or owned by the authenticated user. Keep this rule centralized so HTTP
+/// handlers, runtime skill resolution, and future admin surfaces cannot drift.
+const VISIBLE_SKILL_PREDICATE: &str = "is_active = 1 AND (is_public = 1 OR created_by = ?)";
+
+/// Prefer a user's own skill over a public skill with the same logical name.
+///
+/// The schema currently enforces `(skill_name, version)` uniqueness, but this
+/// ordering is still important for "latest by name" lookups: users should not
+/// lose their private skill because a newer public skill with the same name was
+/// published later.
+const USER_OWNED_SKILL_FIRST_ORDER: &str =
+    "CASE WHEN created_by = ? THEN 0 ELSE 1 END, created_at DESC";
+
 // ── Idempotency classifiers ───────────────────────────────────────────────────
 
 /// Row fetched from `skills_registry` when checking for a duplicate before register.
@@ -170,6 +192,7 @@ pub(crate) struct ExistingRegisterRow {
     pub description: Option<String>,
     pub skill_definition: String,
     pub code_hash: String,
+    pub created_by: Option<String>,
     pub created_at: Option<String>,
 }
 
@@ -195,6 +218,7 @@ pub(crate) enum RegisterDuplicateDecision {
 /// `Conflict` on identical retries when the storage engine canonicalised the JSON on insert.
 pub(crate) fn classify_register_duplicate(
     existing: Option<ExistingRegisterRow>,
+    request_user_id: &str,
     skill_id: &str,
     new_definition_json: &str,
     new_code_hash: &str,
@@ -202,6 +226,13 @@ pub(crate) fn classify_register_duplicate(
     let Some(row) = existing else {
         return RegisterDuplicateDecision::Insert;
     };
+    // A duplicate owned by another user must not become an idempotent replay,
+    // even if the incoming bytes happen to match. Replay is an ownership-scoped
+    // retry contract, not a cross-user dedupe API; returning the stored row here
+    // would leak metadata for a skill the caller did not create.
+    if row.created_by.as_deref() != Some(request_user_id) {
+        return RegisterDuplicateDecision::Conflict;
+    }
     let same_def = json_structurally_equal(&row.skill_definition, new_definition_json);
     let same_hash = row.code_hash == new_code_hash;
     if same_def && same_hash {
@@ -225,6 +256,7 @@ pub(crate) struct ExistingPublishRow {
     pub version: String,
     pub skill_definition: String,
     pub manifest: String,
+    pub created_by: Option<String>,
 }
 
 /// Decision returned by [`classify_publish_duplicate`].
@@ -242,6 +274,7 @@ pub(crate) enum PublishDuplicateDecision {
 /// using structural JSON equality (see [`classify_register_duplicate`] for rationale).
 pub(crate) fn classify_publish_duplicate(
     existing: Option<ExistingPublishRow>,
+    request_user_id: &str,
     skill_id: &str,
     new_definition_json: &str,
     new_manifest_json: &str,
@@ -249,6 +282,9 @@ pub(crate) fn classify_publish_duplicate(
     let Some(row) = existing else {
         return PublishDuplicateDecision::Conflict;
     };
+    if row.created_by.as_deref() != Some(request_user_id) {
+        return PublishDuplicateDecision::Conflict;
+    }
     let same_def = json_structurally_equal(&row.skill_definition, new_definition_json);
     let same_manifest = json_structurally_equal(&row.manifest, new_manifest_json);
     if same_def && same_manifest {
@@ -292,12 +328,14 @@ pub trait SkillService: Send + Sync {
 
     async fn list_skills(
         &self,
+        user_id: String,
         limit: u32,
         offset: u32,
     ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)>;
 
     async fn get_skill(
         &self,
+        user_id: String,
         skill_id: String,
         version: Option<String>,
     ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)>;
@@ -310,6 +348,7 @@ pub trait SkillService: Send + Sync {
 
     async fn list_skill_versions(
         &self,
+        user_id: String,
         skill_name: String,
     ) -> Result<Vec<SkillVersionRecord>, (StatusCode, Json<ErrorResponse>)>;
 
@@ -460,6 +499,7 @@ impl SkillService for DatabaseSkillService {
             "SELECT skill_name, version, description, \
              IFNULL(CAST(skill_definition AS CHAR), '') AS skill_definition, \
              IFNULL(code_hash, '') AS code_hash, \
+             created_by, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
              FROM skills_registry WHERE skill_id = ?",
         )
@@ -475,10 +515,17 @@ impl SkillService for DatabaseSkillService {
                 .try_get::<String, _>("skill_definition")
                 .unwrap_or_default(),
             code_hash: row.try_get::<String, _>("code_hash").unwrap_or_default(),
+            created_by: row.try_get::<String, _>("created_by").ok(),
             created_at: row.try_get::<String, _>("created_at").ok(),
         });
 
-        match classify_register_duplicate(existing_row, &skill_id, &definition_json, &code_hash) {
+        match classify_register_duplicate(
+            existing_row,
+            &user_id,
+            &skill_id,
+            &definition_json,
+            &code_hash,
+        ) {
             RegisterDuplicateDecision::Insert => {
                 // Proceed to INSERT below.
             }
@@ -522,23 +569,28 @@ impl SkillService for DatabaseSkillService {
 
     async fn list_skills(
         &self,
+        user_id: String,
         limit: u32,
         offset: u32,
     ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let (limit, offset) = clamp_api_list_pagination(limit, offset);
 
-        let count_row = query("SELECT COUNT(*) AS cnt FROM skills_registry WHERE is_active = 1")
+        let count_sql =
+            format!("SELECT COUNT(*) AS cnt FROM skills_registry WHERE {VISIBLE_SKILL_PREDICATE}",);
+        let count_row = query(&count_sql)
+            .bind(&user_id)
             .fetch_one(&pool)
             .await
             .map_err(internal_error)?;
         let total: i64 = count_row.try_get("cnt").unwrap_or(0);
 
         let list_sql = format!(
-            "SELECT {SKILL_REGISTRY_LIST_SELECT} FROM skills_registry WHERE is_active = 1 \
+            "SELECT {SKILL_REGISTRY_LIST_SELECT} FROM skills_registry WHERE {VISIBLE_SKILL_PREDICATE} \
              ORDER BY created_at DESC LIMIT ? OFFSET ?",
         );
         let rows = query(&list_sql)
+            .bind(&user_id)
             .bind(limit)
             .bind(offset)
             .fetch_all(&pool)
@@ -569,49 +621,58 @@ impl SkillService for DatabaseSkillService {
 
     async fn get_skill(
         &self,
+        user_id: String,
         skill_id: String,
         version: Option<String>,
     ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let row = query(
+        let by_id_sql = format!(
             "SELECT skill_id, skill_name, version, description, \
              IFNULL(CAST(skill_definition AS CHAR), 'null') AS definition_json, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM skills_registry WHERE skill_id = ?",
-        )
-        .bind(&skill_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(internal_error)?;
+             FROM skills_registry WHERE skill_id = ? AND {VISIBLE_SKILL_PREDICATE}",
+        );
+        let row = query(&by_id_sql)
+            .bind(&skill_id)
+            .bind(&user_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(internal_error)?;
 
         let row = if row.is_none() {
             let name = skill_id.split('@').next().unwrap_or(&skill_id);
             if let Some(version) = version.as_deref() {
-                query(
+                let by_name_version_sql = format!(
                     "SELECT skill_id, skill_name, version, description, \
                      IFNULL(CAST(skill_definition AS CHAR), 'null') AS definition_json, \
                      DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-                     FROM skills_registry WHERE skill_name = ? AND version = ? AND is_active = 1 \
-                     ORDER BY created_at DESC LIMIT 1",
-                )
-                .bind(name)
-                .bind(version)
-                .fetch_optional(&pool)
-                .await
-                .map_err(internal_error)?
+                     FROM skills_registry WHERE skill_name = ? AND version = ? AND {VISIBLE_SKILL_PREDICATE} \
+                     ORDER BY {USER_OWNED_SKILL_FIRST_ORDER} LIMIT 1",
+                );
+                query(&by_name_version_sql)
+                    .bind(name)
+                    .bind(version)
+                    .bind(&user_id)
+                    .bind(&user_id)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(internal_error)?
             } else {
-                query(
+                let by_name_latest_sql = format!(
                     "SELECT skill_id, skill_name, version, description, \
                      IFNULL(CAST(skill_definition AS CHAR), 'null') AS definition_json, \
                      DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-                     FROM skills_registry WHERE skill_name = ? AND is_active = 1 \
-                     ORDER BY created_at DESC LIMIT 1",
-                )
-                .bind(name)
-                .fetch_optional(&pool)
-                .await
-                .map_err(internal_error)?
+                     FROM skills_registry WHERE skill_name = ? AND {VISIBLE_SKILL_PREDICATE} \
+                     ORDER BY {USER_OWNED_SKILL_FIRST_ORDER} LIMIT 1",
+                );
+                query(&by_name_latest_sql)
+                    .bind(name)
+                    .bind(&user_id)
+                    .bind(&user_id)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(internal_error)?
             }
         } else {
             row
@@ -640,21 +701,24 @@ impl SkillService for DatabaseSkillService {
     async fn get_skill_info(
         &self,
         skill_name: String,
-        _user_id: String,
+        user_id: String,
     ) -> Result<SkillInfoRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let row = query(
+        let info_sql = format!(
             "SELECT skill_name, version, description, source, status, created_by, category, \
              publisher_id, trust_tier, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM skills_registry WHERE skill_name = ? AND is_active = 1 \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(&skill_name)
-        .fetch_optional(&pool)
-        .await
-        .map_err(internal_error)?;
+             FROM skills_registry WHERE skill_name = ? AND {VISIBLE_SKILL_PREDICATE} \
+             ORDER BY {USER_OWNED_SKILL_FIRST_ORDER} LIMIT 1",
+        );
+        let row = query(&info_sql)
+            .bind(&skill_name)
+            .bind(&user_id)
+            .bind(&user_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(internal_error)?;
         let row = row.ok_or_else(|| {
             error_response(
                 StatusCode::NOT_FOUND,
@@ -687,18 +751,23 @@ impl SkillService for DatabaseSkillService {
 
     async fn list_skill_versions(
         &self,
+        user_id: String,
         skill_name: String,
     ) -> Result<Vec<SkillVersionRecord>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let rows = query(
+        let versions_sql = format!(
             "SELECT version, status, is_active, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM skills_registry WHERE skill_name = ? ORDER BY created_at DESC",
-        )
-        .bind(&skill_name)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
+             FROM skills_registry WHERE skill_name = ? AND {VISIBLE_SKILL_PREDICATE} \
+             ORDER BY {USER_OWNED_SKILL_FIRST_ORDER}",
+        );
+        let rows = query(&versions_sql)
+            .bind(&skill_name)
+            .bind(&user_id)
+            .bind(&user_id)
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
 
         let mut versions = Vec::with_capacity(rows.len());
         for row in rows {
@@ -714,7 +783,7 @@ impl SkillService for DatabaseSkillService {
 
     async fn get_skill_status(
         &self,
-        _user_id: String,
+        user_id: String,
         per_group: u32,
     ) -> Result<SkillStatusRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
@@ -722,21 +791,24 @@ impl SkillService for DatabaseSkillService {
 
         let fetch_group = |source: &str| {
             let pool = pool.clone();
+            let user_id = user_id.clone();
             let source = source.to_string();
             async move {
-                let rows = query(
+                let group_sql = format!(
                     "SELECT skill_id, skill_name, version, description, status, category, \
                      DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-                     FROM skills_registry WHERE source = ? AND is_active = 1 \
+                     FROM skills_registry WHERE source = ? AND {VISIBLE_SKILL_PREDICATE} \
                      ORDER BY skill_name LIMIT ?",
-                )
-                .bind(&source)
-                .bind(per_group)
-                .fetch_all(&pool)
-                .await
-                .unwrap_or_default();
+                );
+                let rows = query(&group_sql)
+                    .bind(&source)
+                    .bind(&user_id)
+                    .bind(per_group)
+                    .fetch_all(&pool)
+                    .await?;
 
-                rows.iter()
+                let items = rows
+                    .iter()
                     .map(|row| SkillListItem {
                         skill_id: row.try_get::<String, _>("skill_id").unwrap_or_default(),
                         skill_name: row.try_get::<String, _>("skill_name").unwrap_or_default(),
@@ -747,15 +819,17 @@ impl SkillService for DatabaseSkillService {
                         category: row.try_get::<String, _>("category").ok(),
                         created_at: row.try_get::<String, _>("created_at").ok(),
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                Ok::<_, sqlx::Error>(items)
             }
         };
 
-        let (builtin, marketplace, user) = tokio::join!(
+        let (builtin, marketplace, user) = tokio::try_join!(
             fetch_group("builtin"),
             fetch_group("marketplace"),
             fetch_group("user"),
-        );
+        )
+        .map_err(internal_error)?;
 
         let platform_total = (builtin.len() + marketplace.len()) as i64;
         let user_total = user.len() as i64;
@@ -905,7 +979,8 @@ impl SkillService for DatabaseSkillService {
                 let dup_row = query(
                     "SELECT skill_name, version, \
                      IFNULL(CAST(skill_definition AS CHAR), '') AS skill_definition, \
-                     IFNULL(CAST(manifest AS CHAR), '') AS manifest \
+                     IFNULL(CAST(manifest AS CHAR), '') AS manifest, \
+                     created_by \
                      FROM skills_registry WHERE skill_id = ?",
                 )
                 .bind(&skill_id)
@@ -920,10 +995,12 @@ impl SkillService for DatabaseSkillService {
                         .try_get::<String, _>("skill_definition")
                         .unwrap_or_default(),
                     manifest: row.try_get::<String, _>("manifest").unwrap_or_default(),
+                    created_by: row.try_get::<String, _>("created_by").ok(),
                 });
 
                 match classify_publish_duplicate(
                     dup_row,
+                    &user_id,
                     &skill_id,
                     &skill_definition_json,
                     &manifest_json,
@@ -1007,6 +1084,7 @@ impl SkillService for UnconfiguredSkillService {
     }
     async fn list_skills(
         &self,
+        _: String,
         _: u32,
         _: u32,
     ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
@@ -1014,6 +1092,7 @@ impl SkillService for UnconfiguredSkillService {
     }
     async fn get_skill(
         &self,
+        _: String,
         _: String,
         _: Option<String>,
     ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
@@ -1028,6 +1107,7 @@ impl SkillService for UnconfiguredSkillService {
     }
     async fn list_skill_versions(
         &self,
+        _: String,
         _: String,
     ) -> Result<Vec<SkillVersionRecord>, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("skill service not configured"))
@@ -1287,14 +1367,20 @@ mod tests {
             description: Some("desc".to_string()),
             skill_definition: def.to_string(),
             code_hash: hash.to_string(),
+            created_by: Some("owner-1".to_string()),
             created_at: Some("2024-01-01T00:00:00".to_string()),
         }
     }
 
     #[test]
     fn classify_register_duplicate_none_returns_insert() {
-        let decision =
-            classify_register_duplicate(None, "my-skill@1.0.0", r#"{"skill_type":"local"}"#, "abc");
+        let decision = classify_register_duplicate(
+            None,
+            "owner-1",
+            "my-skill@1.0.0",
+            r#"{"skill_type":"local"}"#,
+            "abc",
+        );
         assert_eq!(decision, RegisterDuplicateDecision::Insert);
     }
 
@@ -1303,7 +1389,8 @@ mod tests {
         let def = r#"{"skill_type":"local","instructions":"fn run() {}"}"#;
         let hash = "deadbeef";
         let row = make_existing_register_row(def, hash);
-        let decision = classify_register_duplicate(Some(row), "my-skill@1.0.0", def, hash);
+        let decision =
+            classify_register_duplicate(Some(row), "owner-1", "my-skill@1.0.0", def, hash);
         assert!(
             matches!(decision, RegisterDuplicateDecision::IdempotentReplay(_)),
             "identical payload must return IdempotentReplay, got {decision:?}"
@@ -1319,7 +1406,8 @@ mod tests {
         let stored_def = r#"{"skill_type":"local","instructions":"fn run() {}"}"#;
         let new_def = r#"{"skill_type":"local","instructions":"fn run() { panic!() }"}"#;
         let row = make_existing_register_row(stored_def, "abc");
-        let decision = classify_register_duplicate(Some(row), "my-skill@1.0.0", new_def, "abc");
+        let decision =
+            classify_register_duplicate(Some(row), "owner-1", "my-skill@1.0.0", new_def, "abc");
         assert_eq!(decision, RegisterDuplicateDecision::Conflict);
     }
 
@@ -1327,7 +1415,17 @@ mod tests {
     fn classify_register_duplicate_different_hash_returns_conflict() {
         let def = r#"{"skill_type":"local","instructions":"fn run() {}"}"#;
         let row = make_existing_register_row(def, "old-hash");
-        let decision = classify_register_duplicate(Some(row), "my-skill@1.0.0", def, "new-hash");
+        let decision =
+            classify_register_duplicate(Some(row), "owner-1", "my-skill@1.0.0", def, "new-hash");
+        assert_eq!(decision, RegisterDuplicateDecision::Conflict);
+    }
+
+    #[test]
+    fn classify_register_duplicate_same_payload_different_private_owner_conflicts() {
+        let def = r#"{"skill_type":"local","instructions":"fn run() {}"}"#;
+        let row = make_existing_register_row(def, "abc");
+        let decision =
+            classify_register_duplicate(Some(row), "other-user", "my-skill@1.0.0", def, "abc");
         assert_eq!(decision, RegisterDuplicateDecision::Conflict);
     }
 
@@ -1341,7 +1439,8 @@ mod tests {
         let new_def = r#"{"skill_type":"local","instructions":"fn run() {}"}"#;
         let stored_def = r#"{"instructions":"fn run() {}","skill_type":"local"}"#;
         let row = make_existing_register_row(stored_def, "abc");
-        let decision = classify_register_duplicate(Some(row), "my-skill@1.0.0", new_def, "abc");
+        let decision =
+            classify_register_duplicate(Some(row), "owner-1", "my-skill@1.0.0", new_def, "abc");
         assert!(
             matches!(decision, RegisterDuplicateDecision::IdempotentReplay(_)),
             "reordered-keys retry must be idempotent replay, got {decision:?}"
@@ -1356,12 +1455,14 @@ mod tests {
             version: "2.0.0".to_string(),
             skill_definition: def.to_string(),
             manifest: manifest.to_string(),
+            created_by: Some("owner-1".to_string()),
         }
     }
 
     #[test]
     fn classify_publish_duplicate_none_returns_conflict() {
-        let decision = classify_publish_duplicate(None, "pub-skill@2.0.0", r#"{}"#, r#"{}"#);
+        let decision =
+            classify_publish_duplicate(None, "owner-1", "pub-skill@2.0.0", r#"{}"#, r#"{}"#);
         assert_eq!(decision, PublishDuplicateDecision::Conflict);
     }
 
@@ -1370,7 +1471,8 @@ mod tests {
         let def = r#"{"skill_type":"local","priority":5}"#;
         let manifest = r#"{"skill_type":"local","priority":5}"#;
         let row = make_existing_publish_row(def, manifest);
-        let decision = classify_publish_duplicate(Some(row), "pub-skill@2.0.0", def, manifest);
+        let decision =
+            classify_publish_duplicate(Some(row), "owner-1", "pub-skill@2.0.0", def, manifest);
         assert!(
             matches!(decision, PublishDuplicateDecision::IdempotentReplay(_)),
             "identical payload must return IdempotentReplay, got {decision:?}"
@@ -1386,6 +1488,7 @@ mod tests {
         let row = make_existing_publish_row(r#"{"priority":5}"#, r#"{"priority":5}"#);
         let decision = classify_publish_duplicate(
             Some(row),
+            "owner-1",
             "pub-skill@2.0.0",
             r#"{"priority":10}"#,
             r#"{"priority":5}"#,
@@ -1398,10 +1501,21 @@ mod tests {
         let row = make_existing_publish_row(r#"{"priority":5}"#, r#"{"priority":5}"#);
         let decision = classify_publish_duplicate(
             Some(row),
+            "owner-1",
             "pub-skill@2.0.0",
             r#"{"priority":5}"#,
             r#"{"priority":10}"#,
         );
+        assert_eq!(decision, PublishDuplicateDecision::Conflict);
+    }
+
+    #[test]
+    fn classify_publish_duplicate_same_payload_different_owner_conflicts() {
+        let def = r#"{"skill_type":"local","priority":5}"#;
+        let manifest = r#"{"skill_type":"local","priority":5}"#;
+        let row = make_existing_publish_row(def, manifest);
+        let decision =
+            classify_publish_duplicate(Some(row), "other-user", "pub-skill@2.0.0", def, manifest);
         assert_eq!(decision, PublishDuplicateDecision::Conflict);
     }
 
@@ -1415,8 +1529,13 @@ mod tests {
         let new_manifest = r#"{"a":1,"b":2}"#;
         let stored_manifest = r#"{"b":2,"a":1}"#;
         let row = make_existing_publish_row(stored_def, stored_manifest);
-        let decision =
-            classify_publish_duplicate(Some(row), "pub-skill@2.0.0", new_def, new_manifest);
+        let decision = classify_publish_duplicate(
+            Some(row),
+            "owner-1",
+            "pub-skill@2.0.0",
+            new_def,
+            new_manifest,
+        );
         assert!(
             matches!(decision, PublishDuplicateDecision::IdempotentReplay(_)),
             "reordered-keys retry must be idempotent replay, got {decision:?}"
