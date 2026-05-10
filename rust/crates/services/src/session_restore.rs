@@ -6,9 +6,8 @@
 //! restore_session(session_id)
 //!   ├─ 1. Pull workspace metadata (local → fallback to MatrixOne)
 //!   ├─ 2. Pull events (agent_events → reconstruct turn_count, recent_tools)
-//!   ├─ 3. Pull learning state (learning_snapshots → merge into pipeline modules)
-//!   ├─ 4. Pull checkpoints (session_checkpoints → optional rewind target)
-//!   └─ 5. Return RestoredSession for the REPL to continue
+//!   ├─ 3. Pull checkpoints (session_checkpoints → optional rewind target)
+//!   └─ 4. Return RestoredSession for the REPL to continue
 //! ```
 //!
 //! The restore is local-first: tries local files first, falls back to MatrixOne
@@ -45,8 +44,6 @@ pub struct RestoredSession {
     pub total_tokens_out: u64,
     /// Recently used tools (for context carry-forward).
     pub recent_tools: Vec<String>,
-    /// Learning snapshot JSON (for pipeline module merge).
-    pub learning_snapshot_json: Option<String>,
     /// Number of checkpoints available.
     pub checkpoint_count: u32,
     /// Status of the session when last active.
@@ -237,7 +234,7 @@ impl HybridRestoreService {
         use sqlx::Row;
 
         let row = sqlx::query(
-            "SELECT user_id, content_json \
+            "SELECT content_json \
              FROM session_artifacts \
              WHERE session_id = ? AND artifact_kind = ? \
              ORDER BY created_at DESC LIMIT 1",
@@ -258,9 +255,8 @@ impl HybridRestoreService {
         let metadata =
             serde_json::from_str::<super::session_workspace::WorkspaceMetadata>(&metadata_json)
                 .map_err(|e| format!("restore_cloud_workspace: {e}"))?;
-        let user_id: String = row.try_get("user_id").unwrap_or_default();
 
-        Ok(Some(CloudWorkspaceArtifact { metadata, user_id }))
+        Ok(Some(CloudWorkspaceArtifact { metadata }))
     }
 
     async fn restore_cloud_composite_snapshot_index(
@@ -334,7 +330,6 @@ impl HybridRestoreService {
         match row {
             Some(row) => {
                 use sqlx::Row;
-                let user_id: String = row.try_get("user_id").unwrap_or_default();
                 let status: String = row.try_get("status").unwrap_or_default();
                 let title: Option<String> = row.try_get("title").ok().flatten();
                 let turn_count: i64 = row.try_get("turn_count").unwrap_or(0);
@@ -378,14 +373,6 @@ impl HybridRestoreService {
                 }
                 let latest_model: Option<String> = row.try_get("latest_model").ok().flatten();
                 let model = metadata_state.model.clone().or(latest_model);
-                let learning_snapshot_json = if user_id.is_empty() {
-                    None
-                } else {
-                    self.restore_learning(&user_id, "default")
-                        .await
-                        .ok()
-                        .flatten()
-                };
 
                 // Load active contract from task_contracts table
                 let mut contract_json = Self::load_cloud_contract(pool, session_id)
@@ -412,7 +399,6 @@ impl HybridRestoreService {
                     title,
                     restored_from_cloud: true,
                     recent_tools,
-                    learning_snapshot_json,
                     checkpoint_count: checkpoint_count.max(0) as u32,
                     git_branch: metadata_state.git_branch.clone(),
                     model,
@@ -601,40 +587,6 @@ impl HybridRestoreService {
                 .flatten()
                 .and_then(|meta| serde_json::from_str(&meta).ok())
         }))
-    }
-
-    /// Pull learning snapshot from MatrixOne.
-    async fn restore_learning(
-        &self,
-        user_id: &str,
-        profile: &str,
-    ) -> Result<Option<String>, String> {
-        let pool = match &self.pool {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-
-        let row = sqlx::query(
-            "SELECT snapshot_json FROM learning_snapshots \
-             WHERE user_id = ? AND profile_name = ? \
-             ORDER BY updated_at DESC LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(profile)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| format!("restore_learning: {e}"))?;
-
-        match row {
-            Some(row) => {
-                use sqlx::Row;
-                let json: String = row
-                    .try_get("snapshot_json")
-                    .map_err(|e| format!("decode learning: {e}"))?;
-                Ok(Some(json))
-            }
-            None => Ok(None),
-        }
     }
 
     async fn restore_latest_heavy_checkpoint_state(
@@ -863,7 +815,6 @@ struct LocalJournalSummary {
 #[derive(Debug, Clone)]
 struct CloudWorkspaceArtifact {
     metadata: super::session_workspace::WorkspaceMetadata,
-    user_id: String,
 }
 
 fn summarize_local_journal(session_id: &str) -> Option<LocalJournalSummary> {
@@ -925,7 +876,6 @@ fn restored_session_from_workspace(
     ws: super::session_workspace::WorkspaceMetadata,
     local_journal: Option<&LocalJournalSummary>,
     recent_tools: Vec<String>,
-    learning_snapshot_json: Option<String>,
     checkpoint_count: u32,
     restored_from_cloud: bool,
 ) -> RestoredSession {
@@ -945,7 +895,6 @@ fn restored_session_from_workspace(
         total_tokens_in,
         total_tokens_out,
         recent_tools,
-        learning_snapshot_json,
         checkpoint_count,
         last_status: ws.status,
         git_branch: ws.git_branch,
@@ -1075,12 +1024,6 @@ impl SessionRestoreService for HybridRestoreService {
                 recent_tools = summary.recent_tools.clone();
             }
 
-            // Try local learning file
-            let learning = self
-                .restore_learning("local", "default")
-                .await
-                .unwrap_or(None);
-
             let ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
                 .map(|v| v.len() as u32)
                 .unwrap_or(0);
@@ -1089,7 +1032,6 @@ impl SessionRestoreService for HybridRestoreService {
                 ws,
                 local_journal.as_ref(),
                 recent_tools,
-                learning,
                 ckpt_count,
                 false,
             )));
@@ -1110,13 +1052,6 @@ impl SessionRestoreService for HybridRestoreService {
                 recent_tools = summary.recent_tools.clone();
             }
 
-            let learning = if ws.user_id.is_empty() {
-                None
-            } else {
-                self.restore_learning(&ws.user_id, "default")
-                    .await
-                    .unwrap_or(None)
-            };
             let local_ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
                 .map(|v| v.len() as u32)
                 .unwrap_or(0);
@@ -1130,17 +1065,12 @@ impl SessionRestoreService for HybridRestoreService {
                 ws.metadata,
                 local_journal.as_ref(),
                 recent_tools,
-                learning,
                 cloud_ckpt_count.max(local_ckpt_count),
                 true,
             )));
         }
 
         if let Some(summary) = local_journal {
-            let learning = self
-                .restore_learning("local", "default")
-                .await
-                .unwrap_or(None);
             let ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
                 .map(|v| v.len() as u32)
                 .unwrap_or(0);
@@ -1151,7 +1081,6 @@ impl SessionRestoreService for HybridRestoreService {
                 total_tokens_in: summary.total_tokens_in,
                 total_tokens_out: summary.total_tokens_out,
                 recent_tools: summary.recent_tools,
-                learning_snapshot_json: learning,
                 checkpoint_count: ckpt_count,
                 last_status: summary.last_status,
                 model: summary.model,
@@ -2000,7 +1929,6 @@ mod tests {
         let s = RestoredSession::default();
         assert_eq!(s.turn_count, 0);
         assert!(s.recent_tools.is_empty());
-        assert!(s.learning_snapshot_json.is_none());
         assert!(!s.restored_from_cloud);
         assert!(s.last_context_trace.is_none());
     }
@@ -2013,7 +1941,6 @@ mod tests {
             total_tokens_in: 5000,
             total_tokens_out: 3000,
             recent_tools: vec!["git_status".into(), "grep".into()],
-            learning_snapshot_json: Some("{\"entities\":[]}".into()),
             checkpoint_count: 3,
             last_status: "active".into(),
             git_branch: Some("main".into()),
@@ -2284,7 +2211,6 @@ mod tests {
             total_tokens_in: 100_000,
             total_tokens_out: 80_000,
             recent_tools: vec!["bash".into(), "grep".into(), "read_file".into()],
-            learning_snapshot_json: Some(r#"{"entities":["Rust","MatrixOne"]}"#.into()),
             checkpoint_count: 5,
             last_status: "active".into(),
             git_branch: Some("feature/resume".into()),
@@ -2301,7 +2227,6 @@ mod tests {
         assert_eq!(loaded.total_tokens_in, 100_000);
         assert_eq!(loaded.total_tokens_out, 80_000);
         assert_eq!(loaded.recent_tools.len(), 3);
-        assert!(loaded.learning_snapshot_json.is_some());
         assert_eq!(loaded.checkpoint_count, 5);
         assert_eq!(loaded.last_status, "active");
         assert_eq!(loaded.git_branch.as_deref(), Some("feature/resume"));
@@ -2321,7 +2246,6 @@ mod tests {
             ..Default::default()
         };
         assert!(s.recent_tools.is_empty());
-        assert!(s.learning_snapshot_json.is_none());
         assert!(s.git_branch.is_none());
         assert!(s.model.is_none());
         assert!(s.title.is_none());
@@ -2331,13 +2255,6 @@ mod tests {
     }
 
     // ── HybridRestoreService local_only behavior ──
-
-    #[tokio::test]
-    async fn local_only_learning_restore_returns_none() {
-        let svc = HybridRestoreService::local_only();
-        let result = svc.restore_learning("user1", "default").await.unwrap();
-        assert!(result.is_none());
-    }
 
     #[tokio::test]
     async fn local_only_recent_tools_returns_empty() {
@@ -2627,11 +2544,8 @@ mod tests {
 
     #[test]
     fn restored_session_null_optional_fields() {
-        let json = minimal_session_json(
-            r#""learning_snapshot_json":null,"git_branch":null,"model":null,"title":null"#,
-        );
+        let json = minimal_session_json(r#""git_branch":null,"model":null,"title":null"#);
         let s: RestoredSession = serde_json::from_str(&json).unwrap();
-        assert!(s.learning_snapshot_json.is_none());
         assert!(s.git_branch.is_none());
         assert!(s.model.is_none());
         assert!(s.title.is_none());

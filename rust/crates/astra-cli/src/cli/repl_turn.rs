@@ -3132,7 +3132,6 @@ fn build_manual_heavy_step_checkpoint(
         budget_remaining_rounds: max_turns.saturating_sub(state.turn),
         blocked_tools: Vec::new(),
         recent_tools: state.recent_tools.clone(),
-        learning_snapshot_id: None,
         memory_context: None,
         delegation_id: None,
         delegation_pattern: None,
@@ -3537,9 +3536,6 @@ mod tests {
                 Some(&sid),
                 "default",
                 "repl_startup",
-                Some(3),
-                true,
-                2,
                 &["blocked_tools".to_string()],
                 false,
             ))

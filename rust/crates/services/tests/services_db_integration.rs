@@ -1,5 +1,5 @@
 //! Live MatrixOne checks for list endpoints (`pagination` caps, `skills_registry` list SQL + index),
-//! cross-session audit aggregates (`get_cross_session_stats`, `list_sessions`, mutations, runtime
+//! cross-session audit aggregates (`get_cross_session_stats`, `list_sessions`, runtime
 //! promotions), and durable-task `resume_task` verification history reads.
 //!
 //! ```text
@@ -16,10 +16,9 @@ use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::event_ingestion::{EventIngestionWorker, IngestionConfig, IngestionEvent};
 use astra_services::session_audit::TurnListParams;
 use astra_services::session_audit::{
-    AuditSessionListParams, CrossSessionMutationListParams, CrossSessionRuntimePromotionListParams,
-    CrossSessionStatsParams, DatabaseSessionAuditService, RUNTIME_PROMOTION_EVENT_TYPE,
-    RuntimePromotionController, RuntimePromotionOutcome, RuntimePromotionRecommendation,
-    SessionAuditService,
+    AuditSessionListParams, CrossSessionRuntimePromotionListParams, CrossSessionStatsParams,
+    DatabaseSessionAuditService, RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionController,
+    RuntimePromotionOutcome, RuntimePromotionRecommendation, SessionAuditService,
 };
 use astra_services::session_restore::{
     COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND, HybridRestoreService, SessionRestoreService,
@@ -36,7 +35,7 @@ use astra_services::{
     MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, MAX_MARKETPLACE_SEARCH_OFFSET,
     MarketplaceStatsService, MatrixOneDurableTaskLifecycle, MatrixOneSyncService,
     SessionArtifactJsonStore, SessionArtifactStore, SessionListFilter, SessionService,
-    SkillSearchQuery, SkillService, StagedMutationState, StateSyncService,
+    SkillSearchQuery, SkillService,
 };
 use sqlx::Row;
 use std::collections::HashSet;
@@ -374,24 +373,9 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
 /// Matches [`astra_services::session_audit::MAX_AUDIT_SESSIONS_PER_PAGE`] (not exported).
 const MAX_AUDIT_SESSIONS_PER_PAGE: u32 = 100;
 
-fn assert_cross_session_stats_no_mutations_no_promotions(
-    s: &astra_services::session_audit::CrossSessionStats,
-) {
-    assert_eq!(s.total_mutations, 0);
-    assert_eq!(s.ready_mutations, 0);
-    assert_eq!(s.approval_required_mutations, 0);
-    assert_eq!(s.applied_mutations, 0);
-    assert_eq!(s.reverted_mutations, 0);
-    assert_eq!(s.blocked_mutations, 0);
-    assert_eq!(s.verified_mutations, 0);
-    assert_eq!(s.missing_verifier_mutations, 0);
-    assert_eq!(s.tool_result_verified_mutations, 0);
-    assert_eq!(s.journal_verified_mutations, 0);
-    assert_eq!(s.no_verifier_signal_mutations, 0);
-    assert_eq!(s.ambiguous_multi_action_verifier_mutations, 0);
+fn assert_cross_session_stats_no_promotions(s: &astra_services::session_audit::CrossSessionStats) {
     assert_eq!(s.total_runtime_promotions, 0);
     assert_eq!(s.adaptive_baseline_runtime_promotions, 0);
-    assert_eq!(s.evolution_runtime_promotions, 0);
     assert_eq!(s.promoted_runtime_promotions, 0);
     assert_eq!(s.deferred_runtime_promotions, 0);
     assert_eq!(s.queued_runtime_promotions, 0);
@@ -452,11 +436,7 @@ async fn cleanup_task_contract_and_results(
         .await;
 }
 
-async fn cleanup_restore_fixture(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    user_id: &str,
-    session_ids: &[String],
-) {
+async fn cleanup_restore_fixture(pool: &sqlx::Pool<sqlx::MySql>, session_ids: &[String]) {
     for sid in session_ids {
         let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
             .bind(sid)
@@ -479,12 +459,6 @@ async fn cleanup_restore_fixture(
             .execute(pool)
             .await;
     }
-    let _ = sqlx::query(
-        "DELETE FROM learning_snapshots WHERE user_id = ? AND profile_name = 'default'",
-    )
-    .bind(user_id)
-    .execute(pool)
-    .await;
 }
 
 #[tokio::test]
@@ -504,7 +478,7 @@ async fn session_artifact_latest_and_list_use_stable_tiebreaker_for_tied_timesta
     };
     let tied_ts = "2026-10-01 12:34:56.123456";
 
-    cleanup_restore_fixture(&pool, &user_id, std::slice::from_ref(&session_id)).await;
+    cleanup_restore_fixture(&pool, std::slice::from_ref(&session_id)).await;
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
@@ -566,7 +540,7 @@ async fn session_artifact_latest_and_list_use_stable_tiebreaker_for_tied_timesta
     );
     assert_eq!(listed[1].artifact_id, older_id);
 
-    cleanup_restore_fixture(&pool, &user_id, &[session_id]).await;
+    cleanup_restore_fixture(&pool, &[session_id]).await;
 }
 
 #[tokio::test]
@@ -759,7 +733,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert!((stats.avg_turns_per_session - 1.5).abs() < 1e-9);
     assert!((stats.avg_tokens_per_session - 27.5).abs() < 1e-9);
     assert!((stats.tool_error_rate - (1.0_f64 / 3.0)).abs() < 1e-9);
-    assert_cross_session_stats_no_mutations_no_promotions(&stats);
+    assert_cross_session_stats_no_promotions(&stats);
 
     assert_eq!(stats.top_tools.len(), 1);
     assert_eq!(stats.top_tools[0].name, "bash");
@@ -828,7 +802,7 @@ async fn cross_session_runtime_promotions_db_roundtrip() {
         (
             e1.clone(),
             serde_json::json!({
-                "controller": "evolution",
+                "controller": "adaptive_baseline",
                 "outcome": "auto_applied",
                 "recommendation": "promote",
                 "subject_id": "subj-e1",
@@ -868,7 +842,7 @@ async fn cross_session_runtime_promotions_db_roundtrip() {
         (
             e3.clone(),
             serde_json::json!({
-                "controller": "evolution",
+                "controller": "adaptive_baseline",
                 "outcome": "deferred",
                 "recommendation": "hold",
                 "subject_id": "subj-e3",
@@ -935,10 +909,8 @@ async fn cross_session_runtime_promotions_db_roundtrip() {
         .await
         .expect("stats");
 
-    assert_eq!(stats.total_mutations, 0);
     assert_eq!(stats.total_runtime_promotions, 4);
-    assert_eq!(stats.evolution_runtime_promotions, 2);
-    assert_eq!(stats.adaptive_baseline_runtime_promotions, 2);
+    assert_eq!(stats.adaptive_baseline_runtime_promotions, 4);
     assert_eq!(stats.auto_applied_runtime_promotions, 1);
     assert_eq!(stats.queued_runtime_promotions, 1);
     assert_eq!(stats.deferred_runtime_promotions, 1);
@@ -977,7 +949,7 @@ async fn cross_session_runtime_promotions_db_roundtrip() {
 
     let p1 = by_id.get(&e1).expect("e1");
     assert_eq!(p1.session_id, s1);
-    assert_eq!(p1.controller, RuntimePromotionController::Evolution);
+    assert_eq!(p1.controller, RuntimePromotionController::AdaptiveBaseline);
     assert_eq!(p1.outcome, RuntimePromotionOutcome::AutoApplied);
     assert_eq!(p1.recommendation, RuntimePromotionRecommendation::Promote);
     assert_eq!(p1.subject_id, "subj-e1");
@@ -1008,183 +980,6 @@ async fn cross_session_runtime_promotions_db_roundtrip() {
     assert_eq!(p4.recommendation, RuntimePromotionRecommendation::Promote);
 
     cleanup_agent_sessions_and_events(&pool, &[s1], &event_ids, &[]).await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn cross_session_mutations_db_roundtrip() {
-    let (shared, settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-    let decision_id = Uuid::new_v4().to_string();
-    let event_id = Uuid::new_v4().to_string();
-    let ev_apply = Uuid::new_v4().to_string();
-    let ev_revert = Uuid::new_v4().to_string();
-    let since = "2026-08-10 00:00:00.000000".to_string();
-    let until = "2026-08-10 23:59:59.000000".to_string();
-
-    let event_ids = vec![event_id.clone(), ev_apply.clone(), ev_revert.clone()];
-    cleanup_agent_sessions_and_events(
-        &pool,
-        std::slice::from_ref(&session_id),
-        &event_ids,
-        std::slice::from_ref(&decision_id),
-    )
-    .await;
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'mut', 'active', 0)",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .execute(&pool)
-    .await
-    .expect("insert session");
-
-    let decision_output = serde_json::json!({
-        "turn": 4,
-        "mutation_objective_score": {
-            "quality": {"point": 0.84, "lower": 0.84, "upper": 0.84},
-            "reward_hacking_risk": {"point": 0.10, "lower": 0.10, "upper": 0.10},
-            "causal_support": {"point": 0.75, "lower": 0.75, "upper": 0.75},
-            "was_corrected": false
-        },
-        "action_profiles": [
-            {
-                "tool_call_id": "call-1",
-                "tool_name": "edit_file",
-                "arguments": {"path": "src/lib.rs"},
-                "profile": {
-                    "bounded": true,
-                    "reversible": true,
-                    "requires_pre_state": false,
-                    "action_category": "write",
-                    "compensation_kind": "restore_file",
-                    "compensation_summary": "restore prior contents"
-                }
-            }
-        ]
-    });
-
-    sqlx::query(
-        "INSERT INTO ctx_decision_audits \
-         (decision_id, session_id, event_id, context_capture_id, decision_type, decision_output, model_params, created_at) \
-         VALUES (?, ?, ?, 'cc-it', 'tool_selection', CAST(? AS JSON), CAST('{}' AS JSON), ?)",
-    )
-    .bind(&decision_id)
-    .bind(&session_id)
-    .bind(&event_id)
-    .bind(decision_output.to_string())
-    .bind("2026-08-10 12:00:00.000000")
-    .execute(&pool)
-    .await
-    .expect("insert tool_selection decision");
-
-    for (eid, state, note, ts) in [
-        (
-            &ev_apply,
-            "applied",
-            serde_json::Value::Null,
-            "2026-08-10 12:01:00.000000",
-        ),
-        (
-            &ev_revert,
-            "reverted",
-            serde_json::json!("rolled back after regression"),
-            "2026-08-10 12:05:00.000000",
-        ),
-    ] {
-        let meta = serde_json::json!({
-            "mutation_id": format!("{decision_id}:call-1"),
-            "state": state,
-            "note": note,
-            "tool_name": "edit_file",
-            "turn": 4
-        });
-        sqlx::query(
-            "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
-             causal_chain_id, metadata, created_at) \
-             VALUES (?, ?, ?, 'mutation_state', '{}', '', CAST(? AS JSON), ?)",
-        )
-        .bind(eid)
-        .bind(&session_id)
-        .bind(&user_id)
-        .bind(meta.to_string())
-        .bind(ts)
-        .execute(&pool)
-        .await
-        .expect("insert mutation_state");
-    }
-
-    let audit = DatabaseSessionAuditService::new(settings.clone()).with_pool(shared.clone());
-    let stats = audit
-        .get_cross_session_stats(
-            &user_id,
-            &CrossSessionStatsParams {
-                since: Some(since.clone()),
-                until: Some(until.clone()),
-            },
-        )
-        .await
-        .expect("stats");
-
-    assert_eq!(stats.total_mutations, 1);
-    assert_eq!(stats.reverted_mutations, 1);
-    assert_eq!(stats.applied_mutations, 0);
-    assert_eq!(stats.ready_mutations, 0);
-    assert_eq!(stats.total_runtime_promotions, 0);
-
-    let mlist = audit
-        .list_cross_session_mutations(
-            &user_id,
-            &CrossSessionMutationListParams {
-                page: 1,
-                per_page: 50,
-                since: Some(since.clone()),
-                until: Some(until.clone()),
-                session_id: None,
-                tool_name: None,
-                state: None,
-                promotion_recommendation: None,
-                safety_verdict: None,
-                retention_verdict: None,
-                min_retention_score: None,
-                verifier_signal: None,
-                verifier_source: None,
-                verifier_gap: None,
-                sort: "priority".into(),
-            },
-        )
-        .await
-        .expect("list_cross_session_mutations");
-
-    assert_eq!(mlist.total, 1);
-    assert_eq!(mlist.mutations.len(), 1);
-    let m = &mlist.mutations[0];
-    assert_eq!(m.mutation_id, format!("{decision_id}:call-1"));
-    assert_eq!(m.session_id, session_id);
-    assert_eq!(m.tool_name, "edit_file");
-    assert_eq!(m.state, StagedMutationState::Reverted);
-    assert_eq!(
-        m.state_note.as_deref(),
-        Some("rolled back after regression")
-    );
-    let su = m.state_updated_at.as_deref().unwrap_or("");
-    assert!(
-        su.contains("2026-08-10") && su.contains("12:05"),
-        "state_updated_at={su:?}"
-    );
-
-    cleanup_agent_sessions_and_events(
-        &pool,
-        std::slice::from_ref(&session_id),
-        &event_ids,
-        std::slice::from_ref(&decision_id),
-    )
-    .await;
 }
 
 #[tokio::test]
@@ -1492,7 +1287,6 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
     let session_a = Uuid::new_v4().to_string();
     let session_b = Uuid::new_v4().to_string();
     let checkpoint_id = Uuid::new_v4().to_string();
-    let learning_snapshot_id = Uuid::new_v4().to_string();
     let plan_a_json =
         serde_json::json!({"subtasks":[{"id":"a1","title":"checkpoint"}]}).to_string();
     let plan_a_config = serde_json::json!({"mode":"checkpoint"}).to_string();
@@ -1501,21 +1295,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
     let existing_metadata_a =
         serde_json::json!({"agent_id":"astra-server","note":"keep me"}).to_string();
 
-    cleanup_restore_fixture(&pool, &user_id, &[session_a.clone(), session_b.clone()]).await;
-
-    let learning_json =
-        serde_json::json!({"entities":["Rust","MatrixOne"],"patterns":["*.rs"]}).to_string();
-    sqlx::query(
-        "INSERT INTO learning_snapshots \
-         (snapshot_id, user_id, profile_name, snapshot_json, entity_count, pattern_count, has_calibration, version) \
-         VALUES (?, ?, 'default', ?, 2, 1, 0, 1)",
-    )
-    .bind(&learning_snapshot_id)
-    .bind(&user_id)
-    .bind(&learning_json)
-    .execute(&pool)
-    .await
-    .expect("insert learning snapshot");
+    cleanup_restore_fixture(&pool, &[session_a.clone(), session_b.clone()]).await;
 
     sqlx::query(
         "INSERT INTO agent_sessions \
@@ -1770,10 +1550,6 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         vec!["bash".to_string(), "rg".to_string()]
     );
     assert_eq!(
-        restored_a.learning_snapshot_json.as_deref(),
-        Some(learning_json.as_str())
-    );
-    assert_eq!(
         restored_a.git_branch.as_deref(),
         Some("feature/cloud-sync"),
         "cloud restore should recover git_branch from session metadata"
@@ -1881,7 +1657,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
     assert_eq!(session_b_state_syncs, 1);
     assert_eq!(context_trace_syncs, 2);
 
-    cleanup_restore_fixture(&pool, &user_id, &[session_a, session_b]).await;
+    cleanup_restore_fixture(&pool, &[session_a, session_b]).await;
 }
 
 #[tokio::test]
@@ -1896,7 +1672,7 @@ async fn session_sync_log_async_audit_flusher_writes_per_type_on_live_matrixone(
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
 
-    cleanup_restore_fixture(&pool, &user_id, std::slice::from_ref(&session_id)).await;
+    cleanup_restore_fixture(&pool, std::slice::from_ref(&session_id)).await;
 
     svc.push_session_state(
         &session_id,
@@ -2038,7 +1814,7 @@ async fn session_sync_log_async_audit_flusher_writes_per_type_on_live_matrixone(
         "total success audit rows = 1 + 1 + 205"
     );
 
-    cleanup_restore_fixture(&pool, &user_id, &[session_id]).await;
+    cleanup_restore_fixture(&pool, &[session_id]).await;
 }
 
 #[tokio::test]
@@ -2050,7 +1826,7 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
 
-    cleanup_restore_fixture(&pool, &user_id, std::slice::from_ref(&session_id)).await;
+    cleanup_restore_fixture(&pool, std::slice::from_ref(&session_id)).await;
 
     let mut workspace = WorkspaceMetadata::with_context(
         &session_id,
@@ -2129,7 +1905,7 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
         Some("turn-remote-workspace")
     );
 
-    cleanup_restore_fixture(&pool, &user_id, &[session_id]).await;
+    cleanup_restore_fixture(&pool, &[session_id]).await;
 }
 
 #[tokio::test]
@@ -2143,7 +1919,7 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
 
-    cleanup_restore_fixture(&pool, &user_id, std::slice::from_ref(&session_id)).await;
+    cleanup_restore_fixture(&pool, std::slice::from_ref(&session_id)).await;
 
     let local_index_path = astra_services::local_session_artifact_store()
         .session_path(&session_id, "step_checkpoints/composite_snapshots.json")
@@ -2279,7 +2055,7 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
         Some("prove remote composite snapshot restore")
     );
 
-    cleanup_restore_fixture(&pool, &user_id, &[session_id]).await;
+    cleanup_restore_fixture(&pool, &[session_id]).await;
 }
 
 #[tokio::test]
@@ -2293,7 +2069,7 @@ async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_liv
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
 
-    cleanup_restore_fixture(&pool, &user_id, std::slice::from_ref(&session_id)).await;
+    cleanup_restore_fixture(&pool, std::slice::from_ref(&session_id)).await;
 
     svc.push_session_state(
         &session_id,
@@ -2365,7 +2141,7 @@ async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_liv
     );
     assert!(restored.last_context_trace.is_none());
 
-    cleanup_restore_fixture(&pool, &user_id, &[session_id]).await;
+    cleanup_restore_fixture(&pool, &[session_id]).await;
 }
 
 #[tokio::test]
@@ -2380,7 +2156,7 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
 
-    cleanup_restore_fixture(&pool, &user_id, std::slice::from_ref(&session_id)).await;
+    cleanup_restore_fixture(&pool, std::slice::from_ref(&session_id)).await;
 
     let trace = ContextTraceSignal {
         turn_id: "turn-missing-row".into(),
@@ -2463,7 +2239,7 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
     .expect("context_trace sync count");
     assert_eq!(context_trace_syncs, 1);
 
-    cleanup_restore_fixture(&pool, &user_id, &[session_id]).await;
+    cleanup_restore_fixture(&pool, &[session_id]).await;
 }
 
 #[tokio::test]
@@ -2519,7 +2295,6 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
 
     cleanup_restore_fixture(
         &pool,
-        &user_id,
         &[
             session_id.clone(),
             heavy_only_session.clone(),
@@ -2939,7 +2714,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     .expect("decode ordinary checkpoint sync log count");
     assert_eq!(checkpoint_sync_successes, 1);
 
-    cleanup_restore_fixture(&pool, &user_id, &[session_id, heavy_only_session]).await;
+    cleanup_restore_fixture(&pool, &[session_id, heavy_only_session]).await;
 }
 
 #[tokio::test]
@@ -3244,45 +3019,6 @@ async fn it_publish_skill_idempotent_retry_returns_200() {
     let skill_id = format!("{}@1.0.0", name);
     sqlx::query("DELETE FROM skills_registry WHERE skill_id = ?")
         .bind(&skill_id)
-        .execute(&raw_pool)
-        .await
-        .ok();
-}
-
-#[tokio::test]
-#[ignore]
-async fn it_push_learning_versioned_idempotent_insert_returns_ok() {
-    let (shared_pool, settings) = setup_pool_and_settings().await;
-    let raw_pool = shared_pool.get().clone();
-    let _ = settings; // used for pool setup; MatrixOneSyncService takes a raw pool
-    let flusher = astra_services::state_sync::spawn_audit_flusher(raw_pool.clone());
-    let svc = MatrixOneSyncService::new(raw_pool.clone(), flusher.writer.clone());
-    let user_id = format!("it-sync-user-{}", Uuid::new_v4().simple());
-    let profile = "default";
-    let snapshot = r#"{"entities":[],"patterns":[]}"#;
-
-    let first = svc
-        .push_learning_versioned(&user_id, profile, snapshot, 0, 0, false, None)
-        .await;
-    assert!(first.success, "first insert must succeed: {first:?}");
-
-    // Retry with same snapshot — must succeed (idempotent), not conflict.
-    // (Simulates: INSERT committed, TCP reset, client retries → gets dup-key.)
-    let second = svc
-        .push_learning_versioned(&user_id, profile, snapshot, 0, 0, false, None)
-        .await;
-    assert!(
-        second.success,
-        "idempotent retry of push_learning_versioned must return success, got: {second:?}"
-    );
-    assert!(
-        !second.is_conflict,
-        "idempotent retry must not be a conflict"
-    );
-
-    // Cleanup.
-    sqlx::query("DELETE FROM learning_snapshots WHERE user_id = ?")
-        .bind(&user_id)
         .execute(&raw_pool)
         .await
         .ok();

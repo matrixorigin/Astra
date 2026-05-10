@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use astra_services::{MutationActionCategory, MutationCompensationPolicy};
-
 use super::cloud_approval_policy::{
     CloudGatedToolKind, bash_command_is_read_only, cloud_gated_tool_kind_with_args,
 };
@@ -318,46 +316,10 @@ impl ActionCompensationProfile {
             compensation_summary: Some(summary.to_string()),
         }
     }
-
-    pub fn mutation_compensation_policy(&self) -> MutationCompensationPolicy {
-        MutationCompensationPolicy {
-            bounded: self.bounded,
-            reversible: self.reversible,
-            requires_pre_state: self.requires_pre_state,
-            action_category: mutation_action_category(self.category),
-            compensation_kind: self.compensation_kind.map(compensation_kind_label),
-            compensation_summary: self.compensation_summary.clone(),
-        }
-    }
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-fn mutation_action_category(category: ActionCategory) -> MutationActionCategory {
-    match category {
-        ActionCategory::Read => MutationActionCategory::Read,
-        ActionCategory::Write => MutationActionCategory::Write,
-        ActionCategory::Execute => MutationActionCategory::Execute,
-        ActionCategory::Destructive => MutationActionCategory::Destructive,
-    }
-}
-
-fn compensation_kind_label(kind: CompensationKind) -> String {
-    match kind {
-        CompensationKind::DeleteFile => "delete_file",
-        CompensationKind::RestoreFileContents => "restore_file_contents",
-        CompensationKind::RestoreOrDeleteFile => "restore_or_delete_file",
-        CompensationKind::GitApplyStash => "git_apply_stash",
-        CompensationKind::GitRestoreIndex => "git_restore_index",
-        CompensationKind::GitRestoreWorktree => "git_restore_worktree",
-        CompensationKind::GitRevertCommit => "git_revert_commit",
-        CompensationKind::RestoreDatabaseSnapshot => "restore_database_snapshot",
-        CompensationKind::RestoreSessionState => "restore_session_state",
-        CompensationKind::Manual => "manual",
-    }
-    .to_string()
 }
 
 fn normalize_args(args: &Value) -> Value {
@@ -1284,44 +1246,6 @@ mod tests {
     #[test]
     fn read_only_tools_do_not_emit_prompt_note() {
         assert!(compensation_prompt_note("read_file", &json!({"path": "README.md"})).is_none());
-    }
-
-    #[test]
-    fn profile_bridges_to_mutation_compensation_policy() {
-        let policy = tool_action_profile("write_file", &json!({"path": "src/lib.rs"}))
-            .mutation_compensation_policy();
-        assert!(policy.bounded);
-        assert!(policy.reversible);
-        assert!(policy.requires_pre_state);
-        assert_eq!(policy.action_category, MutationActionCategory::Write);
-        assert_eq!(
-            policy.compensation_kind.as_deref(),
-            Some("restore_or_delete_file")
-        );
-    }
-
-    #[test]
-    fn session_state_profile_bridges_to_restore_session_state_policy() {
-        let policy = tool_action_profile(
-            "adjust_config",
-            &json!({"path": "memory.retrieval_top_k", "value": 6}),
-        )
-        .mutation_compensation_policy();
-        assert!(policy.bounded);
-        assert!(policy.reversible);
-        assert!(!policy.requires_pre_state);
-        assert_eq!(policy.action_category, MutationActionCategory::Write);
-        assert_eq!(
-            policy.compensation_kind.as_deref(),
-            Some("restore_session_state")
-        );
-        assert!(
-            policy
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("rollback_session_state")
-        );
     }
 
     #[test]

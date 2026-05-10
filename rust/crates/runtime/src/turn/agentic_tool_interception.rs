@@ -299,7 +299,6 @@ pub(crate) fn dedup_skill_calls(
                         tool_call_id: call_id.to_string(),
                         tool_name: crate::turn::skill_tool::SKILL_TOOL_NAME.to_string(),
                         result: message,
-                        verification_summary: None,
                     },
                     SkillShortCircuitMeta {
                         reentry_count: reentry,
@@ -452,7 +451,6 @@ async fn intercept_skill_calls(
                     tool_call_id: call_id.to_string(),
                     tool_name: tool_name.to_string(),
                     result: msg,
-                    verification_summary: None,
                 });
             }
         }

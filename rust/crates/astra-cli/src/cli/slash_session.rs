@@ -4615,7 +4615,6 @@ fn reset_state_for_session_restore(state: &mut ReplState) {
     state.total_completion_tokens = 0;
     state.total_cache_read_tokens = 0;
     state.total_cache_creation_tokens = 0;
-    state.learning_snapshot = None;
     state.plan_mode = None;
     state.executing_plan = None;
     state.plan_execution_config = None;
@@ -5149,12 +5148,6 @@ async fn apply_restored_session(
         state.cached_pricing = slash_stats::fallback_pricing(base);
         state.context_budget =
             prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(base));
-    }
-
-    if let Some(ref learning_json) = restored.learning_snapshot_json
-        && !learning_json.is_empty()
-    {
-        state.learning_snapshot = Some(learning_json.clone());
     }
 
     restore_journal_history_if_available(state, &restored.session_id).await;

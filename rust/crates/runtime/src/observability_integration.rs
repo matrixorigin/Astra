@@ -1090,7 +1090,7 @@ impl ObservabilityHub {
 
     /// Run one auto-tuning cycle and return executed rules.
     pub fn run_tuning_cycle(&self, config: &mut RuntimeConfig) -> Vec<String> {
-        let executions = self.tuning_engine.run_cycle_with_patterns(config, None);
+        let executions = self.tuning_engine.run_cycle(config);
 
         // Persist aggregator state after tuning cycle.
         if !executions.is_empty() {

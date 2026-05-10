@@ -185,10 +185,6 @@ pub struct ExternalSources {
     /// When set, the optimizer will persist section content and replace it
     /// with a lightweight `SpillReference` to free token budget.
     pub spill_backend: Option<std::sync::Arc<dyn crate::spill_backend::SpillBackend>>,
-    /// Learned context from skill quality tracker / session history.
-    // NOTE: `learned_context` removed — the runtime adapter now emits it via
-    // `extra_dynamic_sections` (volatile lane) instead of a stable field.
-    // See crates/runtime/src/turn/context_pipeline_adapter.rs.
     /// Delegation system override (injected by orchestrator).
     pub system_override: Option<String>,
     /// Plan-in-progress reminder ("You are executing step 3 of 5...").

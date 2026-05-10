@@ -1,14 +1,10 @@
-//! State convergence: sync learning state between edge (local files) and cloud (MatrixOne).
+//! State convergence: sync metadata and preferences between edge (local files) and cloud (MatrixOne).
 //!
 //! # Architecture
 //!
 //! ```text
 //!   Edge (CLI)                          Cloud (MatrixOne)
 //!   ─────────                          ──────────────────
-//!   ~/.astra/learning/            learning_snapshots table
-//!     {profile}.json         ──push──▶  (user_id, profile, gzip+base64 json)
-//!                            ◀──pull──
-//!
 //!   ~/.astra/sessions/            agent_sessions + agent_events
 //!     workspace.yaml         ──push──▶  (metadata sync)
 //!     journal.jsonl          ──push──▶  (event ingestion)
@@ -20,29 +16,14 @@
 //!
 //! - **Local-first**: Edge always writes locally first, then async pushes to cloud
 //! - **Last-writer-wins**: For preferences, most recent update wins
-//! - **Merge-on-pull**: For learning data, entity/pattern observations are merged
-//! - **Conflict resolution**: Higher observation count wins for entities; union for patterns
 //! - **Idempotent**: Repeated pushes produce same result (UPSERT semantics)
 
 use astra_core::is_duplicate_key_error;
 use async_trait::async_trait;
-use base64::Engine;
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use sqlx::Row;
-use std::io::{Read, Write};
 use std::path::Path;
-use std::time::Duration;
 
-// ─── Retry Configuration ────────────────────────────────────────────────────
-
-/// Maximum number of retry attempts for transient network errors.
-const MAX_RETRIES: u32 = 3;
-/// Initial backoff delay between retries.
-const INITIAL_BACKOFF_MS: u64 = 100;
-/// Maximum backoff delay (exponential backoff caps at this value).
-const MAX_BACKOFF_MS: u64 = 2000;
 /// Bounded channel capacity for the async audit writer. If the channel is full,
 /// audit entries are dropped (acceptable — audit is observability, not business logic).
 const AUDIT_CHANNEL_CAPACITY: usize = 256;
@@ -50,93 +31,6 @@ const AUDIT_CHANNEL_CAPACITY: usize = 256;
 const AUDIT_FLUSH_BATCH_SIZE: usize = 64;
 /// Flush audit entries after this duration even if batch is not full.
 const AUDIT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
-// ─── Learning snapshot idempotency classifier ───────────────────────────────
-
-/// Decision returned by [`classify_learning_insert_duplicate`].
-#[derive(Debug, PartialEq)]
-pub(crate) enum LearningDuplicateDecision {
-    /// The stored snapshot is identical to what was inserted; return success.
-    Idempotent,
-    /// The stored snapshot differs; treat as a real conflict.
-    Conflict,
-}
-
-/// Classify a duplicate-key hit during a new-snapshot INSERT.
-///
-/// Compares SHA-256 hashes of the original (uncompressed) snapshot JSON.
-/// If the stored hash matches what we computed before insertion the request
-/// was a retryable-insert retry and should succeed; otherwise it is a real conflict.
-pub(crate) fn classify_learning_insert_duplicate(
-    existing_hash: Option<&[u8]>,
-    new_hash: &[u8],
-) -> LearningDuplicateDecision {
-    match existing_hash {
-        Some(h) if h == new_hash => LearningDuplicateDecision::Idempotent,
-        _ => LearningDuplicateDecision::Conflict,
-    }
-}
-
-/// Compute the SHA-256 digest of a string slice as a fixed-size byte array.
-fn sha256_bytes(input: &str) -> [u8; 32] {
-    sha2::Sha256::digest(input.as_bytes()).into()
-}
-
-/// Check if an error is likely transient and worth retrying.
-fn is_retryable_error(err: &sqlx::Error) -> bool {
-    match err {
-        // Connection errors are usually transient
-        sqlx::Error::Io(_) => true,
-        // Pool timeout - might resolve after brief wait
-        sqlx::Error::PoolTimedOut => true,
-        // Protocol errors might be transient network issues
-        sqlx::Error::Protocol(_) => true,
-        // Database errors - check for specific transient codes
-        sqlx::Error::Database(db_err) => {
-            // MySQL error codes for transient issues:
-            // 1040 = Too many connections
-            // 1205 = Lock wait timeout exceeded
-            // 1213 = Deadlock found
-            // 2006 = MySQL server has gone away
-            // 2013 = Lost connection to MySQL server
-            if let Some(code) = db_err.code() {
-                let code_str = code.to_string();
-                matches!(
-                    code_str.as_str(),
-                    "1040" | "1205" | "1213" | "2006" | "2013"
-                )
-            } else {
-                // Unknown database error - don't retry
-                false
-            }
-        }
-        // Other errors are not retryable
-        _ => false,
-    }
-}
-
-/// Compress a JSON payload with gzip and encode it as base64 for storage.
-fn compress_json_payload(json: &str) -> Result<String, String> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder
-        .write_all(json.as_bytes())
-        .map_err(|e| format!("gzip write: {e}"))?;
-    let compressed = encoder.finish().map_err(|e| format!("gzip finish: {e}"))?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(compressed))
-}
-
-/// Decode a base64 payload and decompress it from gzip back into JSON text.
-fn decompress_json_payload(encoded: &str) -> Result<String, String> {
-    let compressed = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|e| format!("base64 decode: {e}"))?;
-    let mut decoder = GzDecoder::new(compressed.as_slice());
-    let mut json = String::new();
-    decoder
-        .read_to_string(&mut json)
-        .map_err(|e| format!("gzip decode: {e}"))?;
-    Ok(json)
-}
 
 // ─── Async Audit Writer ────────────────────────────────────────────────────
 
@@ -370,15 +264,6 @@ impl SyncResult {
     }
 }
 
-/// Learning snapshot with version for optimistic locking.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VersionedSnapshot {
-    /// The JSON-serialized learning snapshot.
-    pub json: String,
-    /// Cloud version number (for optimistic locking).
-    pub version: i64,
-}
-
 /// One row from `plan_templates`, serialized for edge pull sync.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanTemplateSyncRow {
@@ -507,132 +392,24 @@ pub struct PlanStepRunSyncRow {
     pub artifact_ref: Option<String>,
 }
 
-/// Delta snapshot containing only changed data since last sync.
-///
-/// Used for incremental sync to reduce network bandwidth.
-/// Full snapshot is ~40KB; delta is typically 2-5KB (85-90% reduction).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeltaSnapshot {
-    /// Unix timestamp of baseline (last successful sync).
-    pub baseline_epoch: u64,
-    /// Changed entities since baseline.
-    pub entity_deltas: Vec<serde_json::Value>,
-    /// Changed patterns since baseline.
-    pub pattern_deltas: Vec<serde_json::Value>,
-    /// Calibration data (always sent in full, as it's small).
-    pub calibration: Option<serde_json::Value>,
-    /// Changed tool health entries since baseline.
-    pub tool_health_deltas: Vec<serde_json::Value>,
-    /// Total count of delta items for statistics.
-    pub delta_count: u32,
-}
-
-impl DeltaSnapshot {
-    /// Create an empty delta snapshot.
-    pub fn empty(baseline_epoch: u64) -> Self {
-        Self {
-            baseline_epoch,
-            entity_deltas: Vec::new(),
-            pattern_deltas: Vec::new(),
-            calibration: None,
-            tool_health_deltas: Vec::new(),
-            delta_count: 0,
-        }
-    }
-
-    /// Check if this delta has any changes.
-    pub fn is_empty(&self) -> bool {
-        self.delta_count == 0
-    }
-
-    /// Approximate size in bytes (for telemetry).
-    pub fn approx_size(&self) -> usize {
-        self.entity_deltas
-            .iter()
-            .map(|v| v.to_string().len())
-            .sum::<usize>()
-            + self
-                .pattern_deltas
-                .iter()
-                .map(|v| v.to_string().len())
-                .sum::<usize>()
-            + self
-                .calibration
-                .as_ref()
-                .map(|v| v.to_string().len())
-                .unwrap_or(0)
-            + self
-                .tool_health_deltas
-                .iter()
-                .map(|v| v.to_string().len())
-                .sum::<usize>()
-    }
-}
-
 /// Metadata about the current sync state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncStatus {
-    pub learning_last_push: Option<String>,
-    pub learning_last_pull: Option<String>,
     pub preferences_last_sync: Option<String>,
     pub pending_pushes: u32,
     pub last_error: Option<String>,
-    /// Last known cloud version (for optimistic locking).
-    #[serde(default)]
-    pub cloud_version: Option<i64>,
 }
 
 // ─── State Sync Service Trait ───────────────────────────────────────────────
 
-/// Abstract sync service for learning state convergence.
+/// Abstract sync service for edge↔cloud metadata convergence.
 ///
 /// Implementations:
 /// - `LocalOnlySyncService` — no-op for offline/edge-only mode
 /// - `MatrixOneSyncService` — full cloud sync via database
 /// - Mock implementations for testing
-///
-/// # Optimistic Locking
-///
-/// The `push_learning_versioned` method uses optimistic locking to prevent
-/// concurrent sessions from overwriting each other's changes:
-///
-/// 1. Call `pull_learning_versioned` to get `(json, version)`
-/// 2. Merge cloud data with local changes
-/// 3. Call `push_learning_versioned(expected_version=version)` to push
-/// 4. If another session pushed in between, returns `is_conflict=true`
-/// 5. On conflict, re-pull, re-merge, and retry
 #[async_trait]
 pub trait StateSyncService: Send + Sync {
-    /// Push local learning snapshot with optimistic locking.
-    ///
-    /// - `expected_version`: The version returned by the last `pull_learning_versioned`.
-    ///   Pass `None` to create a new snapshot (fails if one already exists).
-    ///
-    /// Returns:
-    /// - `success=true, new_version=Some(v)` on success
-    /// - `success=false, is_conflict=true` if version mismatch (another session pushed)
-    /// - `success=false, is_conflict=false` on other errors
-    #[allow(clippy::too_many_arguments)]
-    async fn push_learning_versioned(
-        &self,
-        user_id: &str,
-        profile: &str,
-        snapshot_json: &str,
-        entity_count: u32,
-        pattern_count: u32,
-        has_calibration: bool,
-        expected_version: Option<i64>,
-    ) -> SyncResult;
-
-    /// Pull learning snapshot with version for optimistic locking.
-    ///
-    /// Returns `None` if no snapshot exists, or `Some((json, version))`.
-    async fn pull_learning_versioned(
-        &self,
-        user_id: &str,
-        profile: &str,
-    ) -> Result<Option<VersionedSnapshot>, String>;
-
     /// Push a user preference to cloud.
     async fn push_preference(&self, user_id: &str, key: &str, value: &str) -> SyncResult;
 
@@ -667,28 +444,6 @@ pub trait StateSyncService: Send + Sync {
         pack_json: &str,
     ) -> Result<crate::multi_agent::TasksPackPushResult, String>;
 
-    /// Push a delta snapshot containing only changed data.
-    ///
-    /// Delta sync reduces bandwidth by ~90%: full snapshot is ~40KB, delta is 2-5KB.
-    ///
-    /// The delta is applied incrementally on the server:
-    /// 1. Fetch current snapshot from cloud
-    /// 2. Merge delta entries (replace by key for entities/patterns, full for calibration)
-    /// 3. Store merged result with incremented version
-    ///
-    /// Uses optimistic locking internally; returns conflict if version mismatch.
-    ///
-    /// # Arguments
-    /// - `delta_json`: JSON-serialized DeltaSnapshot
-    /// - `expected_version`: The version returned by the last `pull_learning_versioned`
-    async fn push_delta(
-        &self,
-        user_id: &str,
-        profile: &str,
-        delta_json: &str,
-        expected_version: Option<i64>,
-    ) -> SyncResult;
-
     /// Get current sync status.
     async fn status(&self) -> SyncStatus;
 }
@@ -701,28 +456,6 @@ pub struct LocalOnlySyncService;
 
 #[async_trait]
 impl StateSyncService for LocalOnlySyncService {
-    async fn push_learning_versioned(
-        &self,
-        _user_id: &str,
-        _profile: &str,
-        _snapshot_json: &str,
-        _entity_count: u32,
-        _pattern_count: u32,
-        _has_calibration: bool,
-        _expected_version: Option<i64>,
-    ) -> SyncResult {
-        // Local-only: always succeeds with version 0
-        SyncResult::ok_with_version(SyncDirection::Push, "learning", 0, 0)
-    }
-
-    async fn pull_learning_versioned(
-        &self,
-        _user_id: &str,
-        _profile: &str,
-    ) -> Result<Option<VersionedSnapshot>, String> {
-        Ok(None)
-    }
-
     async fn push_preference(&self, _user_id: &str, _key: &str, _value: &str) -> SyncResult {
         SyncResult::ok(SyncDirection::Push, "preference", 0)
     }
@@ -760,17 +493,6 @@ impl StateSyncService for LocalOnlySyncService {
         Ok(crate::multi_agent::TasksPackPushResult::default())
     }
 
-    async fn push_delta(
-        &self,
-        _user_id: &str,
-        _profile: &str,
-        _delta_json: &str,
-        _expected_version: Option<i64>,
-    ) -> SyncResult {
-        // Local-only: always succeeds with version 0
-        SyncResult::ok_with_version(SyncDirection::Push, "delta", 0, 0)
-    }
-
     async fn status(&self) -> SyncStatus {
         SyncStatus::default()
     }
@@ -784,7 +506,6 @@ impl StateSyncService for LocalOnlySyncService {
 /// explicit update/insert flows, while audit-style records remain append-only.
 ///
 /// Tables used:
-/// - `learning_snapshots` — cross-session learning state
 /// - `user_preferences` — user settings
 /// - `session_sync_log` — audit trail (written via async `SyncAuditWriter`)
 pub struct MatrixOneSyncService {
@@ -797,361 +518,10 @@ impl MatrixOneSyncService {
     pub fn new(pool: sqlx::Pool<sqlx::MySql>, audit: SyncAuditWriter) -> Self {
         Self { pool, audit }
     }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn log_sync(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        sync_type: &str,
-        direction: SyncDirection,
-        payload_size: usize,
-        status: &str,
-        error_msg: Option<&str>,
-    ) {
-        self.audit.log(SyncAuditEntry {
-            user_id: user_id.to_string(),
-            session_id: session_id.to_string(),
-            sync_type: sync_type.to_string(),
-            direction,
-            payload_size,
-            status: status.to_string(),
-            error_message: error_msg.map(|s| s.to_string()),
-        });
-    }
 }
 
 #[async_trait]
 impl StateSyncService for MatrixOneSyncService {
-    async fn push_learning_versioned(
-        &self,
-        user_id: &str,
-        profile: &str,
-        snapshot_json: &str,
-        entity_count: u32,
-        pattern_count: u32,
-        has_calibration: bool,
-        expected_version: Option<i64>,
-    ) -> SyncResult {
-        let snapshot_id = uuid::Uuid::new_v4().to_string();
-        let has_cal = if has_calibration { 1i32 } else { 0 };
-        let compressed_snapshot = match compress_json_payload(snapshot_json) {
-            Ok(value) => value,
-            Err(e) => return SyncResult::err(SyncDirection::Push, "learning", e),
-        };
-        // Pre-compute hash of the original JSON for idempotency comparison on dup-key retry.
-        let new_snapshot_hash = sha256_bytes(snapshot_json);
-
-        // Retry loop with exponential backoff for transient network errors
-        let mut backoff_ms = INITIAL_BACKOFF_MS;
-
-        match expected_version {
-            Some(ver) => {
-                for attempt in 0..=MAX_RETRIES {
-                    // Optimistic lock: UPDATE only if version matches
-                    let updated = sqlx::query(
-                        "UPDATE learning_snapshots SET \
-                            snapshot_json = ?, \
-                            entity_count = ?, \
-                            pattern_count = ?, \
-                            has_calibration = ?, \
-                            version = version + 1, \
-                            updated_at = NOW() \
-                         WHERE user_id = ? AND profile_name = ? AND version = ?",
-                    )
-                    .bind(&compressed_snapshot)
-                    .bind(entity_count as i64)
-                    .bind(pattern_count as i64)
-                    .bind(has_cal)
-                    .bind(user_id)
-                    .bind(profile)
-                    .bind(ver)
-                    .execute(&self.pool)
-                    .await;
-
-                    match updated {
-                        Ok(r) if r.rows_affected() > 0 => {
-                            let new_ver = ver + 1;
-                            self.log_sync(
-                                user_id,
-                                "",
-                                "learning_versioned",
-                                SyncDirection::Push,
-                                compressed_snapshot.len(),
-                                "success",
-                                None,
-                            );
-                            return SyncResult::ok_with_version(
-                                SyncDirection::Push,
-                                "learning",
-                                1,
-                                new_ver,
-                            );
-                        }
-                        Ok(_) => {
-                            // No rows affected — version mismatch (conflict)
-                            // Don't retry conflicts — they need caller to pull fresh data
-                            self.log_sync(
-                                user_id,
-                                "",
-                                "learning_versioned",
-                                SyncDirection::Push,
-                                0,
-                                "conflict",
-                                Some(&format!("expected version {ver}")),
-                            );
-                            return SyncResult::conflict(
-                                SyncDirection::Push,
-                                "learning",
-                                format!(
-                                    "version conflict: expected {ver}, snapshot was modified by another session"
-                                ),
-                            );
-                        }
-                        Err(e) => {
-                            if attempt < MAX_RETRIES && is_retryable_error(&e) {
-                                tracing::debug!(
-                                    target: "astra_services::state_sync",
-                                    operation = "push_learning_versioned",
-                                    attempt = attempt + 1,
-                                    max_retries = MAX_RETRIES,
-                                    error = %e,
-                                    "retry after transient DB error"
-                                );
-                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-                                continue;
-                            }
-                            let msg = format!("push_learning_versioned: {e}");
-                            self.log_sync(
-                                user_id,
-                                "",
-                                "learning_versioned",
-                                SyncDirection::Push,
-                                0,
-                                "error",
-                                Some(&msg),
-                            );
-                            return SyncResult::err(SyncDirection::Push, "learning", msg);
-                        }
-                    }
-                }
-                // Max retries exceeded (shouldn't reach here normally)
-                SyncResult::err(
-                    SyncDirection::Push,
-                    "learning",
-                    "push_learning_versioned: max retries exceeded",
-                )
-            }
-            None => {
-                // No expected version — create new (fail if exists)
-                for attempt in 0..=MAX_RETRIES {
-                    let inserted = sqlx::query(
-                        "INSERT INTO learning_snapshots \
-                         (snapshot_id, user_id, profile_name, snapshot_json, entity_count, \
-                          pattern_count, has_calibration, version, created_at, updated_at) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())",
-                    )
-                    .bind(&snapshot_id)
-                    .bind(user_id)
-                    .bind(profile)
-                    .bind(&compressed_snapshot)
-                    .bind(entity_count as i64)
-                    .bind(pattern_count as i64)
-                    .bind(has_cal)
-                    .execute(&self.pool)
-                    .await;
-
-                    match inserted {
-                        Ok(_) => {
-                            self.log_sync(
-                                user_id,
-                                "",
-                                "learning_versioned",
-                                SyncDirection::Push,
-                                compressed_snapshot.len(),
-                                "success",
-                                None,
-                            );
-                            return SyncResult::ok_with_version(
-                                SyncDirection::Push,
-                                "learning",
-                                1,
-                                1,
-                            );
-                        }
-                        Err(e) => {
-                            let msg = format!("push_learning_versioned (new): {e}");
-                            if is_duplicate_key_error(&e) {
-                                // Re-query the stored snapshot to determine if this is an
-                                // idempotent retry (connection dropped after first INSERT committed)
-                                // or a genuine conflict (different payload under same key).
-                                let stored_row = sqlx::query(
-                                    "SELECT snapshot_json FROM learning_snapshots \
-                                     WHERE user_id = ? AND profile_name = ?",
-                                )
-                                .bind(user_id)
-                                .bind(profile)
-                                .fetch_optional(&self.pool)
-                                .await;
-
-                                let decision = if let Ok(Some(row)) = stored_row {
-                                    let stored_compressed: String =
-                                        row.try_get("snapshot_json").unwrap_or_default();
-                                    let existing_hash = decompress_json_payload(&stored_compressed)
-                                        .ok()
-                                        .map(|json| sha256_bytes(&json));
-                                    classify_learning_insert_duplicate(
-                                        existing_hash.as_ref().map(|h| h.as_slice()),
-                                        &new_snapshot_hash,
-                                    )
-                                } else {
-                                    LearningDuplicateDecision::Conflict
-                                };
-
-                                if decision == LearningDuplicateDecision::Idempotent {
-                                    self.log_sync(
-                                        user_id,
-                                        "",
-                                        "learning_versioned",
-                                        SyncDirection::Push,
-                                        compressed_snapshot.len(),
-                                        "success",
-                                        None,
-                                    );
-                                    return SyncResult::ok_with_version(
-                                        SyncDirection::Push,
-                                        "learning",
-                                        1,
-                                        1,
-                                    );
-                                }
-
-                                self.log_sync(
-                                    user_id,
-                                    "",
-                                    "learning_versioned",
-                                    SyncDirection::Push,
-                                    0,
-                                    "conflict",
-                                    Some(&msg),
-                                );
-                                return SyncResult::conflict(
-                                    SyncDirection::Push,
-                                    "learning",
-                                    "snapshot already exists; use expected_version to update",
-                                );
-                            }
-                            // Check for retryable network error
-                            if attempt < MAX_RETRIES && is_retryable_error(&e) {
-                                tracing::debug!(
-                                    target: "astra_services::state_sync",
-                                    operation = "push_learning_versioned_new",
-                                    attempt = attempt + 1,
-                                    max_retries = MAX_RETRIES,
-                                    error = %e,
-                                    "retry after transient DB error"
-                                );
-                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-                                continue;
-                            }
-                            self.log_sync(
-                                user_id,
-                                "",
-                                "learning_versioned",
-                                SyncDirection::Push,
-                                0,
-                                "error",
-                                Some(&msg),
-                            );
-                            return SyncResult::err(SyncDirection::Push, "learning", msg);
-                        }
-                    }
-                }
-                // Max retries exceeded
-                SyncResult::err(
-                    SyncDirection::Push,
-                    "learning",
-                    "push_learning_versioned (new): max retries exceeded",
-                )
-            }
-        }
-    }
-
-    async fn pull_learning_versioned(
-        &self,
-        user_id: &str,
-        profile: &str,
-    ) -> Result<Option<VersionedSnapshot>, String> {
-        // Retry loop with exponential backoff for transient network errors
-        let mut last_error = None;
-        let mut backoff_ms = INITIAL_BACKOFF_MS;
-
-        for attempt in 0..=MAX_RETRIES {
-            let row = sqlx::query(
-                "SELECT snapshot_json, version FROM learning_snapshots \
-                 WHERE user_id = ? AND profile_name = ? \
-                 ORDER BY updated_at DESC LIMIT 1",
-            )
-            .bind(user_id)
-            .bind(profile)
-            .fetch_optional(&self.pool)
-            .await;
-
-            match row {
-                Ok(Some(row)) => {
-                    use sqlx::Row;
-                    let json: String = row
-                        .try_get("snapshot_json")
-                        .map_err(|e| format!("pull_learning_versioned decode json: {e}"))?;
-                    let decompressed = decompress_json_payload(&json)
-                        .map_err(|e| format!("pull_learning_versioned unzip json: {e}"))?;
-                    let version: i64 = row
-                        .try_get("version")
-                        .map_err(|e| format!("pull_learning_versioned decode version: {e}"))?;
-                    self.log_sync(
-                        user_id,
-                        "",
-                        "learning_versioned",
-                        SyncDirection::Pull,
-                        json.len(),
-                        "success",
-                        None,
-                    );
-                    return Ok(Some(VersionedSnapshot {
-                        json: decompressed,
-                        version,
-                    }));
-                }
-                Ok(None) => return Ok(None),
-                Err(e) => {
-                    if attempt < MAX_RETRIES && is_retryable_error(&e) {
-                        tracing::debug!(
-                            target: "astra_services::state_sync",
-                            operation = "pull_learning_versioned",
-                            attempt = attempt + 1,
-                            max_retries = MAX_RETRIES,
-                            error = %e,
-                            "retry after transient DB error"
-                        );
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                        backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-                        last_error = Some(e);
-                        continue;
-                    }
-                    return Err(format!("pull_learning_versioned: {e}"));
-                }
-            }
-        }
-
-        // Max retries exceeded
-        Err(format!(
-            "pull_learning_versioned: max retries exceeded: {}",
-            last_error.map(|e| e.to_string()).unwrap_or_default()
-        ))
-    }
-
     async fn push_preference(&self, user_id: &str, key: &str, value: &str) -> SyncResult {
         let pref_id = uuid::Uuid::new_v4().to_string();
 
@@ -1758,35 +1128,6 @@ impl StateSyncService for MatrixOneSyncService {
     }
 
     async fn status(&self) -> SyncStatus {
-        // Query latest sync timestamps from audit log
-        let learning_push = sqlx::query(
-            "SELECT CAST(created_at AS CHAR) AS created_at FROM session_sync_log \
-             WHERE sync_type = 'learning' AND sync_direction = 'push' AND status = 'success' \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|row| {
-            use sqlx::Row;
-            row.try_get::<String, _>("created_at").ok()
-        });
-
-        let learning_pull = sqlx::query(
-            "SELECT CAST(created_at AS CHAR) AS created_at FROM session_sync_log \
-             WHERE sync_type = 'learning' AND sync_direction = 'pull' AND status = 'success' \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|row| {
-            use sqlx::Row;
-            row.try_get::<String, _>("created_at").ok()
-        });
-
         let pending: u32 =
             sqlx::query("SELECT COUNT(*) as cnt FROM session_sync_log WHERE status = 'pending'")
                 .fetch_optional(&self.pool)
@@ -1815,208 +1156,11 @@ impl StateSyncService for MatrixOneSyncService {
         });
 
         SyncStatus {
-            learning_last_push: learning_push,
-            learning_last_pull: learning_pull,
             preferences_last_sync: None,
             pending_pushes: pending,
             last_error: last_err,
-            cloud_version: None, // Could be fetched from DB if needed
         }
     }
-
-    async fn push_delta(
-        &self,
-        user_id: &str,
-        profile: &str,
-        delta_json: &str,
-        expected_version: Option<i64>,
-    ) -> SyncResult {
-        // Parse the delta JSON
-        let delta: DeltaSnapshot = match serde_json::from_str(delta_json) {
-            Ok(d) => d,
-            Err(e) => {
-                return SyncResult::err(SyncDirection::Push, "delta", format!("parse delta: {e}"));
-            }
-        };
-        // If delta is empty, skip the push entirely
-        if delta.is_empty() {
-            return SyncResult::ok_with_version(
-                SyncDirection::Push,
-                "delta",
-                0,
-                expected_version.unwrap_or(0),
-            );
-        }
-
-        // Delta sync algorithm:
-        // 1. Fetch current snapshot + version
-        // 2. Deserialize and merge delta entries
-        // 3. Push merged result with version check
-
-        // Step 1: Pull current snapshot
-        let (current_json, current_version) = match self
-            .pull_learning_versioned(user_id, profile)
-            .await
-        {
-            Ok(Some(snap)) => (snap.json, snap.version),
-            Ok(None) => {
-                // No existing snapshot - create from delta only
-                let snapshot = create_snapshot_from_delta(&delta);
-                let json = serde_json::to_string(&snapshot).unwrap_or_default();
-                return self
-                    .push_learning_versioned(
-                        user_id,
-                        profile,
-                        &json,
-                        delta.entity_deltas.len() as u32,
-                        delta.pattern_deltas.len() as u32,
-                        delta.calibration.is_some(),
-                        None,
-                    )
-                    .await;
-            }
-            Err(e) => {
-                return SyncResult::err(SyncDirection::Push, "delta", format!("pull failed: {e}"));
-            }
-        };
-
-        // Check version for conflict
-        if let Some(expected) = expected_version
-            && current_version != expected
-        {
-            return SyncResult::conflict(
-                SyncDirection::Push,
-                "delta",
-                format!(
-                    "version mismatch: expected {}, found {}",
-                    expected, current_version
-                ),
-            );
-        }
-
-        // Step 2: Parse and merge
-        let merged_json = match merge_delta_into_snapshot(&current_json, &delta) {
-            Ok(j) => j,
-            Err(e) => {
-                return SyncResult::err(SyncDirection::Push, "delta", format!("merge failed: {e}"));
-            }
-        };
-
-        // Step 3: Push merged result with optimistic locking
-        // Note: Delta sync stats could be logged at the caller level
-        // delta_items = delta.delta_count
-        // delta_size = delta.approx_size()
-        // full_size = merged_json.len()
-        // reduction_pct = 100 - (delta_size * 100 / full_size.max(1))
-        self.push_learning_versioned(
-            user_id,
-            profile,
-            &merged_json,
-            delta.entity_deltas.len() as u32,
-            delta.pattern_deltas.len() as u32,
-            delta.calibration.is_some(),
-            Some(current_version),
-        )
-        .await
-    }
-}
-
-// ─── Delta Sync Helpers ─────────────────────────────────────────────────────
-
-/// Create a new snapshot from delta entries only (when no existing snapshot exists).
-fn create_snapshot_from_delta(delta: &DeltaSnapshot) -> serde_json::Value {
-    serde_json::json!({
-        "entities": delta.entity_deltas,
-        "patterns": delta.pattern_deltas,
-        "calibration": delta.calibration,
-        "tool_health": delta.tool_health_deltas,
-    })
-}
-
-/// Merge delta entries into an existing snapshot JSON.
-///
-/// Merge strategy:
-/// - entities: Replace by "name" key
-/// - patterns: Replace by "signature" key
-/// - calibration: Full replacement
-/// - tool_health: Replace by "name" key
-fn merge_delta_into_snapshot(snapshot_json: &str, delta: &DeltaSnapshot) -> Result<String, String> {
-    let mut snapshot: serde_json::Value =
-        serde_json::from_str(snapshot_json).map_err(|e| format!("parse snapshot: {e}"))?;
-
-    // Merge entities by name
-    if !delta.entity_deltas.is_empty() {
-        let entities = snapshot.get_mut("entities").and_then(|v| v.as_array_mut());
-        if let Some(arr) = entities {
-            for entity_delta in &delta.entity_deltas {
-                if let Some(name) = entity_delta.get("name").and_then(|v| v.as_str()) {
-                    // Find and replace existing, or append
-                    let pos = arr
-                        .iter()
-                        .position(|e| e.get("name").and_then(|v| v.as_str()) == Some(name));
-                    if let Some(idx) = pos {
-                        arr[idx] = entity_delta.clone();
-                    } else {
-                        arr.push(entity_delta.clone());
-                    }
-                }
-            }
-        } else {
-            // No entities array - create one
-            snapshot["entities"] = serde_json::Value::Array(delta.entity_deltas.clone());
-        }
-    }
-
-    // Merge patterns by signature
-    if !delta.pattern_deltas.is_empty() {
-        let patterns = snapshot.get_mut("patterns").and_then(|v| v.as_array_mut());
-        if let Some(arr) = patterns {
-            for pattern_delta in &delta.pattern_deltas {
-                if let Some(sig) = pattern_delta.get("signature").and_then(|v| v.as_str()) {
-                    let pos = arr
-                        .iter()
-                        .position(|p| p.get("signature").and_then(|v| v.as_str()) == Some(sig));
-                    if let Some(idx) = pos {
-                        arr[idx] = pattern_delta.clone();
-                    } else {
-                        arr.push(pattern_delta.clone());
-                    }
-                }
-            }
-        } else {
-            snapshot["patterns"] = serde_json::Value::Array(delta.pattern_deltas.clone());
-        }
-    }
-
-    // Calibration: full replacement
-    if let Some(cal) = &delta.calibration {
-        snapshot["calibration"] = cal.clone();
-    }
-
-    // Merge tool_health by name
-    if !delta.tool_health_deltas.is_empty() {
-        let tool_health = snapshot
-            .get_mut("tool_health")
-            .and_then(|v| v.as_array_mut());
-        if let Some(arr) = tool_health {
-            for th_delta in &delta.tool_health_deltas {
-                if let Some(name) = th_delta.get("name").and_then(|v| v.as_str()) {
-                    let pos = arr
-                        .iter()
-                        .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(name));
-                    if let Some(idx) = pos {
-                        arr[idx] = th_delta.clone();
-                    } else {
-                        arr.push(th_delta.clone());
-                    }
-                }
-            }
-        } else {
-            snapshot["tool_health"] = serde_json::Value::Array(delta.tool_health_deltas.clone());
-        }
-    }
-
-    serde_json::to_string(&snapshot).map_err(|e| format!("serialize merged: {e}"))
 }
 
 // ─── Preference Constants ───────────────────────────────────────────────────
@@ -2084,22 +1228,6 @@ mod tests {
     }
 
     // ── LocalOnlySyncService ──
-
-    #[tokio::test]
-    async fn local_only_push_versioned_succeeds() {
-        let svc = LocalOnlySyncService;
-        let result = svc
-            .push_learning_versioned("user1", "default", "{}", 0, 0, false, None)
-            .await;
-        assert!(result.success);
-    }
-
-    #[tokio::test]
-    async fn local_only_pull_returns_none() {
-        let svc = LocalOnlySyncService;
-        let result = svc.pull_learning_versioned("user1", "default").await;
-        assert!(result.unwrap().is_none());
-    }
 
     #[tokio::test]
     async fn local_only_preferences() {
@@ -2170,7 +1298,6 @@ mod tests {
     #[test]
     fn sync_status_default_is_clean() {
         let status = SyncStatus::default();
-        assert!(status.learning_last_push.is_none());
         assert_eq!(status.pending_pushes, 0);
         assert!(status.last_error.is_none());
     }
@@ -2184,24 +1311,6 @@ mod tests {
         let loaded: SyncResult = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.items_synced, 3);
         assert!(loaded.success);
-    }
-
-    #[test]
-    fn compressed_payload_roundtrips_json() {
-        let original =
-            r#"{"entities":[{"name":"tool","count":3}],"patterns":[{"signature":"abc"}]}"#;
-
-        let encoded = compress_json_payload(original).unwrap();
-        let restored = decompress_json_payload(&encoded).unwrap();
-
-        assert_ne!(encoded, original);
-        assert_eq!(restored, original);
-    }
-
-    #[test]
-    fn decompress_rejects_plain_json_storage() {
-        let err = decompress_json_payload(r#"{"entities":[]}"#).unwrap_err();
-        assert!(err.contains("base64 decode"));
     }
 
     #[test]
@@ -2289,63 +1398,28 @@ mod tests {
     fn sync_status_default_has_clean_state() {
         let status = SyncStatus::default();
 
-        assert!(status.learning_last_push.is_none());
-        assert!(status.learning_last_pull.is_none());
         assert!(status.preferences_last_sync.is_none());
         assert_eq!(status.pending_pushes, 0);
         assert!(status.last_error.is_none());
-        assert!(status.cloud_version.is_none());
     }
 
     #[test]
     fn sync_status_with_values_roundtrips_through_json() {
         let original = SyncStatus {
-            learning_last_push: Some("2024-01-01T00:00:00Z".to_string()),
-            learning_last_pull: Some("2024-01-02T00:00:00Z".to_string()),
             preferences_last_sync: Some("2024-01-03T00:00:00Z".to_string()),
             pending_pushes: 3,
             last_error: Some("connection refused".to_string()),
-            cloud_version: Some(42),
         };
 
         let json = serde_json::to_string(&original).unwrap();
         let restored: SyncStatus = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(restored.learning_last_push, original.learning_last_push);
+        assert_eq!(
+            restored.preferences_last_sync,
+            original.preferences_last_sync
+        );
         assert_eq!(restored.pending_pushes, original.pending_pushes);
         assert_eq!(restored.last_error, original.last_error);
-        assert_eq!(restored.cloud_version, original.cloud_version);
-    }
-
-    #[tokio::test]
-    async fn local_only_push_learning_is_noop_but_succeeds() {
-        let svc = LocalOnlySyncService;
-
-        let result = svc
-            .push_learning_versioned(
-                "user1",
-                "default",
-                r#"{"entities":[{"name":"test","count":5}]}"#,
-                1,
-                0,
-                true,
-                None,
-            )
-            .await;
-
-        assert!(result.success, "LocalOnly should always succeed");
-        assert_eq!(result.items_synced, 0, "LocalOnly doesn't actually sync");
-    }
-
-    #[tokio::test]
-    async fn local_only_pull_learning_returns_none_for_any_user() {
-        let svc = LocalOnlySyncService;
-
-        let result1 = svc.pull_learning_versioned("user1", "default").await;
-        let result2 = svc.pull_learning_versioned("user2", "work").await;
-
-        assert!(result1.unwrap().is_none());
-        assert!(result2.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2382,31 +1456,6 @@ mod tests {
 
         assert!(status.last_error.is_none());
         assert_eq!(status.pending_pushes, 0);
-        assert!(status.learning_last_push.is_none());
-    }
-
-    // ── Optimistic Locking Tests ──
-
-    #[tokio::test]
-    async fn local_only_versioned_push_succeeds_with_version_zero() {
-        let svc = LocalOnlySyncService;
-
-        let result = svc
-            .push_learning_versioned("user1", "default", "{}", 0, 0, false, None)
-            .await;
-
-        assert!(result.success);
-        assert_eq!(result.new_version, Some(0)); // LocalOnly always returns 0
-        assert!(!result.is_conflict);
-    }
-
-    #[tokio::test]
-    async fn local_only_versioned_pull_returns_none() {
-        let svc = LocalOnlySyncService;
-
-        let result = svc.pull_learning_versioned("user1", "default").await;
-
-        assert!(result.unwrap().is_none());
     }
 
     #[test]
@@ -2419,130 +1468,12 @@ mod tests {
     }
 
     #[test]
-    fn versioned_snapshot_roundtrips_through_json() {
-        let original = VersionedSnapshot {
-            json: r#"{"entities": []}"#.to_string(),
-            version: 42,
-        };
-
-        let serialized = serde_json::to_string(&original).unwrap();
-        let restored: VersionedSnapshot = serde_json::from_str(&serialized).unwrap();
-
-        assert_eq!(restored.json, original.json);
-        assert_eq!(restored.version, original.version);
-    }
-
-    #[test]
     fn sync_result_ok_with_version_includes_version() {
         let result = SyncResult::ok_with_version(SyncDirection::Push, "learning", 1, 5);
 
         assert!(result.success);
         assert_eq!(result.new_version, Some(5));
         assert!(!result.is_conflict);
-    }
-
-    // ── Retry logic tests ──
-
-    #[test]
-    fn is_retryable_error_io_errors() {
-        // IO errors should be retryable
-        let io_err = sqlx::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            "connection reset",
-        ));
-        assert!(is_retryable_error(&io_err));
-    }
-
-    #[test]
-    fn is_retryable_error_pool_timeout() {
-        // Pool timeout should be retryable
-        let timeout_err = sqlx::Error::PoolTimedOut;
-        assert!(is_retryable_error(&timeout_err));
-    }
-
-    #[test]
-    fn is_retryable_error_protocol() {
-        // Protocol errors should be retryable
-        let proto_err = sqlx::Error::Protocol("unexpected packet".to_string());
-        assert!(is_retryable_error(&proto_err));
-    }
-
-    #[test]
-    fn is_retryable_error_non_retryable() {
-        // Column decode errors are not retryable
-        let decode_err = sqlx::Error::ColumnDecode {
-            index: "0".to_string(),
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "bad data",
-            )),
-        };
-        assert!(!is_retryable_error(&decode_err));
-
-        // Type mismatch errors are not retryable
-        let type_err = sqlx::Error::TypeNotFound {
-            type_name: "unknown".to_string(),
-        };
-        assert!(!is_retryable_error(&type_err));
-    }
-
-    #[test]
-    fn retry_constants_are_reasonable() {
-        let max_retries = std::hint::black_box(MAX_RETRIES);
-        let initial_backoff_ms = std::hint::black_box(INITIAL_BACKOFF_MS);
-        let max_backoff_ms = std::hint::black_box(MAX_BACKOFF_MS);
-        // Verify retry constants are within expected ranges
-        assert!((2..=5).contains(&max_retries));
-        assert!((50..=500).contains(&initial_backoff_ms));
-        assert!((1000..=5000).contains(&max_backoff_ms));
-        // Ensure max backoff is greater than initial
-        assert!(max_backoff_ms > initial_backoff_ms);
-    }
-
-    // ── classify_learning_insert_duplicate unit tests ────────────────────────
-
-    #[test]
-    fn classify_learning_insert_dup_matching_hash_is_idempotent() {
-        let hash = sha256_bytes(r#"{"entities":[]}"#);
-        let decision = classify_learning_insert_duplicate(Some(hash.as_slice()), hash.as_slice());
-        assert_eq!(
-            decision,
-            LearningDuplicateDecision::Idempotent,
-            "same hash must be idempotent"
-        );
-    }
-
-    #[test]
-    fn classify_learning_insert_dup_different_hash_is_conflict() {
-        let hash_a = sha256_bytes(r#"{"entities":[]}"#);
-        let hash_b = sha256_bytes(r#"{"entities":[{"id":"x"}]}"#);
-        let decision =
-            classify_learning_insert_duplicate(Some(hash_a.as_slice()), hash_b.as_slice());
-        assert_eq!(
-            decision,
-            LearningDuplicateDecision::Conflict,
-            "different hashes must be a conflict"
-        );
-    }
-
-    #[test]
-    fn classify_learning_insert_dup_no_stored_row_is_conflict() {
-        let hash = sha256_bytes(r#"{"entities":[]}"#);
-        let decision = classify_learning_insert_duplicate(None, hash.as_slice());
-        assert_eq!(
-            decision,
-            LearningDuplicateDecision::Conflict,
-            "missing stored row must be treated as conflict"
-        );
-    }
-
-    #[test]
-    fn sha256_bytes_is_deterministic() {
-        let h1 = sha256_bytes("hello");
-        let h2 = sha256_bytes("hello");
-        assert_eq!(h1, h2);
-        let h3 = sha256_bytes("world");
-        assert_ne!(h1, h3);
     }
 
     // ── SyncAuditWriter / flusher tests ──

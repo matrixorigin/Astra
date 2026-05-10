@@ -37,8 +37,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncDomain {
-    /// Tool health + tool quality persistence
-    Learning,
     /// JournalEvent batch → agent_events
     Events,
     /// TaskRecord + TaskPlan (active plans)
@@ -52,7 +50,6 @@ pub enum SyncDomain {
 impl fmt::Display for SyncDomain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Learning => write!(f, "learning"),
             Self::Events => write!(f, "events"),
             Self::Tasks => write!(f, "tasks"),
             Self::Templates => write!(f, "templates"),
@@ -463,17 +460,6 @@ pub struct SyncPolicy {
 }
 
 impl SyncPolicy {
-    /// Default policy for the Learning domain.
-    pub fn learning() -> Self {
-        Self {
-            pull: PullTrigger::SessionStart,
-            push: PushTrigger::SessionEnd,
-            max_conflict_retries: 3,
-            timeout_secs: 5,
-            prefer_delta: true,
-        }
-    }
-
     /// Default policy for the Events domain.
     pub fn events() -> Self {
         Self {
@@ -556,14 +542,13 @@ pub enum SyncOperation {
 ///
 /// ```rust,ignore
 /// let mut orch = SyncOrchestrator::new(transport, user_id);
-/// orch.register(learning_adapter, SyncPolicy::learning());
 /// orch.register(event_adapter, SyncPolicy::events());
 ///
 /// // Session start
 /// orch.pull_all().await;
 ///
 /// // During session — on each write
-/// orch.notify_write(SyncDomain::Learning);
+/// orch.notify_write(SyncDomain::Events);
 ///
 /// // Session end
 /// orch.push_dirty().await;
@@ -1058,7 +1043,7 @@ mod tests {
 
     #[test]
     fn sync_envelope_lifecycle() {
-        let mut env = SyncEnvelope::new(SyncDomain::Learning);
+        let mut env = SyncEnvelope::new(SyncDomain::Tasks);
         assert!(env.sync_state.is_clean());
         assert_eq!(env.local_version, 0);
 
@@ -1109,11 +1094,6 @@ mod tests {
 
     #[test]
     fn sync_policy_defaults() {
-        let learning = SyncPolicy::learning();
-        assert!(matches!(learning.pull, PullTrigger::SessionStart));
-        assert!(matches!(learning.push, PushTrigger::SessionEnd));
-        assert!(learning.prefer_delta);
-
         let events = SyncPolicy::events();
         assert!(matches!(events.pull, PullTrigger::Never));
         assert!(matches!(events.push, PushTrigger::Batched { .. }));
@@ -1127,7 +1107,6 @@ mod tests {
 
     #[test]
     fn domain_display() {
-        assert_eq!(SyncDomain::Learning.to_string(), "learning");
         assert_eq!(SyncDomain::Events.to_string(), "events");
         assert_eq!(SyncDomain::Tasks.to_string(), "tasks");
     }
@@ -1141,12 +1120,12 @@ mod tests {
         rt.block_on(async {
             let transport = NoopTransport;
             let result = transport
-                .push("u1", SyncDomain::Learning, &test_payload(), None)
+                .push("u1", SyncDomain::Events, &test_payload(), None)
                 .await
                 .unwrap();
             assert!(result.success);
 
-            let result = transport.pull("u1", SyncDomain::Learning).await.unwrap();
+            let result = transport.pull("u1", SyncDomain::Events).await.unwrap();
             assert!(result.payload.is_none());
 
             assert!(transport.health_check().await);
@@ -1159,8 +1138,8 @@ mod tests {
         let mut orch = SyncOrchestrator::new(transport, "user1");
 
         // Register a mock adapter
-        let adapter = MockAdapter::new(SyncDomain::Learning);
-        orch.register(Box::new(adapter), SyncPolicy::learning());
+        let adapter = MockAdapter::new(SyncDomain::Tasks);
+        orch.register(Box::new(adapter), SyncPolicy::tasks());
 
         let results = orch.pull_all().await;
         assert_eq!(results.len(), 1);
@@ -1172,8 +1151,8 @@ mod tests {
         let transport = Arc::new(NoopTransport);
         let mut orch = SyncOrchestrator::new(transport, "user1");
 
-        let adapter = MockAdapter::new(SyncDomain::Learning);
-        orch.register(Box::new(adapter), SyncPolicy::learning());
+        let adapter = MockAdapter::new(SyncDomain::Tasks);
+        orch.register(Box::new(adapter), SyncPolicy::tasks());
 
         // Nothing is dirty → push_dirty returns empty
         let results = orch.push_dirty().await;
@@ -1185,11 +1164,11 @@ mod tests {
         let transport = Arc::new(NoopTransport);
         let mut orch = SyncOrchestrator::new(transport, "user1");
 
-        let adapter = MockAdapter::new(SyncDomain::Learning);
-        orch.register(Box::new(adapter), SyncPolicy::learning());
+        let adapter = MockAdapter::new(SyncDomain::Tasks);
+        orch.register(Box::new(adapter), SyncPolicy::tasks());
 
         // Mark dirty
-        orch.notify_write(SyncDomain::Learning);
+        orch.notify_write(SyncDomain::Tasks);
 
         let results = orch.push_dirty().await;
         assert_eq!(results.len(), 1);
@@ -1201,9 +1180,9 @@ mod tests {
         let transport = Arc::new(NoopTransport);
         let mut orch = SyncOrchestrator::new(transport, "user1");
 
-        let adapter1 = MockAdapter::new(SyncDomain::Learning);
+        let adapter1 = MockAdapter::new(SyncDomain::Tasks);
         let adapter2 = MockAdapter::new(SyncDomain::Events);
-        orch.register(Box::new(adapter1), SyncPolicy::learning());
+        orch.register(Box::new(adapter1), SyncPolicy::tasks());
         orch.register(Box::new(adapter2), SyncPolicy::events());
 
         let summary = orch.status_summary();

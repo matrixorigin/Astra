@@ -389,7 +389,6 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
         budget_remaining_rounds: 8,
         blocked_tools: Vec::new(),
         recent_tools: vec!["bash".to_string()],
-        learning_snapshot_id: None,
         memory_context: None,
         delegation_id: None,
         delegation_pattern: None,
@@ -704,111 +703,7 @@ async fn crash_recovery_low_information_repair_followup_rebuilds_attachment() {
     );
 }
 
-// ── Learning snapshot restoration ────────────────────────────────────────
-
-#[tokio::test]
-async fn resume_restores_learning_snapshot() {
-    use astra_services::session_restore::RestoredSession;
-
-    // Create a mock RestoredSession with learning snapshot
-    let restored = RestoredSession {
-        session_id: "test-learning".into(),
-        turn_count: 5,
-        total_tokens_in: 1000,
-        total_tokens_out: 500,
-        recent_tools: vec!["grep".into()],
-        learning_snapshot_json: Some(
-            r#"{"entities":["Rust","MatrixOne"],"patterns":["*.rs"]}"#.into(),
-        ),
-        checkpoint_count: 1,
-        last_status: "active".into(),
-        git_branch: Some("main".into()),
-        model: Some("gpt-4o".into()),
-        title: Some("Test".into()),
-        restored_from_cloud: true, // Cloud restore has learning
-        ..Default::default()
-    };
-
-    // Verify the learning snapshot is present
-    assert!(restored.learning_snapshot_json.is_some());
-    let json = restored.learning_snapshot_json.as_ref().unwrap();
-    assert!(json.contains("Rust"));
-    assert!(json.contains("MatrixOne"));
-
-    // Simulate what handle_resume_command does
-    let learning_snapshot = if let Some(ref l) = restored.learning_snapshot_json {
-        if !l.is_empty() { Some(l.clone()) } else { None }
-    } else {
-        None
-    };
-
-    assert!(learning_snapshot.is_some());
-    assert_eq!(learning_snapshot.unwrap().as_str(), json);
-}
-
-#[tokio::test]
-async fn resume_local_restore_has_no_learning_snapshot() {
-    use astra_services::session_restore::RestoredSession;
-
-    // Local restore should not have learning snapshot
-    let restored = RestoredSession {
-        session_id: "test-local".into(),
-        turn_count: 3,
-        total_tokens_in: 500,
-        total_tokens_out: 200,
-        recent_tools: vec![],
-        learning_snapshot_json: None, // Local restore doesn't have this
-        checkpoint_count: 1,
-        last_status: "active".into(),
-        git_branch: None,
-        model: None,
-        title: None,
-        restored_from_cloud: false,
-        ..Default::default()
-    };
-
-    assert!(restored.learning_snapshot_json.is_none());
-}
-
 // ── Edge cases ───────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn resume_handles_empty_learning_snapshot() {
-    use astra_services::session_restore::RestoredSession;
-
-    // Empty string should be treated as None
-    let restored = RestoredSession {
-        learning_snapshot_json: Some("".into()),
-        ..Default::default()
-    };
-
-    // Simulate the logic in handle_resume_command
-    let learning_snapshot = if let Some(ref l) = restored.learning_snapshot_json {
-        if !l.is_empty() { Some(l.clone()) } else { None }
-    } else {
-        None
-    };
-
-    assert!(
-        learning_snapshot.is_none(),
-        "empty string should be ignored"
-    );
-}
-
-#[tokio::test]
-async fn resume_handles_invalid_learning_json() {
-    use astra_services::session_restore::RestoredSession;
-
-    // Invalid JSON should still be stored (will fail at merge time)
-    let restored = RestoredSession {
-        learning_snapshot_json: Some("not valid json {{{".into()),
-        ..Default::default()
-    };
-
-    assert!(restored.learning_snapshot_json.is_some());
-    let json = restored.learning_snapshot_json.as_ref().unwrap();
-    assert!(json.contains("{"));
-}
 
 #[tokio::test]
 async fn resume_handles_malformed_workspace_yaml() {
@@ -877,66 +772,6 @@ async fn resume_handles_missing_workspace() {
     assert_eq!(result.model.as_deref(), Some("gpt-4o"));
     assert_eq!(result.last_status, "local");
     assert!(!result.restored_from_cloud);
-}
-
-// ── Integration: full resume flow simulation ─────────────────────────────
-
-#[tokio::test]
-async fn resume_full_flow_cloud_restore() {
-    use astra_services::session_restore::RestoredSession;
-
-    // Simulate a complete cloud restore scenario
-    let restored = RestoredSession {
-        session_id: "cloud-sess-123".into(),
-        turn_count: 42,
-        total_tokens_in: 150_000,
-        total_tokens_out: 80_000,
-        recent_tools: vec!["git".into(), "bash".into(), "grep".into()],
-        learning_snapshot_json: Some(r#"{"entities":["Rust","SQL"],"patterns":["*.rs"]}"#.into()),
-        checkpoint_count: 5,
-        last_status: "active".into(),
-        git_branch: Some("feature/resume".into()),
-        model: Some("claude-3-opus".into()),
-        title: Some("Implement session resume".into()),
-        restored_from_cloud: true,
-        ..Default::default()
-    };
-    assert_eq!(restored.session_id, "cloud-sess-123");
-    assert_eq!(restored.turn_count, 42);
-    assert!(restored.restored_from_cloud);
-    assert!(restored.learning_snapshot_json.is_some());
-    assert_eq!(restored.recent_tools.len(), 3);
-
-    // Simulate state application
-    let mut state = super::ReplState::default();
-    #[allow(clippy::field_reassign_with_default)]
-    {
-        state.session_id = Some(restored.session_id.clone());
-        state.turn = restored.turn_count;
-        state.total_prompt_tokens = restored.total_tokens_in;
-        state.total_completion_tokens = restored.total_tokens_out;
-        state.recent_tools = restored.recent_tools.clone();
-        state.model = restored.model.clone();
-        if let Some(ref m) = state.model {
-            state.cached_pricing = slash_stats::fallback_pricing(m);
-        }
-    }
-
-    // Apply learning snapshot
-    if let Some(ref l) = restored.learning_snapshot_json
-        && !l.is_empty()
-    {
-        state.learning_snapshot = Some(l.clone());
-    }
-
-    // Verify state
-    assert_eq!(state.session_id, Some("cloud-sess-123".into()));
-    assert_eq!(state.turn, 42);
-    assert_eq!(state.total_prompt_tokens, 150_000);
-    assert_eq!(
-        state.learning_snapshot.unwrap(),
-        r#"{"entities":["Rust","SQL"],"patterns":["*.rs"]}"#
-    );
 }
 
 // ── Checkpoint listing ───────────────────────────────────────────────────

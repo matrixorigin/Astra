@@ -663,27 +663,6 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    // ── Learning state convergence (Phase F) ──
-
-    query(
-        "CREATE TABLE IF NOT EXISTS learning_snapshots (
-            snapshot_id VARCHAR(64) PRIMARY KEY,
-            user_id VARCHAR(64) NOT NULL,
-            profile_name VARCHAR(100) NOT NULL,
-            snapshot_json LONGTEXT NOT NULL,
-            entity_count INT NOT NULL DEFAULT 0,
-            pattern_count INT NOT NULL DEFAULT 0,
-            has_calibration SMALLINT NOT NULL DEFAULT 0,
-            version INT NOT NULL DEFAULT 1,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY idx_learning_user_profile (user_id, profile_name),
-            INDEX idx_learning_user_updated (user_id, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     query(
         "CREATE TABLE IF NOT EXISTS user_preferences (
             pref_id VARCHAR(64) PRIMARY KEY,

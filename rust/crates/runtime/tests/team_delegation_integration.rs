@@ -366,24 +366,6 @@ async fn orchestrator_persists_events_and_checkpoint() {
     assert_eq!(cp["phase"], "prepared");
 }
 
-// ─── Learning Merge Integration ─────────────────────────────────────────────
-
-#[tokio::test]
-async fn orchestrator_extracts_learning_from_results() {
-    let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
-    let (orch, _, _) = setup_orchestrator(store).await;
-
-    let report = orch
-        .execute_team("research", "analyze patterns", None)
-        .await;
-    assert_eq!(report.status, TeamExecutionStatus::Completed);
-
-    // Merged learning should be present (even if minimal from stub executor)
-    assert!(report.merged_learning.is_some());
-    let learning = report.merged_learning.unwrap();
-    assert!(learning.agent_count >= 2);
-}
-
 // ─── Team Persistence Round-Trip ────────────────────────────────────────────
 
 #[tokio::test]

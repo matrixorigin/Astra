@@ -2390,24 +2390,19 @@ impl JournalEvent {
         evt
     }
 
-    /// After a successful MatrixOne pull of learning / preferences (startup or post-login audit).
+    /// After a successful MatrixOne pull of preferences (startup or post-login audit).
     ///
     /// Structured fields live under `metadata.cloud_pull` for analytics; `user_input` holds a short
     /// human-readable summary for export and grep.
-    #[allow(clippy::too_many_arguments)]
     pub fn cloud_pull_sync_marker(
         session_id: Option<&str>,
         profile: &str,
         source: &str,
-        learning_version: Option<i64>,
-        learning_snapshot_merged: bool,
-        tool_health_rows_from_cloud: usize,
         preference_keys_merged: &[String],
         reachable_empty_ack: bool,
     ) -> Self {
         let note = format!(
-            "cloud_pull {source} profile={profile} learning_v={:?} prefs={}{}",
-            learning_version,
+            "cloud_pull {source} profile={profile} prefs={}{}",
             preference_keys_merged.len(),
             if reachable_empty_ack {
                 " empty_ack"
@@ -2420,9 +2415,6 @@ impl JournalEvent {
             "cloud_pull": {
                 "profile": profile,
                 "source": source,
-                "learning_version": learning_version,
-                "learning_snapshot_merged": learning_snapshot_merged,
-                "tool_health_rows_from_cloud": tool_health_rows_from_cloud,
                 "preference_keys_merged": preference_keys_merged,
                 "reachable_empty_ack": reachable_empty_ack,
             }
@@ -4267,9 +4259,6 @@ mod tests {
             Some("sid-1"),
             "work",
             "repl_startup",
-            Some(42),
-            true,
-            3,
             &keys,
             false,
         );
@@ -4285,19 +4274,6 @@ mod tests {
         assert_eq!(
             cp.get("source").and_then(|v| v.as_str()),
             Some("repl_startup")
-        );
-        assert_eq!(
-            cp.get("learning_version").and_then(|v| v.as_i64()),
-            Some(42)
-        );
-        assert_eq!(
-            cp.get("learning_snapshot_merged").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            cp.get("tool_health_rows_from_cloud")
-                .and_then(|v| v.as_u64()),
-            Some(3)
         );
         let pref = cp
             .get("preference_keys_merged")
@@ -4317,9 +4293,6 @@ mod tests {
             Some("s-empty"),
             "default",
             "post_login",
-            None,
-            false,
-            0,
             &[],
             true,
         );
@@ -4341,16 +4314,8 @@ mod tests {
     fn cloud_pull_sync_marker_append_to_journal_file() {
         let sid = format!("test-cloud-pull-{}", uuid::Uuid::new_v4());
         let writer = JournalWriter::new(&sid).unwrap();
-        let evt = JournalEvent::cloud_pull_sync_marker(
-            Some(&sid),
-            "default",
-            "post_login",
-            None,
-            false,
-            0,
-            &[],
-            true,
-        );
+        let evt =
+            JournalEvent::cloud_pull_sync_marker(Some(&sid), "default", "post_login", &[], true);
         writer.append(&evt).unwrap();
         let events = read_journal(&sid).unwrap();
         assert_eq!(events.len(), 1);

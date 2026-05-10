@@ -17,13 +17,11 @@ pub mod events;
 pub mod introspection;
 pub mod jobs;
 pub mod learning;
-pub mod learning_merge;
 pub mod llm_trusted_domains;
 pub mod marketplace;
 pub mod marketplace_stats;
 pub mod models;
 pub mod multi_agent;
-pub mod mutation_scoreboard;
 pub mod pagination;
 pub mod reflect;
 pub mod replay;
@@ -152,12 +150,6 @@ pub use multi_agent::{
     DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeAgentRecord, EdgeRegistryService,
     LeaseClaimResult, TaskLeaseHoldCache, TaskLeaseService, TaskLeaseView, TasksPackPushResult,
     UnconfiguredEdgeRegistryService, UnconfiguredTaskLeaseService,
-};
-pub use mutation_scoreboard::{
-    MutationActionCategory, MutationCompensationPolicy, MutationJudgment, MutationObjectiveScore,
-    MutationPromotionEvaluationContext, MutationPromotionRecommendation, MutationPromotionVerdict,
-    MutationRetentionVerdict, MutationSafetyVerdict, MutationScoreboard, MutationVerifierSummary,
-    PersistedMutationDecision, StagedMutation, StagedMutationState,
 };
 pub use pagination::{
     MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET,

@@ -9,7 +9,6 @@ use session_guard::{
 pub(crate) struct ReplStartupArtifacts {
     pub selector: Box<dyn tool_selector::ToolSelector>,
     pub pipeline_modules: PipelineModules,
-    pub profile_name_str: String,
     pub edge_heartbeat_task: Option<tokio::task::JoinHandle<()>>,
     pub skill_quality_path: std::path::PathBuf,
     pub pinned_skills_path: std::path::PathBuf,
@@ -159,10 +158,10 @@ pub(crate) async fn complete_repl_startup(
     );
     tracer.phase("tool_selector");
 
-    // Load cross-session tool-health state (entity/pattern/calibration state has been removed).
+    // Load cross-session tool-health state from local files.
     let profile_name = profile.unwrap_or("default");
     let (cross_session_health_entries, cloud_pull_result, pref_keys_after_pull) = {
-        let mut cross_session_health_entries =
+        let cross_session_health_entries =
             astra_turn_core::tool_health_persistence::load_tool_health(profile_name);
         state.synced_tool_health_entries =
             astra_turn_core::tool_health_persistence::load_synced_tool_health(profile_name);
@@ -177,28 +176,6 @@ pub(crate) async fn complete_repl_startup(
             );
         }
         let cloud_pull_result = try_cloud_pull(profile_name).await;
-        state.cloud_learning_version = cloud_pull_result.version;
-        if !cloud_pull_result.tool_health.is_empty() {
-            let (merged, cloud_wins, cloud_only) =
-                astra_turn_core::tool_health_persistence::merge_tool_health(
-                    &cross_session_health_entries,
-                    &cloud_pull_result.tool_health,
-                );
-            cross_session_health_entries = merged;
-            if cloud_wins > 0 || cloud_only > 0 {
-                let mut parts = Vec::new();
-                if cloud_wins > 0 {
-                    parts.push(format!("{cloud_wins} updated from cloud"));
-                }
-                if cloud_only > 0 {
-                    parts.push(format!("{cloud_only} new from cloud"));
-                }
-                eprintln!(
-                    "{}",
-                    format!("  ✓ Merged tool health: {}", parts.join(", ")).dim()
-                );
-            }
-        }
         let pref_keys = try_cloud_pull_preferences(state).await;
         (cross_session_health_entries, cloud_pull_result, pref_keys)
     };
@@ -268,8 +245,6 @@ pub(crate) async fn complete_repl_startup(
         &cloud_pull_result,
         &pref_keys_after_pull,
     );
-
-    let profile_name_str = profile_name.to_string();
 
     if let Some(token) = current_access_token(profile) {
         let has_models = check_server_has_models(api, &token).await;
@@ -364,7 +339,6 @@ pub(crate) async fn complete_repl_startup(
     Ok(ReplStartupArtifacts {
         selector,
         pipeline_modules,
-        profile_name_str,
         edge_heartbeat_task,
         skill_quality_path,
         pinned_skills_path,

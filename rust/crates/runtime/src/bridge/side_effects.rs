@@ -100,7 +100,6 @@ fn build_hook_db_persist_from_payload(
         })
         .collect::<Vec<_>>();
     let tool_results = object_array_maps(hook_payload, "tool_results");
-    let mut tool_verification_summaries = std::collections::HashMap::new();
     let mut tool_pre_state_snapshots = std::collections::HashMap::new();
     let mut tool_pre_state_snapshot_databases = std::collections::HashMap::new();
     let mut tool_execution_outcomes: std::collections::HashMap<
@@ -148,9 +147,6 @@ fn build_hook_db_persist_from_payload(
         );
         tool_execution_outcomes.insert(tool_call_id.clone(), classification);
 
-        if let Some(summary) = tool_verification_summary_from_tool_result(&tool_result) {
-            tool_verification_summaries.insert(tool_call_id.clone(), summary);
-        }
         if let Some(snapshot_id) = tool_result
             .get("pre_state_snapshot_id")
             .and_then(serde_json::Value::as_str)
@@ -167,12 +163,6 @@ fn build_hook_db_persist_from_payload(
             tool_pre_state_snapshot_databases.insert(tool_call_id, database.to_string());
         }
     }
-    let turn_verification_summary = hook_payload
-        .get("turn_count")
-        .and_then(|value| valid_turn_number(Some(value)))
-        .and_then(|turn| u32::try_from(turn).ok())
-        .filter(|_| tool_calls.len() == 1)
-        .and_then(|turn| turn_verification_summary_from_journal(&session_id, turn));
     let tool_action_profiles = tool_calls
         .iter()
         .map(|tool_call| {
@@ -216,45 +206,6 @@ fn build_hook_db_persist_from_payload(
                         );
                     }
                 }
-                if let Some(summary) = tool_verification_summaries.get(tool_call_id) {
-                    action_profile.insert("verifier".to_string(), summary.clone());
-                    action_profile.insert(
-                        "verifier_source".to_string(),
-                        serde_json::Value::String("tool_result".to_string()),
-                    );
-                } else if let Some(summary) = turn_verification_summary.as_ref() {
-                    action_profile.insert("verifier".to_string(), summary.clone());
-                    action_profile.insert(
-                        "verifier_source".to_string(),
-                        serde_json::Value::String("turn_journal".to_string()),
-                    );
-                } else {
-                    let verifier_gap = if tool_calls.len() > 1 {
-                        "ambiguous_multi_action_turn"
-                    } else {
-                        "no_verifier_signal"
-                    };
-                    action_profile.insert(
-                        "verifier_gap".to_string(),
-                        serde_json::Value::String(verifier_gap.to_string()),
-                    );
-                }
-            } else if let Some(summary) = turn_verification_summary.as_ref() {
-                action_profile.insert("verifier".to_string(), summary.clone());
-                action_profile.insert(
-                    "verifier_source".to_string(),
-                    serde_json::Value::String("turn_journal".to_string()),
-                );
-            } else {
-                let verifier_gap = if tool_calls.len() > 1 {
-                    "ambiguous_multi_action_turn"
-                } else {
-                    "no_verifier_signal"
-                };
-                action_profile.insert(
-                    "verifier_gap".to_string(),
-                    serde_json::Value::String(verifier_gap.to_string()),
-                );
             }
             // Attach execution outcome classification when available.
             if let Some(tool_call_id_str) = tool_call_id.as_str() {
@@ -267,8 +218,6 @@ fn build_hook_db_persist_from_payload(
             serde_json::Value::Object(action_profile)
         })
         .collect::<Vec<_>>();
-    // mutation_objective_score previously derived from pipeline learning; subsystem removed.
-    let mutation_objective_score: Option<serde_json::Value> = None;
     let turn_number = valid_turn_number(hook_payload.get("turn_count"));
     let decision_audit = Some(TurnDecisionAuditRecord {
         decision_id: Uuid::now_v7().to_string(),
@@ -284,7 +233,6 @@ fn build_hook_db_persist_from_payload(
             "turn": hook_payload.get("turn_count").cloned(),
             "tool_calls": tool_call_names,
             "action_profiles": tool_action_profiles,
-            "mutation_objective_score": mutation_objective_score,
             "model_used": optional_object_str(hook_payload, "model_used"),
         }),
         model_used: optional_object_str(hook_payload, "model_used").map(ToString::to_string),
@@ -649,240 +597,13 @@ fn object_array_maps(
         .unwrap_or_default()
 }
 
-fn tool_verification_summary_from_tool_result(
-    tool_result: &serde_json::Map<String, serde_json::Value>,
-) -> Option<serde_json::Value> {
-    tool_result
-        .get("verification_summary")
-        .and_then(extract_verification_summary_from_value)
-        .or_else(|| {
-            tool_result
-                .get("result")
-                .and_then(extract_verification_summary_from_value)
-        })
-        .or_else(|| {
-            tool_result
-                .get("content")
-                .and_then(extract_verification_summary_from_value)
-        })
-}
-
-fn extract_verification_summary_from_value(value: &serde_json::Value) -> Option<serde_json::Value> {
-    if let Some(summary) = astra_services::MutationVerifierSummary::from_value(value) {
-        return serde_json::to_value(summary).ok();
-    }
-
-    match value {
-        serde_json::Value::Object(object) => {
-            if let (Some(all_required_passed), Some(results)) = (
-                object
-                    .get("all_required_passed")
-                    .and_then(serde_json::Value::as_bool),
-                object.get("results").and_then(serde_json::Value::as_array),
-            ) {
-                let parsed_results = results
-                    .iter()
-                    .map(|item| {
-                        serde_json::from_value::<astra_services::VerificationResult>(item.clone())
-                            .ok()
-                    })
-                    .collect::<Option<Vec<_>>>()?;
-                return serde_json::to_value(
-                    astra_services::MutationVerifierSummary::from_results(
-                        all_required_passed,
-                        &parsed_results,
-                    ),
-                )
-                .ok();
-            }
-
-            if let (Some(passed), Some(results_count)) = (
-                object
-                    .get("all_required_passed")
-                    .or_else(|| object.get("passed"))
-                    .and_then(serde_json::Value::as_bool),
-                object
-                    .get("results_count")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(|count| count as u32),
-            ) {
-                let criteria_passed = if passed { results_count } else { 0 };
-                let pass_rate = if results_count == 0 {
-                    astra_core::confidence::ConfidenceInterval::FULL
-                } else {
-                    astra_core::confidence::ConfidenceInterval::exact(
-                        criteria_passed as f64 / results_count as f64,
-                    )
-                };
-                return serde_json::to_value(astra_services::MutationVerifierSummary {
-                    all_required_passed: passed,
-                    criteria_total: results_count,
-                    criteria_passed,
-                    pass_rate,
-                    failing_criteria: Vec::new(),
-                })
-                .ok();
-            }
-
-            None
-        }
-        serde_json::Value::String(string) => serde_json::from_str::<serde_json::Value>(string)
-            .ok()
-            .and_then(|parsed| extract_verification_summary_from_value(&parsed)),
-        _ => None,
-    }
-}
-
-fn turn_verification_summary_from_journal(
-    session_id: &str,
-    turn: u32,
-) -> Option<serde_json::Value> {
-    let summaries = astra_services::session_journal::read_journal(session_id)
-        .ok()?
-        .iter()
-        .filter_map(|event| journal_verification_summary_from_event(event, turn))
-        .collect::<Vec<_>>();
-    if summaries.is_empty() {
-        return None;
-    }
-    serde_json::to_value(merge_verification_summaries(&summaries)).ok()
-}
-
-fn journal_verification_summary_from_event(
-    event: &astra_services::session_journal::JournalEvent,
-    turn: u32,
-) -> Option<astra_services::MutationVerifierSummary> {
-    if !matches!(
-        event.event_type,
-        astra_services::session_journal::JournalEventType::VerificationCompleted
-    ) || event.turn != Some(turn)
-    {
-        return None;
-    }
-    let metadata = event.metadata.as_ref()?;
-    let passed = metadata.get("passed").and_then(serde_json::Value::as_bool);
-    let results = metadata.get("results")?;
-    journal_verification_summary_from_results(results, passed)
-}
-
-fn journal_verification_summary_from_results(
-    results: &serde_json::Value,
-    passed: Option<bool>,
-) -> Option<astra_services::MutationVerifierSummary> {
-    if let Some(summary) = astra_services::MutationVerifierSummary::from_value(results) {
-        return Some(summary);
-    }
-
-    match results {
-        serde_json::Value::Array(items) => {
-            let mut criteria_total = items.len() as u32;
-            let mut criteria_passed = items
-                .iter()
-                .filter(|item| {
-                    item.get("passed").and_then(serde_json::Value::as_bool) == Some(true)
-                })
-                .count() as u32;
-            if criteria_total == 0
-                && let Some(all_required_passed) = passed
-            {
-                criteria_total = 1;
-                criteria_passed = u32::from(all_required_passed);
-            }
-            let all_required_passed =
-                passed.unwrap_or(criteria_total == 0 || criteria_passed == criteria_total);
-            let failing_criteria = items
-                .iter()
-                .filter(|item| {
-                    item.get("passed").and_then(serde_json::Value::as_bool) == Some(false)
-                })
-                .filter_map(|item| {
-                    let object = item.as_object()?;
-                    object
-                        .get("criterion_id")
-                        .or_else(|| object.get("check"))
-                        .or_else(|| object.get("target"))
-                        .or_else(|| object.get("name"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string)
-                })
-                .collect::<Vec<_>>();
-            let pass_rate = if criteria_total == 0 {
-                astra_core::confidence::ConfidenceInterval::FULL
-            } else {
-                astra_core::confidence::ConfidenceInterval::exact(
-                    criteria_passed as f64 / criteria_total as f64,
-                )
-            };
-            Some(astra_services::MutationVerifierSummary {
-                all_required_passed,
-                criteria_total,
-                criteria_passed,
-                pass_rate,
-                failing_criteria,
-            })
-        }
-        serde_json::Value::Object(_) if passed.is_some() => {
-            let all_required_passed = passed.unwrap_or(false);
-            Some(astra_services::MutationVerifierSummary {
-                all_required_passed,
-                criteria_total: 1,
-                criteria_passed: u32::from(all_required_passed),
-                pass_rate: astra_core::confidence::ConfidenceInterval::exact(
-                    if all_required_passed { 1.0 } else { 0.0 },
-                ),
-                failing_criteria: Vec::new(),
-            })
-        }
-        serde_json::Value::String(string) => serde_json::from_str::<serde_json::Value>(string)
-            .ok()
-            .and_then(|parsed| journal_verification_summary_from_results(&parsed, passed)),
-        _ => None,
-    }
-}
-
-fn merge_verification_summaries(
-    summaries: &[astra_services::MutationVerifierSummary],
-) -> astra_services::MutationVerifierSummary {
-    let all_required_passed = summaries.iter().all(|summary| summary.all_required_passed);
-    let criteria_total = summaries.iter().map(|summary| summary.criteria_total).sum();
-    let criteria_passed = summaries
-        .iter()
-        .map(|summary| summary.criteria_passed)
-        .sum();
-    let mut failing_criteria = Vec::new();
-    for criterion in summaries
-        .iter()
-        .flat_map(|summary| summary.failing_criteria.iter())
-    {
-        if !failing_criteria.contains(criterion) {
-            failing_criteria.push(criterion.clone());
-        }
-    }
-    let pass_rate = if criteria_total == 0 {
-        astra_core::confidence::ConfidenceInterval::FULL
-    } else {
-        astra_core::confidence::ConfidenceInterval::exact(
-            criteria_passed as f64 / criteria_total as f64,
-        )
-    };
-    astra_services::MutationVerifierSummary {
-        all_required_passed,
-        criteria_total,
-        criteria_passed,
-        pass_rate,
-        failing_criteria,
-    }
-}
-
 #[cfg(test)]
 #[allow(dead_code)]
 mod inprocess_hook_contract_tests {
     use std::sync::Arc;
 
-    use astra_services::session_journal::{JournalDirGuard, JournalEvent, JournalWriter};
     use async_trait::async_trait;
     use serde_json::{Value, json};
-    use tempfile::tempdir;
     use tokio::sync::Mutex;
 
     use crate::{
@@ -961,14 +682,7 @@ mod inprocess_hook_contract_tests {
         let tool_results: Vec<Value> = vec![json!({
             "tool_call_id": "call-1",
             "name": "bash",
-            "result": "src/lib.rs",
-            "verification_summary": {
-                "all_required_passed": true,
-                "criteria_total": 1,
-                "criteria_passed": 1,
-                "pass_rate": {"point": 1.0, "lower": 1.0, "upper": 1.0},
-                "failing_criteria": []
-            }
+            "result": "src/lib.rs"
         })];
         let tool_calls = vec![json!({
             "id": "call-1",
@@ -1147,48 +861,6 @@ mod inprocess_hook_contract_tests {
         ))
     }
 
-    fn build_hook_payload_with_result_shaped_verifier() -> Value {
-        let messages = vec![json!({"role": "user", "content": "run the verification"})];
-        let tool_results: Vec<Value> = vec![json!({
-            "tool_call_id": "call-1",
-            "name": "verify",
-            "result": {
-                "all_required_passed": false,
-                "results": [
-                    {
-                        "criterion_id": "tests",
-                        "passed": false,
-                        "evidence": "cargo test failed",
-                        "expected": "tests pass",
-                        "duration_ms": 25
-                    }
-                ]
-            }
-        })];
-        let tool_calls = vec![json!({
-            "id": "call-1",
-            "function": {"name": "verify", "arguments": "{\"scope\": \"turn\"}"}
-        })];
-        Value::Object(build_turn_hook_args(
-            "user-1",
-            "session-1",
-            &messages,
-            &tool_results,
-            "Verification failed on tests.",
-            &tool_calls,
-            None,
-            Some("gpt-4"),
-            Some("agent-1"),
-            Some("evt-query-3"),
-            3,
-            None,
-            false,
-            true,
-            true,
-            true,
-        ))
-    }
-
     fn build_hook_payload_with_mo_query_snapshot() -> Value {
         let messages = vec![json!({"role": "user", "content": "update the database"})];
         let tool_results: Vec<Value> = vec![json!({
@@ -1217,81 +889,6 @@ mod inprocess_hook_contract_tests {
             Some("agent-1"),
             Some("evt-query-snapshot"),
             4,
-            None,
-            false,
-            true,
-            true,
-            true,
-        ))
-    }
-
-    fn build_hook_payload_with_single_tool_and_no_verifier(turn: i64) -> Value {
-        let messages = vec![json!({"role": "user", "content": "run the command"})];
-        let tool_results: Vec<Value> = vec![json!({
-            "tool_call_id": "call-1",
-            "name": "bash",
-            "result": "done"
-        })];
-        let tool_calls = vec![json!({
-            "id": "call-1",
-            "function": {"name": "bash", "arguments": "{\"command\": \"cargo test\"}"}
-        })];
-        Value::Object(build_turn_hook_args(
-            "user-1",
-            "session-1",
-            &messages,
-            &tool_results,
-            "Ran the command.",
-            &tool_calls,
-            None,
-            Some("gpt-4"),
-            Some("agent-1"),
-            Some("evt-query-4"),
-            turn,
-            None,
-            false,
-            true,
-            true,
-            true,
-        ))
-    }
-
-    fn build_hook_payload_with_multiple_tools_and_no_verifier(turn: i64) -> Value {
-        let messages = vec![json!({"role": "user", "content": "run both commands"})];
-        let tool_results: Vec<Value> = vec![
-            json!({
-                "tool_call_id": "call-1",
-                "name": "bash",
-                "result": "done"
-            }),
-            json!({
-                "tool_call_id": "call-2",
-                "name": "bash",
-                "result": "done"
-            }),
-        ];
-        let tool_calls = vec![
-            json!({
-                "id": "call-1",
-                "function": {"name": "bash", "arguments": "{\"command\": \"cargo test\"}"}
-            }),
-            json!({
-                "id": "call-2",
-                "function": {"name": "bash", "arguments": "{\"command\": \"cargo fmt\"}"}
-            }),
-        ];
-        Value::Object(build_turn_hook_args(
-            "user-1",
-            "session-1",
-            &messages,
-            &tool_results,
-            "Ran both commands.",
-            &tool_calls,
-            None,
-            Some("gpt-4"),
-            Some("agent-1"),
-            Some("evt-query-5"),
-            turn,
             None,
             false,
             true,
@@ -1375,10 +972,6 @@ mod inprocess_hook_contract_tests {
             json!("{\"command\": \"ls src/\"}")
         );
         assert_eq!(
-            audit.decision_output["action_profiles"][0]["verifier"]["criteria_total"],
-            1
-        );
-        assert_eq!(
             audit.decision_output["action_profiles"][0]["profile"]["category"],
             "read"
         );
@@ -1386,7 +979,6 @@ mod inprocess_hook_contract_tests {
             audit.decision_output["action_profiles"][0]["profile"]["bounded"],
             false
         );
-        assert!(audit.decision_output["mutation_objective_score"].is_null());
 
         let selection = plan
             .skill_selection
@@ -1543,136 +1135,6 @@ mod inprocess_hook_contract_tests {
     }
 
     #[tokio::test]
-    async fn hook_extracts_verifier_summary_from_result_payload() {
-        let hook_writer = RecordingHookDbWriter::default();
-        let reflection_store = RecordingReflectionStateStore::default();
-        let lesson_writer = RecordingReflectionLessonWriter::default();
-        let observer = RecordingObserverWorker::default();
-
-        run_bridge_hook_side_effects(
-            Some(build_hook_payload_with_result_shaped_verifier()),
-            Arc::new(hook_writer.clone()),
-            Arc::new(reflection_store),
-            Arc::new(lesson_writer),
-            Arc::new(observer),
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let plans = hook_writer.plans.lock().await;
-        let audit = plans[0]
-            .decision_audit
-            .as_ref()
-            .expect("decision_audit missing");
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["verifier"]["all_required_passed"],
-            json!(false)
-        );
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["verifier"]["criteria_total"],
-            json!(1)
-        );
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["verifier"]["failing_criteria"],
-            json!(["tests"])
-        );
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["verifier_source"],
-            json!("tool_result")
-        );
-    }
-
-    #[tokio::test]
-    async fn hook_uses_turn_journal_verification_as_single_action_fallback() {
-        let temp = tempdir().expect("tempdir");
-        let _guard = JournalDirGuard::new(temp.path());
-        let writer = JournalWriter::new("session-1").expect("journal writer");
-        writer
-            .append(&JournalEvent::verification_completed(
-                Some("session-1"),
-                4,
-                "subtask-1",
-                "global",
-                false,
-                &json!([
-                    {"check": "unit-tests", "passed": true},
-                    {"check": "integration-tests", "passed": false}
-                ]),
-            ))
-            .expect("append verification");
-
-        let hook_writer = RecordingHookDbWriter::default();
-        let reflection_store = RecordingReflectionStateStore::default();
-        let lesson_writer = RecordingReflectionLessonWriter::default();
-        let observer = RecordingObserverWorker::default();
-
-        run_bridge_hook_side_effects(
-            Some(build_hook_payload_with_single_tool_and_no_verifier(4)),
-            Arc::new(hook_writer.clone()),
-            Arc::new(reflection_store),
-            Arc::new(lesson_writer),
-            Arc::new(observer),
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let plans = hook_writer.plans.lock().await;
-        let audit = plans[0]
-            .decision_audit
-            .as_ref()
-            .expect("decision_audit missing");
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["verifier"]["criteria_total"],
-            json!(2)
-        );
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["verifier"]["criteria_passed"],
-            json!(1)
-        );
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["verifier"]["failing_criteria"],
-            json!(["integration-tests"])
-        );
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["verifier_source"],
-            json!("turn_journal")
-        );
-    }
-
-    #[tokio::test]
-    async fn hook_marks_missing_verifier_signal_for_single_action_turns() {
-        let hook_writer = RecordingHookDbWriter::default();
-        let reflection_store = RecordingReflectionStateStore::default();
-        let lesson_writer = RecordingReflectionLessonWriter::default();
-        let observer = RecordingObserverWorker::default();
-
-        run_bridge_hook_side_effects(
-            Some(build_hook_payload_with_single_tool_and_no_verifier(6)),
-            Arc::new(hook_writer.clone()),
-            Arc::new(reflection_store),
-            Arc::new(lesson_writer),
-            Arc::new(observer),
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let plans = hook_writer.plans.lock().await;
-        let audit = plans[0]
-            .decision_audit
-            .as_ref()
-            .expect("decision_audit missing");
-        assert!(
-            audit.decision_output["action_profiles"][0]
-                .get("verifier")
-                .is_none()
-        );
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["verifier_gap"],
-            json!("no_verifier_signal")
-        );
-    }
-
-    #[tokio::test]
     async fn hook_marks_blocked_tool_results_as_rejected_execution_outcomes() {
         let hook_writer = RecordingHookDbWriter::default();
         let reflection_store = RecordingReflectionStateStore::default();
@@ -1697,65 +1159,6 @@ mod inprocess_hook_contract_tests {
         assert_eq!(
             audit.decision_output["action_profiles"][0]["execution_outcome"]["outcome"],
             json!("rejected")
-        );
-    }
-
-    #[tokio::test]
-    async fn hook_skips_turn_journal_fallback_for_multi_action_turns() {
-        let temp = tempdir().expect("tempdir");
-        let _guard = JournalDirGuard::new(temp.path());
-        let writer = JournalWriter::new("session-1").expect("journal writer");
-        writer
-            .append(&JournalEvent::verification_completed(
-                Some("session-1"),
-                5,
-                "subtask-1",
-                "global",
-                false,
-                &json!([
-                    {"check": "unit-tests", "passed": true},
-                    {"check": "integration-tests", "passed": false}
-                ]),
-            ))
-            .expect("append verification");
-
-        let hook_writer = RecordingHookDbWriter::default();
-        let reflection_store = RecordingReflectionStateStore::default();
-        let lesson_writer = RecordingReflectionLessonWriter::default();
-        let observer = RecordingObserverWorker::default();
-
-        run_bridge_hook_side_effects(
-            Some(build_hook_payload_with_multiple_tools_and_no_verifier(5)),
-            Arc::new(hook_writer.clone()),
-            Arc::new(reflection_store),
-            Arc::new(lesson_writer),
-            Arc::new(observer),
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let plans = hook_writer.plans.lock().await;
-        let audit = plans[0]
-            .decision_audit
-            .as_ref()
-            .expect("decision_audit missing");
-        assert!(
-            audit.decision_output["action_profiles"][0]
-                .get("verifier")
-                .is_none()
-        );
-        assert!(
-            audit.decision_output["action_profiles"][1]
-                .get("verifier")
-                .is_none()
-        );
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["verifier_gap"],
-            json!("ambiguous_multi_action_turn")
-        );
-        assert_eq!(
-            audit.decision_output["action_profiles"][1]["verifier_gap"],
-            json!("ambiguous_multi_action_turn")
         );
     }
 

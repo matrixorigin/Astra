@@ -89,9 +89,6 @@ fn take_plan_context(
 }
 
 /// Create a `Box<dyn ToolSelector>` for the background plan executor.
-///
-/// Shares `entity_graph` / `pattern_library` / `calibrator` with
-/// [`plan_executor::BackgroundPlanContext`] when all three are present.
 fn create_background_selector(
     ctx: &plan_executor::BackgroundPlanContext,
 ) -> Box<dyn astra_runtime::tool_selector::ToolSelector> {

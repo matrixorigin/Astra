@@ -1,32 +1,24 @@
-//! Cloud tool-health and preference sync with MatrixOne.
+//! Cloud preference sync with MatrixOne.
 //!
-//! The older self-evolution subsystem (entity graph, pattern library,
-//! progressive calibrator, delta snapshots) has been removed. What remains
-//! is a tool-health-only LearningSnapshot plus user preferences.
+//! Tool-health and pattern sync has been removed. What remains is
+//! user-preference sync.
 //!
 //! ## Sync Flow
 //!
-//! - **Pull at startup**: [`try_cloud_pull`] returns cloud tool health + version.
-//! - **Push on exit / checkpoint**: [`try_cloud_push_versioned`] writes the
-//!   tool-health-only snapshot back under optimistic locking.
 //! - **Preferences**: [`try_cloud_pull_preferences`] / [`try_cloud_push_preferences`].
 
 use astra_core::resolve_database_name_or;
 use astra_services::session_journal;
 use astra_services::state_sync::{MatrixOneSyncService, StateSyncService, pref_keys};
-use astra_turn_core::tool_health_persistence::{
-    LearningSnapshot, ToolHealthEntry, build_snapshot, save_synced_tool_health,
-};
+use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use crossterm::style::Stylize;
 
 use super::repl_turn::enqueue_ingestion_pub;
 use super::{ExplainMode, ReplState};
 
-/// Result from cloud pull including tool health and version for optimistic locking.
+/// Result from cloud pull attempt at session start.
 pub(super) struct CloudPullResult {
-    pub tool_health: Vec<ToolHealthEntry>,
-    pub version: Option<i64>,
-    /// True when MatrixOne was reachable and versioned pull was attempted (may return no row).
+    /// True when MatrixOne was reachable.
     pub cloud_reachable: bool,
 }
 
@@ -51,60 +43,11 @@ pub(super) async fn try_connect_matrixone() -> Option<sqlx::Pool<sqlx::MySql>> {
         .ok()
 }
 
-/// Try to pull tool-health state from MatrixOne.
-/// Best-effort: silently skips if cloud is unavailable.
-/// Returns tool health entries and cloud version for optimistic locking.
-pub(super) async fn try_cloud_pull(profile_name: &str) -> CloudPullResult {
-    let pool = match try_connect_matrixone().await {
-        Some(p) => p,
-        None => {
-            return CloudPullResult {
-                tool_health: Vec::new(),
-                version: None,
-                cloud_reachable: false,
-            };
-        }
-    };
-    tracing::info!(
-        target: "astra_cli::cloud_sync",
-        profile = %profile_name,
-        operation = "pull_learning",
-        "starting MatrixOne learning pull"
-    );
-    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let svc = MatrixOneSyncService::new(pool, flusher.writer.clone());
-    let user_id = astra_core::cli_user_id();
-    let out = StateSyncService::pull_learning_versioned(&svc, &user_id, profile_name).await;
-    drain_ephemeral_audit(svc, flusher).await;
-    match out {
-        Ok(Some(versioned)) => {
-            let cloud_health = serde_json::from_str::<LearningSnapshot>(&versioned.json)
-                .map(|s| s.tool_health)
-                .unwrap_or_default();
-            eprintln!(
-                "{}",
-                format!("  ✓ Cloud tool-health pulled (v{})", versioned.version).dim()
-            );
-            CloudPullResult {
-                tool_health: cloud_health,
-                version: Some(versioned.version),
-                cloud_reachable: true,
-            }
-        }
-        Ok(None) => CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
-            cloud_reachable: true,
-        },
-        Err(e) => {
-            eprintln!("{}", format!("  ⚠ Cloud pull skipped: {e}").dim());
-            CloudPullResult {
-                tool_health: Vec::new(),
-                version: None,
-                cloud_reachable: true,
-            }
-        }
-    }
+/// Check whether MatrixOne is reachable for downstream preference sync.
+/// Best-effort: silently returns unreachable when cloud is unavailable.
+pub(super) async fn try_cloud_pull(_profile_name: &str) -> CloudPullResult {
+    let cloud_reachable = try_connect_matrixone().await.is_some();
+    CloudPullResult { cloud_reachable }
 }
 
 /// Shut down an ephemeral audit flusher: drop all senders, cancel the token,
@@ -123,66 +66,6 @@ async fn drain_ephemeral_audit(
             tracing::warn!(target: "cloud_sync", "audit flusher drain timed out (5s), some entries may be lost")
         }
     }
-}
-
-/// Push tool-health state to cloud with optimistic locking.
-/// Returns the new cloud version if successful, or None on conflict/failure.
-/// On conflict, the caller should pull fresh data and retry.
-pub(super) async fn try_cloud_push_versioned(
-    profile_name: &str,
-    tool_health: &[ToolHealthEntry],
-    expected_version: Option<i64>,
-) -> Option<i64> {
-    let pool = match try_connect_matrixone().await {
-        Some(p) => p,
-        None => return None,
-    };
-    let snapshot = build_snapshot(tool_health, &[]);
-    let json = match serde_json::to_string(&snapshot) {
-        Ok(j) => j,
-        Err(_) => return None,
-    };
-    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let svc = MatrixOneSyncService::new(pool, flusher.writer.clone());
-    let user_id = astra_core::cli_user_id();
-    let result = StateSyncService::push_learning_versioned(
-        &svc,
-        &user_id,
-        profile_name,
-        &json,
-        0,
-        0,
-        false,
-        expected_version,
-    )
-    .await;
-    drain_ephemeral_audit(svc, flusher).await;
-
-    if result.is_conflict {
-        eprintln!(
-            "{}",
-            "  ⚠ Cloud sync conflict (another session updated)".yellow()
-        );
-        return None;
-    }
-
-    if result.success {
-        if let Err(e) = save_synced_tool_health(profile_name, tool_health) {
-            eprintln!(
-                "{}",
-                format!("  ⚠ Tool-health sync metadata not saved: {e}").dim()
-            );
-        }
-        if let Some(v) = result.new_version {
-            return Some(v);
-        }
-    } else if !result.message.is_empty() {
-        eprintln!(
-            "{}",
-            format!("  ⚠ Cloud push skipped: {}", result.message).dim()
-        );
-    }
-    result.new_version
 }
 
 /// Pull user preferences from cloud at session start.
@@ -278,15 +161,14 @@ pub(super) async fn try_cloud_push_preferences(state: &ReplState) {
 // ═══════════════════════════════════════════ Journal Helpers ═══════════════════════
 
 /// When set to `1`, `repl_startup` also journals a sync marker if MatrixOne was reachable but
-/// returned no learning rows, tool health, or preferences (audit / connectivity proof).
+/// returned no preferences (audit / connectivity proof).
 pub(super) const ASTRA_JOURNAL_CLOUD_EMPTY_ACK: &str = "ASTRA_JOURNAL_CLOUD_EMPTY_ACK";
 
 pub(super) fn cloud_pull_warrants_sync_marker(
     pull: &CloudPullResult,
     pref_keys: &[String],
 ) -> bool {
-    pull.cloud_reachable
-        && (pull.version.is_some() || !pull.tool_health.is_empty() || !pref_keys.is_empty())
+    pull.cloud_reachable && !pref_keys.is_empty()
 }
 
 fn cloud_pull_empty_ack_desired_for_source(source: &str) -> bool {
@@ -329,9 +211,6 @@ pub(super) fn append_cloud_pull_sync_journal(
         Some(sid),
         profile,
         source,
-        pull.version,
-        pull.version.is_some(),
-        pull.tool_health.len(),
         pref_keys,
         reachable_empty_ack,
     );
@@ -343,18 +222,10 @@ pub(super) fn append_cloud_pull_sync_journal(
     }
 }
 
-/// Re-sync tool health and preferences from cloud after authentication.
+/// Re-sync preferences from cloud after authentication.
 pub(crate) async fn post_auth_cloud_resync(profile: Option<&str>, state: &mut ReplState) {
     let profile_name = profile.unwrap_or("default");
     let pull = try_cloud_pull(profile_name).await;
-    state.cloud_learning_version = pull.version.or(state.cloud_learning_version);
-    if !pull.tool_health.is_empty() {
-        let (merged, _, _) = astra_turn_core::tool_health_persistence::merge_tool_health(
-            &state.tool_health_entries,
-            &pull.tool_health,
-        );
-        state.tool_health_entries = merged;
-    }
     let pref_keys = try_cloud_pull_preferences(state).await;
     append_cloud_pull_sync_journal(state, profile_name, "post_login", &pull, &pref_keys);
 }
@@ -366,29 +237,17 @@ mod tests {
     #[test]
     fn cloud_pull_result_default_not_reachable() {
         let result = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: false,
         };
         assert!(!result.cloud_reachable);
-        assert!(result.version.is_none());
     }
 
     #[test]
     fn sync_marker_logic() {
         let empty_pull = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: true,
         };
         assert!(!cloud_pull_warrants_sync_marker(&empty_pull, &[]));
-
-        let versioned_pull = CloudPullResult {
-            tool_health: Vec::new(),
-            version: Some(42),
-            cloud_reachable: true,
-        };
-        assert!(cloud_pull_warrants_sync_marker(&versioned_pull, &[]));
 
         // With pref keys
         assert!(cloud_pull_warrants_sync_marker(
@@ -400,8 +259,6 @@ mod tests {
     #[test]
     fn journal_append_decision() {
         let unreachable = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: false,
         };
         assert!(!should_append_cloud_pull_journal(
@@ -412,8 +269,6 @@ mod tests {
 
         // post_login always journals if reachable
         let reachable_empty = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: true,
         };
         assert!(should_append_cloud_pull_journal(

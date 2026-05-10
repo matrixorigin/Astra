@@ -307,7 +307,7 @@ pub(crate) use repl_state::{ExplainMode, ReplState, SkillDevState};
 pub(crate) use cloud_sync::post_auth_cloud_resync;
 use cloud_sync::{
     append_cloud_pull_sync_journal, try_cloud_pull, try_cloud_pull_preferences,
-    try_cloud_push_preferences, try_cloud_push_versioned,
+    try_cloud_push_preferences,
 };
 
 // ═══════════════════════════════════════════════════════ Task Commands ════
@@ -391,7 +391,6 @@ async fn run_chat_repl(
     let repl_startup::ReplStartupArtifacts {
         selector,
         pipeline_modules: _pipeline_modules,
-        profile_name_str,
         mut edge_heartbeat_task,
         skill_quality_path,
         pinned_skills_path,
@@ -571,10 +570,6 @@ async fn run_chat_repl(
                         if should_exit {
                             break ReplExit::Command;
                         }
-                        // Legacy learning-snapshot merge was a no-op here now that
-                        // entity/pattern/calibration state has been removed. Drop the
-                        // deposited snapshot if `/resume` attached one.
-                        state.learning_snapshot = None;
 
                         // /ask (and future slash commands) can queue a message for
                         // immediate dispatch — send it as if the user typed it.
@@ -629,10 +624,6 @@ async fn run_chat_repl(
                                 if should_exit {
                                     break ReplExit::Command;
                                 }
-                                // Legacy learning-snapshot merge was a no-op here now that
-                                // entity/pattern/calibration state has been removed. Drop the
-                                // deposited snapshot if `/resume` attached one.
-                                state.learning_snapshot = None;
                                 if state.executing_plan.is_some() && state.plan_mode.is_none() {
                                     start_and_monitor_plan(
                                         &mut state,
@@ -845,42 +836,6 @@ async fn run_chat_repl(
                         // Keep panic guard in sync with current session state.
                         if let Some(ref sid) = state.session_id {
                             update_panic_guard(sid, state.turn);
-                        }
-
-                        // Periodic tool-health sync: push to cloud at checkpoint boundaries
-                        // to prevent data loss on crash (every CHECKPOINT_INTERVAL turns)
-                        if state.matrix_runtime.is_some()
-                            && state.turn > 0
-                            && state.turn.is_multiple_of(
-                                astra_services::session_checkpoint::CHECKPOINT_INTERVAL,
-                            )
-                        {
-                            if let Some(new_version) = try_cloud_push_versioned(
-                                &profile_name_str,
-                                &state.tool_health_entries,
-                                state.cloud_learning_version,
-                            )
-                            .await
-                            {
-                                state.cloud_learning_version = Some(new_version);
-                                state.synced_tool_health_entries =
-                                    state.tool_health_entries.clone();
-                                // Update orchestrator envelope to reflect the push
-                                if let Some(ref mc) = state.matrix_runtime {
-                                    let orch = mc.sync_orchestrator_lock().await;
-                                    if let Some(mut env) =
-                                        orch.envelope(astra_services::SyncDomain::Learning)
-                                    {
-                                        env.mark_synced(new_version as u64);
-                                        orch.update_envelope(
-                                            astra_services::SyncDomain::Learning,
-                                            env,
-                                        );
-                                    }
-                                }
-                            }
-                            // On conflict, we skip this push — the final push at session end
-                            // will resolve conflicts via pull-merge-push cycle
                         }
 
                         // --max-budget enforcement: check accumulated cost against budget limit
@@ -2007,111 +1962,7 @@ total_tokens_out: 3
         // that the journal exists, not that the user owns it. This is a known limitation.
     }
 
-    // ── Learning snapshot restoration ────────────────────────────────────────
-
-    #[tokio::test]
-    async fn resume_restores_learning_snapshot() {
-        use astra_services::session_restore::RestoredSession;
-
-        // Create a mock RestoredSession with learning snapshot
-        let restored = RestoredSession {
-            session_id: "test-learning".into(),
-            turn_count: 5,
-            total_tokens_in: 1000,
-            total_tokens_out: 500,
-            recent_tools: vec!["grep".into()],
-            learning_snapshot_json: Some(
-                r#"{"entities":["Rust","MatrixOne"],"patterns":["*.rs"]}"#.into(),
-            ),
-            checkpoint_count: 1,
-            last_status: "active".into(),
-            git_branch: Some("main".into()),
-            model: Some("gpt-4o".into()),
-            title: Some("Test".into()),
-            restored_from_cloud: true, // Cloud restore has learning
-            ..Default::default()
-        };
-
-        // Verify the learning snapshot is present
-        assert!(restored.learning_snapshot_json.is_some());
-        let json = restored.learning_snapshot_json.as_ref().unwrap();
-        assert!(json.contains("Rust"));
-        assert!(json.contains("MatrixOne"));
-
-        // Simulate what handle_resume_command does
-        let learning_snapshot = if let Some(ref l) = restored.learning_snapshot_json {
-            if !l.is_empty() { Some(l.clone()) } else { None }
-        } else {
-            None
-        };
-
-        assert!(learning_snapshot.is_some());
-        assert_eq!(learning_snapshot.unwrap().as_str(), json);
-    }
-
-    #[tokio::test]
-    async fn resume_local_restore_has_no_learning_snapshot() {
-        use astra_services::session_restore::RestoredSession;
-
-        // Local restore should not have learning snapshot
-        let restored = RestoredSession {
-            session_id: "test-local".into(),
-            turn_count: 3,
-            total_tokens_in: 500,
-            total_tokens_out: 200,
-            recent_tools: vec![],
-            learning_snapshot_json: None, // Local restore doesn't have this
-            checkpoint_count: 1,
-            last_status: "active".into(),
-            git_branch: None,
-            model: None,
-            title: None,
-            restored_from_cloud: false,
-            ..Default::default()
-        };
-
-        assert!(restored.learning_snapshot_json.is_none());
-    }
-
     // ── Edge cases ───────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn resume_handles_empty_learning_snapshot() {
-        use astra_services::session_restore::RestoredSession;
-
-        // Empty string should be treated as None
-        let restored = RestoredSession {
-            learning_snapshot_json: Some("".into()),
-            ..Default::default()
-        };
-
-        // Simulate the logic in handle_resume_command
-        let learning_snapshot = if let Some(ref l) = restored.learning_snapshot_json {
-            if !l.is_empty() { Some(l.clone()) } else { None }
-        } else {
-            None
-        };
-
-        assert!(
-            learning_snapshot.is_none(),
-            "empty string should be ignored"
-        );
-    }
-
-    #[tokio::test]
-    async fn resume_handles_invalid_learning_json() {
-        use astra_services::session_restore::RestoredSession;
-
-        // Invalid JSON should still be stored (will fail at merge time)
-        let restored = RestoredSession {
-            learning_snapshot_json: Some("not valid json {{{".into()),
-            ..Default::default()
-        };
-
-        assert!(restored.learning_snapshot_json.is_some());
-        let json = restored.learning_snapshot_json.as_ref().unwrap();
-        assert!(json.contains("{"));
-    }
 
     #[tokio::test]
     async fn resume_handles_malformed_workspace_yaml() {
@@ -2180,71 +2031,6 @@ total_tokens_out: 3
         assert_eq!(result.model.as_deref(), Some("gpt-4o"));
         assert_eq!(result.last_status, "local");
         assert!(!result.restored_from_cloud);
-    }
-
-    // ── Integration: full resume flow simulation ─────────────────────────────
-
-    #[tokio::test]
-    async fn resume_full_flow_cloud_restore() {
-        use astra_services::session_restore::RestoredSession;
-
-        // Simulate a complete cloud restore scenario
-        let restored = RestoredSession {
-            session_id: "cloud-sess-123".into(),
-            turn_count: 42,
-            total_tokens_in: 150_000,
-            total_tokens_out: 80_000,
-            recent_tools: vec!["git".into(), "bash".into(), "grep".into()],
-            learning_snapshot_json: Some(
-                r#"{"entities":["Rust","SQL"],"patterns":["*.rs"]}"#.into(),
-            ),
-            checkpoint_count: 5,
-            last_status: "active".into(),
-            git_branch: Some("feature/resume".into()),
-            model: Some("claude-3-opus".into()),
-            title: Some("Implement session resume".into()),
-            restored_from_cloud: true,
-            ..Default::default()
-        };
-        assert_eq!(restored.session_id, "cloud-sess-123");
-        assert_eq!(restored.turn_count, 42);
-        assert!(restored.restored_from_cloud);
-        assert!(restored.learning_snapshot_json.is_some());
-        assert_eq!(restored.recent_tools.len(), 3);
-
-        // Simulate state application
-        let mut state = super::ReplState::default();
-        #[allow(clippy::field_reassign_with_default)]
-        {
-            state.session_id = Some(restored.session_id.clone());
-            state.turn = restored.turn_count;
-            state.total_prompt_tokens = restored.total_tokens_in;
-            state.total_completion_tokens = restored.total_tokens_out;
-            state.recent_tools = restored.recent_tools.clone();
-            state.model = restored.model.clone();
-            if let Some(ref m) = state.model {
-                state.cached_pricing = slash_stats::fallback_pricing(m);
-                // M3: Use RuntimeConfig-driven context budget on session restore (test code)
-                state.context_budget =
-                    prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(m));
-            }
-        }
-
-        // Apply learning snapshot
-        if let Some(ref l) = restored.learning_snapshot_json
-            && !l.is_empty()
-        {
-            state.learning_snapshot = Some(l.clone());
-        }
-
-        // Verify state
-        assert_eq!(state.session_id, Some("cloud-sess-123".into()));
-        assert_eq!(state.turn, 42);
-        assert_eq!(state.total_prompt_tokens, 150_000);
-        assert_eq!(
-            state.learning_snapshot.unwrap(),
-            r#"{"entities":["Rust","SQL"],"patterns":["*.rs"]}"#
-        );
     }
 
     // ── Checkpoint listing ───────────────────────────────────────────────────
@@ -2625,12 +2411,9 @@ total_tokens_out: 500
     #[test]
     fn display_sync_status_no_crash_full_data() {
         let status = astra_services::SyncStatus {
-            learning_last_push: Some(chrono::Utc::now().to_rfc3339()),
-            learning_last_pull: Some(chrono::Utc::now().to_rfc3339()),
             preferences_last_sync: Some(chrono::Utc::now().to_rfc3339()),
             pending_pushes: 2,
             last_error: Some("connection reset by peer".into()),
-            cloud_version: None,
         };
         slash_health::display_sync_status(&status);
     }
@@ -2672,29 +2455,13 @@ total_tokens_out: 500
     #[test]
     fn cloud_pull_warrants_sync_marker_only_when_reachable_and_nonempty() {
         let dead = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: false,
         };
         assert!(!cloud_pull_warrants_sync_marker(&dead, &[]));
-        let offline_version = CloudPullResult {
-            tool_health: Vec::new(),
-            version: Some(9),
-            cloud_reachable: false,
-        };
-        assert!(!cloud_pull_warrants_sync_marker(&offline_version, &[]));
         let online_empty = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: true,
         };
         assert!(!cloud_pull_warrants_sync_marker(&online_empty, &[]));
-        let online_version = CloudPullResult {
-            tool_health: Vec::new(),
-            version: Some(3),
-            cloud_reachable: true,
-        };
-        assert!(cloud_pull_warrants_sync_marker(&online_version, &[]));
         assert!(cloud_pull_warrants_sync_marker(
             &online_empty,
             &["explain_mode".into()]
@@ -2704,8 +2471,6 @@ total_tokens_out: 500
     #[test]
     fn should_append_cloud_pull_journal_post_login_reachable_empty() {
         let pull = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: true,
         };
         assert!(should_append_cloud_pull_journal(&pull, &[], "post_login"));
@@ -2718,8 +2483,6 @@ total_tokens_out: 500
             std::env::remove_var(ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
         }
         let pull = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: true,
         };
         assert!(!should_append_cloud_pull_journal(
@@ -2733,8 +2496,6 @@ total_tokens_out: 500
     #[test]
     fn should_append_repl_startup_when_empty_ack_env_set() {
         let pull = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: true,
         };
         unsafe {
@@ -2757,8 +2518,6 @@ total_tokens_out: 500
     #[test]
     fn append_cloud_pull_sync_journal_skips_without_session_id() {
         let pull = CloudPullResult {
-            tool_health: Vec::new(),
-            version: Some(1),
             cloud_reachable: true,
         };
         let state = ReplState::default();
@@ -2773,8 +2532,6 @@ total_tokens_out: 500
             ..Default::default()
         };
         let pull = CloudPullResult {
-            tool_health: Vec::new(),
-            version: Some(99),
             cloud_reachable: true,
         };
         let prefs = vec!["explain_mode".to_string()];
@@ -2792,10 +2549,6 @@ total_tokens_out: 500
             .expect("cloud_pull");
         assert_eq!(cp.get("profile").and_then(|v| v.as_str()), Some("work"));
         assert_eq!(
-            cp.get("learning_version").and_then(|v| v.as_i64()),
-            Some(99)
-        );
-        assert_eq!(
             cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
             Some(false)
         );
@@ -2810,8 +2563,6 @@ total_tokens_out: 500
             ..Default::default()
         };
         let pull = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: true,
         };
         append_cloud_pull_sync_journal(&state, "default", "post_login", &pull, &[]);
@@ -2836,27 +2587,9 @@ total_tokens_out: 500
         }
         let result = try_cloud_pull("default").await;
         assert!(
-            result.tool_health.is_empty(),
-            "Without MatrixOne, cloud pull should return empty tool health"
-        );
-        assert!(
-            result.version.is_none(),
-            "Without MatrixOne, cloud pull should return no version"
-        );
-        assert!(
             !result.cloud_reachable,
             "Without MatrixOne, cloud should be unreachable"
         );
-    }
-
-    #[tokio::test]
-    async fn try_cloud_push_is_noop_without_matrixone() {
-        unsafe {
-            std::env::remove_var("MATRIXONE_HOST");
-        }
-        // Should not panic (was the original bug)
-        // Use versioned API (None = new snapshot or unconditional push)
-        let _result = try_cloud_push_versioned("default", &[], None).await;
     }
 
     #[tokio::test]

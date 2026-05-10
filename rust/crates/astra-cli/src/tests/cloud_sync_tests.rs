@@ -81,12 +81,9 @@ fn display_sync_status_no_crash_all_none() {
 #[test]
 fn display_sync_status_no_crash_full_data() {
     let status = astra_services::SyncStatus {
-        learning_last_push: Some(chrono::Utc::now().to_rfc3339()),
-        learning_last_pull: Some(chrono::Utc::now().to_rfc3339()),
         preferences_last_sync: Some(chrono::Utc::now().to_rfc3339()),
         pending_pushes: 2,
         last_error: Some("connection reset by peer".into()),
-        cloud_version: None,
     };
     slash_health::display_sync_status(&status);
 }
@@ -106,11 +103,10 @@ async fn slash_health_offline_shows_cloud_section() {
     assert!(!exit);
 }
 
-// ── Cloud sync regression tests (block_on panic fix cc6d011) ────
+// ── Cloud sync regression tests ─────────────────────────────────────
 // These tests verify the async cloud sync functions don't panic when
-// called from within a tokio runtime (the original bug was block_on
-// inside an existing runtime). We unset MATRIXONE_HOST so they take
-// the graceful-fallback path.
+// called from within a tokio runtime. We unset MATRIXONE_HOST so they
+// take the graceful-fallback path.
 
 #[tokio::test]
 async fn try_connect_matrixone_returns_none_without_env_vars() {
@@ -128,29 +124,13 @@ async fn try_connect_matrixone_returns_none_without_env_vars() {
 #[test]
 fn cloud_pull_warrants_sync_marker_only_when_reachable_and_nonempty() {
     let dead = CloudPullResult {
-        tool_health: Vec::new(),
-        version: None,
         cloud_reachable: false,
     };
     assert!(!cloud_pull_warrants_sync_marker(&dead, &[]));
-    let offline_version = CloudPullResult {
-        tool_health: Vec::new(),
-        version: Some(9),
-        cloud_reachable: false,
-    };
-    assert!(!cloud_pull_warrants_sync_marker(&offline_version, &[]));
     let online_empty = CloudPullResult {
-        tool_health: Vec::new(),
-        version: None,
         cloud_reachable: true,
     };
     assert!(!cloud_pull_warrants_sync_marker(&online_empty, &[]));
-    let online_version = CloudPullResult {
-        tool_health: Vec::new(),
-        version: Some(3),
-        cloud_reachable: true,
-    };
-    assert!(cloud_pull_warrants_sync_marker(&online_version, &[]));
     assert!(cloud_pull_warrants_sync_marker(
         &online_empty,
         &["explain_mode".into()]
@@ -160,8 +140,6 @@ fn cloud_pull_warrants_sync_marker_only_when_reachable_and_nonempty() {
 #[test]
 fn should_append_cloud_pull_journal_post_login_reachable_empty() {
     let pull = CloudPullResult {
-        tool_health: Vec::new(),
-        version: None,
         cloud_reachable: true,
     };
     assert!(should_append_cloud_pull_journal(&pull, &[], "post_login"));
@@ -174,8 +152,6 @@ fn should_append_cloud_pull_journal_repl_startup_empty_without_env() {
         std::env::remove_var(super::ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
     }
     let pull = CloudPullResult {
-        tool_health: Vec::new(),
-        version: None,
         cloud_reachable: true,
     };
     assert!(!should_append_cloud_pull_journal(
@@ -189,8 +165,6 @@ fn should_append_cloud_pull_journal_repl_startup_empty_without_env() {
 #[test]
 fn should_append_repl_startup_when_empty_ack_env_set() {
     let pull = CloudPullResult {
-        tool_health: Vec::new(),
-        version: None,
         cloud_reachable: true,
     };
     unsafe {
@@ -213,8 +187,6 @@ fn should_append_repl_startup_when_empty_ack_env_set() {
 #[test]
 fn append_cloud_pull_sync_journal_skips_without_session_id() {
     let pull = CloudPullResult {
-        tool_health: Vec::new(),
-        version: Some(1),
         cloud_reachable: true,
     };
     let state = ReplState::default();
@@ -229,8 +201,6 @@ fn append_cloud_pull_sync_journal_writes_sync_marker_jsonl() {
         ..Default::default()
     };
     let pull = CloudPullResult {
-        tool_health: Vec::new(),
-        version: Some(99),
         cloud_reachable: true,
     };
     let prefs = vec!["explain_mode".to_string()];
@@ -248,10 +218,6 @@ fn append_cloud_pull_sync_journal_writes_sync_marker_jsonl() {
         .expect("cloud_pull");
     assert_eq!(cp.get("profile").and_then(|v| v.as_str()), Some("work"));
     assert_eq!(
-        cp.get("learning_version").and_then(|v| v.as_i64()),
-        Some(99)
-    );
-    assert_eq!(
         cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
         Some(false)
     );
@@ -266,8 +232,6 @@ fn append_cloud_pull_post_login_reachable_empty_writes_marker() {
         ..Default::default()
     };
     let pull = CloudPullResult {
-        tool_health: Vec::new(),
-        version: None,
         cloud_reachable: true,
     };
     append_cloud_pull_sync_journal(&state, "default", "post_login", &pull, &[]);
@@ -292,26 +256,9 @@ async fn try_cloud_pull_returns_empty_without_matrixone() {
     }
     let result = try_cloud_pull("default").await;
     assert!(
-        result.tool_health.is_empty(),
-        "Without MatrixOne, cloud pull should return empty tool health"
-    );
-    assert!(
-        result.version.is_none(),
-        "Without MatrixOne, cloud pull should return no version"
-    );
-    assert!(
         !result.cloud_reachable,
         "Without MatrixOne, cloud should be unreachable"
     );
-}
-
-#[tokio::test]
-async fn try_cloud_push_is_noop_without_matrixone() {
-    unsafe {
-        std::env::remove_var("MATRIXONE_HOST");
-    }
-    // Should not panic — reduces to a no-op without MatrixOne reachable.
-    let _result = try_cloud_push_versioned("default", &[], None).await;
 }
 
 #[tokio::test]

@@ -4,8 +4,8 @@
 //! active skills, session plan) is re-injected into the conversation so the
 //! LLM doesn't lose access to it.
 //!
-//! Attachment selection uses ToolSelector's learned_context for file hotness
-//! rather than a separate read-cache.
+//! Attachment selection pulls recently-read files from `recent_file_reads`
+//! tracked on `AgenticLoopState`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

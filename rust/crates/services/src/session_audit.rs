@@ -8,12 +8,6 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 
-use crate::evaluation::{DatabaseEvaluationService, EvaluationService};
-use crate::{
-    MutationPromotionEvaluationContext, MutationPromotionRecommendation, MutationRetentionVerdict,
-    MutationSafetyVerdict, MutationScoreboard, PersistedMutationDecision, StagedMutation,
-    StagedMutationState,
-};
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
@@ -246,21 +240,8 @@ pub struct CrossSessionStats {
     pub avg_turns_per_session: f64,
     pub avg_tokens_per_session: f64,
     pub tool_error_rate: f64,
-    pub total_mutations: u32,
-    pub ready_mutations: u32,
-    pub approval_required_mutations: u32,
-    pub applied_mutations: u32,
-    pub reverted_mutations: u32,
-    pub blocked_mutations: u32,
-    pub verified_mutations: u32,
-    pub missing_verifier_mutations: u32,
-    pub tool_result_verified_mutations: u32,
-    pub journal_verified_mutations: u32,
-    pub no_verifier_signal_mutations: u32,
-    pub ambiguous_multi_action_verifier_mutations: u32,
     pub total_runtime_promotions: u32,
     pub adaptive_baseline_runtime_promotions: u32,
-    pub evolution_runtime_promotions: u32,
     pub promoted_runtime_promotions: u32,
     pub deferred_runtime_promotions: u32,
     pub queued_runtime_promotions: u32,
@@ -302,20 +283,11 @@ pub struct CrossSessionToolAnalytics {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CrossSessionMutationListResponse {
-    pub mutations: Vec<crate::StagedMutation>,
-    pub total: u32,
-    pub page: u32,
-    pub per_page: u32,
-}
-
 pub const RUNTIME_PROMOTION_EVENT_TYPE: &str = "runtime_promotion_verdict";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimePromotionController {
-    Evolution,
     AdaptiveBaseline,
 }
 
@@ -431,21 +403,10 @@ pub struct CrossSessionRuntimePromotionListResponse {
     pub per_page: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MutationVerifierSignalFilter {
-    Present,
-    Missing,
-}
-
 const MAX_AUDIT_SESSIONS_PER_PAGE: u32 = 100;
 const MAX_CROSS_SESSION_TOOLS: i64 = 100;
-const MAX_CROSS_SESSION_MUTATIONS_PER_PAGE: u32 = 100;
 const MAX_CROSS_SESSION_PROMOTIONS_PER_PAGE: u32 = 100;
 
-/// Cap rows read for cross-session mutation inputs (wide time window or missing bounds).
-const MAX_CROSS_SESSION_MUTATION_DECISION_ROWS: i64 = 20_000;
-const MAX_CROSS_SESSION_MUTATION_EVENT_ROWS: i64 = 20_000;
 /// Runtime promotion events are paged in memory; bound DB read before filtering.
 const MAX_CROSS_SESSION_RUNTIME_PROMOTION_ROWS: i64 = 5_000;
 
@@ -494,28 +455,6 @@ pub struct CrossSessionStatsParams {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct CrossSessionMutationListParams {
-    #[serde(default = "default_page")]
-    pub page: u32,
-    #[serde(default = "default_per_page")]
-    pub per_page: u32,
-    pub since: Option<String>,
-    pub until: Option<String>,
-    pub session_id: Option<String>,
-    pub tool_name: Option<String>,
-    pub state: Option<StagedMutationState>,
-    pub promotion_recommendation: Option<MutationPromotionRecommendation>,
-    pub safety_verdict: Option<MutationSafetyVerdict>,
-    pub retention_verdict: Option<MutationRetentionVerdict>,
-    pub min_retention_score: Option<f64>,
-    pub verifier_signal: Option<MutationVerifierSignalFilter>,
-    pub verifier_source: Option<String>,
-    pub verifier_gap: Option<String>,
-    #[serde(default = "default_cross_session_mutation_sort")]
-    pub sort: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct CrossSessionRuntimePromotionListParams {
     #[serde(default = "default_page")]
     pub page: u32,
@@ -529,21 +468,6 @@ pub struct CrossSessionRuntimePromotionListParams {
     pub recommendation: Option<RuntimePromotionRecommendation>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MutationStateUpdateRequest {
-    pub state: StagedMutationState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct MutationStateOverride {
-    mutation_id: String,
-    state: StagedMutationState,
-    note: Option<String>,
-    created_at: String,
-}
-
 fn default_page() -> u32 {
     1
 }
@@ -555,9 +479,6 @@ fn default_sort() -> String {
 }
 fn default_order() -> String {
     "desc".into()
-}
-fn default_cross_session_mutation_sort() -> String {
-    "priority".into()
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -607,13 +528,6 @@ pub trait SessionAuditService: Send + Sync {
     /// List error/anomaly events in a session.
     async fn list_errors(&self, user_id: &str, session_id: &str) -> AuditResult<ErrorListResponse>;
 
-    /// Get the per-session mutation scoreboard reconstructed from decision audits.
-    async fn get_mutation_scoreboard(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> AuditResult<MutationScoreboard>;
-
     /// List runtime promotion verdicts recorded for a single session.
     async fn list_session_runtime_promotions(
         &self,
@@ -643,13 +557,6 @@ pub trait SessionAuditService: Send + Sync {
         user_id: &str,
         params: &CrossSessionStatsParams,
     ) -> AuditResult<Vec<CrossSessionToolAnalytics>>;
-
-    /// List staged mutations across the user's sessions.
-    async fn list_cross_session_mutations(
-        &self,
-        user_id: &str,
-        params: &CrossSessionMutationListParams,
-    ) -> AuditResult<CrossSessionMutationListResponse>;
 
     /// List runtime promotion verdicts across the user's sessions.
     async fn list_cross_session_runtime_promotions(
@@ -712,106 +619,6 @@ impl DatabaseSessionAuditService {
         }
     }
 
-    async fn load_cross_session_mutation_inputs(
-        &self,
-        pool: &sqlx::Pool<sqlx::MySql>,
-        user_id: &str,
-        since: Option<&str>,
-        until: Option<&str>,
-    ) -> AuditResult<(
-        Vec<PersistedMutationDecision>,
-        Vec<(String, MutationStateOverride)>,
-    )> {
-        let mut mutation_where_parts: Vec<String> = vec!["s.user_id = ?".into()];
-        let mut mutation_bind_values: Vec<String> = vec![user_id.into()];
-        if let Some(since) = since {
-            mutation_where_parts.push("d.created_at >= ?".into());
-            mutation_bind_values.push(since.to_string());
-        }
-        if let Some(until) = until {
-            mutation_where_parts.push("d.created_at <= ?".into());
-            mutation_bind_values.push(until.to_string());
-        }
-        let mutation_where_clause = mutation_where_parts.join(" AND ");
-        let decisions_sql = format!(
-            "SELECT d.decision_id, d.session_id, CAST(d.decision_output AS CHAR) AS decision_output \
-             FROM ctx_decision_audits d \
-             JOIN agent_sessions s ON s.session_id = d.session_id \
-             WHERE {mutation_where_clause} AND d.decision_type = 'tool_selection' \
-             ORDER BY d.created_at DESC LIMIT ?"
-        );
-        let mut dq = sqlx::query(&decisions_sql);
-        for v in &mutation_bind_values {
-            dq = dq.bind(v);
-        }
-        dq = dq.bind(MAX_CROSS_SESSION_MUTATION_DECISION_ROWS);
-        let mut decision_rows = dq.fetch_all(pool).await.map_err(internal_error)?;
-        decision_rows.reverse();
-        let mutation_decisions = decision_rows
-            .into_iter()
-            .map(|row| {
-                let decision_output = row
-                    .try_get::<String, _>("decision_output")
-                    .ok()
-                    .and_then(|value| serde_json::from_str(&value).ok())
-                    .unwrap_or(serde_json::Value::Null);
-                PersistedMutationDecision {
-                    decision_id: row.try_get("decision_id").unwrap_or_default(),
-                    session_id: row.try_get("session_id").unwrap_or_default(),
-                    decision_output,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let mut override_where_parts: Vec<String> = vec!["e.user_id = ?".into()];
-        let mut override_bind_values: Vec<String> = vec![user_id.into()];
-        if let Some(since) = since {
-            override_where_parts.push("e.created_at >= ?".into());
-            override_bind_values.push(since.to_string());
-        }
-        if let Some(until) = until {
-            override_where_parts.push("e.created_at <= ?".into());
-            override_bind_values.push(until.to_string());
-        }
-        let override_where_clause = override_where_parts.join(" AND ");
-        let overrides_sql = format!(
-            "SELECT e.session_id, CAST(e.metadata AS CHAR) AS metadata, \
-             CAST(e.created_at AS CHAR) AS created_at \
-             FROM agent_events e \
-             WHERE {override_where_clause} AND e.event_type = 'mutation_state' \
-             ORDER BY e.created_at DESC LIMIT ?"
-        );
-        let mut oq = sqlx::query(&overrides_sql);
-        for v in &override_bind_values {
-            oq = oq.bind(v);
-        }
-        oq = oq.bind(MAX_CROSS_SESSION_MUTATION_EVENT_ROWS);
-        let mut override_rows = oq.fetch_all(pool).await.map_err(internal_error)?;
-        override_rows.reverse();
-        let mutation_overrides = override_rows
-            .into_iter()
-            .filter_map(|row| {
-                let metadata = row
-                    .try_get::<String, _>("metadata")
-                    .ok()
-                    .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
-                    .unwrap_or(serde_json::Value::Null);
-                parse_mutation_state_override(
-                    &metadata,
-                    row.try_get::<String, _>("created_at").unwrap_or_default(),
-                )
-                .map(|override_entry| {
-                    (
-                        row.try_get("session_id").unwrap_or_default(),
-                        override_entry,
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-
-        Ok((mutation_decisions, mutation_overrides))
-    }
-
     async fn load_cross_session_runtime_promotions(
         &self,
         pool: &sqlx::Pool<sqlx::MySql>,
@@ -847,52 +654,6 @@ impl DatabaseSessionAuditService {
             .iter()
             .filter_map(runtime_promotion_record_from_row)
             .collect())
-    }
-
-    fn evaluation_service(&self) -> DatabaseEvaluationService {
-        let service = DatabaseEvaluationService::new(self.matrixone.clone());
-        if let Some(ref pool) = self.pool {
-            service.with_pool(pool.clone())
-        } else {
-            service
-        }
-    }
-
-    async fn load_mutation_promotion_context(
-        &self,
-        user_id: &str,
-        missing_verifier_rate: Option<f64>,
-    ) -> AuditResult<MutationPromotionEvaluationContext> {
-        let evaluation = self.evaluation_service();
-        let quality = evaluation.get_quality_trend(user_id, 30, None).await?;
-        let latest_gate = evaluation
-            .get_gate_history(user_id, 1)
-            .await?
-            .gates
-            .into_iter()
-            .next();
-        let calibration = evaluation.get_calibration(user_id, None, 30).await?;
-        let calibration_error_interval = if calibration.noise_filtered_sample_count > 0 {
-            calibration.noise_filtered_calibration_error_interval
-        } else {
-            calibration.calibration_error_interval
-        };
-
-        Ok(MutationPromotionEvaluationContext {
-            noise_filtered_quality: Some(quality.noise_filtered_overall_avg_interval),
-            latest_gate_passed: latest_gate.as_ref().map(|gate| gate.passed),
-            latest_gate_score_delta: latest_gate.as_ref().map(|gate| gate.score_delta),
-            latest_gate_score_delta_interval: latest_gate
-                .as_ref()
-                .map(|gate| gate.score_delta_interval),
-            calibration_error: Some(if calibration.noise_filtered_sample_count > 0 {
-                calibration.noise_filtered_calibration_error
-            } else {
-                calibration.calibration_error
-            }),
-            calibration_error_interval: Some(calibration_error_interval),
-            missing_verifier_rate,
-        })
     }
 }
 
@@ -1464,80 +1225,6 @@ impl SessionAuditService for DatabaseSessionAuditService {
         Ok(ErrorListResponse { errors, total })
     }
 
-    async fn get_mutation_scoreboard(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> AuditResult<MutationScoreboard> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        self.verify_session_owner(&pool, session_id, user_id)
-            .await?;
-
-        let rows = query(
-            "SELECT decision_id, session_id, CAST(decision_output AS CHAR) AS decision_output \
-             FROM ctx_decision_audits \
-             WHERE session_id = ? AND decision_type = 'tool_selection' \
-             ORDER BY created_at ASC",
-        )
-        .bind(session_id)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        let decisions = rows
-            .into_iter()
-            .map(|row| {
-                let decision_output = row
-                    .try_get::<String, _>("decision_output")
-                    .ok()
-                    .and_then(|value| serde_json::from_str(&value).ok())
-                    .unwrap_or(serde_json::Value::Null);
-                PersistedMutationDecision {
-                    decision_id: row.try_get("decision_id").unwrap_or_default(),
-                    session_id: row.try_get("session_id").unwrap_or_default(),
-                    decision_output,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let override_rows = query(
-            "SELECT CAST(metadata AS CHAR) AS metadata, CAST(created_at AS CHAR) AS created_at \
-             FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND event_type = 'mutation_state' \
-             ORDER BY created_at ASC",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        let overrides = override_rows
-            .into_iter()
-            .filter_map(|row| {
-                let metadata = row
-                    .try_get::<String, _>("metadata")
-                    .ok()
-                    .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
-                    .unwrap_or(serde_json::Value::Null);
-                parse_mutation_state_override(
-                    &metadata,
-                    row.try_get::<String, _>("created_at").unwrap_or_default(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let scoreboard = build_mutation_scoreboard(session_id, decisions, overrides);
-        let context = self
-            .load_mutation_promotion_context(
-                user_id,
-                mutation_missing_verifier_rate(scoreboard.mutations.iter()),
-            )
-            .await?;
-
-        Ok(scoreboard.with_promotion_context(&context))
-    }
-
     async fn list_session_runtime_promotions(
         &self,
         user_id: &str,
@@ -1850,32 +1537,6 @@ impl SessionAuditService for DatabaseSessionAuditService {
             })
             .collect();
 
-        let (mutation_decisions, mutation_overrides) = self
-            .load_cross_session_mutation_inputs(
-                &pool,
-                user_id,
-                params.since.as_deref(),
-                params.until.as_deref(),
-            )
-            .await?;
-        let mutation_scoreboards =
-            build_cross_session_mutation_scoreboards(mutation_decisions, mutation_overrides);
-        let context = self
-            .load_mutation_promotion_context(
-                user_id,
-                mutation_missing_verifier_rate(
-                    mutation_scoreboards
-                        .iter()
-                        .flat_map(|scoreboard| scoreboard.mutations.iter()),
-                ),
-            )
-            .await?;
-        let mutation_stats = aggregate_cross_session_mutation_scoreboards(
-            mutation_scoreboards
-                .into_iter()
-                .map(|scoreboard| scoreboard.with_promotion_context(&context))
-                .collect(),
-        );
         let runtime_promotion_stats = aggregate_runtime_promotion_stats(
             &self
                 .load_cross_session_runtime_promotions(
@@ -1910,23 +1571,9 @@ impl SessionAuditService for DatabaseSessionAuditService {
             } else {
                 0.0
             },
-            total_mutations: mutation_stats.total_mutations,
-            ready_mutations: mutation_stats.ready_mutations,
-            approval_required_mutations: mutation_stats.approval_required_mutations,
-            applied_mutations: mutation_stats.applied_mutations,
-            reverted_mutations: mutation_stats.reverted_mutations,
-            blocked_mutations: mutation_stats.blocked_mutations,
-            verified_mutations: mutation_stats.verified_mutations,
-            missing_verifier_mutations: mutation_stats.missing_verifier_mutations,
-            tool_result_verified_mutations: mutation_stats.tool_result_verified_mutations,
-            journal_verified_mutations: mutation_stats.journal_verified_mutations,
-            no_verifier_signal_mutations: mutation_stats.no_verifier_signal_mutations,
-            ambiguous_multi_action_verifier_mutations: mutation_stats
-                .ambiguous_multi_action_verifier_mutations,
             total_runtime_promotions: runtime_promotion_stats.total_runtime_promotions,
             adaptive_baseline_runtime_promotions: runtime_promotion_stats
                 .adaptive_baseline_runtime_promotions,
-            evolution_runtime_promotions: runtime_promotion_stats.evolution_runtime_promotions,
             promoted_runtime_promotions: runtime_promotion_stats.promoted_runtime_promotions,
             deferred_runtime_promotions: runtime_promotion_stats.deferred_runtime_promotions,
             queued_runtime_promotions: runtime_promotion_stats.queued_runtime_promotions,
@@ -2051,41 +1698,6 @@ impl SessionAuditService for DatabaseSessionAuditService {
         Ok(result)
     }
 
-    async fn list_cross_session_mutations(
-        &self,
-        user_id: &str,
-        params: &CrossSessionMutationListParams,
-    ) -> AuditResult<CrossSessionMutationListResponse> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        let (mutation_decisions, mutation_overrides) = self
-            .load_cross_session_mutation_inputs(
-                &pool,
-                user_id,
-                params.since.as_deref(),
-                params.until.as_deref(),
-            )
-            .await?;
-        let scoreboards =
-            build_cross_session_mutation_scoreboards(mutation_decisions, mutation_overrides);
-        let context = self
-            .load_mutation_promotion_context(
-                user_id,
-                mutation_missing_verifier_rate(
-                    scoreboards
-                        .iter()
-                        .flat_map(|scoreboard| scoreboard.mutations.iter()),
-                ),
-            )
-            .await?;
-        let mutations = scoreboards
-            .into_iter()
-            .map(|scoreboard| scoreboard.with_promotion_context(&context))
-            .flat_map(|scoreboard| scoreboard.mutations.into_iter())
-            .collect::<Vec<_>>();
-
-        Ok(select_cross_session_mutations(mutations, params))
-    }
-
     async fn list_cross_session_runtime_promotions(
         &self,
         user_id: &str,
@@ -2133,9 +1745,6 @@ impl SessionAuditService for UnconfiguredSessionAuditService {
     async fn list_errors(&self, _: &str, _: &str) -> AuditResult<ErrorListResponse> {
         Err(internal_error("audit service not configured"))
     }
-    async fn get_mutation_scoreboard(&self, _: &str, _: &str) -> AuditResult<MutationScoreboard> {
-        Err(internal_error("audit service not configured"))
-    }
     async fn list_session_runtime_promotions(
         &self,
         _: &str,
@@ -2162,13 +1771,6 @@ impl SessionAuditService for UnconfiguredSessionAuditService {
         _: &str,
         _: &CrossSessionStatsParams,
     ) -> AuditResult<Vec<CrossSessionToolAnalytics>> {
-        Err(internal_error("audit service not configured"))
-    }
-    async fn list_cross_session_mutations(
-        &self,
-        _: &str,
-        _: &CrossSessionMutationListParams,
-    ) -> AuditResult<CrossSessionMutationListResponse> {
         Err(internal_error("audit service not configured"))
     }
     async fn list_cross_session_runtime_promotions(
@@ -2236,68 +1838,6 @@ fn compute_duration_secs(first: Option<&str>, last: Option<&str>) -> f64 {
     }
 }
 
-fn build_mutation_scoreboard(
-    session_id: &str,
-    decisions: Vec<PersistedMutationDecision>,
-    overrides: Vec<MutationStateOverride>,
-) -> MutationScoreboard {
-    let scoreboard = MutationScoreboard::from_persisted_decisions(
-        format!("audit:mutation-scoreboard:{session_id}"),
-        session_id.to_string(),
-        decisions,
-    );
-    if overrides.is_empty() {
-        return scoreboard;
-    }
-
-    let mut latest_overrides = std::collections::HashMap::<String, MutationStateOverride>::new();
-    for override_entry in overrides {
-        latest_overrides.insert(override_entry.mutation_id.clone(), override_entry);
-    }
-
-    let mutations = scoreboard
-        .mutations
-        .into_iter()
-        .map(|mut mutation| {
-            if let Some(override_entry) = latest_overrides.get(&mutation.mutation_id) {
-                mutation.state = override_entry.state;
-                mutation.state_note = override_entry.note.clone();
-                mutation.state_updated_at = Some(override_entry.created_at.clone());
-            }
-            mutation
-        })
-        .collect::<Vec<_>>();
-
-    MutationScoreboard::new(scoreboard.scoreboard_id, scoreboard.session_id, mutations)
-}
-
-fn select_cross_session_mutations(
-    mut mutations: Vec<StagedMutation>,
-    params: &CrossSessionMutationListParams,
-) -> CrossSessionMutationListResponse {
-    apply_cross_session_mutation_filters(&mut mutations, params);
-    sort_cross_session_mutations(&mut mutations, &params.sort);
-
-    let total = mutations.len() as u32;
-    let page = params.page.max(1);
-    let per_page = params
-        .per_page
-        .clamp(1, MAX_CROSS_SESSION_MUTATIONS_PER_PAGE);
-    let offset = (page.saturating_sub(1) * per_page) as usize;
-    let mutations = mutations
-        .into_iter()
-        .skip(offset)
-        .take(per_page as usize)
-        .collect();
-
-    CrossSessionMutationListResponse {
-        mutations,
-        total,
-        page,
-        per_page,
-    }
-}
-
 fn select_cross_session_runtime_promotions(
     mut promotions: Vec<RuntimePromotionRecord>,
     params: &CrossSessionRuntimePromotionListParams,
@@ -2340,207 +1880,10 @@ fn select_cross_session_runtime_promotions(
     }
 }
 
-fn apply_cross_session_mutation_filters(
-    mutations: &mut Vec<StagedMutation>,
-    params: &CrossSessionMutationListParams,
-) {
-    if let Some(state) = params.state {
-        mutations.retain(|mutation| mutation.state == state);
-    }
-    if let Some(recommendation) = params.promotion_recommendation {
-        mutations.retain(|mutation| {
-            mutation.judgment.promotion_verdict.recommendation == recommendation
-        });
-    }
-    if let Some(session_id) = params
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        mutations.retain(|mutation| mutation.session_id == session_id);
-    }
-    if let Some(tool_name) = params
-        .tool_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| normalize_tool_name(value.to_string()))
-    {
-        mutations.retain(|mutation| normalize_tool_name(mutation.tool_name.clone()) == tool_name);
-    }
-    if let Some(safety_verdict) = params.safety_verdict {
-        mutations.retain(|mutation| mutation.judgment.safety_verdict == safety_verdict);
-    }
-    if let Some(retention_verdict) = params.retention_verdict {
-        mutations.retain(|mutation| mutation.judgment.retention_verdict == retention_verdict);
-    }
-    if let Some(min_retention_score) = params.min_retention_score {
-        let threshold = min_retention_score.clamp(0.0, 1.0);
-        mutations.retain(|mutation| mutation.judgment.retention_score.lower >= threshold);
-    }
-    if let Some(verifier_signal) = params.verifier_signal {
-        mutations.retain(|mutation| match verifier_signal {
-            MutationVerifierSignalFilter::Present => mutation.verifier.is_some(),
-            MutationVerifierSignalFilter::Missing => mutation.verifier.is_none(),
-        });
-    }
-    if let Some(verifier_source) = params
-        .verifier_source
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        mutations.retain(|mutation| mutation.verifier_source.as_deref() == Some(verifier_source));
-    }
-    if let Some(verifier_gap) = params
-        .verifier_gap
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        mutations.retain(|mutation| mutation.verifier_gap.as_deref() == Some(verifier_gap));
-    }
-}
-
-fn sort_cross_session_mutations(mutations: &mut [StagedMutation], sort: &str) {
-    match sort {
-        "updated" => {
-            mutations.sort_by(mutation_updated_cmp);
-        }
-        "retention" => {
-            mutations.sort_by(|left, right| {
-                mutation_retention_cmp(left, right)
-                    .then_with(|| mutation_priority_cmp(left, right))
-                    .then_with(|| mutation_updated_cmp(left, right))
-            });
-        }
-        _ => {
-            mutations.sort_by(|left, right| {
-                mutation_priority_cmp(left, right)
-                    .then_with(|| mutation_retention_cmp(left, right))
-                    .then_with(|| mutation_updated_cmp(left, right))
-            });
-        }
-    }
-}
-
-fn mutation_priority_cmp(left: &StagedMutation, right: &StagedMutation) -> std::cmp::Ordering {
-    mutation_priority_tuple(right).cmp(&mutation_priority_tuple(left))
-}
-
-fn mutation_retention_cmp(left: &StagedMutation, right: &StagedMutation) -> std::cmp::Ordering {
-    right
-        .judgment
-        .retention_score
-        .lower
-        .total_cmp(&left.judgment.retention_score.lower)
-        .then_with(|| {
-            right
-                .judgment
-                .retention_score
-                .point
-                .total_cmp(&left.judgment.retention_score.point)
-        })
-}
-
-fn mutation_priority_tuple(mutation: &StagedMutation) -> (u8, u8, u8, u8) {
-    (
-        match mutation.state {
-            StagedMutationState::Ready => 5,
-            StagedMutationState::Pending => 4,
-            StagedMutationState::Blocked => 3,
-            StagedMutationState::Reverted => 2,
-            StagedMutationState::Applied => 1,
-        },
-        match mutation.judgment.promotion_verdict.recommendation {
-            MutationPromotionRecommendation::Promote => 3,
-            MutationPromotionRecommendation::Canary => 2,
-            MutationPromotionRecommendation::Hold => 1,
-        },
-        match mutation.judgment.safety_verdict {
-            MutationSafetyVerdict::RequiresApproval => 3,
-            MutationSafetyVerdict::Safe => 2,
-            MutationSafetyVerdict::Blocked => 1,
-        },
-        match mutation.judgment.retention_verdict {
-            MutationRetentionVerdict::Retain => 3,
-            MutationRetentionVerdict::Review => 2,
-            MutationRetentionVerdict::Reject => 1,
-        },
-    )
-}
-
-fn mutation_updated_cmp(left: &StagedMutation, right: &StagedMutation) -> std::cmp::Ordering {
-    right
-        .state_updated_at
-        .cmp(&left.state_updated_at)
-        .then_with(|| right.turn_index.cmp(&left.turn_index))
-        .then_with(|| right.session_id.cmp(&left.session_id))
-        .then_with(|| right.mutation_id.cmp(&left.mutation_id))
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct MutationStatsAggregate {
-    total_mutations: u32,
-    ready_mutations: u32,
-    approval_required_mutations: u32,
-    applied_mutations: u32,
-    reverted_mutations: u32,
-    blocked_mutations: u32,
-    verified_mutations: u32,
-    missing_verifier_mutations: u32,
-    tool_result_verified_mutations: u32,
-    journal_verified_mutations: u32,
-    no_verifier_signal_mutations: u32,
-    ambiguous_multi_action_verifier_mutations: u32,
-}
-
-impl MutationStatsAggregate {
-    fn observe_mutation(&mut self, mutation: &StagedMutation) {
-        self.total_mutations += 1;
-        if mutation.state == StagedMutationState::Ready {
-            self.ready_mutations += 1;
-        }
-        if mutation.state == StagedMutationState::Pending
-            && mutation.judgment.safety_verdict == MutationSafetyVerdict::RequiresApproval
-        {
-            self.approval_required_mutations += 1;
-        }
-        if mutation.state == StagedMutationState::Applied {
-            self.applied_mutations += 1;
-        }
-        if mutation.state == StagedMutationState::Reverted {
-            self.reverted_mutations += 1;
-        }
-        if mutation.state == StagedMutationState::Blocked {
-            self.blocked_mutations += 1;
-        }
-        if mutation.verifier.is_some() {
-            self.verified_mutations += 1;
-        } else {
-            self.missing_verifier_mutations += 1;
-        }
-        match mutation.verifier_source.as_deref() {
-            Some("tool_result") => self.tool_result_verified_mutations += 1,
-            Some("turn_journal") => self.journal_verified_mutations += 1,
-            _ => {}
-        }
-        match mutation.verifier_gap.as_deref() {
-            Some("no_verifier_signal") => self.no_verifier_signal_mutations += 1,
-            Some("ambiguous_multi_action_turn") => {
-                self.ambiguous_multi_action_verifier_mutations += 1;
-            }
-            _ => {}
-        }
-    }
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct RuntimePromotionStatsAggregate {
     total_runtime_promotions: u32,
     adaptive_baseline_runtime_promotions: u32,
-    evolution_runtime_promotions: u32,
     promoted_runtime_promotions: u32,
     deferred_runtime_promotions: u32,
     queued_runtime_promotions: u32,
@@ -2556,9 +1899,6 @@ impl RuntimePromotionStatsAggregate {
         match promotion.controller {
             RuntimePromotionController::AdaptiveBaseline => {
                 self.adaptive_baseline_runtime_promotions += 1;
-            }
-            RuntimePromotionController::Evolution => {
-                self.evolution_runtime_promotions += 1;
             }
         }
         match promotion.outcome {
@@ -2584,59 +1924,6 @@ impl RuntimePromotionStatsAggregate {
     }
 }
 
-fn parse_mutation_state_override(
-    metadata: &serde_json::Value,
-    created_at: String,
-) -> Option<MutationStateOverride> {
-    let mutation_id = metadata
-        .get("mutation_id")
-        .and_then(serde_json::Value::as_str)?;
-    let state = metadata
-        .get("state")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<StagedMutationState>(value).ok())?;
-    if !matches!(
-        state,
-        StagedMutationState::Applied | StagedMutationState::Reverted | StagedMutationState::Blocked
-    ) {
-        return None;
-    }
-    Some(MutationStateOverride {
-        mutation_id: mutation_id.to_string(),
-        state,
-        note: metadata
-            .get("note")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|note| !note.is_empty())
-            .map(ToString::to_string),
-        created_at,
-    })
-}
-
-#[cfg(test)]
-fn aggregate_cross_session_mutation_stats(
-    decisions: Vec<PersistedMutationDecision>,
-    overrides: Vec<(String, MutationStateOverride)>,
-) -> MutationStatsAggregate {
-    aggregate_cross_session_mutation_scoreboards(build_cross_session_mutation_scoreboards(
-        decisions, overrides,
-    ))
-}
-
-fn aggregate_cross_session_mutation_scoreboards(
-    scoreboards: Vec<MutationScoreboard>,
-) -> MutationStatsAggregate {
-    let mut aggregate = MutationStatsAggregate::default();
-    for scoreboard in scoreboards {
-        for mutation in &scoreboard.mutations {
-            aggregate.observe_mutation(mutation);
-        }
-    }
-
-    aggregate
-}
-
 fn aggregate_runtime_promotion_stats(
     promotions: &[RuntimePromotionRecord],
 ) -> RuntimePromotionStatsAggregate {
@@ -2647,152 +1934,17 @@ fn aggregate_runtime_promotion_stats(
     aggregate
 }
 
-fn mutation_missing_verifier_rate<'a>(
-    mutations: impl Iterator<Item = &'a StagedMutation>,
-) -> Option<f64> {
-    let mut total = 0_u32;
-    let mut missing = 0_u32;
-    for mutation in mutations {
-        total += 1;
-        if mutation.verifier.is_none() {
-            missing += 1;
-        }
-    }
-    (total > 0).then_some(missing as f64 / total as f64)
-}
-
-fn build_cross_session_mutation_scoreboards(
-    decisions: Vec<PersistedMutationDecision>,
-    overrides: Vec<(String, MutationStateOverride)>,
-) -> Vec<MutationScoreboard> {
-    let mut decisions_by_session =
-        std::collections::HashMap::<String, Vec<PersistedMutationDecision>>::new();
-    for decision in decisions {
-        decisions_by_session
-            .entry(decision.session_id.clone())
-            .or_default()
-            .push(decision);
-    }
-
-    let mut overrides_by_session =
-        std::collections::HashMap::<String, Vec<MutationStateOverride>>::new();
-    for (session_id, override_entry) in overrides {
-        overrides_by_session
-            .entry(session_id)
-            .or_default()
-            .push(override_entry);
-    }
-
-    let mut session_ids = decisions_by_session
-        .keys()
-        .cloned()
-        .collect::<std::collections::HashSet<_>>();
-    session_ids.extend(overrides_by_session.keys().cloned());
-
-    let mut scoreboards = session_ids
-        .into_iter()
-        .map(|session_id| {
-            build_mutation_scoreboard(
-                &session_id,
-                decisions_by_session.remove(&session_id).unwrap_or_default(),
-                overrides_by_session.remove(&session_id).unwrap_or_default(),
-            )
-        })
-        .collect::<Vec<_>>();
-    scoreboards.sort_by(|left, right| left.session_id.cmp(&right.session_id));
-    scoreboards
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_core::confidence::ConfidenceInterval;
 
     #[test]
     fn cross_session_input_row_caps_are_positive() {
         const _: () = {
-            assert!(MAX_CROSS_SESSION_MUTATION_DECISION_ROWS > 0);
-            assert!(MAX_CROSS_SESSION_MUTATION_EVENT_ROWS > 0);
             assert!(MAX_CROSS_SESSION_RUNTIME_PROMOTION_ROWS > 0);
         };
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn sample_queue_mutation(
-        mutation_id: &str,
-        session_id: &str,
-        tool_name: &str,
-        state: StagedMutationState,
-        safety_verdict: MutationSafetyVerdict,
-        retention_verdict: MutationRetentionVerdict,
-        retention_score: f64,
-        state_updated_at: Option<&str>,
-    ) -> crate::StagedMutation {
-        let mut mutation = crate::StagedMutation::new(
-            mutation_id,
-            session_id,
-            1,
-            tool_name,
-            serde_json::json!({"path": format!("src/{mutation_id}.rs")}),
-            None,
-            crate::MutationObjectiveScore::from_learning_signal(
-                retention_score,
-                None,
-                0.05,
-                0.95,
-                false,
-            ),
-            None,
-            crate::MutationCompensationPolicy {
-                bounded: true,
-                reversible: true,
-                requires_pre_state: false,
-                action_category: crate::MutationActionCategory::Write,
-                compensation_kind: Some("restore_file".into()),
-                compensation_summary: Some("restore prior contents".into()),
-            },
-        );
-        mutation.state = state;
-        mutation.judgment.safety_verdict = safety_verdict;
-        mutation.judgment.retention_verdict = retention_verdict;
-        mutation.judgment.retention_score = ConfidenceInterval::exact(retention_score);
-        mutation.judgment.promotion_verdict = crate::MutationPromotionVerdict {
-            recommendation: match state {
-                StagedMutationState::Ready | StagedMutationState::Applied => {
-                    crate::MutationPromotionRecommendation::Promote
-                }
-                StagedMutationState::Pending => crate::MutationPromotionRecommendation::Canary,
-                StagedMutationState::Blocked | StagedMutationState::Reverted => {
-                    crate::MutationPromotionRecommendation::Hold
-                }
-            },
-            confidence_score: retention_score,
-            support_score: if mutation.verifier.is_some() {
-                1.0
-            } else {
-                0.55
-            },
-            safety_score: match safety_verdict {
-                MutationSafetyVerdict::Safe => 0.90,
-                MutationSafetyVerdict::RequiresApproval => 0.65,
-                MutationSafetyVerdict::Blocked => 0.25,
-            },
-            overall_score: retention_score,
-            evidence: mutation.judgment.rationale.clone(),
-            blockers: if matches!(
-                state,
-                StagedMutationState::Blocked | StagedMutationState::Reverted
-            ) {
-                mutation.judgment.rationale.clone()
-            } else {
-                Vec::new()
-            },
-            rollback_hint: mutation.compensation.compensation_summary.clone(),
-        };
-        mutation.state_updated_at = state_updated_at.map(ToString::to_string);
-        mutation
     }
 
     #[test]
@@ -2974,21 +2126,8 @@ mod tests {
             avg_turns_per_session: 15.0,
             avg_tokens_per_session: 80_000.0,
             tool_error_rate: 0.075,
-            total_mutations: 12,
-            ready_mutations: 4,
-            approval_required_mutations: 3,
-            applied_mutations: 2,
-            reverted_mutations: 1,
-            blocked_mutations: 2,
-            verified_mutations: 7,
-            missing_verifier_mutations: 5,
-            tool_result_verified_mutations: 4,
-            journal_verified_mutations: 3,
-            no_verifier_signal_mutations: 4,
-            ambiguous_multi_action_verifier_mutations: 1,
             total_runtime_promotions: 6,
             adaptive_baseline_runtime_promotions: 2,
-            evolution_runtime_promotions: 4,
             promoted_runtime_promotions: 1,
             deferred_runtime_promotions: 2,
             queued_runtime_promotions: 2,
@@ -3010,8 +2149,6 @@ mod tests {
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("\"session_count\":10"));
         assert!(json.contains("\"total_turns\":150"));
-        assert!(json.contains("\"total_mutations\":12"));
-        assert!(json.contains("\"verified_mutations\":7"));
         assert!(json.contains("\"total_runtime_promotions\":6"));
         assert!(json.contains("\"runtime_hold_recommendations\":2"));
         assert!(json.contains("\"top_tools\":["));
@@ -3038,21 +2175,8 @@ mod tests {
             avg_turns_per_session: 0.0,
             avg_tokens_per_session: 0.0,
             tool_error_rate: 0.0,
-            total_mutations: 0,
-            ready_mutations: 0,
-            approval_required_mutations: 0,
-            applied_mutations: 0,
-            reverted_mutations: 0,
-            blocked_mutations: 0,
-            verified_mutations: 0,
-            missing_verifier_mutations: 0,
-            tool_result_verified_mutations: 0,
-            journal_verified_mutations: 0,
-            no_verifier_signal_mutations: 0,
-            ambiguous_multi_action_verifier_mutations: 0,
             total_runtime_promotions: 0,
             adaptive_baseline_runtime_promotions: 0,
-            evolution_runtime_promotions: 0,
             promoted_runtime_promotions: 0,
             deferred_runtime_promotions: 0,
             queued_runtime_promotions: 0,
@@ -3338,21 +2462,8 @@ mod tests {
             avg_turns_per_session: 10.0,
             avg_tokens_per_session: 8000.0,
             tool_error_rate: 0.025,
-            total_mutations: 9,
-            ready_mutations: 3,
-            approval_required_mutations: 2,
-            applied_mutations: 2,
-            reverted_mutations: 1,
-            blocked_mutations: 1,
-            verified_mutations: 5,
-            missing_verifier_mutations: 4,
-            tool_result_verified_mutations: 3,
-            journal_verified_mutations: 2,
-            no_verifier_signal_mutations: 3,
-            ambiguous_multi_action_verifier_mutations: 1,
             total_runtime_promotions: 4,
             adaptive_baseline_runtime_promotions: 1,
-            evolution_runtime_promotions: 3,
             promoted_runtime_promotions: 1,
             deferred_runtime_promotions: 1,
             queued_runtime_promotions: 1,
@@ -3366,8 +2477,6 @@ mod tests {
         let json = serde_json::to_string(&stats).unwrap();
         let restored: CrossSessionStats = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.session_count, 10);
-        assert_eq!(restored.total_mutations, 9);
-        assert_eq!(restored.missing_verifier_mutations, 4);
         assert_eq!(restored.total_runtime_promotions, 4);
         assert_eq!(restored.runtime_promote_recommendations, 2);
         assert!((restored.tool_error_rate - 0.025).abs() < 0.001);
@@ -3401,443 +2510,6 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         let restored: CrossSessionToolAnalytics = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.last_error.as_deref(), Some("timeout"));
-    }
-
-    #[test]
-    fn build_mutation_scoreboard_skips_decisions_without_objective_score() {
-        let scoreboard = build_mutation_scoreboard(
-            "session-1",
-            vec![
-                PersistedMutationDecision {
-                    decision_id: "decision-1".into(),
-                    session_id: "session-1".into(),
-                    decision_output: serde_json::json!({
-                        "turn": 4,
-                        "mutation_objective_score": {
-                            "quality": {"point": 0.84, "lower": 0.84, "upper": 0.84},
-                            "reward_hacking_risk": {"point": 0.10, "lower": 0.10, "upper": 0.10},
-                            "causal_support": {"point": 0.75, "lower": 0.75, "upper": 0.75},
-                            "was_corrected": false
-                        },
-                        "action_profiles": [
-                            {
-                                "tool_call_id": "call-1",
-                                "tool_name": "edit_file",
-                                "arguments": {"path": "src/lib.rs"},
-                                "profile": {
-                                    "bounded": true,
-                                    "reversible": true,
-                                    "requires_pre_state": false,
-                                    "action_category": "write",
-                                    "compensation_kind": "restore_file",
-                                    "compensation_summary": "restore prior contents"
-                                }
-                            }
-                        ]
-                    }),
-                },
-                PersistedMutationDecision {
-                    decision_id: "decision-2".into(),
-                    session_id: "session-1".into(),
-                    decision_output: serde_json::json!({
-                        "turn": 5,
-                        "action_profiles": [
-                            {
-                                "tool_call_id": "call-2",
-                                "tool_name": "bash",
-                                "arguments": {"command": "ls"},
-                                "profile": {
-                                    "bounded": true,
-                                    "reversible": true,
-                                    "requires_pre_state": false,
-                                    "action_category": "read"
-                                }
-                            }
-                        ]
-                    }),
-                },
-            ],
-            vec![],
-        );
-
-        assert_eq!(scoreboard.total_mutations, 1);
-        assert_eq!(scoreboard.ready_mutations, 0);
-        assert_eq!(
-            scoreboard.mutations[0]
-                .judgment
-                .promotion_verdict
-                .recommendation,
-            crate::MutationPromotionRecommendation::Canary
-        );
-        assert_eq!(scoreboard.mutations[0].tool_name, "edit_file");
-        assert_eq!(scoreboard.mutations[0].turn_index, 4);
-    }
-
-    #[test]
-    fn build_mutation_scoreboard_applies_latest_state_override() {
-        let scoreboard = build_mutation_scoreboard(
-            "session-1",
-            vec![PersistedMutationDecision {
-                decision_id: "decision-1".into(),
-                session_id: "session-1".into(),
-                decision_output: serde_json::json!({
-                    "turn": 4,
-                    "mutation_objective_score": {
-                        "quality": {"point": 0.84, "lower": 0.84, "upper": 0.84},
-                        "reward_hacking_risk": {"point": 0.10, "lower": 0.10, "upper": 0.10},
-                        "causal_support": {"point": 0.75, "lower": 0.75, "upper": 0.75},
-                        "was_corrected": false
-                    },
-                    "action_profiles": [
-                        {
-                            "tool_call_id": "call-1",
-                            "tool_name": "edit_file",
-                            "arguments": {"path": "src/lib.rs"},
-                            "profile": {
-                                "bounded": true,
-                                "reversible": true,
-                                "requires_pre_state": false,
-                                "action_category": "write",
-                                "compensation_kind": "restore_file",
-                                "compensation_summary": "restore prior contents"
-                            }
-                        }
-                    ]
-                }),
-            }],
-            vec![
-                MutationStateOverride {
-                    mutation_id: "decision-1:call-1".into(),
-                    state: StagedMutationState::Applied,
-                    note: Some("promoted after review".into()),
-                    created_at: "2026-04-12T12:00:00Z".into(),
-                },
-                MutationStateOverride {
-                    mutation_id: "decision-1:call-1".into(),
-                    state: StagedMutationState::Reverted,
-                    note: Some("rolled back after regression".into()),
-                    created_at: "2026-04-12T12:05:00Z".into(),
-                },
-            ],
-        );
-
-        assert_eq!(scoreboard.applied_mutations, 0);
-        assert_eq!(scoreboard.reverted_mutations, 1);
-        assert_eq!(scoreboard.mutations[0].state, StagedMutationState::Reverted);
-        assert_eq!(
-            scoreboard.mutations[0].state_note.as_deref(),
-            Some("rolled back after regression")
-        );
-        assert_eq!(
-            scoreboard.mutations[0].state_updated_at.as_deref(),
-            Some("2026-04-12T12:05:00Z")
-        );
-    }
-
-    #[test]
-    fn aggregate_cross_session_mutation_stats_sums_per_session_scoreboards() {
-        let stats = aggregate_cross_session_mutation_stats(
-            vec![
-                PersistedMutationDecision {
-                    decision_id: "decision-1".into(),
-                    session_id: "session-1".into(),
-                    decision_output: serde_json::json!({
-                        "turn": 1,
-                        "mutation_objective_score": {
-                            "quality": {"point": 0.90, "lower": 0.90, "upper": 0.90},
-                            "reward_hacking_risk": {"point": 0.05, "lower": 0.05, "upper": 0.05},
-                            "causal_support": {"point": 0.90, "lower": 0.90, "upper": 0.90},
-                            "was_corrected": false
-                        },
-                        "action_profiles": [
-                            {
-                                "tool_call_id": "call-1",
-                                "tool_name": "edit_file",
-                                "arguments": {"path": "src/lib.rs"},
-                                "verifier_source": "tool_result",
-                                "verifier": {
-                                    "all_required_passed": true,
-                                    "criteria_total": 1,
-                                    "criteria_passed": 1,
-                                    "pass_rate": {"point": 1.0, "lower": 1.0, "upper": 1.0},
-                                    "failing_criteria": []
-                                },
-                                "profile": {
-                                    "bounded": true,
-                                    "reversible": true,
-                                    "requires_pre_state": false,
-                                    "action_category": "write",
-                                    "compensation_kind": "restore_file",
-                                    "compensation_summary": "restore prior contents"
-                                }
-                            }
-                        ]
-                    }),
-                },
-                PersistedMutationDecision {
-                    decision_id: "decision-2".into(),
-                    session_id: "session-2".into(),
-                    decision_output: serde_json::json!({
-                        "turn": 2,
-                        "mutation_objective_score": {
-                            "quality": {"point": 0.75, "lower": 0.75, "upper": 0.75},
-                            "reward_hacking_risk": {"point": 0.15, "lower": 0.15, "upper": 0.15},
-                            "causal_support": {"point": 0.70, "lower": 0.70, "upper": 0.70},
-                            "was_corrected": false
-                        },
-                        "action_profiles": [
-                            {
-                                "tool_call_id": "call-2",
-                                "tool_name": "bash",
-                                "arguments": {"command": "git commit -m x"},
-                                "verifier_gap": "no_verifier_signal",
-                                "profile": {
-                                    "bounded": false,
-                                    "reversible": true,
-                                    "requires_pre_state": false,
-                                    "action_category": "execute",
-                                    "compensation_kind": "git_revert_commit",
-                                    "compensation_summary": "revert the commit"
-                                }
-                            }
-                        ]
-                    }),
-                },
-                PersistedMutationDecision {
-                    decision_id: "decision-3".into(),
-                    session_id: "session-3".into(),
-                    decision_output: serde_json::json!({
-                        "turn": 3,
-                        "mutation_objective_score": {
-                            "quality": {"point": 0.81, "lower": 0.81, "upper": 0.81},
-                            "reward_hacking_risk": {"point": 0.10, "lower": 0.10, "upper": 0.10},
-                            "causal_support": {"point": 0.82, "lower": 0.82, "upper": 0.82},
-                            "was_corrected": false
-                        },
-                        "action_profiles": [
-                            {
-                                "tool_call_id": "call-3",
-                                "tool_name": "bash",
-                                "arguments": {"command": "cargo test"},
-                                "verifier_source": "turn_journal",
-                                "verifier": {
-                                    "all_required_passed": true,
-                                    "criteria_total": 2,
-                                    "criteria_passed": 2,
-                                    "pass_rate": {"point": 1.0, "lower": 1.0, "upper": 1.0},
-                                    "failing_criteria": []
-                                },
-                                "profile": {
-                                    "bounded": false,
-                                    "reversible": true,
-                                    "requires_pre_state": false,
-                                    "action_category": "execute",
-                                    "compensation_kind": "git_revert_commit",
-                                    "compensation_summary": "revert the commit"
-                                }
-                            }
-                        ]
-                    }),
-                },
-                PersistedMutationDecision {
-                    decision_id: "decision-4".into(),
-                    session_id: "session-4".into(),
-                    decision_output: serde_json::json!({
-                        "turn": 4,
-                        "mutation_objective_score": {
-                            "quality": {"point": 0.72, "lower": 0.72, "upper": 0.72},
-                            "reward_hacking_risk": {"point": 0.18, "lower": 0.18, "upper": 0.18},
-                            "causal_support": {"point": 0.74, "lower": 0.74, "upper": 0.74},
-                            "was_corrected": false
-                        },
-                        "action_profiles": [
-                            {
-                                "tool_call_id": "call-4",
-                                "tool_name": "bash",
-                                "arguments": {"command": "git push"},
-                                "verifier_gap": "ambiguous_multi_action_turn",
-                                "profile": {
-                                    "bounded": false,
-                                    "reversible": true,
-                                    "requires_pre_state": false,
-                                    "action_category": "execute",
-                                    "compensation_kind": "git_revert_commit",
-                                    "compensation_summary": "revert the commit"
-                                }
-                            }
-                        ]
-                    }),
-                },
-            ],
-            vec![
-                (
-                    "session-2".into(),
-                    MutationStateOverride {
-                        mutation_id: "decision-2:call-2".into(),
-                        state: StagedMutationState::Applied,
-                        note: Some("applied globally".into()),
-                        created_at: "2026-04-12T12:00:00Z".into(),
-                    },
-                ),
-                (
-                    "session-4".into(),
-                    MutationStateOverride {
-                        mutation_id: "decision-4:call-4".into(),
-                        state: StagedMutationState::Blocked,
-                        note: Some("blocked after review".into()),
-                        created_at: "2026-04-12T12:01:00Z".into(),
-                    },
-                ),
-            ],
-        );
-
-        assert_eq!(stats.total_mutations, 4);
-        assert_eq!(stats.ready_mutations, 1);
-        assert_eq!(stats.applied_mutations, 1);
-        assert_eq!(stats.approval_required_mutations, 1);
-        assert_eq!(stats.blocked_mutations, 1);
-        assert_eq!(stats.verified_mutations, 2);
-        assert_eq!(stats.missing_verifier_mutations, 2);
-        assert_eq!(stats.tool_result_verified_mutations, 1);
-        assert_eq!(stats.journal_verified_mutations, 1);
-        assert_eq!(stats.no_verifier_signal_mutations, 1);
-        assert_eq!(stats.ambiguous_multi_action_verifier_mutations, 1);
-    }
-
-    #[test]
-    fn build_cross_session_mutation_scoreboards_returns_session_scoped_mutations() {
-        let scoreboards = build_cross_session_mutation_scoreboards(
-            vec![
-                PersistedMutationDecision {
-                    decision_id: "decision-1".into(),
-                    session_id: "session-a".into(),
-                    decision_output: serde_json::json!({
-                        "turn": 1,
-                        "mutation_objective_score": {
-                            "quality": {"point": 0.90, "lower": 0.90, "upper": 0.90},
-                            "reward_hacking_risk": {"point": 0.05, "lower": 0.05, "upper": 0.05},
-                            "causal_support": {"point": 0.90, "lower": 0.90, "upper": 0.90},
-                            "was_corrected": false
-                        },
-                        "action_profiles": [
-                            {
-                                "tool_call_id": "call-a",
-                                "tool_name": "edit_file",
-                                "arguments": {"path": "src/a.rs"},
-                                "profile": {
-                                    "bounded": true,
-                                    "reversible": true,
-                                    "requires_pre_state": false,
-                                    "action_category": "write",
-                                    "compensation_kind": "restore_file",
-                                    "compensation_summary": "restore prior contents"
-                                }
-                            }
-                        ]
-                    }),
-                },
-                PersistedMutationDecision {
-                    decision_id: "decision-2".into(),
-                    session_id: "session-b".into(),
-                    decision_output: serde_json::json!({
-                        "turn": 2,
-                        "mutation_objective_score": {
-                            "quality": {"point": 0.80, "lower": 0.80, "upper": 0.80},
-                            "reward_hacking_risk": {"point": 0.10, "lower": 0.10, "upper": 0.10},
-                            "causal_support": {"point": 0.80, "lower": 0.80, "upper": 0.80},
-                            "was_corrected": false
-                        },
-                        "action_profiles": [
-                            {
-                                "tool_call_id": "call-b",
-                                "tool_name": "edit_file",
-                                "arguments": {"path": "src/b.rs"},
-                                "profile": {
-                                    "bounded": true,
-                                    "reversible": true,
-                                    "requires_pre_state": false,
-                                    "action_category": "write",
-                                    "compensation_kind": "restore_file",
-                                    "compensation_summary": "restore prior contents"
-                                }
-                            }
-                        ]
-                    }),
-                },
-            ],
-            vec![],
-        );
-
-        assert_eq!(scoreboards.len(), 2);
-        assert_eq!(scoreboards[0].session_id, "session-a");
-        assert_eq!(scoreboards[1].session_id, "session-b");
-        assert_eq!(scoreboards[0].mutations[0].tool_args["path"], "src/a.rs");
-        assert_eq!(scoreboards[1].mutations[0].tool_args["path"], "src/b.rs");
-    }
-
-    #[test]
-    fn cross_session_mutation_list_params_defaults() {
-        let params: CrossSessionMutationListParams = serde_json::from_str("{}").unwrap();
-        assert_eq!(params.page, 1);
-        assert_eq!(params.per_page, 20);
-        assert!(params.since.is_none());
-        assert!(params.until.is_none());
-        assert!(params.session_id.is_none());
-        assert!(params.tool_name.is_none());
-        assert!(params.state.is_none());
-        assert!(params.promotion_recommendation.is_none());
-        assert!(params.safety_verdict.is_none());
-        assert!(params.retention_verdict.is_none());
-        assert!(params.min_retention_score.is_none());
-        assert!(params.verifier_signal.is_none());
-        assert!(params.verifier_source.is_none());
-        assert!(params.verifier_gap.is_none());
-        assert_eq!(params.sort, "priority");
-    }
-
-    #[test]
-    fn cross_session_mutation_list_params_with_filters() {
-        let params: CrossSessionMutationListParams = serde_json::from_str(
-            r#"{
-                "page": 2,
-                "per_page": 5,
-                "session_id": "session-b",
-                "tool_name": "\"write_file\"",
-                "state": "pending",
-                "promotion_recommendation": "canary",
-                "safety_verdict": "requires_approval",
-                "retention_verdict": "retain",
-                "min_retention_score": 0.7,
-                "verifier_signal": "missing",
-                "verifier_gap": "no_verifier_signal",
-                "sort": "retention"
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(params.page, 2);
-        assert_eq!(params.per_page, 5);
-        assert_eq!(params.session_id.as_deref(), Some("session-b"));
-        assert_eq!(params.tool_name.as_deref(), Some("\"write_file\""));
-        assert_eq!(params.state, Some(StagedMutationState::Pending));
-        assert_eq!(
-            params.promotion_recommendation,
-            Some(MutationPromotionRecommendation::Canary)
-        );
-        assert_eq!(
-            params.safety_verdict,
-            Some(MutationSafetyVerdict::RequiresApproval)
-        );
-        assert_eq!(
-            params.retention_verdict,
-            Some(MutationRetentionVerdict::Retain)
-        );
-        assert_eq!(params.min_retention_score, Some(0.7));
-        assert_eq!(
-            params.verifier_signal,
-            Some(MutationVerifierSignalFilter::Missing)
-        );
-        assert_eq!(params.verifier_gap.as_deref(), Some("no_verifier_signal"));
-        assert_eq!(params.sort, "retention");
     }
 
     #[test]
@@ -3884,7 +2556,7 @@ mod tests {
                 "session-b".into(),
                 "2026-04-12T11:00:00Z".into(),
                 RuntimePromotionEventData {
-                    controller: RuntimePromotionController::Evolution,
+                    controller: RuntimePromotionController::AdaptiveBaseline,
                     outcome: RuntimePromotionOutcome::Queued,
                     recommendation: RuntimePromotionRecommendation::Canary,
                     subject_id: "proposal-1".into(),
@@ -3905,7 +2577,7 @@ mod tests {
                 "session-b".into(),
                 "2026-04-12T10:00:00Z".into(),
                 RuntimePromotionEventData {
-                    controller: RuntimePromotionController::Evolution,
+                    controller: RuntimePromotionController::AdaptiveBaseline,
                     outcome: RuntimePromotionOutcome::AutoApplied,
                     recommendation: RuntimePromotionRecommendation::Promote,
                     subject_id: "proposal-2".into(),
@@ -3931,7 +2603,7 @@ mod tests {
                 since: None,
                 until: None,
                 session_id: Some("session-b".into()),
-                controller: Some(RuntimePromotionController::Evolution),
+                controller: Some(RuntimePromotionController::AdaptiveBaseline),
                 outcome: Some(RuntimePromotionOutcome::Queued),
                 recommendation: Some(RuntimePromotionRecommendation::Canary),
             },
@@ -3972,7 +2644,7 @@ mod tests {
                 "session-b".into(),
                 "2026-04-12T11:00:00Z".into(),
                 RuntimePromotionEventData {
-                    controller: RuntimePromotionController::Evolution,
+                    controller: RuntimePromotionController::AdaptiveBaseline,
                     outcome: RuntimePromotionOutcome::Queued,
                     recommendation: RuntimePromotionRecommendation::Canary,
                     subject_id: "proposal-1".into(),
@@ -3993,7 +2665,7 @@ mod tests {
                 "session-b".into(),
                 "2026-04-12T10:00:00Z".into(),
                 RuntimePromotionEventData {
-                    controller: RuntimePromotionController::Evolution,
+                    controller: RuntimePromotionController::AdaptiveBaseline,
                     outcome: RuntimePromotionOutcome::AutoApplied,
                     recommendation: RuntimePromotionRecommendation::Promote,
                     subject_id: "proposal-2".into(),
@@ -4014,8 +2686,7 @@ mod tests {
         let stats = aggregate_runtime_promotion_stats(&promotions);
 
         assert_eq!(stats.total_runtime_promotions, 3);
-        assert_eq!(stats.adaptive_baseline_runtime_promotions, 1);
-        assert_eq!(stats.evolution_runtime_promotions, 2);
+        assert_eq!(stats.adaptive_baseline_runtime_promotions, 3);
         assert_eq!(stats.promoted_runtime_promotions, 0);
         assert_eq!(stats.deferred_runtime_promotions, 1);
         assert_eq!(stats.queued_runtime_promotions, 1);
@@ -4033,7 +2704,7 @@ mod tests {
                 "session-a".into(),
                 "2026-04-12T12:00:00Z".into(),
                 RuntimePromotionEventData {
-                    controller: RuntimePromotionController::Evolution,
+                    controller: RuntimePromotionController::AdaptiveBaseline,
                     outcome: RuntimePromotionOutcome::CanaryStarted,
                     recommendation: RuntimePromotionRecommendation::Canary,
                     subject_id: "proposal-1".into(),
@@ -4054,7 +2725,7 @@ mod tests {
                 "session-a".into(),
                 "2026-04-12T12:01:00Z".into(),
                 RuntimePromotionEventData {
-                    controller: RuntimePromotionController::Evolution,
+                    controller: RuntimePromotionController::AdaptiveBaseline,
                     outcome: RuntimePromotionOutcome::CanaryRolledBack,
                     recommendation: RuntimePromotionRecommendation::Canary,
                     subject_id: "proposal-1".into(),
@@ -4075,312 +2746,11 @@ mod tests {
         let stats = aggregate_runtime_promotion_stats(&promotions);
 
         assert_eq!(stats.total_runtime_promotions, 2);
-        assert_eq!(stats.evolution_runtime_promotions, 2);
+        assert_eq!(stats.adaptive_baseline_runtime_promotions, 2);
         assert_eq!(stats.runtime_canary_recommendations, 2);
         assert_eq!(stats.promoted_runtime_promotions, 0);
         assert_eq!(stats.deferred_runtime_promotions, 0);
         assert_eq!(stats.queued_runtime_promotions, 0);
         assert_eq!(stats.auto_applied_runtime_promotions, 0);
-    }
-
-    #[test]
-    fn cross_session_mutation_queue_prioritizes_ready_then_actionable_pending() {
-        let response = select_cross_session_mutations(
-            vec![
-                sample_queue_mutation(
-                    "applied",
-                    "session-a",
-                    "write_file",
-                    StagedMutationState::Applied,
-                    MutationSafetyVerdict::Safe,
-                    MutationRetentionVerdict::Retain,
-                    0.95,
-                    Some("2026-04-10T09:00:00Z"),
-                ),
-                sample_queue_mutation(
-                    "pending-approval",
-                    "session-b",
-                    "write_file",
-                    StagedMutationState::Pending,
-                    MutationSafetyVerdict::RequiresApproval,
-                    MutationRetentionVerdict::Retain,
-                    0.82,
-                    Some("2026-04-10T10:00:00Z"),
-                ),
-                sample_queue_mutation(
-                    "ready",
-                    "session-c",
-                    "edit_file",
-                    StagedMutationState::Ready,
-                    MutationSafetyVerdict::Safe,
-                    MutationRetentionVerdict::Review,
-                    0.61,
-                    Some("2026-04-09T10:00:00Z"),
-                ),
-                sample_queue_mutation(
-                    "blocked",
-                    "session-d",
-                    "bash",
-                    StagedMutationState::Blocked,
-                    MutationSafetyVerdict::Blocked,
-                    MutationRetentionVerdict::Reject,
-                    0.12,
-                    Some("2026-04-11T10:00:00Z"),
-                ),
-            ],
-            &CrossSessionMutationListParams {
-                page: 1,
-                per_page: 20,
-                since: None,
-                until: None,
-                session_id: None,
-                tool_name: None,
-                state: None,
-                promotion_recommendation: None,
-                safety_verdict: None,
-                retention_verdict: None,
-                min_retention_score: None,
-                verifier_signal: None,
-                verifier_source: None,
-                verifier_gap: None,
-                sort: "priority".into(),
-            },
-        );
-
-        let ordered_ids = response
-            .mutations
-            .iter()
-            .map(|mutation| mutation.mutation_id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            ordered_ids,
-            vec!["ready", "pending-approval", "blocked", "applied"]
-        );
-    }
-
-    #[test]
-    fn cross_session_mutation_queue_filters_by_tool_and_verdicts() {
-        let mut wrong_score = sample_queue_mutation(
-            "wrong-score",
-            "session-b",
-            "write_file",
-            StagedMutationState::Pending,
-            MutationSafetyVerdict::RequiresApproval,
-            MutationRetentionVerdict::Retain,
-            0.82,
-            Some("2026-04-10T13:00:00Z"),
-        );
-        wrong_score.judgment.retention_score = ConfidenceInterval::new(0.82, 0.42, 0.91);
-
-        let response = select_cross_session_mutations(
-            vec![
-                sample_queue_mutation(
-                    "match",
-                    "session-b",
-                    "write_file",
-                    StagedMutationState::Pending,
-                    MutationSafetyVerdict::RequiresApproval,
-                    MutationRetentionVerdict::Retain,
-                    0.83,
-                    Some("2026-04-10T10:00:00Z"),
-                ),
-                sample_queue_mutation(
-                    "wrong-tool",
-                    "session-b",
-                    "bash",
-                    StagedMutationState::Pending,
-                    MutationSafetyVerdict::RequiresApproval,
-                    MutationRetentionVerdict::Retain,
-                    0.99,
-                    Some("2026-04-10T11:00:00Z"),
-                ),
-                sample_queue_mutation(
-                    "wrong-retention",
-                    "session-b",
-                    "write_file",
-                    StagedMutationState::Pending,
-                    MutationSafetyVerdict::RequiresApproval,
-                    MutationRetentionVerdict::Review,
-                    0.83,
-                    Some("2026-04-10T12:00:00Z"),
-                ),
-                wrong_score,
-            ],
-            &CrossSessionMutationListParams {
-                page: 1,
-                per_page: 20,
-                since: None,
-                until: None,
-                session_id: Some("session-b".into()),
-                tool_name: Some("\"write_file\"".into()),
-                state: Some(StagedMutationState::Pending),
-                promotion_recommendation: Some(MutationPromotionRecommendation::Canary),
-                safety_verdict: Some(MutationSafetyVerdict::RequiresApproval),
-                retention_verdict: Some(MutationRetentionVerdict::Retain),
-                min_retention_score: Some(0.7),
-                verifier_signal: None,
-                verifier_source: None,
-                verifier_gap: None,
-                sort: "priority".into(),
-            },
-        );
-
-        assert_eq!(response.total, 1);
-        assert_eq!(response.mutations.len(), 1);
-        assert_eq!(response.mutations[0].mutation_id, "match");
-    }
-
-    #[test]
-    fn cross_session_mutation_queue_sorts_retention_by_lower_bound_first() {
-        let mut uncertain_high_point = sample_queue_mutation(
-            "uncertain-high-point",
-            "session-a",
-            "write_file",
-            StagedMutationState::Pending,
-            MutationSafetyVerdict::RequiresApproval,
-            MutationRetentionVerdict::Retain,
-            0.92,
-            Some("2026-04-10T10:00:00Z"),
-        );
-        uncertain_high_point.judgment.retention_score = ConfidenceInterval::new(0.92, 0.41, 0.99);
-
-        let mut steady_lower_bound = sample_queue_mutation(
-            "steady-lower-bound",
-            "session-b",
-            "write_file",
-            StagedMutationState::Pending,
-            MutationSafetyVerdict::RequiresApproval,
-            MutationRetentionVerdict::Retain,
-            0.83,
-            Some("2026-04-10T10:00:00Z"),
-        );
-        steady_lower_bound.judgment.retention_score = ConfidenceInterval::new(0.83, 0.79, 0.87);
-
-        let response = select_cross_session_mutations(
-            vec![uncertain_high_point, steady_lower_bound],
-            &CrossSessionMutationListParams {
-                page: 1,
-                per_page: 20,
-                since: None,
-                until: None,
-                session_id: None,
-                tool_name: None,
-                state: Some(StagedMutationState::Pending),
-                promotion_recommendation: Some(MutationPromotionRecommendation::Canary),
-                safety_verdict: Some(MutationSafetyVerdict::RequiresApproval),
-                retention_verdict: Some(MutationRetentionVerdict::Retain),
-                min_retention_score: None,
-                verifier_signal: None,
-                verifier_source: None,
-                verifier_gap: None,
-                sort: "retention".into(),
-            },
-        );
-
-        let ordered_ids = response
-            .mutations
-            .iter()
-            .map(|mutation| mutation.mutation_id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            ordered_ids,
-            vec!["steady-lower-bound", "uncertain-high-point"]
-        );
-    }
-
-    #[test]
-    fn cross_session_mutation_queue_filters_by_verifier_signal_and_gap() {
-        let mut missing = sample_queue_mutation(
-            "missing",
-            "session-a",
-            "write_file",
-            StagedMutationState::Pending,
-            MutationSafetyVerdict::RequiresApproval,
-            MutationRetentionVerdict::Retain,
-            0.81,
-            Some("2026-04-10T10:00:00Z"),
-        );
-        missing.verifier_gap = Some("no_verifier_signal".into());
-
-        let mut ambiguous = sample_queue_mutation(
-            "ambiguous",
-            "session-b",
-            "bash",
-            StagedMutationState::Pending,
-            MutationSafetyVerdict::RequiresApproval,
-            MutationRetentionVerdict::Review,
-            0.65,
-            Some("2026-04-10T11:00:00Z"),
-        );
-        ambiguous.verifier_gap = Some("ambiguous_multi_action_turn".into());
-
-        let mut present = sample_queue_mutation(
-            "present",
-            "session-c",
-            "edit_file",
-            StagedMutationState::Ready,
-            MutationSafetyVerdict::Safe,
-            MutationRetentionVerdict::Retain,
-            0.93,
-            Some("2026-04-10T12:00:00Z"),
-        );
-        present.verifier = Some(crate::MutationVerifierSummary::from_results(
-            true,
-            &[crate::VerificationResult {
-                criterion_id: "tests".into(),
-                passed: true,
-                evidence: "all checks passed".into(),
-                expected: "tests green".into(),
-                duration_ms: 120,
-                error: None,
-            }],
-        ));
-        present.verifier_source = Some("tool_result".into());
-
-        let missing_response = select_cross_session_mutations(
-            vec![missing.clone(), ambiguous.clone(), present.clone()],
-            &CrossSessionMutationListParams {
-                page: 1,
-                per_page: 20,
-                since: None,
-                until: None,
-                session_id: None,
-                tool_name: None,
-                state: None,
-                promotion_recommendation: None,
-                safety_verdict: None,
-                retention_verdict: None,
-                min_retention_score: None,
-                verifier_signal: Some(MutationVerifierSignalFilter::Missing),
-                verifier_source: None,
-                verifier_gap: Some("no_verifier_signal".into()),
-                sort: "priority".into(),
-            },
-        );
-        assert_eq!(missing_response.total, 1);
-        assert_eq!(missing_response.mutations[0].mutation_id, "missing");
-
-        let present_response = select_cross_session_mutations(
-            vec![missing, ambiguous, present],
-            &CrossSessionMutationListParams {
-                page: 1,
-                per_page: 20,
-                since: None,
-                until: None,
-                session_id: None,
-                tool_name: None,
-                state: None,
-                promotion_recommendation: None,
-                safety_verdict: None,
-                retention_verdict: None,
-                min_retention_score: None,
-                verifier_signal: Some(MutationVerifierSignalFilter::Present),
-                verifier_source: Some("tool_result".into()),
-                verifier_gap: None,
-                sort: "priority".into(),
-            },
-        );
-        assert_eq!(present_response.total, 1);
-        assert_eq!(present_response.mutations[0].mutation_id, "present");
     }
 }

@@ -853,7 +853,6 @@ impl StepRecorder {
             budget_remaining_rounds,
             blocked_tools: blocked_tools.to_vec(),
             recent_tools: recent_tools.to_vec(),
-            learning_snapshot_id: None,
             memory_context: self
                 .current_step
                 .as_ref()

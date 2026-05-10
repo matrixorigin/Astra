@@ -220,7 +220,7 @@ fn bind_working_memory(sources: &ContextSources<'_>) -> String {
 /// change at session boundaries: `system_override` and opt-in
 /// `extra_stable_sections` (environment_static from the bridge / adapter
 /// edge_profile, output style, etc.). Turn-volatile content —
-/// learned_context, self-awareness, tool-dependent guidance — routes
+/// self-awareness, tool-dependent guidance, memoria insights — routes
 /// through `RuntimeVolatile` (`bind_runtime_volatile`) so it sits after
 /// the Session→None cache marker and doesn't invalidate the prefix.
 /// These stable pieces sit in `CacheScope::Session` so Anthropic's

@@ -286,33 +286,6 @@ fn merge_recent_outcomes(
     merged
 }
 
-/// Export tool-health entries that changed relative to the last-synced
-/// baseline. Used by delta sync to send only diffs to cloud.
-pub fn export_tool_health_delta(
-    current: &[ToolHealthEntry],
-    baseline: &[ToolHealthEntry],
-) -> Vec<serde_json::Value> {
-    let baseline_map: std::collections::HashMap<&str, &ToolHealthEntry> = baseline
-        .iter()
-        .map(|entry| (entry.name.as_str(), entry))
-        .collect();
-
-    current
-        .iter()
-        .filter(|entry| match baseline_map.get(entry.name.as_str()) {
-            Some(prev) => {
-                prev.total_calls != entry.total_calls
-                    || prev.total_failures != entry.total_failures
-                    || (prev.failure_rate - entry.failure_rate).abs() > f64::EPSILON
-                    || prev.last_updated_epoch != entry.last_updated_epoch
-                    || prev.recent_outcomes != entry.recent_outcomes
-            }
-            None => true,
-        })
-        .filter_map(|entry| serde_json::to_value(entry).ok())
-        .collect()
-}
-
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -455,24 +428,5 @@ mod tests {
                 .join(".astra/learning/profile-empty.json")
                 .exists()
         );
-    }
-
-    #[test]
-    fn export_tool_health_delta_detects_changes() {
-        let baseline = vec![sample_health("bash", 5, 1, 100)];
-        let current = vec![
-            sample_health("bash", 6, 1, 200),
-            sample_health("read_file", 1, 0, 200),
-        ];
-        let delta = export_tool_health_delta(&current, &baseline);
-        assert_eq!(delta.len(), 2, "1 changed + 1 new");
-    }
-
-    #[test]
-    fn export_tool_health_delta_skips_unchanged() {
-        let baseline = vec![sample_health("bash", 5, 1, 100)];
-        let current = vec![sample_health("bash", 5, 1, 100)];
-        let delta = export_tool_health_delta(&current, &baseline);
-        assert!(delta.is_empty());
     }
 }

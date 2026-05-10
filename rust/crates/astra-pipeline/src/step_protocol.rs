@@ -812,8 +812,6 @@ pub struct HeavyCheckpoint {
     /// Session state
     pub blocked_tools: Vec<String>,
     pub recent_tools: Vec<String>,
-    /// Learning state reference
-    pub learning_snapshot_id: Option<String>,
     /// Memory context snapshot (for auditing)
     pub memory_context: Option<MemoryContext>,
     /// Active delegation ID (if running inside a delegation)
@@ -871,10 +869,6 @@ pub struct DelegationSubRunSummary {
 
 /// A named breakpoint — an addressable point in the execution timeline.
 /// Wraps a `HeavyCheckpoint` with additional metadata for resume/fork.
-///
-/// The optional `composite_snapshot` replaces the old flat fields with a
-/// unified bag-of-references model. When present, `tool_health_entries`,
-/// `learning_snapshot_epoch` etc. are still populated for backward compat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BreakpointInfo {
     /// Unique identifier for this breakpoint.
@@ -893,11 +887,7 @@ pub struct BreakpointInfo {
     pub tool_health_entries: Vec<crate::ToolHealthEntry>,
     /// Correction history from TurnGuard at this point.
     pub correction_history_json: Option<String>,
-    /// Learning snapshot identifier (profile name + epoch).
-    pub learning_snapshot_epoch: Option<u64>,
     /// Composite snapshot — unified bag-of-references across state dimensions.
-    /// When present, this is the canonical source; the flat fields above are kept
-    /// for backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composite_snapshot: Option<astra_core::composite_snapshot::CompositeSnapshot>,
 }
@@ -964,7 +954,6 @@ impl StepCheckpoint {
             budget_remaining_rounds: 0,
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
-            learning_snapshot_id: None,
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -3036,7 +3025,6 @@ mod tests {
             budget_remaining_rounds: 5,
             blocked_tools: vec![],
             recent_tools: vec![],
-            learning_snapshot_id: None,
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -3072,7 +3060,6 @@ mod tests {
             budget_remaining_rounds: 10,
             blocked_tools: vec![],
             recent_tools: vec![],
-            learning_snapshot_id: None,
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -3158,7 +3145,6 @@ mod tests {
             h.messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
             h.budget_remaining_tokens = 2000;
             h.blocked_tools = vec!["bash".into()];
-            h.learning_snapshot_id = Some("snap-001".into());
         }
         let json = serde_json::to_string(&cp).unwrap();
         let restored: StepCheckpoint = serde_json::from_str(&json).unwrap();
@@ -3167,7 +3153,6 @@ mod tests {
             assert_eq!(h.messages.len(), 1);
             assert_eq!(h.budget_remaining_tokens, 2000);
             assert_eq!(h.blocked_tools, vec!["bash"]);
-            assert_eq!(h.learning_snapshot_id.as_deref(), Some("snap-001"));
         }
     }
 
@@ -3394,7 +3379,6 @@ mod tests {
             budget_remaining_rounds: 0,
             blocked_tools: vec![],
             recent_tools: vec![],
-            learning_snapshot_id: None,
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,

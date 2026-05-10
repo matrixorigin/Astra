@@ -48,8 +48,6 @@ pub struct RestoredSession {
     pub protocol_version: u32,
     /// Completed tool results extracted from events (tool_name → outputs)
     pub completed_tool_results: HashMap<String, Vec<String>>,
-    /// Learning snapshot ID (for cross-session knowledge)
-    pub learning_snapshot_id: Option<String>,
     /// Structured interruption record from the checkpoint that created this restore
     /// point. When present, describes why the previous run was interrupted and
     /// what the caller should do to resume (e.g., wait, compact, intervene).
@@ -177,7 +175,6 @@ fn build_restored_session(
         resume_turn,
         protocol_version: heavy.light.protocol_version,
         completed_tool_results: completed_results,
-        learning_snapshot_id: heavy.learning_snapshot_id,
         interruption: heavy.interruption,
         approval_overrides: heavy.approval_overrides,
         consecutive_context_window_errors: heavy.consecutive_context_window_errors,
@@ -472,7 +469,6 @@ mod tests {
             budget_remaining_rounds: 5,
             blocked_tools,
             recent_tools: vec!["git_status".to_string()],
-            learning_snapshot_id: Some("snap-123".to_string()),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -667,7 +663,6 @@ mod tests {
             resume_turn: 3,
             protocol_version: PROTOCOL_VERSION,
             completed_tool_results: HashMap::new(),
-            learning_snapshot_id: None,
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,

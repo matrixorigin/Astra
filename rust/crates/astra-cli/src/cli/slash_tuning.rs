@@ -244,12 +244,6 @@ fn format_trigger(trigger: &EvolutionTrigger) -> String {
         EvolutionTrigger::NegativeFeedbackStreak { count } => {
             format!("{} consecutive negative signals", count)
         }
-        EvolutionTrigger::PatternDrift { confidence_drop } => {
-            format!(
-                "Pattern confidence drops by {:.0}%",
-                confidence_drop * 100.0
-            )
-        }
         EvolutionTrigger::SignalAccumulation {
             signal_type,
             count,

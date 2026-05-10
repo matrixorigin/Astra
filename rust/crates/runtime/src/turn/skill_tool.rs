@@ -859,7 +859,6 @@ pub struct SkillActivation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SkillVerificationOutcome {
     pub all_required_passed: bool,
-    pub summary: Option<astra_services::MutationVerifierSummary>,
 }
 
 /// Result of a single skill execution.
@@ -881,7 +880,6 @@ pub struct InterceptedToolResult {
     pub tool_call_id: String,
     pub tool_name: String,
     pub result: String,
-    pub verification_summary: Option<astra_services::MutationVerifierSummary>,
 }
 
 /// Handle `discover_skills` then `skill` tool calls in one batch (discover runs first).
@@ -967,7 +965,6 @@ pub async fn partition_discover_and_execute_skills(
                 .unwrap_or_default()
                 .to_string(),
             result,
-            verification_summary: None,
         });
     }
 
@@ -1109,14 +1106,12 @@ pub async fn partition_and_execute_skills(
                     tool_call_id: call_id,
                     tool_name,
                     result,
-                    verification_summary: skill_verification.and_then(|v| v.summary),
                 }
             }
             None => InterceptedToolResult {
                 tool_call_id: call_id,
                 tool_name,
                 result: "Invalid skill arguments: expected object or JSON string".to_string(),
-                verification_summary: None,
             },
         };
 
@@ -1286,7 +1281,6 @@ async fn execute_pipeline(
                 activation: last_activation,
                 verification: Some(SkillVerificationOutcome {
                     all_required_passed: false,
-                    summary: None,
                 }),
             };
         }
@@ -1312,7 +1306,6 @@ async fn execute_pipeline(
         activation: last_activation,
         verification: Some(SkillVerificationOutcome {
             all_required_passed: all_passed,
-            summary: None,
         }),
     }
 }
@@ -1669,7 +1662,6 @@ fn validate_skill_output_schema(
             output_text,
             Some(SkillVerificationOutcome {
                 all_required_passed: true,
-                summary: None,
             }),
         );
     }
@@ -1692,7 +1684,6 @@ fn validate_skill_output_schema(
         warning,
         Some(SkillVerificationOutcome {
             all_required_passed: false,
-            summary: None,
         }),
     )
 }
@@ -2012,12 +2003,6 @@ fn execute_skill<'a>(
                                         output,
                                         Some(SkillVerificationOutcome {
                                             all_required_passed: all_passed,
-                                            summary: Some(
-                                                astra_services::MutationVerifierSummary::from_results(
-                                                    all_passed,
-                                                    &results,
-                                                ),
-                                            ),
                                         }),
                                     )
                                 } else {
@@ -3396,7 +3381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_skill_fork_returns_verification_summary() {
+    async fn execute_skill_fork_returns_verification_outcome() {
         use async_trait::async_trait;
 
         struct ForkResolver {
@@ -3492,10 +3477,6 @@ mod tests {
         assert!(r.activation.is_some());
         let verification = r.verification.expect("expected verification outcome");
         assert!(verification.all_required_passed);
-        let summary = verification.summary.expect("expected verifier summary");
-        assert_eq!(summary.criteria_total, 1);
-        assert_eq!(summary.criteria_passed, 1);
-        assert!(summary.failing_criteria.is_empty());
     }
 
     #[test]
@@ -3661,12 +3642,10 @@ mod tests {
         assert_eq!(skill_results[0].tool_call_id, "call_1");
         assert_eq!(skill_results[0].tool_name, "skill");
         assert!(skill_results[0].result.contains("code-review"));
-        assert!(skill_results[0].verification_summary.is_none());
 
         assert_eq!(skill_results[1].tool_call_id, "call_3");
         assert_eq!(skill_results[1].tool_name, "skill");
         assert!(skill_results[1].result.contains("test-writer"));
-        assert!(skill_results[1].verification_summary.is_none());
 
         assert_eq!(remaining[0]["function"]["name"], "bash");
     }

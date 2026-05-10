@@ -36,10 +36,6 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub tool_selection: ToolSelectionConfig,
 
-    /// Learning/adaptation configuration.
-    #[serde(default)]
-    pub learning: LearningConfig,
-
     /// Telemetry configuration.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
@@ -229,7 +225,6 @@ impl Default for RuntimeConfig {
             compression: CompressionConfig::default(),
             memory: MemoryConfig::default(),
             tool_selection: ToolSelectionConfig::default(),
-            learning: LearningConfig::default(),
             telemetry: TelemetryConfig::default(),
             token_budget: TokenBudgetConfig::default(),
             verification: VerificationConfig::default(),
@@ -445,10 +440,6 @@ pub struct ToolSelectionConfig {
     /// Boost factor for recently used tools.
     #[serde(default = "default_recent_tool_boost")]
     pub recent_tool_boost: f64,
-
-    /// Whether to use learned patterns for tool selection.
-    #[serde(default = "default_true")]
-    pub use_learned_patterns: bool,
 
     /// Maximum tokens for tool schemas.
     #[serde(default = "default_max_tool_schema_tokens")]
@@ -965,7 +956,6 @@ impl Default for ToolSelectionConfig {
             confidence_threshold: default_tool_confidence_threshold(),
             prefer_recent_tools: default_true(),
             recent_tool_boost: default_recent_tool_boost(),
-            use_learned_patterns: default_true(),
             max_tool_schema_tokens: default_max_tool_schema_tokens(),
             tool_budget_tokens: 0,
             max_identical_tool_calls: 0,
@@ -987,62 +977,6 @@ impl Default for ToolSelectionConfig {
             cache_waste_midloop_threshold: 0,
             exploration_family_churn_midloop_threshold: 0,
             model_profiles: Vec::new(),
-        }
-    }
-}
-
-// ─── Learning Configuration ──────────────────────────────────────────────────
-
-/// Configuration for learning and adaptation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LearningConfig {
-    /// Whether learning is enabled.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-
-    /// Entity decay half-life in days.
-    #[serde(default = "default_entity_decay_half_life")]
-    pub entity_decay_half_life_days: u32,
-
-    /// Pattern decay half-life in days.
-    #[serde(default = "default_pattern_decay_half_life")]
-    pub pattern_decay_half_life_days: u32,
-
-    /// Minimum samples before calibration is applied.
-    #[serde(default = "default_min_calibration_samples")]
-    pub min_calibration_samples: u32,
-
-    /// Exploration rate for tool chain patterns (epsilon-greedy).
-    #[serde(default = "default_exploration_rate")]
-    pub exploration_rate: f64,
-
-    /// Whether to apply progressive calibration.
-    #[serde(default = "default_true")]
-    pub progressive_calibration: bool,
-}
-
-fn default_entity_decay_half_life() -> u32 {
-    60
-}
-fn default_pattern_decay_half_life() -> u32 {
-    30
-}
-fn default_min_calibration_samples() -> u32 {
-    5
-}
-fn default_exploration_rate() -> f64 {
-    0.1
-}
-
-impl Default for LearningConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            entity_decay_half_life_days: default_entity_decay_half_life(),
-            pattern_decay_half_life_days: default_pattern_decay_half_life(),
-            min_calibration_samples: default_min_calibration_samples(),
-            exploration_rate: default_exploration_rate(),
-            progressive_calibration: true,
         }
     }
 }
@@ -1397,7 +1331,6 @@ impl RuntimeConfig {
             compression,
             memory,
             tool_selection,
-            learning,
             telemetry,
             token_budget,
             verification,
@@ -1499,7 +1432,6 @@ impl RuntimeConfig {
             confidence_threshold,
             prefer_recent_tools,
             recent_tool_boost,
-            use_learned_patterns,
             max_tool_schema_tokens,
             tool_budget_tokens,
             max_identical_tool_calls,
@@ -1541,11 +1473,6 @@ impl RuntimeConfig {
             &mut self.tool_selection.recent_tool_boost,
             recent_tool_boost,
             default_recent_tool_boost(),
-        );
-        merge_if_non_default(
-            &mut self.tool_selection.use_learned_patterns,
-            use_learned_patterns,
-            default_true(),
         );
         merge_if_non_default(
             &mut self.tool_selection.max_tool_schema_tokens,
@@ -1658,41 +1585,6 @@ impl RuntimeConfig {
         if !model_profiles.is_empty() {
             self.tool_selection.model_profiles = model_profiles;
         }
-
-        let LearningConfig {
-            enabled,
-            entity_decay_half_life_days,
-            pattern_decay_half_life_days,
-            min_calibration_samples,
-            exploration_rate,
-            progressive_calibration,
-        } = learning;
-        merge_if_non_default(&mut self.learning.enabled, enabled, default_true());
-        merge_if_non_default(
-            &mut self.learning.entity_decay_half_life_days,
-            entity_decay_half_life_days,
-            default_entity_decay_half_life(),
-        );
-        merge_if_non_default(
-            &mut self.learning.pattern_decay_half_life_days,
-            pattern_decay_half_life_days,
-            default_pattern_decay_half_life(),
-        );
-        merge_if_non_default(
-            &mut self.learning.min_calibration_samples,
-            min_calibration_samples,
-            default_min_calibration_samples(),
-        );
-        merge_if_non_default(
-            &mut self.learning.exploration_rate,
-            exploration_rate,
-            default_exploration_rate(),
-        );
-        merge_if_non_default(
-            &mut self.learning.progressive_calibration,
-            progressive_calibration,
-            default_true(),
-        );
 
         let TelemetryConfig {
             capture_context_traces,
@@ -2116,7 +2008,6 @@ mod tests {
                 confidence_threshold: 0.7,
                 prefer_recent_tools: false,
                 recent_tool_boost: 0.4,
-                use_learned_patterns: false,
                 max_tool_schema_tokens: 22000,
                 tool_budget_tokens: 0,
                 max_identical_tool_calls: 0,
@@ -2138,14 +2029,6 @@ mod tests {
                 cache_waste_midloop_threshold: 0,
                 exploration_family_churn_midloop_threshold: 0,
                 model_profiles: Vec::new(),
-            },
-            learning: LearningConfig {
-                enabled: false,
-                entity_decay_half_life_days: 10,
-                pattern_decay_half_life_days: 20,
-                min_calibration_samples: 8,
-                exploration_rate: 0.25,
-                progressive_calibration: false,
             },
             telemetry: TelemetryConfig {
                 capture_context_traces: false,
@@ -2213,15 +2096,7 @@ mod tests {
         assert!((merged.tool_selection.confidence_threshold - 0.7).abs() < 0.001);
         assert!(!merged.tool_selection.prefer_recent_tools);
         assert!((merged.tool_selection.recent_tool_boost - 0.4).abs() < 0.001);
-        assert!(!merged.tool_selection.use_learned_patterns);
         assert_eq!(merged.tool_selection.max_tool_schema_tokens, 22000);
-
-        assert!(!merged.learning.enabled);
-        assert_eq!(merged.learning.entity_decay_half_life_days, 10);
-        assert_eq!(merged.learning.pattern_decay_half_life_days, 20);
-        assert_eq!(merged.learning.min_calibration_samples, 8);
-        assert!((merged.learning.exploration_rate - 0.25).abs() < 0.001);
-        assert!(!merged.learning.progressive_calibration);
 
         assert!(!merged.telemetry.capture_context_traces);
         assert!(!merged.telemetry.capture_tool_traces);

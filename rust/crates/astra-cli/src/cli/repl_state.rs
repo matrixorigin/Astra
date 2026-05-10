@@ -137,8 +137,6 @@ pub(crate) struct ReplState {
     pub ingestion_user_id: Option<String>,
     /// Matrix pool + journal ingestion + sync orchestrator (None if MatrixOne unavailable).
     pub matrix_runtime: Option<std::sync::Arc<astra_runtime::MatrixCloudRuntime>>,
-    /// Learning snapshot restored from cloud (to be merged into learning modules).
-    pub learning_snapshot: Option<String>,
     /// Local task service for /task commands.
     pub task_service: Option<std::sync::Arc<astra_services::LocalTaskService>>,
     /// Cross-session tool health data for error budget persistence.
@@ -170,9 +168,6 @@ pub(crate) struct ReplState {
     pub current_plan_subtask_id: Option<String>,
     /// Whether the last chat turn was interrupted by Ctrl+C (used by plan auto-execution).
     pub last_turn_interrupted: bool,
-    /// Cloud learning snapshot version for optimistic locking.
-    /// Set by try_cloud_pull, used by try_cloud_push to prevent concurrent overwrites.
-    pub cloud_learning_version: Option<i64>,
     /// Last turn's journal event — for /turn command display.
     pub last_turn_event: Option<session_journal::JournalEvent>,
     /// Unified skill registry (single source of truth for all skill resolution).
@@ -438,7 +433,6 @@ impl Default for ReplState {
             ),
             ingestion_user_id: None,
             matrix_runtime: None,
-            learning_snapshot: None,
             task_service: None,
             tool_health_entries: Vec::new(),
             synced_tool_health_entries: Vec::new(),
@@ -452,7 +446,6 @@ impl Default for ReplState {
             plan_execution_rounds: 0,
             current_plan_subtask_id: None,
             last_turn_interrupted: false,
-            cloud_learning_version: None,
             last_turn_event: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),

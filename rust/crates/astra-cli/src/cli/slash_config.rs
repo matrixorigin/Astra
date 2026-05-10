@@ -104,25 +104,6 @@ fn show_config() {
             .yellow()
     );
 
-    // Learning settings
-    println!("\n{}", "📈 Learning".bold());
-    println!(
-        "  enabled: {}",
-        config.learning.enabled.to_string().yellow()
-    );
-    println!(
-        "  entity_decay_half_life_days: {}",
-        config
-            .learning
-            .entity_decay_half_life_days
-            .to_string()
-            .yellow()
-    );
-    println!(
-        "  exploration_rate: {}",
-        format!("{:.2}", config.learning.exploration_rate).yellow()
-    );
-
     // Token budget settings
     println!("\n{}", "🎯 Token Budget".bold());
     println!(
