@@ -72,6 +72,12 @@ Do NOT write a full "## Code Review" header and act as if you covered everything
 
 Fetch the full diff. Scan for signals and decide which checks to run in Step 3.
 
+**Parallel review planning:**
+
+- If you spawn focused reviewers or use isolated worktrees, make the capability check explicit before claiming parallelism.
+- If `git worktree` or background agent isolation is unavailable, do not silently degrade to serial execution. Say so in the final report: `Parallelism degraded: git worktree unavailable; reviews ran serially.` Include the reason if the tool returned one.
+- If a capability is required for the requested review depth and the fallback would materially reduce coverage, stop and ask whether to degrade or retry with the required capability.
+
 **Signals → checks:**
 
 | Signal in diff | Check to run |
@@ -96,6 +102,14 @@ Do not call `git_show` or `git {action: "diff"}` more than once on the same targ
 ## Step 3: Report
 
 **Output NOTHING while making tool calls. Write the report only when all analysis is done.**
+
+**Self-critique gate before final report:**
+
+Run a final review pass over your own findings and the changed files before writing the report:
+
+1. Re-read the diff summary and confirm every reported 🔴/🟡 issue still applies to the final diff.
+2. Run mechanical gates that match the modified file types. Always include `git diff --check` for working-tree reviews; add formatter/test gates only when the diff changed code in that ecosystem.
+3. If a gate fails because of the changes under review, report it as a finding. If the gate is unavailable, state it as residual risk instead of pretending it passed.
 
 ```
 ## Code Review: {target}

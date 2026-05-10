@@ -5,8 +5,10 @@
 //! (e.g., `ServerToolExecutor` adds resource governance and process isolation,
 //! `CliToolExecutor` adds terminal UI and MCP dispatch).
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -58,6 +60,15 @@ pub struct DefaultToolExecutor {
     progress_callback: Option<Arc<dyn ToolProgressCallback>>,
     github_client: Option<GitHubClient>,
     task_manager: Arc<TaskManager>,
+    bash_cache: Arc<Mutex<HashMap<BashCacheKey, ToolResult>>>,
+    workspace_generation: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BashCacheKey {
+    workspace_root: String,
+    workspace_generation: u64,
+    command: String,
 }
 
 impl DefaultToolExecutor {
@@ -68,6 +79,8 @@ impl DefaultToolExecutor {
             progress_callback: None,
             github_client: None,
             task_manager: Arc::new(TaskManager::new()),
+            bash_cache: Arc::new(Mutex::new(HashMap::new())),
+            workspace_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -173,6 +186,25 @@ impl ToolExecutor for DefaultToolExecutor {
             return ToolResult::error(format!("Tool '{name}' not executed: run was cancelled"));
         }
 
+        if name == "bash"
+            && !args.get("force").and_then(Value::as_bool).unwrap_or(false)
+            && let Some(key) = self.bash_cache_key(args)
+            && let Some(mut cached) = {
+                self.bash_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&key)
+                    .cloned()
+            }
+        {
+            mark_result_cached(&mut cached);
+            if let Some(cb) = &self.progress_callback {
+                cb.tool_completed(&call_id, &cached.output, !cached.is_error)
+                    .await;
+            }
+            return cached;
+        }
+
         let result = match tokio::time::timeout(TOOL_TIMEOUT, self.dispatch(name, args)).await {
             Ok(r) => r,
             Err(_) => ToolResult::error(format!(
@@ -196,6 +228,19 @@ impl ToolExecutor for DefaultToolExecutor {
             result
         };
 
+        if name == "bash"
+            && !result.is_error
+            && let Some(key) = self.bash_cache_key(args)
+        {
+            self.bash_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, result.clone());
+        }
+        if is_workspace_mutation_tool(name) && !result.is_error {
+            self.workspace_generation.fetch_add(1, Ordering::Relaxed);
+        }
+
         if let Some(cb) = &self.progress_callback {
             cb.tool_completed(&call_id, &result.output, !result.is_error)
                 .await;
@@ -216,6 +261,15 @@ impl ToolExecutor for DefaultToolExecutor {
 // ─── Dispatch ───────────────────────────────────────────────────────────────
 
 impl DefaultToolExecutor {
+    fn bash_cache_key(&self, args: &Value) -> Option<BashCacheKey> {
+        let command = args.get("command")?.as_str()?.to_string();
+        Some(BashCacheKey {
+            workspace_root: self.ctx.workspace_root.display().to_string(),
+            workspace_generation: self.workspace_generation.load(Ordering::Relaxed),
+            command,
+        })
+    }
+
     async fn dispatch(&self, name: &str, args: &Value) -> ToolResult {
         let ws = &self.ctx.workspace_root;
         let pr = &self.ctx.project_root;
@@ -449,6 +503,18 @@ impl DefaultToolExecutor {
     }
 }
 
+fn mark_result_cached(result: &mut ToolResult) {
+    let metadata = result.metadata.get_or_insert_with(serde_json::Map::new);
+    metadata.insert("cached".to_string(), Value::Bool(true));
+}
+
+fn is_workspace_mutation_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "write_file" | "str_replace" | "multi_edit" | "delete_file"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -573,6 +639,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_bash_reuses_identical_successful_result() {
+        let (_tmp, exec) = test_executor();
+        let args = serde_json::json!({
+            "command": "n=$(cat dedup-count 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > dedup-count; cat dedup-count"
+        });
+
+        let first = exec.execute("bash", &args).await;
+        let second = exec.execute("bash", &args).await;
+
+        assert!(!first.is_error, "first failed: {}", first.output);
+        assert!(!second.is_error, "second failed: {}", second.output);
+        assert_eq!(first.output, second.output);
+        assert_eq!(
+            std::fs::read_to_string(_tmp.path().join("dedup-count")).unwrap(),
+            "1\n",
+            "identical second bash call should not execute again"
+        );
+        assert_eq!(
+            second
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_force_bypasses_dedup_cache() {
+        let (_tmp, exec) = test_executor();
+        let args = serde_json::json!({
+            "command": "n=$(cat force-count 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > force-count; cat force-count"
+        });
+        let forced_args = serde_json::json!({
+            "command": "n=$(cat force-count 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > force-count; cat force-count",
+            "force": true
+        });
+
+        let first = exec.execute("bash", &args).await;
+        let forced = exec.execute("bash", &forced_args).await;
+
+        assert!(!first.is_error, "first failed: {}", first.output);
+        assert!(!forced.is_error, "forced failed: {}", forced.output);
+        assert_ne!(first.output, forced.output);
+        assert_eq!(
+            std::fs::read_to_string(_tmp.path().join("force-count")).unwrap(),
+            "2\n"
+        );
+        assert_ne!(
+            forced
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_cache_invalidates_after_file_mutation() {
+        let (tmp, exec) = test_executor();
+        std::fs::write(tmp.path().join("watched.txt"), "one\n").unwrap();
+        let args = serde_json::json!({"command": "cat watched.txt"});
+
+        let first = exec.execute("bash", &args).await;
+        let write = exec
+            .execute(
+                "write_file",
+                &serde_json::json!({"path": "watched.txt", "content": "two"}),
+            )
+            .await;
+        let second = exec.execute("bash", &args).await;
+
+        assert!(!first.is_error, "first failed: {}", first.output);
+        assert!(!write.is_error, "write failed: {}", write.output);
+        assert!(!second.is_error, "second failed: {}", second.output);
+        assert_eq!(first.output, "one\n");
+        assert_eq!(second.output, "two\n");
+        assert_ne!(
+            second
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_bash_non_zero_is_error() {
         let (_tmp, exec) = test_executor();
         let result = exec
@@ -630,7 +785,7 @@ mod tests {
             .await;
         assert!(!result.is_error);
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
-        assert_eq!(content, "new text here");
+        assert_eq!(content, "new text here\n");
     }
 
     #[tokio::test]
@@ -791,7 +946,7 @@ mod tests {
             .await;
         assert!(!result.is_error);
         let content = std::fs::read_to_string(tmp.path().join("m.txt")).unwrap();
-        assert_eq!(content, "AAA bbb CCC");
+        assert_eq!(content, "AAA bbb CCC\n");
     }
 
     #[tokio::test]

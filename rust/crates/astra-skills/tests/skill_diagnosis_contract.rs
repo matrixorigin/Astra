@@ -286,6 +286,30 @@ fn skill_md_example_blocks_are_parseable() {
 }
 
 #[test]
+fn review_changes_skill_requires_parallel_fallback_and_self_critique_gate() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let repo_root = std::path::Path::new(manifest_dir)
+        .ancestors()
+        .nth(3)
+        .expect("walk up to repo root");
+    let path = repo_root
+        .join("skills")
+        .join("review_changes")
+        .join("SKILL.md");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+    assert!(
+        text.contains("worktree") && text.contains("degrade"),
+        "review_changes must explicitly disclose worktree/parallel fallback"
+    );
+    assert!(
+        text.contains("Self-critique gate") && text.contains("git diff --check"),
+        "review_changes must run a self-critique lint gate before the final report"
+    );
+}
+
+#[test]
 fn parser_ignores_prose_between_fences() {
     // Real skill output will have paragraphs before the JSON. Parser must
     // locate the block regardless of leading content.
