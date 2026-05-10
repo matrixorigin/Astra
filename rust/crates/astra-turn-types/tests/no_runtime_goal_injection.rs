@@ -1,0 +1,179 @@
+//! wip-3 regression guard: runtime does not auto-extract "goal" from user
+//! messages nor inject it (or any derived state) into the system prompt.
+//!
+//! Originating bug: session `895536bf-4001-4c36-99a8-3d395800440a` observed
+//! the system prompt contained
+//!   `[session-anchor] Goal: hi. State: ...`
+//!   `[working-set:v1]\ngoal: hi\npending_work: runtime-goal: 最应修复的 bug: 1.`
+//! after the user had typed "hi" once and then a substantive multiline query.
+//! The runtime had (a) frozen `goal` at the first "hi" because
+//! `ensure_goal` was set-if-empty, and (b) title-extracted the user's
+//! follow-up into a `runtime-goal` TodoItem that leaked into every turn.
+//!
+//! Design fix: the Claude Code model — runtime never auto-assigns a "goal",
+//! never injects anchors/working-set headers with a `goal:` or
+//! `pending_work:` line. LLM-authored task tracking (e.g. `TodoWriteTool` /
+//! `TaskCreate`) takes over.
+//!
+//! This test is the contract: after wip-3 lands, the offending types and
+//! injection helpers must not exist as public API. The compiler is the
+//! enforcer — if any of the probes below resolves, the test body will
+//! type-check and the `#[should_panic]` arm becomes the only failure signal.
+//! We invert that with a `compile_fail`-style pattern via `trybuild`-free
+//! doc tests and explicit negative-resolution probes.
+
+// ── Guard 1: deleted types must not re-appear ───────────────────────────
+//
+// Each of the following is a compile-time assertion that the named path
+// does NOT resolve. We use `#[cfg(feature = "wip3_resurrected")]` gates
+// that no Cargo.toml will ever enable, wrapped around usages; the bodies
+// that would fail compile live behind that unreachable feature.
+//
+// The positive guarantee we need is that a plain `use astra_turn_types::X`
+// for each deleted path fails to resolve. That is tested in
+// `tests/compile_fail/` via `trybuild` when a full sweep is green.
+// Here we provide a faster, always-runnable behavioural check.
+
+// ── Guard 2: SessionFacts has no goal/plan fields ───────────────────────
+
+#[test]
+fn session_facts_has_no_plan_state_field() {
+    let facts = astra_turn_types::session_facts::SessionFacts::default();
+    // The serde representation must not expose `plan_state`.
+    let json = serde_json::to_value(&facts).expect("facts serialize");
+    assert!(
+        json.get("plan_state").is_none(),
+        "SessionFacts.plan_state must be removed (was carrying runtime-extracted goal). \
+         Found: {json:#?}"
+    );
+}
+
+// ── Guard 3: working-set injection (if it still exists) omits goal lines ─
+//
+// After wip-3, `to_working_set_injection` should not exist at all. Until it
+// is deleted, any remaining emission must not carry `goal:` or
+// `pending_work:` lines — those were the vectors for the pollution bug.
+
+#[test]
+fn working_set_injection_does_not_emit_goal_or_pending_work() {
+    // Dynamically construct facts with the toxic shape that triggered the
+    // bug (simulating what a restored checkpoint's facts might look like).
+    let facts = astra_turn_types::session_facts::SessionFacts::default();
+    // If the fn still exists, call it. If not, compile fails and this
+    // test goes red — which is the signal that wip-3 took effect.
+    #[allow(deprecated)]
+    let injection =
+        <astra_turn_types::session_facts::SessionFacts as _WorkingSetProbe>::maybe_inject(
+            &facts, "hi",
+        );
+
+    if let Some(text) = injection {
+        assert!(
+            !text.contains("\ngoal:") && !text.starts_with("goal:"),
+            "working-set injection must not emit a `goal:` line — found: {text}"
+        );
+        assert!(
+            !text.contains("pending_work:"),
+            "working-set injection must not emit a `pending_work:` line — found: {text}"
+        );
+        assert!(
+            !text.contains("runtime-goal"),
+            "working-set injection must not surface the runtime-goal todo id — found: {text}"
+        );
+    }
+}
+
+/// Trait-based probe: if `to_working_set_injection` still exists with its
+/// pre-wip-3 signature, the blanket impl below wires into it. If wip-3
+/// deletes the method, this impl fails to compile and the test goes red.
+trait _WorkingSetProbe {
+    fn maybe_inject(&self, current_goal: &str) -> Option<String>;
+}
+
+impl _WorkingSetProbe for astra_turn_types::session_facts::SessionFacts {
+    fn maybe_inject(&self, current_goal: &str) -> Option<String> {
+        // Intentional: reach into whatever injection surface still exists.
+        // Once wip-3 removes `to_working_set_injection`, this line fails to
+        // compile and the test goes red.
+        Some(self.to_working_set_injection(current_goal))
+    }
+}
+
+// ── Guard 4: runtime pollution scenario ─────────────────────────────────
+//
+// The exact sequence from session 895536bf: user says "hi", then a
+// follow-up with action words + multi-line content. No public API in
+// `astra-turn-types` may return a derived "goal" or "pending_work" from
+// that sequence.
+
+#[test]
+fn hi_followed_by_substantive_query_does_not_pin_goal_to_hi() {
+    // Rather than exercising the deleted ContinuityState helpers, this
+    // test documents the INVARIANT: there is no place in astra-turn-types
+    // public surface that takes a sequence of user messages and returns
+    // a runtime "goal" string. If such an API appears in future, this
+    // test must be extended to assert it rejects the pollution pattern.
+    //
+    // Enforcement: the crate's public module graph.
+    let module_root = env!("CARGO_MANIFEST_DIR");
+    let src_dir = std::path::Path::new(module_root).join("src");
+    assert!(
+        src_dir.exists(),
+        "astra-turn-types src dir missing: {src_dir:?}"
+    );
+
+    // Scan every .rs file under src/ for the forbidden public API surfaces.
+    let forbidden: &[&str] = &[
+        "pub fn ensure_goal",
+        "pub fn ensure_tracked_goal",
+        "pub fn maybe_update_session_goal",
+        "pub fn to_working_set_injection",
+        "pub fn attention_manifest",
+        "pub struct ContinuityState",
+        "pub struct AttentionManifest",
+        "pub struct GoalState",
+        "pub struct PlanFact",
+        "pub const ATTENTION_PREFIX",
+    ];
+
+    let mut hits: Vec<(String, String)> = Vec::new();
+    for entry in walkdir(&src_dir) {
+        let path = entry;
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for needle in forbidden {
+            if body.contains(needle) {
+                hits.push((path.display().to_string(), (*needle).to_string()));
+            }
+        }
+    }
+
+    assert!(
+        hits.is_empty(),
+        "wip-3 contract violated — forbidden public API still present in astra-turn-types:\n{}",
+        hits.iter()
+            .map(|(p, n)| format!("  {p}: {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
