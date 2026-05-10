@@ -768,7 +768,96 @@ fn maybe_update_session_goal(state: &mut ReplState, line: &str) {
         Some(existing) if session_goal_is_placeholder(existing) => {
             state.session_goal = Some(candidate);
         }
+        Some(existing) if is_topic_pivot(existing, &candidate) => {
+            // User has clearly changed direction. Replace the
+            // anchor rather than carry the stale goal forever. The
+            // threshold is conservative (low word-overlap AND the
+            // new line is substantive) so an ordinary follow-up
+            // like "add a test for that" doesn't trigger a pivot.
+            state.session_goal = Some(candidate);
+        }
         Some(_) => {}
+    }
+}
+
+/// Heuristic: two user messages describe meaningfully different
+/// tasks if they share almost no content words. Purely
+/// lexical — intentionally dumb — because the LLM already routes
+/// around stale goal anchors gracefully; we only need to catch
+/// the obvious "hi → review 5 commits" pivot, not subtle
+/// conceptual shifts.
+///
+/// Returns `true` when:
+///   * the new candidate is substantive (≥ 4 content words), AND
+///   * < 15 % of its content words overlap with the current goal.
+///
+/// Content words = lowercased tokens ≥ 3 ASCII chars (or ≥ 2 CJK
+/// chars), excluding a small stopword set. The stopword set is
+/// intentionally small — drift is OK; the penalty for a false
+/// positive (replacing a good goal) is milder than for a false
+/// negative (goal stuck on greeting forever).
+fn is_topic_pivot(existing: &str, candidate: &str) -> bool {
+    let existing_words = content_words(existing);
+    let candidate_words = content_words(candidate);
+    if candidate_words.len() < 4 {
+        return false;
+    }
+    if existing_words.is_empty() {
+        // Existing is all stopwords (impossible after the placeholder
+        // check but defensive). Treat as pivot.
+        return true;
+    }
+    let overlap = candidate_words
+        .iter()
+        .filter(|w| existing_words.contains(*w))
+        .count();
+    let ratio = overlap as f32 / candidate_words.len() as f32;
+    ratio < 0.15
+}
+
+/// Extract lowercased content words from `s`. Called only from
+/// pivot detection, so we can afford a `Vec` + keep the function
+/// pure.
+fn content_words(s: &str) -> std::collections::HashSet<String> {
+    const STOP: &[&str] = &[
+        "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "is", "are", "be",
+        "was", "were", "it", "this", "that", "these", "those", "can", "do", "does", "how", "what",
+        "why", "when", "please", "me", "my", "i", "we", "us", "you", "your", "从", "的", "了",
+        "在", "是", "和", "与", "或", "也", "但", "吗", "呢", "吧", "啊", "这", "那", "这个",
+        "那个", "现在", "以及",
+    ];
+    let mut out = std::collections::HashSet::new();
+    let mut current = String::new();
+    for ch in s.chars() {
+        if ch.is_alphanumeric() {
+            current.push(ch);
+        } else {
+            if !current.is_empty() {
+                push_if_content(&current, &mut out, STOP);
+                current.clear();
+            }
+        }
+    }
+    if !current.is_empty() {
+        push_if_content(&current, &mut out, STOP);
+    }
+    out
+}
+
+fn push_if_content(word: &str, set: &mut std::collections::HashSet<String>, stop: &[&str]) {
+    let lower = word.to_lowercase();
+    if stop.iter().any(|s| *s == lower) {
+        return;
+    }
+    // Threshold: ≥3 bytes if ASCII, ≥2 chars if non-ASCII (CJK).
+    let is_ascii = lower.is_ascii();
+    let min_ok = if is_ascii {
+        lower.len() >= 3
+    } else {
+        lower.chars().count() >= 2
+    };
+    if min_ok {
+        set.insert(lower);
     }
 }
 
@@ -4093,7 +4182,7 @@ mod tests {
     }
 
     #[test]
-    fn maybe_update_session_goal_replaces_placeholder_but_preserves_real_goal() {
+    fn maybe_update_session_goal_replaces_placeholder_but_preserves_real_goal_on_followup() {
         let mut state = ReplState {
             session_goal: Some("hi".to_string()),
             ..ReplState::default()
@@ -4102,8 +4191,65 @@ mod tests {
         maybe_update_session_goal(&mut state, "review local changes");
         assert_eq!(state.session_goal.as_deref(), Some("review local changes"));
 
-        maybe_update_session_goal(&mut state, "investigate auth refresh drift");
+        // Low-info follow-up — must NOT trigger pivot detection.
+        maybe_update_session_goal(&mut state, "yes, proceed");
         assert_eq!(state.session_goal.as_deref(), Some("review local changes"));
+    }
+
+    #[test]
+    fn maybe_update_session_goal_updates_on_clear_topic_pivot() {
+        // Original anchor: "hi" (placeholder) → "review 5 commits on
+        // enhance_2 branch". Later, the user pivots to something
+        // unrelated that shares no content words — the anchor must
+        // follow, not stay frozen on the review task.
+        let mut state = ReplState {
+            session_goal: Some("review 5 commits on enhance_2 branch".to_string()),
+            ..ReplState::default()
+        };
+
+        // Pivot: investigate a compaction regression — no word overlap
+        // with review/commits/branch.
+        maybe_update_session_goal(
+            &mut state,
+            "investigate the compaction regression that swallowed bash output",
+        );
+        assert_eq!(
+            state.session_goal.as_deref(),
+            Some("investigate the compaction regression that swallowed bash output"),
+            "clear pivot must refresh the anchor"
+        );
+    }
+
+    #[test]
+    fn maybe_update_session_goal_preserves_on_mild_followup() {
+        // Follow-ups that share even one content word with the
+        // current goal must NOT trigger pivot.
+        let mut state = ReplState {
+            session_goal: Some("review the session memory observatory design".to_string()),
+            ..ReplState::default()
+        };
+
+        maybe_update_session_goal(&mut state, "now also review the session anchor behaviour");
+        // Shares "review" / "session" / "the" → ratio well above 0.15 → preserved.
+        assert_eq!(
+            state.session_goal.as_deref(),
+            Some("review the session memory observatory design")
+        );
+    }
+
+    #[test]
+    fn maybe_update_session_goal_ignores_short_user_messages_for_pivot() {
+        // User typing "1" or "all four" as a menu response must
+        // NEVER flip the anchor, regardless of word overlap.
+        let mut state = ReplState {
+            session_goal: Some("review 5 commits".to_string()),
+            ..ReplState::default()
+        };
+
+        // Short substantive-looking reply; still less than 4 content words
+        // → pivot guard prevents replacement.
+        maybe_update_session_goal(&mut state, "pick option 2");
+        assert_eq!(state.session_goal.as_deref(), Some("review 5 commits"));
     }
 
     #[test]

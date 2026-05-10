@@ -442,8 +442,16 @@ impl SelfModel {
             }
             // Sort by name for stability
             tool_health_summaries.sort_by(|a, b| a.name.cmp(&b.name));
+            // Age-bounded outcomes: the cache can hold entries from
+            // earlier tasks in the same session, which the model
+            // then sees as still-relevant advice ("recent identical
+            // successes: git show …" injected on a turn that has
+            // nothing to do with git). Bound the window to the last
+            // 30 tool calls so the memory stays local to the current
+            // thread of work.
+            const OUTCOME_MEMORY_WINDOW_EPOCHS: u64 = 30;
             outcome_memory = health
-                .latest_outcomes(4)
+                .latest_outcomes_within(4, OUTCOME_MEMORY_WINDOW_EPOCHS)
                 .into_iter()
                 .map(|hint| OutcomeMemoryHint {
                     tool_name: hint.tool_name,

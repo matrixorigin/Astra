@@ -895,19 +895,51 @@ impl ToolHealthTracker {
     /// Latest known outcomes across signatures, newest first.
     #[must_use]
     pub fn latest_outcomes(&self, limit: usize) -> Vec<RecentOutcomeHint> {
+        self.latest_outcomes_within(limit, u64::MAX)
+    }
+
+    /// Age-bounded variant. Only returns outcomes whose monotonic
+    /// `at_epoch` is within `max_age_epochs` of the most recent
+    /// outcome across all signatures. Lets callers filter out stale
+    /// entries (e.g. from earlier tasks in the same session) that
+    /// the LLM would otherwise see as still-relevant advice.
+    ///
+    /// `at_epoch` is a per-session monotonic counter (one tick per
+    /// tool result), not wall-clock. So `max_age_epochs=30` roughly
+    /// means "from the last ~30 tool calls".
+    #[must_use]
+    pub fn latest_outcomes_within(
+        &self,
+        limit: usize,
+        max_age_epochs: u64,
+    ) -> Vec<RecentOutcomeHint> {
+        let max_epoch = self
+            .outcome_cache
+            .values()
+            .filter_map(|ring| ring.back().map(|o| o.at_epoch))
+            .max()
+            .unwrap_or(0);
+        let min_epoch = max_epoch.saturating_sub(max_age_epochs);
+
         let mut hints: Vec<_> = self
             .outcome_cache
             .iter()
             .filter_map(|(signature, ring)| {
-                ring.back().map(|outcome| RecentOutcomeHint {
-                    tool_name: signature
-                        .split_once(':')
-                        .map(|(tool_name, _)| tool_name.to_string())
-                        .unwrap_or_else(|| signature.clone()),
-                    signature: signature.clone(),
-                    success: outcome.success,
-                    at_epoch: outcome.at_epoch,
-                    failure_category: outcome.failure_category,
+                ring.back().and_then(|outcome| {
+                    if outcome.at_epoch < min_epoch {
+                        None
+                    } else {
+                        Some(RecentOutcomeHint {
+                            tool_name: signature
+                                .split_once(':')
+                                .map(|(tool_name, _)| tool_name.to_string())
+                                .unwrap_or_else(|| signature.clone()),
+                            signature: signature.clone(),
+                            success: outcome.success,
+                            at_epoch: outcome.at_epoch,
+                            failure_category: outcome.failure_category,
+                        })
+                    }
                 })
             })
             .collect();
