@@ -278,9 +278,6 @@ async fn compaction_uses_l1_when_available() {
         tier: astra_runtime::prompts::CompactionTier::CompactHistory,
         keep_recent_turns: 3,
         current_tokens: 50000,
-        session_memory_file: None,
-        session_memory_combine:
-            astra_runtime::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
         session_facts: None,
     };
 
@@ -333,9 +330,6 @@ async fn first_user_message_survives_compaction() {
         tier: astra_runtime::prompts::CompactionTier::CompactHistory,
         keep_recent_turns: 2,
         current_tokens: 60000,
-        session_memory_file: None,
-        session_memory_combine:
-            astra_runtime::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
         session_facts: None,
     };
 
@@ -540,9 +534,6 @@ async fn multi_compaction_preserves_goal_and_decisions() {
         tier: astra_runtime::prompts::CompactionTier::AggressivePrune,
         keep_recent_turns: 3,
         current_tokens: 80000,
-        session_memory_file: None,
-        session_memory_combine:
-            astra_runtime::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
         session_facts: None,
     };
 
@@ -724,9 +715,6 @@ async fn tool_heavy_session_preserves_task() {
         tier: astra_runtime::prompts::CompactionTier::AggressivePrune,
         keep_recent_turns: 2,
         current_tokens: 70000,
-        session_memory_file: None,
-        session_memory_combine:
-            astra_runtime::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
         session_facts: None,
     };
 
@@ -929,9 +917,6 @@ async fn measure_memoria_token_overhead() {
         tier: astra_runtime::prompts::CompactionTier::AggressivePrune,
         keep_recent_turns: 3,
         current_tokens: 80000,
-        session_memory_file: None,
-        session_memory_combine:
-            astra_runtime::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
         session_facts: None,
     };
 
@@ -1065,9 +1050,6 @@ async fn full_loop_l1_write_then_compaction_reads() {
         tier: astra_runtime::prompts::CompactionTier::AggressivePrune,
         keep_recent_turns: 3,
         current_tokens: 80000,
-        session_memory_file: None,
-        session_memory_combine:
-            astra_runtime::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
         session_facts: None,
     };
 
@@ -1124,9 +1106,6 @@ async fn l2_fallback_when_memoria_unavailable() {
         tier: astra_runtime::prompts::CompactionTier::AggressivePrune,
         keep_recent_turns: 3,
         current_tokens: 80000,
-        session_memory_file: None,
-        session_memory_combine:
-            astra_runtime::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
         session_facts: None,
     };
 

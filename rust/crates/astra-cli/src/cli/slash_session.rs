@@ -2055,6 +2055,32 @@ pub(super) async fn handle_session_command(
                                     },
                                 );
                             }
+                            session_journal::JournalEventType::SessionMemoryExtraction => {
+                                let meta = evt.metadata.as_ref();
+                                let outcome = meta
+                                    .and_then(|m| m.get("outcome"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let detail = meta
+                                    .and_then(|m| {
+                                        m.get("source")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string())
+                                            .or_else(|| {
+                                                m.get("reason")
+                                                    .and_then(|v| v.as_str())
+                                                    .map(|s| s.to_string())
+                                            })
+                                    })
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "  {} 📝 T{} session memory: {} ({})",
+                                    ts_short.dim(),
+                                    evt.turn.unwrap_or(0),
+                                    outcome,
+                                    detail,
+                                );
+                            }
                             session_journal::JournalEventType::PipelineFeedback
                             | session_journal::JournalEventType::PipelineAlert
                             | session_journal::JournalEventType::PipelineCompactionAudit => {
@@ -4649,13 +4675,24 @@ fn apply_restored_workspace_state(state: &mut ReplState, session_id: &str) {
     repl_turn::apply_pending_goal_progress_state(state);
 }
 
-fn build_session_memory_resume_guidance(session_id: &str) -> Option<String> {
-    let workspace = session_workspace::read_workspace(session_id).ok()?;
-    let path = astra_runtime::resolve_resume_session_memory_file(
-        session_id,
-        Some(workspace.cwd.as_str()),
-    )?;
-    let memory_md = astra_runtime::read_session_memory_file(&path)?;
+async fn build_session_memory_resume_guidance(session_id: &str) -> Option<String> {
+    use astra_runtime::turn::cloud::memoria_compact::{HttpMemoriaClient, MemoriaClient};
+    use astra_runtime::turn::cloud::session_memory_protocol::SESSION_MEMORY_PREFIX;
+
+    let _workspace = session_workspace::read_workspace(session_id).ok()?;
+    let client = HttpMemoriaClient::from_env()?;
+    let memories = client
+        .retrieve_ext(
+            &format!("{SESSION_MEMORY_PREFIX} session state"),
+            Some(session_id),
+            3,
+            true,
+        )
+        .await
+        .ok()?;
+    let memory_md = astra_runtime::turn::cloud::session_memory_protocol::pick_latest_l1(&memories)?
+        .content
+        .clone();
     let sections = astra_runtime::extract_learnings_for_backflow(&memory_md);
     if sections.is_empty() {
         return None;
@@ -4981,7 +5018,7 @@ async fn apply_restored_session(
         );
         state.resume_guidance = combine_resume_guidance(
             step_guidance,
-            build_session_memory_resume_guidance(&restored.session_id),
+            build_session_memory_resume_guidance(&restored.session_id).await,
         );
         if let Some(ref ao_json) = step_restored.approval_overrides {
             state.perm_manager.merge_restored_overrides(ao_json);
@@ -5010,7 +5047,7 @@ async fn apply_restored_session(
         );
         state.resume_guidance = combine_resume_guidance(
             step_guidance,
-            build_session_memory_resume_guidance(&restored.session_id),
+            build_session_memory_resume_guidance(&restored.session_id).await,
         );
     } else if !restored.conversation_messages.is_empty()
         || !restored.blocked_tools.is_empty()
@@ -5029,7 +5066,7 @@ async fn apply_restored_session(
         );
         state.resume_guidance = combine_resume_guidance(
             step_guidance,
-            build_session_memory_resume_guidance(&restored.session_id),
+            build_session_memory_resume_guidance(&restored.session_id).await,
         );
         eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());
     } else if let Some(ref mc) = state.matrix_runtime {
@@ -5064,7 +5101,7 @@ async fn apply_restored_session(
                         );
                         state.resume_guidance = combine_resume_guidance(
                             step_guidance,
-                            build_session_memory_resume_guidance(&restored.session_id),
+                            build_session_memory_resume_guidance(&restored.session_id).await,
                         );
                         eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());
                     }
@@ -5085,7 +5122,7 @@ async fn apply_restored_session(
             Ok(None) => {
                 state.resume_guidance = combine_resume_guidance(
                     None,
-                    build_session_memory_resume_guidance(&restored.session_id),
+                    build_session_memory_resume_guidance(&restored.session_id).await,
                 );
             }
             Err(e) => {
@@ -5093,14 +5130,14 @@ async fn apply_restored_session(
                 eprintln!("{}", format!("     ({e})").dim());
                 state.resume_guidance = combine_resume_guidance(
                     None,
-                    build_session_memory_resume_guidance(&restored.session_id),
+                    build_session_memory_resume_guidance(&restored.session_id).await,
                 );
             }
         }
     } else {
         state.resume_guidance = combine_resume_guidance(
             None,
-            build_session_memory_resume_guidance(&restored.session_id),
+            build_session_memory_resume_guidance(&restored.session_id).await,
         );
     }
 

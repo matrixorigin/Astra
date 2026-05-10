@@ -203,6 +203,11 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) pre_loaded_messages: Option<Vec<serde_json::Value>>,
     /// Extra context appended to the system prompt (gateway injects cron/session context here).
     pub(crate) append_system_prompt: Option<String>,
+    /// Background session-memory.md extraction coordinator. Cloned
+    /// from `ReplState::session_memory_extractor`. `None` keeps
+    /// extraction disabled (one-shot `chat -m`, plan subtasks, tests).
+    pub(crate) session_memory_extractor:
+        Option<std::sync::Arc<astra_runtime::session_memory::MemoryExtractionService>>,
     /// Shared harness snapshot sink for /inspect command.
     #[cfg(feature = "harness")]
     pub(crate) harness_sink: Option<std::sync::Arc<astra_harness::InMemorySnapshotSink>>,
@@ -317,6 +322,7 @@ impl<'a> ChatTurnParams<'a> {
             pipeline_state: None,
             pre_loaded_messages: None,
             append_system_prompt: None,
+            session_memory_extractor: None,
             #[cfg(feature = "harness")]
             harness_sink: ctx.harness_sink.clone(),
             #[cfg(feature = "harness")]

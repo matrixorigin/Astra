@@ -378,6 +378,7 @@ pub(super) async fn handle_state_command(
                 pipeline_state: None,
             pre_loaded_messages: None,
                     append_system_prompt: None,
+                    session_memory_extractor: None,
                     #[cfg(feature = "harness")]
                     harness_sink: Some(state.harness_sink.clone()),
                     #[cfg(feature = "harness")]
@@ -496,6 +497,7 @@ pub(super) async fn handle_state_command(
                             pipeline_state: None,
                             pre_loaded_messages: None,
                             append_system_prompt: None,
+                            session_memory_extractor: None,
                             #[cfg(feature = "harness")]
                             harness_sink: Some(state.harness_sink.clone()),
                             #[cfg(feature = "harness")]
@@ -595,6 +597,7 @@ pub(super) async fn handle_state_command(
                                     pipeline_state: None,
                                     pre_loaded_messages: None,
                                     append_system_prompt: None,
+                                    session_memory_extractor: None,
                                     #[cfg(feature = "harness")]
                                     harness_sink: Some(state.harness_sink.clone()),
                                     #[cfg(feature = "harness")]

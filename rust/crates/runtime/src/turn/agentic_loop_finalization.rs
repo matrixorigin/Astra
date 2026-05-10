@@ -500,6 +500,12 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     );
 
     finalize_turn_trace(state).await;
+
+    // Background session-memory extraction. Fire-and-forget; service
+    // handles LLM vs. rule-based decision, event emission, UX broker,
+    // and debounce. See `crate::session_memory::MemoryExtractionService`.
+    maybe_run_memory_extraction(state);
+
     // Drop any execution-retry corrective messages now that the loop has
     // finished. Keeping them in `state.messages` would pollute every
     // subsequent user turn (the model would see a stale "you didn't apply the
@@ -624,30 +630,58 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
         .set_plan_state(post_hook_plan_state.clone());
     state.continuity.facts.set_plan_state(post_hook_plan_state);
 
-    // P4: Error-triggered L1 persist — when an error occurred this turn,
-    // write L1 to local session memory file immediately so user corrections
-    // are captured before compaction can drop them.
-    if had_error {
-        if let Some(ref sid) = state.current_session_id {
-            let l1_content = crate::turn::cloud::session_memory_protocol::build_l1_from_messages(
-                &state.messages,
-                state.max_turns.saturating_sub(state.remaining_turns),
-                state.total_prompt as usize,
-            );
-            if let Ok(path) = astra_services::local_session_artifact_store()
-                .session_path(sid, "session-memory.md")
-            {
-                if let Err(e) =
-                    astra_turn_core::cloud_session_memory_extract::write_session_memory_file(
-                        &path,
-                        &l1_content,
-                    )
-                {
-                    tracing::debug!(session_id = %sid, error = %e, "error-triggered L1 write failed (non-fatal)");
-                }
-            }
-        }
-    }
+    // The error-triggered L1 persist now runs through the extraction
+    // runner (wired in `finalize_and_render`). `had_error` is one of
+    // the triggers the runner's gate (`should_extract_with_error_trigger`)
+    // checks; when it fires and no selector LLM is configured the
+    // runner falls through to the exact same `build_l1_from_messages`
+    // + `write_session_memory_file` pair this block used to do inline.
+}
+
+/// Bridge between turn finalization and
+/// [`crate::session_memory::MemoryExtractionService`]. Returns
+/// immediately — the service decides whether to spawn, emits the
+/// gate/skip/extracted/errored journal event inline, advances
+/// `state.session_memory_state` on admission, and owns the background
+/// worker.
+fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
+    let Some(svc) = state.memory_extraction_service.clone() else {
+        return;
+    };
+    let Some(session_id) = state.current_session_id.clone() else {
+        return;
+    };
+    let had_error = state.error_recovery.consecutive_same_error > 0;
+    let turn_number = state.max_turns.saturating_sub(state.remaining_turns);
+
+    // Total context size the model actually sees — uncached prompt +
+    // cache reads + cache creation. Using `total_prompt` alone here
+    // was a semantic bug: on prompt-cache-heavy sessions 90% of the
+    // context is cached hits, so `total_prompt` stayed in the 1K
+    // range even after 50K+ tokens of real conversation. Gate
+    // evaluated `current_tokens=1K` against `min_tokens_to_init=10K`
+    // and always reported `below_init_gate`, so extraction never
+    // fired on the happy path. See `cli_loop_host.rs` for the same
+    // `total_in` formula used by the UI.
+    let current_tokens = state
+        .total_prompt
+        .saturating_add(state.total_cache_read)
+        .saturating_add(state.total_cache_creation) as usize;
+
+    let req = crate::session_memory::ExtractionRequest {
+        session_id,
+        messages: state.messages.clone(),
+        current_tokens,
+        current_tool_calls: state.total_tool_calls as usize,
+        had_error,
+        turn_number: turn_number as u32,
+        config: astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig::default(
+        ),
+    };
+
+    // Debounce state is mutated by the service on admission — caller
+    // doesn't need to do anything else.
+    let _ = svc.maybe_spawn(&mut state.session_memory_state, req);
 }
 
 fn complete_active_runtime_todo_if_finalized(
@@ -1550,6 +1584,254 @@ mod tests {
             state.continuity.facts.recent_tool_calls,
             state.session_facts.recent_tool_calls
         );
+    }
+
+    // ── finalize_and_render integrates MemoryExtractionService ─────────
+    //
+    // Verifies the post-wiring finalization path:
+    //   * actually calls `svc.maybe_spawn` when a service is attached
+    //   * writes `session-memory.md` on the rule-based fallback path
+    //   * emits a `session_memory_extraction` event
+    //   * is a no-op when no service is attached (test/dispatcher paths)
+
+    /// Capturing no-op Memoria client for finalize-side integration tests.
+    /// Records every `store` so assertions can verify the runner persisted
+    /// L1 content without hitting a real Memoria HTTP endpoint.
+    #[derive(Default)]
+    struct CapturingMemoriaForFinalize {
+        stored: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::turn::cloud::memoria_compact::MemoriaClient for CapturingMemoriaForFinalize {
+        async fn retrieve_ext(
+            &self,
+            _q: &str,
+            _sid: Option<&str>,
+            _k: usize,
+            _f: bool,
+        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+            Ok(Vec::new())
+        }
+        async fn store(
+            &self,
+            content: &str,
+            ty: &str,
+            sid: Option<&str>,
+            _t: Option<&str>,
+        ) -> Result<String, String> {
+            self.stored.lock().unwrap().push((
+                content.to_string(),
+                ty.to_string(),
+                sid.map(str::to_string),
+            ));
+            Ok("mem".to_string())
+        }
+        async fn purge_working(&self, _sid: &str) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
+    fn attach_memory_extraction_service(
+        state: &mut AgenticLoopState,
+    ) -> (
+        tokio::sync::mpsc::Receiver<astra_services::event_ingestion::IngestionEvent>,
+        std::sync::Arc<CapturingMemoriaForFinalize>,
+    ) {
+        use std::sync::Arc;
+        let (ingestion, rx) = astra_services::event_ingestion::IngestionSender::for_tests(256);
+        let memoria = Arc::new(CapturingMemoriaForFinalize::default());
+        let svc = Arc::new(crate::session_memory::MemoryExtractionService::new(
+            Arc::new(crate::session_memory::ConstSelectorResolver(None)),
+            Arc::clone(&memoria) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient>,
+            ingestion,
+            "test-user",
+            Arc::new(crate::session_memory::BackgroundActivityBroker::new()),
+        ));
+        state.memory_extraction_service = Some(svc);
+        (rx, memoria)
+    }
+
+    async fn wait_for_memoria_store(memoria: &std::sync::Arc<CapturingMemoriaForFinalize>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !memoria.stored.lock().unwrap().is_empty() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("no Memoria store landed within 5s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_persists_session_memory_on_error() {
+        let sid = format!(
+            "finalize-writes-sm-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.current_session_id = Some(sid.clone());
+        state.error_recovery.consecutive_same_error = 1;
+        state
+            .messages
+            .push(serde_json::json!({"role": "user", "content": "rule-based marker FOO"}));
+        state.total_prompt = 15_000; // past 10K init gate
+        let (_rx, memoria) = attach_memory_extraction_service(&mut state);
+
+        finalize_and_render(&mut host, &mut state).await;
+        wait_for_memoria_store(&memoria).await;
+
+        let stored = memoria.stored.lock().unwrap().clone();
+        assert_eq!(stored.len(), 1, "expected 1 Memoria store, got {stored:?}");
+        let (content, memory_type, stored_sid) = &stored[0];
+        assert_eq!(memory_type, "working");
+        assert_eq!(stored_sid.as_deref(), Some(sid.as_str()));
+        assert!(
+            content.contains("rule-based marker FOO"),
+            "rule-based L1 should carry the user message; content: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_without_session_id_does_not_panic() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.current_session_id = None;
+        state.error_recovery.consecutive_same_error = 1;
+        state
+            .messages
+            .push(serde_json::json!({"role": "user", "content": "no sid"}));
+        let (_rx, _memoria) = attach_memory_extraction_service(&mut state);
+
+        finalize_and_render(&mut host, &mut state).await;
+        // assertion: we got here without panicking.
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_skips_below_init_gate_and_emits_skip_event() {
+        let sid = format!(
+            "finalize-skips-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.current_session_id = Some(sid.clone());
+        state.error_recovery.consecutive_same_error = 0;
+        state
+            .messages
+            .push(serde_json::json!({"role": "user", "content": "clean turn"}));
+        state.total_prompt = 3_000; // below 10K init gate
+        let (mut rx, memoria) = attach_memory_extraction_service(&mut state);
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        // No Memoria store happened.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            memoria.stored.lock().unwrap().is_empty(),
+            "no extraction should run below init gate"
+        );
+
+        // One skip event emitted with reason=below_init_gate.
+        let mut saw_below_init_gate = false;
+        while let Ok(evt) = rx.try_recv() {
+            if evt.event_type != "session_memory_extraction" {
+                continue;
+            }
+            let meta = evt.metadata.as_ref().unwrap();
+            if meta["outcome"] == "skipped" && meta["reason"] == "below_init_gate" {
+                saw_below_init_gate = true;
+            }
+        }
+        assert!(
+            saw_below_init_gate,
+            "expected a skipped{{below_init_gate}} event"
+        );
+    }
+
+    /// Regression guard for the token-count bug: when prompt-cache hits
+    /// dominate, `total_prompt` stays small while `total_cache_read`
+    /// carries most of the context. The gate must see the SUM, not
+    /// just `total_prompt`, or extraction never fires on cache-heavy
+    /// sessions (real production scenario).
+    #[tokio::test]
+    async fn finalize_and_render_counts_cached_tokens_toward_init_gate() {
+        let sid = format!(
+            "finalize-cached-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.current_session_id = Some(sid.clone());
+        state.error_recovery.consecutive_same_error = 0;
+        state
+            .messages
+            .push(serde_json::json!({"role": "user", "content": "cache-heavy turn"}));
+        // Realistic cache-heavy numbers: uncached prompt is tiny (1K)
+        // but cache reads carry 40K of context. Sum is 41K, well past
+        // the 10K init gate.
+        state.total_prompt = 1_000;
+        state.total_cache_read = 40_000;
+        state.total_cache_creation = 0;
+        let (mut rx, memoria) = attach_memory_extraction_service(&mut state);
+
+        finalize_and_render(&mut host, &mut state).await;
+        wait_for_memoria_store(&memoria).await;
+
+        // The store must have landed (gate saw ~41K total, not 1K).
+        assert_eq!(
+            memoria.stored.lock().unwrap().len(),
+            1,
+            "cache-heavy turn should still trigger extraction; if this \
+             fails the gate is back to using raw total_prompt"
+        );
+
+        // And the event should be `extracted`, not `below_init_gate`.
+        let mut saw_extracted = false;
+        let mut saw_below_init = false;
+        while let Ok(evt) = rx.try_recv() {
+            if evt.event_type != "session_memory_extraction" {
+                continue;
+            }
+            let meta = evt.metadata.as_ref().unwrap();
+            if meta["outcome"] == "extracted" {
+                saw_extracted = true;
+            }
+            if meta["outcome"] == "skipped" && meta["reason"] == "below_init_gate" {
+                saw_below_init = true;
+            }
+        }
+        assert!(saw_extracted, "expected an `extracted` event");
+        assert!(
+            !saw_below_init,
+            "cache-heavy session must NOT report below_init_gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_without_service_is_silent_noop() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.current_session_id = Some("no-svc".to_string());
+        state.total_prompt = 50_000; // would normally trigger
+        assert!(state.memory_extraction_service.is_none());
+        finalize_and_render(&mut host, &mut state).await;
+        // Implicit: no panic, no file, no events.
     }
 
     #[tokio::test]

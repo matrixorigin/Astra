@@ -255,17 +255,44 @@ pub async fn build_server_state(
         crate::server::delegation_engine::DelegationTracker::new()
             .with_progress_broadcaster(Arc::clone(&progress_broadcaster)),
     );
+
+    let user_id = astra_core::cli_user_id();
+
+    // Build MatrixCloudRuntime early so its memory-extraction service
+    // (which needs both ingestion and encryptor) can be shared with the
+    // lifecycle service + delegation sub-run executor, and later
+    // reused as the bridge persist tracker.
+    let matrix_rt = Arc::new(
+        crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(
+            shared_pool.clone(),
+            "default",
+            &user_id,
+            learning_stack.entity_graph.clone(),
+            learning_stack.pattern_library.clone(),
+            learning_stack.calibrator.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+            Arc::clone(&lease_hold_cache),
+        )
+        .with_encryptor(run_encryptor.clone()),
+    );
+    let memory_extraction_service = matrix_rt.clone_memory_extraction_service();
+
     // Wire a real sub-run executor backed by ServerAgenticLoopHost.
-    let sub_run_executor: Arc<dyn crate::server::delegation_engine::SubRunExecutor> = Arc::new(
-        super::run_lifecycle::ServerSubRunExecutor::new(
+    let sub_run_executor: Arc<dyn crate::server::delegation_engine::SubRunExecutor> = {
+        let mut exec = super::run_lifecycle::ServerSubRunExecutor::new(
             settings.matrixone.clone(),
             run_encryptor.clone(),
             state.edge_callback_ledger.clone(),
         )
         .with_pool(shared_pool.clone())
         .with_edge_connection_pool(state.edge_connection_pool.clone())
-        .with_skill_service(state.skill_service.clone()),
-    );
+        .with_skill_service(state.skill_service.clone());
+        if let Some(svc) = memory_extraction_service.as_ref() {
+            exec = exec.with_memory_extraction_service(Arc::clone(svc));
+        }
+        Arc::new(exec)
+    };
     let delegation_engine = Arc::new(
         crate::server::delegation_engine::DelegationEngine::with_executor(
             Arc::new(tokio::sync::RwLock::new((*profile_registry).clone())),
@@ -289,7 +316,7 @@ pub async fn build_server_state(
         std::sync::Arc::new(resource_governor);
 
     // Create lifecycle service with delegation engine wired in.
-    let run_lifecycle = super::run_lifecycle::AgenticRunLifecycleService::new(
+    let mut run_lifecycle = super::run_lifecycle::AgenticRunLifecycleService::new(
         settings.matrixone.clone(),
         run_encryptor.clone(),
         state.edge_callback_ledger.clone(),
@@ -303,6 +330,9 @@ pub async fn build_server_state(
     .with_hook_db_writer(state.turn_hook_db_writer.clone())
     .with_observer_worker(state.turn_observer_worker.clone())
     .with_tool_event_writer(state.turn_tool_event_writer.clone());
+    if let Some(svc) = memory_extraction_service.as_ref() {
+        run_lifecycle = run_lifecycle.with_memory_extraction_service(Arc::clone(svc));
+    }
 
     #[cfg(feature = "harness")]
     let run_lifecycle = run_lifecycle.with_harness_registry(state.harness_registry.clone());
@@ -310,7 +340,6 @@ pub async fn build_server_state(
     // Wire team persistence store backed by MatrixOne.
     let team_store =
         astra_services::team_persistence::MatrixOneTeamStore::new(shared_pool.get().clone());
-    let user_id = astra_core::cli_user_id();
     if let Err(e) = team_store.ensure_builtins(&user_id).await {
         tracing::warn!(
             target: "astra_runtime::state_builder",
@@ -328,17 +357,6 @@ pub async fn build_server_state(
         .with_team_store(team_store)
         .with_resource_governor(resource_governor.clone());
 
-    let matrix_rt = Arc::new(crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(
-        shared_pool.clone(),
-        "default",
-        &user_id,
-        learning_stack.entity_graph.clone(),
-        learning_stack.pattern_library.clone(),
-        learning_stack.calibrator.clone(),
-        Arc::new(Mutex::new(Vec::new())),
-        None,
-        Arc::clone(&lease_hold_cache),
-    ));
     // Wire in-process chat turn bridge with matrix_rt as the persist tracker.
     // HIGH #4: attach matrix_rt as BridgePersistTracker so SSE persist tasks drain on shutdown.
     let state = state

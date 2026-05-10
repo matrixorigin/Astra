@@ -408,13 +408,10 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
     )
     .unwrap();
 
-    let summary_path = astra_runtime::claude_code_session_memory_path(&current_cwd_str, &sid);
-    std::fs::create_dir_all(summary_path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &summary_path,
-        "# Session Memory\n\n## Errors & Corrections\n- Use apply_patch instead of python file rewrites.\n\n## Learnings\n- Keep diffs minimal and project-scoped.\n",
-    )
-    .unwrap();
+    // Session-memory file setup removed: `build_session_memory_resume_guidance`
+    // now retrieves the last L1 from Memoria, not from disk. This test
+    // asserts the resume replay path but not the memory-content injection.
+    let _ = astra_runtime::claude_code_session_memory_path(&current_cwd_str, &sid);
 
     let mut creds = CredentialsFile::default();
     creds.profiles.insert(
@@ -516,9 +513,13 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
         .expect("expected first recovered request to target stale session id");
     let resumed_text = resumed.to_string();
     assert!(resumed_text.contains("rate_limited"));
-    assert!(resumed_text.contains("Keep diffs minimal and project-scoped."));
-    assert!(resumed_text.contains("Use apply_patch instead of python file rewrites."));
     assert!(resumed_text.contains("继续"));
+    // Session-memory resume-guidance content is no longer tested here:
+    // after the unified Memoria-backed rewrite, resume guidance reads
+    // the last L1 from Memoria instead of a local markdown file, and
+    // this test uses an HTTP mock (no Memoria endpoint). See
+    // `session_memory::MemoryExtractionService` for the canonical
+    // integration tests around L1 content.
 
     let retried = requests.last().unwrap();
     assert_ne!(
@@ -529,7 +530,8 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
     );
     let retried_text = retried.to_string();
     assert!(retried_text.contains("rate_limited"));
-    assert!(retried_text.contains("Keep diffs minimal and project-scoped."));
+    // Memory-content injection assertion removed with the Memoria
+    // unification — see note at resumed_text assertions above.
     assert_eq!(state.pending_recovery, None);
     assert_eq!(
         state.session_id.as_deref(),

@@ -24,7 +24,6 @@ use crate::prompts::{CompactConfig, CompactionTier};
 use crate::turn::cloud::compaction::CompactResult;
 use crate::turn::cloud::memoria_compact::{
     MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams, compact_with_memoria,
-    resolve_session_memory_file_options,
 };
 use crate::turn::prompt_cache::{PromptCacheConfig, apply_anthropic_cache_metadata};
 
@@ -46,8 +45,6 @@ pub(crate) struct MemoriaContext<'a> {
     pub summary_client: Option<&'a dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
     /// Pipeline-selected compaction tier (authoritative — do NOT re-derive).
     pub tier: CompactionTier,
-    /// CWD for resolving on-disk session memory paths.
-    pub cwd: Option<&'a str>,
     /// Optional pre-parsed session facts (bridge path provides these;
     /// server path does not yet).
     pub session_facts: Option<astra_turn_types::session_facts::SessionFacts>,
@@ -145,16 +142,12 @@ impl<'a> MemoriaContext<'a> {
         });
 
         let memoria_config = MemoriaCompactConfig::default();
-        let (session_memory_file, session_memory_combine) =
-            resolve_session_memory_file_options(self.session_id, self.cwd);
         let memoria_params = MemoriaCompactParams {
             budget_chars: resolved.budget_chars,
             keep_chars: resolved.keep_chars,
             tier: resolved.tier,
             keep_recent_turns: resolved.keep_recent_turns,
             current_tokens: resolved.current_tokens,
-            session_memory_file,
-            session_memory_combine,
             session_facts: self.session_facts.clone(),
         };
 

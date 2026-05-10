@@ -10,7 +10,6 @@
 //! Lessons are extracted from the L1b narrative and tool signals, then
 //! stored in Memoria as L3 durable memory (Session Memory Protocol §6.2).
 
-use astra_services::session_artifact_store::SessionArtifactStore;
 use astra_services::session_journal;
 use std::time::Duration;
 
@@ -21,6 +20,26 @@ use super::session_guard::clear_panic_guard;
 
 /// Finalize a REPL session: journal end event, persist state, extract learnings.
 pub(super) async fn finalize_session(state: &mut ReplState) {
+    // 0. Drain any background session-memory extraction worker still in
+    //    flight from the final turn. Without this, the tokio::spawn()
+    //    task gets killed when the CLI process exits: the gate said
+    //    Run, but Memoria never receives the L1 write and the
+    //    `session_memory_extraction` event never fires. 10s is
+    //    generous — the worker's internal LLM_TIMEOUT is 30s but real
+    //    selector calls return in well under 5s.
+    if let Some(svc) = state.session_memory_extractor.as_ref() {
+        let leftover = svc
+            .wait_for_pending(std::time::Duration::from_secs(10))
+            .await;
+        if leftover > 0 {
+            tracing::warn!(
+                target: "session_cleanup",
+                leftover,
+                "session-memory extraction still in flight after 10s — forcing shutdown"
+            );
+        }
+    }
+
     // 1. Journal: session end event (idempotent — panic hook may have already written it)
     if let Some(ref j) = state.journal {
         let wrote =
@@ -46,21 +65,32 @@ pub(super) async fn finalize_session(state: &mut ReplState) {
     //     (b) Checkpointer final flush (tool failures, stalls) → semantic T3
     //     (c) Episodic session summary → episodic T3
     if state.turn > 0 {
-        let narrative = state.session_id.as_deref().and_then(|sid| {
-            let raw = astra_services::local_session_artifact_store()
-                .session_path(sid, "session-memory.md")
-                .ok()
-                .and_then(|p| astra_runtime::read_session_memory_file(&p))
-                .or_else(|| {
-                    let cwd = std::env::current_dir().ok()?;
-                    let path = astra_runtime::resolve_resume_session_memory_file(
-                        sid,
-                        Some(cwd.to_str()?),
-                    )?;
-                    astra_runtime::read_session_memory_file(&path)
-                })?;
-            astra_runtime::turn::cloud::session_memory_protocol::SessionMemory::parse(&raw)
-        });
+        // Retrieve the latest L1 from Memoria (same source the server
+        // knowledge-backflow path uses). Best-effort: offline / no
+        // client / no matching memory → proceed without narrative.
+        let narrative = if let Some(sid) = state.session_id.as_deref() {
+            use astra_runtime::turn::cloud::memoria_compact::{HttpMemoriaClient, MemoriaClient};
+            use astra_runtime::turn::cloud::session_memory_protocol::{
+                SESSION_MEMORY_PREFIX, SessionMemory,
+            };
+            match HttpMemoriaClient::from_env() {
+                Some(client) => client
+                    .retrieve_ext(
+                        &format!("{SESSION_MEMORY_PREFIX} session state"),
+                        Some(sid),
+                        3,
+                        true,
+                    )
+                    .await
+                    .ok()
+                    .as_deref()
+                    .and_then(astra_runtime::turn::cloud::session_memory_protocol::pick_latest_l1)
+                    .and_then(|m| SessionMemory::parse(&m.content)),
+                None => None,
+            }
+        } else {
+            None
+        };
 
         // (a) L1b narrative extraction
         let mut all_lessons =

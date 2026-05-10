@@ -79,6 +79,10 @@ pub struct ServerSkillSubRunExecutor {
     /// so sub-run snapshots appear in the parent's history.
     #[cfg(feature = "harness")]
     harness_sink: Option<std::sync::Arc<dyn astra_harness::SnapshotSink>>,
+    /// Shared background session-memory extraction coordinator cloned
+    /// from the parent lifecycle service. `None` → no extraction in
+    /// skill sub-runs (rarely surfaces user-relevant memory).
+    memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
 }
 
 impl ServerSkillSubRunExecutor {
@@ -105,7 +109,16 @@ impl ServerSkillSubRunExecutor {
             dedup_state: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
+            memory_extraction_service: None,
         }
+    }
+
+    pub fn with_memory_extraction_service(
+        mut self,
+        svc: Arc<crate::session_memory::MemoryExtractionService>,
+    ) -> Self {
+        self.memory_extraction_service = Some(svc);
+        self
     }
 
     /// Share the parent host's `emitted_tool_call_ids` HashSet so that sub-run
@@ -443,6 +456,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            session_memory_state: Default::default(),
+            memory_extraction_service: self.memory_extraction_service.clone(),
             continuity: Default::default(),
             compact_strategy,
             approval_overrides: None,

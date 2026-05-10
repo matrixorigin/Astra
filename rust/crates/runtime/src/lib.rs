@@ -93,6 +93,7 @@ pub mod liquid {
 pub mod prompts;
 pub mod self_model;
 pub mod server;
+pub mod session_memory;
 pub mod tool_registry;
 pub mod tool_selector;
 pub mod turn;
@@ -288,7 +289,7 @@ pub use astra_turn_core::{
         SESSION_MEMORY_TEMPLATE, SessionMemoryExtractConfig, SessionMemoryState,
         build_extraction_prompt, build_learnings_extraction_prompt, extract_learnings_for_backflow,
         extract_section, parse_learnings_response, should_extract as should_extract_session_memory,
-        should_extract_with_error_trigger, truncate_for_prompt, write_session_memory_file,
+        should_extract_with_error_trigger, truncate_for_prompt,
     },
     cloud_summary::{HttpSummaryClient, LlmConnParams, SummaryLlmClient, SummaryResponse},
     complete::build_turn_complete_event,
@@ -345,10 +346,8 @@ pub use turn::{
         },
         memoria_compact::{
             HttpMemoriaClient, MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams,
-            MemoriaMemory, SessionMemoryFileCombine, claude_code_session_memory_path,
-            compact_with_memoria, memoria_compact_retrieve_query, read_session_memory_file,
-            resolve_resume_session_memory_file, resolve_session_memory_file_options,
-            sanitize_path_for_claude_projects,
+            MemoriaMemory, claude_code_session_memory_path, compact_with_memoria,
+            memoria_compact_retrieve_query, sanitize_path_for_claude_projects,
         },
     },
     implicit_feedback::{

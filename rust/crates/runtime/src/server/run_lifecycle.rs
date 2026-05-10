@@ -385,6 +385,7 @@ fn build_server_skill_executor(
     session_id: &str,
     edge_connection_pool: Option<&astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    memory_extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
     #[cfg(feature = "harness")] harness_sink: Option<
         &std::sync::Arc<dyn astra_harness::SnapshotSink>,
     >,
@@ -406,6 +407,9 @@ fn build_server_skill_executor(
     .with_request_constraints(request_constraints)
     .with_skill_resolver(skill_resolver)
     .with_cancel_token(cancel_token);
+    if let Some(svc) = memory_extraction_service {
+        subrun_executor = subrun_executor.with_memory_extraction_service(Arc::clone(svc));
+    }
     if let Some(pool) = edge_connection_pool {
         subrun_executor = subrun_executor.with_edge_connection_pool(pool.clone());
     }
@@ -1440,6 +1444,11 @@ pub struct AgenticRunLifecycleService {
     /// Harness sink registry for server-side harness observation (Phase 2A).
     #[cfg(feature = "harness")]
     harness_registry: Option<crate::server::harness_handlers::HarnessSinkRegistry>,
+    /// Shared background session-memory extraction coordinator. Cloned
+    /// into every `AgenticLoopState` the service builds, so all turns
+    /// share selector cooldown, in-flight dedup, event sink, and
+    /// broker. `None` → extraction disabled (e.g. minimal test service).
+    memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
 }
 
 impl AgenticRunLifecycleService {
@@ -1469,7 +1478,16 @@ impl AgenticRunLifecycleService {
             background_task_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(feature = "harness")]
             harness_registry: None,
+            memory_extraction_service: None,
         }
+    }
+
+    pub fn with_memory_extraction_service(
+        mut self,
+        svc: Arc<crate::session_memory::MemoryExtractionService>,
+    ) -> Self {
+        self.memory_extraction_service = Some(svc);
+        self
     }
 
     #[cfg(feature = "harness")]
@@ -1633,13 +1651,30 @@ impl AgenticRunLifecycleService {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if self.background_task_count.load(Ordering::Acquire) == 0 {
-                return true;
+                break;
             }
             if tokio::time::Instant::now() >= deadline {
                 return false;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+
+        // Turn-owned background_task_count reached zero, but the
+        // session-memory extraction service has its own pending
+        // counter (see `MemoryExtractionService::wait_for_pending`).
+        // Fold it into the same shutdown deadline so we don't kill
+        // in-flight Memoria writes mid-HTTP.
+        if let Some(svc) = self.memory_extraction_service.as_ref() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let leftover = svc.wait_for_pending(remaining).await;
+            if leftover > 0 {
+                return false;
+            }
+        }
+        true
     }
 
     /// Returns the current number of in-flight background tasks.
@@ -2110,6 +2145,7 @@ impl AgenticRunLifecycleService {
             session_id,
             self.edge_connection_pool.as_ref(),
             cancel_token,
+            self.memory_extraction_service.as_ref(),
             #[cfg(feature = "harness")]
             harness_sink_arc.as_ref(),
         );
@@ -2226,6 +2262,8 @@ impl AgenticRunLifecycleService {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            session_memory_state: Default::default(),
+            memory_extraction_service: self.memory_extraction_service.clone(),
             continuity: runtime_continuity.unwrap_or_default(),
             compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
                 request.model.as_deref().unwrap_or(""),
@@ -2942,16 +2980,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     // Try to retrieve L1 narrative from Memoria for knowledge extraction
                     let narrative = memoria_client
                         .retrieve_ext(
-                            &format!("{} session state", crate::turn::cloud::session_memory_protocol::SESSION_MEMORY_PREFIX),
-                            Some(sid), 3, true,
+                            &format!(
+                                "{} session state",
+                                crate::turn::cloud::session_memory_protocol::SESSION_MEMORY_PREFIX
+                            ),
+                            Some(sid),
+                            3,
+                            true,
                         )
                         .await
                         .ok()
-                        .and_then(|mems| {
-                            mems.into_iter()
-                                .find(|m| m.content.starts_with(crate::turn::cloud::session_memory_protocol::SESSION_MEMORY_PREFIX))
-                        })
-                        .and_then(|m| crate::turn::cloud::session_memory_protocol::SessionMemory::parse(&m.content));
+                        .as_deref()
+                        .and_then(crate::turn::cloud::session_memory_protocol::pick_latest_l1)
+                        .and_then(|m| {
+                            crate::turn::cloud::session_memory_protocol::SessionMemory::parse(
+                                &m.content,
+                            )
+                        });
                     match crate::turn::cloud::session_end_governance::run_session_end_governance(
                         &loop_state.session_facts,
                         narrative.as_ref(),
@@ -3724,6 +3769,7 @@ pub struct ServerSubRunExecutor {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     skill_service: Option<Arc<dyn SkillService>>,
     skill_resolver_cache: std::sync::OnceLock<ServerSkillResolverBundle>,
+    memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
 }
 
 impl ServerSubRunExecutor {
@@ -3740,11 +3786,20 @@ impl ServerSubRunExecutor {
             edge_connection_pool: None,
             skill_service: None,
             skill_resolver_cache: std::sync::OnceLock::new(),
+            memory_extraction_service: None,
         }
     }
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
+        self
+    }
+
+    pub fn with_memory_extraction_service(
+        mut self,
+        svc: Arc<crate::session_memory::MemoryExtractionService>,
+    ) -> Self {
+        self.memory_extraction_service = Some(svc);
         self
     }
 
@@ -3999,6 +4054,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            session_memory_state: Default::default(),
+            memory_extraction_service: self.memory_extraction_service.clone(),
             continuity: Default::default(),
             compact_strategy,
             approval_overrides: None,

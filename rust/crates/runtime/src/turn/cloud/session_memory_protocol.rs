@@ -392,6 +392,47 @@ fn count_progress_markers(text: &str) -> (usize, usize) {
 
 pub const SESSION_MEMORY_PREFIX: &str = "[session-memory:v1]";
 
+/// Given a list of Memoria memories (already filtered by `session_id`),
+/// return the single L1 row that readers should treat as authoritative.
+///
+/// Returns `None` when no row starts with [`SESSION_MEMORY_PREFIX`].
+///
+/// When multiple L1 rows exist for one session — possible when a prior
+/// [`persist_l1`] invocation saw a transient purge failure and the
+/// next successful store left a stale row behind — callers MUST use
+/// this helper rather than `.find()` directly. The helper picks the
+/// highest `retrieval_score` deterministically and emits a single
+/// warning so operators can spot the split. `find()` on a list that
+/// happens to be unsorted would silently pick an older row.
+pub fn pick_latest_l1(
+    memories: &[crate::turn::cloud::memoria_compact::MemoriaMemory],
+) -> Option<&crate::turn::cloud::memoria_compact::MemoriaMemory> {
+    let mut matching = memories
+        .iter()
+        .filter(|m| m.content.starts_with(SESSION_MEMORY_PREFIX));
+    let first = matching.next()?;
+    // Common case: exactly one L1 row. Avoid scanning the rest.
+    let remaining: Vec<_> = matching.collect();
+    if remaining.is_empty() {
+        return Some(first);
+    }
+    tracing::warn!(
+        target: "astra_runtime::session_memory::protocol",
+        stale_count = remaining.len(),
+        "multiple session-memory L1 rows for one session; picking highest retrieval_score"
+    );
+    let mut best = first;
+    let mut best_score = first.retrieval_score.unwrap_or(f64::NEG_INFINITY);
+    for m in remaining {
+        let s = m.retrieval_score.unwrap_or(f64::NEG_INFINITY);
+        if s > best_score {
+            best_score = s;
+            best = m;
+        }
+    }
+    Some(best)
+}
+
 const REQUIRED_SECTIONS: &[&str] = &["Task Specification", "Current State", "User Messages"];
 
 #[cfg(test)]
@@ -852,31 +893,88 @@ pub fn injection_level_for_pressure_with_thresholds(
 
 // ── P3: Persist L1 to Memoria ────────────────────────────────────────────────
 
-/// Purge old L1 for this session, then store the new one with one retry.
-/// Extracted from the tokio::spawn body so it can be tested with a mock client.
+/// Outcome of one [`persist_l1`] call. The `PurgeFailed` variant is
+/// distinct from `StoreFailed` because the caller's downstream
+/// decisions differ: after a failed purge we abort *before* storing,
+/// so no state change happened and the next turn can retry cleanly;
+/// after a failed store we tried twice and need a different mitigation.
+#[derive(Debug)]
+pub enum PersistL1Error {
+    /// Pre-store purge of the previous L1 exhausted retries. We did
+    /// NOT attempt the new store — retrying would risk two L1 rows
+    /// coexisting, making prefix-based retrieval non-deterministic.
+    PurgeFailed(String),
+    /// Purge succeeded (or there was nothing to purge) but the new
+    /// store failed even after one retry.
+    StoreFailed(String),
+}
+
+impl std::fmt::Display for PersistL1Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PurgeFailed(m) => write!(f, "L1 purge failed: {m}"),
+            Self::StoreFailed(m) => write!(f, "L1 store failed: {m}"),
+        }
+    }
+}
+
+/// Purge old L1 for this session (with retry), then store the new one.
+///
+/// The write side of session memory MUST keep Memoria's prefix index
+/// single-valued per session: two concurrent `SESSION_MEMORY_PREFIX`
+/// rows would make retrieval non-deterministic. If purge fails after
+/// retries we abort — leaving the stale row in place is safer than
+/// racing a new one next to it.
 pub async fn persist_l1(
     client: &dyn crate::turn::cloud::memoria_compact::MemoriaClient,
     l1_content: &str,
     session_id: &str,
-) -> Result<String, String> {
-    // Best-effort purge of old L1 for this session
-    let _ = client.purge_working(session_id).await;
+) -> Result<String, PersistL1Error> {
+    // Purge with one retry. A permanent failure here blocks the store.
+    if let Err(first_err) = client.purge_working(session_id).await {
+        tracing::warn!(
+            session_id = %session_id,
+            attempt = 1,
+            error = %first_err,
+            "L1 purge failed, retrying"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Err(second_err) = client.purge_working(session_id).await {
+            tracing::warn!(
+                session_id = %session_id,
+                attempt = 2,
+                error = %second_err,
+                "L1 purge failed, aborting store to avoid duplicate L1"
+            );
+            return Err(PersistL1Error::PurgeFailed(second_err));
+        }
+    }
 
-    // Store with one retry
+    // Store with one retry.
     match client
         .store(l1_content, "working", Some(session_id), Some("T2"))
         .await
     {
         Ok(id) => Ok(id),
         Err(e) => {
-            tracing::warn!(session_id = %session_id, attempt = 1, error = %e, "L1 store failed, retrying");
+            tracing::warn!(
+                session_id = %session_id,
+                attempt = 1,
+                error = %e,
+                "L1 store failed, retrying"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             client
                 .store(l1_content, "working", Some(session_id), Some("T2"))
                 .await
                 .map_err(|e2| {
-                    tracing::warn!(session_id = %session_id, attempt = 2, error = %e2, "L1 store failed, giving up");
-                    e2
+                    tracing::warn!(
+                        session_id = %session_id,
+                        attempt = 2,
+                        error = %e2,
+                        "L1 store failed, giving up"
+                    );
+                    PersistL1Error::StoreFailed(e2)
                 })
         }
     }
@@ -2184,11 +2282,17 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn persist_l1_purge_failure_does_not_block_store() {
-            // Mock that fails purge but succeeds store
-            struct PurgeFailMock;
+        async fn persist_l1_aborts_store_when_purge_exhausts_retries() {
+            // Permanent purge failure must abort the store: leaving a
+            // stale L1 alongside a new one would make prefix-based
+            // retrieval non-deterministic.
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            struct PermanentPurgeFailMock {
+                purge_attempts: AtomicUsize,
+                store_attempts: AtomicUsize,
+            }
             #[async_trait::async_trait]
-            impl MemoriaClient for PurgeFailMock {
+            impl MemoriaClient for PermanentPurgeFailMock {
                 async fn retrieve_ext(
                     &self,
                     _: &str,
@@ -2205,17 +2309,83 @@ mod tests {
                     _: Option<&str>,
                     _: Option<&str>,
                 ) -> Result<String, String> {
-                    Ok("ok".into())
+                    self.store_attempts.fetch_add(1, Ordering::Relaxed);
+                    Ok("would-be-duplicate".into())
                 }
                 async fn purge_working(&self, _: &str) -> Result<u64, String> {
+                    self.purge_attempts.fetch_add(1, Ordering::Relaxed);
                     Err("purge broken".into())
                 }
                 async fn delete(&self, _: &str) -> Result<(), String> {
                     Ok(())
                 }
             }
-            let result = persist_l1(&PurgeFailMock, "L1", "s").await;
-            assert!(result.is_ok(), "purge failure should not prevent store");
+            let mock = PermanentPurgeFailMock {
+                purge_attempts: AtomicUsize::new(0),
+                store_attempts: AtomicUsize::new(0),
+            };
+            let result = persist_l1(&mock, "L1", "s").await;
+            assert!(
+                matches!(result, Err(PersistL1Error::PurgeFailed(_))),
+                "permanent purge failure must return PurgeFailed, got {result:?}"
+            );
+            assert_eq!(
+                mock.purge_attempts.load(Ordering::Relaxed),
+                2,
+                "purge should be retried once"
+            );
+            assert_eq!(
+                mock.store_attempts.load(Ordering::Relaxed),
+                0,
+                "store MUST NOT be attempted after exhausted purge retries"
+            );
+        }
+
+        #[tokio::test]
+        async fn persist_l1_retries_purge_once_then_proceeds() {
+            // Transient purge failure recovers on retry; store then runs.
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            struct TransientPurgeMock {
+                purge_attempts: AtomicUsize,
+            }
+            #[async_trait::async_trait]
+            impl MemoriaClient for TransientPurgeMock {
+                async fn retrieve_ext(
+                    &self,
+                    _: &str,
+                    _: Option<&str>,
+                    _: usize,
+                    _: bool,
+                ) -> Result<Vec<MemoriaMemory>, String> {
+                    Ok(vec![])
+                }
+                async fn store(
+                    &self,
+                    _: &str,
+                    _: &str,
+                    _: Option<&str>,
+                    _: Option<&str>,
+                ) -> Result<String, String> {
+                    Ok("mem-1".into())
+                }
+                async fn purge_working(&self, _: &str) -> Result<u64, String> {
+                    let n = self.purge_attempts.fetch_add(1, Ordering::Relaxed);
+                    if n == 0 {
+                        Err("transient".into())
+                    } else {
+                        Ok(1)
+                    }
+                }
+                async fn delete(&self, _: &str) -> Result<(), String> {
+                    Ok(())
+                }
+            }
+            let mock = TransientPurgeMock {
+                purge_attempts: AtomicUsize::new(0),
+            };
+            let result = persist_l1(&mock, "L1", "s").await;
+            assert_eq!(result.unwrap(), "mem-1");
+            assert_eq!(mock.purge_attempts.load(Ordering::Relaxed), 2);
         }
     }
 
@@ -2387,5 +2557,86 @@ mod tests {
             !anchor.is_trivial("wait, let's talk about logging"),
             "facts-shape anchor must re-anchor after user drift, got: {anchor}"
         );
+    }
+
+    // ── pick_latest_l1 ──────────────────────────────────────────────────
+
+    mod pick_latest_l1_tests {
+        use super::super::pick_latest_l1;
+        use crate::turn::cloud::memoria_compact::MemoriaMemory;
+
+        fn mem(id: &str, content: &str, score: Option<f64>) -> MemoriaMemory {
+            MemoriaMemory {
+                memory_id: id.to_string(),
+                content: content.to_string(),
+                memory_type: "working".to_string(),
+                retrieval_score: score,
+            }
+        }
+
+        #[test]
+        fn empty_returns_none() {
+            assert!(pick_latest_l1(&[]).is_none());
+        }
+
+        #[test]
+        fn no_prefix_match_returns_none() {
+            let list = vec![
+                mem("a", "random note", Some(0.9)),
+                mem("b", "[other-prefix] text", Some(0.8)),
+            ];
+            assert!(pick_latest_l1(&list).is_none());
+        }
+
+        #[test]
+        fn single_match_is_returned() {
+            let list = vec![
+                mem("a", "random note", Some(0.9)),
+                mem("b", "[session-memory:v1]\nfoo", Some(0.5)),
+            ];
+            let picked = pick_latest_l1(&list).unwrap();
+            assert_eq!(picked.memory_id, "b");
+        }
+
+        #[test]
+        fn multiple_matches_pick_highest_score() {
+            // Critical unhappy path: two L1 rows exist because a prior
+            // purge failure left a stale one in place. Readers MUST
+            // converge on the same "latest" regardless of input order.
+            let list = vec![
+                mem("old", "[session-memory:v1]\nold content", Some(0.4)),
+                mem("new", "[session-memory:v1]\nnew content", Some(0.9)),
+            ];
+            let picked = pick_latest_l1(&list).unwrap();
+            assert_eq!(picked.memory_id, "new");
+
+            // Reversed input → same answer.
+            let reversed = vec![list[1].clone(), list[0].clone()];
+            let picked_rev = pick_latest_l1(&reversed).unwrap();
+            assert_eq!(
+                picked_rev.memory_id, "new",
+                "pick_latest_l1 must be deterministic regardless of input order"
+            );
+        }
+
+        #[test]
+        fn missing_scores_use_neg_infinity_so_scored_wins() {
+            let list = vec![
+                mem("scored", "[session-memory:v1]\nA", Some(0.1)),
+                mem("unscored", "[session-memory:v1]\nB", None),
+            ];
+            assert_eq!(pick_latest_l1(&list).unwrap().memory_id, "scored");
+        }
+
+        #[test]
+        fn all_unscored_returns_first_match() {
+            let list = vec![
+                mem("first", "[session-memory:v1]\nA", None),
+                mem("second", "[session-memory:v1]\nB", None),
+            ];
+            // With all scores absent, both compare equal and `first`
+            // wins by iteration order. Documented in the fn doc.
+            assert_eq!(pick_latest_l1(&list).unwrap().memory_id, "first");
+        }
     }
 }

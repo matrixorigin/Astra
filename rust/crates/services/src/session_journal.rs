@@ -848,12 +848,101 @@ pub enum JournalEventType {
     LlmResponseFull,
     /// Background memory extraction agent completed (extracted, skipped, or errored).
     MemoryExtraction,
+    /// Background session-memory (session-memory.md) extraction completed.
+    /// Distinct from `MemoryExtraction` (Memoria memories): this event
+    /// describes a single atomic rewrite of the session-memory L1
+    /// artifact, not a Memoria store.
+    SessionMemoryExtraction,
     /// Context pipeline per-turn feedback (cache ratio, tokens, tier).
     PipelineFeedback,
     /// Context pipeline trace alert fired (cache break, recovery loop, etc.).
     PipelineAlert,
     /// Context pipeline compaction audit (what was dropped/cleared, why).
     PipelineCompactionAudit,
+}
+
+/// Why the gate rejected a session-memory extraction attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMemoryExtractionSkipReason {
+    NoSessionId,
+    BelowInitGate,
+    NoGrowth,
+    InFlight,
+    SelectorCooldown,
+}
+
+/// Why an attempt errored during the LLM/write phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMemoryExtractionErrorReason {
+    LlmTimeout,
+    LlmError,
+    EmptyResponse,
+    /// Pre-store purge of previous L1 failed after retries — aborting
+    /// the store avoids leaving two L1 rows in Memoria for one session,
+    /// which would make prefix-based retrieval non-deterministic.
+    PurgeFailed,
+    WriteFailed,
+}
+
+/// Which code path produced the written content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMemoryExtractionSource {
+    Llm,
+    RuleFallback,
+}
+
+/// Full outcome of a single extraction attempt. Serialized flat into the
+/// event metadata: `{"outcome": "extracted", "source": "llm",
+/// "bytes_written": 4021}` or `{"outcome": "skipped", "reason": "in_flight"}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionMemoryExtractionOutcome {
+    Extracted {
+        source: SessionMemoryExtractionSource,
+        bytes_written: u64,
+    },
+    Skipped {
+        reason: SessionMemoryExtractionSkipReason,
+    },
+    Errored {
+        reason: SessionMemoryExtractionErrorReason,
+    },
+}
+
+impl SessionMemoryExtractionOutcome {
+    /// Short tag matching the top-level `outcome` field. Cheap enough to
+    /// call from log lines and UX bridges that don't want to match the
+    /// full enum.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Extracted { .. } => "extracted",
+            Self::Skipped { .. } => "skipped",
+            Self::Errored { .. } => "errored",
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Extracted {
+                source,
+                bytes_written,
+            } => serde_json::json!({
+                "outcome": "extracted",
+                "source": source,
+                "bytes_written": bytes_written,
+            }),
+            Self::Skipped { reason } => serde_json::json!({
+                "outcome": "skipped",
+                "reason": reason,
+            }),
+            Self::Errored { reason } => serde_json::json!({
+                "outcome": "errored",
+                "reason": reason,
+            }),
+        }
+    }
 }
 
 /// Writer that appends events to a session journal file.
@@ -3286,6 +3375,24 @@ impl JournalEvent {
             "categories": categories,
             "prefix_reused": prefix_reused,
         }));
+        evt
+    }
+
+    /// Session-memory (session-memory.md) extraction outcome event.
+    ///
+    /// Distinct from [`JournalEvent::memory_extraction`] (Memoria memories).
+    /// Metadata is a flat, self-describing object driven by the
+    /// [`SessionMemoryExtractionOutcome`] enum.
+    pub fn session_memory_extraction(
+        session_id: Option<&str>,
+        turn: u32,
+        duration_ms: u64,
+        outcome: SessionMemoryExtractionOutcome,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::SessionMemoryExtraction, session_id);
+        evt.turn = Some(turn);
+        evt.duration_ms = Some(duration_ms);
+        evt.metadata = Some(outcome.to_json());
         evt
     }
 

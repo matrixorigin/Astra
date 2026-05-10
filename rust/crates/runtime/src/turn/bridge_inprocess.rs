@@ -1755,7 +1755,6 @@ impl InProcessChatTurnBridge {
                             as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
                     ),
                     tier: pipeline_tier,
-                    cwd: edge_profile.get("cwd").and_then(Value::as_str),
                     session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
                 };
 
@@ -2076,7 +2075,6 @@ impl InProcessChatTurnBridge {
                                         as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
                                 ),
                                 tier: crate::prompts::CompactionTier::AggressivePrune,
-                                cwd: edge_profile.get("cwd").and_then(Value::as_str),
                                 session_facts: session_facts_shared
                                     .lock()
                                     .ok()
@@ -3443,21 +3441,11 @@ impl InProcessChatTurnBridge {
                     );
                 }
 
-                let l1_content = crate::turn::cloud::session_memory_protocol::build_l1_from_messages(
-                    &messages, cloud_loop_turns as usize,
-                    usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as usize,
-                );
-                let l1_sid = session_id.clone();
-                let l1_client = memoria_client_shared.clone();
-                tokio::spawn(async move {
-                    let Some(client) = l1_client else { return; };
-                    match crate::turn::cloud::session_memory_protocol::persist_l1(
-                        &client, &l1_content, &l1_sid,
-                    ).await {
-                        Ok(id) => tracing::debug!(session_id = %l1_sid, memory_id = %id, "L1 session memory persisted"),
-                        Err(e) => tracing::warn!(session_id = %l1_sid, error = %e, "L1 session memory persist failed"),
-                    }
-                });
+                // L1 session-memory persistence now lives in
+                // `crate::session_memory::MemoryExtractionService`
+                // (driven from the turn finalization path). The bridge
+                // no longer owns a duplicate write — single ownership,
+                // single event stream.
             }
 
             // turn_complete
@@ -5400,9 +5388,6 @@ mod tests {
             tier: crate::prompts::CompactionTier::AggressivePrune,
             keep_recent_turns: 2,
             current_tokens: 80000,
-            session_memory_file: None,
-            session_memory_combine:
-                crate::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
             session_facts: None,
         };
 
@@ -5454,9 +5439,6 @@ mod tests {
             tier: crate::prompts::CompactionTier::CompactHistory,
             keep_recent_turns: 2,
             current_tokens: 500,
-            session_memory_file: None,
-            session_memory_combine:
-                crate::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
             session_facts: None,
         };
 
@@ -5495,9 +5477,6 @@ mod tests {
             tier: crate::prompts::CompactionTier::AggressivePrune,
             keep_recent_turns: 2,
             current_tokens: 80000,
-            session_memory_file: None,
-            session_memory_combine:
-                crate::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
             session_facts: None,
         };
 

@@ -346,6 +346,8 @@ mod tests {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            session_memory_state: Default::default(),
+            memory_extraction_service: None,
             continuity: Default::default(),
             compact_strategy: Default::default(),
             approval_overrides: None,

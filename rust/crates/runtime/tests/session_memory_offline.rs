@@ -11,8 +11,7 @@
 
 use astra_runtime::prompts::CompactionTier;
 use astra_runtime::turn::cloud::memoria_compact::{
-    MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams, MemoriaMemory,
-    SessionMemoryFileCombine, compact_with_memoria,
+    MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams, MemoriaMemory, compact_with_memoria,
 };
 use astra_runtime::turn::cloud::session_end_governance::run_session_end_governance;
 use astra_runtime::turn::cloud::session_memory_protocol::{
@@ -262,8 +261,6 @@ async fn full_session_memory_lifecycle_glues_modules() {
         tier: CompactionTier::CompactHistory,
         keep_recent_turns: 2,
         current_tokens: 8_000,
-        session_memory_file: None,
-        session_memory_combine: SessionMemoryFileCombine::None,
         session_facts: Some(facts.clone()),
     };
     let result = compact_with_memoria(
@@ -443,8 +440,6 @@ async fn compaction_degrades_gracefully_when_retrieve_errors() {
         tier: CompactionTier::CompactHistory,
         keep_recent_turns: 2,
         current_tokens: 8_000,
-        session_memory_file: None,
-        session_memory_combine: SessionMemoryFileCombine::None,
         session_facts: None,
     };
 

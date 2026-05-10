@@ -7,7 +7,7 @@
 use astra_runtime::prompts::CompactionTier;
 use astra_runtime::turn::cloud::memoria_compact::{
     HttpMemoriaClient, MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams,
-    SessionMemoryFileCombine, compact_with_memoria,
+    compact_with_memoria,
 };
 use astra_runtime::turn::cloud::session_end_governance::*;
 use astra_runtime::turn::cloud::session_memory_protocol::*;
@@ -300,9 +300,7 @@ async fn e2e_full_session_lifecycle() {
         tier: CompactionTier::CompactHistory,
         keep_recent_turns: 2,
         current_tokens: 50000,
-        session_memory_file: None,
-        session_memory_combine: SessionMemoryFileCombine::None,
-        session_facts: Some(facts.clone()),
+        session_facts: None,
     };
     let result = compact_with_memoria(
         &messages,
@@ -614,9 +612,7 @@ async fn unhappy_memoria_down_during_compaction() {
         tier: CompactionTier::CompactHistory,
         keep_recent_turns: 2,
         current_tokens: 50000,
-        session_memory_file: None,
-        session_memory_combine: SessionMemoryFileCombine::None,
-        session_facts: Some(facts),
+        session_facts: None,
     };
 
     // Should NOT panic — falls back gracefully
@@ -699,9 +695,7 @@ async fn unhappy_empty_session_compaction() {
         tier: CompactionTier::CompactHistory,
         keep_recent_turns: 2,
         current_tokens: 50000,
-        session_memory_file: None,
-        session_memory_combine: SessionMemoryFileCombine::None,
-        session_facts: Some(facts.clone()),
+        session_facts: None,
     };
 
     let result = compact_with_memoria(
@@ -782,9 +776,7 @@ async fn unhappy_malformed_narrative_in_memoria() {
         tier: CompactionTier::CompactHistory,
         keep_recent_turns: 2,
         current_tokens: 50000,
-        session_memory_file: None,
-        session_memory_combine: SessionMemoryFileCombine::None,
-        session_facts: Some(facts),
+        session_facts: Some(facts.clone()),
     };
 
     let result = compact_with_memoria(

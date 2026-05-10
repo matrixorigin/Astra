@@ -10,14 +10,6 @@
 //! 3. Truncate old messages (keep recent turns)
 //! 4. Optionally store new working memory with updated context
 //! ```
-//!
-//! ## On-disk session memory
-//!
-//! When `ASTRA_SESSION_MEMORY_COMBINE` is set, the compactor can read
-//! `CLAUDE_CONFIG_DIR/projects/<sanitized-cwd>/<session_id>/session-memory/summary.md`
-//! or a path from `ASTRA_SESSION_MEMORY_FILE`.
-//! - `fallback`: use the file only if Memoria returns no memories.
-//! - `merge` / `true` / `1` / `both`: keep Memoria hits and add a capped file excerpt.
 
 use std::path::{Path, PathBuf};
 
@@ -59,25 +51,6 @@ impl Default for MemoriaCompactConfig {
     }
 }
 
-/// How to mix on-disk `summary.md` with Memoria HTTP retrieval.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum SessionMemoryFileCombine {
-    /// Ignore on-disk session memory for compaction injection.
-    #[default]
-    None,
-    /// Use the file only when Memoria returns no memories.
-    Fallback,
-    /// Include a capped file excerpt alongside Memoria under the same token budget.
-    Merge,
-}
-
-impl SessionMemoryFileCombine {
-    /// Feature was previously env-gated; always None after cleanup.
-    pub fn from_env() -> Self {
-        Self::None
-    }
-}
-
 /// Parameters for a single compaction invocation.
 #[derive(Debug, Clone)]
 pub struct MemoriaCompactParams {
@@ -91,10 +64,6 @@ pub struct MemoriaCompactParams {
     pub keep_recent_turns: usize,
     /// Current token count before compaction.
     pub current_tokens: usize,
-    /// Optional path to on-disk session memory.
-    pub session_memory_file: Option<PathBuf>,
-    /// How to combine that file with Memoria retrieval.
-    pub session_memory_combine: SessionMemoryFileCombine,
     /// Optional session facts for facts-first compaction (L1a ground truth).
     /// When present, `build_facts_first_injection()` is used as the primary
     /// memory context, with Memoria narrative as supplement.
@@ -106,7 +75,6 @@ pub struct MemoriaCompactParams {
 // ---------------------------------------------------------------------------
 
 const CLAUDE_PROJECTS_SANITIZE_MAX_CHARS: usize = 200;
-const MAX_SESSION_MEMORY_FILE_BYTES: u64 = 512 * 1024;
 
 fn djb2_hash_utf16(s: &str) -> i32 {
     let mut hash: i32 = 0;
@@ -163,6 +131,10 @@ fn claude_config_home_dir() -> PathBuf {
 }
 
 /// `{CLAUDE_CONFIG_DIR}/projects/<sanitized cwd>/<session_id>/session-memory/summary.md`
+///
+/// Kept only for external tooling that still looks at the legacy
+/// on-disk layout. The runtime itself no longer reads or writes this
+/// path — session memory lives in Memoria.
 pub fn claude_code_session_memory_path(cwd: &str, session_id: &str) -> PathBuf {
     claude_config_home_dir()
         .join("projects")
@@ -170,45 +142,6 @@ pub fn claude_code_session_memory_path(cwd: &str, session_id: &str) -> PathBuf {
         .join(session_id)
         .join("session-memory")
         .join("summary.md")
-}
-
-/// Read a bounded UTF-8 session memory file (whitespace-trimmed).
-pub fn read_session_memory_file(path: &Path) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
-    if meta.len() > MAX_SESSION_MEMORY_FILE_BYTES {
-        return None;
-    }
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-/// Resolve the on-disk session memory file for crash/session recovery.
-///
-/// Unlike [`resolve_session_memory_file_options`], this path selection is
-/// Attempt to find an on-disk session memory file. Recovery path reuses existing session-memory
-/// summaries derived from the cwd + session_id (no env override after cleanup).
-pub fn resolve_resume_session_memory_file(session_id: &str, cwd: Option<&str>) -> Option<PathBuf> {
-    let cwd = cwd.filter(|s| !s.is_empty())?;
-    Some(claude_code_session_memory_path(cwd, session_id))
-}
-
-/// Resolve on-disk session memory path and combine mode. Env override removed; always None.
-pub fn resolve_session_memory_file_options(
-    session_id: &str,
-    cwd: Option<&str>,
-) -> (Option<PathBuf>, SessionMemoryFileCombine) {
-    let env_combine = SessionMemoryFileCombine::from_env();
-
-    if env_combine == SessionMemoryFileCombine::None {
-        return (None, SessionMemoryFileCombine::None);
-    }
-
-    (
-        resolve_resume_session_memory_file(session_id, cwd),
-        env_combine,
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -513,70 +446,6 @@ fn build_memory_context(memories: &[MemoriaMemory], max_tokens: usize) -> String
         "[Session Context from Memory]\n{}\n[End Context]",
         parts.join("\n")
     )
-}
-
-fn trim_str_to_approx_tokens(s: &str, max_tokens: usize) -> String {
-    let max_chars = max_tokens.saturating_mul(4).max(256);
-    let n = s.chars().count();
-    if n <= max_chars {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_chars.saturating_sub(1)).collect();
-        format!("{truncated}…")
-    }
-}
-
-fn wrap_file_session_context(body: &str) -> String {
-    format!("[Session memory — on-disk summary]\n{body}\n[End on-disk session memory]")
-}
-
-fn build_file_only_session_context(file_text: &str, max_tokens: usize) -> String {
-    let t = trim_str_to_approx_tokens(file_text, max_tokens);
-    if t.is_empty() {
-        String::new()
-    } else {
-        wrap_file_session_context(&t)
-    }
-}
-
-fn build_session_context_with_optional_file(
-    memories: &[MemoriaMemory],
-    file_text: Option<&str>,
-    combine: SessionMemoryFileCombine,
-    max_tokens: usize,
-) -> String {
-    match combine {
-        SessionMemoryFileCombine::None => build_memory_context(memories, max_tokens),
-        SessionMemoryFileCombine::Fallback => {
-            if memories.is_empty() {
-                match file_text {
-                    Some(ft) if !ft.is_empty() => build_file_only_session_context(ft, max_tokens),
-                    _ => String::new(),
-                }
-            } else {
-                build_memory_context(memories, max_tokens)
-            }
-        }
-        SessionMemoryFileCombine::Merge => match file_text {
-            Some(ft) if !ft.is_empty() => {
-                let file_cap = (max_tokens * 28 / 100)
-                    .max(200)
-                    .min(max_tokens.saturating_sub(80));
-                let file_body = trim_str_to_approx_tokens(ft, file_cap);
-                let file_wrapped = wrap_file_session_context(&file_body);
-                let file_used = crate::prompts::estimate_str_tokens(&file_wrapped);
-                let mem_budget = max_tokens.saturating_sub(file_used);
-                let mem_ctx = build_memory_context(memories, mem_budget);
-                match (mem_ctx.is_empty(), file_wrapped.is_empty()) {
-                    (true, false) => file_wrapped,
-                    (false, true) => mem_ctx,
-                    (false, false) => format!("{file_wrapped}\n\n{mem_ctx}"),
-                    (true, true) => String::new(),
-                }
-            }
-            _ => build_memory_context(memories, max_tokens),
-        },
-    }
 }
 
 /// Build a working memory summary from recent messages.
@@ -971,12 +840,6 @@ pub async fn compact_with_memoria(
         }
     };
 
-    let file_text = params
-        .session_memory_file
-        .as_ref()
-        .and_then(|p| read_session_memory_file(p));
-    let had_on_disk_session_memory = file_text.is_some();
-
     let will_summarize = compact_config
         .zip(summary_client.as_ref())
         .is_some_and(|(cfg, _)| cfg.should_summarize(params.tier));
@@ -993,13 +856,10 @@ pub async fn compact_with_memoria(
     // Facts-first path: when SessionFacts available, use ground truth + narrative
     // instead of raw Memoria memories. Zero LLM, always available.
     let memory_context = if let Some(facts) = &params.session_facts {
-        // Try to find L1 narrative from Memoria memories (prefix match)
-        let narrative = memories
-            .iter()
-            .find(|m| {
-                m.content
-                    .starts_with(super::session_memory_protocol::SESSION_MEMORY_PREFIX)
-            })
+        // `pick_latest_l1` handles the unusual case where stale L1 rows
+        // coexist (e.g. a prior purge failure) — scoring, not order,
+        // picks the authoritative one, and a warn! log flags the split.
+        let narrative = super::session_memory_protocol::pick_latest_l1(&memories)
             .and_then(|m| super::session_memory_protocol::SessionMemory::parse(&m.content));
         let injection =
             super::session_memory_protocol::build_facts_first_injection(facts, narrative.as_ref());
@@ -1010,12 +870,7 @@ pub async fn compact_with_memoria(
         );
         injection
     } else {
-        build_session_context_with_optional_file(
-            &memories,
-            file_text.as_deref(),
-            params.session_memory_combine,
-            memory_max_tokens,
-        )
+        build_memory_context(&memories, memory_max_tokens)
     };
     let has_memory_context = !memory_context.is_empty();
     let memory_chars = memory_context.chars().count();
@@ -1044,14 +899,7 @@ pub async fn compact_with_memoria(
         }
 
         // Update boundary to reflect memory usage
-        let inj_summary = if had_on_disk_session_memory {
-            format!(
-                "Memoria: {} memories retrieved; on-disk session memory included",
-                memories.len()
-            )
-        } else {
-            format!("Memoria: {} memories retrieved", memories.len())
-        };
+        let inj_summary = format!("Memoria: {} memories retrieved", memories.len());
         if let Some(ref mut boundary) = result.boundary {
             boundary.summary = Some(inj_summary.clone());
         } else {
@@ -1066,9 +914,8 @@ pub async fn compact_with_memoria(
         }
 
         eprintln!(
-            "[compact] Session context injected ({} memories, on_disk={}, {} est. tokens)",
+            "[compact] Session context injected ({} memories, {} est. tokens)",
             memories.len(),
-            had_on_disk_session_memory,
             crate::prompts::estimate_str_tokens(&memory_context)
         );
     }
@@ -1170,12 +1017,7 @@ pub async fn compact_with_memoria(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| Mutex::new(()))
-    }
+    use std::sync::Mutex;
 
     #[test]
     fn parse_retrieved_memories_skips_and_reports_malformed_entries() {
@@ -1197,45 +1039,6 @@ mod tests {
         let memories = parse_retrieved_memories(&data);
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].memory_id, "m1");
-    }
-
-    fn with_env_paths<R>(
-        changes: &[(&'static str, Option<&std::path::Path>)],
-        f: impl FnOnce() -> R,
-    ) -> R {
-        let _lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
-        let previous: Vec<_> = changes
-            .iter()
-            .map(|(key, _)| (*key, std::env::var_os(key)))
-            .collect();
-
-        for (key, value) in changes {
-            if let Some(path) = value {
-                unsafe {
-                    std::env::set_var(key, path);
-                }
-            } else {
-                unsafe {
-                    std::env::remove_var(key);
-                }
-            }
-        }
-
-        let result = f();
-
-        for (key, previous) in previous {
-            if let Some(previous) = previous {
-                unsafe {
-                    std::env::set_var(key, previous);
-                }
-            } else {
-                unsafe {
-                    std::env::remove_var(key);
-                }
-            }
-        }
-
-        result
     }
 
     struct MockMemoriaClient {
@@ -1293,15 +1096,6 @@ mod tests {
 
     fn assistant(content: &str) -> Value {
         json!({"role": "assistant", "content": content})
-    }
-
-    fn make_mem(id: &str, content: &str) -> MemoriaMemory {
-        MemoriaMemory {
-            memory_id: id.to_string(),
-            content: content.to_string(),
-            memory_type: "semantic".to_string(),
-            retrieval_score: Some(0.8),
-        }
     }
 
     #[test]
@@ -1450,8 +1244,6 @@ mod tests {
             tier: CompactionTier::Normal,
             keep_recent_turns: 4,
             current_tokens: 1000,
-            session_memory_file: None,
-            session_memory_combine: SessionMemoryFileCombine::None,
             session_facts: None,
         };
         let result = compact_with_memoria(
@@ -1482,8 +1274,6 @@ mod tests {
             tier: CompactionTier::TrimSchemas,
             keep_recent_turns: 4,
             current_tokens: 1000, // Below threshold
-            session_memory_file: None,
-            session_memory_combine: SessionMemoryFileCombine::None,
             session_facts: None,
         };
 
@@ -1527,8 +1317,6 @@ mod tests {
             tier: CompactionTier::CompactHistory,
             keep_recent_turns: 4,
             current_tokens: 6000, // Above threshold
-            session_memory_file: None,
-            session_memory_combine: SessionMemoryFileCombine::None,
             session_facts: None,
         };
 
@@ -1610,8 +1398,6 @@ mod tests {
             tier: CompactionTier::CompactHistory,
             keep_recent_turns: 4,
             current_tokens: 6000,
-            session_memory_file: None,
-            session_memory_combine: SessionMemoryFileCombine::None,
             session_facts: Some(facts),
         };
 
@@ -1685,8 +1471,6 @@ mod tests {
             tier: CompactionTier::CompactHistory,
             keep_recent_turns: 4,
             current_tokens: 6000,
-            session_memory_file: None,
-            session_memory_combine: SessionMemoryFileCombine::None,
             session_facts: Some(facts),
         };
 
@@ -1775,8 +1559,6 @@ mod tests {
             tier: CompactionTier::AggressivePrune, // Meets summary_min_tier
             keep_recent_turns: 4,
             current_tokens: 6000,
-            session_memory_file: None,
-            session_memory_combine: SessionMemoryFileCombine::None,
             session_facts: None,
         };
 
@@ -1832,8 +1614,6 @@ mod tests {
             tier: CompactionTier::AggressivePrune,
             keep_recent_turns: 4,
             current_tokens: 6000,
-            session_memory_file: None,
-            session_memory_combine: SessionMemoryFileCombine::None,
             session_facts: None,
         };
 
@@ -1880,8 +1660,6 @@ mod tests {
             tier: CompactionTier::AggressivePrune,
             keep_recent_turns: 4,
             current_tokens: 6000,
-            session_memory_file: None,
-            session_memory_combine: SessionMemoryFileCombine::None,
             session_facts: None,
         };
 
@@ -1928,8 +1706,6 @@ mod tests {
             tier: CompactionTier::TrimSchemas, // Below AggressivePrune threshold
             keep_recent_turns: 4,
             current_tokens: 6000,
-            session_memory_file: None,
-            session_memory_combine: SessionMemoryFileCombine::None,
             session_facts: None,
         };
 
@@ -1966,357 +1742,6 @@ mod tests {
             sanitize_path_for_claude_projects("/home/user/proj"),
             "-home-user-proj"
         );
-    }
-
-    #[test]
-    fn resolve_resume_session_memory_file_uses_claude_path_without_combine_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = with_env_paths(
-            &[
-                ("CLAUDE_CONFIG_DIR", Some(dir.path())),
-                ("ASTRA_SESSION_MEMORY_FILE", None),
-            ],
-            || resolve_resume_session_memory_file("sess-123", Some("/tmp/my project")).unwrap(),
-        );
-        assert_eq!(
-            path,
-            dir.path()
-                .join("projects")
-                .join(sanitize_path_for_claude_projects("/tmp/my project"))
-                .join("sess-123")
-                .join("session-memory")
-                .join("summary.md")
-        );
-    }
-
-    #[tokio::test]
-    async fn compact_fallback_injects_file_when_memoria_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("summary.md");
-        std::fs::write(&f, "# Session\nDisk-only anchor text").unwrap();
-        let msgs = vec![user("hi"), assistant("hello")];
-        let config = MemoriaCompactConfig {
-            min_tokens_for_retrieval: 100,
-            store_on_compact: false,
-            ..Default::default()
-        };
-        let mock = MockMemoriaClient::new(vec![]);
-        let params = MemoriaCompactParams {
-            budget_chars: 10000,
-            keep_chars: 2000,
-            tier: CompactionTier::CompactHistory,
-            keep_recent_turns: 4,
-            current_tokens: 6000,
-            session_memory_file: Some(f),
-            session_memory_combine: SessionMemoryFileCombine::Fallback,
-            session_facts: None,
-        };
-        let r = compact_with_memoria(
-            &msgs,
-            Some("sid"),
-            &config,
-            &params,
-            Some(&mock),
-            None,
-            None,
-        )
-        .await;
-        let text = r
-            .messages
-            .iter()
-            .filter_map(|m| m.get("content").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("Disk-only anchor"));
-        assert!(text.contains("[Session memory — on-disk summary]"));
-    }
-
-    #[tokio::test]
-    async fn compact_fallback_skips_file_when_memoria_hits() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("summary.md");
-        std::fs::write(&f, "SHOULD_NOT_APPEAR").unwrap();
-        let mock = MockMemoriaClient::new(vec![MemoriaMemory {
-            memory_id: "m1".to_string(),
-            content: "from memoria".to_string(),
-            memory_type: "working".to_string(),
-            retrieval_score: None,
-        }]);
-        let params = MemoriaCompactParams {
-            budget_chars: 10000,
-            keep_chars: 2000,
-            tier: CompactionTier::CompactHistory,
-            keep_recent_turns: 4,
-            current_tokens: 6000,
-            session_memory_file: Some(f),
-            session_memory_combine: SessionMemoryFileCombine::Fallback,
-            session_facts: None,
-        };
-        let config = MemoriaCompactConfig {
-            min_tokens_for_retrieval: 100,
-            store_on_compact: false,
-            ..Default::default()
-        };
-        let r = compact_with_memoria(
-            &vec![user("a"), assistant("b")],
-            Some("sid"),
-            &config,
-            &params,
-            Some(&mock),
-            None,
-            None,
-        )
-        .await;
-        let text = r
-            .messages
-            .iter()
-            .filter_map(|m| m.get("content").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("from memoria"));
-        assert!(!text.contains("SHOULD_NOT_APPEAR"));
-    }
-
-    #[tokio::test]
-    async fn compact_merge_combines_disk_and_memoria() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("summary.md");
-        std::fs::write(&f, "DISK_UNIQUE").unwrap();
-        let mock = MockMemoriaClient::new(vec![MemoriaMemory {
-            memory_id: "m1".to_string(),
-            content: "MEM_UNIQUE".to_string(),
-            memory_type: "working".to_string(),
-            retrieval_score: None,
-        }]);
-        let params = MemoriaCompactParams {
-            budget_chars: 10000,
-            keep_chars: 2000,
-            tier: CompactionTier::CompactHistory,
-            keep_recent_turns: 4,
-            current_tokens: 6000,
-            session_memory_file: Some(f),
-            session_memory_combine: SessionMemoryFileCombine::Merge,
-            session_facts: None,
-        };
-        let config = MemoriaCompactConfig {
-            min_tokens_for_retrieval: 100,
-            store_on_compact: false,
-            ..Default::default()
-        };
-        let r = compact_with_memoria(
-            &vec![user("a"), assistant("b")],
-            Some("sid"),
-            &config,
-            &params,
-            Some(&mock),
-            None,
-            None,
-        )
-        .await;
-        let text = r
-            .messages
-            .iter()
-            .filter_map(|m| m.get("content").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("DISK_UNIQUE"));
-        assert!(text.contains("MEM_UNIQUE"));
-    }
-
-    // ──────────────────────────────────────────────────────────
-    // djb2_hash_utf16
-    // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn djb2_hash_empty_string() {
-        assert_eq!(djb2_hash_utf16(""), 0);
-    }
-
-    #[test]
-    fn djb2_hash_deterministic() {
-        let h1 = djb2_hash_utf16("hello");
-        let h2 = djb2_hash_utf16("hello");
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
-    fn djb2_hash_different_for_different_inputs() {
-        assert_ne!(djb2_hash_utf16("abc"), djb2_hash_utf16("def"));
-    }
-
-    // ──────────────────────────────────────────────────────────
-    // abs_hash_to_string_36
-    // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn abs_hash_to_string_36_zero() {
-        assert_eq!(abs_hash_to_string_36(0), "0");
-    }
-
-    #[test]
-    fn abs_hash_to_string_36_positive() {
-        let s = abs_hash_to_string_36(36);
-        assert_eq!(s, "10"); // 36 in base-36 is "10"
-    }
-
-    #[test]
-    fn abs_hash_to_string_36_negative() {
-        // abs(-36) = 36, same as positive
-        assert_eq!(abs_hash_to_string_36(-36), "10");
-    }
-
-    #[test]
-    fn abs_hash_to_string_36_large() {
-        let s = abs_hash_to_string_36(i32::MAX);
-        assert!(!s.is_empty());
-        // Only [0-9a-z] characters
-        assert!(s.chars().all(|c| c.is_ascii_alphanumeric()));
-    }
-
-    // ──────────────────────────────────────────────────────────
-    // sanitize_path_for_claude_projects (extended)
-    // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn sanitize_path_short_keeps_as_is() {
-        assert_eq!(sanitize_path_for_claude_projects("abc123"), "abc123");
-    }
-
-    #[test]
-    fn sanitize_path_long_appends_hash() {
-        let long_path = "a/".repeat(200); // > 200 chars after sanitization
-        let result = sanitize_path_for_claude_projects(&long_path);
-        assert!(result.len() > 200); // prefix + "-" + hash
-        assert!(result.contains('-'));
-    }
-
-    #[test]
-    fn sanitize_path_empty() {
-        assert_eq!(sanitize_path_for_claude_projects(""), "");
-    }
-
-    // ──────────────────────────────────────────────────────────
-    // trim_str_to_approx_tokens
-    // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn trim_str_within_limit() {
-        let s = "hello world";
-        assert_eq!(trim_str_to_approx_tokens(s, 100), s);
-    }
-
-    #[test]
-    fn trim_str_exceeds_limit() {
-        let s = "a".repeat(2000);
-        let r = trim_str_to_approx_tokens(&s, 1); // 1 token ≈ 4 chars, min 256
-        assert!(r.len() < s.len());
-        assert!(r.ends_with('…'));
-    }
-
-    #[test]
-    fn trim_str_empty() {
-        assert_eq!(trim_str_to_approx_tokens("", 100), "");
-    }
-
-    // ──────────────────────────────────────────────────────────
-    // wrap_file_session_context / build_file_only_session_context
-    // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn wrap_file_session_context_format() {
-        let r = wrap_file_session_context("my notes");
-        assert!(r.starts_with("[Session memory"));
-        assert!(r.contains("my notes"));
-        assert!(r.ends_with("]"));
-    }
-
-    #[test]
-    fn build_file_only_empty_yields_empty() {
-        assert!(build_file_only_session_context("", 100).is_empty());
-    }
-
-    #[test]
-    fn build_file_only_wraps_text() {
-        let r = build_file_only_session_context("disk notes", 100);
-        assert!(r.contains("disk notes"));
-        assert!(r.contains("[Session memory"));
-    }
-
-    // ──────────────────────────────────────────────────────────
-    // build_session_context_with_optional_file
-    // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn session_context_none_combine_ignores_file() {
-        let mems = vec![make_mem("x", "mem stuff")];
-        let r = build_session_context_with_optional_file(
-            &mems,
-            Some("disk stuff"),
-            SessionMemoryFileCombine::None,
-            1000,
-        );
-        assert!(r.contains("mem stuff"));
-        assert!(!r.contains("disk stuff"));
-    }
-
-    #[test]
-    fn session_context_fallback_with_memories_ignores_file() {
-        let mems = vec![make_mem("x", "mem stuff")];
-        let r = build_session_context_with_optional_file(
-            &mems,
-            Some("disk stuff"),
-            SessionMemoryFileCombine::Fallback,
-            1000,
-        );
-        assert!(r.contains("mem stuff"));
-        assert!(!r.contains("disk stuff"));
-    }
-
-    #[test]
-    fn session_context_fallback_empty_memories_uses_file() {
-        let r = build_session_context_with_optional_file(
-            &[],
-            Some("disk fallback"),
-            SessionMemoryFileCombine::Fallback,
-            1000,
-        );
-        assert!(r.contains("disk fallback"));
-    }
-
-    #[test]
-    fn session_context_fallback_empty_both() {
-        let r = build_session_context_with_optional_file(
-            &[],
-            None,
-            SessionMemoryFileCombine::Fallback,
-            1000,
-        );
-        assert!(r.is_empty());
-    }
-
-    #[test]
-    fn session_context_merge_combines_both() {
-        let mems = vec![make_mem("x", "mem side")];
-        let r = build_session_context_with_optional_file(
-            &mems,
-            Some("disk side"),
-            SessionMemoryFileCombine::Merge,
-            1000,
-        );
-        assert!(r.contains("mem side"));
-        assert!(r.contains("disk side"));
-    }
-
-    #[test]
-    fn session_context_merge_no_file_just_memory() {
-        let mems = vec![make_mem("x", "only mem")];
-        let r = build_session_context_with_optional_file(
-            &mems,
-            None,
-            SessionMemoryFileCombine::Merge,
-            1000,
-        );
-        assert!(r.contains("only mem"));
     }
 
     // ──────────────────────────────────────────────────────────
@@ -2698,42 +2123,6 @@ mod tests {
         assert!(r.contains("[summary truncated"));
     }
 
-    // ──────────────────────────────────────────────────────────
-    // read_session_memory_file
-    // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn read_session_memory_file_normal() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("notes.md");
-        std::fs::write(&f, "  session notes  \n").unwrap();
-        assert_eq!(read_session_memory_file(&f), Some("session notes".into()));
-    }
-
-    #[test]
-    fn read_session_memory_file_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("empty.md");
-        std::fs::write(&f, "   ").unwrap();
-        assert_eq!(read_session_memory_file(&f), None);
-    }
-
-    #[test]
-    fn read_session_memory_file_missing() {
-        let path = std::path::Path::new("/nonexistent/file.md");
-        assert_eq!(read_session_memory_file(path), None);
-    }
-
-    #[test]
-    fn read_session_memory_file_too_large() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("huge.md");
-        // Create file > 512KB
-        let data = "x".repeat(600 * 1024);
-        std::fs::write(&f, &data).unwrap();
-        assert_eq!(read_session_memory_file(&f), None);
-    }
-
     #[tokio::test]
     async fn compact_store_on_compact_stores_semantic_summary() {
         // When store_on_compact=true and summary succeeds,
@@ -2761,8 +2150,6 @@ mod tests {
             tier: CompactionTier::AggressivePrune,
             keep_recent_turns: 4,
             current_tokens: 6000,
-            session_memory_file: None,
-            session_memory_combine: SessionMemoryFileCombine::None,
             session_facts: None,
         };
         let compact_config = CompactConfig {
@@ -2917,8 +2304,6 @@ mod tests {
             tier: CompactionTier::AggressivePrune,
             keep_recent_turns: 4,
             current_tokens: 6000,
-            session_memory_file: None,
-            session_memory_combine: SessionMemoryFileCombine::None,
             session_facts: None,
         };
         let compact_config = CompactConfig {

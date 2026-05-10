@@ -49,6 +49,45 @@ pub fn matrix_settings_from_env() -> Result<MatrixOneSettings, String> {
     MatrixOneSettings::from_env_strict()
 }
 
+/// Production resolver that reads the `"selector"`-tagged cheap model
+/// from the `infra_llm_models` registry. Used to feed
+/// [`crate::session_memory::MemoryExtractionService`] without pulling
+/// the full MatrixCloudRuntime into every caller.
+pub struct PoolSelectorResolver {
+    pool: SharedPool,
+    encryptor: Arc<astra_services::FernetTokenEncryptor>,
+}
+
+impl PoolSelectorResolver {
+    pub fn new(pool: SharedPool, encryptor: Arc<astra_services::FernetTokenEncryptor>) -> Self {
+        Self { pool, encryptor }
+    }
+}
+
+impl std::fmt::Debug for PoolSelectorResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolSelectorResolver").finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::session_memory::SelectorParamsResolver for PoolSelectorResolver {
+    async fn resolve(&self) -> Option<crate::memory_relevance::LlmConnParams> {
+        let settings = self.pool.settings();
+        let pool = self.pool.get();
+        let resolved =
+            astra_services::models::resolve_memory_model(settings, &self.encryptor, Some(pool))
+                .await
+                .ok()?;
+        Some(crate::memory_relevance::LlmConnParams {
+            base_url: resolved.base_url,
+            api_key: resolved.api_key,
+            model_name: resolved.model_name,
+            provider: resolved.provider,
+        })
+    }
+}
+
 /// Pool + ingestion + unified sync orchestrator. Safe to share behind `Arc`.
 pub struct MatrixCloudRuntime {
     shared_pool: SharedPool,
@@ -80,6 +119,16 @@ pub struct MatrixCloudRuntime {
     audit_flusher_shutdown: tokio_util::sync::CancellationToken,
     audit_flusher_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     encryptor: Option<Arc<astra_services::FernetTokenEncryptor>>,
+    /// Lazy slot for the session-memory extraction coordinator. The
+    /// service depends on the encryptor (for selector resolution) so
+    /// we can't build it in [`Self::attach`]; it's populated by
+    /// [`Self::with_encryptor`] when both pool and encryptor are
+    /// available, and exposed via
+    /// [`Self::clone_memory_extraction_service`].
+    memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    /// User ID this runtime was attached for — needed when constructing
+    /// the memory extraction service inside [`Self::with_encryptor`].
+    user_id: Arc<str>,
 }
 
 impl MatrixCloudRuntime {
@@ -167,14 +216,53 @@ impl MatrixCloudRuntime {
             audit_flusher_shutdown: audit_flusher.shutdown,
             audit_flusher_handle: Mutex::new(Some(audit_flusher.join_handle)),
             encryptor: None,
+            memory_extraction_service: None,
+            user_id: Arc::from(user_id),
         }
     }
 
-    /// Attach a token encryptor for decrypting model API keys from the DB.
-    /// Call this after `attach()` when the encryptor is available.
+    /// Attach a token encryptor for decrypting model API keys from the
+    /// DB. Call this after `attach()` when the encryptor is available.
+    ///
+    /// Also spins up the [`crate::session_memory::MemoryExtractionService`]
+    /// here, because it needs all three of: encryptor (for selector
+    /// resolve), ingestion sender (for events), and a [`MemoriaClient`]
+    /// (the sole persistence target for L1 session memory). If
+    /// [`HttpMemoriaClient::from_env`] returns `None` (no Memoria
+    /// endpoint configured / offline), the service is NOT built —
+    /// extraction is opt-in on connectivity, not silent fallback.
     pub fn with_encryptor(mut self, enc: Arc<astra_services::FernetTokenEncryptor>) -> Self {
-        self.encryptor = Some(enc);
+        self.encryptor = Some(Arc::clone(&enc));
+        let ingestion = self.ingestion.lock().ok().and_then(|g| g.as_ref().cloned());
+        let memoria = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
+        if let (Some(ingestion), Some(memoria)) = (ingestion, memoria) {
+            let resolver: Arc<dyn crate::session_memory::SelectorParamsResolver> =
+                Arc::new(PoolSelectorResolver {
+                    pool: self.shared_pool.clone(),
+                    encryptor: Arc::clone(&enc),
+                });
+            let broker = Arc::new(crate::session_memory::BackgroundActivityBroker::new());
+            let memoria_client: Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient> =
+                Arc::new(memoria);
+            let svc = Arc::new(crate::session_memory::MemoryExtractionService::new(
+                resolver,
+                memoria_client,
+                ingestion,
+                Arc::clone(&self.user_id),
+                broker,
+            ));
+            self.memory_extraction_service = Some(svc);
+        }
         self
+    }
+
+    /// Clone the memory-extraction coordinator for consumers (server
+    /// lifecycle service, CLI repl state). `None` if `with_encryptor`
+    /// hasn't been called, or ingestion was already shut down.
+    pub fn clone_memory_extraction_service(
+        &self,
+    ) -> Option<Arc<crate::session_memory::MemoryExtractionService>> {
+        self.memory_extraction_service.clone()
     }
 
     /// Resolve the cheapest selector-tagged model from the registry.

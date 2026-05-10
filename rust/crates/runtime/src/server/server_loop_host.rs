@@ -2155,7 +2155,6 @@ impl ServerAgenticLoopHost {
                 &summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
             ),
             tier,
-            cwd: self.edge_profile.get("cwd").and_then(|v| v.as_str()),
             session_facts: None,
         };
         ctx.compact(&state.messages, system_messages, visible_tools)
@@ -4664,6 +4663,8 @@ mod tests {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            session_memory_state: Default::default(),
+            memory_extraction_service: None,
             continuity: Default::default(),
             compact_strategy: Default::default(),
             approval_overrides: None,

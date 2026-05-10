@@ -301,6 +301,13 @@ pub(crate) struct ReplState {
     pub selector_model_params: Option<astra_runtime::memory_relevance::LlmConnParams>,
     /// Background memory extraction agent.
     pub memory_extractor: super::memory_extraction::MemoryExtractor,
+    /// Background session-memory.md extraction coordinator. Cloned
+    /// from `matrix_runtime` at REPL startup once the encryptor is
+    /// installed; `None` means no cloud runtime is attached (local-only
+    /// CLI paths) and extraction runs silently with no LLM and no
+    /// events.
+    pub session_memory_extractor:
+        Option<std::sync::Arc<astra_runtime::session_memory::MemoryExtractionService>>,
 
     /// P8: persistent auto-invoke handler. Owns the per-cause cooldowns
     /// across turns of this session. Created lazily on first turn so
@@ -510,6 +517,7 @@ impl Default for ReplState {
             lesson_checkpointer: astra_runtime::lesson_checkpoint::LessonCheckpointer::new(),
             selector_model_params: None,
             memory_extractor: super::memory_extraction::MemoryExtractor::new(),
+            session_memory_extractor: None,
             auto_invoke_handler: None,
             latest_skill_diagnosis: None,
             diagnosis_outcome_tracker:

@@ -6,6 +6,7 @@
 mod edge_executor;
 mod explain_reports;
 mod params;
+pub(crate) mod session_memory_ux;
 mod sse_loop;
 
 #[cfg(test)]

@@ -343,6 +343,22 @@ impl IngestionSender {
         }
     }
 
+    /// Build a sender whose events can be drained from the returned
+    /// receiver. Tests wire this up when they need to assert on enqueued
+    /// events instead of just ignoring them. Not intended for production
+    /// code paths — use [`IngestionSender`] obtained from
+    /// [`EventIngestionWorker::spawn`] there.
+    pub fn for_tests(capacity: usize) -> (Self, mpsc::Receiver<IngestionEvent>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Self {
+                tx,
+                overflow_count: Arc::new(AtomicU64::new(0)),
+            },
+            rx,
+        )
+    }
+
     /// Enqueue an event for async ingestion. Non-blocking; increments overflow counter if channel full.
     pub fn enqueue(&self, event: IngestionEvent) {
         if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(event) {

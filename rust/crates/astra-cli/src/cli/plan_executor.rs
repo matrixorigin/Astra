@@ -1791,6 +1791,7 @@ async fn plan_executor_task(
                     pipeline_state: None,
                     pre_loaded_messages: None,
                     append_system_prompt: None,
+                    session_memory_extractor: None,
                     #[cfg(feature = "harness")]
                     harness_sink: ctx.harness_sink.clone(),
                     #[cfg(feature = "harness")]

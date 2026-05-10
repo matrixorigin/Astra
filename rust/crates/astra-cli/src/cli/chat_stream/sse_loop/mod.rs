@@ -153,6 +153,16 @@ pub(crate) async fn stream_chat_sse(
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
     let root_agent_id = p.root_agent_id.unwrap_or("main");
+
+    // UX bridge: subscribe to the session-memory broker for this turn
+    // and forward qualifying events to the CLI stream as `StatusLine`
+    // so long-running LLM extraction gets a subtle visual cue. Runs
+    // for the duration of the turn; dropped when `_session_memory_ux`
+    // goes out of scope.
+    let _session_memory_ux = crate::chat_stream::session_memory_ux::SessionMemoryUxBridge::spawn(
+        p.session_memory_extractor.as_ref(),
+        p.stream_event_tx.clone(),
+    );
     // Stable run_id for this turn — shared by:
     //   1. state.current_run_id (so on_turn_completed captures the
     //      parent prefix keyed on this id)
@@ -745,6 +755,8 @@ pub(crate) async fn stream_chat_sse(
         server_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
+        session_memory_state: Default::default(),
+        memory_extraction_service: p.session_memory_extractor.clone(),
         continuity: p.runtime_continuity.cloned().unwrap_or_default(),
         compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_and_model(
             p.provider, p.model,

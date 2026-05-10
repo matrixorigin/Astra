@@ -275,6 +275,10 @@ pub(crate) async fn complete_repl_startup(
                 eprintln!("  {} team store builtins: {e}", theme::icon_warn());
             }
             state.team_store = std::sync::Arc::new(mo_team_store);
+            // Session-memory.md background extractor. Shares broker +
+            // ingestion with the rest of the runtime so events land in
+            // agent_events and the CLI can bridge UX signals.
+            state.session_memory_extractor = mc.clone_memory_extraction_service();
         }
     }
     tracer.phase("matrix_pool");
