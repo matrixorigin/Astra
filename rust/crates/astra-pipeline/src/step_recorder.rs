@@ -865,7 +865,6 @@ impl StepRecorder {
             consecutive_context_window_errors,
             pipeline_state: None,   // Set by caller after construction
             compaction_state: None, // Set by caller after construction
-            continuity_state: None, // Set by caller after construction
         })
     }
 

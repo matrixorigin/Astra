@@ -437,7 +437,7 @@ fn compact_tool_results_with_pin_list(
         let file_path = extract_file_path_from_tool_result(msg, &id_to_name);
         let is_pinned = file_path
             .as_deref()
-            .map(|p| facts.is_active_file(p, pin_turns) || facts.is_pending_relevant_file(p))
+            .map(|p| facts.is_active_file(p, pin_turns))
             .unwrap_or(false);
         if !is_pinned {
             unpinned.push((i, estimate_tokens(content)));
@@ -1982,62 +1982,6 @@ mod tests {
             "state-aware ({}) should compact ≤ normal ({})",
             stats_aware.results_compacted,
             stats_normal.results_compacted
-        );
-    }
-
-    #[test]
-    fn state_aware_pins_pending_task_relevant_files() {
-        use crate::cloud_session_facts::{PlanFact, SessionFacts};
-
-        let facts = SessionFacts {
-            turn: 10,
-            plan_state: Some(PlanFact {
-                goal: "finish compaction".to_string(),
-                completed: 1,
-                total: 2,
-                current_subtask: Some("preserve src/pending.rs while editing".to_string()),
-            }),
-            ..Default::default()
-        };
-        let big = "x".repeat(2000);
-        let mut messages = vec![
-            assistant_with_tool_args(&[
-                ("c1", "read_file", r#"{"path":"src/pending.rs"}"#),
-                ("c2", "read_file", r#"{"path":"src/old.rs"}"#),
-                ("c3", "read_file", r#"{"path":"src/other.rs"}"#),
-            ]),
-            json!({
-                "role": "tool",
-                "tool_call_id": "c1",
-                "name": "read_file",
-                "content": format!("src/pending.rs\n{big}")
-            }),
-            json!({
-                "role": "tool",
-                "tool_call_id": "c2",
-                "name": "read_file",
-                "content": format!("src/old.rs\n{big}")
-            }),
-            json!({
-                "role": "tool",
-                "tool_call_id": "c3",
-                "name": "read_file",
-                "content": format!("src/other.rs\n{big}")
-            }),
-        ];
-
-        let stats =
-            compact_tool_results_state_aware(&mut messages, 0.95, &facts, 5, Default::default());
-
-        assert!(stats.results_compacted > 0);
-        let pending = messages[1]["content"].as_str().unwrap();
-        assert!(
-            pending.starts_with("src/pending.rs"),
-            "pending-task-relevant file result must remain intact, got: {pending}"
-        );
-        assert!(
-            !super::is_cleared_content(pending),
-            "pending-task-relevant file result must not be compacted"
         );
     }
 

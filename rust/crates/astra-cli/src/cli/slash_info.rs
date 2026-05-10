@@ -1266,7 +1266,6 @@ pub(super) async fn handle_info_command(
                 git_worktree_journal: None,
                 session_state_journal: None,
                 task_manager: None,
-                runtime_continuity: None,
                 turn_index: 0,
                 pipeline_state: None,
                 pre_loaded_messages: None,
@@ -1717,10 +1716,6 @@ pub(super) async fn handle_info_command(
                     );
                 }
             }
-            if let Some(ref goal) = state.session_goal {
-                eprintln!("  {:<12}  {}", "goal".cyan(), truncate_str(goal, 80).dim());
-            }
-
             eprintln!("  {}", "─".repeat(56).cyan().dim());
 
             // Inline last turn's actual component breakdown if available

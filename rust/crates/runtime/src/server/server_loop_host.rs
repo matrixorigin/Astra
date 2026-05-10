@@ -1895,9 +1895,6 @@ impl ServerAgenticLoopHost {
             .pipeline_session
             .as_mut()
             .expect("pipeline_session must be initialized for all production paths");
-        if pipeline_sess.working_memory().is_empty() {
-            pipeline_sess.start_goal(user_content);
-        }
         let input = AdaptiveTurnInput {
             statics: &statics,
             agent: &agent,
@@ -4379,7 +4376,6 @@ mod tests {
             current_session_id: None,
             current_run_id: None,
             recursion_depth: 0,
-            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -4455,7 +4451,6 @@ mod tests {
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: None,
-            continuity: Default::default(),
             compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),

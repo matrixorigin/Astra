@@ -469,17 +469,12 @@ pub(super) fn build_effective_line(
         .as_deref()
         .filter(|_| is_low_information_followup(line))
     {
-        let goal_line = state
-            .session_goal
-            .as_deref()
-            .map(|g| format!("Session goal: {g}\n"))
-            .unwrap_or_default();
         effective_line = format!(
             "[Active task attachment]\n\
 Resume the active task/thread below unless the user explicitly changes topic.\n\
 Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
 If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
-{goal_line}{anchor}\n\n[User follow-up]\n{effective_line}"
+{anchor}\n\n[User follow-up]\n{effective_line}"
         );
     }
 
@@ -714,126 +709,6 @@ fn is_greeting_like_message(line: &str) -> bool {
             | "good afternoon"
             | "good evening"
     ) || matches!(trimmed, "你好" | "您好" | "嗨" | "哈喽")
-}
-
-fn session_goal_candidate(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if trimmed.is_empty()
-        || is_greeting_like_message(trimmed)
-        || is_low_information_followup(trimmed)
-    {
-        return None;
-    }
-
-    Some(truncate_chars(trimmed, 220))
-}
-
-fn session_goal_is_placeholder(goal: &str) -> bool {
-    let trimmed = goal.trim();
-    trimmed.is_empty() || is_greeting_like_message(trimmed)
-}
-
-fn maybe_update_session_goal(state: &mut ReplState, line: &str) {
-    let Some(candidate) = session_goal_candidate(line) else {
-        return;
-    };
-
-    match state.session_goal.as_deref() {
-        None => state.session_goal = Some(candidate),
-        Some(existing) if session_goal_is_placeholder(existing) => {
-            state.session_goal = Some(candidate);
-        }
-        Some(existing) if is_topic_pivot(existing, &candidate) => {
-            // User has clearly changed direction. Replace the
-            // anchor rather than carry the stale goal forever. The
-            // threshold is conservative (low word-overlap AND the
-            // new line is substantive) so an ordinary follow-up
-            // like "add a test for that" doesn't trigger a pivot.
-            state.session_goal = Some(candidate);
-        }
-        Some(_) => {}
-    }
-}
-
-/// Heuristic: two user messages describe meaningfully different
-/// tasks if they share almost no content words. Purely
-/// lexical — intentionally dumb — because the LLM already routes
-/// around stale goal anchors gracefully; we only need to catch
-/// the obvious "hi → review 5 commits" pivot, not subtle
-/// conceptual shifts.
-///
-/// Returns `true` when:
-///   * the new candidate is substantive (≥ 4 content words), AND
-///   * < 15 % of its content words overlap with the current goal.
-///
-/// Content words = lowercased tokens ≥ 3 ASCII chars (or ≥ 2 CJK
-/// chars), excluding a small stopword set. The stopword set is
-/// intentionally small — drift is OK; the penalty for a false
-/// positive (replacing a good goal) is milder than for a false
-/// negative (goal stuck on greeting forever).
-fn is_topic_pivot(existing: &str, candidate: &str) -> bool {
-    let existing_words = content_words(existing);
-    let candidate_words = content_words(candidate);
-    if candidate_words.len() < 4 {
-        return false;
-    }
-    if existing_words.is_empty() {
-        // Existing is all stopwords (impossible after the placeholder
-        // check but defensive). Treat as pivot.
-        return true;
-    }
-    let overlap = candidate_words
-        .iter()
-        .filter(|w| existing_words.contains(*w))
-        .count();
-    let ratio = overlap as f32 / candidate_words.len() as f32;
-    ratio < 0.15
-}
-
-/// Extract lowercased content words from `s`. Called only from
-/// pivot detection, so we can afford a `Vec` + keep the function
-/// pure.
-fn content_words(s: &str) -> std::collections::HashSet<String> {
-    const STOP: &[&str] = &[
-        "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "is", "are", "be",
-        "was", "were", "it", "this", "that", "these", "those", "can", "do", "does", "how", "what",
-        "why", "when", "please", "me", "my", "i", "we", "us", "you", "your", "从", "的", "了",
-        "在", "是", "和", "与", "或", "也", "但", "吗", "呢", "吧", "啊", "这", "那", "这个",
-        "那个", "现在", "以及",
-    ];
-    let mut out = std::collections::HashSet::new();
-    let mut current = String::new();
-    for ch in s.chars() {
-        if ch.is_alphanumeric() {
-            current.push(ch);
-        } else {
-            if !current.is_empty() {
-                push_if_content(&current, &mut out, STOP);
-                current.clear();
-            }
-        }
-    }
-    if !current.is_empty() {
-        push_if_content(&current, &mut out, STOP);
-    }
-    out
-}
-
-fn push_if_content(word: &str, set: &mut std::collections::HashSet<String>, stop: &[&str]) {
-    let lower = word.to_lowercase();
-    if stop.iter().any(|s| *s == lower) {
-        return;
-    }
-    // Threshold: ≥3 bytes if ASCII, ≥2 chars if non-ASCII (CJK).
-    let is_ascii = lower.is_ascii();
-    let min_ok = if is_ascii {
-        lower.len() >= 3
-    } else {
-        lower.chars().count() >= 2
-    };
-    if min_ok {
-        set.insert(lower);
-    }
 }
 
 fn summarize_assistant_for_anchor(full_text: &str) -> Option<String> {
@@ -1110,7 +985,6 @@ async fn run_chat_turn(
             git_worktree_journal: Some(state.git_worktree_journal.clone()),
             session_state_journal: Some(state.session_state_journal.clone()),
             task_manager: Some(state.task_manager.clone()),
-            runtime_continuity: state.runtime_continuity.as_ref(),
             turn_index: state.turn,
             pipeline_state: None,
             pre_loaded_messages: None,
@@ -1954,7 +1828,6 @@ fn apply_turn_success_sync(
                 let obs_session = hub.start_session(&user_id, session_id);
                 state.observability_session = Some(obs_session);
                 apply_pending_adaptive_state(state);
-                apply_pending_goal_progress_state(state);
             }
         }
     }
@@ -1974,7 +1847,6 @@ fn apply_turn_success_sync(
         &state.cached_pricing,
     );
     state.total_session_cost += turn_cost;
-    state.runtime_continuity = Some(result.runtime_continuity.clone());
     state.last_response = Some(result.full_text.clone());
     state.continuation_anchor = build_continuation_anchor(state, line, &result);
     state.pending_followup_suggestion =
@@ -1985,7 +1857,6 @@ fn apply_turn_success_sync(
         super::repl_ui::clear_followup_prompt_hint();
     }
 
-    maybe_update_session_goal(state, line);
     // New user input invalidates redo stack (history diverged)
     state.redo_stack.clear();
     state.history.push((
@@ -2421,7 +2292,6 @@ fn build_full_session_state_compact(
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
     astra_turn_core::conversation_log::SessionStateCompact {
         recent_tools: state.recent_tools.clone(),
-        continuity: state.runtime_continuity.clone(),
         blocked_tools: cp
             .blocked_tools
             .unwrap_or_else(|| prev_state.blocked_tools.clone()),
@@ -2817,7 +2687,6 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
             astra_runtime::observability_integration::ObservabilitySession::new_simple(session_id),
         )));
         apply_pending_adaptive_state(state);
-        apply_pending_goal_progress_state(state);
     }
 }
 
@@ -2939,27 +2808,12 @@ fn sync_session_state_to_workspace(
     state: &ReplState,
     ws: &mut astra_services::session_workspace::WorkspaceMetadata,
 ) {
-    ws.session_goal = state.session_goal.clone();
-    ws.goal_progress = None;
     ws.pinned_skills = state.pinned_skills.iter().cloned().collect();
     ws.discovered_skills = state.discovered_skills.iter().cloned().collect();
 
     // Persist adaptive engine state (anti-flap, experiment, tuned config)
     if let Some(obs) = &state.observability_session {
         if let Ok(guard) = obs.read() {
-            ws.goal_progress = guard.goal_progress_snapshot().filter(|progress| {
-                state
-                    .session_goal
-                    .as_deref()
-                    .map(|goal| goal == progress.goal.as_str())
-                    .unwrap_or(true)
-            });
-            if ws.session_goal.is_none() {
-                ws.session_goal = ws
-                    .goal_progress
-                    .as_ref()
-                    .map(|progress| progress.goal.clone());
-            }
             ws.last_scenario_change_turn = guard.last_scenario_change_turn;
             ws.last_token_budget_direction = guard.last_token_budget_direction;
             ws.last_token_budget_change_turn = guard.last_token_budget_change_turn;
@@ -2974,24 +2828,10 @@ pub(super) struct GoalSteeringChange {
 }
 
 pub(super) fn steer_observability_goal(
-    state: &mut ReplState,
-    goal: &str,
+    _state: &mut ReplState,
+    _goal: &str,
 ) -> Option<GoalSteeringChange> {
-    let session_turn = state.turn;
-    let obs = state.observability_session.as_ref()?;
-    let mut guard = obs.write().unwrap_or_else(|error| error.into_inner());
-    let previous_goal = guard
-        .goal_tracker
-        .as_ref()
-        .map(|tracker| tracker.goal().to_string())
-        .or_else(|| guard.original_query.clone());
-    if !guard.steer_goal(goal) {
-        return None;
-    }
-    Some(GoalSteeringChange {
-        previous_goal,
-        turn: session_turn,
-    })
+    None
 }
 
 /// Apply persisted adaptive engine state to a newly created ObservabilitySession.
@@ -3026,36 +2866,6 @@ pub(super) fn apply_pending_adaptive_state(state: &mut ReplState) {
         {
             let current = std::mem::take(&mut guard.config);
             guard.config = current.merge(saved_config);
-        }
-    }
-}
-
-pub(super) fn apply_pending_goal_progress_state(state: &mut ReplState) {
-    let goal_progress = match state.pending_goal_progress.take() {
-        Some(progress) => progress,
-        None => return,
-    };
-    if state
-        .session_goal
-        .as_deref()
-        .map(|goal| goal != goal_progress.goal.as_str())
-        .unwrap_or(false)
-    {
-        // Deliberately drop stale progress snapshots when the tracked goal no longer
-        // matches the current session goal.
-        return;
-    }
-    let obs = match &state.observability_session {
-        Some(session) => session,
-        None => {
-            state.pending_goal_progress = Some(goal_progress);
-            return;
-        }
-    };
-    match obs.write() {
-        Ok(mut guard) => guard.restore_goal_progress(goal_progress),
-        Err(_) => {
-            state.pending_goal_progress = Some(goal_progress);
         }
     }
 }
@@ -3141,7 +2951,6 @@ fn build_manual_heavy_step_checkpoint(
         consecutive_context_window_errors: 0,
         compaction_state: None,
         pipeline_state: None,
-        continuity_state: None,
     };
     StepCheckpoint::Heavy(Box::new(heavy))
 }
@@ -3579,80 +3388,6 @@ mod tests {
     }
 
     #[test]
-    fn sync_session_state_persists_goal_progress() {
-        let mut state = ReplState::default();
-        state.session_goal = Some("ship auth".to_string());
-        let mut obs =
-            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-goal");
-        obs.record_query("ship auth");
-        obs.record_tool_result(
-            "bash",
-            "test result: ok. 12 passed; 0 failed; 0 ignored",
-            Some(0),
-        );
-        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(obs)));
-
-        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new("sid-goal", "m");
-        sync_session_state_to_workspace(&state, &mut ws);
-
-        let progress = ws.goal_progress.expect("goal progress should persist");
-        assert_eq!(progress.goal, "ship auth");
-        assert_eq!(progress.milestone_count, 1);
-        assert!(progress.completion_score > 0.0);
-    }
-
-    #[test]
-    fn apply_pending_goal_progress_restores_observability_tracker() {
-        let mut source =
-            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-src");
-        source.record_query("ship auth");
-        source.record_tool_result("bash", "Finished `dev` profile", Some(0));
-        let snapshot = source
-            .goal_progress_snapshot()
-            .expect("goal progress snapshot");
-
-        let mut state = ReplState::default();
-        state.session_goal = Some(snapshot.goal.clone());
-        state.pending_goal_progress = Some(snapshot.clone());
-        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-dst"),
-        )));
-
-        apply_pending_goal_progress_state(&mut state);
-
-        let restored = state
-            .observability_session
-            .as_ref()
-            .unwrap()
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .goal_progress()
-            .expect("restored progress");
-        assert_eq!(restored.milestone_count, snapshot.milestone_count);
-        assert!(state.pending_goal_progress.is_none());
-    }
-
-    #[test]
-    fn apply_pending_goal_progress_requeues_when_lock_is_poisoned() {
-        let mut source =
-            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-src");
-        source.record_query("ship auth");
-        source.record_tool_result("bash", "Finished `dev` profile", Some(0));
-        let snapshot = source
-            .goal_progress_snapshot()
-            .expect("goal progress snapshot");
-
-        let mut state = ReplState::default();
-        state.session_goal = Some(snapshot.goal.clone());
-        state.pending_goal_progress = Some(snapshot.clone());
-        state.observability_session = Some(poisoned_observability_session("sid-poisoned"));
-
-        apply_pending_goal_progress_state(&mut state);
-
-        assert_eq!(state.pending_goal_progress, Some(snapshot));
-    }
-
-    #[test]
     fn apply_pending_adaptive_state_requeues_when_lock_is_poisoned() {
         let mut state = ReplState::default();
         state.pending_adaptive_state = Some(super::repl_state::PersistedAdaptiveState {
@@ -3673,53 +3408,6 @@ mod tests {
             .expect("adaptive state should remain pending");
         assert_eq!(adaptive.last_token_budget_direction, 1);
         assert_eq!(adaptive.active_experiment_id.as_deref(), Some("exp-1"));
-    }
-
-    #[test]
-    fn steer_observability_goal_updates_live_tracker() {
-        let mut state = ReplState::default();
-        let mut obs =
-            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-steer");
-        obs.record_query("finish auth flow");
-        obs.compressed_turns.push(2);
-        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(obs)));
-
-        steer_observability_goal(&mut state, "ship billing flow");
-
-        let guard = state
-            .observability_session
-            .as_ref()
-            .unwrap()
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(guard.original_query.as_deref(), Some("ship billing flow"));
-        assert_eq!(
-            guard.goal_tracker.as_ref().map(|tracker| tracker.goal()),
-            Some("ship billing flow")
-        );
-        assert_eq!(guard.recent_queries, vec!["ship billing flow".to_string()]);
-        assert!(guard.compressed_turns.is_empty());
-    }
-
-    #[test]
-    fn steer_observability_goal_reports_session_turn_not_internal_loop_turn() {
-        let mut state = ReplState {
-            turn: 3,
-            ..Default::default()
-        };
-        let mut obs =
-            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-steer");
-        obs.turn_number = 6;
-        obs.record_query("review session health");
-        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(obs)));
-
-        let change = steer_observability_goal(&mut state, "run plan execution").expect("change");
-
-        assert_eq!(change.turn, 3);
-        assert_eq!(
-            change.previous_goal.as_deref(),
-            Some("review session health")
-        );
     }
 
     #[test]
@@ -4092,128 +3780,6 @@ mod tests {
         );
         assert!(!effective.contains("[Active task attachment]"));
         assert_eq!(effective, "修一下输入法问题");
-    }
-
-    #[test]
-    fn build_effective_line_injects_session_goal_with_anchor() {
-        let state = ReplState {
-            continuation_anchor: Some(
-                "Latest user task: fix auth middleware\nLatest assistant direction: add JWT validation"
-                    .to_string(),
-            ),
-            session_goal: Some("build a REST API with axum".to_string()),
-            ..ReplState::default()
-        };
-
-        let effective = build_effective_line("ok", &state, &mut crate::ui_adapter::LineUiAdapter);
-        assert!(
-            effective.contains("[Active task attachment]"),
-            "anchor injected"
-        );
-        assert!(
-            effective.contains("Session goal: build a REST API with axum"),
-            "session goal present"
-        );
-        assert!(
-            effective.contains("fix auth middleware"),
-            "latest task present"
-        );
-
-        // Without session_goal
-        let state_no_goal = ReplState {
-            continuation_anchor: Some("Latest user task: fix auth".to_string()),
-            session_goal: None,
-            ..ReplState::default()
-        };
-        let effective_no_goal = build_effective_line(
-            "sure",
-            &state_no_goal,
-            &mut crate::ui_adapter::LineUiAdapter,
-        );
-        assert!(effective_no_goal.contains("[Active task attachment]"));
-        assert!(!effective_no_goal.contains("Session goal:"));
-    }
-
-    #[test]
-    fn maybe_update_session_goal_promotes_substantive_goal_after_greeting() {
-        let mut state = ReplState::default();
-
-        maybe_update_session_goal(&mut state, "hi");
-        assert!(state.session_goal.is_none());
-
-        maybe_update_session_goal(&mut state, "review local changes");
-        assert_eq!(state.session_goal.as_deref(), Some("review local changes"));
-    }
-
-    #[test]
-    fn maybe_update_session_goal_replaces_placeholder_but_preserves_real_goal_on_followup() {
-        let mut state = ReplState {
-            session_goal: Some("hi".to_string()),
-            ..ReplState::default()
-        };
-
-        maybe_update_session_goal(&mut state, "review local changes");
-        assert_eq!(state.session_goal.as_deref(), Some("review local changes"));
-
-        // Low-info follow-up — must NOT trigger pivot detection.
-        maybe_update_session_goal(&mut state, "yes, proceed");
-        assert_eq!(state.session_goal.as_deref(), Some("review local changes"));
-    }
-
-    #[test]
-    fn maybe_update_session_goal_updates_on_clear_topic_pivot() {
-        // Original anchor: "hi" (placeholder) → "review 5 commits on
-        // enhance_2 branch". Later, the user pivots to something
-        // unrelated that shares no content words — the anchor must
-        // follow, not stay frozen on the review task.
-        let mut state = ReplState {
-            session_goal: Some("review 5 commits on enhance_2 branch".to_string()),
-            ..ReplState::default()
-        };
-
-        // Pivot: investigate a compaction regression — no word overlap
-        // with review/commits/branch.
-        maybe_update_session_goal(
-            &mut state,
-            "investigate the compaction regression that swallowed bash output",
-        );
-        assert_eq!(
-            state.session_goal.as_deref(),
-            Some("investigate the compaction regression that swallowed bash output"),
-            "clear pivot must refresh the anchor"
-        );
-    }
-
-    #[test]
-    fn maybe_update_session_goal_preserves_on_mild_followup() {
-        // Follow-ups that share even one content word with the
-        // current goal must NOT trigger pivot.
-        let mut state = ReplState {
-            session_goal: Some("review the session memory observatory design".to_string()),
-            ..ReplState::default()
-        };
-
-        maybe_update_session_goal(&mut state, "now also review the session anchor behaviour");
-        // Shares "review" / "session" / "the" → ratio well above 0.15 → preserved.
-        assert_eq!(
-            state.session_goal.as_deref(),
-            Some("review the session memory observatory design")
-        );
-    }
-
-    #[test]
-    fn maybe_update_session_goal_ignores_short_user_messages_for_pivot() {
-        // User typing "1" or "all four" as a menu response must
-        // NEVER flip the anchor, regardless of word overlap.
-        let mut state = ReplState {
-            session_goal: Some("review 5 commits".to_string()),
-            ..ReplState::default()
-        };
-
-        // Short substantive-looking reply; still less than 4 content words
-        // → pivot guard prevents replacement.
-        maybe_update_session_goal(&mut state, "pick option 2");
-        assert_eq!(state.session_goal.as_deref(), Some("review 5 commits"));
     }
 
     #[test]
@@ -4658,7 +4224,6 @@ mod tests {
             step_recorder_summary: None,
             tool_health_export: Vec::new(),
             last_heavy_checkpoint: None,
-            runtime_continuity: Default::default(),
             ttft_ms: None,
             context_ms: None,
             selector_strategy: None,

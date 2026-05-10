@@ -2,8 +2,7 @@ use chrono::Utc;
 use serde::Serialize;
 
 use crate::cli_args::{
-    SelfCmd, SelfJournalArgs, SelfMutateCmd, SelfMutateConfigArgs, SelfMutateGoalArgs,
-    SelfReflectArgs,
+    SelfCmd, SelfJournalArgs, SelfMutateCmd, SelfMutateConfigArgs, SelfReflectArgs,
 };
 use crate::cli_utils::resumable_last_session_id;
 use astra_config::runtime_config::RuntimeConfig;
@@ -75,14 +74,6 @@ struct MutatePreviewResponse {
     effective_config_changed: bool,
     would_clear_override: bool,
     checks: Vec<CheckResult>,
-}
-
-#[derive(Debug, Serialize)]
-struct GoalMutationResponse {
-    session_id: String,
-    old_goal: Option<String>,
-    new_goal: String,
-    persisted: bool,
 }
 
 pub(crate) async fn execute_self_command(
@@ -185,14 +176,6 @@ pub(crate) async fn execute_self_command(
             let preview = preview_config_mutation(&session_id, args)?;
             persist_config_mutation(&session_id, args, &preview)?;
             to_json(&preview)
-        }
-        SelfCmd::Mutate(SelfMutateCmd::Goal(SelfMutateGoalArgs { session_id, text })) => {
-            let session_id = resolve_session_id(session_id.as_deref(), profile)?;
-            to_json(&persist_goal_mutation(
-                &session_id,
-                text,
-                "astra self mutate",
-            )?)
         }
     }
 }
@@ -425,54 +408,6 @@ pub(crate) fn persist_config_override(
     serde_json::to_value(&preview).map_err(|e| e.to_string())
 }
 
-fn persist_goal_mutation(
-    session_id: &str,
-    text: &str,
-    source: &str,
-) -> Result<GoalMutationResponse, String> {
-    let mut ws = session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
-    let old_goal = ws.session_goal.clone();
-    ws.session_goal = Some(text.to_string());
-    ws.goal_progress = None;
-    ws.updated_at = Utc::now().to_rfc3339();
-    session_workspace::write_workspace(&ws).map_err(|e| e.to_string())?;
-    append_config_change_event(
-        session_id,
-        ws.turn_count,
-        "session_goal",
-        &serde_json::Value::String(text.to_string()),
-        old_goal.clone().map(serde_json::Value::String),
-    )?;
-    if old_goal.as_deref() != Some(text) {
-        append_goal_steering_event(
-            session_id,
-            ws.turn_count,
-            source,
-            old_goal.as_deref(),
-            text,
-            None,
-        )?;
-    }
-    Ok(GoalMutationResponse {
-        session_id: session_id.to_string(),
-        old_goal,
-        new_goal: text.to_string(),
-        persisted: true,
-    })
-}
-
-pub(crate) fn persist_goal_override(
-    session_id: &str,
-    text: &str,
-) -> Result<serde_json::Value, String> {
-    serde_json::to_value(persist_goal_mutation(
-        session_id,
-        text,
-        "edge_tool:set_goal",
-    )?)
-    .map_err(|e| e.to_string())
-}
-
 pub(crate) fn persist_tool_preferences(
     session_id: &str,
     pinned_tools: &[String],
@@ -548,27 +483,6 @@ fn append_config_change_event(
     evt.turn = Some(turn);
     evt.metadata = Some(serde_json::Value::Object(metadata));
     writer.append(&evt).map_err(|e| e.to_string())
-}
-
-pub(crate) fn append_goal_steering_event(
-    session_id: &str,
-    turn: u32,
-    source: &str,
-    previous_goal: Option<&str>,
-    new_goal: &str,
-    detail: Option<serde_json::Value>,
-) -> Result<(), String> {
-    let writer = session_journal::JournalWriter::new(session_id).map_err(|e| e.to_string())?;
-    writer
-        .append(&JournalEvent::goal_steered(
-            Some(session_id),
-            turn,
-            source,
-            previous_goal,
-            new_goal,
-            detail,
-        ))
-        .map_err(|e| e.to_string())
 }
 
 fn recent_event_previews(
@@ -900,7 +814,7 @@ mod tests {
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-snapshot-session";
         let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.session_goal = Some("finish the engine".to_string());
+        ws.plan_goal = Some("finish the engine".to_string());
         ws.discovered_skills = vec!["goal-driven-evolution".to_string()];
         ws.active_experiment_id = Some("exp-42".to_string());
         ws.last_context_trace = Some(ContextTraceSignal {

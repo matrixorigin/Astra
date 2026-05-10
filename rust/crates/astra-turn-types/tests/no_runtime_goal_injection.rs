@@ -48,55 +48,40 @@ fn session_facts_has_no_plan_state_field() {
     );
 }
 
-// ── Guard 3: working-set injection (if it still exists) omits goal lines ─
+// ── Guard 3: working-set injection helper must not exist ──────────────────
 //
-// After wip-3, `to_working_set_injection` should not exist at all. Until it
-// is deleted, any remaining emission must not carry `goal:` or
-// `pending_work:` lines — those were the vectors for the pollution bug.
+// After wip-3, `to_working_set_injection` is deleted outright. The previous
+// compile-time probe has been removed alongside the method. This guard now
+// runs a source-grep check so the suite still produces a red test (not just
+// a compile error) if the method ever resurfaces.
 
 #[test]
-fn working_set_injection_does_not_emit_goal_or_pending_work() {
-    // Dynamically construct facts with the toxic shape that triggered the
-    // bug (simulating what a restored checkpoint's facts might look like).
-    let facts = astra_turn_types::session_facts::SessionFacts::default();
-    // If the fn still exists, call it. If not, compile fails and this
-    // test goes red — which is the signal that wip-3 took effect.
-    #[allow(deprecated)]
-    let injection =
-        <astra_turn_types::session_facts::SessionFacts as _WorkingSetProbe>::maybe_inject(
-            &facts, "hi",
-        );
+fn to_working_set_injection_method_is_absent_from_public_api() {
+    let module_root = env!("CARGO_MANIFEST_DIR");
+    let src_dir = std::path::Path::new(module_root).join("src");
+    let forbidden_signatures: &[&str] =
+        &["fn to_working_set_injection", "to_working_set_injection("];
 
-    if let Some(text) = injection {
-        assert!(
-            !text.contains("\ngoal:") && !text.starts_with("goal:"),
-            "working-set injection must not emit a `goal:` line — found: {text}"
-        );
-        assert!(
-            !text.contains("pending_work:"),
-            "working-set injection must not emit a `pending_work:` line — found: {text}"
-        );
-        assert!(
-            !text.contains("runtime-goal"),
-            "working-set injection must not surface the runtime-goal todo id — found: {text}"
-        );
+    let mut hits: Vec<(String, String)> = Vec::new();
+    for path in walkdir(&src_dir) {
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for needle in forbidden_signatures {
+            if body.contains(needle) {
+                hits.push((path.display().to_string(), (*needle).to_string()));
+            }
+        }
     }
-}
 
-/// Trait-based probe: if `to_working_set_injection` still exists with its
-/// pre-wip-3 signature, the blanket impl below wires into it. If wip-3
-/// deletes the method, this impl fails to compile and the test goes red.
-trait _WorkingSetProbe {
-    fn maybe_inject(&self, current_goal: &str) -> Option<String>;
-}
-
-impl _WorkingSetProbe for astra_turn_types::session_facts::SessionFacts {
-    fn maybe_inject(&self, current_goal: &str) -> Option<String> {
-        // Intentional: reach into whatever injection surface still exists.
-        // Once wip-3 removes `to_working_set_injection`, this line fails to
-        // compile and the test goes red.
-        Some(self.to_working_set_injection(current_goal))
-    }
+    assert!(
+        hits.is_empty(),
+        "wip-3 contract violated — to_working_set_injection must not exist:\n{}",
+        hits.iter()
+            .map(|(p, n)| format!("  {p}: {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
 
 // ── Guard 4: runtime pollution scenario ─────────────────────────────────

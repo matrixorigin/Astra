@@ -145,8 +145,6 @@ pub struct ExtractionRecord {
 // ── Injection side ─────────────────────────────────────────────────────
 
 /// What the pressure-adaptive decision picked for this compaction.
-/// Parallel to [`crate::turn::cloud::session_memory_protocol::InjectionLevel`]
-/// but `Copy` + `Serialize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InjectionLevel {

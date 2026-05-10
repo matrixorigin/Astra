@@ -509,10 +509,6 @@ enum SessionStateRollbackAction {
         old_value: Value,
         snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
     },
-    GoalOverride {
-        previous_goal: Option<String>,
-        snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
-    },
     Compression {
         turn: u32,
         snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
@@ -592,7 +588,6 @@ fn action_kind(action: &SessionStateRollbackAction) -> &'static str {
     match action {
         SessionStateRollbackAction::ToolPreferences { .. } => "tool_preferences",
         SessionStateRollbackAction::ConfigOverride { .. } => "config_override",
-        SessionStateRollbackAction::GoalOverride { .. } => "goal_override",
         SessionStateRollbackAction::Compression { .. } => "compression",
         SessionStateRollbackAction::TaskState { .. } => "task_state",
     }
@@ -706,50 +701,6 @@ fn persist_config_override(
         Some(old_value),
         source,
     )
-}
-
-fn persist_goal_override(session_id: &str, goal: &str, source: &str) -> Result<(), String> {
-    let mut workspace =
-        astra_services::session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
-    let previous_goal = workspace.session_goal.clone();
-    workspace.session_goal = Some(goal.to_string());
-    workspace.goal_progress = None;
-    workspace.updated_at = chrono::Utc::now().to_rfc3339();
-    astra_services::session_workspace::write_workspace(&workspace).map_err(|e| e.to_string())?;
-    append_config_change_event(
-        session_id,
-        workspace.turn_count,
-        "session_goal",
-        &Value::String(goal.to_string()),
-        previous_goal.clone().map(Value::String),
-        source,
-    )?;
-    if previous_goal.as_deref() != Some(goal) {
-        let writer = astra_services::session_journal::JournalWriter::new(session_id)
-            .map_err(|e| e.to_string())?;
-        writer
-            .append(
-                &astra_services::session_journal::JournalEvent::goal_steered(
-                    Some(session_id),
-                    workspace.turn_count,
-                    source,
-                    previous_goal.as_deref(),
-                    goal,
-                    None,
-                ),
-            )
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-fn clear_persisted_goal_override(session_id: &str) -> Result<(), String> {
-    let mut workspace =
-        astra_services::session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
-    workspace.session_goal = None;
-    workspace.goal_progress = None;
-    workspace.updated_at = chrono::Utc::now().to_rfc3339();
-    astra_services::session_workspace::write_workspace(&workspace).map_err(|e| e.to_string())
 }
 
 fn persist_tool_preferences(
@@ -1367,7 +1318,6 @@ impl ServerToolExecutor {
                     "config" => tool_result_from_output(self.adjust_config(args)),
                     "prioritize" => tool_result_from_output(self.prioritize_tool(args)),
                     "deprioritize" => tool_result_from_output(self.deprioritize_tool(args)),
-                    "set_goal" => tool_result_from_output(self.set_goal(args)),
                     "compact" => tool_result_from_output(self.compress_context(args)),
                     "enter_plan" => {
                         astra_tools::ToolResult::text(self.tool_enter_plan_mode(args).await)
@@ -1382,14 +1332,13 @@ impl ServerToolExecutor {
                         &astra_tools::schemas::server_executor_tool_schemas(),
                         args,
                     )),
-                    "" => tool_result_from_output("Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep, tool_search".to_string()),
+                    "" => tool_result_from_output("Missing required parameter: action. Use: config, prioritize, deprioritize, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep, tool_search".to_string()),
                     other => tool_result_from_output(format!("Unknown session action: '{other}'")),
                 }
             }
             "prioritize_tool" => tool_result_from_output(self.prioritize_tool(args)),
             "deprioritize_tool" => tool_result_from_output(self.deprioritize_tool(args)),
             "introspect" => tool_result_from_output(self.handle_introspect(args)),
-            "set_goal" => tool_result_from_output(self.set_goal(args)),
             "compress_context" => tool_result_from_output(self.compress_context(args)),
             "rollback_session_state" => tool_result_from_output(self.rollback_session_state(args)),
             "task_create" => tool_result_from_output(self.task_create(args)),
@@ -1512,7 +1461,7 @@ impl ServerToolExecutor {
             _ => astra_tools::ToolResult::error(format!(
                 "Error: Tool '{name}' is not available in server-side execution mode. \
                      Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
-                     multi_edit, list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
+                     multi_edit, list_dir, adjust_config, prioritize_tool, deprioritize_tool, compress_context, \
                      rollback_session_state, task_*, sleep, tool_search, mo_query, rollback_database_snapshots, \
                      grep, glob, git_status, git_diff, git_log, git_file_history, git_contributors, git_log_search, \
                      git_show, git_blame, symbols, git_commit, git_stash, git_revert_commit, github_list_prs, github_get_pr, \
@@ -1990,20 +1939,6 @@ impl ServerToolExecutor {
         );
     }
 
-    fn record_goal_rollback(
-        &self,
-        previous_goal: Option<String>,
-        snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
-    ) {
-        self.record_session_state_rollback(
-            "session".to_string(),
-            SessionStateRollbackAction::GoalOverride {
-                previous_goal,
-                snapshot,
-            },
-        );
-    }
-
     fn record_compression_rollback(
         &self,
         turn: u32,
@@ -2105,15 +2040,6 @@ impl ServerToolExecutor {
             SessionStateRollbackAction::ConfigOverride { path, .. } => {
                 value.insert("path".to_string(), Value::String(path.clone()));
             }
-            SessionStateRollbackAction::GoalOverride { previous_goal, .. } => {
-                value.insert(
-                    "previous_goal".to_string(),
-                    previous_goal
-                        .clone()
-                        .map(Value::String)
-                        .unwrap_or(Value::Null),
-                );
-            }
             SessionStateRollbackAction::Compression { turn, .. } => {
                 value.insert(
                     "turn".to_string(),
@@ -2176,24 +2102,6 @@ impl ServerToolExecutor {
                 .map_err(|error| {
                     format!("failed to persist restored config override for {path}: {error}")
                 })
-            }
-            SessionStateRollbackAction::GoalOverride {
-                previous_goal,
-                snapshot,
-            } => {
-                self.restore_observability_snapshot(snapshot)?;
-                match previous_goal.as_deref() {
-                    Some(goal) => persist_goal_override(
-                        &self.session_id,
-                        goal,
-                        "server_tool_executor:rollback_session_state",
-                    )
-                    .map_err(|error| {
-                        format!("failed to persist restored goal override: {error}")
-                    })?,
-                    None => clear_persisted_goal_override(&self.session_id)?,
-                }
-                Ok(())
             }
             SessionStateRollbackAction::Compression { snapshot, .. } => {
                 self.restore_observability_snapshot(snapshot)
@@ -2779,61 +2687,6 @@ impl ServerToolExecutor {
             Some(snap) => astra_turn_core::introspect::render_introspect(&snap, detail),
             None => "No introspection data available yet (first turn).".to_string(),
         }
-    }
-
-    fn set_goal(&self, args: &Value) -> String {
-        let goal = match args.get("goal").and_then(Value::as_str) {
-            Some(goal) if !goal.trim().is_empty() => goal.trim(),
-            _ => return json!({"error": "Missing required parameter: goal"}).to_string(),
-        };
-        let Some(observability_session) = self.observability_session.as_ref() else {
-            return json!({"error": "No observability session available"}).to_string();
-        };
-        let mut session = match observability_session.write() {
-            Ok(guard) => guard,
-            Err(_) => {
-                return json!({"error": "Failed to acquire observability session"}).to_string();
-            }
-        };
-        let session_snapshot = session.rollback_snapshot();
-        let previous_goal = session
-            .goal_tracker
-            .as_ref()
-            .map(|tracker| tracker.goal().to_string())
-            .or_else(|| session.original_query.clone());
-
-        if let Err(error) =
-            persist_goal_override(&self.session_id, goal, "server_tool_executor:set_goal")
-        {
-            return json!({
-                "error": "failed_to_persist_goal",
-                "detail": error,
-                "goal": goal,
-            })
-            .to_string();
-        }
-        if let Err(error) = self.publish_current_workspace("server_tool_executor:set_goal") {
-            return json!({
-                "error": "failed_to_publish_workspace_artifact",
-                "detail": error,
-                "goal": goal,
-            })
-            .to_string();
-        }
-
-        let goal_changed = session.steer_goal(goal);
-        if goal_changed {
-            self.record_goal_rollback(previous_goal.clone(), session_snapshot);
-        }
-
-        json!({
-            "status": "ok",
-            "previous_goal": previous_goal,
-            "goal": goal,
-            "goal_changed": goal_changed,
-            "turn": session.turn_number,
-        })
-        .to_string()
     }
 
     fn compress_context(&self, args: &Value) -> String {
@@ -3942,10 +3795,6 @@ esac
             source
                 .contains("publish_current_workspace(\"server_tool_executor:deprioritize_tool\")"),
             "deprioritize_tool should publish remote workspace artifacts"
-        );
-        assert!(
-            source.contains("publish_current_workspace(\"server_tool_executor:set_goal\")"),
-            "set_goal should publish remote workspace artifacts"
         );
         assert!(
             source.contains(

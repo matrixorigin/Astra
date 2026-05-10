@@ -784,16 +784,6 @@ pub struct AgenticLoopState {
     /// Current nested agent/sub-run depth. Root loops start at 0.
     pub recursion_depth: u8,
 
-    /// Current turn's attention manifest text (`[attention:v1]\n…`), when
-    /// non-trivial. Populated by `inject_runtime_attention_manifest` and
-    /// routed into the **volatile system-prompt lane** by the host's
-    /// payload builder. Must NOT be pushed into `messages[]` — the
-    /// manifest drifts every turn and doing so breaks prefix cache.
-    ///
-    /// `None` when the continuity state is the trivial "nothing to
-    /// report" shape — the volatile block emits nothing in that case.
-    pub attention_manifest_text: Option<String>,
-
     // ── Accumulated output ──
     pub final_text: String,
     /// True once the current `final_text` has already been sent to the user.
@@ -1051,11 +1041,6 @@ pub struct AgenticLoopState {
     /// gate structurally unreachable.
     pub memory_extraction_service:
         Option<std::sync::Arc<crate::session_memory::MemoryExtractionService>>,
-
-    // ── Runtime-owned continuity (goal/todo/attention) ──
-    /// Deterministic continuity state used to reconstruct attention every LLM round
-    /// without relying on model-invoked task tools.
-    pub continuity: astra_turn_types::continuity::ContinuityState,
 
     /// Provider-aware compaction strategy for microcompact placeholders.
     pub compact_strategy: astra_turn_core::microcompact::CompactStrategy,
@@ -1730,7 +1715,6 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         current_session_id: None,
         current_run_id: None,
         recursion_depth: 0,
-        attention_manifest_text: None,
         final_text: String::new(),
         final_text_streamed: false,
         total_prompt: 0,
@@ -1808,7 +1792,6 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         interruption: None,
         session_facts: Default::default(),
         memory_extraction_service: None,
-        continuity: Default::default(),
         compact_strategy: Default::default(),
         approval_overrides: None,
         confidence_trend: Default::default(),
@@ -2059,18 +2042,6 @@ pub(crate) mod tests {
         }
     }
 
-    fn make_edge_tool_with_status(name: &str, status: &str, output: &str) -> EdgeToolExecResult {
-        EdgeToolExecResult {
-            request_id: format!("req-{name}"),
-            tool: name.to_string(),
-            args: json!({}),
-            output: output.to_string(),
-            tool_result_fields: None,
-            status: status.to_string(),
-            duration_ms: 10,
-        }
-    }
-
     // ── State builder ───────────────────────────────────────────────────────
 
     pub(crate) fn make_state() -> AgenticLoopState {
@@ -2082,7 +2053,6 @@ pub(crate) mod tests {
             current_session_id: None,
             current_run_id: None,
             recursion_depth: 0,
-            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -2162,7 +2132,6 @@ pub(crate) mod tests {
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: None,
-            continuity: Default::default(),
             compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),
@@ -2219,33 +2188,6 @@ pub(crate) mod tests {
         assert!(!should_emit_adaptive_scenario_event(false, false, true));
         assert!(!should_emit_adaptive_scenario_event(true, true, true));
         assert!(!should_emit_adaptive_scenario_event(false, true, false));
-    }
-
-    #[test]
-    fn edge_tool_observability_records_goal_tracker_without_hub() {
-        let mut state = make_state();
-        let session = std::sync::Arc::new(std::sync::RwLock::new(
-            crate::observability_integration::ObservabilitySession::new_simple("sess-1"),
-        ));
-        {
-            let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
-            guard.turn_number = 1;
-            guard.record_query("run tests for authentication flow");
-        }
-        state.telemetry.observability_session = Some(session.clone());
-
-        let edge_tools = vec![
-            make_edge_tool_with_status("bash", "ok", "test result: ok. 24 passed; 0 failed"),
-            make_edge_tool_with_status("bash", "error", "test result: FAILED. 1 passed; 2 failed"),
-        ];
-        record_edge_tool_observability(&mut state, &edge_tools);
-
-        let progress = session
-            .read()
-            .unwrap()
-            .goal_progress()
-            .expect("goal progress");
-        assert_eq!(progress.milestone_count, 2);
     }
 
     #[tokio::test]

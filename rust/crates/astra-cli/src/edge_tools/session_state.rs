@@ -1,7 +1,6 @@
 use std::time::SystemTime;
 
 use astra_runtime::observability_integration::ObservabilitySessionRollbackSnapshot;
-use astra_services::session_workspace;
 use serde_json::Value;
 
 use super::{ToolExecutor, task_mgmt::TaskManagerSnapshot};
@@ -15,10 +14,6 @@ pub(crate) enum SessionStateRollbackAction {
     ConfigOverride {
         path: String,
         old_value: Value,
-        snapshot: ObservabilitySessionRollbackSnapshot,
-    },
-    GoalOverride {
-        previous_goal: Option<String>,
         snapshot: ObservabilitySessionRollbackSnapshot,
     },
     Compression {
@@ -96,19 +91,10 @@ impl SessionStateRollbackJournal {
     }
 }
 
-fn clear_persisted_goal_override(session_id: &str) -> Result<(), String> {
-    let mut ws = session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
-    ws.session_goal = None;
-    ws.goal_progress = None;
-    ws.updated_at = chrono::Utc::now().to_rfc3339();
-    session_workspace::write_workspace(&ws).map_err(|e| e.to_string())
-}
-
 fn action_kind(action: &SessionStateRollbackAction) -> &'static str {
     match action {
         SessionStateRollbackAction::ToolPreferences { .. } => "tool_preferences",
         SessionStateRollbackAction::ConfigOverride { .. } => "config_override",
-        SessionStateRollbackAction::GoalOverride { .. } => "goal_override",
         SessionStateRollbackAction::Compression { .. } => "compression",
         SessionStateRollbackAction::TaskState { .. } => "task_state",
     }
@@ -152,20 +138,6 @@ impl ToolExecutor {
             SessionStateRollbackAction::ConfigOverride {
                 path,
                 old_value,
-                snapshot,
-            },
-        );
-    }
-
-    pub(crate) fn record_goal_rollback(
-        &self,
-        previous_goal: Option<String>,
-        snapshot: ObservabilitySessionRollbackSnapshot,
-    ) {
-        self.record_session_state_rollback(
-            "set_goal".to_string(),
-            SessionStateRollbackAction::GoalOverride {
-                previous_goal,
                 snapshot,
             },
         );
@@ -271,15 +243,6 @@ impl ToolExecutor {
             SessionStateRollbackAction::ConfigOverride { path, .. } => {
                 value.insert("path".to_string(), Value::String(path.clone()));
             }
-            SessionStateRollbackAction::GoalOverride { previous_goal, .. } => {
-                value.insert(
-                    "previous_goal".to_string(),
-                    previous_goal
-                        .clone()
-                        .map(Value::String)
-                        .unwrap_or(Value::Null),
-                );
-            }
             SessionStateRollbackAction::Compression { turn, .. } => {
                 value.insert(
                     "turn".to_string(),
@@ -344,23 +307,6 @@ impl ToolExecutor {
                     .map_err(|error| {
                         format!("failed to persist restored config override for {path}: {error}")
                     })?;
-                }
-                Ok(())
-            }
-            SessionStateRollbackAction::GoalOverride {
-                previous_goal,
-                snapshot,
-            } => {
-                self.restore_observability_snapshot(snapshot)?;
-                if let Some(session_id) = self.active_session_id() {
-                    match previous_goal.as_deref() {
-                        Some(goal) => crate::self_command::persist_goal_override(&session_id, goal)
-                            .map(|_| ())
-                            .map_err(|error| {
-                                format!("failed to persist restored goal override: {error}")
-                            })?,
-                        None => clear_persisted_goal_override(&session_id)?,
-                    }
                 }
                 Ok(())
             }

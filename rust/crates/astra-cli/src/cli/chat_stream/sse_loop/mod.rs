@@ -575,7 +575,6 @@ pub(crate) async fn stream_chat_sse(
         current_session_id,
         current_run_id: Some(parent_turn_run_id.clone()),
         recursion_depth: 0,
-        attention_manifest_text: None,
         final_text: String::new(),
         final_text_streamed: false,
         total_prompt: 0,
@@ -749,7 +748,6 @@ pub(crate) async fn stream_chat_sse(
         interruption: None,
         session_facts: Default::default(),
         memory_extraction_service: p.session_memory_extractor.clone(),
-        continuity: p.runtime_continuity.cloned().unwrap_or_default(),
         compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_and_model(
             p.provider, p.model,
         ),
@@ -883,7 +881,6 @@ pub(crate) async fn stream_chat_sse(
         step_recorder: &state.step_recorder,
         turn_guard: &state.turn_guard,
         last_heavy_checkpoint: state.stall.last_heavy_checkpoint,
-        runtime_continuity: state.continuity,
         ttft_ms: state.telemetry.first_ttft_ms,
         context_ms: state.telemetry.first_context_assembly_ms,
         selector_strategy: state.telemetry.first_selector_strategy,

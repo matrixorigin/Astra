@@ -193,17 +193,6 @@ pub(crate) fn build_external_sources(
         ));
     }
 
-    // Attention manifest — replaces the legacy `role:user` history
-    // injection. Lives in the volatile lane (None scope) so it rides
-    // the post-cache segment; history stays byte-stable for prefix
-    // cache. See `inject_runtime_attention_manifest`.
-    if let Some(text) = state.attention_manifest_text.as_ref() {
-        extra_dynamic_sections.push(crate::prompts::PromptSection::dynamic(
-            format!("\n\n{text}"),
-            crate::prompts::PromptTokenBucket::Environment,
-        ));
-    }
-
     ExternalSources {
         memory_entries,
         spill_dir: None,
@@ -635,52 +624,6 @@ mod tests {
         let state = make_state();
         let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
         assert!(sources.memory_entries.is_empty());
-    }
-
-    // ── Attention manifest routes through volatile lane ────────────────
-    // Post-refactor (replaces the legacy history push): the manifest
-    // text sits on `state.attention_manifest_text` and must land in
-    // `extra_dynamic_sections` alongside other per-turn content. The
-    // binder downstream routes it into the None-scope volatile block
-    // so prefix cache stays byte-stable.
-
-    #[test]
-    fn external_sources_routes_attention_manifest_into_dynamic_sections() {
-        let ep = serde_json::Map::new();
-        let mut state = make_state();
-        state.attention_manifest_text =
-            Some("[attention:v1]\ngoal: fix timeout\ncurrent_todo: wire retry".to_string());
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
-
-        let found = sources.extra_dynamic_sections.iter().any(|s| {
-            s.text.contains("[attention:v1]") && s.text.contains("current_todo: wire retry")
-        });
-        assert!(
-            found,
-            "attention_manifest_text must be emitted into extra_dynamic_sections, got: {:?}",
-            sources
-                .extra_dynamic_sections
-                .iter()
-                .map(|s| s.text.chars().take(60).collect::<String>())
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn external_sources_omits_attention_manifest_when_state_text_is_none() {
-        let ep = serde_json::Map::new();
-        let state = make_state(); // default: attention_manifest_text = None
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
-
-        let leaks = sources
-            .extra_dynamic_sections
-            .iter()
-            .filter(|s| s.text.contains("[attention:v1]"))
-            .count();
-        assert_eq!(
-            leaks, 0,
-            "None attention_manifest_text must not produce an empty manifest section"
-        );
     }
 
     // ── Composite integration tests ─────────────────────────────────────

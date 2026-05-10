@@ -94,9 +94,6 @@ pub(crate) struct StreamResult {
     pub(crate) tool_health_export: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     /// Last heavy checkpoint built during the agentic loop (for cloud persistence).
     pub(crate) last_heavy_checkpoint: Option<astra_pipeline::step_protocol::StepCheckpoint>,
-    /// Live runtime-owned continuity after the turn. Saved back into REPL state
-    /// so multi-turn sessions do not fall back to prompt-only continuity.
-    pub(crate) runtime_continuity: astra_turn_types::continuity::ContinuityState,
     /// Time to first token in milliseconds.
     pub(crate) ttft_ms: Option<u64>,
     /// Context assembly time in milliseconds.

@@ -356,5 +356,5 @@ pub use astra_learning::auto_tuning;
 pub use astra_text_utils::semantic_dedup;
 pub use astra_text_utils::text_tokenize;
 pub use astra_turn_core::cloud_session_facts::update_from_journal_event;
-pub use astra_turn_types::session_facts::{ErrorFact, FileEntry, PlanFact, SessionFacts, ToolFact};
+pub use astra_turn_types::session_facts::{ErrorFact, FileEntry, SessionFacts, ToolFact};
 pub use matrix_cloud_runtime::{MatrixCloudRuntime, matrix_settings_from_env};

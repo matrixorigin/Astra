@@ -235,10 +235,6 @@ mod tests {
                 working_memory: Default::default(),
             },
         );
-        original.start_goal("finish context pipeline goal retention");
-        original.record_goal_signal(crate::goal_tracker::MilestoneSignal::FileChanged(
-            "rust/crates/astra-turn-core/src/context_binder.rs".into(),
-        ));
         original
             .working_memory_mut()
             .set_next_action("run focused core tests");
@@ -251,10 +247,6 @@ mod tests {
         );
         assert_eq!(restored.stats.compact_events.len(), 1);
         let rendered = restored.working_memory().render_prompt_section();
-        assert!(
-            rendered.contains("finish context pipeline goal retention"),
-            "goal must survive pipeline snapshot restore"
-        );
         assert!(
             rendered.contains("run focused core tests"),
             "next action must survive pipeline snapshot restore"

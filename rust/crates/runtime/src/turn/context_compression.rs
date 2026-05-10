@@ -152,13 +152,15 @@ impl CompressionPipeline {
 /// Find the end index (exclusive) of the protected head region:
 /// system messages + first user message.
 fn protected_head_end(messages: &[Value]) -> usize {
-    crate::turn::cloud::session_memory_protocol::first_user_end(
-        messages,
-        messages
-            .iter()
-            .take_while(|m| m.get("role").and_then(|v| v.as_str()) == Some("system"))
-            .count(),
-    )
+    let start = messages
+        .iter()
+        .take_while(|m| m.get("role").and_then(|v| v.as_str()) == Some("system"))
+        .count();
+    messages[start..]
+        .iter()
+        .position(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+        .map(|i| start + i + 1)
+        .unwrap_or(start)
 }
 
 /// Deduplicated turn indices for a message index range.

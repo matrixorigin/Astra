@@ -1368,66 +1368,6 @@ impl InProcessChatTurnBridge {
             // ── Memoria client (shared across P1 anchor + compaction + P3 write) ──
             let memoria_client_shared = memoria_client_owned.clone();
 
-            // ── P1: L0 session anchor — inject original task into dynamic system prompt ──
-            // Derive anchor from current conversation state. On turn 1, falls back to
-            // first user message. On subsequent turns, builds a lightweight L1 from
-            // messages to show current state + progress — zero network calls.
-            //
-            // Skip emission when the anchor is trivial (bootstrap shape that
-            // just echoes the current user message) — injecting it in that
-            // case duplicates the user turn for ~100 tokens of no signal.
-            let session_anchor = {
-                use crate::turn::cloud::session_memory_protocol::{
-                    extract_anchor, extract_anchor_from_facts, extract_message_text,
-                    build_l1_from_messages, SessionMemory,
-                };
-                let first_user_text = messages
-                    .iter()
-                    .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-                    .and_then(|m| extract_message_text(m))
-                    .unwrap_or_default();
-
-                if first_user_text.is_empty() {
-                    String::new()
-                } else {
-                    // Prefer facts-based anchor (ground truth) when available
-                    let facts_opt = session_facts_shared.lock().ok();
-                    let has_facts = facts_opt.as_ref().map(|f| f.turn > 0).unwrap_or(false);
-
-                    let anchor = if has_facts {
-                        let facts = facts_opt.unwrap();
-                        // Try to get narrative for task spec (optional enrichment)
-                        let turn_count = messages.iter()
-                            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-                            .count();
-                        let l1 = if turn_count > 0 {
-                            let l1_text = build_l1_from_messages(&messages, turn_count, 0);
-                            SessionMemory::parse(&l1_text).filter(|l| l.validate().is_ok())
-                        } else {
-                            None
-                        };
-                        extract_anchor_from_facts(&first_user_text, &facts, l1.as_ref())
-                    } else {
-                        // First turn or lock failed — use legacy anchor
-                        let turn_count = messages.iter()
-                            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-                            .count();
-                        let l1 = if turn_count > 0 {
-                            let l1_text = build_l1_from_messages(&messages, turn_count, 0);
-                            SessionMemory::parse(&l1_text).filter(|l| l.validate().is_ok())
-                        } else {
-                            None
-                        };
-                        extract_anchor(&first_user_text, l1.as_ref())
-                    };
-                    if anchor.is_trivial(user_content_for_signal) {
-                        String::new()
-                    } else {
-                        format!("\n\n{anchor}")
-                    }
-                }
-            };
-
             // ── Round budget directive: encourage synthesis after several rounds ──
             let tool_cfg = astra_config::runtime_config::RuntimeConfig::load().tool_selection;
             let (tool_round_guidance, guidance_signals) = prompts::tool_round_guidance_trace_with(
@@ -1455,7 +1395,6 @@ impl InProcessChatTurnBridge {
             //     user message content),
             //   memoria_insights_hint (per-turn retrieval),
             //   recent_arg_hints_hint (per-turn tool args),
-            //   session_anchor (per-turn state),
             //   tool_round_guidance (per-turn messages count)
             let mut stable_sections = Vec::new();
             let mut dynamic_sections = Vec::new();
@@ -1558,21 +1497,6 @@ impl InProcessChatTurnBridge {
                         skill_listing_hint.clone(),
                         prompts::PromptTokenBucket::Environment,
                     ),
-                );
-            }
-            if !session_anchor.is_empty() {
-                dynamic_sections.push(
-                    prompts::PromptSection::dynamic(
-                        session_anchor.clone(),
-                        prompts::PromptTokenBucket::Environment,
-                    )
-                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            session_anchor: true,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
                 );
             }
             if !tool_round_guidance.is_empty() {
@@ -4112,7 +4036,6 @@ mod tests {
         let feedback_rules_hint = "\n\n[Learned Feedback Rules]\n- Rule: do not use mocks";
         let self_awareness_hint =
             "\n\n## Self-Awareness\nCurrent task: review runtime prompt assembly.";
-        let session_anchor = "\n\n## Session Anchor\nOriginal task: optimize prompt tracing.";
         let dynamic_sections = vec![
             prompts::PromptSection::dynamic(
                 "\n\n# Project Profile\ncwd: /test".to_string(),
@@ -4189,20 +4112,6 @@ mod tests {
                 },
             ),
             prompts::PromptSection::dynamic(
-                "session anchor payload".to_string(),
-                prompts::PromptTokenBucket::Environment,
-            )
-            .with_trace_signals(
-                astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals:
-                        astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            session_anchor: !session_anchor.is_empty(),
-                            ..Default::default()
-                        },
-                    ..Default::default()
-                },
-            ),
-            prompts::PromptSection::dynamic(
                 "\n\n## Memoria Recall\n- Stored: prefer Rust for CLI work.".to_string(),
                 prompts::PromptTokenBucket::Environment,
             )
@@ -4240,7 +4149,6 @@ mod tests {
         assert!(breakdown.context_signals.self_awareness);
         assert!(breakdown.context_signals.implicit_feedback);
         assert!(breakdown.context_signals.learned_feedback_rules);
-        assert!(breakdown.context_signals.session_anchor);
         assert!(breakdown.context_signals.memoria_insights);
         assert!(!breakdown.context_signals.system_prompt_override);
         assert!(!breakdown.context_signals.effort_hint);
@@ -5471,41 +5379,6 @@ mod tests {
     }
 
     #[test]
-    fn p1_anchor_handles_anthropic_content_blocks_in_user_message() {
-        use crate::turn::cloud::session_memory_protocol::extract_anchor;
-
-        // Simulate Anthropic-style content blocks in user message
-        let messages = vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": [
-                {"type": "text", "text": "Build a distributed cache with LRU eviction"}
-            ]}),
-        ];
-
-        let first_user_text = messages
-            .iter()
-            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-            .and_then(|m| {
-                m.get("content").and_then(|c| {
-                    c.as_str().map(String::from).or_else(|| {
-                        c.as_array().and_then(|blocks| {
-                            blocks.iter().find_map(|b| {
-                                b.get("text").and_then(Value::as_str).map(String::from)
-                            })
-                        })
-                    })
-                })
-            });
-
-        assert!(
-            first_user_text.is_some(),
-            "Should extract text from content blocks"
-        );
-        let anchor = extract_anchor(&first_user_text.unwrap(), None);
-        assert!(anchor.to_string().contains("distributed cache"));
-    }
-
-    #[test]
     fn p3_usage_reads_canonical_input_tokens_key() {
         // The bridge's usage map uses the canonical key set produced by
         // `turn::token_usage::TokenUsage::to_json_map`. Ensure the key name
@@ -5889,50 +5762,6 @@ mod tests {
         );
     }
 
-    // ── Fix #1: anchor evolves with L1 ──────────────────────────────────
-
-    #[test]
-    fn p1_anchor_evolves_when_l1_available() {
-        use crate::turn::cloud::session_memory_protocol::{
-            SESSION_MEMORY_PREFIX, SessionMemory, extract_anchor,
-        };
-
-        // Without L1 — shows "starting"
-        let anchor_no_l1 = extract_anchor("Build rate limiter", None).to_string();
-        assert!(anchor_no_l1.contains("starting"));
-        assert!(anchor_no_l1.contains("0/0"));
-
-        // With L1 — shows current state and progress
-        let l1_text = format!(
-            "{SESSION_MEMORY_PREFIX}\n\
-             # Session Title\nRate Limiter\n\
-             # Task Specification\nBuild a distributed rate limiter.\n\
-             # Current State\nRedis integration complete, testing.\n\
-             # Key Files\nsrc/main.rs\n\
-             # Progress\n✅ Setup\n✅ Redis\n🔄 Testing\n⏳ Deploy\n\
-             # Errors & Corrections\nNone\n\
-             # Decisions\n- Use Redis\n\
-             # User Messages\nBuild rate limiter\n\
-             # Worklog\nT1\n\
-             # Context\nT5"
-        );
-        let l1 = SessionMemory::parse(&l1_text).unwrap();
-        let anchor_with_l1 = extract_anchor("Build rate limiter", Some(&l1)).to_string();
-
-        assert!(
-            !anchor_with_l1.contains("starting"),
-            "should not say 'starting' when L1 available"
-        );
-        assert!(
-            anchor_with_l1.contains("Redis integration"),
-            "should show current state from L1"
-        );
-        assert!(
-            anchor_with_l1.contains("2/4"),
-            "should show progress from L1"
-        );
-    }
-
     // ── Fix #4: P2 skips continuation when task is done ─────────────────
 
     /// Helper matching the actual P2 completion detection logic in the turn loop.
@@ -6026,44 +5855,6 @@ mod tests {
     fn p2_true_positive_cant_believe_completed() {
         // "can't" in a non-negating context should NOT suppress completion detection
         assert!(signals_done("I can't believe we completed successfully!"));
-    }
-
-    // ── P1 latency fix: anchor from local messages, no network ──────────
-
-    #[test]
-    fn p1_anchor_evolves_from_local_messages_no_network() {
-        use crate::turn::cloud::session_memory_protocol::{
-            SessionMemory, build_l1_from_messages, extract_anchor,
-        };
-
-        // Multi-turn conversation — anchor should show progress, not "starting"
-        let messages = vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "Build a rate limiter using Redis"}),
-            json!({"role": "assistant", "content": "Starting implementation.", "tool_calls": [
-                {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.rs\"}"}}
-            ]}),
-            json!({"role": "tool", "content": "fn main() {}", "tool_call_id": "c1"}),
-            json!({"role": "assistant", "content": "Done with step 1."}),
-            json!({"role": "user", "content": "Now add Redis connection"}),
-            json!({"role": "assistant", "content": "Added Redis."}),
-        ];
-
-        let turn_count = messages
-            .iter()
-            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-            .count();
-        assert_eq!(turn_count, 3);
-
-        let l1_text = build_l1_from_messages(&messages, turn_count, 0);
-        let l1 = SessionMemory::parse(&l1_text).unwrap();
-        let anchor = extract_anchor("Build a rate limiter using Redis", Some(&l1)).to_string();
-
-        assert!(
-            !anchor.contains("starting"),
-            "multi-turn anchor should not say 'starting'"
-        );
-        assert!(anchor.contains("Turn 3"), "should reflect current turn");
     }
 
     // ── Fix #11: CJK detection for bilingual continuation prompt ────────

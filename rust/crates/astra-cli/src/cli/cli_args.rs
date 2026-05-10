@@ -797,8 +797,6 @@ pub(crate) enum SelfMutateCmd {
     Preview(SelfMutateConfigArgs),
     /// Apply a RuntimeConfig mutation to persisted session state
     Apply(SelfMutateConfigArgs),
-    /// Set the persisted session goal text
-    Goal(SelfMutateGoalArgs),
 }
 
 #[derive(Args, Debug)]
@@ -812,16 +810,6 @@ pub(crate) struct SelfMutateConfigArgs {
     /// New value as JSON (falls back to a raw string when not valid JSON)
     #[arg(long)]
     pub value: String,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct SelfMutateGoalArgs {
-    /// Session id or unique prefix (defaults to the most recent resumable session)
-    #[arg(long)]
-    pub session_id: Option<String>,
-    /// New session goal text
-    #[arg(long)]
-    pub text: String,
 }
 
 #[derive(Args, Debug)]

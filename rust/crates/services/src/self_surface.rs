@@ -235,35 +235,12 @@ impl Default for SurfaceConstraints {
 pub struct GoalSurface {
     pub session_id: String,
     pub goal: Option<String>,
-    pub session_goal: Option<String>,
     pub plan_goal: Option<String>,
-    pub tracked_goal: Option<String>,
-    pub goal_source: String,
-    pub tracking_status: String,
     pub phase: String,
     pub plan_execution_rounds: usize,
     pub plan_corrections: Vec<String>,
-    pub progress: Option<GoalProgressView>,
     pub recent_goal_events: Vec<EventPreview>,
     pub pending_blockers: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct GoalProgressView {
-    pub tracked_goal: String,
-    pub completion_score: f64,
-    pub momentum: f64,
-    pub milestone_count: usize,
-    pub summary: String,
-    pub recent_milestones: Vec<GoalMilestoneView>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct GoalMilestoneView {
-    pub turn: u32,
-    pub signal: String,
-    pub detail: Option<String>,
-    pub relevance: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -669,24 +646,10 @@ fn build_run_surface(
     let budget = budget_state_from_artifacts(artifacts);
     let risk_flags = build_risk_flags(&budget, health, runtime_checks, evolution);
     let pending_blockers = build_pending_blockers(health, runtime_checks, &[]);
-    let session_goal = artifacts
-        .workspace
-        .as_ref()
-        .and_then(|ws| ws.session_goal.clone());
-    let plan_goal = artifacts
+    let effective_goal = artifacts
         .workspace
         .as_ref()
         .and_then(|ws| ws.plan_goal.clone());
-    let tracked_goal = artifacts.workspace.as_ref().and_then(|ws| {
-        ws.goal_progress
-            .as_ref()
-            .map(|progress| progress.goal.clone())
-    });
-    let (effective_goal, _) = resolve_effective_goal(
-        session_goal.as_deref(),
-        plan_goal.as_deref(),
-        tracked_goal.as_deref(),
-    );
 
     RunSurface {
         session_id: artifacts.session_id.clone(),
@@ -833,36 +796,15 @@ fn build_goal_surface(
     snapshot: &PersistentSelfSnapshot,
     artifacts: &SessionArtifacts,
 ) -> GoalSurface {
-    let progress = artifacts
-        .workspace
-        .as_ref()
-        .and_then(|ws| ws.goal_progress.as_ref())
-        .map(goal_progress_view);
-    let session_goal = artifacts
-        .workspace
-        .as_ref()
-        .and_then(|ws| ws.session_goal.clone());
     let plan_goal = artifacts
         .workspace
         .as_ref()
         .and_then(|ws| ws.plan_goal.clone());
-    let tracked_goal = progress.as_ref().map(|view| view.tracked_goal.clone());
-    let (goal, goal_source) = resolve_effective_goal(
-        session_goal.as_deref(),
-        plan_goal.as_deref(),
-        tracked_goal.as_deref(),
-    );
-    let tracking_status =
-        goal_tracking_status(goal.as_deref(), tracked_goal.as_deref()).to_string();
 
     GoalSurface {
         session_id: artifacts.session_id.clone(),
-        goal,
-        session_goal,
+        goal: plan_goal.clone(),
         plan_goal,
-        tracked_goal,
-        goal_source: goal_source.to_string(),
-        tracking_status,
         phase: snapshot.run.phase.clone(),
         plan_execution_rounds: artifacts
             .workspace
@@ -874,7 +816,6 @@ fn build_goal_surface(
             .as_ref()
             .map(|ws| ws.plan_corrections.clone())
             .unwrap_or_default(),
-        progress,
         recent_goal_events: recent_event_previews(
             &artifacts.journal_events,
             10,
@@ -887,66 +828,6 @@ fn build_goal_surface(
             ],
         ),
         pending_blockers: snapshot.run.pending_blockers.clone(),
-    }
-}
-
-fn resolve_effective_goal(
-    session_goal: Option<&str>,
-    plan_goal: Option<&str>,
-    tracked_goal: Option<&str>,
-) -> (Option<String>, &'static str) {
-    if let Some(goal) = plan_goal {
-        return (Some(goal.to_string()), "plan_goal");
-    }
-    if let Some(goal) = session_goal {
-        return (Some(goal.to_string()), "session_goal");
-    }
-    if let Some(goal) = tracked_goal {
-        return (Some(goal.to_string()), "tracked_goal");
-    }
-    (None, "none")
-}
-
-fn goal_tracking_status(effective_goal: Option<&str>, tracked_goal: Option<&str>) -> &'static str {
-    match (effective_goal, tracked_goal) {
-        (None, None) => "idle",
-        (Some(_), None) => "untracked",
-        (Some(goal), Some(tracked)) if goal == tracked => "aligned",
-        (Some(_), Some(_)) => "stale",
-        (None, Some(_)) => "tracked_only",
-    }
-}
-
-fn goal_progress_view(
-    snapshot: &crate::session_workspace::GoalProgressSnapshot,
-) -> GoalProgressView {
-    GoalProgressView {
-        tracked_goal: snapshot.goal.clone(),
-        completion_score: snapshot.completion_score,
-        momentum: snapshot.momentum,
-        milestone_count: snapshot.milestone_count,
-        summary: snapshot.summary.clone(),
-        recent_milestones: snapshot
-            .milestones
-            .iter()
-            .rev()
-            .take(8)
-            .map(goal_milestone_view)
-            .collect(),
-    }
-}
-
-fn goal_milestone_view(
-    milestone: &crate::session_workspace::GoalMilestoneSnapshot,
-) -> GoalMilestoneView {
-    GoalMilestoneView {
-        turn: milestone.turn,
-        signal: milestone.signal.kind().to_string(),
-        detail: milestone
-            .signal
-            .detail()
-            .map(|detail| truncate(&detail, 120)),
-        relevance: milestone.relevance,
     }
 }
 
@@ -2285,7 +2166,7 @@ mod tests {
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "svc-self-snapshot";
         let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.session_goal = Some("ship self surface".to_string());
+        ws.plan_goal = Some("ship self surface".to_string());
         ws.last_context_trace = Some(ContextTraceSignal {
             turn_id: "turn-2".to_string(),
             captured_at: Some(Utc::now().to_rfc3339()),
@@ -2494,7 +2375,6 @@ mod tests {
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "svc-self-snapshot-plan-goal";
         let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.session_goal = Some("ship self surface".to_string());
         ws.plan_goal = Some("execute migration plan".to_string());
         session_workspace::write_workspace(&ws).unwrap();
 
@@ -2503,115 +2383,6 @@ mod tests {
         let snapshot = service.snapshot(session_id, 10).await.unwrap();
 
         assert_eq!(snapshot.run.goal.as_deref(), Some("execute migration plan"));
-    }
-
-    #[tokio::test]
-    async fn goal_surface_includes_persisted_goal_progress() {
-        let temp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(temp.path());
-        let session_id = "svc-self-goal-progress";
-        let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.goal_progress = Some(crate::session_workspace::GoalProgressSnapshot {
-            goal: "ship self surface".to_string(),
-            completion_score: 0.72,
-            momentum: 0.5,
-            milestone_count: 2,
-            summary: "Well underway — 72% estimated".to_string(),
-            weighted_progress: 1.4,
-            negative_signals: 0.0,
-            milestones: vec![
-                crate::session_workspace::GoalMilestoneSnapshot {
-                    turn: 1,
-                    signal: crate::session_workspace::GoalMilestoneSignalSnapshot::FileChanged {
-                        path: "rust/crates/services/src/self_surface.rs".to_string(),
-                    },
-                    relevance: 0.8,
-                },
-                crate::session_workspace::GoalMilestoneSnapshot {
-                    turn: 2,
-                    signal: crate::session_workspace::GoalMilestoneSignalSnapshot::BuildSuccess,
-                    relevance: 0.9,
-                },
-            ],
-        });
-        session_workspace::write_workspace(&ws).unwrap();
-
-        let service =
-            LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));
-        let surface = service
-            .surface(session_id, SelfSurfaceDimension::Goal, 10)
-            .await
-            .unwrap();
-
-        let SelfSurfaceResponse::Goal(goal) = surface else {
-            panic!("expected goal surface");
-        };
-        let progress = goal.progress.expect("goal progress view");
-        assert_eq!(goal.goal.as_deref(), Some("ship self surface"));
-        assert_eq!(goal.tracked_goal.as_deref(), Some("ship self surface"));
-        assert_eq!(goal.goal_source, "tracked_goal");
-        assert_eq!(goal.tracking_status, "aligned");
-        assert_eq!(progress.tracked_goal, "ship self surface");
-        assert_eq!(progress.milestone_count, 2);
-        assert_eq!(progress.recent_milestones[0].signal, "build_success");
-        assert_eq!(
-            progress.recent_milestones[0].detail.as_deref(),
-            Some("build succeeded")
-        );
-    }
-
-    #[tokio::test]
-    async fn goal_surface_exposes_plan_goal_alignment_state() {
-        let temp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(temp.path());
-        let session_id = "svc-self-goal-alignment";
-        let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.session_goal = Some("ship self surface".to_string());
-        ws.plan_goal = Some("execute migration plan".to_string());
-        ws.goal_progress = Some(crate::session_workspace::GoalProgressSnapshot {
-            goal: "ship self surface".to_string(),
-            completion_score: 0.72,
-            momentum: 0.5,
-            milestone_count: 2,
-            summary: "Still tracking the old session goal".to_string(),
-            weighted_progress: 1.4,
-            negative_signals: 0.0,
-            milestones: vec![crate::session_workspace::GoalMilestoneSnapshot {
-                turn: 2,
-                signal: crate::session_workspace::GoalMilestoneSignalSnapshot::BuildSuccess,
-                relevance: 0.9,
-            }],
-        });
-        session_workspace::write_workspace(&ws).unwrap();
-        JournalWriter::new(session_id)
-            .unwrap()
-            .append(&JournalEvent::goal_steered(
-                Some(session_id),
-                2,
-                "plan_execution_start",
-                Some("ship self surface"),
-                "execute migration plan",
-                Some(serde_json::json!({"mode": "auto"})),
-            ))
-            .unwrap();
-
-        let service =
-            LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));
-        let surface = service
-            .surface(session_id, SelfSurfaceDimension::Goal, 10)
-            .await
-            .unwrap();
-
-        let SelfSurfaceResponse::Goal(goal) = surface else {
-            panic!("expected goal surface");
-        };
-        assert_eq!(goal.goal.as_deref(), Some("execute migration plan"));
-        assert_eq!(goal.session_goal.as_deref(), Some("ship self surface"));
-        assert_eq!(goal.plan_goal.as_deref(), Some("execute migration plan"));
-        assert_eq!(goal.tracked_goal.as_deref(), Some("ship self surface"));
-        assert_eq!(goal.goal_source, "plan_goal");
-        assert_eq!(goal.tracking_status, "stale");
-        assert_eq!(goal.recent_goal_events[0].event_type, "goal_steered");
     }
 
     #[tokio::test]
@@ -2647,7 +2418,7 @@ mod tests {
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "svc-self-objective-pending";
         let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.session_goal = Some("ship self surface".to_string());
+        ws.plan_goal = Some("ship self surface".to_string());
         ws.contract_json = Some(
             serde_json::to_string(&sample_contract(
                 ContractStatus::Active,
@@ -2687,7 +2458,7 @@ mod tests {
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "svc-self-objective-verified";
         let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.session_goal = Some("ship self surface".to_string());
+        ws.plan_goal = Some("ship self surface".to_string());
         let mut contract = sample_contract(ContractStatus::Completed, SubtaskStage::Verified);
         contract.last_global_results = vec![sample_verification_result("global-check", true)];
         ws.contract_json = Some(serde_json::to_string(&contract).unwrap());

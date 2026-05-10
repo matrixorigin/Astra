@@ -270,7 +270,6 @@ async fn initialize_repl_state_marks_workspace_session_as_pending_recovery() {
     ws.turn_count = 1;
     ws.total_tokens_in = 5;
     ws.total_tokens_out = 3;
-    ws.session_goal = Some("ship session restore".to_string());
     ws.pinned_skills = vec![
         "session-lifecycle".to_string(),
         "goal-driven-evolution".to_string(),
@@ -398,7 +397,6 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
         consecutive_context_window_errors: 0,
         pipeline_state: None,
         compaction_state: None,
-        continuity_state: None,
     };
     astra_pipeline::step_checkpoint::write_step_checkpoint(
         &sid,

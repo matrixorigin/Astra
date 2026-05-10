@@ -196,8 +196,7 @@ pub fn snapshot_from_capture_json(v: &serde_json::Value) -> RoundSnapshot {
     //   - `## Self-Awareness`  — the block rendered by SelfModel, carries
     //     live `Turn: N` and `Tokens: M/K` counters (session 986a553e).
     //   - `[session-memory:`   — the session-memory manifest, re-rendered
-    //     per turn with updated working-set state.
-    //   - `[attention:v1]`     — user-attention manifest, per-turn.
+    //     per turn with updated state.
     //
     // Detection is substring-based to keep the parser dependency-free;
     // the rule code consuming these indices treats presence as a signal,
@@ -277,16 +276,12 @@ fn contains_volatile_pattern(text: &str) -> bool {
     //
     // Real volatile produced by the SelfModel renderer always emits
     // the section header immediately followed by `Turn: N | Tokens: M`.
-    // The session-memory and attention manifests carry a similarly
-    // distinctive header + `goal:` line. Gate on both to cut false
-    // positives.
+    // The session-memory manifest carries a similarly distinctive header
+    // + `goal:` line. Gate on both to cut false positives.
     if text.contains("## Self-Awareness") && text.contains("Turn: ") && text.contains("Tokens: ") {
         return true;
     }
     if text.contains("[session-memory:") && text.contains("goal:") {
-        return true;
-    }
-    if text.contains("[attention:v1]") && text.contains("goal:") {
         return true;
     }
     false
@@ -1577,7 +1572,6 @@ mod tests {
         assert!(contains_volatile_pattern(
             "<system-reminder>\n[session-memory:v1]\ngoal: foo"
         ));
-        assert!(contains_volatile_pattern("[attention:v1]\ngoal: hi"));
     }
 
     #[test]

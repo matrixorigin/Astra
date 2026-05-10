@@ -1095,7 +1095,6 @@ impl ToolExecutor {
         let mut errors = 0u32;
         let mut agents_spawned = 0u32;
         let mut agents_completed = 0u32;
-        let mut current_goal = String::new();
 
         for evt in &events {
             let etype = evt.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1117,15 +1116,6 @@ impl ToolExecutor {
             }
         }
 
-        // Try to get current goal from observability session
-        if let Some(obs) = self.observability_session.as_ref()
-            && let Ok(s) = obs.read()
-        {
-            if let Some(gt) = s.goal_tracker.as_ref() {
-                current_goal = gt.goal().to_string();
-            }
-        }
-
         let mut out = String::from("## Session Summary\n");
         out.push_str(&format!("Session: {session_id}\n"));
         out.push_str(&format!(
@@ -1142,10 +1132,6 @@ impl ToolExecutor {
                 "Agents: {agents_spawned} spawned, {agents_completed} completed\n"
             ));
         }
-        if !current_goal.is_empty() {
-            out.push_str(&format!("Current goal: {current_goal}\n"));
-        }
-
         // Task status nudge: if there are active tasks, remind the
         // agent to update them (Claude Code parity: proactive nudge).
         let tasks = self.task_manager.snapshot();
@@ -1893,7 +1879,6 @@ impl ToolExecutor {
                 "adjust_config" => self.adjust_config(args),
                 "prioritize_tool" => self.prioritize_tool(args),
                 "deprioritize_tool" => self.deprioritize_tool(args),
-                "set_goal" => self.set_goal(args),
                 "compress_context" => self.compress_context(args),
                 "get_agent_info" => self.get_agent_info(args).await,
                 "reflect" => {
@@ -1998,7 +1983,6 @@ impl ToolExecutor {
                         "config" => self.adjust_config(args),
                         "prioritize" => self.prioritize_tool(args),
                         "deprioritize" => self.deprioritize_tool(args),
-                        "set_goal" => self.set_goal(args),
                         "compact" => self.compress_context(args),
                         "rollback_edits" => self.rollback_file_edits(args),
                         "ask_user" => self.ask_user(args),
@@ -2007,7 +1991,7 @@ impl ToolExecutor {
                         "timeline" => self.render_session_timeline(args),
                         "summary" => self.render_session_summary(),
                         "history" => self.render_session_history(args),
-                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, tool_search, timeline, summary, history".to_string(),
+                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, tool_search, timeline, summary, history".to_string(),
                         other => format!("Unknown session action: '{other}'"),
                     }
                 }
@@ -2419,27 +2403,6 @@ impl ToolExecutor {
                     .to_string()
                 }
             }
-            "goals" => {
-                if let Some(ref model) = self_model {
-                    serde_json::json!({
-                        "goal": model.goals.goal,
-                        "session_goal": model.goals.session_goal,
-                        "plan_goal": model.goals.plan_goal,
-                        "tracked_goal": model.goals.tracked_goal,
-                        "goal_source": model.goals.goal_source,
-                        "tracking_status": model.goals.tracking_status,
-                        "progress": model.goals.progress,
-                        "recent_milestones": model.goals.recent_milestones,
-                        "milestone_count": model.goals.milestone_count,
-                    })
-                    .to_string()
-                } else {
-                    serde_json::json!({
-                        "note": "No goal tracker available."
-                    })
-                    .to_string()
-                }
-            }
             "context_snapshot" | "context_trend" => {
                 if let Some(ref model) = self_model {
                     serde_json::json!({
@@ -2499,15 +2462,6 @@ impl ToolExecutor {
         // Latest token budget from context traces.
         let latest_budget = session.context_traces.last().map(|ct| &ct.token_budget);
 
-        // Goal information.
-        let goal_text = session.goal_tracker.as_ref().map(|gt| gt.goal());
-        let goal_progress = session.goal_tracker.as_ref().map(|gt| gt.progress());
-        let milestones: Option<Vec<_>> = session
-            .goal_tracker
-            .as_ref()
-            .map(|gt| gt.milestones().to_vec());
-        let milestone_slice = milestones.as_deref();
-
         let skills_slice: &[String] = &session.cached_skill_names;
         let tool_health_tracker = if session.last_tool_health_export.is_empty() {
             None
@@ -2534,11 +2488,7 @@ impl ToolExecutor {
             elapsed,
             session.user_corrections.len(),
             session.compressed_turns.len(),
-            goal_text,
             None,
-            goal_text,
-            goal_progress.as_ref(),
-            milestone_slice,
             signals_slice,
             &session.config,
             session.last_strategy_application.as_ref(),

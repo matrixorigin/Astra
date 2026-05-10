@@ -124,7 +124,6 @@ pub mod cloud_session_facts;
 pub mod cloud_session_memory_extract;
 pub mod counter;
 pub mod delegation_tree;
-pub mod goal_tracker;
 pub mod headless_tool_journal;
 pub mod orchestration_types;
 pub mod permission_sync;

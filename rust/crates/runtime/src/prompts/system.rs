@@ -895,7 +895,6 @@ pub fn build_system_prompt_trace(
             section.trace_signals.context_signals.implicit_feedback;
         context_signals.learned_feedback_rules |=
             section.trace_signals.context_signals.learned_feedback_rules;
-        context_signals.session_anchor |= section.trace_signals.context_signals.session_anchor;
         context_signals.memoria_insights |= section.trace_signals.context_signals.memoria_insights;
         guidance_signals.round_budget_warning |=
             section.trace_signals.guidance_signals.round_budget_warning;
@@ -1237,8 +1236,6 @@ pub fn parallel_batching_nudge_directive(messages: &[serde_json::Value]) -> Stri
 ///     (nudges, feedback, guidance). If that invariant ever changes, this
 ///     branch must be tightened with a content marker analogous to the one
 ///     used for `user` below.
-///   * `role == "user"` with content matching [`is_attention_manifest_content`] —
-///     the `[attention:v1]` manifest we inject as a user-role message.
 fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool {
     let role = message.get("role").and_then(|r| r.as_str());
     if role == Some("system") {
@@ -1250,10 +1247,6 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
     let Some(content) = message.get("content").and_then(|c| c.as_str()) else {
         return false;
     };
-    // Attention manifests carry the `[attention:v1]\n...` prefix.
-    if is_attention_manifest_content(content) {
-        return true;
-    }
     // Session 8d9e5903 regression: every outbound request ends with a
     // role=user `<system-reminder>` wrapper produced by the volatile
     // lane (wire_assembly / bridge_inprocess / server_loop_host). This
@@ -1261,7 +1254,13 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
     // round-cadence detection — otherwise the single-tool-streak
     // counter always returns 0 on live sessions and the
     // parallel-batching force never fires.
-    content.starts_with(SYSTEM_REMINDER_WRAPPER_PREFIX)
+    if content.starts_with(SYSTEM_REMINDER_WRAPPER_PREFIX) {
+        return true;
+    }
+    // Legacy attention manifest carried as a `role:user` scaffolding
+    // message. Emission was dropped in wip-3; this check remains so
+    // restored checkpoints from older versions still route around it.
+    content.starts_with("[attention:v1]\n")
 }
 
 /// Wrapper tag applied by the volatile lane to mark runtime-injected
@@ -1269,14 +1268,6 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
 /// awareness / volatile nudges). See `wire_assembly`, `bridge_inprocess`,
 /// and `server_loop_host` for producers.
 const SYSTEM_REMINDER_WRAPPER_PREFIX: &str = "<system-reminder>";
-
-/// Returns true when `content` begins with the attention-manifest prefix
-/// followed by a newline. Allocation-free — safe to call in hot loops over
-/// full message history.
-fn is_attention_manifest_content(content: &str) -> bool {
-    let prefix = astra_turn_types::continuity::ATTENTION_PREFIX;
-    content.starts_with(prefix) && content.as_bytes().get(prefix.len()) == Some(&b'\n')
-}
 
 fn trailing_tool_result_count(messages: &[serde_json::Value]) -> usize {
     messages
@@ -1415,28 +1406,6 @@ pub const STALL_NUDGE: &str = "You appear to be repeating the same tool calls. \
 #[allow(deprecated)]
 mod tests {
     use super::*;
-
-    // ── is_attention_manifest_content ─────────────────────────────
-
-    #[test]
-    fn attention_manifest_content_requires_prefix_and_newline() {
-        let prefix = astra_turn_types::continuity::ATTENTION_PREFIX;
-        // Exact prefix without newline — not a manifest (truncated / malformed).
-        assert!(!is_attention_manifest_content(prefix));
-        // Prefix followed by newline and body — valid manifest.
-        assert!(is_attention_manifest_content(&format!("{}\nfoo", prefix)));
-        // Prefix followed by newline only — still a valid manifest shell.
-        assert!(is_attention_manifest_content(&format!("{}\n", prefix)));
-        // Empty content — not a manifest.
-        assert!(!is_attention_manifest_content(""));
-        // Prefix followed by a non-newline byte — not a manifest (guards
-        // against accidental matches like `[attention:v1]extra`).
-        assert!(!is_attention_manifest_content(&format!("{}X", prefix)));
-        // Random user content that merely mentions the marker — not a manifest.
-        assert!(!is_attention_manifest_content(
-            "what does [attention:v1] mean?"
-        ));
-    }
 
     // ── detect_task_type ──────────────────────────────────────────
 
@@ -2664,7 +2633,6 @@ mod tests {
                     self_awareness: true,
                     implicit_feedback: true,
                     learned_feedback_rules: true,
-                    session_anchor: true,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -2680,7 +2648,6 @@ mod tests {
         assert!(breakdown.context_signals.self_awareness);
         assert!(breakdown.context_signals.implicit_feedback);
         assert!(breakdown.context_signals.learned_feedback_rules);
-        assert!(breakdown.context_signals.session_anchor);
     }
 
     #[test]

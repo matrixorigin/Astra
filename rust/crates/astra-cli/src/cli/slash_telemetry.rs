@@ -289,7 +289,7 @@ fn show_drift_analysis(
     session: &std::sync::Arc<
         std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
     >,
-    state: &ReplState,
+    _state: &ReplState,
 ) {
     let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
 
@@ -326,51 +326,6 @@ fn show_drift_analysis(
     }
     eprintln!();
 
-    // Analyze drift from session goal
-    if state.session_goal.is_some() {
-        let analysis = session_guard.check_drift();
-        let severity_color = if analysis.drift_severity > 0.7 {
-            "red"
-        } else if analysis.drift_severity > 0.4 {
-            "yellow"
-        } else {
-            "green"
-        };
-        let severity_str = format!("{:.1}%", analysis.drift_severity * 100.0);
-        eprintln!(
-            "  {:<18} {}",
-            "drift_severity:".dim(),
-            match severity_color {
-                "red" => severity_str.red().to_string(),
-                "yellow" => severity_str.yellow().to_string(),
-                _ => severity_str.green().to_string(),
-            }
-        );
-        if let Some(turn) = analysis.drift_turn {
-            eprintln!("  {:<18} {}", "drift_turn:".dim(), turn);
-        }
-        eprintln!(
-            "  {:<18} {:?}",
-            "likely_cause:".dim(),
-            analysis.likely_cause
-        );
-        if !analysis.affected_context.is_empty() {
-            eprintln!("  {:<18}", "affected_context:".dim());
-            for ctx in analysis.affected_context.iter().take(3) {
-                eprintln!("    • {}", ctx);
-            }
-        }
-        eprintln!(
-            "  {:<18} {}",
-            "recovery:".dim(),
-            analysis.recovery_suggestion
-        );
-    } else {
-        eprintln!(
-            "  {}",
-            "No session goal set — drift analysis requires a baseline.".dim()
-        );
-    }
     eprintln!();
 }
 

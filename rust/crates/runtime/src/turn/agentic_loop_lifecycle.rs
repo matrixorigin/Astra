@@ -824,28 +824,23 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
 
     if turn_index > 0 {
-        // Working-set + inventory snapshots go through the structured
-        // volatile lane so they stay out of `state.messages[]` — the
-        // wire layer drains them into volatile_preamble for each LLM
-        // call. Previously these were pushed as trailing `role=system`
-        // messages and had to be re-deduped before every push, which
-        // still broke Anthropic/DeepSeek prefix caching (session
-        // 05e63cac / c0905eab). Legacy retains() stay for a grace
-        // period to scrub checkpoints restored from pre-migration
-        // sessions.
-        const WORKING_SET_HEADER: &str = "[working-set:v1]\n";
+        // Inventory snapshots go through the structured volatile lane so
+        // they stay out of `state.messages[]` — the wire layer drains
+        // them into volatile_preamble for each LLM call. Legacy
+        // retains() stay for a grace period to scrub checkpoints
+        // restored from pre-migration sessions (working-set / attention
+        // manifests were removed in wip-3).
+        const LEGACY_WORKING_SET_HEADER: &str = "[working-set:v1]\n";
+        const LEGACY_ATTENTION_HEADER: &str = "[attention:v1]\n";
         state.messages.retain(|m| {
-            m.get("role").and_then(Value::as_str) != Some("system")
-                || !m
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|c| c.starts_with(WORKING_SET_HEADER))
+            let role = m.get("role").and_then(Value::as_str);
+            let content = m.get("content").and_then(Value::as_str);
+            match (role, content) {
+                (Some("system"), Some(c)) if c.starts_with(LEGACY_WORKING_SET_HEADER) => false,
+                (Some("user"), Some(c)) if c.starts_with(LEGACY_ATTENTION_HEADER) => false,
+                _ => true,
+            }
         });
-        let working_set_text = state.session_facts.to_working_set_injection(&state.message);
-        state.push_volatile(
-            super::agentic_loop_host::VolatileKind::WorkingSet,
-            working_set_text,
-        );
 
         const INVENTORY_HEADER: &str = "## Already Fetched (do NOT re-read/re-grep these)\n";
         state.messages.retain(|m| {
@@ -1158,69 +1153,6 @@ mod tests {
             budget_entries, 1,
             "budget injection must be idempotent (singleton dedup); pending={:?}",
             state.volatile_pending,
-        );
-    }
-
-    #[tokio::test]
-    async fn prepare_turn_injects_single_canonical_working_set() {
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.message = "continue fixing context continuity".to_string();
-        state
-            .session_facts
-            .active_files
-            .push(astra_turn_types::session_facts::FileEntry {
-                path: "src/main.rs".to_string(),
-                last_action: "write".to_string(),
-                turn: 1,
-            });
-
-        let _ = prepare_turn_iteration(&mut host, &mut state, 1)
-            .await
-            .expect("prepare turn");
-        let _ = prepare_turn_iteration(&mut host, &mut state, 2)
-            .await
-            .expect("prepare next turn");
-
-        // Post-Task #45: working-set lives in the structured volatile lane,
-        // not in state.messages. The lane drains per LLM call so at
-        // prepare-turn time we see at most ONE pending entry (the
-        // current turn's snapshot) — second-call replace, not accumulate.
-        let working_sets: Vec<_> = state
-            .volatile_pending
-            .iter()
-            .filter(|inj| inj.content.starts_with("[working-set:v1]\n"))
-            .collect();
-        assert_eq!(
-            working_sets.len(),
-            1,
-            "working set lane must hold exactly one entry per prepare cycle, \
-             got {} in pending={:?} and messages={:?}",
-            working_sets.len(),
-            state.volatile_pending,
-            state.messages,
-        );
-        assert_eq!(
-            working_sets[0].kind,
-            super::super::agentic_loop_host::VolatileKind::WorkingSet,
-        );
-        assert!(
-            working_sets[0]
-                .content
-                .contains("goal: continue fixing context continuity")
-        );
-        assert!(working_sets[0].content.contains("- src/main.rs [write t1]"));
-        // And messages[] must stay clean of working-set content.
-        let msg_working_sets: Vec<_> = state
-            .messages
-            .iter()
-            .filter_map(|m| m.get("content").and_then(serde_json::Value::as_str))
-            .filter(|c| c.starts_with("[working-set:v1]\n"))
-            .collect();
-        assert!(
-            msg_working_sets.is_empty(),
-            "working-set must NEVER end up in state.messages (byte-stable \
-             history invariant); leaked into: {msg_working_sets:?}",
         );
     }
 

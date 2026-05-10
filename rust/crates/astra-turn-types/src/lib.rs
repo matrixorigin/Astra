@@ -3,7 +3,6 @@
 //! This crate provides foundational types used during turn execution,
 //! extracted from the monolithic runtime crate for better modularity.
 
-pub mod continuity;
 mod implicit_feedback;
 mod memory_ranking;
 mod memory_structure;

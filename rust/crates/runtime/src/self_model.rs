@@ -1,8 +1,8 @@
 //! Self-Model — Unified introspection view of the agent's state.
 //!
 //! The SelfModel is a read-only snapshot that composes data from existing
-//! components (ObservabilitySession, GoalTracker, ToolHealthTracker,
-//! RuntimeConfig, AutoTuningEngine) into a single coherent view.
+//! components (ObservabilitySession, ToolHealthTracker, RuntimeConfig,
+//! AutoTuningEngine) into a single coherent view.
 //!
 //! This enables:
 //! - Dynamic system prompt sections showing the agent its own state
@@ -22,7 +22,6 @@ use astra_config::user_profile::Scenario;
 use astra_learning::auto_tuning::{FeedbackSignal, SignalType};
 use astra_text_utils::str_preview::truncate_str;
 use astra_turn_core::context_assembly_trace::TokenBudgetTrace;
-use astra_turn_core::goal_tracker::{GoalProgress, Milestone};
 use astra_turn_core::tool_health::ToolHealthTracker;
 
 // ─── Core Self-Model ────────────────────────────────────────────────────────
@@ -283,27 +282,13 @@ pub struct TokenBudgetSnapshot {
     pub compression_triggered: bool,
 }
 
-/// Goal tracking state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Goal tracking state. Minimal — only carries the plan goal (if any).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GoalState {
-    /// The effective goal currently steering the agent.
+    /// The plan goal currently steering the agent (if a plan is active).
     pub goal: Option<String>,
-    /// The session goal (original user query).
-    pub session_goal: Option<String>,
     /// The active plan goal, if plan execution currently owns steering.
     pub plan_goal: Option<String>,
-    /// The goal currently tracked by the live GoalTracker.
-    pub tracked_goal: Option<String>,
-    /// Which source currently provides the effective goal.
-    pub goal_source: String,
-    /// Whether tracked progress is aligned with the effective goal.
-    pub tracking_status: String,
-    /// Goal progress analysis.
-    pub progress: Option<GoalProgress>,
-    /// Recent milestones (last 5).
-    pub recent_milestones: Vec<Milestone>,
-    /// Total milestone count.
-    pub milestone_count: usize,
 }
 
 /// Simplified feedback signal for display.
@@ -361,11 +346,7 @@ impl SelfModel {
         session_elapsed_secs: u64,
         correction_count: usize,
         compression_count: usize,
-        session_goal: Option<&str>,
         plan_goal: Option<&str>,
-        tracked_goal: Option<&str>,
-        goal_progress: Option<&GoalProgress>,
-        milestones: Option<&[Milestone]>,
         recent_signals: &[FeedbackSignal],
         _config: &RuntimeConfig,
     ) -> Self {
@@ -382,11 +363,7 @@ impl SelfModel {
             session_elapsed_secs,
             correction_count,
             compression_count,
-            session_goal,
             plan_goal,
-            tracked_goal,
-            goal_progress,
-            milestones,
             recent_signals,
             _config,
             None,
@@ -410,11 +387,7 @@ impl SelfModel {
         session_elapsed_secs: u64,
         correction_count: usize,
         compression_count: usize,
-        session_goal: Option<&str>,
         plan_goal: Option<&str>,
-        tracked_goal: Option<&str>,
-        goal_progress: Option<&GoalProgress>,
-        milestones: Option<&[Milestone]>,
         recent_signals: &[FeedbackSignal],
         _config: &RuntimeConfig,
         last_strategy: Option<&crate::turn::agentic_stage_bridge::StrategyApplication>,
@@ -518,27 +491,9 @@ impl SelfModel {
         };
 
         // ── Goals ──
-        let recent_milestones = milestones
-            .map(|ms| {
-                let n = ms.len();
-                let start = n.saturating_sub(5);
-                ms[start..].to_vec()
-            })
-            .unwrap_or_default();
-        let milestone_count = milestones.map(|ms| ms.len()).unwrap_or(0);
-        let (goal, goal_source) = resolve_effective_goal(session_goal, plan_goal, tracked_goal);
-        let tracking_status = goal_tracking_status(goal.as_deref(), tracked_goal).to_string();
-
         let goals = GoalState {
-            goal,
-            session_goal: session_goal.map(|s| s.to_string()),
+            goal: plan_goal.map(|s| s.to_string()),
             plan_goal: plan_goal.map(|s| s.to_string()),
-            tracked_goal: tracked_goal.map(|s| s.to_string()),
-            goal_source: goal_source.to_string(),
-            tracking_status,
-            progress: goal_progress.cloned(),
-            recent_milestones,
-            milestone_count,
         };
 
         // ── Recent signals (last 10) ──
@@ -707,33 +662,6 @@ impl SelfModel {
     }
 }
 
-fn resolve_effective_goal(
-    session_goal: Option<&str>,
-    plan_goal: Option<&str>,
-    tracked_goal: Option<&str>,
-) -> (Option<String>, &'static str) {
-    if let Some(goal) = plan_goal {
-        return (Some(goal.to_string()), "plan_goal");
-    }
-    if let Some(goal) = session_goal {
-        return (Some(goal.to_string()), "session_goal");
-    }
-    if let Some(goal) = tracked_goal {
-        return (Some(goal.to_string()), "tracked_goal");
-    }
-    (None, "none")
-}
-
-fn goal_tracking_status(effective_goal: Option<&str>, tracked_goal: Option<&str>) -> &'static str {
-    match (effective_goal, tracked_goal) {
-        (None, None) => "idle",
-        (Some(_), None) => "untracked",
-        (Some(goal), Some(tracked)) if goal == tracked => "aligned",
-        (Some(_), Some(_)) => "stale",
-        (None, Some(_)) => "tracked_only",
-    }
-}
-
 fn render_outcome_memory_hint(hint: &OutcomeMemoryHint) -> String {
     let status = if hint.success {
         "ok".to_string()
@@ -784,31 +712,10 @@ impl SelfModel {
             let _ = writeln!(s, "Scenario: {}", scenario);
         }
 
-        // ── Goal progress ──
+        // ── Plan goal ──
         if let Some(ref goal) = self.goals.goal {
             let truncated = truncate_str(goal, 100);
-            let _ = write!(s, "Goal: \"{}\"", truncated);
-            if self.goals.goal_source != "none" && self.goals.goal_source != "session_goal" {
-                let _ = write!(s, " [{}]", self.goals.goal_source);
-            }
-            if let Some(ref progress) = self.goals.progress {
-                let _ = write!(
-                    s,
-                    " (progress: {:.0}%, momentum: {})",
-                    progress.completion_score * 100.0,
-                    if progress.momentum > 0.1 {
-                        "↑"
-                    } else if progress.momentum < -0.1 {
-                        "↓"
-                    } else {
-                        "→"
-                    }
-                );
-            }
-            if self.goals.tracking_status == "stale" {
-                s.push_str(" (tracking stale)");
-            }
-            s.push('\n');
+            let _ = writeln!(s, "Goal: \"{}\"", truncated);
         }
 
         // ── Tool health ──
@@ -1199,25 +1106,8 @@ impl SelfModel {
     /// - recorded recent feedback signals
     #[must_use]
     pub fn has_meaningful_self_awareness(&self) -> bool {
-        // Goal signal: explicit `plan_goal` always counts (an ActionPlan
-        // is actively steering), but `session_goal` / `tracked_goal` are
-        // auto-seeded from the first user message in
-        // `ObservabilitySession::record_query_at`, and `progress` is
-        // always populated alongside them (the tracker returns a zero
-        // `GoalProgress` even with zero milestones). Neither presence is
-        // a signal — only observed progress or recorded milestones are.
+        // Plan goal: explicit plan_goal means an ActionPlan is steering.
         if self.goals.plan_goal.is_some() {
-            return true;
-        }
-        if !self.goals.recent_milestones.is_empty() {
-            return true;
-        }
-        if self
-            .goals
-            .progress
-            .as_ref()
-            .is_some_and(|p| p.milestone_count > 0 || p.completion_score > 0.05)
-        {
             return true;
         }
         if !self.capabilities.outcome_memory.is_empty()
@@ -1342,37 +1232,10 @@ impl SelfModel {
 
         // ── Goals ──
         s.push_str("\n## Goals\n");
-        if let Some(ref goal) = self.goals.goal {
-            let _ = writeln!(s, "- Effective goal: \"{}\"", goal);
-        } else {
-            s.push_str("- No explicit goal set\n");
-        }
-        if let Some(ref goal) = self.goals.session_goal {
-            let _ = writeln!(s, "- Session goal: \"{}\"", goal);
-        }
         if let Some(ref goal) = self.goals.plan_goal {
             let _ = writeln!(s, "- Plan goal: \"{}\"", goal);
-        }
-        if let Some(ref goal) = self.goals.tracked_goal {
-            let _ = writeln!(s, "- Tracked goal: \"{}\"", goal);
-        }
-        let _ = writeln!(s, "- Goal source: {}", self.goals.goal_source);
-        let _ = writeln!(s, "- Tracking status: {}", self.goals.tracking_status);
-        if let Some(ref progress) = self.goals.progress {
-            let _ = writeln!(s, "- Completion: {:.0}%", progress.completion_score * 100.0);
-            let _ = writeln!(s, "- Momentum: {:.2}", progress.momentum);
-            let _ = writeln!(s, "- Milestones: {}", progress.milestone_count);
-            let _ = writeln!(s, "- Summary: {}", progress.summary);
-        }
-        if !self.goals.recent_milestones.is_empty() {
-            s.push_str("- Recent milestones:\n");
-            for m in &self.goals.recent_milestones {
-                let _ = writeln!(
-                    s,
-                    "  - Turn {}: {:?} (relevance: {:.2})",
-                    m.turn, m.signal, m.relevance
-                );
-            }
+        } else {
+            s.push_str("- No active plan\n");
         }
 
         // ── Capabilities ──
@@ -1532,72 +1395,18 @@ mod tests {
             0,
             0,
             None,
-            None,
-            None,
-            None,
-            None,
             &[],
             &config,
         );
         assert_eq!(model.capabilities.total_tools, 3);
         assert_eq!(model.state.turn_number, 3);
         assert!(model.goals.goal.is_none());
-        assert!(model.goals.session_goal.is_none());
-        assert_eq!(model.goals.goal_source, "none");
-        assert_eq!(model.goals.tracking_status, "idle");
+        assert!(model.goals.plan_goal.is_none());
         assert!(model.recent_signals.is_empty());
     }
 
     #[test]
-    fn snapshot_with_goal() {
-        let config = RuntimeConfig::default();
-        let progress = GoalProgress {
-            completion_score: 0.45,
-            momentum: 0.3,
-            milestone_count: 5,
-            summary: "Making good progress".to_string(),
-        };
-        let model = SelfModel::snapshot(
-            &["bash"],
-            &[],
-            &[],
-            &[],
-            None,
-            7,
-            None,
-            None,
-            None,
-            300,
-            1,
-            0,
-            Some("Fix the auth bug"),
-            None,
-            Some("Fix the auth bug"),
-            Some(&progress),
-            None,
-            &[],
-            &config,
-        );
-        assert_eq!(model.goals.goal.as_deref(), Some("Fix the auth bug"));
-        assert_eq!(
-            model.goals.session_goal.as_deref(),
-            Some("Fix the auth bug")
-        );
-        assert_eq!(
-            model.goals.tracked_goal.as_deref(),
-            Some("Fix the auth bug")
-        );
-        assert_eq!(model.goals.goal_source, "session_goal");
-        assert_eq!(model.goals.tracking_status, "aligned");
-        assert_eq!(
-            model.goals.progress.as_ref().unwrap().completion_score,
-            0.45
-        );
-        assert_eq!(model.state.correction_count, 1);
-    }
-
-    #[test]
-    fn snapshot_with_plan_goal_reports_stale_tracking() {
+    fn snapshot_with_plan_goal() {
         let config = RuntimeConfig::default();
         let model = SelfModel::snapshot(
             &["bash"],
@@ -1612,11 +1421,7 @@ mod tests {
             300,
             0,
             0,
-            Some("Fix the auth bug"),
             Some("Execute the migration plan"),
-            Some("Fix the auth bug"),
-            None,
-            None,
             &[],
             &config,
         );
@@ -1626,19 +1431,9 @@ mod tests {
             Some("Execute the migration plan")
         );
         assert_eq!(
-            model.goals.session_goal.as_deref(),
-            Some("Fix the auth bug")
-        );
-        assert_eq!(
             model.goals.plan_goal.as_deref(),
             Some("Execute the migration plan")
         );
-        assert_eq!(
-            model.goals.tracked_goal.as_deref(),
-            Some("Fix the auth bug")
-        );
-        assert_eq!(model.goals.goal_source, "plan_goal");
-        assert_eq!(model.goals.tracking_status, "stale");
     }
 
     #[test]
@@ -1664,10 +1459,6 @@ mod tests {
             10,
             0,
             0,
-            None,
-            None,
-            None,
-            None,
             None,
             &[],
             &config,
@@ -1717,10 +1508,6 @@ mod tests {
             0,
             0,
             Some("Inspect duplicate work"),
-            None,
-            None,
-            None,
-            None,
             &[],
             &config,
         );
@@ -1777,10 +1564,6 @@ mod tests {
             0,
             0,
             Some("Fix the auth bug in user_service.rs"),
-            None,
-            None,
-            None,
-            None,
             &[],
             &config,
         );
@@ -1821,10 +1604,6 @@ mod tests {
             0,
             0,
             Some(goal),
-            None,
-            None,
-            None,
-            None,
             &[],
             &config,
         );
@@ -1854,10 +1633,6 @@ mod tests {
             2,
             1,
             Some("Implement feature X"),
-            None,
-            None,
-            None,
-            None,
             &[],
             &config,
         );
@@ -1889,10 +1664,6 @@ mod tests {
             0,
             0,
             0,
-            None,
-            None,
-            None,
-            None,
             None,
             &signals,
             &config,
@@ -1933,10 +1704,6 @@ mod tests {
             10,
             0,
             0,
-            None,
-            None,
-            None,
-            None,
             None,
             &[],
             &config,
@@ -1986,10 +1753,6 @@ mod tests {
             0,
             0,
             None,
-            None,
-            None,
-            None,
-            None,
             &[],
             &config,
         )
@@ -2016,10 +1779,6 @@ mod tests {
             1,
             0,
             0,
-            None,
-            None,
-            None,
-            None,
             None,
             &[],
             &config,
@@ -2051,10 +1810,6 @@ mod tests {
             0,
             0,
             None,
-            None,
-            None,
-            None,
-            None,
             &[],
             &config,
         );
@@ -2079,10 +1834,6 @@ mod tests {
             60,
             0,
             0,
-            None,
-            None,
-            None,
-            None,
             None,
             &[],
             &config,
@@ -2122,10 +1873,6 @@ mod tests {
             0,
             0,
             None,
-            None,
-            None,
-            None,
-            None,
             &[],
             &config,
         )
@@ -2158,10 +1905,6 @@ mod tests {
             0,
             0,
             0,
-            None,
-            None,
-            None,
-            None,
             None,
             &[],
             &config,
@@ -2357,10 +2100,6 @@ mod tests {
             2, // correction_count > 0
             0,
             None,
-            None,
-            None,
-            None,
-            None,
             &[],
             &config,
         )
@@ -2487,118 +2226,6 @@ mod tests {
             !model.has_meaningful_self_awareness(),
             "minimal model (only turn counter) must be gated out"
         );
-    }
-
-    #[test]
-    fn not_meaningful_when_only_session_goal_set() {
-        // `session_goal` is auto-seeded from the first user message, so
-        // its presence alone is not a signal — otherwise every turn
-        // after turn 1 would pass the gate, regressing the whole
-        // purpose of this method.
-        let config = RuntimeConfig::default();
-        let model = SelfModel::snapshot(
-            &["bash"],
-            &[],
-            &[],
-            &[],
-            None,
-            1,
-            None,
-            None,
-            None,
-            0,
-            0,
-            0,
-            Some("hi"),
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &config,
-        );
-        assert!(
-            !model.has_meaningful_self_awareness(),
-            "bare session_goal echoing the first user message is not a real signal"
-        );
-    }
-
-    #[test]
-    fn meaningful_when_plan_goal_set() {
-        // Explicit plan_goal (set by ActionPlan execution) is a real
-        // commitment — counts on its own.
-        let config = RuntimeConfig::default();
-        let model = SelfModel::snapshot(
-            &["bash"],
-            &[],
-            &[],
-            &[],
-            None,
-            1,
-            None,
-            None,
-            None,
-            0,
-            0,
-            0,
-            None,
-            Some("refactor auth middleware"),
-            None,
-            None,
-            None,
-            &[],
-            &config,
-        );
-        assert!(model.has_meaningful_self_awareness());
-    }
-
-    #[test]
-    fn meaningful_when_session_goal_with_progress() {
-        // session_goal + tracker progress with real completion = signal.
-        let mut model = minimal_model();
-        model.goals.session_goal = Some("hi".into());
-        model.goals.progress = Some(GoalProgress {
-            completion_score: 0.5,
-            momentum: 0.1,
-            milestone_count: 1,
-            summary: "half done".into(),
-        });
-        assert!(model.has_meaningful_self_awareness());
-    }
-
-    #[test]
-    fn not_meaningful_when_progress_is_zero_placeholder() {
-        // `GoalTracker::progress()` returns a zero-filled GoalProgress even
-        // when no milestone has been recorded. Production always calls
-        // `goal_tracker.progress()` → `Some(...)`, so the `progress.is_some()`
-        // check alone would trip on turn 1 before any real work happens.
-        // Only positive completion_score or non-zero milestone_count counts.
-        let mut model = minimal_model();
-        model.goals.session_goal = Some("hi".into());
-        model.goals.progress = Some(GoalProgress {
-            completion_score: 0.0,
-            momentum: 0.0,
-            milestone_count: 0,
-            summary: "No milestones recorded yet.".into(),
-        });
-        assert!(
-            !model.has_meaningful_self_awareness(),
-            "zero-placeholder progress must not count — otherwise turn 1 \
-             bootstrap would always trip the gate"
-        );
-    }
-
-    #[test]
-    fn meaningful_when_session_goal_with_milestones() {
-        use astra_turn_core::goal_tracker::{Milestone, MilestoneSignal};
-        let mut model = minimal_model();
-        model.goals.session_goal = Some("hi".into());
-        model.goals.recent_milestones.push(Milestone {
-            turn: 2,
-            signal: MilestoneSignal::BuildSuccess,
-            relevance: 1.0,
-        });
-        assert!(model.has_meaningful_self_awareness());
     }
 
     #[test]

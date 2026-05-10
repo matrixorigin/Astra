@@ -129,7 +129,6 @@ pub struct PromptContextSignals {
     pub self_awareness: bool,
     pub implicit_feedback: bool,
     pub learned_feedback_rules: bool,
-    pub session_anchor: bool,
     #[serde(default)]
     pub memoria_insights: bool,
 }

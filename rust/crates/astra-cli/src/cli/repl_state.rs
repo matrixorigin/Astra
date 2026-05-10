@@ -98,9 +98,6 @@ pub(crate) struct ReplState {
     /// Sticky task/thread summary used to anchor ultra-short follow-ups like
     /// "继续" even after history compaction prunes earlier turns.
     pub continuation_anchor: Option<String>,
-    /// Session-level goal derived from the first substantive user message.
-    /// Survives compaction and is injected alongside the continuation anchor.
-    pub session_goal: Option<String>,
     /// One-shot diagnostics context injected by `/ask`. Prepended to the next
     /// user message so the LLM sees runtime state alongside the question.
     /// Consumed (cleared) after one turn.
@@ -248,9 +245,6 @@ pub(crate) struct ReplState {
     /// Resume guidance message from a previously interrupted checkpoint.
     /// One-shot: consumed and cleared after the first turn that uses it.
     pub resume_guidance: Option<String>,
-    /// Runtime-owned continuity restored from checkpoint or updated by the last turn.
-    /// This is the live source for the next agentic loop, not just prompt guidance.
-    pub runtime_continuity: Option<astra_turn_types::continuity::ContinuityState>,
 
     /// Pre-computed plan-resume digest (P3.3).
     ///
@@ -334,8 +328,6 @@ pub(crate) struct ReplState {
     >,
     /// Adaptive state restored from workspace, applied when ObservabilitySession is created.
     pub pending_adaptive_state: Option<PersistedAdaptiveState>,
-    /// Persisted live goal-progress snapshot restored from workspace.
-    pub pending_goal_progress: Option<astra_services::session_workspace::GoalProgressSnapshot>,
 
     // ── User Profile (M5) ──
     /// User profile manager for preferences and scenario detection.
@@ -402,7 +394,6 @@ impl Default for ReplState {
             )),
             task_manager: std::sync::Arc::new(crate::edge_tools::TaskManager::new()),
             continuation_anchor: None,
-            session_goal: None,
             diagnostics_context: None,
             queued_message: None,
             pending_followup_suggestion: None,
@@ -483,7 +474,6 @@ impl Default for ReplState {
             pending_idle_agent_messages: Vec::new(),
             redo_stack: Vec::new(),
             resume_guidance: None,
-            runtime_continuity: None,
             pending_plan_resume_digest: None,
             drift_compressed_turns: Vec::new(),
             drift_user_corrections: Vec::new(),
@@ -504,7 +494,6 @@ impl Default for ReplState {
             observability_hub: None,
             observability_session: None,
             pending_adaptive_state: None,
-            pending_goal_progress: None,
             user_profile_manager: {
                 let store =
                     std::sync::Arc::new(astra_config::user_profile::UserProfileStore::new());

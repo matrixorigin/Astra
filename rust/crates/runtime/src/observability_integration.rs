@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use astra_services::session_journal::{JournalEvent, JournalWriter};
 use astra_services::session_workspace::{
     ContextTraceBudgetSignal, ContextTraceHistorySignal, ContextTraceMemorySignal,
-    ContextTraceSignal, ContextTraceTimingSignal, ContextTraceToolSelection, GoalProgressSnapshot,
+    ContextTraceSignal, ContextTraceTimingSignal, ContextTraceToolSelection,
 };
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +28,6 @@ use astra_learning::auto_tuning::{
 };
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use astra_turn_core::decision_explainer::{DecisionExplanation, DriftDetector, FocusDriftAnalysis};
-use astra_turn_core::goal_tracker::{GoalProgress, GoalTracker};
 
 // ─── Session Context ────────────────────────────────────────────────────────
 
@@ -83,9 +82,6 @@ pub struct ObservabilitySession {
 
     /// Fuzzy str_replace matching telemetry for this session.
     pub fuzzy_match_events: Vec<FuzzyMatchEvent>,
-
-    /// Goal completion tracker (initialized on first user query).
-    pub goal_tracker: Option<GoalTracker>,
 
     /// Last drift origin turn already emitted as a signal/journal event.
     last_reported_drift_turn: Option<u32>,
@@ -205,7 +201,6 @@ pub struct ObservabilitySession {
 pub struct ObservabilitySessionRollbackSnapshot {
     pub config: RuntimeConfig,
     pub original_query: Option<String>,
-    pub goal_progress: Option<GoalProgressSnapshot>,
     pub recent_queries: Vec<String>,
     pub compressed_turns: Vec<u32>,
     pub user_corrections: Vec<u32>,
@@ -283,7 +278,6 @@ impl ObservabilitySession {
             last_query_at: None,
             turn_timings: Vec::new(),
             fuzzy_match_events: Vec::new(),
-            goal_tracker: None,
             last_reported_drift_turn: None,
             last_scenario_change_turn: None,
             last_token_budget_direction: 0,
@@ -329,7 +323,6 @@ impl ObservabilitySession {
             last_query_at: None,
             turn_timings: Vec::new(),
             fuzzy_match_events: Vec::new(),
-            goal_tracker: None,
             last_reported_drift_turn: None,
             last_scenario_change_turn: None,
             last_token_budget_direction: 0,
@@ -512,44 +505,10 @@ impl ObservabilitySession {
         self.record_query_at(query, Instant::now());
     }
 
-    /// Explicitly steer the session onto a new goal and reset goal-specific drift state.
-    pub fn steer_goal(&mut self, goal: &str) -> bool {
-        let goal = goal.trim();
-        if goal.is_empty() {
-            return false;
-        }
-        let already_tracking = self
-            .goal_tracker
-            .as_ref()
-            .map(|tracker| tracker.goal() == goal)
-            .or_else(|| {
-                self.original_query
-                    .as_deref()
-                    .map(|existing| existing == goal)
-            })
-            .unwrap_or(false);
-        if already_tracking {
-            return false;
-        }
-
-        self.original_query = Some(goal.to_string());
-        self.goal_tracker = Some(GoalTracker::new(goal));
-        self.recent_queries.clear();
-        self.recent_queries.push(goal.to_string());
-        self.compressed_turns.clear();
-        self.user_corrections.clear();
-        self.context_traces.clear();
-        self.drift_detector = DriftDetector::default();
-        self.last_reported_drift_turn = None;
-        self.last_query_at = None;
-        true
-    }
-
     fn record_query_at(&mut self, query: &str, query_time: Instant) {
         // Set original query on first turn
         if self.original_query.is_none() {
             self.original_query = Some(query.to_string());
-            self.goal_tracker = Some(GoalTracker::new(query));
         }
         self.recent_queries.push(query.to_string());
         // Keep only the last N queries
@@ -557,12 +516,6 @@ impl ObservabilitySession {
             self.recent_queries.remove(0);
         }
 
-        // Feed user sentiment to goal tracker
-        if let Some(ref mut tracker) = self.goal_tracker {
-            if let Some(signal) = astra_turn_core::goal_tracker::detect_user_sentiment(query) {
-                tracker.record(self.turn_number, signal);
-            }
-        }
         self.last_query_at = Some(query_time);
     }
 
@@ -801,32 +754,14 @@ impl ObservabilitySession {
         Some(analysis)
     }
 
-    /// Record a tool result as a potential goal milestone.
-    pub fn record_tool_result(&mut self, tool_name: &str, output: &str, exit_code: Option<i32>) {
-        if let Some(ref mut tracker) = self.goal_tracker {
-            if let Some(signal) =
-                astra_turn_core::goal_tracker::detect_signal(tool_name, output, exit_code)
-            {
-                tracker.record(self.turn_number, signal);
-            }
-        }
-    }
-
-    /// Get current goal progress (None if no goal set yet).
-    pub fn goal_progress(&self) -> Option<GoalProgress> {
-        self.goal_tracker.as_ref().map(|t| t.progress())
-    }
-
-    /// Export persisted goal-tracker state for workspace resume and self surfaces.
-    pub fn goal_progress_snapshot(&self) -> Option<GoalProgressSnapshot> {
-        self.goal_tracker.as_ref().map(GoalTracker::snapshot)
+    /// Record a tool result (no-op; previously fed the goal tracker).
+    pub fn record_tool_result(&mut self, _tool_name: &str, _output: &str, _exit_code: Option<i32>) {
     }
 
     pub fn rollback_snapshot(&self) -> ObservabilitySessionRollbackSnapshot {
         ObservabilitySessionRollbackSnapshot {
             config: self.config.clone(),
             original_query: self.original_query.clone(),
-            goal_progress: self.goal_progress_snapshot(),
             recent_queries: self.recent_queries.clone(),
             compressed_turns: self.compressed_turns.clone(),
             user_corrections: self.user_corrections.clone(),
@@ -841,10 +776,6 @@ impl ObservabilitySession {
     pub fn restore_rollback_snapshot(&mut self, snapshot: &ObservabilitySessionRollbackSnapshot) {
         self.config = snapshot.config.clone();
         self.original_query = snapshot.original_query.clone();
-        self.goal_tracker = snapshot
-            .goal_progress
-            .as_ref()
-            .map(GoalTracker::from_snapshot);
         self.recent_queries = snapshot.recent_queries.clone();
         self.compressed_turns = snapshot.compressed_turns.clone();
         self.user_corrections = snapshot.user_corrections.clone();
@@ -855,12 +786,6 @@ impl ObservabilitySession {
         };
         self.last_reported_drift_turn = snapshot.last_reported_drift_turn;
         self.last_query_at = snapshot.last_query_at;
-    }
-
-    /// Restore goal-tracker state from workspace persistence.
-    pub fn restore_goal_progress(&mut self, snapshot: GoalProgressSnapshot) {
-        self.original_query = Some(snapshot.goal.clone());
-        self.goal_tracker = Some(GoalTracker::from_snapshot(&snapshot));
     }
 }
 
@@ -1601,35 +1526,6 @@ mod tests {
         let profile = hub.profiles().get_profile("user1");
         assert_eq!(profile.stats.total_queries, 1);
         assert_eq!(profile.stats.total_tool_calls, 1);
-    }
-
-    #[test]
-    fn steer_goal_resets_goal_specific_drift_state() {
-        let mut session = ObservabilitySession::new_simple("session-steer");
-        session.record_query("finish auth flow");
-        session.recent_queries.push("debug auth flow".to_string());
-        session.compressed_turns.push(3);
-        session.user_corrections.push(4);
-        session.context_traces.push(ContextAssemblyTrace::default());
-        session.last_reported_drift_turn = Some(7);
-        session.last_query_at = Some(Instant::now());
-
-        session.steer_goal("ship billing flow");
-
-        assert_eq!(session.original_query.as_deref(), Some("ship billing flow"));
-        assert_eq!(
-            session.goal_tracker.as_ref().map(|tracker| tracker.goal()),
-            Some("ship billing flow")
-        );
-        assert_eq!(
-            session.recent_queries,
-            vec!["ship billing flow".to_string()]
-        );
-        assert!(session.compressed_turns.is_empty());
-        assert!(session.user_corrections.is_empty());
-        assert!(session.context_traces.is_empty());
-        assert_eq!(session.last_reported_drift_turn, None);
-        assert!(session.last_query_at.is_none());
     }
 
     #[test]

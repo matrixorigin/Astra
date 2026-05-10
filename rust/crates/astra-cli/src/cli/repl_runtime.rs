@@ -502,7 +502,6 @@ pub(crate) fn initialize_repl_state(
         state.observability_session = Some(hub.start_session(&user_id, "pending"));
         // Apply any adaptive state stashed during workspace restore.
         super::repl_turn::apply_pending_adaptive_state(&mut state);
-        super::repl_turn::apply_pending_goal_progress_state(&mut state);
     }
 
     // Restore persisted feedback aggregator state (if any)
