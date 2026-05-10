@@ -133,7 +133,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run"},
-                        "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."}
+                        "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."},
+                        "force": {"type": "boolean", "description": "If true, bypass the per-session identical-command cache and execute even when the same command already succeeded."}
                     },
                     "required": ["command"]
                 }
@@ -196,7 +197,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             }
                         },
                         "dry_run": {"type": "boolean", "description": "Preview diff without applying (default: false)"},
-                        "replace_all": {"type": "boolean", "description": "Replace ALL occurrences (default: false)"}
+                        "replace_all": {"type": "boolean", "description": "Replace ALL occurrences (default: false)"},
+                        "allow_structural_change": {"type": "boolean", "description": "Bypass structural safety checks for intentional syntax-breaking or comment-removing edits (default: false)"}
                     },
                     "required": ["path"]
                 }

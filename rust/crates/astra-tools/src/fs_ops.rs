@@ -624,11 +624,18 @@ impl PreparedWriteFile {
         }
 
         match std::fs::write(&self.path, &self.content) {
-            Ok(()) => ToolResult::text(format!(
-                "Successfully wrote {} bytes to {}",
-                self.content.len(),
-                self.path_str
-            )),
+            Ok(()) => {
+                let warning = format_file_in_place_best_effort(&self.path);
+                let mut message = format!(
+                    "Successfully wrote {} bytes to {}",
+                    self.content.len(),
+                    self.path_str
+                );
+                if let Some(warning) = warning {
+                    message.push_str(&format!("\nWarning: {warning}"));
+                }
+                ToolResult::text(message)
+            }
             Err(e) => ToolResult::error(format!("Error: Cannot write file: {e}")),
         }
     }
@@ -654,11 +661,12 @@ pub fn prepare_write_file(
         Ok(p) => p,
         Err(e) => return Err(ToolResult::error(e)),
     };
+    let content = normalize_content_before_write(&path, content);
 
     Ok(PreparedWriteFile {
         path,
         path_str: path_str.to_string(),
-        content: content.to_string(),
+        content,
     })
 }
 
@@ -695,7 +703,14 @@ impl PreparedStrReplace {
             return ToolResult::text(self.success_message);
         }
         match std::fs::write(&self.path, &self.new_content) {
-            Ok(()) => ToolResult::text(self.success_message),
+            Ok(()) => {
+                let warning = format_file_in_place_best_effort(&self.path);
+                let mut message = self.success_message;
+                if let Some(warning) = warning {
+                    message.push_str(&format!("\nWarning: {warning}"));
+                }
+                ToolResult::text(message)
+            }
             Err(e) => ToolResult::error(format!("Error: Cannot write file: {e}")),
         }
     }
@@ -733,6 +748,10 @@ pub fn prepare_str_replace(
         .get("dry_run")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let allow_structural_change = args
+        .get("allow_structural_change")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let path = match resolve_path(workspace_root, path_str) {
         Ok(p) => p,
         Err(e) => return Err(ToolResult::error(e)),
@@ -758,11 +777,22 @@ pub fn prepare_str_replace(
             } else {
                 new_str.to_string()
             };
-            let new_content = if replace_all {
+            let mut new_content = if replace_all {
                 content.replace(fuzzy_match.actual, &replacement)
             } else {
                 content.replacen(fuzzy_match.actual, &replacement, 1)
             };
+            if !allow_structural_change {
+                validate_structural_edit(
+                    &path,
+                    &content,
+                    &new_content,
+                    fuzzy_match.actual,
+                    new_str,
+                )
+                .map_err(ToolResult::error)?;
+            }
+            new_content = normalize_content_before_write(&path, &new_content);
             let success_message = if dry_run {
                 unified_diff(&content, &new_content, path_str)
             } else {
@@ -795,11 +825,16 @@ pub fn prepare_str_replace(
         )));
     }
 
-    let new_content = if replace_all {
+    let mut new_content = if replace_all {
         content.replace(old_str, new_str)
     } else {
         content.replacen(old_str, new_str, 1)
     };
+    if !allow_structural_change {
+        validate_structural_edit(&path, &content, &new_content, old_str, new_str)
+            .map_err(ToolResult::error)?;
+    }
+    new_content = normalize_content_before_write(&path, &new_content);
     let success_message = if dry_run {
         unified_diff(&content, &new_content, path_str)
     } else if replace_all {
@@ -852,10 +887,17 @@ impl PreparedMultiEdit {
         }
 
         match std::fs::write(&self.path, &self.new_content) {
-            Ok(()) => ToolResult::text(format!(
-                "Successfully applied {} edit(s) to {}",
-                self.edit_count, self.path_str
-            )),
+            Ok(()) => {
+                let warning = format_file_in_place_best_effort(&self.path);
+                let mut message = format!(
+                    "Successfully applied {} edit(s) to {}",
+                    self.edit_count, self.path_str
+                );
+                if let Some(warning) = warning {
+                    message.push_str(&format!("\nWarning: {warning}"));
+                }
+                ToolResult::text(message)
+            }
             Err(e) => ToolResult::error(format!("Error: Cannot write file: {e}")),
         }
     }
@@ -880,6 +922,10 @@ pub fn prepare_multi_edit(
         .get("dry_run")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let allow_structural_change = args
+        .get("allow_structural_change")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let path = match resolve_path(workspace_root, path_str) {
         Ok(p) => p,
@@ -890,7 +936,8 @@ pub fn prepare_multi_edit(
         Err(e) => return Err(ToolResult::error(format!("Error: Cannot read file: {e}"))),
     };
 
-    let mut working = content;
+    let original_content = content;
+    let mut working = original_content.clone();
     for (i, edit) in edits.iter().enumerate() {
         let old_str = match edit.get("old_str").and_then(|v| v.as_str()) {
             Some(s) => s,
@@ -924,8 +971,14 @@ pub fn prepare_multi_edit(
                 "Error: edit[{i}] old_str found {count} times in {path_str}. Must match exactly once."
             )));
         }
-        working = working.replacen(old_str, new_str, 1);
+        let next = working.replacen(old_str, new_str, 1);
+        if !allow_structural_change {
+            validate_structural_edit(&path, &working, &next, old_str, new_str)
+                .map_err(ToolResult::error)?;
+        }
+        working = next;
     }
+    working = normalize_content_before_write(&path, &working);
 
     Ok(PreparedMultiEdit {
         path,
@@ -1054,6 +1107,140 @@ pub fn multi_edit(workspace_root: &Path, args: &Value) -> ToolResult {
         Ok(prepared) => prepared.apply(),
         Err(error) => error,
     }
+}
+
+const TEXT_TRAILING_NEWLINE_EXTS: &[&str] = &[
+    "bash", "c", "cc", "cfg", "conf", "cpp", "css", "csv", "go", "h", "hpp", "html", "java", "js",
+    "jsx", "json", "jsonl", "kt", "lua", "md", "py", "rb", "rs", "sh", "sql", "toml", "ts", "tsx",
+    "txt", "xml", "yaml", "yml", "zsh",
+];
+
+const BINARY_WRITE_EXTS: &[&str] = &[
+    "bin", "dat", "pdf", "zip", "gz", "tar", "bz2", "xz", "7z", "rar", "exe", "dll", "so", "dylib",
+    "o", "a", "lib", "wasm", "class", "pyc", "pyo", "mp3", "mp4", "avi", "mov", "wav", "flac",
+    "ogg", "png", "jpg", "jpeg", "gif", "bmp", "webp", "ttf", "otf", "woff", "woff2", "eot",
+    "sqlite", "db", "mdb", "ico",
+];
+
+fn extension_lower(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+}
+
+fn should_ensure_trailing_newline(path: &Path) -> bool {
+    let Some(ext) = extension_lower(path) else {
+        return false;
+    };
+    if BINARY_WRITE_EXTS.contains(&ext.as_str()) {
+        return false;
+    }
+    TEXT_TRAILING_NEWLINE_EXTS.contains(&ext.as_str())
+}
+
+fn normalize_content_before_write(path: &Path, content: &str) -> String {
+    let mut out = content.to_string();
+    if should_ensure_trailing_newline(path) && !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn format_file_in_place_best_effort(path: &Path) -> Option<String> {
+    match extension_lower(path).as_deref() {
+        Some("rs") => run_formatter(path, "rustfmt", &["--emit=files"]),
+        Some("py") => run_formatter(path, "ruff", &["format", "--quiet"]),
+        Some("ts" | "tsx" | "js" | "jsx" | "json" | "md" | "yaml" | "yml") => {
+            run_formatter(path, "prettier", &["--write", "--log-level=warn"])
+        }
+        _ => None,
+    }
+}
+
+fn run_formatter(path: &Path, program: &str, args: &[&str]) -> Option<String> {
+    let mut command = std::process::Command::new(program);
+    command.args(args).arg(path);
+    match command.output() {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Some(format!(
+                "{program} failed for {}: {}{}",
+                path.display(),
+                stdout.trim(),
+                stderr.trim()
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(format!("{program} failed for {}: {e}", path.display())),
+    }
+}
+
+fn validate_structural_edit(
+    path: &Path,
+    original: &str,
+    updated: &str,
+    old_str: &str,
+    new_str: &str,
+) -> Result<(), String> {
+    let Some(lang) = crate::code_intel::detect_language(path) else {
+        return Ok(());
+    };
+
+    if comment_line_count(new_str) < comment_line_count(old_str) {
+        return Err(format!(
+            "Error: structural validation rejected edit to {}: replacement removes comment/doc-comment lines. If this is intentional, retry with allow_structural_change=true.",
+            path.display()
+        ));
+    }
+
+    let Some(original_has_error) = tree_sitter_has_error(original, lang) else {
+        return Ok(());
+    };
+    if original_has_error {
+        return Ok(());
+    }
+    if tree_sitter_has_error(updated, lang).unwrap_or(false) {
+        return Err(format!(
+            "Error: structural validation rejected edit to {}: updated file has syntax errors. If this is intentional, retry with allow_structural_change=true.",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn comment_line_count(s: &str) -> usize {
+    s.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("///")
+                || trimmed.starts_with("//!")
+                || trimmed.starts_with("//")
+                || trimmed.starts_with('#')
+        })
+        .count()
+}
+
+fn tree_sitter_has_error(source: &str, lang: crate::code_intel::Language) -> Option<bool> {
+    let mut parser = tree_sitter::Parser::new();
+    let language = match lang {
+        crate::code_intel::Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+        crate::code_intel::Language::Python => tree_sitter_python::LANGUAGE.into(),
+        crate::code_intel::Language::TypeScript | crate::code_intel::Language::JavaScript => {
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+        }
+        crate::code_intel::Language::Go => tree_sitter_go::LANGUAGE.into(),
+        crate::code_intel::Language::Java => tree_sitter_java::LANGUAGE.into(),
+        crate::code_intel::Language::C | crate::code_intel::Language::Cpp => {
+            tree_sitter_cpp::LANGUAGE.into()
+        }
+        crate::code_intel::Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+    };
+    parser.set_language(&language).ok()?;
+    parser
+        .parse(source, None)
+        .map(|tree| tree.root_node().has_error())
 }
 
 fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> String {
@@ -1718,6 +1905,43 @@ mod tests {
     }
 
     #[test]
+    fn write_file_text_extensions_get_trailing_newline() {
+        let tmp = TempDir::new().unwrap();
+        let args = serde_json::json!({"path": "permissions.json", "content": "{\"allow\":[]}"});
+
+        let result = write_file(tmp.path(), &args);
+
+        assert!(!result.is_error, "got error: {}", result.output);
+        let content = std::fs::read_to_string(tmp.path().join("permissions.json")).unwrap();
+        assert_eq!(content, "{\"allow\":[]}\n");
+    }
+
+    #[test]
+    fn write_file_binary_extensions_do_not_get_trailing_newline() {
+        let tmp = TempDir::new().unwrap();
+        let args = serde_json::json!({"path": "payload.bin", "content": "abc"});
+
+        let result = write_file(tmp.path(), &args);
+
+        assert!(!result.is_error, "got error: {}", result.output);
+        let content = std::fs::read(tmp.path().join("payload.bin")).unwrap();
+        assert_eq!(content, b"abc");
+    }
+
+    #[test]
+    fn write_file_rust_runs_rustfmt_best_effort() {
+        let tmp = TempDir::new().unwrap();
+        let args =
+            serde_json::json!({"path": "main.rs", "content": "fn main(){println!(\"hi\");}"});
+
+        let result = write_file(tmp.path(), &args);
+
+        assert!(!result.is_error, "got error: {}", result.output);
+        let content = std::fs::read_to_string(tmp.path().join("main.rs")).unwrap();
+        assert_eq!(content, "fn main() {\n    println!(\"hi\");\n}\n");
+    }
+
+    #[test]
     fn str_replace_basic() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("f.txt"), "foo bar baz").unwrap();
@@ -1725,7 +1949,95 @@ mod tests {
         let result = str_replace(tmp.path(), &args);
         assert!(!result.is_error);
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
-        assert_eq!(content, "foo qux baz");
+        assert_eq!(content, "foo qux baz\n");
+    }
+
+    #[test]
+    fn str_replace_text_extensions_get_trailing_newline() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("lib.rs"), "fn main() {}").unwrap();
+        let args = serde_json::json!({"path": "lib.rs", "old_str": "main", "new_str": "run"});
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(!result.is_error, "got error: {}", result.output);
+        let content = std::fs::read_to_string(tmp.path().join("lib.rs")).unwrap();
+        assert!(
+            content.ends_with('\n'),
+            "missing trailing newline: {content:?}"
+        );
+    }
+
+    #[test]
+    fn str_replace_rejects_new_rust_parse_errors_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let original = "fn main() {\n    println!(\"ok\");\n}\n";
+        std::fs::write(tmp.path().join("main.rs"), original).unwrap();
+        let args = serde_json::json!({
+            "path": "main.rs",
+            "old_str": "println!(\"ok\");",
+            "new_str": "println!(\"ok);"
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(result.is_error, "invalid Rust edit should be rejected");
+        assert!(
+            result.output.contains("structural validation"),
+            "got: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("main.rs")).unwrap();
+        assert_eq!(content, original);
+    }
+
+    #[test]
+    fn str_replace_rejects_comment_line_loss_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let original = "/// One\n/// Two\n/// Three\npub fn thing() {}\n";
+        std::fs::write(tmp.path().join("lib.rs"), original).unwrap();
+        let args = serde_json::json!({
+            "path": "lib.rs",
+            "old_str": original,
+            "new_str": "/// One\n/// Three\npub fn thing() {}\n"
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(result.is_error, "doc-comment loss should be rejected");
+        assert!(
+            result.output.contains("comment/doc-comment"),
+            "got: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("lib.rs")).unwrap();
+        assert_eq!(content, original);
+    }
+
+    #[test]
+    fn str_replace_allows_structural_change_when_explicitly_requested() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("main.rs"),
+            "fn main() {\n    println!(\"ok\");\n}\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "path": "main.rs",
+            "old_str": "println!(\"ok\");",
+            "new_str": "println!(\"ok);",
+            "allow_structural_change": true
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(
+            !result.is_error,
+            "explicit bypass should allow edit: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("main.rs")).unwrap();
+        assert!(content.contains("println!(\"ok);"));
     }
 
     #[test]
@@ -1801,7 +2113,7 @@ mod tests {
         let result = str_replace(tmp.path(), &args);
         assert!(!result.is_error, "got error: {}", result.output);
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
-        assert_eq!(content, "let x = \u{201C}world\u{201D};");
+        assert_eq!(content, "let x = \u{201C}world\u{201D};\n");
     }
 
     #[test]
@@ -2353,7 +2665,7 @@ mod tests {
         let result = multi_edit(tmp.path(), &args);
         assert!(!result.is_error);
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
-        assert_eq!(content, "AAA bbb CCC");
+        assert_eq!(content, "AAA bbb CCC\n");
     }
 
     #[test]
