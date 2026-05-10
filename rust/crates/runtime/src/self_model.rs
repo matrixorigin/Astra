@@ -86,7 +86,8 @@ pub struct SelfModel {
     /// boost the tool's score; negative entries penalize. Surfaced so the
     /// agent can audit why a tool is being preferred or avoided.
     #[serde(default)]
-    pub outcome_bias: std::collections::BTreeMap<String, f64>,
+    pub outcome_bias:
+        std::collections::BTreeMap<String, astra_turn_core::tool_health::OutcomeBiasEntry>,
     /// High-failure tools surfaced for the model to reason about — the
     /// runtime provides the signal; the model decides whether to avoid
     /// them or try anyway.
@@ -648,7 +649,10 @@ impl SelfModel {
     /// (`ToolHealthTracker::outcome_bias_by_tool`). Only non-zero entries
     /// should be passed in; zeros will still render as "neutral" rows if
     /// supplied.
-    pub fn with_outcome_bias(mut self, bias: std::collections::BTreeMap<String, f64>) -> Self {
+    pub fn with_outcome_bias(
+        mut self,
+        bias: std::collections::BTreeMap<String, astra_turn_core::tool_health::OutcomeBiasEntry>,
+    ) -> Self {
         self.outcome_bias = bias;
         self
     }
@@ -968,11 +972,11 @@ impl SelfModel {
         // Explains which tools the selector is currently boosting /
         // penalizing based on recent success / failure history.
         if !self.outcome_bias.is_empty() {
-            let mut entries: Vec<(String, f64)> = self
+            let mut entries: Vec<(String, f64, Option<String>)> = self
                 .outcome_bias
                 .iter()
-                .filter(|(_, b)| b.abs() >= 0.005)
-                .map(|(t, b)| (t.clone(), *b))
+                .filter(|(_, e)| e.score.abs() >= 0.005)
+                .map(|(t, e)| (t.clone(), e.score, e.last_failure_tag.clone()))
                 .collect();
             entries.sort_by(|a, b| {
                 b.1.abs()
@@ -983,12 +987,14 @@ impl SelfModel {
                 let rendered: Vec<String> = entries
                     .into_iter()
                     .take(4)
-                    .map(|(tool, bias)| {
+                    .map(|(tool, bias, tag)| {
                         let arrow = if bias > 0.0 { "↑" } else { "↓" };
                         let reason = if bias > 0.0 {
-                            "recent successes"
+                            "recent successes".to_string()
+                        } else if let Some(t) = tag {
+                            format!("recent failures: {t}")
                         } else {
-                            "recent failures"
+                            "recent failures".to_string()
                         };
                         format!("{tool} {arrow}{:.2} ({reason})", bias.abs())
                     })
@@ -2371,10 +2377,23 @@ mod tests {
 
     #[test]
     fn outcome_bias_renders_sorted_by_magnitude() {
+        use astra_turn_core::tool_health::OutcomeBiasEntry;
         let mut bias = std::collections::BTreeMap::new();
-        bias.insert("bash".to_string(), -0.10);
-        bias.insert("write_file".to_string(), 0.08);
-        bias.insert("read_file".to_string(), 0.02);
+        bias.insert(
+            "bash".to_string(),
+            OutcomeBiasEntry {
+                score: -0.10,
+                last_failure_tag: Some("timeout".to_string()),
+            },
+        );
+        bias.insert(
+            "write_file".to_string(),
+            OutcomeBiasEntry::from_score(0.08),
+        );
+        bias.insert(
+            "read_file".to_string(),
+            OutcomeBiasEntry::from_score(0.02),
+        );
         let model = minimal_model().with_outcome_bias(bias);
         let rendered = model.to_system_prompt_section();
         assert!(
@@ -2392,12 +2411,20 @@ mod tests {
         assert!(pos_write < pos_read, "|0.08| > |0.02|: {line}");
         assert!(line.contains("↓0.10"), "got: {line}");
         assert!(line.contains("↑0.08"), "got: {line}");
+        assert!(
+            line.contains("recent failures: timeout"),
+            "negative-bias entry should surface failure tag: {line}"
+        );
     }
 
     #[test]
     fn outcome_bias_filters_near_zero_entries() {
+        use astra_turn_core::tool_health::OutcomeBiasEntry;
         let mut bias = std::collections::BTreeMap::new();
-        bias.insert("noise".to_string(), 0.001);
+        bias.insert(
+            "noise".to_string(),
+            OutcomeBiasEntry::from_score(0.001),
+        );
         let model = minimal_model().with_outcome_bias(bias);
         let rendered = model.to_system_prompt_section();
         assert!(
@@ -2696,7 +2723,10 @@ mod tests {
     #[test]
     fn meaningful_when_outcome_bias_populated() {
         let mut model = minimal_model();
-        model.outcome_bias.insert("bash".into(), -0.3);
+        model.outcome_bias.insert(
+            "bash".into(),
+            astra_turn_core::tool_health::OutcomeBiasEntry::from_score(-0.3),
+        );
         assert!(model.has_meaningful_self_awareness());
     }
 

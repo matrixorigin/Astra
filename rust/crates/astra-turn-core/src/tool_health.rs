@@ -8,7 +8,7 @@
 //! ends. It complements the cross-session `ToolQualityTracker` which
 //! tracks long-term tool reliability.
 
-use crate::action_compensation::{FailureCategory, classify_execution_outcome};
+use crate::action_compensation::{classify_execution_outcome, FailureCategory};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -46,6 +46,37 @@ pub struct RecentOutcomeHint {
     pub success: bool,
     pub at_epoch: u64,
     pub failure_category: Option<FailureCategory>,
+}
+
+/// Per-tool outcome bias entry returned by
+/// [`ToolHealthTracker::outcome_bias_by_tool`].
+///
+/// `score` is the clamped bias in `[-0.16, +0.10]` (negative = penalize,
+/// positive = boost). `last_failure_tag` is the failure class tag of the
+/// most recent failing outcome (only populated for negative biases); lets
+/// renderers replace the generic "recent failures" reason with the actual
+/// failure kind (e.g. `"recent failures: timeout"`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OutcomeBiasEntry {
+    pub score: f64,
+    /// Failure-class tag (e.g. `"timeout"`, `"permission"`) of the most
+    /// recent failing outcome for this tool. Stored as `String` for
+    /// Serde compatibility; callers can match on it as a stable tag set
+    /// defined by [`failure_category_tag`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_tag: Option<String>,
+}
+
+impl OutcomeBiasEntry {
+    /// Convenience: build an entry with no failure tag. Used by callers
+    /// that reconstruct a bias map purely from a numeric score.
+    #[must_use]
+    pub fn from_score(score: f64) -> Self {
+        Self {
+            score,
+            last_failure_tag: None,
+        }
+    }
 }
 
 impl ToolOutcome {
@@ -741,14 +772,22 @@ impl ToolHealthTracker {
     ///   clipped to `[-0.16, +0.10]`.
     ///
     /// Only entries with `|bias| > 0.001` are returned to keep the map sparse.
+    ///
+    /// Each entry also carries the `last_failure_tag` — the tag (e.g. `"timeout"`,
+    /// `"permission"`) of the most recent failing outcome across this tool's
+    /// signatures. `None` for tools with no recent failures or unclassified
+    /// failures. Lets downstream rendering say *why* the selector is
+    /// penalizing a tool instead of just "recent failures".
     #[must_use]
-    pub fn outcome_bias_by_tool(&self, max_age_secs: u64) -> HashMap<String, f64> {
+    pub fn outcome_bias_by_tool(&self, max_age_secs: u64) -> HashMap<String, OutcomeBiasEntry> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default();
         let mut successes: HashMap<String, usize> = HashMap::new();
         let mut fails: HashMap<String, usize> = HashMap::new();
+        // Per-tool newest failure: (epoch, tag).
+        let mut newest_fail: HashMap<String, (u64, Option<String>)> = HashMap::new();
         for (signature, ring) in &self.outcome_cache {
             let Some(outcome) = ring.back() else { continue };
             if outcome.at_epoch > 0
@@ -764,10 +803,21 @@ impl ToolHealthTracker {
             if outcome.success {
                 *successes.entry(tool_name).or_default() += 1;
             } else {
-                *fails.entry(tool_name).or_default() += 1;
+                *fails.entry(tool_name.clone()).or_default() += 1;
+                let tag = outcome
+                    .failure_category
+                    .map(|c| failure_category_tag(c).to_string());
+                newest_fail
+                    .entry(tool_name)
+                    .and_modify(|slot| {
+                        if outcome.at_epoch >= slot.0 {
+                            *slot = (outcome.at_epoch, tag.clone());
+                        }
+                    })
+                    .or_insert((outcome.at_epoch, tag));
             }
         }
-        let mut bias: HashMap<String, f64> = HashMap::new();
+        let mut bias: HashMap<String, OutcomeBiasEntry> = HashMap::new();
         let keys: std::collections::HashSet<&String> =
             successes.keys().chain(fails.keys()).collect();
         for key in keys {
@@ -776,7 +826,18 @@ impl ToolHealthTracker {
             let raw = 0.05 * s - 0.08 * f;
             let clamped = raw.clamp(-0.16, 0.10);
             if clamped.abs() > 0.001 {
-                bias.insert(key.clone(), clamped);
+                let last_failure_tag = if clamped < 0.0 {
+                    newest_fail.get(key).and_then(|(_, tag)| tag.clone())
+                } else {
+                    None
+                };
+                bias.insert(
+                    key.clone(),
+                    OutcomeBiasEntry {
+                        score: clamped,
+                        last_failure_tag,
+                    },
+                );
             }
         }
         bias

@@ -162,7 +162,12 @@ pub struct ObservabilitySession {
 
     /// Gap 6: per-tool outcome bias currently applied by the selector
     /// (`ToolHealthTracker::outcome_bias_by_tool`). Sorted by tool name.
-    pub outcome_bias: std::collections::BTreeMap<String, f64>,
+    ///
+    /// Values are `OutcomeBiasEntry { score, last_failure_tag }`. The tag
+    /// (e.g. `"timeout"`, `"permission"`) is populated only for negative
+    /// biases and surfaces the actual failure class back to the agent.
+    pub outcome_bias:
+        std::collections::BTreeMap<String, astra_turn_core::tool_health::OutcomeBiasEntry>,
 
     /// High-failure tools surfaced for SelfModel reasoning (name, fail_rate, samples).
     /// Populated by the adaptive-tuning cycle; consumed by the SelfModel snapshot
@@ -378,7 +383,7 @@ impl ObservabilitySession {
         let bias_text = self
             .outcome_bias
             .iter()
-            .map(|(t, b)| format!("{t}={b:.3}"))
+            .map(|(t, b)| format!("{t}={:.3}", b.score))
             .collect::<Vec<_>>()
             .join(",");
         self.injection_history.observe(
@@ -425,7 +430,7 @@ impl ObservabilitySession {
         let bias_text = self
             .outcome_bias
             .iter()
-            .map(|(t, b)| format!("{t}={b:.3}"))
+            .map(|(t, b)| format!("{t}={:.3}", b.score))
             .collect::<Vec<_>>()
             .join(",");
         self.injection_history.observe(
@@ -716,7 +721,10 @@ impl ObservabilitySession {
 
     /// Gap 6: publish the current per-tool outcome bias snapshot. Passing
     /// an empty map clears the prompt surface for this signal.
-    pub fn set_outcome_bias(&mut self, bias: std::collections::BTreeMap<String, f64>) {
+    pub fn set_outcome_bias(
+        &mut self,
+        bias: std::collections::BTreeMap<String, astra_turn_core::tool_health::OutcomeBiasEntry>,
+    ) {
         self.outcome_bias = bias;
     }
 
@@ -1475,7 +1483,7 @@ mod tests {
     #[test]
     fn observe_injections_stale_after_unchanged_signal_across_many_turns() {
         use astra_turn_core::injection_tracking::{
-            ChannelStatus, InjectionChannel, freshness_report,
+            freshness_report, ChannelStatus, InjectionChannel,
         };
         let mut session = ObservabilitySession::new_simple("sess-f85a02bb");
         session.recent_failing_tests = vec!["could not find Cargo.toml".to_string()];
@@ -1505,7 +1513,7 @@ mod tests {
     #[test]
     fn observe_injections_returns_to_fresh_when_content_changes() {
         use astra_turn_core::injection_tracking::{
-            ChannelStatus, InjectionChannel, freshness_report,
+            freshness_report, ChannelStatus, InjectionChannel,
         };
         let mut session = ObservabilitySession::new_simple("sess-tier4");
         session.recent_failing_tests = vec!["old failure".to_string()];
@@ -1534,10 +1542,13 @@ mod tests {
     #[test]
     fn observe_injections_tracks_each_channel_independently() {
         use astra_turn_core::injection_tracking::{
-            ChannelStatus, InjectionChannel, freshness_report,
+            freshness_report, ChannelStatus, InjectionChannel,
         };
         let mut session = ObservabilitySession::new_simple("sess-chan-sep");
-        session.outcome_bias.insert("bash".to_string(), 0.10);
+        session.outcome_bias.insert(
+            "bash".to_string(),
+            astra_turn_core::tool_health::OutcomeBiasEntry::from_score(0.10),
+        );
         // OutcomeBias stable; lessons change every turn.
         for t in 0..15 {
             session.turn_number = t;
@@ -1922,7 +1933,10 @@ mod tests {
     fn clear_failing_tests_does_not_touch_other_injection_channels() {
         let mut s = ObservabilitySession::new_simple("sess-scope");
         s.record_failing_test_names(vec!["t1".into()]);
-        s.outcome_bias.insert("bash".to_string(), 0.10);
+        s.outcome_bias.insert(
+            "bash".to_string(),
+            astra_turn_core::tool_health::OutcomeBiasEntry::from_score(0.10),
+        );
         s.recent_rejections
             .push(crate::self_model::RejectionSummary {
                 tool: "write_file".to_string(),
@@ -1935,8 +1949,8 @@ mod tests {
 
         assert!(s.recent_failing_tests.is_empty());
         assert_eq!(
-            s.outcome_bias.get("bash"),
-            Some(&0.10),
+            s.outcome_bias.get("bash").map(|e| e.score),
+            Some(0.10),
             "outcome_bias must not be cleared by clear_failing_tests"
         );
         assert_eq!(
@@ -1958,7 +1972,7 @@ mod tests {
         // it, the next observation reports the channel as Empty (no
         // content) rather than Stale.
         use astra_turn_core::injection_tracking::{
-            ChannelStatus, InjectionChannel, freshness_report,
+            freshness_report, ChannelStatus, InjectionChannel,
         };
         let mut s = ObservabilitySession::new_simple("sess-tier1-e2e");
 
@@ -2048,9 +2062,12 @@ mod tests {
         let session = hub.start_session("u", "s");
         let mut s = session.write().unwrap();
         let mut m = std::collections::BTreeMap::new();
-        m.insert("bash".to_string(), 0.25);
+        m.insert(
+            "bash".to_string(),
+            astra_turn_core::tool_health::OutcomeBiasEntry::from_score(0.25),
+        );
         s.set_outcome_bias(m);
-        assert_eq!(s.outcome_bias.get("bash"), Some(&0.25));
+        assert_eq!(s.outcome_bias.get("bash").map(|e| e.score), Some(0.25));
         s.set_outcome_bias(std::collections::BTreeMap::new());
         assert!(s.outcome_bias.is_empty());
     }

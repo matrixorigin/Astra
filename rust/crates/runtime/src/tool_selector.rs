@@ -89,7 +89,8 @@ pub struct SelectionContext<'a> {
     /// boost a tool's score; negative entries soft-deprioritize it. Bounded
     /// to ±0.10 in the scoring pipeline so it never overrides strong
     /// textual/intent signals — use `restricted_tools` for hard exclusions.
-    pub outcome_bias: std::collections::HashMap<String, f64>,
+    pub outcome_bias:
+        std::collections::HashMap<String, astra_turn_core::tool_health::OutcomeBiasEntry>,
     /// Fallback action from the previous turn's confidence diagnosis.
     /// When `Some(Broaden)`, the selector should relax budget constraints
     /// and include more candidate tools.
@@ -712,6 +713,15 @@ impl ToolSelector for TfIdfSelector {
         let tracker_ref: Option<&ToolQualityTracker> = tracker_guard.as_deref();
         let calibrator_ref = self.confidence_calibrator.as_deref();
 
+        // Scoring pipeline only needs the numeric score; render-time tag
+        // is consumed separately by SelfModel. Project entries down to f64
+        // at this boundary to avoid threading OutcomeBiasEntry through the
+        // scoring/ranker internals.
+        let outcome_bias_scores: std::collections::HashMap<String, f64> = ctx
+            .outcome_bias
+            .iter()
+            .map(|(k, v)| (k.clone(), v.score))
+            .collect();
         let (_schemas, report) = self.registry.select_routed_with_pressure(
             ctx.query,
             &routing,
@@ -723,7 +733,7 @@ impl ToolSelector for TfIdfSelector {
             ctx.budget_pressure,
             &co_occurrence,
             &ctx.file_context,
-            &ctx.outcome_bias,
+            &outcome_bias_scores,
         );
         drop(tracker_guard);
 

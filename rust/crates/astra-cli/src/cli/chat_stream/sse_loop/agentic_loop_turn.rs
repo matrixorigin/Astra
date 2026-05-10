@@ -726,12 +726,15 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     // cumulative signals back to the agent.
     {
         let (current, max_total) = ctx.denial_pressure;
-        let bias: std::collections::BTreeMap<String, f64> = ctx
+        let bias: std::collections::BTreeMap<
+            String,
+            astra_turn_core::tool_health::OutcomeBiasEntry,
+        > = ctx
             .turn_guard
             .health
             .outcome_bias_by_tool(3600)
             .into_iter()
-            .filter(|(_, v)| v.abs() >= 0.005)
+            .filter(|(_, e)| e.score.abs() >= 0.005)
             .collect();
         if let Some(session_lock) = &ctx.executor.observability_session
             && let Ok(mut session) = session_lock.write()
