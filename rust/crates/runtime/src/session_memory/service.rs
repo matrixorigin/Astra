@@ -42,14 +42,14 @@ use crate::memory_relevance::LlmConnParams;
 use crate::turn::cloud::memoria_compact::MemoriaClient;
 
 use super::activity::{BackgroundActivity, BackgroundActivityBroker};
-use super::gate::{GateDecision, evaluate};
+use super::gate::{evaluate, GateDecision};
 use super::health::{MemoriaAdmit, MemoriaHealth, SelectorHealth};
 use super::observatory::{
-    ExtractionOutcome as ObsExtractionOutcome, ExtractionRecord as ObsExtractionRecord,
-    ExtractionTrigger, SessionMemoryObservatory, clip_preview,
+    clip_preview, ExtractionOutcome as ObsExtractionOutcome,
+    ExtractionRecord as ObsExtractionRecord, ExtractionTrigger, SessionMemoryObservatory,
 };
 use super::request::{ExtractionRequest, SpawnDecision};
-use super::runner::{ExtractionArtifacts, run_extraction};
+use super::runner::{run_extraction, ExtractionArtifacts};
 
 #[cfg(test)]
 type MaybeSpawnAfterGateHook = std::sync::Arc<dyn Fn(&ExtractionRequest) + Send + Sync + 'static>;
@@ -316,11 +316,30 @@ impl MemoryExtractionService {
                 /// early-return path.
                 memoria_admit: MemoriaAdmit,
             },
+            /// Skip without touching the breaker. Used by gate-level
+            /// skips (NoGrowth, BelowInitGate, NoSessionId) and by
+            /// MemoriaUnhealthy — none of them were ever offered a
+            /// probe slot, so there's nothing to cancel.
             Skip {
                 trigger: ExtractionTrigger,
                 reason: SessionMemoryExtractionSkipReason,
                 label: &'static str,
-                cancel_probe: bool,
+            },
+            /// Skip AND release a HalfOpenProbe slot that was
+            /// speculatively granted by `admit()`. Only fires on the
+            /// in-flight-collision branch: the breaker already handed
+            /// out a probe, but another worker claimed the sid first,
+            /// so this caller must return the probe via
+            /// `record_probe_cancelled` before returning.
+            ///
+            /// Split from `Skip` so the two code paths are obvious at
+            /// the match site and so a future contributor can't
+            /// accidentally add a skip reason that silently forgets to
+            /// cancel a probe by defaulting a `bool` field.
+            SkipCancelProbe {
+                trigger: ExtractionTrigger,
+                reason: SessionMemoryExtractionSkipReason,
+                label: &'static str,
             },
         }
 
@@ -371,7 +390,6 @@ impl MemoryExtractionService {
                     trigger: trig,
                     reason,
                     label: skip_reason_label(reason),
-                    cancel_probe: false,
                 }
             } else {
                 // Memoria circuit breaker: fail fast when the endpoint has
@@ -391,7 +409,6 @@ impl MemoryExtractionService {
                         trigger: trig,
                         reason: SessionMemoryExtractionSkipReason::MemoriaUnhealthy,
                         label: "memoria_unhealthy",
-                        cancel_probe: false,
                     },
                     MemoriaAdmit::Closed | MemoriaAdmit::HalfOpenProbe => {
                         // Claim the in-flight slot synchronously. `in_flight`
@@ -414,15 +431,22 @@ impl MemoryExtractionService {
                                 memoria_admit,
                             }
                         } else {
-                            Admission::Skip {
-                                trigger: trig,
-                                reason: SessionMemoryExtractionSkipReason::InFlight,
-                                label: "in_flight",
-                                // Defer the breaker mutation until after
-                                // `session_states` is unlocked to avoid a
-                                // session_states → memoria_health nested
-                                // lock edge.
-                                cancel_probe: matches!(memoria_admit, MemoriaAdmit::HalfOpenProbe),
+                            // Defer breaker mutation to the match arm
+                            // below so `session_states` is unlocked
+                            // first (avoids session_states →
+                            // memoria_health nested-lock edge).
+                            if matches!(memoria_admit, MemoriaAdmit::HalfOpenProbe) {
+                                Admission::SkipCancelProbe {
+                                    trigger: trig,
+                                    reason: SessionMemoryExtractionSkipReason::InFlight,
+                                    label: "in_flight",
+                                }
+                            } else {
+                                Admission::Skip {
+                                    trigger: trig,
+                                    reason: SessionMemoryExtractionSkipReason::InFlight,
+                                    label: "in_flight",
+                                }
                             }
                         }
                     }
@@ -439,11 +463,27 @@ impl MemoryExtractionService {
                 trigger,
                 reason,
                 label,
-                cancel_probe,
             } => {
-                if cancel_probe {
-                    self.memoria_health.record_probe_cancelled();
-                }
+                let sid_opt = if req.session_id.is_empty() {
+                    None
+                } else {
+                    Some(req.session_id.as_str())
+                };
+                self.emit_skip_event(sid_opt, req.turn_number, reason, &skip_breadcrumbs);
+                self.record_skipped(sid_opt, req.turn_number, trigger, label, None);
+                return SpawnDecision::Skipped;
+            }
+            Admission::SkipCancelProbe {
+                trigger,
+                reason,
+                label,
+            } => {
+                // Release the half-open probe slot that `admit()`
+                // speculatively handed out. Done here — after the
+                // `session_states` lock was released at the end of the
+                // admission block — to avoid a session_states →
+                // memoria_health nested-lock edge.
+                self.memoria_health.record_probe_cancelled();
                 let sid_opt = if req.session_id.is_empty() {
                     None
                 } else {
@@ -495,6 +535,26 @@ impl MemoryExtractionService {
         // the guard is dropped here without disposition — which
         // calls `record_probe_cancelled` for HalfOpenProbe and is a
         // no-op for Closed.
+        // Drop order is semantically load-bearing and relies on Rust's
+        // reverse-declaration drop rule: at the end of `run_one`, locals
+        // drop in *reverse* of declaration. We want:
+        //
+        //   1. `probe_guard` drops first  → breaker disposition settled
+        //                                    (record_success / record_failure
+        //                                    / record_probe_cancelled) BEFORE
+        //                                    a follow-up `maybe_spawn` can
+        //                                    observe the probe slot as free.
+        //   2. `_in_flight_guard` drops next → the in-flight claim is
+        //                                      released only AFTER the
+        //                                      breaker state is coherent, so
+        //                                      another caller that squeezes
+        //                                      in on the just-freed slot sees
+        //                                      the post-extraction breaker
+        //                                      state, not a mid-transition
+        //                                      one.
+        //
+        // Declaration order below is therefore: probe_guard, then
+        // _in_flight_guard. Do not reorder.
         let mut probe_guard = Some(super::health::ProbeGuard::new(
             Arc::clone(&self.memoria_health),
             memoria_admit,
@@ -845,7 +905,7 @@ fn summarize_persisted_content(content: &str) -> (Vec<String>, String) {
 
 impl MemoryExtractionService {
     async fn load_current_memory(&self, session_id: &str) -> String {
-        use crate::turn::cloud::session_memory_protocol::{SESSION_MEMORY_PREFIX, pick_latest_l1};
+        use crate::turn::cloud::session_memory_protocol::{pick_latest_l1, SESSION_MEMORY_PREFIX};
         let Ok(memories) = self
             .memoria_client
             .retrieve_ext(
@@ -2471,6 +2531,91 @@ mod tests {
             admit_after,
             crate::session_memory::health::MemoriaAdmit::HalfOpenProbe,
             "probe slot must be released after selector_cooldown early-return; got {admit_after:?}"
+        );
+    }
+
+    /// Concurrency regression: N parallel `maybe_spawn` calls on the
+    /// same session while the breaker is in `HalfOpenProbe` must
+    /// release the probe slot exactly once. The serial
+    /// `half_open_in_flight_skip_cancels_probe_after_state_lock_is_released`
+    /// test only proves lock-order; it does not prove the
+    /// cancel-path survives racing claimants. This test does.
+    ///
+    /// Invariants:
+    ///   * exactly one caller wins the in-flight claim and returns
+    ///     `Spawned` (consuming the probe slot);
+    ///   * every other caller returns `Skipped`;
+    ///   * none of the losers records `record_probe_cancelled`
+    ///     (because the slot was already consumed by the winner —
+    ///     `memoria_admit` for losers must be evaluated AFTER the
+    ///     winner already claimed, but our code currently evaluates
+    ///     `admit()` while holding `session_states`, so each caller
+    ///     sees its own `admit()` result; the losers that saw
+    ///     `HalfOpenProbe` must call `record_probe_cancelled`).
+    ///
+    /// The assertion we CAN make without deep-wiring the breaker: the
+    /// post-run breaker state must be self-consistent — either one
+    /// probe succeeded or was cancelled, never "lost" (i.e.
+    /// `probe_in_flight=true` with no worker running).
+    #[tokio::test]
+    async fn concurrent_maybe_spawn_on_half_open_probe_never_strands_slot() {
+        let (svc, _rx, _broker) = build_breaker_ctx();
+
+        // Trip the breaker (2 failures, cfg threshold = 2).
+        for i in 0..2 {
+            let sid = format!("trip-conc-{i}-{}", nanos());
+            assert_eq!(
+                svc.maybe_spawn(sample_req(&sid, 20_000, false)),
+                SpawnDecision::Spawned
+            );
+            svc.wait_for_pending(Duration::from_secs(2)).await;
+        }
+        // Wait past cooldown so admit() returns HalfOpenProbe.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // Fire N parallel maybe_spawn on the SAME sid. The in-flight
+        // set serialises to one winner; the rest hit the probe-cancel
+        // path.
+        let sid = format!("race-probe-{}", nanos());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let svc = Arc::clone(&svc);
+            let sid = sid.clone();
+            handles.push(tokio::spawn(async move {
+                svc.maybe_spawn(sample_req(&sid, 20_000, false))
+            }));
+        }
+        let mut spawned = 0usize;
+        let mut skipped = 0usize;
+        for h in handles {
+            match h.await.unwrap() {
+                SpawnDecision::Spawned => spawned += 1,
+                SpawnDecision::Skipped => skipped += 1,
+            }
+        }
+        assert_eq!(
+            spawned, 1,
+            "exactly one racer must win the in-flight claim; got {spawned} spawned"
+        );
+        assert_eq!(skipped, 7, "the rest must skip; got {skipped} skipped");
+
+        svc.wait_for_pending(Duration::from_secs(3)).await;
+
+        // The breaker must be in a consistent state: no probe
+        // stranded in-flight. Equivalent: a fresh admit() must
+        // terminate (Open/Closed/HalfOpenProbe) rather than hanging
+        // on a never-released probe. We assert the stronger
+        // property: after cooldown elapses the next call must once
+        // again be able to probe (i.e. `probe_in_flight=false`).
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let admit_after = svc.memoria_health.admit();
+        assert!(
+            matches!(
+                admit_after,
+                crate::session_memory::health::MemoriaAdmit::HalfOpenProbe
+                    | crate::session_memory::health::MemoriaAdmit::Closed
+            ),
+            "breaker must not be stranded after the race; got {admit_after:?}"
         );
     }
 

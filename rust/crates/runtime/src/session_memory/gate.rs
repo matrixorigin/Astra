@@ -98,6 +98,10 @@ fn evaluate_inner(
     // exactly the cases operators most want to postmortem. The prior
     // inline implementation always persisted on error, so this also
     // restores that behaviour.
+    //
+    // NOTE: the empty-sid check above must stay BEFORE this branch —
+    // `had_error=true` with `session_id=""` is still NoSessionId, not
+    // a runnable extraction. Do not reorder.
     if had_error {
         return GateDecision::Run;
     }
@@ -224,6 +228,37 @@ mod tests {
         assert_eq!(
             decision,
             GateDecision::Skip(SessionMemoryExtractionSkipReason::BelowInitGate)
+        );
+    }
+
+    /// Regression: empty `session_id` + `had_error=true` must still
+    /// short-circuit to `NoSessionId`, NOT slip through the error
+    /// bypass and produce a `Run` with no sid. Persisting under "" is
+    /// a phantom-session bug that silently collides across unrelated
+    /// callers. The empty-sid check MUST precede the `had_error`
+    /// branch — this test locks that ordering in.
+    #[test]
+    fn had_error_with_empty_session_id_is_no_session_id() {
+        let state = SessionMemoryState::default();
+        let decision = evaluate(&state, "", 50_000, 10, true, &cfg());
+        assert_eq!(
+            decision,
+            GateDecision::Skip(SessionMemoryExtractionSkipReason::NoSessionId),
+            "empty session_id must gate out before had_error bypass fires"
+        );
+    }
+
+    /// Companion: the pathological combination — empty sid, tokens
+    /// below init gate, error flag set — must also produce
+    /// `NoSessionId`, not `Run` (error bypass) and not
+    /// `BelowInitGate` (init gate).
+    #[test]
+    fn had_error_empty_sid_below_init_is_no_session_id() {
+        let state = SessionMemoryState::default();
+        let decision = evaluate(&state, "", 100, 0, true, &cfg());
+        assert_eq!(
+            decision,
+            GateDecision::Skip(SessionMemoryExtractionSkipReason::NoSessionId)
         );
     }
 }
