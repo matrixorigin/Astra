@@ -901,7 +901,7 @@ fn format_status(status: &AgentStatus) -> String {
         AgentStatus::Initializing => "initializing".to_string(),
         AgentStatus::Running { activity } => format!("running: {activity}"),
         AgentStatus::Idle => "idle".to_string(),
-        AgentStatus::Completed { result } => {
+        AgentStatus::Completed { result, .. } => {
             let preview = if result.chars().count() > 50 {
                 format!("{}...", result.chars().take(50).collect::<String>())
             } else {
@@ -909,7 +909,7 @@ fn format_status(status: &AgentStatus) -> String {
             };
             format!("completed: {preview}")
         }
-        AgentStatus::Failed { error } => format!("failed: {error}"),
+        AgentStatus::Failed { error, .. } => format!("failed: {error}"),
         AgentStatus::Cancelled => "cancelled".to_string(),
     }
 }

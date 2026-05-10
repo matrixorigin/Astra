@@ -132,8 +132,8 @@ impl AgentTreeNode {
                 ("▶", activity_short)
             }
             AgentStatus::Idle => ("◯", "idle".to_string()),
-            AgentStatus::Completed { result: _ } => ("✓", "done".to_string()),
-            AgentStatus::Failed { error: _ } => ("✗", "failed".to_string()),
+            AgentStatus::Completed { .. } => ("✓", "done".to_string()),
+            AgentStatus::Failed { .. } => ("✗", "failed".to_string()),
             AgentStatus::Cancelled => ("⊘", "cancelled".to_string()),
         };
 
@@ -268,6 +268,7 @@ mod tests {
                 "run-1",
                 AgentStatus::Completed {
                     result: "ok".into(),
+                    finish_reason: None,
                 },
             ),
             make_agent(
@@ -303,6 +304,7 @@ mod tests {
                 "run-1",
                 AgentStatus::Completed {
                     result: "ok".into(),
+                    finish_reason: None,
                 },
             ),
             make_agent(

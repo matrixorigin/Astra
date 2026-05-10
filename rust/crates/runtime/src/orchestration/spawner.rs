@@ -228,8 +228,22 @@ pub struct SpawnRunResult {
     pub agent_id: String,
     /// Run ID.
     pub run_id: String,
-    /// Final status.
+    /// Final status (`"completed"` / `"cancelled"` / `"failed"` / `"waiting"`).
     pub status: String,
+    /// **Structured reason the run ended.** Unlike `status` this
+    /// distinguishes between *normal* completion and early-exit
+    /// paths that happen to be reported as `status="completed"` for
+    /// legacy reasons — most notably budget exhaustion. Parents that
+    /// care about "did the child actually finish the task or did it
+    /// run out of turns" should switch on this field instead of
+    /// regex-matching `output`.
+    ///
+    /// Values mirror [`astra_turn_core::interruption::InterruptionKind::label`]
+    /// when the loop ended on an interruption. `"normal"` when the
+    /// loop completed cleanly with no interruption. `"cancelled"`,
+    /// `"failed"`, `"waiting"` repeat the legacy status for
+    /// convenience.
+    pub finish_reason: String,
     /// Output text (if completed).
     pub output: Option<String>,
     /// Error message (if failed).
@@ -461,7 +475,14 @@ impl DynamicAgentSpawner {
             .model
             .clone()
             .unwrap_or_else(|| agent_def.default_model.clone());
-        let max_turns = input.max_turns.unwrap_or(agent_def.max_turns);
+        // Budget resolution: explicit `max_turns` wins, else the
+        // `complexity` hint scales the agent-type default, else the
+        // default is used as-is. See `resolve_turn_budget`.
+        let max_turns = astra_turn_core::orchestration_spawn_tool::resolve_turn_budget(
+            input.max_turns,
+            input.complexity.as_deref(),
+            agent_def.max_turns,
+        );
 
         // 3b. Resolve fork-prefix inheritance before any side effects
         // (mailbox, worktree, active_agents state). A hard-fail from
@@ -722,7 +743,7 @@ impl DynamicAgentSpawner {
                 let wait_timeout = self.background_wait_timeout;
                 if let Some(status) = self.wait_for_agent(&agent_id, wait_timeout).await {
                     match status {
-                        AgentStatus::Completed { result } => {
+                        AgentStatus::Completed { result, .. } => {
                             return Ok(SpawnAgentOutput::Completed {
                                 agent_id,
                                 result,
@@ -730,7 +751,7 @@ impl DynamicAgentSpawner {
                                 duration_ms: 0,
                             });
                         }
-                        AgentStatus::Failed { error } => {
+                        AgentStatus::Failed { error, .. } => {
                             return Ok(SpawnAgentOutput::Failed { error });
                         }
                         _ => {}
@@ -786,10 +807,12 @@ impl DynamicAgentSpawner {
                                     .error
                                     .clone()
                                     .unwrap_or_else(|| "agent run failed".to_string()),
+                                finish_reason: Some(run_result.finish_reason.clone()),
                             },
                             "waiting" => AgentStatus::Idle,
                             _ => AgentStatus::Completed {
                                 result: run_result.output.clone().unwrap_or_default(),
+                                finish_reason: Some(run_result.finish_reason.clone()),
                             },
                         };
                         self.update_status(&agent_id, status).await;
@@ -829,8 +852,14 @@ impl DynamicAgentSpawner {
                         }
                     }
                     Err(e) => {
-                        self.update_status(&agent_id, AgentStatus::Failed { error: e.clone() })
-                            .await;
+                        self.update_status(
+                            &agent_id,
+                            AgentStatus::Failed {
+                                error: e.clone(),
+                                finish_reason: None,
+                            },
+                        )
+                        .await;
                         self.unregister_mailbox(&agent_id).await;
 
                         Ok(SpawnAgentOutput::Failed { error: e })
@@ -871,10 +900,12 @@ impl DynamicAgentSpawner {
                             .error
                             .clone()
                             .unwrap_or_else(|| "agent run failed".to_string()),
+                        finish_reason: Some(run_result.finish_reason.clone()),
                     },
                     "waiting" => AgentStatus::Idle,
                     _ => AgentStatus::Completed {
                         result: run_result.output.unwrap_or_default(),
+                        finish_reason: Some(run_result.finish_reason.clone()),
                     },
                 };
                 // Persist to journal before updating status
@@ -888,8 +919,14 @@ impl DynamicAgentSpawner {
             }
             Err(e) => {
                 self.persist_agent_terminated(agent_id, "failed").await;
-                self.update_status(agent_id, AgentStatus::Failed { error: e })
-                    .await;
+                self.update_status(
+                    agent_id,
+                    AgentStatus::Failed {
+                        error: e,
+                        finish_reason: None,
+                    },
+                )
+                .await;
                 // Unregister mailbox before archive removes the agent from active_agents.
                 self.unregister_mailbox(agent_id).await;
                 self.archive_agent(agent_id).await;
@@ -1099,7 +1136,7 @@ impl DynamicAgentSpawner {
             .iter()
             .filter(|s| bg_ids.contains(&s.agent_id))
             .filter_map(|s| {
-                if let AgentStatus::Completed { ref result } = s.status {
+                if let AgentStatus::Completed { ref result, .. } = s.status {
                     Some((s.agent_id.clone(), result.clone()))
                 } else {
                     None
@@ -1185,7 +1222,7 @@ impl DynamicAgentSpawner {
                     activity: activity.clone(),
                 },
                 AgentStatus::Idle => ProgressEventType::Idle,
-                AgentStatus::Completed { result } => {
+                AgentStatus::Completed { result, .. } => {
                     let duration_ms = state
                         .started_at
                         .elapsed()
@@ -1201,7 +1238,7 @@ impl DynamicAgentSpawner {
                         duration_ms,
                     }
                 }
-                AgentStatus::Failed { error } => ProgressEventType::Failed {
+                AgentStatus::Failed { error, .. } => ProgressEventType::Failed {
                     error: error.clone(),
                 },
                 AgentStatus::Cancelled => ProgressEventType::Cancelled {
@@ -1637,6 +1674,7 @@ mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 status: "completed".into(),
+                finish_reason: "normal".into(),
                 output: Some("ok".into()),
                 error: None,
                 prompt_tokens: 0,
@@ -1657,6 +1695,7 @@ mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 status: "completed".into(),
+                finish_reason: "normal".into(),
                 output: Some("ok".into()),
                 error: None,
                 prompt_tokens: 1,
@@ -1677,6 +1716,7 @@ mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 status: self.status.into(),
+                finish_reason: self.status.into(),
                 output: self.output.map(str::to_string),
                 error: self.error.map(str::to_string),
                 prompt_tokens: 0,
@@ -1698,6 +1738,7 @@ mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 status: "completed".into(),
+                finish_reason: "normal".into(),
                 output: Some("ok".into()),
                 error: None,
                 prompt_tokens: 0,
@@ -1904,6 +1945,7 @@ mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 status: "completed".into(),
+                finish_reason: "normal".into(),
                 output: Some("done".into()),
                 error: None,
                 prompt_tokens: 0,

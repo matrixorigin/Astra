@@ -4609,6 +4609,8 @@ mod tests {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            turn_budget_hint_emitted_50: false,
+            turn_budget_hint_emitted_20: false,
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,

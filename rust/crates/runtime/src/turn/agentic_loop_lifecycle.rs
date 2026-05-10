@@ -92,6 +92,55 @@ fn used_budget_extensions(state: &AgenticLoopState) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 
+/// Inject a one-shot "you have N turns left — wrap up" nudge into
+/// the volatile lane when crossing budget thresholds (50 % and
+/// 20 % remaining). Purpose: let a spawned agent that can't see
+/// its own max_turns recognise when it's running short and start
+/// finalising output instead of falling off the turn cliff with
+/// nothing delivered. The signal piggybacks on
+/// [`VolatileKind::BudgetAdvisory`] — one volatile slot per round,
+/// drained by the bridge. Short, blunt wording so the model acts on
+/// it rather than treating it as flavor text.
+///
+/// Guard against repeated emission: we only fire exactly once per
+/// threshold crossing. The threshold watermarks live on the state
+/// (`turn_budget_hint_emitted_50`, `..._20`). A budget extension
+/// resets them so a freshly-extended budget gets the hints again
+/// at the new thresholds.
+fn maybe_emit_turn_budget_self_pacing_hint(state: &mut AgenticLoopState) {
+    // Budgets of 3 turns or fewer aren't worth pacing — the hint
+    // itself would be the largest part of the remaining work.
+    if state.max_turns < 4 {
+        return;
+    }
+    // `remaining_turns` was already decremented by the caller, so
+    // this is the TRUE number remaining for this round and later.
+    let remaining = state.remaining_turns;
+    let max = state.max_turns;
+    if max == 0 {
+        return;
+    }
+    let pct_remaining = remaining * 100 / max;
+
+    // 20 % crossing: hard nudge. 50 % crossing: soft nudge.
+    // Emit the highest-priority (lowest %) threshold that newly
+    // triggered, not both.
+    if pct_remaining <= 20 && !state.turn_budget_hint_emitted_20 {
+        state.turn_budget_hint_emitted_20 = true;
+        state.turn_budget_hint_emitted_50 = true; // hoist so we don't re-emit 50 later
+        let msg = format!(
+            "[turn-budget] {remaining}/{max} turns remaining (≤20%). Wrap up now: write your final answer or last tool call. Further discovery will be cut off."
+        );
+        state.push_volatile(super::agentic_loop_host::VolatileKind::BudgetAdvisory, msg);
+    } else if pct_remaining <= 50 && !state.turn_budget_hint_emitted_50 {
+        state.turn_budget_hint_emitted_50 = true;
+        let msg = format!(
+            "[turn-budget] {remaining}/{max} turns remaining (≤50%). Start converging: prioritise the deliverable over exploration."
+        );
+        state.push_volatile(super::agentic_loop_host::VolatileKind::BudgetAdvisory, msg);
+    }
+}
+
 pub(crate) fn extract_tool_args(args: Option<&str>) -> Option<Value> {
     let args = args?;
     serde_json::from_str::<Value>(args).ok()
@@ -271,6 +320,12 @@ fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
 
     state.max_turns += additional_turns;
     state.remaining_turns += additional_turns;
+    // Fresh budget → fresh self-pacing thresholds. Without this,
+    // a child that already emitted the 50 %/20 % hints at the
+    // original budget would be silent through the extension and
+    // crash off the new cliff with no warning.
+    state.turn_budget_hint_emitted_50 = false;
+    state.turn_budget_hint_emitted_20 = false;
     let review_message = format!(
         "[Budget review] Recent progress looks real for this {}task, so continuing with {} extra turn(s). Hard limit: {} total turns.",
         if state.task_profile.exploratory_task {
@@ -575,6 +630,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
 
     state.remaining_turns = state.remaining_turns.saturating_sub(1);
+    maybe_emit_turn_budget_self_pacing_hint(state);
     state.step_recorder.begin_turn_with_context(
         session_turn_number(state).saturating_sub(1),
         turn_index as u32,

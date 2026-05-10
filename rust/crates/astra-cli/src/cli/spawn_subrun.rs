@@ -336,6 +336,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             has_any_usage: false,
             max_turns,
             remaining_turns: max_turns,
+            turn_budget_hint_emitted_50: false,
+            turn_budget_hint_emitted_20: false,
             agentic_turn_budget: task_profile.agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
@@ -472,6 +474,19 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 (None, 0, 0, 0)
             };
 
+        // Derive finish_reason from the structured interruption
+        // record if present. This surfaces budget exhaustion /
+        // token budget exceeded / context overflow as first-class
+        // signals even when the legacy `status` remains
+        // `"completed"` — which is how the loop reports all
+        // resumable interruptions. Parents (and agent get_result)
+        // can now switch on this field without regex-matching
+        // the output.
+        let finish_reason_from_state = state
+            .interruption
+            .as_ref()
+            .map(|i| i.kind.label().to_string());
+
         match loop_result {
             Ok(AgenticLoopOutcome::Completed) => {
                 // Emit completed event
@@ -495,6 +510,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     agent_id,
                     run_id,
                     status: "completed".to_string(),
+                    finish_reason: finish_reason_from_state.unwrap_or_else(|| "normal".to_string()),
                     output: Some(state.final_text),
                     error: None,
                     prompt_tokens,
@@ -515,6 +531,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     agent_id,
                     run_id,
                     status: "cancelled".to_string(),
+                    finish_reason: finish_reason_from_state
+                        .unwrap_or_else(|| "cancelled".to_string()),
                     output: if state.final_text.is_empty() {
                         None
                     } else {
@@ -539,6 +557,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     agent_id,
                     run_id,
                     status: "failed".to_string(),
+                    finish_reason: finish_reason_from_state.unwrap_or_else(|| "failed".to_string()),
                     output: if state.final_text.is_empty() {
                         None
                     } else {
@@ -563,6 +582,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     agent_id,
                     run_id,
                     status: "waiting".to_string(),
+                    finish_reason: finish_reason_from_state
+                        .unwrap_or_else(|| "waiting".to_string()),
                     output: Some(reason),
                     error: None,
                     prompt_tokens,
