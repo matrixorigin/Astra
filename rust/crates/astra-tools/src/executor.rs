@@ -306,7 +306,7 @@ impl ToolExecutor for DefaultToolExecutor {
                     },
                 );
         }
-        if is_workspace_mutation_tool(name) && !result.is_error {
+        if is_workspace_mutation_tool(name, args) && !result.is_error {
             self.workspace_generation.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -627,10 +627,33 @@ fn mark_result_cached(result: &mut ToolResult) {
     metadata.insert("cached".to_string(), Value::Bool(true));
 }
 
-fn is_workspace_mutation_tool(name: &str) -> bool {
+fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
+    match name {
+        "write_file" | "str_replace" | "multi_edit" | "delete_file" | "git_commit"
+        | "git_revert_commit" => true,
+        "git_stash" => args
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(git_stash_action_mutates_workspace),
+        "git" => args
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|action| match action {
+                "commit" | "revert_commit" => true,
+                "stash" => args
+                    .get("sub_action")
+                    .and_then(Value::as_str)
+                    .is_some_and(git_stash_action_mutates_workspace),
+                _ => false,
+            }),
+        _ => false,
+    }
+}
+
+fn git_stash_action_mutates_workspace(action: &str) -> bool {
     matches!(
-        name,
-        "write_file" | "str_replace" | "multi_edit" | "delete_file"
+        action,
+        "push" | "save" | "apply" | "pop" | "drop" | "branch"
     )
 }
 
@@ -1017,6 +1040,108 @@ mod tests {
                 .and_then(|m| m.get("cached"))
                 .and_then(|v| v.as_bool()),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_cache_invalidates_after_git_commit() {
+        let (tmp, exec) = test_executor();
+        init_git_repo(tmp.path());
+
+        let tracked = tmp.path().join("tracked.txt");
+        std::fs::write(&tracked, "initial\n").unwrap();
+        let initial = exec
+            .execute("git_commit", &serde_json::json!({"message": "initial"}))
+            .await;
+        assert!(
+            !initial.is_error,
+            "initial commit failed: {}",
+            initial.output
+        );
+
+        let args = serde_json::json!({"command": "git log --oneline -1"});
+        let first = exec.execute("bash", &args).await;
+        assert!(!first.is_error, "first log failed: {}", first.output);
+        assert!(first.output.contains("initial"), "got: {}", first.output);
+
+        std::fs::write(&tracked, "changed\n").unwrap();
+        let change = exec
+            .execute(
+                "git_commit",
+                &serde_json::json!({"message": "change tracked"}),
+            )
+            .await;
+        assert!(!change.is_error, "change commit failed: {}", change.output);
+
+        let second = exec.execute("bash", &args).await;
+        assert!(!second.is_error, "second log failed: {}", second.output);
+        assert!(
+            second.output.contains("change tracked"),
+            "git_commit must invalidate cached git log output: {}",
+            second.output
+        );
+        assert_ne!(
+            second
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_cache_invalidates_after_git_stash_drop() {
+        let (tmp, exec) = test_executor();
+        init_git_repo(tmp.path());
+
+        let tracked = tmp.path().join("tracked.txt");
+        std::fs::write(&tracked, "initial\n").unwrap();
+        let initial = exec
+            .execute("git_commit", &serde_json::json!({"message": "initial"}))
+            .await;
+        assert!(
+            !initial.is_error,
+            "initial commit failed: {}",
+            initial.output
+        );
+
+        std::fs::write(&tracked, "stashed\n").unwrap();
+        let push = exec
+            .execute(
+                "git_stash",
+                &serde_json::json!({"action": "push", "message": "save tracked"}),
+            )
+            .await;
+        assert!(!push.is_error, "stash push failed: {}", push.output);
+
+        let args = serde_json::json!({"command": "git stash list"});
+        let cached_source = exec.execute("bash", &args).await;
+        assert!(
+            cached_source.output.contains("save tracked"),
+            "expected stash list to include pushed stash: {}",
+            cached_source.output
+        );
+
+        let drop = exec
+            .execute("git_stash", &serde_json::json!({"action": "drop"}))
+            .await;
+        assert!(!drop.is_error, "stash drop failed: {}", drop.output);
+
+        let after_drop = exec.execute("bash", &args).await;
+        assert_ne!(
+            after_drop
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "git_stash drop changes refs/stash, so cached git stash list must be invalidated"
+        );
+        assert!(
+            !after_drop.output.contains("save tracked"),
+            "fresh stash list should not include dropped stash: {}",
+            after_drop.output
         );
     }
 

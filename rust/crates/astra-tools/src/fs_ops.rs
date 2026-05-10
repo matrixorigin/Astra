@@ -623,7 +623,7 @@ impl PreparedWriteFile {
             return ToolResult::error(format!("Error: Cannot create directories: {e}"));
         }
 
-        match write_file_atomic_with_format(&self.path, self.content.as_bytes()) {
+        match write_file_atomic_with_format(&self.path, self.content.as_bytes(), false) {
             Ok(warning) => {
                 let mut message = format!(
                     "Successfully wrote {} bytes to {}",
@@ -681,6 +681,7 @@ pub struct PreparedStrReplace {
     path: PathBuf,
     new_content: String,
     dry_run: bool,
+    allow_structural_change: bool,
     success_message: String,
 }
 
@@ -701,7 +702,11 @@ impl PreparedStrReplace {
         if self.dry_run {
             return ToolResult::text(self.success_message);
         }
-        match write_file_atomic_with_format(&self.path, self.new_content.as_bytes()) {
+        match write_file_atomic_with_format(
+            &self.path,
+            self.new_content.as_bytes(),
+            self.allow_structural_change,
+        ) {
             Ok(warning) => {
                 let mut message = self.success_message;
                 if let Some(warning) = warning {
@@ -803,6 +808,7 @@ pub fn prepare_str_replace(
                 path,
                 new_content,
                 dry_run,
+                allow_structural_change,
                 success_message,
             });
         }
@@ -847,6 +853,7 @@ pub fn prepare_str_replace(
         path,
         new_content,
         dry_run,
+        allow_structural_change,
         success_message,
     })
 }
@@ -865,6 +872,7 @@ pub struct PreparedMultiEdit {
     new_content: String,
     edit_count: usize,
     dry_run: bool,
+    allow_structural_change: bool,
 }
 
 impl PreparedMultiEdit {
@@ -884,7 +892,11 @@ impl PreparedMultiEdit {
             ));
         }
 
-        match write_file_atomic_with_format(&self.path, self.new_content.as_bytes()) {
+        match write_file_atomic_with_format(
+            &self.path,
+            self.new_content.as_bytes(),
+            self.allow_structural_change,
+        ) {
             Ok(warning) => {
                 let mut message = format!(
                     "Successfully applied {} edit(s) to {}",
@@ -983,6 +995,7 @@ pub fn prepare_multi_edit(
         new_content: working,
         edit_count: edits.len(),
         dry_run,
+        allow_structural_change,
     })
 }
 
@@ -1230,14 +1243,21 @@ fn normalize_line_endings_to_lf(s: &str) -> String {
     out
 }
 
-fn format_file_in_place_best_effort(path: &Path) -> Option<String> {
+enum FormatterOutcome {
+    Success,
+    NotFound,
+    Warning(String),
+    SyntaxError(String),
+}
+
+fn format_file_in_place_best_effort(path: &Path) -> FormatterOutcome {
     match extension_lower(path).as_deref() {
         Some("rs") => run_formatter(path, "rustfmt", &["--emit=files"]),
         Some("py") => run_formatter(path, "ruff", &["format", "--quiet"]),
         Some("ts" | "tsx" | "js" | "jsx" | "json" | "md" | "yaml" | "yml") => {
             run_formatter(path, "prettier", &["--write", "--log-level=warn"])
         }
-        _ => None,
+        _ => FormatterOutcome::NotFound,
     }
 }
 
@@ -1247,15 +1267,18 @@ fn format_file_in_place_best_effort(path: &Path) -> Option<String> {
 /// half-written or half-formatted state.
 ///
 /// Returns a formatter warning string when the formatter reported a
-/// non-fatal error (same semantics as the old
-/// [`format_file_in_place_best_effort`]). Formatter failures are
-/// swallowed — we still rename the (unformatted) tmp to the target
-/// so the caller's edit still lands.
+/// non-fatal error. Syntax-level formatter failures abort the write:
+/// returning success while writing syntactically broken code gives the
+/// caller a false signal that the edit is valid.
 ///
 /// Pre-commit hooks / editors watching the target via inotify see
 /// **one** `MODIFY` event (the rename), not `CREATE` + partial
 /// writes during formatting.
-fn write_file_atomic_with_format(path: &Path, content: &[u8]) -> Result<Option<String>, String> {
+fn write_file_atomic_with_format(
+    path: &Path,
+    content: &[u8],
+    allow_formatter_syntax_error: bool,
+) -> Result<Option<String>, String> {
     // Staging file lives next to the target — POSIX rename() is
     // only atomic within the same filesystem. Using a /tmp staging
     // file would break across mount points.
@@ -1269,11 +1292,18 @@ fn write_file_atomic_with_format(path: &Path, content: &[u8]) -> Result<Option<S
         return Err(format!("Error: Cannot stage write: {e}"));
     }
 
-    // Format the staged file. Formatter errors become warnings —
-    // the content we wrote is still the user/model's intent; a
-    // failed format just means it's not prettified. We do NOT abort
-    // the whole write on formatter failure.
-    let warning = format_file_in_place_best_effort(&tmp);
+    let warning = match format_file_in_place_best_effort(&tmp) {
+        FormatterOutcome::Success | FormatterOutcome::NotFound => None,
+        FormatterOutcome::Warning(warning) => Some(warning),
+        FormatterOutcome::SyntaxError(error) => {
+            if allow_formatter_syntax_error {
+                Some(error)
+            } else {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(error);
+            }
+        }
+    };
 
     // Atomic rename commits the final state. Only here does the
     // target path change.
@@ -1308,24 +1338,47 @@ fn staging_tmp_path(target: &Path) -> PathBuf {
     tmp
 }
 
-fn run_formatter(path: &Path, program: &str, args: &[&str]) -> Option<String> {
+fn run_formatter(path: &Path, program: &str, args: &[&str]) -> FormatterOutcome {
     let mut command = std::process::Command::new(program);
     command.args(args).arg(path);
     match command.output() {
-        Ok(output) if output.status.success() => None,
+        Ok(output) if output.status.success() => FormatterOutcome::Success,
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            Some(format!(
+            let diagnostic = format!(
                 "{program} failed for {}: {}{}",
                 path.display(),
                 stdout.trim(),
                 stderr.trim()
-            ))
+            );
+            if formatter_failure_is_syntax_error(&diagnostic) {
+                FormatterOutcome::SyntaxError(format!("Error: SYNTAX ERROR: {diagnostic}"))
+            } else {
+                FormatterOutcome::Warning(diagnostic)
+            }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => Some(format!("{program} failed for {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FormatterOutcome::NotFound,
+        Err(e) => {
+            FormatterOutcome::Warning(format!("{program} failed for {}: {e}", path.display()))
+        }
     }
+}
+
+fn formatter_failure_is_syntax_error(diagnostic: &str) -> bool {
+    let lower = diagnostic.to_ascii_lowercase();
+    [
+        "syntax",
+        "parse error",
+        "failed to parse",
+        "unterminated",
+        "unclosed",
+        "mismatched",
+        "unexpected",
+        "expected",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn validate_structural_edit(
@@ -2116,6 +2169,32 @@ mod tests {
         assert!(!result.is_error, "got error: {}", result.output);
         let content = std::fs::read_to_string(tmp.path().join("main.rs")).unwrap();
         assert_eq!(content, "fn main() {\n    println!(\"hi\");\n}\n");
+    }
+
+    #[test]
+    fn write_file_rust_syntax_formatter_failure_is_error_and_preserves_target() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("main.rs");
+        std::fs::write(&target, "fn main() {}\n").unwrap();
+        let args = serde_json::json!({
+            "path": "main.rs",
+            "content": "fn main(){ println!(\"hi); }"
+        });
+
+        let result = write_file(tmp.path(), &args);
+
+        assert!(
+            result.is_error,
+            "syntax failure must be an error: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("SYNTAX ERROR"),
+            "syntax failure must be prominent: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(target).unwrap();
+        assert_eq!(content, "fn main() {}\n");
     }
 
     #[test]
@@ -3134,10 +3213,11 @@ mod tests {
         let target = tmp.path().join("lib.rs");
         std::fs::write(&target, "original\n").unwrap();
 
-        let _warning = write_file_atomic_with_format(&target, b"new body\n").unwrap();
+        let _warning =
+            write_file_atomic_with_format(&target, b"pub fn new_body() {}\n", false).unwrap();
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
-            "new body\n",
+            "pub fn new_body() {}\n",
             "target must have the new content after atomic write"
         );
         // Directory must contain exactly `lib.rs` — no lingering
@@ -3159,7 +3239,7 @@ mod tests {
         // End-to-end: write, check content lands.
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("hello.txt");
-        let result = write_file_atomic_with_format(&target, b"hello world\n");
+        let result = write_file_atomic_with_format(&target, b"hello world\n", false);
         assert!(result.is_ok(), "atomic write must succeed: {result:?}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello world\n");
     }
@@ -3184,7 +3264,7 @@ mod tests {
             ro.set_mode(0o500); // r-x only, no write for owner
             std::fs::set_permissions(tmp.path(), ro).unwrap();
 
-            let result = write_file_atomic_with_format(&target, b"NEW\n");
+            let result = write_file_atomic_with_format(&target, b"NEW\n", false);
 
             // Restore perms before asserting so tempdir drop works.
             std::fs::set_permissions(tmp.path(), orig_perm).unwrap();
