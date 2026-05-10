@@ -265,7 +265,11 @@ async fn e2e_full_session_lifecycle() {
     assert!(anchor.contains("Avoid: web_fetch"), "anchor: {anchor}");
 
     // ── Phase 4: Build facts-first injection ──
-    let injection = build_facts_first_injection(&facts, Some(&narrative));
+    let injection = build_facts_first_injection(
+        &facts,
+        Some(&narrative),
+        astra_runtime::turn::cloud::session_memory_protocol::InjectionLevel::L1Full,
+    );
     assert!(injection.contains("# System State"));
     assert!(injection.contains("Turn 10"));
     assert!(injection.contains("src/auth.rs"));
@@ -426,7 +430,11 @@ async fn e2e_cross_validation_skips_contradicted_narrative() {
     );
     let narrative = SessionMemory::parse(&narrative_text);
 
-    let injection = build_facts_first_injection(&facts, narrative.as_ref());
+    let injection = build_facts_first_injection(
+        &facts,
+        narrative.as_ref(),
+        astra_runtime::turn::cloud::session_memory_protocol::InjectionLevel::L1Full,
+    );
 
     // Contract: when the narrative's task block contradicts facts (plan
     // complete but errors accumulated), the task is silently omitted.

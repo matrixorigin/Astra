@@ -669,11 +669,25 @@ pub fn compress_to_injection(l1: &SessionMemory) -> String {
 }
 
 /// Build facts-first injection: L1a (system facts) + L1b (narrative) with cross-validation.
-/// Returns ~650 tokens at normal pressure. See design doc Section 4.4.
+///
+/// Returns a pressure-adapted injection per design doc §4.8:
+/// * `L1Full`    → facts + full validated narrative (~650t)
+/// * `L1Minimal` → facts only, narrative skipped (~150t)
+/// * `L0Only`    → empty string — caller is responsible for falling back
+///   to the L0 anchor which already lives in the dynamic system prompt.
 pub fn build_facts_first_injection(
     facts: &SessionFacts,
     narrative: Option<&SessionMemory>,
+    level: InjectionLevel,
 ) -> String {
+    if level == InjectionLevel::L0Only {
+        // At ≥85% pressure the L0 anchor lives in the dynamic system
+        // prompt already (CacheScope::None); returning empty here keeps
+        // the compaction injection out of the way so it doesn't
+        // double-up.
+        return String::new();
+    }
+
     let mut out = String::from("[session-memory]\n");
 
     // ── Layer 1: System Facts (ground truth, ~150t) ──
@@ -686,17 +700,28 @@ pub fn build_facts_first_injection(
         }
     }
     out.push_str(&facts.to_injection());
-    append_validated_narrative(&mut out, facts, narrative);
+
+    // ── Layer 2 (narrative) only at L1Full. At L1Minimal the budget
+    //     doesn't justify ~500t of prose — protocol §4.8.
+    if level == InjectionLevel::L1Full {
+        append_validated_narrative(&mut out, facts, narrative);
+    }
 
     out
 }
 
 /// Build continuity-first injection: runtime-owned attention/todo state first,
 /// then SessionFacts, then LLM narrative only as validated supplement.
+/// Pressure-adaptive mirror of [`build_facts_first_injection`].
 pub fn build_continuity_first_injection(
     continuity: &ContinuityState,
     narrative: Option<&SessionMemory>,
+    level: InjectionLevel,
 ) -> String {
+    if level == InjectionLevel::L0Only {
+        return String::new();
+    }
+
     let mut out = String::from("[session-memory]\n");
     let attention = AttentionManifest::from_state(continuity, 4_000).into_string();
     out.push_str(&attention);
@@ -704,7 +729,9 @@ pub fn build_continuity_first_injection(
         out.push('\n');
     }
     out.push_str(&continuity.facts.to_injection());
-    append_validated_narrative(&mut out, &continuity.facts, narrative);
+    if level == InjectionLevel::L1Full {
+        append_validated_narrative(&mut out, &continuity.facts, narrative);
+    }
     out
 }
 
@@ -747,6 +774,48 @@ fn continuity_from_facts(facts: &SessionFacts) -> ContinuityState {
         facts: facts.clone(),
         user_corrections: Vec::new(),
         verification: Default::default(),
+    }
+}
+
+/// Inspect facts + narrative for cross-validation signals that the
+/// narrative is stale and a fresh L1b extraction would help. Purely a
+/// read — nothing is mutated. The caller decides how to act (typically
+/// by requesting a re-extraction with `had_error=true` semantics or
+/// emitting an operator-visible event). See design doc §4.4.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NarrativeStaleness {
+    /// Plan is complete but there are unresolved errors — the
+    /// narrative's Task Specification may claim "done" contradicting
+    /// facts. Consumers of injection already skip the Task section;
+    /// this flag surfaces the same signal to other call sites.
+    pub task_contradicted: bool,
+    /// 3+ errors recorded in facts but the narrative's User Corrections
+    /// section is empty. Suggests the LLM missed real user correction
+    /// events that should be captured next cycle.
+    pub missing_corrections: bool,
+}
+
+impl NarrativeStaleness {
+    pub fn any(&self) -> bool {
+        self.task_contradicted || self.missing_corrections
+    }
+}
+
+/// Compute staleness signals without building the full injection.
+/// Zero-allocation on the happy path.
+pub fn narrative_staleness(
+    facts: &SessionFacts,
+    narrative: Option<&SessionMemory>,
+) -> NarrativeStaleness {
+    let task_contradicted = narrative_task_contradicts_facts(facts);
+    let missing_corrections = facts.error_state.total_errors >= 3
+        && narrative
+            .and_then(|n| n.section("User Corrections"))
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true);
+    NarrativeStaleness {
+        task_contradicted,
+        missing_corrections,
     }
 }
 
@@ -1375,7 +1444,8 @@ mod tests {
             ("Task Specification", "Build a web server"),
             ("Decisions", "- Use axum framework"),
         ]);
-        let injection = build_facts_first_injection(&facts, Some(&narrative));
+        let injection =
+            build_facts_first_injection(&facts, Some(&narrative), InjectionLevel::L1Full);
         // System State must come before Task
         let facts_pos = injection.find("# System State").unwrap();
         let task_pos = injection.find("# Task").unwrap();
@@ -1395,7 +1465,8 @@ mod tests {
             ),
             ("Decisions", "- Use axum\n- Use sqlx"),
         ]);
-        let injection = build_facts_first_injection(&facts, Some(&narrative));
+        let injection =
+            build_facts_first_injection(&facts, Some(&narrative), InjectionLevel::L1Full);
         assert!(injection.contains("# Task\nImplement OAuth"));
         assert!(injection.contains("# User Corrections\nUse RS256 not HS256"));
         assert!(injection.contains("# Learnings"));
@@ -1414,7 +1485,7 @@ mod tests {
             last_action: "read".to_string(),
             turn: 3,
         });
-        let injection = build_facts_first_injection(&facts, None);
+        let injection = build_facts_first_injection(&facts, None, InjectionLevel::L1Full);
         assert!(injection.contains("# System State"));
         assert!(injection.contains("Turn 3"));
         assert!(!injection.contains("# Task")); // no narrative
@@ -1433,7 +1504,7 @@ mod tests {
             ..Default::default()
         };
 
-        let injection = build_facts_first_injection(&facts, None);
+        let injection = build_facts_first_injection(&facts, None, InjectionLevel::L1Full);
         let attention_pos = injection.find("[attention:v1]").unwrap();
         let facts_pos = injection.find("# System State").unwrap();
         assert!(attention_pos < facts_pos);
@@ -1465,7 +1536,8 @@ mod tests {
             ("Task Specification", "Build API — completed successfully"),
             ("User Corrections", "Use RS256"),
         ]);
-        let injection = build_facts_first_injection(&facts, Some(&narrative));
+        let injection =
+            build_facts_first_injection(&facts, Some(&narrative), InjectionLevel::L1Full);
         // Task should be SKIPPED due to contradiction
         assert!(
             !injection.contains("# Task"),
@@ -1519,7 +1591,8 @@ mod tests {
         };
         let narrative = narrative_with_sections(&[("Task Specification", "LLM narrative")]);
 
-        let injection = build_continuity_first_injection(&continuity, Some(&narrative));
+        let injection =
+            build_continuity_first_injection(&continuity, Some(&narrative), InjectionLevel::L1Full);
         let attention_pos = injection.find("[attention:v1]").unwrap();
         let facts_pos = injection.find("# System State").unwrap();
         let task_pos = injection.find("# Task").unwrap();
@@ -1539,7 +1612,8 @@ mod tests {
             ("Decisions", "- Use api_key=abc123"),
         ]);
 
-        let injection = build_facts_first_injection(&facts, Some(&narrative));
+        let injection =
+            build_facts_first_injection(&facts, Some(&narrative), InjectionLevel::L1Full);
         assert!(injection.contains("token=[REDACTED]"));
         assert!(injection.contains("password:[REDACTED]"));
         assert!(injection.contains("api_key=[REDACTED]"));
@@ -1560,7 +1634,8 @@ mod tests {
         });
         // No errors — no contradiction
         let narrative = narrative_with_sections(&[("Task Specification", "Build API")]);
-        let injection = build_facts_first_injection(&facts, Some(&narrative));
+        let injection =
+            build_facts_first_injection(&facts, Some(&narrative), InjectionLevel::L1Full);
         assert!(injection.contains("# Task\nBuild API")); // Task NOT skipped
         assert!(!injection.contains("⚠️"));
     }
@@ -1573,7 +1648,8 @@ mod tests {
             "Learnings",
             "- first\n- second\n- third\n- fourth\n- fifth",
         )]);
-        let injection = build_facts_first_injection(&facts, Some(&narrative));
+        let injection =
+            build_facts_first_injection(&facts, Some(&narrative), InjectionLevel::L1Full);
         assert!(!injection.contains("- first"));
         assert!(!injection.contains("- second"));
         assert!(injection.contains("- third"));
@@ -2177,6 +2253,179 @@ mod tests {
         assert_eq!(
             injection_level_for_pressure(DEFAULT_L1_MINIMAL_THRESHOLD),
             InjectionLevel::L0Only
+        );
+    }
+
+    // ── Pressure-adaptive injection contract (§4.8) ─────────────────────
+
+    /// Helper producing a facts+narrative fixture that all three levels
+    /// can exercise. Facts carry plan/files/errors; narrative carries
+    /// Task Spec + Learnings + Decisions. The shape difference between
+    /// levels should be clean and contract-level, not pattern-fragile.
+    fn pressure_fixture() -> (SessionFacts, SessionMemory) {
+        use astra_turn_types::session_facts::{FileEntry, PlanFact};
+        let mut facts = SessionFacts {
+            turn: 5,
+            estimated_tokens: 40_000,
+            active_files: vec![FileEntry {
+                path: "src/auth.rs".to_string(),
+                last_action: "write".to_string(),
+                turn: 4,
+            }],
+            ..Default::default()
+        };
+        facts.set_plan_state(Some(PlanFact {
+            goal: "Add OAuth".to_string(),
+            completed: 3,
+            total: 5,
+            current_subtask: Some("token refresh".to_string()),
+        }));
+        let narrative_text = format!(
+            "{SESSION_MEMORY_PREFIX}\n\
+             # Task Specification\nAdd OAuth with JWT tokens to the API.\n\
+             # Current State\n3/5 subtasks done.\n\
+             # User Corrections\n- Use PKCE, not implicit flow.\n\
+             # Learnings\n- JWT refresh rotation is stateful.\n\
+             # Decisions\n- Picked reqwest over hyper.\n\
+             # User Messages\nAdd OAuth please.\n",
+        );
+        let narrative =
+            SessionMemory::parse(&narrative_text).expect("fixture narrative must parse");
+        (facts, narrative)
+    }
+
+    #[test]
+    fn full_level_includes_narrative() {
+        let (facts, narrative) = pressure_fixture();
+        let out = build_facts_first_injection(&facts, Some(&narrative), InjectionLevel::L1Full);
+        assert!(
+            out.contains("OAuth"),
+            "L1Full must carry narrative Task Spec; got: {out}"
+        );
+        assert!(
+            out.contains("Last Decision") || out.contains("reqwest"),
+            "L1Full must carry the last Decision; got: {out}"
+        );
+        assert!(
+            out.contains("Learnings"),
+            "L1Full must carry Learnings section; got: {out}"
+        );
+    }
+
+    #[test]
+    fn minimal_level_drops_narrative_keeps_facts() {
+        let (facts, narrative) = pressure_fixture();
+        let out = build_facts_first_injection(&facts, Some(&narrative), InjectionLevel::L1Minimal);
+        // Facts survive (plan progress is facts-derived).
+        assert!(!out.is_empty(), "L1Minimal still emits facts; got empty");
+        // Narrative-only content is gone.
+        assert!(
+            !out.contains("reqwest"),
+            "L1Minimal must drop narrative Decisions; got: {out}"
+        );
+        assert!(
+            !out.contains("JWT refresh rotation"),
+            "L1Minimal must drop narrative Learnings; got: {out}"
+        );
+        assert!(
+            !out.contains("PKCE"),
+            "L1Minimal must drop narrative User Corrections; got: {out}"
+        );
+        // But the facts-level Task (from plan.goal) may still appear
+        // via the attention manifest; that's fine — it's ground truth,
+        // not narrative.
+    }
+
+    #[test]
+    fn l0_only_returns_empty() {
+        let (facts, narrative) = pressure_fixture();
+        let out = build_facts_first_injection(&facts, Some(&narrative), InjectionLevel::L0Only);
+        assert_eq!(
+            out, "",
+            "L0Only defers to the L0 anchor in the dynamic system prompt; injection must be empty"
+        );
+    }
+
+    // ── Cross-validation staleness signals (§4.4) ───────────────────────
+
+    #[test]
+    fn staleness_clean_when_facts_and_narrative_agree() {
+        let (facts, narrative) = pressure_fixture();
+        let s = narrative_staleness(&facts, Some(&narrative));
+        assert!(!s.task_contradicted);
+        assert!(!s.missing_corrections);
+        assert!(!s.any());
+    }
+
+    #[test]
+    fn staleness_detects_plan_done_with_errors() {
+        use astra_turn_types::session_facts::{ErrorFact, PlanFact};
+        let mut facts = SessionFacts {
+            turn: 5,
+            ..Default::default()
+        };
+        facts.set_plan_state(Some(PlanFact {
+            goal: "done goal".to_string(),
+            completed: 5,
+            total: 5,
+            current_subtask: None,
+        }));
+        facts.error_state = ErrorFact {
+            total_errors: 1,
+            last_error: Some("panic in auth".to_string()),
+            last_error_turn: Some(5),
+        };
+        let s = narrative_staleness(&facts, None);
+        assert!(
+            s.task_contradicted,
+            "plan complete + unresolved errors must flag as contradicted"
+        );
+    }
+
+    #[test]
+    fn staleness_detects_missing_corrections_under_error_pressure() {
+        use astra_turn_types::session_facts::ErrorFact;
+        let facts = SessionFacts {
+            turn: 10,
+            error_state: ErrorFact {
+                total_errors: 4,
+                last_error: Some("last one".to_string()),
+                last_error_turn: Some(10),
+            },
+            ..Default::default()
+        };
+        // No narrative → corrections section is effectively empty.
+        let s = narrative_staleness(&facts, None);
+        assert!(
+            s.missing_corrections,
+            "≥3 errors + empty corrections must flag for re-extraction"
+        );
+    }
+
+    #[test]
+    fn staleness_quiet_when_corrections_recorded() {
+        use astra_turn_types::session_facts::ErrorFact;
+        let facts = SessionFacts {
+            turn: 10,
+            error_state: ErrorFact {
+                total_errors: 4,
+                last_error: Some("last one".to_string()),
+                last_error_turn: Some(10),
+            },
+            ..Default::default()
+        };
+        let narrative_text = format!(
+            "{SESSION_MEMORY_PREFIX}\n\
+             # Task Specification\nWork on auth.\n\
+             # Current State\nstuck on cookie handling.\n\
+             # User Corrections\n- Use secure cookies only.\n\
+             # User Messages\nPlease fix cookies.\n",
+        );
+        let narrative = SessionMemory::parse(&narrative_text).unwrap();
+        let s = narrative_staleness(&facts, Some(&narrative));
+        assert!(
+            !s.missing_corrections,
+            "non-empty corrections must suppress the re-extraction flag"
         );
     }
 

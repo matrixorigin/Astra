@@ -861,12 +861,33 @@ pub async fn compact_with_memoria(
         // picks the authoritative one, and a warn! log flags the split.
         let narrative = super::session_memory_protocol::pick_latest_l1(&memories)
             .and_then(|m| super::session_memory_protocol::SessionMemory::parse(&m.content));
-        let injection =
-            super::session_memory_protocol::build_facts_first_injection(facts, narrative.as_ref());
+
+        // Pressure-adaptive injection (design doc §4.8):
+        //  * pressure < 0.75 → L1 full (~650t)
+        //  * pressure < 0.85 → facts only (~150t)
+        //  * pressure ≥ 0.85 → empty here; L0 anchor in the system prompt
+        //                      already carries minimal goal state.
+        // budget_chars is the compacted output budget; token pressure
+        // approximates `current_tokens / budget_tokens` using the usual
+        // 4-char-per-token ratio.
+        let budget_tokens = params.budget_chars.saturating_mul(1).max(1) / 4;
+        let pressure = if budget_tokens == 0 {
+            0.0
+        } else {
+            (params.current_tokens as f64) / (budget_tokens.max(1) as f64)
+        };
+        let level = super::session_memory_protocol::injection_level_for_pressure(pressure);
+        let injection = super::session_memory_protocol::build_facts_first_injection(
+            facts,
+            narrative.as_ref(),
+            level.clone(),
+        );
         eprintln!(
-            "[compact] Facts-first injection ({} chars, narrative={})",
+            "[compact] Facts-first injection ({} chars, narrative={}, pressure={:.2}, level={:?})",
             injection.len(),
             narrative.is_some(),
+            pressure,
+            level,
         );
         injection
     } else {
@@ -1393,7 +1414,11 @@ mod tests {
             last_error_turn: Some(3),
         };
         let params = MemoriaCompactParams {
-            budget_chars: 10000,
+            // 40K chars → 10K tokens; current_tokens 6000 gives
+            // pressure 0.6 (L1Full band per §4.8). Older fixtures
+            // used 10K chars which yielded pressure 2.4× and would
+            // trigger L0Only (empty injection).
+            budget_chars: 40_000,
             keep_chars: 2000,
             tier: CompactionTier::CompactHistory,
             keep_recent_turns: 4,
@@ -1466,7 +1491,12 @@ mod tests {
             turn: 1,
         });
         let params = MemoriaCompactParams {
-            budget_chars: 10000,
+            // `budget_chars` is the model's input-budget in chars
+            // (effective_input_limit * 4). Use 40K chars → 10K tokens
+            // so current_tokens/budget_tokens = 0.6 (L1Full pressure
+            // band per §4.8). Earlier fixtures used 10K chars which
+            // gave pressure 2.4x and triggered L0Only (empty injection).
+            budget_chars: 40_000,
             keep_chars: 2000,
             tier: CompactionTier::CompactHistory,
             keep_recent_turns: 4,

@@ -256,7 +256,10 @@ async fn full_session_memory_lifecycle_glues_modules() {
         store_on_compact: false,
     };
     let params = MemoriaCompactParams {
-        budget_chars: 10_000,
+        // 40K chars → 10K tokens; current_tokens 8_000 yields
+        // pressure 0.8 (L1Minimal band per §4.8). That keeps the
+        // facts injection while exercising the adaptive path.
+        budget_chars: 40_000,
         keep_chars: 2_000,
         tier: CompactionTier::CompactHistory,
         keep_recent_turns: 2,

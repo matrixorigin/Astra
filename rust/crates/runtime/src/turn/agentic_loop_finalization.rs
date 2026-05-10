@@ -650,8 +650,24 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
     let Some(session_id) = state.current_session_id.clone() else {
         return;
     };
-    let had_error = state.error_recovery.consecutive_same_error > 0;
     let turn_number = state.max_turns.saturating_sub(state.remaining_turns);
+
+    // had_error = actual error this turn OR the narrative is
+    // cross-validated stale. The second clause implements design doc
+    // §4.4 "Many errors + no corrections → trigger re-extraction":
+    // re-using `had_error` for this is deliberate — the gate's
+    // override path already bypasses normal debounce when past the
+    // init gate, which is exactly the semantics we want when the
+    // narrative missed recent user corrections. The service's event
+    // stream will still surface `extracted` / `errored` with
+    // `error_triggered` breadcrumb-free (the signal is implicit in
+    // the early firing, not a new event variant).
+    let staleness = crate::turn::cloud::session_memory_protocol::narrative_staleness(
+        &state.session_facts,
+        None, // narrative not materialised here; flag based on facts alone
+    );
+    let had_error =
+        state.error_recovery.consecutive_same_error > 0 || staleness.missing_corrections;
 
     // Total context size the model actually sees — uncached prompt +
     // cache reads + cache creation. Using `total_prompt` alone here
