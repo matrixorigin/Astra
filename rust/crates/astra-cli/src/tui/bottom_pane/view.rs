@@ -43,4 +43,27 @@ pub(crate) trait BottomPaneView: Send {
     }
 
     fn pre_draw_tick(&mut self, _now: std::time::Instant) {}
+
+    /// Short key-binding hint rendered as a 1-row footer at the bottom
+    /// of the view. Return `None` to suppress (no hint bar reserved).
+    ///
+    /// The expected style is dim, space-separated, `·` as a separator
+    /// between groups:
+    ///
+    /// ```text
+    /// ↑↓ navigate · Enter resume · Esc close
+    /// ```
+    fn hint_keys(&self) -> Option<String> {
+        None
+    }
+
+    /// Opt in to having `BottomPane`'s status-line footer (model ·
+    /// cost · token budget · permission mode · git branch · pending
+    /// approvals) rendered under this view. `false` keeps the view
+    /// occupying the entire bottom pane area — appropriate for
+    /// dismissable dialogs that should feel like pop-ups, not
+    /// embedded side panels.
+    fn reserve_status_footer(&self) -> bool {
+        false
+    }
 }

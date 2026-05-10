@@ -80,6 +80,12 @@ pub struct Case {
     #[serde(default)]
     pub steps: Vec<CaseStep>,
 
+    /// Environment variables injected into the astra subprocess.
+    /// Use for tuning knobs like `ASTRA_MAX_TURN_INPUT_TOKENS` without
+    /// introducing new CLI flags.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+
     /// Shell command to run before the case (e.g., create temp files).
     /// Runs in `working_dir` or CWD. Non-zero exit aborts the case.
     #[serde(default)]

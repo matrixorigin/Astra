@@ -38,8 +38,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// Env var that enables the sink at process startup.
 pub const SELECTOR_OBS_ENV: &str = "ASTRA_SELECTOR_OBS";
 
-/// 0 = unread, 1 = off, 2 = on. Matches the `FORK_FLAG_CACHE` pattern
-/// in `fork_capture.rs` — same hot-path load semantics, same
+/// 0 = unread, 1 = off, 2 = on. Hot-path load semantics with a
 /// bypass-able surface for tests.
 static OBS_FLAG: AtomicU8 = AtomicU8::new(0);
 
@@ -82,8 +81,7 @@ pub fn restore_selector_observability_for_tests(raw: u8) {
 }
 
 /// Shared test mutex. Cross-crate selector-observability tests must
-/// share this so they don't race for flag state. Same pattern as
-/// `fork_capture::FORK_FLAG_TEST_MUTEX`.
+/// share this so they don't race for flag state.
 #[doc(hidden)]
 pub static SELECTOR_OBS_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

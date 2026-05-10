@@ -259,6 +259,18 @@ pub fn provider_preserves_reasoning(provider: &str, model: &str) -> bool {
 /// **Skipped entirely** when `provider_preserves_reasoning` returns true (e.g. Moonshot),
 /// because those providers reject empty-string reasoning_content.
 ///
+/// **Signature-bearing assistant messages are preserved verbatim** regardless of
+/// position. Anthropic's Messages API (and proxies like DeepSeek's
+/// `/anthropic` endpoint) require the full original `thinking` block plus
+/// its HMAC `signature` to be echoed on every assistant+tool_use turn in
+/// a thinking-enabled request. Stripping the content would work the first
+/// time but fail on the next round when the signature references a
+/// now-empty thinking block — session effccfcd-28d8-41f4-a4b0-ecd0ec503625
+/// t4_r2 hit `content[].thinking in the thinking mode must be passed
+/// back to the API`. Presence of a non-empty `reasoning_signature` is
+/// authoritative evidence that the upstream emitted a signed thinking
+/// block and will reject replay without it.
+///
 /// **Only affects the in-flight messages array** — heavy checkpoints and persisted events
 /// retain the full reasoning for debugging and audit.
 pub fn strip_stale_reasoning(messages: &mut [Value], provider: &str, model: &str) {
@@ -317,6 +329,20 @@ pub fn strip_stale_reasoning(messages: &mut [Value], provider: &str, model: &str
         if msg.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
+        // Anthropic-protocol guard: any assistant message carrying a
+        // non-empty `reasoning_signature` is replaying a signed thinking
+        // block. Stripping the paired `reasoning_content` would invalidate
+        // the signature on the next turn. Preserve both fields verbatim
+        // and skip this message entirely. See session
+        // effccfcd-28d8-41f4-a4b0-ecd0ec503625 t4_r2 for the failure
+        // mode (HTTP 400 from deepseek-*-anthropic).
+        if msg
+            .get("reasoning_signature")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+        {
+            continue;
+        }
         if i < last_idx {
             if msg
                 .get("reasoning_content")
@@ -325,7 +351,10 @@ pub fn strip_stale_reasoning(messages: &mut [Value], provider: &str, model: &str
             {
                 // Replace with empty string (keep field for API compat).
                 msg["reasoning_content"] = Value::String(String::new());
-                // Signature is meaningless without reasoning text.
+                // Signature is meaningless without reasoning text — and
+                // defensively stripped in case an empty signature leaked
+                // through. The signed-message guard above already skipped
+                // any message with a real signature.
                 if let Some(obj) = msg.as_object_mut() {
                     obj.remove("reasoning_signature");
                 }
@@ -610,6 +639,147 @@ mod tests {
         // Already-empty field stays empty (not removed).
         assert_eq!(msgs[0]["reasoning_content"].as_str(), Some(""));
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("real"));
+    }
+
+    /// Session effccfcd-28d8-41f4-a4b0-ecd0ec503625 t4_r2 regression: older
+    /// assistant messages that carry an Anthropic-style `reasoning_signature`
+    /// (DeepSeek's `/anthropic` endpoint, real Anthropic thinking, Bedrock
+    /// Converse) must keep BOTH `reasoning_content` and `reasoning_signature`
+    /// verbatim — the signature is an HMAC over the original text and any
+    /// divergence fails the next turn with
+    /// `content[].thinking in the thinking mode must be passed back`.
+    #[test]
+    fn strip_stale_reasoning_preserves_signature_bearing_messages() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "deep thought 1",
+                "reasoning_signature": "sig-abc-123",
+                "tool_calls": [
+                    {"id":"t1","type":"function","function":{"name":"bash","arguments":"{}"}}
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "t1", "content": "r1"}),
+            json!({"role": "user", "content": "q2"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "deep thought 2",
+                "reasoning_signature": "sig-xyz-456",
+                "tool_calls": [
+                    {"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
+        ];
+        strip_stale_reasoning(&mut msgs, "anthropic", "deepseek-v4-pro-anthropic");
+        // Older assistant (idx 1) has a signature — MUST be preserved verbatim,
+        // not cleared to empty. That's the effccfcd regression.
+        assert_eq!(
+            msgs[1]["reasoning_content"].as_str(),
+            Some("deep thought 1"),
+            "signature-bearing assistant must keep reasoning_content verbatim",
+        );
+        assert_eq!(
+            msgs[1]["reasoning_signature"].as_str(),
+            Some("sig-abc-123"),
+            "reasoning_signature must survive the strip pass",
+        );
+        // Latest also keeps its signature + content.
+        assert_eq!(
+            msgs[4]["reasoning_content"].as_str(),
+            Some("deep thought 2")
+        );
+        assert_eq!(msgs[4]["reasoning_signature"].as_str(), Some("sig-xyz-456"));
+    }
+
+    /// Signature-bearing messages are preserved even when the latest
+    /// assistant doesn't carry a signature (mid-session shape where only
+    /// earlier turns have signed thinking). The per-message signature check
+    /// must win over the "strip everything before last_idx" rule.
+    #[test]
+    fn strip_stale_reasoning_preserves_signed_even_when_latest_is_unsigned() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "signed thought",
+                "reasoning_signature": "sig-keep-me",
+                "tool_calls": [
+                    {"id":"t1","type":"function","function":{"name":"bash","arguments":"{}"}}
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "t1", "content": "r1"}),
+            json!({"role": "user", "content": "q2"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "latest unsigned thought",
+                "tool_calls": [
+                    {"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}
+                ]
+            }),
+        ];
+        strip_stale_reasoning(&mut msgs, "anthropic", "claude-sonnet-4");
+        assert_eq!(
+            msgs[1]["reasoning_content"].as_str(),
+            Some("signed thought")
+        );
+        assert_eq!(msgs[1]["reasoning_signature"].as_str(), Some("sig-keep-me"));
+        assert_eq!(
+            msgs[4]["reasoning_content"].as_str(),
+            Some("latest unsigned thought")
+        );
+    }
+
+    /// Mixed history: some older assistants have signatures, some don't.
+    /// Only the unsigned older ones should get stripped to empty.
+    #[test]
+    fn strip_stale_reasoning_strips_only_unsigned_older_messages() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q1"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "older unsigned",
+                "tool_calls": [
+                    {"id":"t1","type":"function","function":{"name":"bash","arguments":"{}"}}
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "t1", "content": "r1"}),
+            json!({"role": "user", "content": "q2"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "older signed",
+                "reasoning_signature": "sig-2",
+                "tool_calls": [
+                    {"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
+            json!({"role": "user", "content": "q3"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "latest",
+                "tool_calls": [
+                    {"id":"t3","type":"function","function":{"name":"bash","arguments":"{}"}}
+                ]
+            }),
+        ];
+        strip_stale_reasoning(&mut msgs, "anthropic", "claude-sonnet-4");
+        // Unsigned older → stripped to empty
+        assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(""));
+        assert!(msgs[1].get("reasoning_signature").is_none());
+        // Signed older → kept verbatim
+        assert_eq!(msgs[4]["reasoning_content"].as_str(), Some("older signed"));
+        assert_eq!(msgs[4]["reasoning_signature"].as_str(), Some("sig-2"));
+        // Latest → kept
+        assert_eq!(msgs[7]["reasoning_content"].as_str(), Some("latest"));
     }
 
     #[test]

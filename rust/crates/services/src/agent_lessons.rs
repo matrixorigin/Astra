@@ -119,6 +119,153 @@ impl LessonHint {
             workload_tag: l.workload_tag.clone(),
         }
     }
+
+    /// True when this lesson carries enough signal to be worth injecting
+    /// into the system prompt.
+    ///
+    /// Filters out low-quality memories that leak through Memoria's
+    /// retrieval (e.g. scratchpad entries like `"test"`, single-word
+    /// dumps, bare punctuation). These often end up tagged as
+    /// `semantic`/`procedural` by the LLM during memory storage but
+    /// carry no reusable advice.
+    ///
+    /// Rules (all must hold):
+    /// - `action` has ≥ [`MIN_LESSON_ACTION_CHARS`] non-whitespace chars
+    ///   after sanitize.
+    /// - `action` contains ≥ [`MIN_LESSON_ACTION_WORDS`] distinct tokens
+    ///   (letters, digits, CJK characters). This rejects `"test"`,
+    ///   `"ok"`, `"..."` while keeping real single-sentence guidance.
+    /// - `action` isn't a well-known scratchpad phrase
+    ///   ([`SCRATCHPAD_LOWERCASE_PHRASES`]).
+    ///
+    /// Callers that load lessons from Memoria or other untrusted stores
+    /// should apply this before rendering.
+    #[must_use]
+    pub fn is_prompt_worthy(&self) -> bool {
+        is_action_prompt_worthy(&self.action)
+    }
+}
+
+/// Minimum non-whitespace character count for a lesson action to be
+/// injection-worthy. Chosen to exclude single words like `"test"` /
+/// `"ok"` / `"done"` while permitting terse CJK advice.
+pub const MIN_LESSON_ACTION_CHARS: usize = 12;
+
+/// Minimum distinct word count (Unicode word-ish tokens). `"test"` → 1,
+/// `"run cargo test"` → 3.
+pub const MIN_LESSON_ACTION_WORDS: usize = 3;
+
+/// Lowercase phrases that sometimes surface from scratchpad memory
+/// storage but never carry reusable advice. Matched case-insensitively
+/// after whitespace collapse.
+pub const SCRATCHPAD_LOWERCASE_PHRASES: &[&str] = &[
+    "test",
+    "testing",
+    "ok",
+    "okay",
+    "done",
+    "todo",
+    "fixme",
+    "memoria test",
+    "memoria — test",
+    "memoria - test",
+    "lorem ipsum",
+    "hello world",
+    "asdf",
+    "foo bar",
+    "placeholder",
+];
+
+/// True when `action` passes the quality gate described on
+/// [`LessonHint::is_prompt_worthy`].
+pub fn is_action_prompt_worthy(action: &str) -> bool {
+    let collapsed = collapse_whitespace_lower(action);
+    if collapsed.is_empty() {
+        return false;
+    }
+    if SCRATCHPAD_LOWERCASE_PHRASES.iter().any(|p| collapsed == *p) {
+        return false;
+    }
+    let non_ws_chars = action.chars().filter(|c| !c.is_whitespace()).count();
+    if non_ws_chars < MIN_LESSON_ACTION_CHARS {
+        return false;
+    }
+    let word_count = count_word_tokens(action);
+    if word_count < MIN_LESSON_ACTION_WORDS {
+        return false;
+    }
+    true
+}
+
+fn collapse_whitespace_lower(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_ws = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !prev_ws && !out.is_empty() {
+                out.push(' ');
+                prev_ws = true;
+            }
+        } else {
+            for lower in ch.to_lowercase() {
+                out.push(lower);
+            }
+            prev_ws = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Convert a raw Memoria memory JSON object into a [`LessonHint`],
+/// applying the type allowlist (`semantic` / `procedural`),
+/// [`sanitize_for_prompt`], and the [`is_action_prompt_worthy`] quality
+/// gate. Returns `None` when the memory is the wrong type, malformed, or
+/// doesn't clear the quality bar.
+///
+/// Canonical mapper shared by the CLI (`memoria_retrieve_lessons`) and
+/// the end-to-end integration tests so both paths are guaranteed to
+/// apply the same filters.
+pub fn memory_value_to_lesson_hint(m: &serde_json::Value) -> Option<LessonHint> {
+    let content = m.get("content")?.as_str()?;
+    let memory_type = m.get("memory_type")?.as_str()?;
+    if !matches!(memory_type, "semantic" | "procedural") {
+        return None;
+    }
+    let action = sanitize_for_prompt(content);
+    if !is_action_prompt_worthy(&action) {
+        return None;
+    }
+    let compact = if action.len() > 80 {
+        action
+            .split_once(['.', '—', ';'])
+            .map(|(s, _)| s.trim().to_string())
+    } else {
+        None
+    };
+    Some(LessonHint {
+        kind: LessonKind::PromptShape,
+        trigger_signal: "memoria".into(),
+        action,
+        compact,
+        workload_tag: None,
+    })
+}
+
+fn count_word_tokens(s: &str) -> usize {
+    let mut count = 0;
+    let mut in_word = false;
+    for ch in s.chars() {
+        let is_wordy = ch.is_alphanumeric();
+        if is_wordy {
+            if !in_word {
+                count += 1;
+                in_word = true;
+            }
+        } else {
+            in_word = false;
+        }
+    }
+    count
 }
 
 /// Generate a compact summary (~60 chars) from a full action string.
@@ -230,5 +377,177 @@ impl NewLesson {
             return Err("confidence must be in [0.0, 1.0]");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hint_with_action(action: &str) -> LessonHint {
+        LessonHint {
+            kind: LessonKind::PromptShape,
+            trigger_signal: "memoria".into(),
+            action: action.to_string(),
+            compact: None,
+            workload_tag: None,
+        }
+    }
+
+    #[test]
+    fn scratchpad_phrase_test_rejected() {
+        assert!(!hint_with_action("test").is_prompt_worthy());
+    }
+
+    #[test]
+    fn scratchpad_phrase_memoria_test_rejected() {
+        assert!(!hint_with_action("memoria — test").is_prompt_worthy());
+        assert!(!hint_with_action("memoria - test").is_prompt_worthy());
+        assert!(!hint_with_action("Memoria Test").is_prompt_worthy());
+    }
+
+    #[test]
+    fn short_single_word_rejected() {
+        assert!(!hint_with_action("done").is_prompt_worthy());
+        assert!(!hint_with_action("OK").is_prompt_worthy());
+    }
+
+    #[test]
+    fn empty_or_whitespace_rejected() {
+        assert!(!hint_with_action("").is_prompt_worthy());
+        assert!(!hint_with_action("   \n\t  ").is_prompt_worthy());
+    }
+
+    #[test]
+    fn punctuation_only_rejected() {
+        assert!(!hint_with_action("...").is_prompt_worthy());
+        assert!(!hint_with_action("???").is_prompt_worthy());
+    }
+
+    #[test]
+    fn two_short_words_rejected() {
+        // Two tokens below word-count threshold (needs 3).
+        assert!(!hint_with_action("run it").is_prompt_worthy());
+    }
+
+    #[test]
+    fn real_advice_accepted() {
+        assert!(
+            hint_with_action("Always run `cargo test` before committing code changes to main.")
+                .is_prompt_worthy()
+        );
+    }
+
+    #[test]
+    fn terse_but_meaningful_advice_accepted() {
+        // 3+ words, >= min chars, not a scratchpad phrase.
+        assert!(hint_with_action("prefer rust for CLI tools").is_prompt_worthy());
+    }
+
+    #[test]
+    fn cjk_advice_accepted() {
+        // CJK ideographs count as alphanumeric; four chars of CJK still
+        // passes the char count since char count uses byte-free scan.
+        // We pick a longer phrase to pass the char and word threshold.
+        let action = "提交前 请先 运行 cargo test";
+        assert!(hint_with_action(action).is_prompt_worthy());
+    }
+
+    #[test]
+    fn whitespace_variants_of_scratchpad_phrase_rejected() {
+        // Memoria may store "  memoria  —   test  " or similar —
+        // normalized dedup should still reject.
+        assert!(!hint_with_action("  memoria   —   test  ").is_prompt_worthy());
+    }
+
+    #[test]
+    fn boundary_exactly_at_min_chars_and_words() {
+        // "run cargo test" = 13 non-ws chars, 3 words → accepted.
+        assert!(hint_with_action("run cargo test").is_prompt_worthy());
+        // "run cargo" = 8 non-ws chars, 2 words → rejected on char count.
+        assert!(!hint_with_action("run cargo").is_prompt_worthy());
+    }
+
+    #[test]
+    fn count_word_tokens_basic() {
+        assert_eq!(count_word_tokens(""), 0);
+        assert_eq!(count_word_tokens("hello"), 1);
+        assert_eq!(count_word_tokens("hello world"), 2);
+        assert_eq!(count_word_tokens("hello, world!"), 2);
+        assert_eq!(count_word_tokens("  run  cargo test "), 3);
+    }
+
+    #[test]
+    fn collapse_whitespace_lower_normalizes() {
+        assert_eq!(
+            collapse_whitespace_lower("  Memoria   TEST  "),
+            "memoria test"
+        );
+        assert_eq!(collapse_whitespace_lower("hello\nworld"), "hello world");
+    }
+
+    // ── memory_value_to_lesson_hint ────────────────────────────────────
+
+    #[test]
+    fn mapper_rejects_wrong_memory_type() {
+        let m = serde_json::json!({
+            "content": "Use RS256 for JWT signing, HS512 for internal only",
+            "memory_type": "working",
+        });
+        assert!(memory_value_to_lesson_hint(&m).is_none());
+    }
+
+    #[test]
+    fn mapper_rejects_scratchpad_content() {
+        let m = serde_json::json!({
+            "content": "test",
+            "memory_type": "semantic",
+        });
+        assert!(memory_value_to_lesson_hint(&m).is_none());
+    }
+
+    #[test]
+    fn mapper_rejects_memoria_test_phrase() {
+        let m = serde_json::json!({
+            "content": "memoria — test",
+            "memory_type": "semantic",
+        });
+        assert!(
+            memory_value_to_lesson_hint(&m).is_none(),
+            "memoria — test scratchpad must be filtered"
+        );
+    }
+
+    #[test]
+    fn mapper_accepts_real_semantic_lesson() {
+        let m = serde_json::json!({
+            "content": "Always run `cargo test` before committing to main branch",
+            "memory_type": "semantic",
+        });
+        let hint = memory_value_to_lesson_hint(&m).expect("should accept");
+        assert_eq!(hint.kind, LessonKind::PromptShape);
+        assert_eq!(hint.trigger_signal, "memoria");
+        assert!(hint.action.starts_with("Always run"));
+    }
+
+    #[test]
+    fn mapper_accepts_procedural_type() {
+        let m = serde_json::json!({
+            "content": "When encountering rate-limit errors, back off with exponential delay",
+            "memory_type": "procedural",
+        });
+        assert!(memory_value_to_lesson_hint(&m).is_some());
+    }
+
+    #[test]
+    fn mapper_returns_none_for_missing_content() {
+        let m = serde_json::json!({ "memory_type": "semantic" });
+        assert!(memory_value_to_lesson_hint(&m).is_none());
+    }
+
+    #[test]
+    fn mapper_returns_none_for_missing_type() {
+        let m = serde_json::json!({ "content": "some valid lesson text here" });
+        assert!(memory_value_to_lesson_hint(&m).is_none());
     }
 }

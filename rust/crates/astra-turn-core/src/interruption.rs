@@ -121,6 +121,17 @@ pub struct InterruptionRecord {
     pub error_detail: Option<String>,
     /// Human-readable summary for the user.
     pub user_message: String,
+    /// Optional stall-signal breadcrumb. Populated when the
+    /// interruption is caused by a measurable loop-guard condition so
+    /// the resumed session can see *why* it was cut (e.g.,
+    /// `"single_tool_streak=18"`) and the LLM can self-correct on
+    /// continuation. `None` for interruptions with no such signal
+    /// (rate limits, auth failures, user cancellations).
+    ///
+    /// Backwards compatible: older persisted records without this
+    /// field deserialize with `stall_signal = None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_signal: Option<String>,
 }
 
 impl InterruptionRecord {
@@ -140,13 +151,23 @@ impl InterruptionRecord {
             remaining_turns: state_summary.remaining_turns,
             error_detail: state_summary.error_detail,
             user_message,
+            stall_signal: state_summary.stall_signal,
         }
+    }
+
+    /// Attach a stall-signal breadcrumb (builder style). Typically
+    /// called by the finalization layer when a loop-guard condition
+    /// contributed to the interruption.
+    #[must_use]
+    pub fn with_stall_signal(mut self, signal: impl Into<String>) -> Self {
+        self.stall_signal = Some(signal.into());
+        self
     }
 
     /// Serialize to JSON for journal/checkpoint embedding.
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "kind": self.kind.label(),
             "resumable": self.kind.is_resumable(),
             "resume_action": self.resume_action,
@@ -156,7 +177,16 @@ impl InterruptionRecord {
             "remaining_turns": self.remaining_turns,
             "error_detail": self.error_detail,
             "user_message": self.user_message,
-        })
+        });
+        if let Some(ref sig) = self.stall_signal
+            && let Some(obj) = v.as_object_mut()
+        {
+            obj.insert(
+                "stall_signal".to_string(),
+                serde_json::Value::String(sig.clone()),
+            );
+        }
+        v
     }
 
     fn format_user_message(
@@ -195,12 +225,17 @@ impl InterruptionRecord {
 }
 
 /// Snapshot of loop state at interruption time (used to build `InterruptionRecord`).
+#[derive(Debug, Clone, Default)]
 pub struct InterruptionStateSummary {
     pub has_checkpoint: bool,
     pub tool_calls_completed: u32,
     pub turns_completed: u32,
     pub remaining_turns: u32,
     pub error_detail: Option<String>,
+    /// Optional stall-signal breadcrumb. See
+    /// [`InterruptionRecord::stall_signal`] for semantics. Leave `None`
+    /// when no loop-guard condition was active at interruption time.
+    pub stall_signal: Option<String>,
 }
 
 /// Build a system-level resume guidance message from a persisted interruption record.
@@ -259,6 +294,10 @@ pub fn build_resume_guidance_with_context(
         guidance.push_str("  Checkpoint: saved — prior tool results are preserved in context\n");
     }
 
+    let stall_signal = interruption_json
+        .get("stall_signal")
+        .and_then(|v| v.as_str());
+
     // Kind-specific advice
     match kind {
         "budget_exhausted" | "token_budget_exceeded" | "cumulative_budget_exceeded" => {
@@ -266,6 +305,20 @@ pub fn build_resume_guidance_with_context(
                 "  Action: Prioritize completing the most important remaining work first. \
                  Avoid exploratory tool calls — focus on delivering a result.\n",
             );
+            // If the budget was exhausted because the model streaked on
+            // single-tool rounds, say so explicitly so the LLM can see
+            // the *cause* of its interruption and batch on resume.
+            if let Some(sig) = stall_signal
+                && sig.starts_with("single_tool_streak=")
+            {
+                let streak = sig.trim_start_matches("single_tool_streak=");
+                guidance.push_str(&format!(
+                    "  Cause: the previous run used exactly ONE tool per round for {streak} \
+                     consecutive rounds, which exhausted the per-turn round budget. On \
+                     resume, batch independent calls (different files / greps / reads) \
+                     into a single parallel round instead.\n"
+                ));
+            }
         }
         "rate_limited" | "cooldown_rejected" | "server_overload" => {
             guidance.push_str(
@@ -390,11 +443,35 @@ pub fn interruption_from_error_kind(
 pub fn classify_error(error: &str) -> Option<(InterruptionKind, ResumeAction)> {
     let lower = error.to_lowercase();
 
-    // Auth / credential failures
+    // Auth / credential failures. Keep this list synced with the
+    // providers we ship (Bedrock / Anthropic direct / OpenAI / MiniMax).
+    // Session f5d6ef02 regression: Bedrock emits "Could not validate
+    // credentials" which none of the original patterns matched — five
+    // turn_errors in that session were labelled [unknown] with vacuous
+    // guidance.
+    //
+    // NOTE: `403` / `forbidden` also covers IAM/region-permission denials
+    // that aren't strictly a credential-refresh problem. The resume
+    // description below is worded generically ("invalid — please refresh")
+    // because for our UX both cases need user intervention, not a retry.
+    let has_token = lower.contains("token");
+    let has_expired = lower.contains("expired");
     if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("forbidden")
         || lower.contains("unauthorized")
         || lower.contains("authentication")
-        || lower.contains("invalid.*key")
+        // Tightened: require the verb context so we don't match benign
+        // strings like "credential helper not found" from git/keystore.
+        || lower.contains("validate credentials")
+        || lower.contains("invalid credentials")
+        || lower.contains("missing credentials")
+        || lower.contains("credentials are")
+        // AWS STS / OAuth session-token expiry — covers all shapes:
+        // "expired token", "token is expired", "token has expired",
+        // "security token ... is expired".
+        || (has_token && has_expired)
+        || (lower.contains("invalid") && lower.contains("key"))
         || lower.contains("api key")
     {
         return Some((
@@ -496,6 +573,7 @@ mod tests {
                 turns_completed: 15,
                 remaining_turns: 0,
                 error_detail: None,
+                stall_signal: None,
             },
         );
         let json = record.to_json();
@@ -503,6 +581,43 @@ mod tests {
         assert_eq!(json["resumable"], true);
         assert_eq!(json["has_checkpoint"], true);
         assert_eq!(json["tool_calls_completed"], 5);
+        assert!(
+            json.get("stall_signal").is_none(),
+            "stall_signal omitted from JSON when None for backwards compat: {json:?}"
+        );
+    }
+
+    #[test]
+    fn record_with_stall_signal_serializes_the_breadcrumb() {
+        let record = InterruptionRecord::new(
+            InterruptionKind::BudgetExhausted,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 18,
+                turns_completed: 18,
+                remaining_turns: 131,
+                error_detail: None,
+                stall_signal: Some("single_tool_streak=18".to_string()),
+            },
+        );
+        let json = record.to_json();
+        assert_eq!(
+            json["stall_signal"], "single_tool_streak=18",
+            "the resumed session must see *why* the loop was cut so the LLM can self-correct"
+        );
+    }
+
+    #[test]
+    fn with_stall_signal_builder_attaches_breadcrumb() {
+        let record = InterruptionRecord::new(
+            InterruptionKind::BudgetExhausted,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary::default(),
+        )
+        .with_stall_signal("single_tool_streak=7");
+        assert_eq!(record.stall_signal.as_deref(), Some("single_tool_streak=7"));
+        assert_eq!(record.to_json()["stall_signal"], "single_tool_streak=7");
     }
 
     #[test]
@@ -516,6 +631,7 @@ mod tests {
                 turns_completed: 2,
                 remaining_turns: 8,
                 error_detail: Some("429 Too Many Requests".to_string()),
+                stall_signal: None,
             },
         );
         assert!(record.user_message.contains("rate_limited"));
@@ -534,6 +650,7 @@ mod tests {
                 turns_completed: 5,
                 remaining_turns: 5,
                 error_detail: Some("context_length_exceeded".to_string()),
+                stall_signal: None,
             },
         );
         assert!(record.kind.is_resumable());
@@ -560,6 +677,38 @@ mod tests {
         assert!(guidance.contains("12 tool call(s)"));
         assert!(guidance.contains("Checkpoint: saved"));
         assert!(guidance.contains("Prioritize"));
+        // With no stall_signal, no cause line.
+        assert!(
+            !guidance.contains("Cause:"),
+            "Cause line should be absent when no stall_signal present: {guidance}"
+        );
+    }
+
+    #[test]
+    fn resume_guidance_budget_exhausted_with_stall_signal_surfaces_cause() {
+        let irj = serde_json::json!({
+            "kind": "budget_exhausted",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 18,
+            "turns_completed": 18,
+            "remaining_turns": 131,
+            "user_message": "[budget_exhausted] 18 tool call(s) completed.",
+            "stall_signal": "single_tool_streak=18"
+        });
+        let guidance = build_resume_guidance(&irj).expect("should produce guidance");
+        assert!(
+            guidance.contains("Cause:"),
+            "resumed session must see *why* it was cut so the LLM can self-correct: {guidance}"
+        );
+        assert!(
+            guidance.contains("18 consecutive rounds"),
+            "streak count must be interpolated into the cause line: {guidance}"
+        );
+        assert!(
+            guidance.contains("batch"),
+            "corrective advice must tell the model to batch next: {guidance}"
+        );
     }
 
     #[test]
@@ -639,6 +788,41 @@ mod tests {
     #[test]
     fn classify_error_unknown_returns_none() {
         assert!(classify_error("some random error").is_none());
+    }
+
+    /// Session f5d6ef02 regression: Bedrock/AWS auth layers emit
+    /// "Could not validate credentials" which the classifier missed
+    /// — it contains neither "401", "unauthorized", "authentication",
+    /// nor "api key". Five consecutive turn_errors in one session were
+    /// labelled `[unknown]` with vacuous guidance, hiding what was
+    /// actually a recoverable credential-refresh situation.
+    #[test]
+    fn classify_error_bedrock_validate_credentials() {
+        let (kind, _) = classify_error("Error: Could not validate credentials").unwrap();
+        assert_eq!(
+            kind,
+            InterruptionKind::AuthFailure,
+            "Bedrock-style 'Could not validate credentials' must map to AuthFailure \
+             so the UI can surface 'please re-authenticate' instead of 'unknown error'"
+        );
+    }
+
+    #[test]
+    fn classify_error_aws_expired_token() {
+        // Another common AWS STS shape that ends up in the same
+        // code path when session tokens expire mid-run.
+        let (kind, _) =
+            classify_error("The security token included in the request is expired").unwrap();
+        assert_eq!(kind, InterruptionKind::AuthFailure);
+    }
+
+    #[test]
+    fn classify_error_forbidden_403_maps_to_auth() {
+        // 403 is closer to "auth" than to "server error" for our UX —
+        // it's a permissions/credentials problem the user can fix,
+        // not a transient outage.
+        let (kind, _) = classify_error("HTTP 403 Forbidden").unwrap();
+        assert_eq!(kind, InterruptionKind::AuthFailure);
     }
 
     #[test]

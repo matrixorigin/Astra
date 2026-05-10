@@ -20,7 +20,8 @@ use crate::turn::bridge_sse_helpers::render_sse;
 use crate::turn::llm_client::{
     LLM_MAX_RETRIES, LlmCancel, apply_provider_auth, build_provider_request_body,
     consolidate_system_messages, llm_request_url_for_provider, llm_retry_base_ms,
-    provider_uses_bedrock_converse, sleep_ms_or_llm_cancel,
+    parse_openai_sse_json_stream, provider_uses_anthropic_messages, provider_uses_bedrock_converse,
+    sleep_ms_or_llm_cancel,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
     PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
@@ -232,6 +233,7 @@ async fn bedrock_stream_with_retry(
     messages: &[Value],
     tools: &[Value],
     model_name: &str,
+    wire_model_name: Option<&str>,
     api_key: &str,
     base_url: &str,
     provider: &str,
@@ -242,18 +244,19 @@ async fn bedrock_stream_with_retry(
 ) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
     let cooldown = rate_limit_cooldown();
     let model_key = model_name;
+    let upstream_name = wire_model_name.unwrap_or(model_name);
 
     let body = build_provider_request_body(
         messages,
         tools,
-        model_name,
+        upstream_name,
         provider,
         max_output_tokens,
         None,
         true,
         thinking,
     );
-    let url = llm_request_url_for_provider(base_url, provider, model_name, true);
+    let url = llm_request_url_for_provider(base_url, provider, upstream_name, true);
 
     let total_budget = crate::turn::llm_client::llm_total_budget();
     let started = std::time::Instant::now();
@@ -275,6 +278,17 @@ async fn bedrock_stream_with_retry(
 
         let mut req = client.post(&url).header("content-type", "application/json");
         req = apply_provider_auth(req, provider, api_key, None);
+
+        if std::env::var("ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT").is_ok() {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let dump_path = std::env::temp_dir().join(format!("astra-bedrock-body-{ts}.json"));
+            let dump_content =
+                serde_json::to_string_pretty(&body).unwrap_or_else(|_| "serialize error".into());
+            let _ = std::fs::write(&dump_path, &dump_content);
+        }
 
         let request_started = std::time::Instant::now();
         let response = match req.json(&body).send().await {
@@ -340,6 +354,391 @@ async fn bedrock_stream_with_retry(
     ))
 }
 
+/// Anthropic Messages streaming parser (native Anthropic API + anthropic-
+/// compatible endpoints like DeepSeek's `/anthropic`).
+///
+/// The Anthropic streaming protocol is distinct from OpenAI's
+/// `choices[0].delta.content` shape. Events arrive as:
+///   - `message_start`         — initial usage (input_tokens, cached_input_tokens, ...)
+///   - `content_block_start`   — per-block metadata (text / tool_use / thinking)
+///   - `content_block_delta`   — incremental `text_delta` / `thinking_delta` / `input_json_delta`
+///   - `content_block_stop`
+///   - `message_delta`         — final usage patch (output_tokens)
+///   - `message_stop`
+///
+/// Pre-fix, `call_llm_stream` handed anthropic bytes to the OpenAI parser,
+/// which expected `choices` + `delta.content` and silently dropped every
+/// anthropic event. Result: `turn_complete` with empty `full_text` and
+/// empty `usage` — captured in `llm_capture_*.json` as
+/// `response: {finish_reason:"stop", full_text:"", usage:{}}`.
+///
+/// This function translates anthropic events into the SAME canonical SSE
+/// types the OpenAI branch emits (`text_delta`, `reasoning_delta`,
+/// `tool_call_start`, `usage`), so downstream consumers
+/// (`apply_forward_llm_sse_event` in `bridge_sse_helpers.rs`) work
+/// unchanged.
+#[allow(clippy::too_many_arguments)]
+async fn anthropic_stream_with_retry(
+    client: &reqwest::Client,
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    wire_model_name: Option<&str>,
+    api_key: &str,
+    base_url: &str,
+    provider: &str,
+    max_output_tokens: Option<usize>,
+    has_fallback: bool,
+    client_cancel: Option<Arc<CancellationToken>>,
+    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
+) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
+    let cooldown = rate_limit_cooldown();
+    let model_key = model_name;
+    let upstream_name = wire_model_name.unwrap_or(model_name);
+
+    let body = build_provider_request_body(
+        messages,
+        tools,
+        upstream_name,
+        provider,
+        max_output_tokens,
+        None,
+        true,
+        thinking,
+    );
+    let url = llm_request_url_for_provider(base_url, provider, upstream_name, true);
+
+    let total_budget = crate::turn::llm_client::llm_total_budget();
+    let started = std::time::Instant::now();
+    let mut last_err = String::new();
+
+    for attempt in 0..=LLM_MAX_RETRIES {
+        if attempt > 0 && started.elapsed() > total_budget {
+            return Err(format!(
+                "anthropic stream total budget exhausted ({:.0}s): {last_err}",
+                total_budget.as_secs_f64()
+            ));
+        }
+        if attempt > 0 {
+            let delay = bridge_retry_backoff_ms(attempt);
+            sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        let mut req = client.post(&url).header("content-type", "application/json");
+        req = apply_provider_auth(req, provider, api_key, None);
+
+        let response = match req.json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("anthropic stream send failed: {e}");
+                continue;
+            }
+        };
+
+        let status = response.status().as_u16();
+        if response.status().is_success() {
+            cooldown.with(model_key, |c| c.record_success());
+            let byte_stream = response.bytes_stream();
+            let idle_pre = crate::turn::llm_client::stream_idle_timeout();
+            let idle_post = crate::turn::llm_client::stream_idle_timeout_after_progress();
+            let cc = client_cancel.clone();
+            let out = stream! {
+                let sse = parse_openai_sse_json_stream(byte_stream);
+                tokio::pin!(sse);
+                // Accumulate state for the final `_inprocess_summary` event.
+                let mut full_text = String::new();
+                let mut reasoning = String::new();
+                let mut reasoning_signature = String::new();
+                let mut tool_calls_map: std::collections::HashMap<usize, Map<String, Value>> =
+                    std::collections::HashMap::new();
+                let mut usage = Map::new();
+                let mut made_progress = false;
+
+                loop {
+                    let idle = if made_progress { idle_post } else { idle_pre };
+                    tokio::select! {
+                        biased;
+                        _ = crate::turn::llm_client::wait_until_cancelled_or_pending(cc.as_deref()) => {
+                            astra_core::agent_warn!(
+                                "llm",
+                                "anthropic SSE cancelled (client disconnect)"
+                            );
+                            break;
+                        }
+                        tick = tokio::time::timeout(idle, sse.next()) => {
+                            let Ok(next) = tick else {
+                                astra_core::agent_warn!(
+                                    "llm",
+                                    "anthropic SSE idle after {}ms — closing",
+                                    idle.as_millis(),
+                                );
+                                break;
+                            };
+                            let Some(chunk) = next else { break };
+                            let chunk = match chunk {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    yield render_sse(&Value::Object(
+                                        crate::build_stream_error_event(
+                                            &format!("anthropic SSE transport error: {e}"),
+                                            "stream_transport",
+                                            true,
+                                        ),
+                                    ));
+                                    break;
+                                }
+                            };
+                            for emitted in apply_anthropic_event(
+                                &chunk,
+                                &mut full_text,
+                                &mut reasoning,
+                                &mut reasoning_signature,
+                                &mut tool_calls_map,
+                                &mut usage,
+                                &mut made_progress,
+                            ) {
+                                yield emitted;
+                            }
+                        }
+                    }
+                }
+
+                let tool_calls: Vec<Value> = {
+                    let mut entries: Vec<_> = tool_calls_map.drain().collect();
+                    entries.sort_by_key(|(i, _)| *i);
+                    entries.into_iter().map(|(_, m)| Value::Object(m)).collect()
+                };
+                yield render_sse(&json!({
+                    "type": "_inprocess_summary",
+                    "full_text": full_text,
+                    "reasoning": reasoning,
+                    "reasoning_signature": reasoning_signature,
+                    "tool_calls": tool_calls,
+                    "usage": Value::Object(usage),
+                }));
+            };
+            return Ok(Box::pin(out));
+        }
+
+        let retry_after_ms = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after_ms);
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<body read error: {e}>"));
+        last_err = format!("anthropic stream HTTP {status}: {text}");
+
+        match classify_non_success_and_record_cooldown(
+            status,
+            retry_after_ms,
+            cooldown,
+            model_key,
+            has_fallback,
+            "anthropic",
+        ) {
+            RetryDecision::Retry { delay_ms } => {
+                if let Some(d) = delay_ms {
+                    sleep_ms_or_llm_cancel(d, bridge_llm_cancel(&client_cancel))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                continue;
+            }
+            RetryDecision::Terminal => return Err(last_err),
+        }
+    }
+    Err(format!(
+        "anthropic stream exhausted {LLM_MAX_RETRIES} retries: {last_err}"
+    ))
+}
+
+/// Translate one parsed Anthropic SSE event into zero or more canonical
+/// SSE bytes the bridge's forwarder knows how to handle.
+///
+/// Updates the caller's accumulator for `full_text` / `reasoning` /
+/// `reasoning_signature` / `tool_calls_map` / `usage` so the final
+/// `_inprocess_summary` event has complete state.
+///
+/// `reasoning_signature` is the HMAC-like token Anthropic emits at the
+/// end of every `thinking` content block via a `signature_delta`. When
+/// the caller re-submits the assistant message on the next turn, the
+/// upstream requires the signature to be echoed back — DeepSeek's
+/// anthropic-compatible endpoint surfaces its absence as
+/// `content[].thinking must be passed back` (HTTP 400).
+fn apply_anthropic_event(
+    chunk: &Value,
+    full_text: &mut String,
+    reasoning: &mut String,
+    reasoning_signature: &mut String,
+    tool_calls_map: &mut std::collections::HashMap<usize, Map<String, Value>>,
+    usage: &mut Map<String, Value>,
+    made_progress: &mut bool,
+) -> Vec<Bytes> {
+    let mut out = Vec::new();
+    let Some(ty) = chunk.get("type").and_then(Value::as_str) else {
+        return out;
+    };
+    match ty {
+        "message_start" => {
+            if let Some(u) = chunk
+                .get("message")
+                .and_then(|m| m.get("usage"))
+                .and_then(Value::as_object)
+                && let Some(extracted) = crate::turn::token_usage::extract_usage(
+                    crate::turn::token_usage::UsageDialect::AnthropicMessages,
+                    u,
+                )
+            {
+                let map = extracted.to_json_map();
+                *usage = map.clone();
+                out.push(render_sse(&json!({
+                    "type": "usage",
+                    "input_tokens": extracted.input_tokens,
+                    "cached_input_tokens": extracted.cached_input_tokens,
+                    "cache_creation_tokens": extracted.cache_creation_tokens,
+                    "output_tokens": extracted.output_tokens,
+                    "total_tokens": extracted.total_tokens(),
+                })));
+                *made_progress = true;
+            }
+        }
+        "content_block_start" => {
+            // Record a tool_use block start so later input_json_delta can
+            // be accumulated. Text / thinking blocks need no per-start
+            // record.
+            if let Some(block) = chunk.get("content_block").and_then(Value::as_object)
+                && block.get("type").and_then(Value::as_str) == Some("tool_use")
+            {
+                let index = chunk.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("_unknown");
+                tool_calls_map.insert(
+                    index,
+                    Map::from_iter([
+                        ("id".to_string(), Value::String(id.to_string())),
+                        ("type".to_string(), Value::String("function".to_string())),
+                        (
+                            "function".to_string(),
+                            json!({"name": name, "arguments": ""}),
+                        ),
+                    ]),
+                );
+                out.push(render_sse(&json!({
+                    "type": "tool_call_start",
+                    "call_id": id,
+                    "tool": name,
+                })));
+                *made_progress = true;
+            }
+        }
+        "content_block_delta" => {
+            let Some(delta) = chunk.get("delta").and_then(Value::as_object) else {
+                return out;
+            };
+            match delta.get("type").and_then(Value::as_str) {
+                Some("text_delta") => {
+                    if let Some(text) = delta.get("text").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        full_text.push_str(text);
+                        out.push(render_sse(&json!({
+                            "type": "text_delta",
+                            "content": text,
+                        })));
+                        *made_progress = true;
+                    }
+                }
+                Some("thinking_delta") => {
+                    if let Some(text) = delta.get("thinking").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        reasoning.push_str(text);
+                        out.push(render_sse(&json!({
+                            "type": "reasoning_delta",
+                            "content": text,
+                        })));
+                        *made_progress = true;
+                    }
+                }
+                Some("signature_delta") => {
+                    // Anthropic emits the HMAC-style signature for the
+                    // preceding thinking block as its own delta. Append
+                    // to accumulator so the final `_inprocess_summary`
+                    // event carries it to the bridge's forwarder, which
+                    // persists it on the assistant message so the NEXT
+                    // turn can echo it back unchanged. DeepSeek's
+                    // anthropic endpoint rejects replays that lose the
+                    // signature.
+                    if let Some(sig) = delta.get("signature").and_then(Value::as_str)
+                        && !sig.is_empty()
+                    {
+                        reasoning_signature.push_str(sig);
+                        *made_progress = true;
+                    }
+                }
+                Some("input_json_delta") => {
+                    if let Some(partial) = delta.get("partial_json").and_then(Value::as_str)
+                        && !partial.is_empty()
+                    {
+                        let index =
+                            chunk.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                        if let Some(entry) = tool_calls_map.get_mut(&index)
+                            && let Some(f) =
+                                entry.get_mut("function").and_then(Value::as_object_mut)
+                            && let Some(args) = f.get_mut("arguments")
+                        {
+                            if let Value::String(s) = args {
+                                s.push_str(partial);
+                            }
+                        }
+                        *made_progress = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        "message_delta" => {
+            // Final usage patch: `usage.output_tokens`.
+            if let Some(u) = chunk.get("usage").and_then(Value::as_object)
+                && let Some(out_toks) = u.get("output_tokens").and_then(Value::as_u64)
+            {
+                usage.insert("output_tokens".into(), Value::from(out_toks));
+                let input = usage
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let cached = usage
+                    .get("cached_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let cache_creation = usage
+                    .get("cache_creation_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                out.push(render_sse(&json!({
+                    "type": "usage",
+                    "input_tokens": input,
+                    "cached_input_tokens": cached,
+                    "cache_creation_tokens": cache_creation,
+                    "output_tokens": out_toks,
+                    "total_tokens": input + cached + cache_creation + out_toks,
+                })));
+            }
+        }
+        "message_stop" | "content_block_stop" | "ping" => {}
+        _ => {}
+    }
+    out
+}
+
 /// Call LLM streaming API, yield SSE bytes.
 /// Emits: text_delta, reasoning_delta, reasoning_done, tool_call_start, usage SSE events,
 /// then a final `_inprocess_summary` event with full_text/tool_calls/usage/model_used.
@@ -359,6 +758,7 @@ pub(crate) async fn call_llm_stream(
     messages: &[Value],
     tools: &[Value],
     model_name: &str,
+    wire_model_name: Option<&str>,
     api_key: &str,
     base_url: &str,
     provider: &str,
@@ -368,7 +768,14 @@ pub(crate) async fn call_llm_stream(
     thinking: &astra_turn_core::thinking_config::ThinkingConfig,
 ) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
     let cooldown = rate_limit_cooldown();
+    // `model_key` addresses the per-local-row rate-limit state. Two local
+    // rows that share an upstream wire name (via `wire_model_name` alias)
+    // still cooldown independently.
     let model_key = model_name;
+    // `upstream_name` is what the provider actually sees in the request
+    // body and URL. When no alias is configured, falls back to the local
+    // name so callers that don't care about aliases pass `None`.
+    let upstream_name = wire_model_name.unwrap_or(model_name);
 
     let mut client_builder = reqwest::Client::builder()
         .connect_timeout(crate::turn::llm_client::llm_connect_timeout())
@@ -384,6 +791,24 @@ pub(crate) async fn call_llm_stream(
             &messages,
             tools,
             model_name,
+            wire_model_name,
+            api_key,
+            base_url,
+            provider,
+            max_output_tokens,
+            has_fallback,
+            client_cancel,
+            thinking,
+        )
+        .await;
+    }
+    if provider_uses_anthropic_messages(provider) {
+        return anthropic_stream_with_retry(
+            &client,
+            &messages,
+            tools,
+            model_name,
+            wire_model_name,
             api_key,
             base_url,
             provider,
@@ -398,7 +823,7 @@ pub(crate) async fn call_llm_stream(
     let body = build_provider_request_body(
         &messages,
         tools,
-        model_name,
+        upstream_name,
         provider,
         max_output_tokens,
         None,
@@ -406,7 +831,7 @@ pub(crate) async fn call_llm_stream(
         thinking,
     );
 
-    let url = llm_request_url_for_provider(base_url, provider, model_name, true);
+    let url = llm_request_url_for_provider(base_url, provider, upstream_name, true);
     let req_bytes = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
 
     // Total budget guard: abort if retries + cooldown delays exceed the budget.
@@ -968,6 +1393,431 @@ mod tests {
         );
     }
 
+    // ── wire_model_name alias routing ────────────────────────────────────
+    //
+    // When a local row carries `wire_model_name = Some("deepseek-v4-pro")`
+    // but its stored `model_name` is `deepseek-v4-pro-anthropic`, the
+    // outbound request's `model` field MUST be the wire name. This is the
+    // fix that lets us host two local rows backed by the same upstream
+    // model id but differing on provider / base_url / credentials.
+    #[tokio::test]
+    async fn call_llm_stream_sends_wire_model_name_in_body_when_alias_set() {
+        use std::sync::Mutex;
+
+        use axum::{Router, body::Body, extract::State, response::Response, routing::post};
+
+        #[derive(Clone, Default, Debug)]
+        struct ModelCapture {
+            model: Option<String>,
+        }
+
+        async fn handler(
+            State(capture): State<Arc<Mutex<ModelCapture>>>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> Response {
+            capture.lock().expect("capture lock").model = body
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let payload = json!({"choices":[{"delta":{"content":"ok"}}]});
+            let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+            let body = format!("data: {payload}\n\ndata: {done}\n\n");
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .expect("response")
+        }
+
+        let capture = Arc::new(Mutex::new(ModelCapture::default()));
+        let app = Router::new()
+            .route("/chat/completions", post(handler))
+            .with_state(capture.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let base = format!("http://{addr}");
+
+        let stream = call_llm_stream(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "deepseek-v4-pro-anthropic",
+            Some("deepseek-v4-pro"),
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            None,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        )
+        .await
+        .expect("stream");
+        let _: Vec<_> = stream.collect().await;
+
+        let seen = capture.lock().expect("capture lock").clone();
+        assert_eq!(
+            seen.model.as_deref(),
+            Some("deepseek-v4-pro"),
+            "wire_model_name must land in the request body's `model` field, \
+             not the local row name. seen={seen:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn call_llm_stream_sends_local_model_name_when_no_alias() {
+        use std::sync::Mutex;
+
+        use axum::{Router, body::Body, extract::State, response::Response, routing::post};
+
+        #[derive(Clone, Default, Debug)]
+        struct ModelCapture {
+            model: Option<String>,
+        }
+
+        async fn handler(
+            State(capture): State<Arc<Mutex<ModelCapture>>>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> Response {
+            capture.lock().expect("capture lock").model = body
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let payload = json!({"choices":[{"delta":{"content":"ok"}}]});
+            let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+            let body = format!("data: {payload}\n\ndata: {done}\n\n");
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .expect("response")
+        }
+
+        let capture = Arc::new(Mutex::new(ModelCapture::default()));
+        let app = Router::new()
+            .route("/chat/completions", post(handler))
+            .with_state(capture.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let base = format!("http://{addr}");
+
+        let stream = call_llm_stream(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "gpt-5-mini",
+            None,
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            None,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        )
+        .await
+        .expect("stream");
+        let _: Vec<_> = stream.collect().await;
+
+        let seen = capture.lock().expect("capture lock").clone();
+        assert_eq!(
+            seen.model.as_deref(),
+            Some("gpt-5-mini"),
+            "with no alias, request body.model must equal the local name. seen={seen:?}",
+        );
+    }
+
+    // ── anthropic-sse stream parser ─────────────────────────────────────
+    //
+    // Pre-fix: `call_llm_stream` branched only on `BedrockConverse` and fell
+    // through to the OpenAI SSE parser for everything else, including
+    // `provider=anthropic`. Anthropic's stream uses distinct event names
+    // (`message_start`, `content_block_delta`, `message_delta`,
+    // `message_stop`) whose payloads do NOT match the OpenAI
+    // `choices[0].delta.{content,tool_calls}` schema. So every event was
+    // silently dropped → empty text + empty usage even though the upstream
+    // responded correctly. This regression surfaced when we added
+    // `deepseek-v4-pro-anthropic` via the anthropic-compatible endpoint.
+    //
+    // The test below emits a minimal anthropic stream and asserts both:
+    //   - the accumulated text reaches the client via `text_delta` forward
+    //   - usage tokens from `message_start` + `message_delta` reach the
+    //     client as a canonical `type: usage` SSE event
+    #[tokio::test]
+    async fn call_llm_stream_parses_anthropic_sse_text_and_usage() {
+        use axum::{Router, body::Body, extract::State, response::Response, routing::post};
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default, Debug)]
+        struct Hit {
+            got: bool,
+        }
+
+        async fn handler(State(hit): State<Arc<Mutex<Hit>>>) -> Response {
+            hit.lock().expect("hit").got = true;
+            // A minimal but realistic Anthropic SSE stream: message_start
+            // with initial usage, two text_deltas, a message_delta with
+            // final usage, then message_stop.
+            let sse = concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":42,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":10,\"output_tokens\":0}}}\n\n",
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":7}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            );
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(sse))
+                .expect("response")
+        }
+
+        let hit = Arc::new(Mutex::new(Hit::default()));
+        let app = Router::new()
+            .route("/v1/messages", post(handler))
+            .with_state(hit.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let base = format!("http://{addr}");
+
+        let stream = call_llm_stream(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "claude-test",
+            None,
+            "test-key",
+            &base,
+            "anthropic",
+            Some(50),
+            false,
+            None,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        )
+        .await
+        .expect("stream started");
+
+        // Collect every forwarded SSE event into (type, payload) pairs so
+        // we can assert on the canonical types the bridge emits downstream.
+        let bytes: Vec<Bytes> = stream.collect().await;
+        let raw = bytes
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect::<String>();
+
+        let mut text_deltas = Vec::<String>::new();
+        let mut usage_events = Vec::<Value>::new();
+        for chunk in raw.split("\n\n") {
+            let chunk = chunk.trim();
+            let Some(rest) = chunk.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(rest) else {
+                continue;
+            };
+            match v.get("type").and_then(Value::as_str) {
+                Some("text_delta") => text_deltas.push(
+                    v.get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+                Some("usage") => usage_events.push(v),
+                _ => {}
+            }
+        }
+
+        assert!(hit.lock().expect("hit").got, "upstream was called");
+        assert_eq!(
+            text_deltas.join(""),
+            "Hello world",
+            "forwarded text must aggregate the anthropic text_deltas — got {text_deltas:?}",
+        );
+        let last_usage = usage_events.last().cloned().unwrap_or_default();
+        assert_eq!(
+            last_usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            42,
+            "input_tokens must reach the forwarded usage event — got {last_usage}",
+        );
+        assert_eq!(
+            last_usage
+                .get("cached_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            10,
+            "cached_input_tokens must propagate — got {last_usage}",
+        );
+        assert!(
+            last_usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                >= 7,
+            "output_tokens must reflect message_delta update — got {last_usage}",
+        );
+    }
+
+    // ── anthropic-sse thinking + signature ──────────────────────────────
+    //
+    // Anthropic's extended-thinking protocol sends reasoning as a
+    // `thinking` content block. During streaming the block emits:
+    //   1) `content_block_start` with `content_block.type = "thinking"`
+    //   2) one or more `content_block_delta` with `delta.type = "thinking_delta"`
+    //   3) one `content_block_delta` with `delta.type = "signature_delta"`
+    //      carrying `delta.signature: "<signed_hmac>"`
+    //   4) `content_block_stop`
+    //
+    // The upstream refuses to accept a subsequent assistant message that
+    // echoes thinking content WITHOUT the original signature — DeepSeek's
+    // anthropic-compatible endpoint surfaces this as:
+    //   `content[].thinking in the thinking mode must be passed back to the API`
+    //
+    // Without capturing signature_delta, astra records only the reasoning
+    // text; the next turn's request loses the signature and the upstream
+    // rejects. This test pins the contract that the final
+    // `_inprocess_summary` event carries `reasoning_signature`.
+    #[tokio::test]
+    async fn call_llm_stream_captures_anthropic_thinking_signature() {
+        use axum::{Router, body::Body, extract::State, response::Response, routing::post};
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default, Debug)]
+        struct Hit {
+            got: bool,
+        }
+
+        async fn handler(State(hit): State<Arc<Mutex<Hit>>>) -> Response {
+            hit.lock().expect("hit").got = true;
+            let sse = concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":100,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0}}}\n\n",
+                // Thinking block: start, two thinking deltas, signature delta, stop.
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Let me think\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" about this.\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_abc123\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                // Text block to satisfy Anthropic's rule about a non-thinking
+                // final block.
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            );
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(sse))
+                .expect("response")
+        }
+
+        let hit = Arc::new(Mutex::new(Hit::default()));
+        let app = Router::new()
+            .route("/v1/messages", post(handler))
+            .with_state(hit.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let base = format!("http://{addr}");
+
+        let stream = call_llm_stream(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "claude-test",
+            None,
+            "test-key",
+            &base,
+            "anthropic",
+            Some(50),
+            false,
+            None,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        )
+        .await
+        .expect("stream started");
+
+        let bytes: Vec<Bytes> = stream.collect().await;
+        let raw = bytes
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect::<String>();
+
+        // Walk SSE events and find the _inprocess_summary — it carries the
+        // final `reasoning_signature` the forwarder propagates downstream.
+        let mut summary: Option<Value> = None;
+        for chunk in raw.split("\n\n") {
+            let chunk = chunk.trim();
+            let Some(rest) = chunk.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(rest) else {
+                continue;
+            };
+            if v.get("type").and_then(Value::as_str) == Some("_inprocess_summary") {
+                summary = Some(v);
+                break;
+            }
+        }
+        assert!(hit.lock().expect("hit").got, "upstream was called");
+        let summary = summary.expect("stream must emit a final _inprocess_summary event");
+        assert_eq!(
+            summary
+                .get("reasoning")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "Let me think about this.",
+            "thinking deltas must accumulate into reasoning — got {summary}",
+        );
+        assert_eq!(
+            summary
+                .get("reasoning_signature")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "sig_abc123",
+            "signature_delta must be captured and forwarded so the next \
+             turn can echo it back — got {summary}",
+        );
+    }
+
     #[tokio::test]
     async fn call_llm_stream_omits_empty_assistant_tool_calls_in_request_body() {
         #[derive(Clone, Default, Debug)]
@@ -1019,6 +1869,7 @@ mod tests {
             &messages,
             &[],
             "gpt-5-mini",
+            None,
             "k",
             &base,
             "openai",
@@ -1117,6 +1968,7 @@ mod tests {
             &[json!({"role":"user","content":"hi"})],
             &[],
             "gpt-5-mini",
+            None,
             "k",
             &base,
             "openai",
@@ -1161,6 +2013,7 @@ mod tests {
             &[json!({"role":"user","content":"hi"})],
             &[],
             "gpt-5-mini",
+            None,
             "k",
             &base,
             "openai",
@@ -1209,6 +2062,7 @@ mod tests {
             &[json!({"role":"user","content":"hi"})],
             &[],
             "gpt-5-mini",
+            None,
             "k",
             &base,
             "openai",
@@ -1448,6 +2302,7 @@ mod tests {
             &messages,
             &[],
             "anthropic.claude-sonnet-4-test",
+            None,
             "dummy-key",
             &base_url,
             "bedrock",
@@ -1567,6 +2422,7 @@ mod tests {
             &messages,
             &[],
             "anthropic.claude-sonnet-4-test",
+            None,
             "dummy-key",
             &base_url,
             "bedrock",

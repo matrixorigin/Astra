@@ -1009,6 +1009,12 @@ pub(super) async fn execute_cli_command(
             } else {
                 (None, None)
             };
+            #[cfg(feature = "harness")]
+            let harness_sink = astra_harness::InMemorySnapshotSink::arc();
+            #[cfg(feature = "harness")]
+            let harness_trace = std::sync::Arc::new(std::sync::RwLock::new(
+                astra_harness::SessionTrace::new(None),
+            ));
             let chat_ctx = crate::chat_stream::BasicCliChatContext {
                 api,
                 auth_profile: profile.as_deref(),
@@ -1026,11 +1032,9 @@ pub(super) async fn execute_cli_command(
                 root_agent_id: Some(&root_agent_id),
                 stream_event_tx,
                 #[cfg(feature = "harness")]
-                harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
+                harness_sink: Some(harness_sink.clone()),
                 #[cfg(feature = "harness")]
-                harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(
-                    astra_harness::SessionTrace::new(None),
-                ))),
+                harness_trace: Some(harness_trace),
             };
             let mut params = ChatTurnParams::basic_cli(
                 &chat_ctx,
@@ -1087,6 +1091,9 @@ pub(super) async fn execute_cli_command(
             if let Some(handle) = _stream_event_writer {
                 let _ = handle.await;
             }
+
+            #[cfg(feature = "harness")]
+            append_headless_inspect_snapshot(&mut sr, &message, &harness_sink);
 
             // Output result
             if args.json {
@@ -1603,6 +1610,94 @@ fn gateway_env_context() -> (Option<String>, Option<String>) {
 fn final_json_output(sr: &StreamResult, exit_code: ExitCode) -> serde_json::Value {
     let (trace_id, request_id) = gateway_env_context();
     final_json_output_with_context(sr, exit_code, trace_id, request_id)
+}
+
+#[cfg(feature = "harness")]
+fn message_requests_headless_inspect(message: &str) -> bool {
+    fn normalize(raw: &str) -> String {
+        raw.trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\''
+                    | '`'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | ','
+                    | '.'
+                    | ':'
+                    | ';'
+                    | '!'
+                    | '?'
+            )
+        })
+        .to_ascii_lowercase()
+    }
+
+    for line in message.lines() {
+        if line.split_whitespace().next().map(normalize).as_deref() == Some("/inspect") {
+            return true;
+        }
+    }
+
+    let tokens: Vec<String> = message.split_whitespace().map(normalize).collect();
+    tokens.iter().enumerate().any(|(idx, token)| {
+        if token != "/inspect" {
+            return false;
+        }
+        let prev = idx
+            .checked_sub(1)
+            .and_then(|i| tokens.get(i).map(String::as_str));
+        let prev2 = idx
+            .checked_sub(2)
+            .and_then(|i| tokens.get(i).map(String::as_str));
+        matches!(
+            prev,
+            Some("use" | "run" | "execute" | "invoke" | "call" | "show" | "append" | "appends")
+        ) || (prev == Some("the")
+            && matches!(
+                prev2,
+                Some(
+                    "use"
+                        | "run"
+                        | "execute"
+                        | "invoke"
+                        | "call"
+                        | "show"
+                        | "append"
+                        | "appends"
+                        | "appended"
+                )
+            ))
+    })
+}
+
+#[cfg(feature = "harness")]
+fn append_headless_inspect_snapshot(
+    sr: &mut StreamResult,
+    message: &str,
+    sink: &std::sync::Arc<astra_harness::InMemorySnapshotSink>,
+) {
+    if !message_requests_headless_inspect(message) {
+        return;
+    }
+
+    use astra_harness::SnapshotSink;
+    let snapshot_text = match sink.latest() {
+        Some(snapshot) => slash_inspect::format_snapshot_summary(&snapshot),
+        None => "No harness snapshot available yet.".to_string(),
+    };
+
+    if !sr.full_text.is_empty() && !sr.full_text.ends_with('\n') {
+        sr.full_text.push('\n');
+    }
+    if !sr.full_text.is_empty() {
+        sr.full_text.push('\n');
+    }
+    sr.full_text.push_str(&snapshot_text);
 }
 
 fn final_json_output_with_context(
@@ -3049,6 +3144,62 @@ mod exit_code_tests {
     fn exit_code_success_on_empty_result() {
         let sr = empty_stream_result();
         assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[cfg(feature = "harness")]
+    #[test]
+    fn headless_inspect_request_appends_latest_snapshot() {
+        use astra_harness::{DecisionRecord, HookPoint, RuntimeSnapshot, SnapshotSink};
+
+        let sink = astra_harness::InMemorySnapshotSink::arc();
+        let mut snapshot = RuntimeSnapshot::empty();
+        snapshot.session_id = "s1".to_string();
+        snapshot.turn_number = 1;
+        snapshot.turns_used = 2;
+        snapshot.tool_calls_this_session = 1;
+        snapshot.unique_tools_used = vec!["bash".to_string()];
+        snapshot.last_tool_called = Some("bash".to_string());
+        sink.update(&DecisionRecord {
+            session_id: "s1".to_string(),
+            turn: 1,
+            point: HookPoint::PostToolBatch,
+            wall_time_unix_millis: 0,
+            monotonic_millis_since_session: 0,
+            snapshot,
+        });
+
+        let mut sr = empty_stream_result();
+        sr.full_text = "done".to_string();
+        append_headless_inspect_snapshot(
+            &mut sr,
+            "Run a command, then use /inspect to show the snapshot.",
+            &sink,
+        );
+
+        assert!(sr.full_text.contains("done"));
+        assert!(sr.full_text.contains("Harness Snapshot"));
+        assert!(sr.full_text.contains("Tool calls:"));
+        assert!(sr.full_text.contains("Unique tools:        bash"));
+    }
+
+    #[cfg(feature = "harness")]
+    #[test]
+    fn headless_inspect_request_requires_slash_token() {
+        assert!(message_requests_headless_inspect("Then use /inspect."));
+        assert!(message_requests_headless_inspect("/inspect"));
+        assert!(message_requests_headless_inspect(
+            "The headless CLI should append the /inspect snapshot."
+        ));
+        assert!(message_requests_headless_inspect(
+            "The harness runner automatically appends the /inspect snapshot."
+        ));
+        assert!(!message_requests_headless_inspect(
+            "Mention inspection, but do not run the command"
+        ));
+        assert!(!message_requests_headless_inspect("What is `/inspect`?"));
+        assert!(!message_requests_headless_inspect(
+            "https://example.com/inspect"
+        ));
     }
 
     #[test]

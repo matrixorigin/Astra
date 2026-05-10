@@ -26,6 +26,7 @@ chrono = { workspace = true }
 dashmap = "6.1.0"
 dirs = "6.0.0"
 fastrand = "2"
+fnv = "1.0"
 futures-util = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
@@ -42,6 +43,7 @@ uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
+filetime = "0.2"
 # `test-util` enables `#[tokio::test(start_paused = true)]` / virtual time so
 # timing-dependent tests (streaming SSE gaps, tool-exec delays) don't burn
 # real seconds on every invocation.

@@ -6677,7 +6677,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_inherited_prefix_resolves_captured_parent() {
         use astra_turn_core::fork_capture::{
-            CaptureRequest, ForkCaptureOutcome, capture_parent_prefix, set_fork_flag_for_tests,
+            CaptureRequest, ForkCaptureOutcome, capture_parent_prefix,
         };
         use astra_turn_core::fork_prefix::{
             CacheMode, ProviderKind, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry,
@@ -6685,7 +6685,6 @@ mod tests {
         };
         use astra_turn_core::fork_prefix_store::{InMemoryPrefixStore, PrefixCaptureSink};
 
-        let prev_flag = set_fork_flag_for_tests(true);
         let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
         let schema = serde_json::json!({"function": {"name": "bash"}});
         let (schema_bytes, schema_hash) = hash_tool_schema(&schema);
@@ -6745,7 +6744,5 @@ mod tests {
             !inherited.prefix_messages.is_empty(),
             "resolved prefix must carry the captured parent messages"
         );
-
-        astra_turn_core::fork_capture::restore_fork_flag_raw_for_tests(prev_flag);
     }
 }

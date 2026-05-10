@@ -1,0 +1,212 @@
+{
+  "model": "us.anthropic.claude-sonnet-4-6",
+  "outcome": "success",
+  "provider": "bedrock",
+  "request": {
+    "message_count": 2,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "<024dbd2bebefa43f:5954>",
+            "type": "text"
+          },
+          {
+            "text": "<e908c6ff44e4857e:4062>",
+            "type": "text"
+          },
+          {
+            "cache_control": {
+              "type": "ephemeral"
+            },
+            "text": "<ba9996431707277e:202>",
+            "type": "text"
+          },
+          {
+            "text": "<4a5ef42c14d9b01f:1924>",
+            "type": "text"
+          }
+        ],
+        "role": "system"
+      },
+      {
+        "content": [
+          {
+            "cache_control": {
+              "type": "ephemeral"
+            },
+            "text": "<44e8481ab6283c2f:154>",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "tool_count": 21,
+    "tools": [
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<44398221718c166b:465>",
+          "name": "bash"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<119dd3a221936acf:589>",
+          "name": "read_file"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<6eba59bd2321ea9b:421>",
+          "name": "write_file"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<cba06bcff3e7c859:923>",
+          "name": "str_replace"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<dc385dd7b08e54f9:312>",
+          "name": "list_dir"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<e2f7e8d420cdaa49:877>",
+          "name": "grep"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<5a1cb5db03145952:811>",
+          "name": "glob"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<d88e733bad1650ca:322>",
+          "name": "introspect"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<eb6ec4a19f2cbfe5:1702>",
+          "name": "lsp"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<d9c80ae9dba5bab0:2537>",
+          "name": "git"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<1e0f45bb4f4ab39a:492>",
+          "name": "github"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<82129b8e8f834022:793>",
+          "name": "web_fetch"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<60ba68782336b9cd:665>",
+          "name": "memory"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<49ff2b22f9b6a5e3:1521>",
+          "name": "session"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<232903e941b7875a:398>",
+          "name": "mo"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<b8cda398a5f01423:1612>",
+          "name": "agent"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<648620cee5ddcb14:989>",
+          "name": "symbols"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<9a61af59276c2cb1:399>",
+          "name": "powershell"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<2b192910f27d83ae:1704>",
+          "name": "run_script"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<bb2d35669810c53c:1032>",
+          "name": "skill"
+        },
+        "type": "function"
+      },
+      {
+        "cache_control": {
+          "type": "ephemeral"
+        },
+        "function": {
+          "_scrubbed_schema_digest": "<9301156bd23febec:728>",
+          "name": "web_search"
+        },
+        "type": "function"
+      }
+    ]
+  },
+  "response": {
+    "finish_reason": "tool_calls",
+    "usage": {
+      "cache_creation_tokens": 885,
+      "cached_input_tokens": 8426,
+      "input_tokens": 3,
+      "output_tokens": 69,
+      "total_tokens": 9383
+    }
+  },
+  "round": 0,
+  "session_id": "462c485e-SCRUBBED",
+  "turn": 1
+}

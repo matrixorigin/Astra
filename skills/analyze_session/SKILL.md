@@ -1,17 +1,20 @@
 ---
 name: analyze-session
-description: "Developer skill: diagnostic analysis and debugging of an astra session. Primary input is `astra journal digest` (stable JSON from local ~/.astra/sessions). Optional deep dive: heavy checkpoints, debug JSON, stall/escalation forensics."
+description: "Unified diagnostic skill: session analysis, performance evaluation, and optimization recommendations. Primary input is `astra journal digest`. Covers: token waste, tool health, cache efficiency, stall forensics, and optimization scoring."
 user_invocable: true
-when_to_use: "When the user wants to analyze a past session for token waste, tool selection accuracy, context efficiency, or diagnose why a session is stuck, slow, or looping"
+when_to_use: "When the user wants to analyze a past session for token waste, tool selection accuracy, context efficiency, diagnose why a session is stuck/slow/looping, or get optimization recommendations"
 arguments:
   - name: TARGET
     description: "Session ID, debug JSON path (/tmp/debug-*.json), or keyword ('this', 'last'). Omit to analyze most recent."
     required: false
   - name: FOCUS
-    description: "Interpretation focus: 'context', 'tools', 'tokens', 'errors', 'flow', 'debug', or 'all' (default: all)"
+    description: "Interpretation focus: 'context', 'tools', 'tokens', 'errors', 'flow', 'debug', 'evaluate', or 'all' (default: all)"
     required: false
   - name: SYMPTOM
     description: "For debug focus: 'stuck', 'slow', 'looping', 'wrong-tools', 'errors', or 'all' (default: all)"
+    required: false
+  - name: OBJECTIVE
+    description: "For evaluate focus: 'cost', 'accuracy', 'latency', or 'balanced' (default: balanced)"
     required: false
 allowed_tools:
   - bash
@@ -260,6 +263,59 @@ Signs in the digest:
 - `safety_guard_blocks > 0` AND `tool_calls_failed / total_tool_calls > 0.15`
 - Multiple turns with same `user_input_preview` pattern ("不行", "还是不行", "打开没东西")
 - `tokens_in` growing monotonically without compaction (agent rewrites instead of fixing)
+
+---
+
+## Phase 2F: Efficiency Evaluation (FOCUS=evaluate or FOCUS=all)
+
+When FOCUS is `evaluate` (or `all`), compute efficiency ratings from digest aggregates.
+
+### Token Efficiency
+
+| Rating | Tokens per Query |
+|--------|------------------|
+| 🟢 excellent | < 10,000 |
+| 🟡 good | 10,000 – 19,999 |
+| 🟠 moderate | 20,000 – 39,999 |
+| 🔴 needs_improvement | ≥ 40,000 |
+
+Formula: `avg_tokens_in / turn_count` (or `total_tokens_in / session_start_count`)
+
+### Call Efficiency
+
+| Rating | Calls per Query |
+|--------|-----------------|
+| 🟢 excellent | ≤ 2 |
+| 🟡 good | 2.1 – 4 |
+| 🟠 moderate | 4.1 – 6 |
+| 🔴 needs_improvement | > 6 |
+
+Formula: `total_tool_calls / turn_count`
+
+### Cache Efficiency
+
+| Rating | Cache Hit Rate |
+|--------|----------------|
+| 🟢 excellent | ≥ 70% |
+| 🟡 good | 50% – 69% |
+| 🟠 moderate | 30% – 49% |
+| 🔴 needs_improvement | < 30% |
+
+Formula: `cache_read_tokens / (prompt_tokens + cache_read_tokens + cache_creation_tokens)`
+
+### Optimization Scoring (when OBJECTIVE is provided)
+
+| Objective | Focus | Trade-offs |
+|-----------|-------|------------|
+| **cost** | Reduce tokens, compress history, smaller model | May reduce context quality |
+| **accuracy** | Increase context, add verification, larger model | Higher cost, slower |
+| **latency** | Reduce call count, parallelize, cache results | May miss context updates |
+| **balanced** | Weighted: cost 0.3, accuracy 0.4, latency 0.3 | Moderate trade-offs |
+
+Scoring:
+- **Cost**: `1 - (actual_tokens / baseline)` where baseline = turns × 20,000
+- **Accuracy**: `(total_tool_calls - tool_calls_failed) / total_tool_calls`
+- **Latency**: `1 - (actual_calls / baseline)` where baseline = turns × 4
 
 ---
 

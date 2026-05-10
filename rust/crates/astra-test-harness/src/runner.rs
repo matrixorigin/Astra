@@ -391,6 +391,7 @@ mod tests {
             difficulty: None,
             weight: 1.0,
             steps: vec![],
+            env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
         };
@@ -413,6 +414,7 @@ mod tests {
             difficulty: None,
             weight: 1.0,
             steps: vec![],
+            env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
         };
@@ -437,6 +439,7 @@ mod tests {
             difficulty: None,
             weight: 1.0,
             steps: vec![],
+            env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
         };

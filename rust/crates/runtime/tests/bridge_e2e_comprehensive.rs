@@ -8710,21 +8710,29 @@ async fn a5_persist_activity_writer_called() {
 // Phase B: Round Reduction E2E Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// B1: Think-before-act directive is present in system prompt (static, always injected).
+/// B1: "Plan first" directive is present in system prompt (static, always injected).
+///
+/// This section was originally called "Think-Before-Act" in separate
+/// Planning Protocol / Context Strategy / Parallel Tool Calls / Batching
+/// blocks. They were consolidated into one "Plan, Batch, Execute" section
+/// (see `planning_section` in `prompts/system.rs`) — the behavioral contract
+/// is the same, so this test pins the rules rather than the heading.
 #[tokio::test]
 async fn b1_think_before_act_directive_in_system_prompt() {
     let prompt =
         astra_runtime::prompts::build_main_system_prompt(&["read_file", "grep"], "", 1.0, None);
     assert!(
-        prompt.contains("Think-Before-Act"),
-        "system prompt should contain Think-Before-Act section"
+        prompt.contains("Plan, Batch, Execute") || prompt.contains("Think-Before-Act"),
+        "system prompt should carry the planning directive (current heading: \
+         'Plan, Batch, Execute')"
     );
     assert!(
-        prompt.contains("Identify ALL the information you need"),
+        prompt.contains("Plan first") || prompt.contains("Identify ALL the information you need"),
         "should guide planning before tool calls"
     );
     assert!(
-        prompt.contains("Batch all independent calls into ONE turn"),
+        prompt.contains("Batch independent reads")
+            || prompt.contains("Batch all independent calls into ONE turn"),
         "should promote batching"
     );
 }
@@ -8878,7 +8886,10 @@ async fn b2_round_budget_warning_shows_remaining() {
     );
 }
 
-/// B1: Think-before-act directive in section-based prompt builder too.
+/// B1: Planning directive in section-based prompt builder too.
+///
+/// Same rename as the `b1_think_before_act_directive_in_system_prompt`
+/// note: "Think-Before-Act" was consolidated into "Plan, Batch, Execute".
 #[tokio::test]
 async fn b1_think_before_act_in_sections_builder() {
     let sections = astra_runtime::prompts::build_system_prompt_sections_with_style(
@@ -8890,8 +8901,9 @@ async fn b1_think_before_act_in_sections_builder() {
     );
     let full_text = astra_runtime::prompts::sections_to_string(&sections);
     assert!(
-        full_text.contains("Think-Before-Act"),
-        "sections builder should include Think-Before-Act"
+        full_text.contains("Plan, Batch, Execute") || full_text.contains("Think-Before-Act"),
+        "sections builder should include the planning directive (current heading: \
+         'Plan, Batch, Execute')"
     );
 }
 
@@ -9699,11 +9711,11 @@ async fn d3_semantic_dedup_pre_check_returns_cached() {
 
     let mut dedup = SemanticDedup::new(0.75);
 
-    // Record a call
+    // Record a call (output must be >= 20 chars to be considered meaningful by pre_check_block)
     dedup.check_and_record(
         "read_file",
         &json!({"path": "Cargo.toml"}),
-        "package name = foo",
+        "[package]\nname = \"foo\"\nversion = \"0.1.0\"",
         0,
     );
 
@@ -9716,7 +9728,7 @@ async fn d3_semantic_dedup_pre_check_returns_cached() {
     let (prev_turn, cached_output) = blocked.unwrap();
     assert_eq!(prev_turn, 0);
     assert!(
-        cached_output.contains("package name"),
+        cached_output.contains("name = \"foo\""),
         "should return cached output"
     );
 }

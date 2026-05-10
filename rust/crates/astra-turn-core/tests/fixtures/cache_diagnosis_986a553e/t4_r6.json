@@ -1,0 +1,442 @@
+{
+  "model": "MiniMax-M2.7",
+  "outcome": "success",
+  "provider": "openai",
+  "request": {
+    "message_count": 34,
+    "messages": [
+      {
+        "content": "<a9d762413ffdd03e:10200>",
+        "role": "system"
+      },
+      {
+        "content": "hi",
+        "role": "user"
+      },
+      {
+        "content": "\n\nHi! How can I help you today?",
+        "role": "assistant"
+      },
+      {
+        "content": "hi",
+        "role": "user"
+      },
+      {
+        "content": "\nHi! What would you like to work on?",
+        "role": "assistant"
+      },
+      {
+        "content": "hi",
+        "role": "user"
+      },
+      {
+        "content": "\nHi! What would you like to work on?",
+        "role": "assistant"
+      },
+      {
+        "content": "<9ded160832e830dd:419>",
+        "role": "user"
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "<141d4420af19d326:68>",
+              "name": "skill"
+            },
+            "id": "call_function_uswwylp2rwjq_1",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "_round_index": 0,
+        "_tool_name": "pre_resolved",
+        "content": "<638e55ab4224af06:3082>",
+        "role": "tool",
+        "tool_call_id": "call_function_uswwylp2rwjq_1"
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"action\":\"log\",\"n\":3}",
+              "name": "git"
+            },
+            "id": "call_function_2kpn0u579ih0_1",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "_round_index": 1,
+        "_tool_name": "git",
+        "content": "<607270e76246d5d4:231>",
+        "role": "tool",
+        "tool_call_id": "call_function_2kpn0u579ih0_1"
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"action\":\"show\",\"revision\":\"2333e25\"}",
+              "name": "git"
+            },
+            "id": "call_function_6gqvnbp62o5u_1",
+            "type": "function"
+          },
+          {
+            "function": {
+              "arguments": "{\"action\":\"show\",\"revision\":\"13ad21a\"}",
+              "name": "git"
+            },
+            "id": "call_function_6gqvnbp62o5u_2",
+            "type": "function"
+          },
+          {
+            "function": {
+              "arguments": "{\"action\":\"show\",\"revision\":\"8fa1168\"}",
+              "name": "git"
+            },
+            "id": "call_function_6gqvnbp62o5u_3",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "_round_index": 2,
+        "_tool_name": "git",
+        "content": "<308d9511495eb114:16009>",
+        "role": "tool",
+        "tool_call_id": "call_function_6gqvnbp62o5u_1"
+      },
+      {
+        "_round_index": 2,
+        "_tool_name": "git",
+        "content": "<308d9511495eb114:16009>",
+        "role": "tool",
+        "tool_call_id": "call_function_6gqvnbp62o5u_2"
+      },
+      {
+        "_round_index": 2,
+        "_tool_name": "git",
+        "content": "<308d9511495eb114:16009>",
+        "role": "tool",
+        "tool_call_id": "call_function_6gqvnbp62o5u_3"
+      },
+      {
+        "content": "<31528fe13b4f6a98:81>",
+        "role": "system"
+      },
+      {
+        "content": "<e72c85bcd9c638e8:99>",
+        "role": "user"
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"action\":\"show\",\"revision\":\"13ad21a\"}",
+              "name": "git"
+            },
+            "id": "call_abbe541c38244c0caec385d1",
+            "type": "function"
+          },
+          {
+            "function": {
+              "arguments": "{\"action\":\"show\",\"revision\":\"8fa1168\"}",
+              "name": "git"
+            },
+            "id": "call_d0583875dc2f4905bd146d4d",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "_round_index": 3,
+        "_tool_name": "git",
+        "content": "<308d9511495eb114:16009>",
+        "role": "tool",
+        "tool_call_id": "call_abbe541c38244c0caec385d1"
+      },
+      {
+        "_round_index": 3,
+        "_tool_name": "git",
+        "content": "<308d9511495eb114:16009>",
+        "role": "tool",
+        "tool_call_id": "call_d0583875dc2f4905bd146d4d"
+      },
+      {
+        "content": "<1dda877da073c21b:81>",
+        "role": "system"
+      },
+      {
+        "content": "<555ed5e89b93f1db:99>",
+        "role": "user"
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"command\":\"git show --stat 13ad21a\"}",
+              "name": "bash"
+            },
+            "id": "call_function_orgusnz1nbte_1",
+            "type": "function"
+          },
+          {
+            "function": {
+              "arguments": "{\"command\":\"git show --stat 8fa1168\"}",
+              "name": "bash"
+            },
+            "id": "call_function_orgusnz1nbte_2",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "_round_index": 4,
+        "_tool_name": "bash",
+        "content": "<058fc3e241c91714:1238>",
+        "role": "tool",
+        "tool_call_id": "call_function_orgusnz1nbte_1"
+      },
+      {
+        "_round_index": 4,
+        "_tool_name": "bash",
+        "content": "<7572b6b4829f301c:1337>",
+        "role": "tool",
+        "tool_call_id": "call_function_orgusnz1nbte_2"
+      },
+      {
+        "content": "<1dda877da073c21b:81>",
+        "role": "system"
+      },
+      {
+        "content": "<555ed5e89b93f1db:99>",
+        "role": "user"
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"command\":\"git show 13ad21a\"}",
+              "name": "bash"
+            },
+            "id": "call_function_0yq10t3i5rmh_1",
+            "type": "function"
+          },
+          {
+            "function": {
+              "arguments": "{\"command\":\"git show 8fa1168\"}",
+              "name": "bash"
+            },
+            "id": "call_function_0yq10t3i5rmh_2",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "_round_index": 5,
+        "_tool_name": "bash",
+        "content": "<f00f9a5d2a43c032:6635>",
+        "role": "tool",
+        "tool_call_id": "call_function_0yq10t3i5rmh_1"
+      },
+      {
+        "_round_index": 5,
+        "_tool_name": "bash",
+        "content": "<f0a19285592ac9f4:4633>",
+        "role": "tool",
+        "tool_call_id": "call_function_0yq10t3i5rmh_2"
+      },
+      {
+        "content": "<1dda877da073c21b:81>",
+        "role": "system"
+      },
+      {
+        "content": "<33882fba54390fbe:299>",
+        "role": "system"
+      },
+      {
+        "content": "<system-reminder>\n\n\n## Git State\n- Git branch: improve_promts\n- Recent commits:\n2333e25c feat(introspect): subtopic=cache diagnostic with d0640d3d regression net\n13ad21aa fix(observability): normalize anthropic-dialect usage in error capture\n8fa1168e fix(cache): pin web_search so tool marker reaches the real tail\n\n\n\n## Self-Awareness\nTurn: 9 | Tokens: 33115/80000 (58% remaining)\nScenario: CodeReview\nOutcome memory: recent identical successes: ok bash:{\"command\":\"git show 13ad21a\"}; ok bash:{\"command\":\"git show 8f<54ad61d8b43dd987:1927>",
+        "role": "user"
+      }
+    ],
+    "tool_count": 21,
+    "tools": [
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<f036392ee6ecad0a:481>",
+          "name": "bash"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<a5c1724998bc2627:610>",
+          "name": "read_file"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<32c9d2f246f0cd4a:443>",
+          "name": "write_file"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<80ba8de0af921882:946>",
+          "name": "str_replace"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<169dd2d6b97d457a:332>",
+          "name": "list_dir"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<9737c05e630a9475:893>",
+          "name": "grep"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<a4a2cad08abafcd8:827>",
+          "name": "glob"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<275162787a9c81e9:732>",
+          "name": "introspect"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<17dae0e631c586b4:1717>",
+          "name": "lsp"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<db30cbd4649dc53c:2552>",
+          "name": "git"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<31e1a0b3e9863d8b:510>",
+          "name": "github"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<7b6c83b45c9f85b4:814>",
+          "name": "web_fetch"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<38a3a5b392734f26:683>",
+          "name": "memory"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<8f7eb16c3ba1f11c:1540>",
+          "name": "session"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<6f50aa59ce23b0f4:412>",
+          "name": "mo"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<b76aaafca238b8af:1629>",
+          "name": "agent"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<6099cf86e756edc5:1008>",
+          "name": "symbols"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<a0167fcc5daafadb:421>",
+          "name": "powershell"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<605bc90866fa1dcd:1726>",
+          "name": "run_script"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<21b8adc67b35d234:1049>",
+          "name": "skill"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<d9324ec6f5265316:750>",
+          "name": "web_search"
+        },
+        "type": "function"
+      }
+    ]
+  },
+  "response": {
+    "finish_reason": "stop",
+    "usage": {
+      "cache_creation_tokens": 0,
+      "cached_input_tokens": 0,
+      "input_tokens": 33767,
+      "output_tokens": 1070,
+      "total_tokens": 34837
+    }
+  },
+  "round": 6,
+  "session_id": "986a553e-SCRUBBED",
+  "turn": 4
+}

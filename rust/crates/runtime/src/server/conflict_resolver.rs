@@ -104,6 +104,10 @@ impl LlmConflictResolver {
             &messages,
             &[], // no tools
             &self.model,
+            // Conflict resolver does not currently support wire_model_name
+            // aliases — the single-model constructor takes a plain string.
+            // When the alias feature reaches this path, plumb a new field.
+            None,
             &self.api_key,
             &self.base_url,
             &self.provider,

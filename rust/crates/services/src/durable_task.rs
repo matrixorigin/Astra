@@ -153,11 +153,16 @@ impl std::fmt::Debug for CloudLlmConfig {
 
 impl CloudLlmConfig {
     /// Build from an already-resolved active model (see [`resolve_reasoning_model`]).
+    ///
+    /// Uses `ResolvedActiveLlmModel::upstream_model_name` so alias rows
+    /// (see `wire_model_name`) send their upstream name in the outbound
+    /// `model` field rather than the local row name.
     pub fn from_resolved(resolved: crate::models::ResolvedActiveLlmModel) -> Self {
+        let model = resolved.upstream_model_name().to_string();
         Self {
             api_key: resolved.api_key,
             base_url: resolved.base_url,
-            model: resolved.model_name,
+            model,
         }
     }
 }
@@ -6307,6 +6312,7 @@ mod tests {
     fn cloud_llm_config_from_resolved_roundtrip() {
         let resolved = crate::models::ResolvedActiveLlmModel {
             model_name: "gpt-4o-mini".into(),
+            wire_model_name: None,
             api_key: "sk-test".into(),
             base_url: "https://api.openai.com/v1".into(),
             provider: "openai".into(),

@@ -28,6 +28,22 @@ pub const MAX_PTL_RETRIES: usize = 3;
 /// Minimum number of API rounds to keep when dropping for PTL retry.
 pub const MIN_ROUNDS_TO_KEEP: usize = 1;
 
+/// Inline compact instruction appended as a trailing user message in the
+/// cache-friendly summary path. Kept short and stable so the main loop's
+/// system prompt + historical messages form the cached prefix and only this
+/// trailing instruction differs between the main LLM call and the compact
+/// sub-call. Matches the "Claude Code" pattern: reuse the shared prefix,
+/// diverge only at the tail.
+pub const INLINE_COMPACT_INSTRUCTION: &str = "\
+Please produce a dense, structured summary of our conversation above so I can \
+discard the old turns and continue with just the summary in context. Preserve: \
+the user's original goals and any constraints they stated, decisions we made \
+and why, files read or modified (with paths), tools invoked and their key \
+results, errors encountered and their fixes, and any pending work. Omit \
+chit-chat, redundant acknowledgements, and exploration that did not change \
+the outcome. Format the summary as sections: **Goals**, **Decisions**, \
+**Actions**, **Status**, **Key Facts**. Target under 800 words.";
+
 // ---------------------------------------------------------------------------
 // LLM client abstraction (for testability)
 // ---------------------------------------------------------------------------
@@ -151,6 +167,100 @@ fn build_summary_messages(rendered_conversation: &str) -> Vec<Value> {
             "content": build_compact_user_prompt(rendered_conversation),
         }),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Inline (cache-friendly) summary
+// ---------------------------------------------------------------------------
+
+/// Generate a summary by **reusing the main loop's system prompt and message
+/// history** as the cached prefix, appending only a short compact instruction
+/// as the final user turn.
+///
+/// This is the "Claude Code" pattern: compact requests share the main
+/// conversation's prompt-cache prefix, so the sub-call pays only for the
+/// trailing instruction + output tokens instead of re-sending the whole
+/// history.
+///
+/// Unlike [`generate_compact_summary`] (which uses its own `COMPACT_SYSTEM_PROMPT`
+/// and a rendered-conversation blob), this function feeds the provider the
+/// *actual* `system_messages` and `history` used by the main turn. The wire
+/// prefix therefore matches the main LLM call's prefix exactly — which is the
+/// condition Anthropic / OpenAI / Bedrock prompt caching hashes on.
+///
+/// Arguments:
+/// - `system_messages`: the system-role messages used by the main turn
+///   (already includes any pipeline-injected prompt). Passed through verbatim.
+/// - `history`: the conversation turns to summarize. Passed through verbatim
+///   (same cache hash as the main call's tail messages, up to the boundary).
+/// - `client`: LLM client used to POST the request.
+///
+/// Returns `Some(summary_text)` on success, or `None` if PTL retries are
+/// exhausted (caller should fall back to structural compaction).
+///
+/// PTL retry behaviour mirrors [`generate_compact_summary`]: on a context-window
+/// error we drop the oldest API round from `history` and retry up to
+/// [`MAX_PTL_RETRIES`] times.
+pub async fn generate_inline_summary(
+    system_messages: &[Value],
+    history: &[Value],
+    client: &dyn SummaryLlmClient,
+) -> Option<String> {
+    let mut rounds = group_by_api_round(history).1;
+    let min_keep = MIN_ROUNDS_TO_KEEP;
+
+    for attempt in 0..=MAX_PTL_RETRIES {
+        // Build the messages array: <system...> + <history rounds...> + trailing user instruction.
+        let mut messages: Vec<Value> =
+            Vec::with_capacity(system_messages.len() + history.len() + 1);
+        messages.extend(system_messages.iter().cloned());
+        for round in &rounds {
+            for msg in round.messages() {
+                messages.push(msg);
+            }
+        }
+        messages.push(json!({
+            "role": "user",
+            "content": INLINE_COMPACT_INSTRUCTION,
+        }));
+
+        match client.summarize(&messages).await {
+            Ok(resp) if !resp.is_ptl_error => {
+                return Some(crate::cloud_compact_prompt::format_structured_summary(
+                    &resp.text,
+                ));
+            }
+            Ok(resp) if resp.is_ptl_error => {
+                if attempt >= MAX_PTL_RETRIES {
+                    eprintln!(
+                        "[inline_summary] PTL retries exhausted after {} attempts",
+                        attempt
+                    );
+                    return None;
+                }
+                let rounds_before = rounds.len();
+                let new_rounds = drop_oldest_rounds(&rounds, 1, min_keep);
+                if new_rounds.len() == rounds_before {
+                    eprintln!("[inline_summary] cannot drop more rounds, giving up");
+                    return None;
+                }
+                eprintln!(
+                    "[inline_summary] PTL error, dropping oldest round (attempt {}, {} → {} rounds)",
+                    attempt,
+                    rounds_before,
+                    new_rounds.len()
+                );
+                rounds = new_rounds.to_vec();
+            }
+            Ok(_) => unreachable!(),
+            Err(e) => {
+                eprintln!("[inline_summary] LLM error: {e}, giving up");
+                return None;
+            }
+        }
+    }
+
+    None
 }
 
 fn build_bedrock_summary_body(messages: &[Value], max_output_tokens: usize) -> Value {

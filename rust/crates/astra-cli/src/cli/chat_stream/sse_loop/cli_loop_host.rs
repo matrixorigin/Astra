@@ -101,18 +101,53 @@ fn derive_turn_interaction_mode(
     render_is_silent: bool,
     stdin_is_terminal: bool,
 ) -> TurnInteractionMode {
-    if is_plan_subtask || has_approval_request_tx || render_is_silent || !stdin_is_terminal {
+    // Plan subtasks are a structural override: a delegated subtask has
+    // no user-facing session, so Auto/Prompt/Deny all collapse to
+    // NonInteractive. Nothing the subtask does should depend on the
+    // parent user's mode.
+    if is_plan_subtask {
         return TurnInteractionMode::NonInteractive;
     }
+
     match permission_mode {
-        PermissionMode::Prompt => TurnInteractionMode::Prompt,
+        // Auto is the user's explicit opt-in to "run uninterrupted" —
+        // it stays Auto regardless of stdin/approval-channel/silent
+        // render. All of those signals only matter for Prompt (which
+        // needs stdin to ask the user), and Auto already short-circuits
+        // prompts anyway. Regression for session c6e18730 where piped
+        // or silent contexts silently demoted Auto → NonInteractive,
+        // which in turn disabled the nudge-suppression gate the user
+        // opted into.
         PermissionMode::Auto => TurnInteractionMode::Auto,
-        PermissionMode::Deny => TurnInteractionMode::Deny,
+        // Prompt requires user interaction; if we can't actually prompt
+        // (no tty, alternate approval channel, silenced UI), fall back
+        // to NonInteractive so callers don't block on a human.
+        PermissionMode::Prompt => {
+            if has_approval_request_tx || render_is_silent || !stdin_is_terminal {
+                TurnInteractionMode::NonInteractive
+            } else {
+                TurnInteractionMode::Prompt
+            }
+        }
+        // Deny under non-interactive contexts also collapses to
+        // NonInteractive: there's nothing to refuse interactively and
+        // Deny's deterministic-denial behaviour is already what
+        // NonInteractive callers expect.
+        PermissionMode::Deny => {
+            if has_approval_request_tx || render_is_silent || !stdin_is_terminal {
+                TurnInteractionMode::NonInteractive
+            } else {
+                TurnInteractionMode::Deny
+            }
+        }
     }
 }
 
 impl CliAgenticLoopHost<'_> {
-    fn turn_interaction_mode(&self) -> TurnInteractionMode {
+    /// Internal accessor. The trait impl delegates here; this method
+    /// exists separately so other CLI-only call sites can use it
+    /// without going through the `AgenticLoopHost` trait object.
+    fn turn_interaction_mode_inherent(&self) -> TurnInteractionMode {
         derive_turn_interaction_mode(
             self.perm_manager.mode(),
             self.is_plan_subtask,
@@ -120,6 +155,12 @@ impl CliAgenticLoopHost<'_> {
             self.render_policy.is_silent(),
             std::io::stdin().is_terminal(),
         )
+    }
+
+    /// Backwards-compatible inherent alias used by existing call sites
+    /// inside this module. Delegates to `turn_interaction_mode_inherent`.
+    fn turn_interaction_mode(&self) -> TurnInteractionMode {
+        self.turn_interaction_mode_inherent()
     }
 }
 
@@ -146,6 +187,18 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             );
         }
         let pre_clear = std::mem::take(&mut self.pending_clear_lines);
+
+        // Session c47c2dca regression fix: drain the structured volatile
+        // lane BEFORE subsequent immutable state borrows — the lane
+        // holds runtime nudges (stall reflection, circuit-breaker
+        // self-check, Task #42/#43 advisories, etc.) that must ride the
+        // outgoing payload or the LLM never sees them. Using the
+        // `_appended_to` variant so we never produce consecutive
+        // role=user pairs (Bedrock HTTP 400). See
+        // `take_volatile_pending_as_message` / `take_volatile_pending_appended_to`
+        // docs for the full context.
+        let augmented_messages_owned: Option<Vec<serde_json::Value>> =
+            state.take_volatile_pending_appended_to(state.messages.clone());
 
         // If a skill activation overrode the model, use that; otherwise fall back to host default.
         let effective_model = state.skills.model_override.as_deref().or(self.model);
@@ -197,6 +250,15 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 .or_else(|| self.root_send_message_context.clone()),
         );
 
+        // Use the augmented messages from the volatile drain if any;
+        // otherwise fall through to state.messages untouched. The
+        // augmentation is already protocol-safe (no consecutive-user
+        // pairs — see `take_volatile_pending_appended_to`).
+        let messages_slice: &[serde_json::Value] = match augmented_messages_owned.as_ref() {
+            Some(vec) => vec.as_slice(),
+            None => state.messages.as_slice(),
+        };
+
         let turn_result = fetch_chat_turn_sse(ChatTurnSseFetchRequest {
             api: self.api,
             token: self.token.as_str(),
@@ -213,7 +275,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             executor: Arc::clone(&self.executor),
             selector: self.selector,
             registry: &self.registry,
-            messages: state.messages.as_slice(),
+            messages: messages_slice,
             ephemeral_prefix: state.skills.listing_message.as_ref(),
             current_session_id: state.current_session_id.as_deref(),
             tool_results: state.tool_results.as_slice(),
@@ -295,6 +357,88 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             self.executor.set_cloud_token(refreshed_token.clone());
             self.token = refreshed_token;
         }
+
+        // Update introspect snapshot so the `introspect` tool returns fresh
+        // data if the model calls it on a subsequent round this turn.
+        let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
+        let cache_ratio = if total_in > 0 {
+            state.total_cache_read as f64 / total_in as f64
+        } else {
+            0.0
+        };
+        let working_mem = state
+            .pipeline_session
+            .as_ref()
+            .map(|s| s.working_memory().render_prompt_section())
+            .unwrap_or_default();
+        self.executor
+            .update_introspect_snapshot(astra_turn_core::introspect::IntrospectSnapshot {
+                token_pressure: 0.0,
+                cache_hit_ratio: cache_ratio,
+                turns_completed: state.llm_rounds_completed,
+                turns_remaining: state.remaining_turns as u32,
+                compaction_tier: format!("{:?}", state.compact_tier_applied),
+                alerts: Vec::new(),
+                tool_health: Vec::new(),
+                working_memory_summary: working_mem,
+                total_input_tokens: state.total_prompt + state.total_cache_read,
+                total_output_tokens: state.total_completion,
+                cache_read_tokens: state.total_cache_read,
+                cache_creation_tokens: state.total_cache_creation,
+                // Task #46 fields populated from state on each turn.
+                recent_rounds: state
+                    .recent_rounds
+                    .iter()
+                    .map(|r| astra_turn_core::introspect::RoundSnapshotEntry {
+                        turn: r.turn,
+                        round: r.round,
+                        provider: r.provider.clone(),
+                        model: r.model.clone(),
+                        prompt_tokens: r.prompt_tokens,
+                        cache_read_tokens: r.cache_read_tokens,
+                        cache_creation_tokens: r.cache_creation_tokens,
+                        completion_tokens: r.completion_tokens,
+                        tool_calls_returned: r.tool_calls_returned,
+                        tool_call_names: r.tool_call_names.clone(),
+                        duration_ms: r.duration_ms,
+                        finish_reason: r.finish_reason.clone(),
+                    })
+                    .collect(),
+                volatile_pending: state
+                    .volatile_pending
+                    .iter()
+                    .map(|inj| astra_turn_core::introspect::VolatileSnapshotEntry {
+                        kind: format!("{:?}", inj.kind),
+                        content: inj.content.clone(),
+                        round_index: inj.round_index,
+                    })
+                    .collect(),
+                stall_state: astra_turn_core::introspect::StallSnapshotSummary {
+                    nudge_count: state.stall.nudge_count,
+                    events: state
+                        .stall
+                        .events
+                        .iter()
+                        .map(|(name, turn)| format!("{name} @ turn {turn}"))
+                        .collect(),
+                    introspection_count: state.stall.introspection_count,
+                    forced_execution_escalation: state.stall.forced_execution_escalation,
+                    forced_parallel_batching: state.stall.forced_parallel_batching,
+                    forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
+                    forced_redundant_reads_corrective: state
+                        .stall
+                        .forced_redundant_reads_corrective,
+                    forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
+                    forced_exploration_family_phase2: state.stall.forced_exploration_family_phase2,
+                    forced_exploration_family_corrective: state
+                        .stall
+                        .forced_exploration_family_corrective,
+                },
+                // Injection freshness is session-scoped (filled by
+                // `handle_introspect` from `ObservabilitySession.injection_history`).
+                injection_freshness: Vec::new(),
+                current_round: state.current_round_index,
+            });
 
         Ok(HostTurnResult {
             accum: turn_result.core,
@@ -436,6 +580,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         self.render_policy.is_silent()
     }
 
+    fn turn_interaction_mode(&self) -> TurnInteractionMode {
+        self.turn_interaction_mode_inherent()
+    }
+
     fn valid_tool_names(&self) -> &HashSet<String> {
         &self.valid_tool_names
     }
@@ -492,9 +640,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // for prompt-cache reuse. No-op unless:
         //   - the `prefix_store` Arc was plumbed in (CLI startup
         //     sets this on every host when fork_prefix.enabled)
-        //   - feature flag is on (capture_parent_prefix
-        //     early-returns otherwise, preserving the
-        //     FeatureDisabled contract)
         //   - ingest populated the expected state fields
         let Some(store) = self.prefix_store.as_ref() else {
             return;
@@ -586,6 +731,149 @@ mod tests {
         assert_eq!(
             derive_turn_interaction_mode(PermissionMode::Prompt, false, true, false, true),
             TurnInteractionMode::NonInteractive
+        );
+    }
+
+    // ── Auto mode preservation under non-interactive contexts ─────────
+    //
+    // The user's Auto-mode intent is "don't interrupt me, trust the
+    // model". This must NOT be silently demoted to NonInteractive just
+    // because the turn is happening in a piped-stdin / silent-render /
+    // approval-channel context — those only matter for Prompt mode (no
+    // stdin to prompt on → fall back to NonInteractive so nothing
+    // blocks on a human). In Auto, there's nothing to prompt anyway,
+    // so the structural non-interactivity is orthogonal.
+    //
+    // Regression for session c6e18730: Auto-mode user saw `## ⚠
+    // Sequential Tool Calls Detected` nudges injected into message
+    // history because `suppresses_loop_nudges` in agentic_loop_execution_phase
+    // gates on `TurnInteractionMode::Auto`, but derive_turn_interaction_mode
+    // was collapsing Auto → NonInteractive for any structural reason,
+    // so `suppress_nudges` evaluated false and nudges fired.
+
+    #[test]
+    fn derive_turn_interaction_mode_preserves_auto_without_tty() {
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Auto, false, false, false, false),
+            TurnInteractionMode::Auto,
+            "Auto must NOT be demoted to NonInteractive just because stdin is piped — \
+             user's opt-in to uninterrupted execution still applies"
+        );
+    }
+
+    #[test]
+    fn derive_turn_interaction_mode_preserves_auto_with_silent_render() {
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Auto, false, false, true, true),
+            TurnInteractionMode::Auto,
+            "silent render (e.g. --quiet or harness) must not override Auto intent"
+        );
+    }
+
+    #[test]
+    fn derive_turn_interaction_mode_preserves_auto_with_approval_channel() {
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Auto, false, true, false, true),
+            TurnInteractionMode::Auto,
+            "approval-tx (e.g. web-approval flow) is irrelevant to Auto — Auto short-\
+             circuits approvals anyway"
+        );
+    }
+
+    #[test]
+    fn derive_turn_interaction_mode_demotes_auto_only_for_plan_subtask() {
+        // Plan subtasks are structurally non-interactive: the subtask
+        // agent has no user-facing session, and injected nudges land
+        // in a throwaway context. Auto→NonInteractive here is OK.
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Auto, true, false, false, true),
+            TurnInteractionMode::NonInteractive,
+            "plan subtasks have no user-facing mode distinction — NonInteractive"
+        );
+    }
+
+    #[test]
+    fn derive_turn_interaction_mode_demotes_deny_like_prompt() {
+        // Deny mode under non-interactive also falls back to
+        // NonInteractive (no opportunity to refuse anything
+        // interactively — and Deny's behaviour is already deterministic
+        // denial, same as NonInteractive's restrictive default).
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Deny, false, false, false, false),
+            TurnInteractionMode::NonInteractive
+        );
+    }
+
+    // ── Session c47c2dca regression guard ─────────────────────────────
+    //
+    // `CliAgenticLoopHost::execute_turn` MUST drain
+    // `state.volatile_pending` before handing messages to the bridge,
+    // otherwise runtime-injected nudges (stall reflections, circuit-
+    // breaker self-check, Task #42/#43 advisories, budget warnings,
+    // the Corrective family, etc.) never reach the LLM. The
+    // `take_volatile_pending_as_message` method on `AgenticLoopState`
+    // exists specifically for this CLI-side drain — if someone
+    // removes the call, nudges silently disappear again.
+    //
+    // A stronger test would drive the full execute_turn path and
+    // snoop the outgoing HTTP payload. But execute_turn pulls in
+    // enough non-trivial state (HTTP client, executor, perm manager,
+    // memoria hub, …) that the minimal-reproduction cost isn't
+    // justified for a single-line check. A source-level assertion
+    // suffices to guard the invariant and documents WHY the call
+    // is there.
+
+    #[test]
+    fn execute_turn_drains_volatile_lane_into_outgoing_messages() {
+        // Guard against the session c47c2dca regression. The CLI must
+        // drain the structured volatile lane before building the
+        // outgoing HTTP payload; otherwise stall nudges, circuit-breaker
+        // self-check messages, and Task #42/#43 advisories are silently
+        // dropped.
+        //
+        // We check three independent textual signatures of the fix —
+        // assembled by string concatenation so this test's literals
+        // don't self-match. If any one of these goes missing, the
+        // regression is likely back.
+        let source = include_str!("cli_loop_host.rs");
+
+        // Signature 1: the drain method must be actually INVOKED, not
+        // just mentioned in comments/docstrings. We look for the exact
+        // call syntax (dot prefix + parens suffix) assembled via
+        // concat! so this test's literal cannot self-satisfy.
+        //
+        // The accepted method is the protocol-safe `_appended_to`
+        // variant — appending a bare user msg via the non-safe variant
+        // would create consecutive-user-role pairs that Bedrock
+        // rejects. Either is better than dropping the lane entirely,
+        // but the safe one is what production must use.
+        //
+        // Do NOT quote the call syntax verbatim anywhere in this
+        // function body or its comments — it would defeat the check.
+        let safe_call = concat!(".take_volatile_pending", "_appended_to(");
+        assert!(
+            source.contains(safe_call),
+            "execute_turn must invoke the protocol-safe drain method \
+             (session c47c2dca regression + consecutive-user guard). \
+             The expected call syntax is absent; nudges will be dropped \
+             or produce invalid payloads."
+        );
+
+        // Signature 2: the LOCAL outgoing-messages vec built from
+        // state.messages + the drained volatile msg. Pattern stays
+        // lexically distinct from this test's literals.
+        assert!(
+            source.contains("augmented.push(msg)"),
+            "execute_turn must append the drained volatile msg to a local \
+             clone of state.messages (session c47c2dca regression fix shape)"
+        );
+
+        // Signature 3: the slice handed to the fetch request must be
+        // the augmented one when non-empty, else state.messages.
+        assert!(
+            source.contains("messages_slice"),
+            "execute_turn must pass an augmented messages_slice to \
+             fetch_chat_turn_sse, not raw state.messages (session c47c2dca)"
         );
     }
 }

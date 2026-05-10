@@ -21,11 +21,11 @@ arguments:
     required: false
 allowed_tools:
   - bash
-  - git_diff
-  - git_status
+  - git
+  - git
   - git_log
-  - github_list_prs
-  - github_get_pr
+  - github
+  - github
 ---
 # GitHub Create PR
 
@@ -55,7 +55,7 @@ git branch --show-current
 If on `main` or the base branch, stop — nothing to create a PR from.
 
 ### 1.3 Check for uncommitted changes
-Use `git_status`. If dirty, ask if user wants to commit first.
+Use `git {action: "status"}`. If dirty, ask if user wants to commit first.
 
 ### 1.4 Verify the branch actually has commits to PR (empty-diff guard)
 
@@ -74,12 +74,12 @@ unresolved), **STOP**:
   nothing to PR.
 - Do not invoke `gh pr create` on an empty diff. GitHub will reject it with
   "No commits between ${base} and {branch}", and the failure is wasted tokens.
-- Suggest running `git_status` / `write_file` / `str_replace` first, or use
+- Suggest running `git {action: "status"}` / `write_file` / `str_replace` first, or use
   a different `BASE` (e.g. `develop`, `master`) if the user intended a
   different target branch.
 
 ### 1.5 Check for existing PR from this branch
-Use `github_list_prs` with `state: "open"` to check. If a PR already exists from this branch, show it and ask whether to update or create a new one.
+Use `github {action: "list_prs"}` with `state: "open"` to check. If a PR already exists from this branch, show it and ask whether to update or create a new one.
 
 ## Phase 2: Generate PR Content
 
@@ -91,7 +91,7 @@ git log main..HEAD --oneline
 Use conventional commit prefix if applicable: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`.
 
 ### Body
-If not provided, generate from diff summary using `git_diff` with `stat_only: true`:
+If not provided, generate from diff summary using `git {action: "diff"}` with `stat_only: true`:
 
 ```markdown
 ## Summary

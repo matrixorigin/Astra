@@ -37,10 +37,9 @@ use crate::turn::llm_client::{
     call_llm_nonstream_fallback_with_request_overrides, llm_connect_timeout, llm_fallback_timeout,
     sleep_ms_or_llm_cancel,
 };
-use crate::turn::prompt_cache::{
-    PromptCacheConfig, annotate_tool_schemas_for_caching, apply_anthropic_cache_metadata,
-    build_system_message_with_dynamic_sections,
-};
+#[cfg(feature = "bridge-e2e-hooks")]
+use crate::turn::prompt_cache::apply_anthropic_cache_metadata;
+use crate::turn::prompt_cache::{PromptCacheConfig, annotate_tool_schemas_for_caching};
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
@@ -48,10 +47,9 @@ use astra_turn_core::bridge_rate_limit_cooldown::{
     FallbackOutcome, RateLimitAction, try_resolve_fallback,
 };
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
+use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::thinking_config::ThinkingConfig;
-use astra_turn_core::tool_schema_prune::{
-    filter_tool_schemas_by_excluded_names, prune_tool_schemas,
-};
+use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
 use astra_turn_core::turn_guard::merge_deprioritized_tools_into_restricted;
 
 fn request_aware_summary_http_client() -> Result<reqwest::Client, String> {
@@ -236,6 +234,9 @@ fn mock_round_partial_text(error: &astra_core::ClassifiedError) -> Option<String
 #[derive(Debug, Clone)]
 struct ResolvedTurnLlmConfig {
     model_name: String,
+    /// Upstream literal name to put in the request body's `model` field.
+    /// `None` → send `model_name`. See `ResolvedActiveLlmModel::upstream_model_name`.
+    wire_model_name: Option<String>,
     api_key: String,
     base_url: String,
     provider: String,
@@ -243,6 +244,31 @@ struct ResolvedTurnLlmConfig {
     header_overrides: HashMap<String, String>,
     completions_url_override: Option<String>,
     request_timeout: Option<Duration>,
+}
+
+/// Full output of [`ServerAgenticLoopHost::run_turn_pipeline`] — everything the
+/// wire-payload path needs from a pipeline turn in one place.
+struct PipelineTurnOutcome {
+    /// Rendered system message(s), ready to prepend to the LLM request.
+    system_messages: Vec<Value>,
+    /// For prefix-only providers (DeepSeek, GLM, Qwen): volatile content
+    /// (CacheScope::None blocks) moved out of the system message into a
+    /// synthetic user/assistant pair so the system message stays byte-stable
+    /// across turns, maximizing prefix cache hit rates.
+    /// Empty for Anthropic/Bedrock providers (they use cache_control markers).
+    volatile_preamble: Vec<Value>,
+    /// Flattened plain-text system prompt, for trace + cache-estimate consumers.
+    system_plain: String,
+    /// Per-section token breakdown for observability.
+    breakdown: astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
+    /// Compaction tier the planner selected this turn. The runtime must honour
+    /// this rather than re-deriving a tier from raw prompt-token estimates —
+    /// double derivation used to be the primary source of pipeline/runtime drift.
+    tier: CompactionTier,
+    /// Tool schemas already pruned to `tier` by the pipeline's Optimize phase.
+    /// Runtime still needs to layer `cache_control` annotations (Phase 2), but
+    /// the pruning decision is authoritative from here down.
+    tool_schemas: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +342,7 @@ async fn resolve_llm_model_for_turn(
         return Ok(ResolvedTurnLlmConfig {
             model_name: normalize_request_model(preferred_model)
                 .unwrap_or_else(|| "gpt-4o-mini".to_string()),
+            wire_model_name: None,
             api_key: String::new(),
             base_url: "https://api.openai.com/v1".to_string(),
             provider: "openai".to_string(),
@@ -330,6 +357,7 @@ async fn resolve_llm_model_for_turn(
             .await?;
     Ok(ResolvedTurnLlmConfig {
         model_name: resolved.model_name,
+        wire_model_name: resolved.wire_model_name,
         api_key: resolved.api_key,
         base_url: resolved.base_url,
         provider: resolved.provider,
@@ -377,6 +405,21 @@ pub struct CapturedLlmRequest {
     /// as text; for Anthropic: the concatenated text of all blocks up to and
     /// including the last cache_control breakpoint).
     pub cacheable_prefix_sha256: String,
+    /// Indices of messages (in the captured `messages` array) that carry a
+    /// `cache_control` marker anywhere in their content. Order matches the
+    /// message order. Empty for non-Anthropic providers.
+    ///
+    /// Used by tests to assert the rolling-breakpoint invariant across
+    /// consecutive rounds: the historical marker from round N must still
+    /// be present at the same message index in round N+1 so that Anthropic
+    /// can hit the cached prefix through the message history — not just
+    /// through `system` + `tools`.
+    pub message_cache_control_indices: Vec<usize>,
+    /// For each message in `messages`, the SHA-256 hex of that message's
+    /// canonical JSON serialization (sort_keys). Tests compare slices of
+    /// this vector across rounds to prove the cacheable message prefix is
+    /// byte-stable (a prerequisite for Anthropic cache hits beyond tools).
+    pub message_sha256: Vec<String>,
 }
 
 #[cfg(feature = "bridge-e2e-hooks")]
@@ -435,6 +478,47 @@ fn cacheable_prefix_text(system_primary: &Value, is_anthropic: bool) -> String {
     }
 }
 
+/// Normalize a message to the shape Anthropic uses for cache-key
+/// derivation. Removes `cache_control` attributes everywhere (they are
+/// request-layer directives, not tokens) and upgrades `content: "text"`
+/// strings to the canonical `content: [{type:"text", text:"..."}]`
+/// array form so that the "marker placed → content promoted to array"
+/// shape flip produced by `apply_cache_control_to_message` does not
+/// spuriously break byte-level prefix comparisons in tests.
+#[cfg(feature = "bridge-e2e-hooks")]
+fn normalize_message_for_cache_hash(m: &Value) -> Value {
+    let mut out = m.clone();
+    if let Some(obj) = out.as_object_mut()
+        && let Some(content) = obj.get("content").cloned()
+        && let Some(s) = content.as_str()
+    {
+        obj.insert(
+            "content".into(),
+            serde_json::json!([{ "type": "text", "text": s }]),
+        );
+    }
+    strip_cache_control(&mut out);
+    out
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+fn strip_cache_control(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            map.remove("cache_control");
+            for (_, child) in map.iter_mut() {
+                strip_cache_control(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                strip_cache_control(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(feature = "bridge-e2e-hooks")]
 fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -486,6 +570,35 @@ fn build_captured_llm_request(
         .unwrap_or(false);
     let prefix = cacheable_prefix_text(&primary, cache_cfg.is_anthropic);
     let cacheable_prefix_sha256 = sha256_hex(&prefix);
+    let message_cache_control_indices: Vec<usize> = if cache_cfg.is_anthropic {
+        messages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| {
+                let at_msg = value_has_cache_control(m);
+                let in_content = m
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| arr.iter().any(value_has_cache_control));
+                (at_msg || in_content).then_some(i)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Hash each message AFTER normalizing to the shape Anthropic uses for
+    // cache-key derivation (see `normalize_message_for_cache_hash`). This
+    // lets prefix-stability tests prove "same tokens, different marker
+    // placement" is still a cache hit.
+    let message_sha256: Vec<String> = messages
+        .iter()
+        .map(|m| {
+            let normalized = normalize_message_for_cache_hash(m);
+            let canonical =
+                serde_json::to_string(&normalized).unwrap_or_else(|_| "<unserializable>".into());
+            sha256_hex(&canonical)
+        })
+        .collect();
     CapturedLlmRequest {
         turn_index,
         provider,
@@ -500,6 +613,8 @@ fn build_captured_llm_request(
         last_tool_has_cache_control,
         last_message_has_cache_control,
         cacheable_prefix_sha256,
+        message_cache_control_indices,
+        message_sha256,
     }
 }
 
@@ -523,6 +638,10 @@ pub struct ServerAgenticLoopHost {
     model_override: Option<String>,
     llm_token_service: Option<LlmTokenServiceConfig>,
     resolved_model_name: Option<String>,
+    /// Cached LLM connection params from the last successful model resolution.
+    /// Used by `summary_client()` to construct the compact-summary client
+    /// without re-resolving (model resolution requires async DB call).
+    resolved_llm_params: Option<astra_turn_core::cloud_summary::LlmConnParams>,
 
     // ── Context ──
     edge_tools: Vec<Value>,
@@ -837,6 +956,7 @@ impl ServerAgenticLoopHostBuilder {
             model_override: self.model_override,
             llm_token_service: self.llm_token_service,
             resolved_model_name: None,
+            resolved_llm_params: None,
             edge_tools,
             edge_profile: self.edge_profile,
             valid_tools,
@@ -1071,20 +1191,62 @@ impl ServerAgenticLoopHost {
         };
 
         let edge_tools_snapshot = self.edge_tools.clone();
-        let (system_msgs, _system_plain, system_prompt_breakdown) = self
-            .build_system_messages_cached(&state.message, &edge_tools_snapshot, state, &cache_cfg);
-        self.emit_context_meta(&system_prompt_breakdown);
+        // Use the same pipeline path as `execute_turn` so mock-replay exercises
+        // exactly what a real turn would send. The previous implementation had
+        let (provider_name, model_name_for_pipeline) = match &self.mock_provider {
+            Some((p, m)) => (p.clone(), m.clone()),
+            None => ("openai".to_string(), "server-loop-mock".to_string()),
+        };
+        let user_content = state.message.clone();
+        let mock_pipeline = self.run_turn_pipeline(
+            state,
+            &edge_tools_snapshot,
+            &provider_name,
+            &model_name_for_pipeline,
+            &user_content,
+        );
+        let system_msgs = mock_pipeline.system_messages;
+        let volatile_preamble = mock_pipeline.volatile_preamble;
+        self.emit_context_meta(&mock_pipeline.breakdown);
 
         // Replicate the real-path tool + message annotations so captured
-        // payloads reflect what a real provider would see.
-        let mut annotated_tools = edge_tools_snapshot.clone();
+        // payloads reflect what a real provider would see. Start from the
+        // pipeline-pruned tool schemas so mock replay mirrors the real
+        // wire. Route the history through the same `assemble_llm_messages`
+        // stitcher the real path uses so matrix tests see the output of
+        // volatile-preamble folding and `consolidate_mid_history_volatile_injections`.
+        let mut annotated_tools = mock_pipeline.tool_schemas;
         annotate_tool_schemas_for_caching(&mut annotated_tools, &cache_cfg);
-        let mut annotated_messages = state.messages.clone();
-        apply_anthropic_cache_metadata(&mut annotated_messages, &cache_cfg, &self.session_id);
         let (provider, model) = self
             .mock_provider
             .clone()
             .unwrap_or_else(|| ("openai".to_string(), "server-loop-mock".to_string()));
+        let mock_llm_cfg = ResolvedTurnLlmConfig {
+            provider: provider.clone(),
+            model_name: model.clone(),
+            wire_model_name: None,
+            api_key: String::new(),
+            base_url: String::new(),
+            fallback_chain: Vec::new(),
+            header_overrides: HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
+        };
+        let wire_messages = self.assemble_llm_messages(
+            system_msgs.clone(),
+            volatile_preamble.clone(),
+            state.messages.clone(),
+            state,
+            &mock_llm_cfg,
+            &cache_cfg,
+        );
+        // `assemble_llm_messages` produces `[system(s), …, compacted msgs,
+        // post-compact attachments]`. For the capture's downstream
+        // assertions we want just the message portion (post the canonical
+        // system messages). Extract.
+        let sys_count = system_msgs.len();
+        let annotated_messages: Vec<Value> =
+            wire_messages.iter().skip(sys_count).cloned().collect();
         let mut capture_messages = system_msgs.clone();
         capture_messages.extend(annotated_messages.clone());
 
@@ -1100,7 +1262,7 @@ impl ServerAgenticLoopHost {
                 &system_msgs,
                 &annotated_tools,
                 &annotated_messages,
-                &system_prompt_breakdown,
+                &mock_pipeline.breakdown,
             );
             if let Ok(mut guard) = cap.lock() {
                 guard.push(captured);
@@ -1150,8 +1312,8 @@ impl ServerAgenticLoopHost {
             if error.kind == astra_core::ErrorKind::ContextWindow {
                 let accum = ChatTurnSseAccum {
                     error_message: Some(error.message.clone()),
-                    system_prompt_tokens: Some(system_prompt_breakdown.total_tokens),
-                    system_prompt_breakdown: serde_json::to_value(&system_prompt_breakdown).ok(),
+                    system_prompt_tokens: Some(mock_pipeline.breakdown.total_tokens),
+                    system_prompt_breakdown: serde_json::to_value(&mock_pipeline.breakdown).ok(),
                     ..Default::default()
                 };
                 return Ok(HostTurnResult {
@@ -1259,8 +1421,8 @@ impl ServerAgenticLoopHost {
             cache_read_tokens: u.cached_input_tokens,
             cache_creation_tokens: u.cache_creation_tokens,
             has_usage: true,
-            system_prompt_tokens: Some(system_prompt_breakdown.total_tokens),
-            system_prompt_breakdown: serde_json::to_value(&system_prompt_breakdown).ok(),
+            system_prompt_tokens: Some(mock_pipeline.breakdown.total_tokens),
+            system_prompt_breakdown: serde_json::to_value(&mock_pipeline.breakdown).ok(),
             ..Default::default()
         };
 
@@ -1581,321 +1743,6 @@ impl ServerAgenticLoopHost {
         results
     }
 
-    /// Build the system prompt from edge context and the tool schemas visible
-    /// to the current turn.
-    ///
-    /// Returns `(structured_system_messages, plain_text_for_estimates)`.
-    /// The structured messages include Anthropic cache_control annotations when
-    /// applicable, enabling prompt caching on the runs path.
-    fn build_system_messages_cached(
-        &self,
-        user_content: &str,
-        tools: &[Value],
-        state: &AgenticLoopState,
-        cache_cfg: &PromptCacheConfig,
-    ) -> (
-        Vec<Value>,
-        String,
-        astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
-    ) {
-        let tool_names: Vec<&str> = tools
-            .iter()
-            .filter_map(|t| {
-                t.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-            })
-            .collect();
-
-        let mut profile_parts = Vec::new();
-        if let Some(cwd) = self.edge_profile.get("cwd").and_then(Value::as_str) {
-            profile_parts.push(format!("cwd: {cwd}"));
-        }
-        if let Some(branch) = self.edge_profile.get("git_branch").and_then(Value::as_str) {
-            profile_parts.push(format!("git_branch: {branch}"));
-        }
-
-        let active_skill_names: Vec<&str> = self
-            .edge_profile
-            .get("active_skills")
-            .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
-        let skill_hint = if active_skill_names.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n\n## Active Output Skills\nThe user has enabled these output constraints: {}. \
-                 Follow their formatting rules strictly.",
-                active_skill_names.join(", ")
-            )
-        };
-
-        let learned_context_text = self
-            .edge_profile
-            .get("learned_context_hint")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_default();
-        let learned_context_hint = if learned_context_text.is_empty() {
-            String::new()
-        } else {
-            format!("\n\n## Learned Runtime Context\n{learned_context_text}")
-        };
-
-        let task_type = self
-            .edge_profile
-            .get("selection_task_type")
-            .and_then(Value::as_str)
-            .or_else(|| crate::prompts::detect_task_type(user_content));
-
-        let profile_desc = if profile_parts.is_empty() {
-            String::new()
-        } else {
-            format!("\n\n# Project Profile\n{}", profile_parts.join("\n"))
-        };
-
-        // Skill effort/agent_type hints (dynamic per-turn)
-        let mut extra_dynamic = String::new();
-        if let Some(ref effort) = state.skills.effort {
-            extra_dynamic.push_str(&format!(
-                "\n\n## Effort Level\nThe active skill requests effort level: **{effort}**. \
-                 Adjust thoroughness accordingly.",
-            ));
-        }
-        if let Some(ref agent_type) = state.skills.agent_type {
-            extra_dynamic.push_str(&format!(
-                "\n\n## Agent Type\nYou are acting as a **{agent_type}** agent for this skill.",
-            ));
-        }
-
-        // Memory storage decisions are now LLM-driven via system prompt rules.
-        let memory_signal_hint = String::new();
-
-        // System prompt override from delegation coordination context
-        let system_override = self
-            .edge_profile
-            .get("system_prompt_override")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(|s| format!("\n\n{s}"))
-            .unwrap_or_default();
-
-        let tool_cfg = astra_config::runtime_config::RuntimeConfig::load().tool_selection;
-        let (tool_round_guidance, guidance_signals) =
-            crate::prompts::tool_round_guidance_trace_with(
-                &state.messages,
-                state.llm_rounds_completed,
-                tool_cfg.effective_round_budget_warning(),
-                tool_cfg.effective_round_budget_limit(),
-            );
-
-        let mut dynamic_sections = Vec::new();
-        if !profile_desc.is_empty() {
-            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
-                profile_desc.clone(),
-                crate::prompts::PromptTokenBucket::Environment,
-            ));
-        }
-        if !skill_hint.is_empty() {
-            dynamic_sections.push(
-                crate::prompts::PromptSection::dynamic(
-                    skill_hint.clone(),
-                    crate::prompts::PromptTokenBucket::UserPreferences,
-                )
-                .with_trace_signals(
-                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals:
-                            astra_turn_core::context_assembly_trace::PromptContextSignals {
-                                active_output_skills: true,
-                                ..Default::default()
-                            },
-                        ..Default::default()
-                    },
-                ),
-            );
-        }
-        if !learned_context_hint.is_empty() {
-            dynamic_sections.push(
-                crate::prompts::PromptSection::dynamic(
-                    learned_context_hint.clone(),
-                    crate::prompts::PromptTokenBucket::UserPreferences,
-                )
-                .with_trace_signals(
-                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals:
-                            astra_turn_core::context_assembly_trace::PromptContextSignals {
-                                learned_runtime_context: true,
-                                ..Default::default()
-                            },
-                        ..Default::default()
-                    },
-                ),
-            );
-        }
-        if !extra_dynamic.is_empty() {
-            dynamic_sections.push(
-                crate::prompts::PromptSection::dynamic(
-                    extra_dynamic.clone(),
-                    crate::prompts::PromptTokenBucket::Environment,
-                )
-                .with_trace_signals(
-                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals:
-                            astra_turn_core::context_assembly_trace::PromptContextSignals {
-                                effort_hint: state.skills.effort.is_some(),
-                                agent_type_hint: state.skills.agent_type.is_some(),
-                                ..Default::default()
-                            },
-                        ..Default::default()
-                    },
-                ),
-            );
-        }
-        if !memory_signal_hint.is_empty() {
-            dynamic_sections.push(
-                crate::prompts::PromptSection::dynamic(
-                    memory_signal_hint.clone(),
-                    crate::prompts::PromptTokenBucket::Environment,
-                )
-                .with_trace_signals(
-                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals:
-                            astra_turn_core::context_assembly_trace::PromptContextSignals {
-                                memory_signal_detected: true,
-                                ..Default::default()
-                            },
-                        ..Default::default()
-                    },
-                ),
-            );
-        }
-        if !system_override.is_empty() {
-            dynamic_sections.push(
-                crate::prompts::PromptSection::dynamic(
-                    system_override.clone(),
-                    crate::prompts::PromptTokenBucket::Environment,
-                )
-                .with_trace_signals(
-                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals:
-                            astra_turn_core::context_assembly_trace::PromptContextSignals {
-                                system_prompt_override: true,
-                                ..Default::default()
-                            },
-                        ..Default::default()
-                    },
-                ),
-            );
-        }
-        // Plan-resume reminder: injected when the session has an active plan.
-        // The hint is an `Arc<RwLock<Option<String>>>` so mid-run tool calls
-        // (enter_plan_mode / exit_plan_mode) can refresh it without
-        // re-building the host. Reading at prompt-build time ensures the
-        // next turn's system prompt reflects the current plan-mode state,
-        // not the state at loop start.
-        let plan_resume_hint = self.plan_resume_hint.read().ok().and_then(|g| g.clone());
-        if let Some(hint) = plan_resume_hint {
-            if !hint.is_empty() {
-                dynamic_sections.push(crate::prompts::PromptSection::dynamic(
-                    hint,
-                    crate::prompts::PromptTokenBucket::Environment,
-                ));
-            }
-        }
-        if !tool_round_guidance.is_empty() {
-            dynamic_sections.push(
-                crate::prompts::PromptSection::dynamic(
-                    tool_round_guidance.clone(),
-                    crate::prompts::PromptTokenBucket::Environment,
-                )
-                .with_trace_signals(
-                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        guidance_signals,
-                        ..Default::default()
-                    },
-                ),
-            );
-        }
-        // Runtime identity: model, workspace, session, user, date.
-        let runtime_ctx = crate::prompts::AgentRuntimeContext {
-            model_name: self.resolved_model_name.clone(),
-            workspace_cwd: self
-                .edge_profile
-                .get("cwd")
-                .and_then(Value::as_str)
-                .map(String::from),
-            git_branch: self
-                .edge_profile
-                .get("git_branch")
-                .and_then(Value::as_str)
-                .map(String::from),
-            session_id: Some(self.session_id.clone()),
-            user_id: Some(self.user_id.clone()),
-            current_date: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
-        };
-        dynamic_sections.push(crate::prompts::PromptSection::dynamic(
-            runtime_ctx.to_prompt_section(),
-            crate::prompts::PromptTokenBucket::Environment,
-        ));
-
-        // Build structured system messages with Anthropic cache annotations.
-        // Stable sections (Global/Session) get cache_control; dynamic content does not.
-        let (sys_msg, dynamic_msg, sections) = build_system_message_with_dynamic_sections(
-            &tool_names,
-            &dynamic_sections,
-            self.selection_confidence,
-            task_type,
-            cache_cfg,
-        );
-        let skill_injections: Vec<astra_turn_core::context_assembly_trace::SkillInjection> =
-            if active_skill_names.is_empty() {
-                vec![]
-            } else {
-                let hint_tokens = crate::prompts::estimate_str_tokens(&skill_hint) as u32;
-                // Observability guard: when the estimator returns 0 but we DO have
-                // active skills, downstream context_meta would show
-                // `skills_injected = N with tokens=0 each`, which is indistinguishable
-                // from "nothing was injected". Emit a debug trace so operators can
-                // tell the two cases apart.
-                if hint_tokens == 0 && !active_skill_names.is_empty() {
-                    tracing::debug!(
-                        active_skill_count = active_skill_names.len(),
-                        "skill hint token estimate is 0; context_meta breakdown will show 0 tokens per skill"
-                    );
-                }
-                // Safe: `active_skill_names` is non-empty in this branch.
-                // `.max(1)` is an observability sentinel: if integer division
-                // truncates to 0 (hint shorter than skill count, or estimator
-                // returns 0), we still report 1 token per injection so that
-                // `context_meta.skills_injected` doesn't misleadingly show
-                // "active_output_skills=true" alongside "0 tokens injected".
-                let per = (hint_tokens / active_skill_names.len() as u32).max(1);
-                active_skill_names
-                    .iter()
-                    .map(
-                        |name| astra_turn_core::context_assembly_trace::SkillInjection {
-                            skill_name: (*name).to_string(),
-                            skill_version: None,
-                            tokens: per,
-                            selection_reason: "active_output_skill".into(),
-                        },
-                    )
-                    .collect()
-            };
-        let breakdown =
-            crate::prompts::build_system_prompt_trace(&sections, skill_injections, vec![]);
-        let mut system_messages = vec![sys_msg];
-        if let Some(dm) = dynamic_msg {
-            system_messages.push(dm);
-        }
-
-        // Plain text for token estimation (no cache annotations)
-        let plain = crate::prompts::sections_to_string(&sections);
-
-        (system_messages, plain, breakdown)
-    }
-
     fn emit_context_meta(
         &mut self,
         breakdown: &astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
@@ -1976,9 +1823,33 @@ impl ServerAgenticLoopHost {
         visible
     }
 
-    /// Test-only: returns the plain-text system prompt (no cache annotations).
-    #[cfg(test)]
-    fn build_system_prompt(&self, user_content: &str, visible_tools: &[Value]) -> String {
+    /// Build the turn's system messages via the context pipeline.
+    ///
+    /// Single source of truth for both the real `execute_turn` path and the
+    /// `bridge-e2e-hooks`-gated `execute_mock_turn` path. Previously the mock
+    /// that duplicated section assembly AND drifted from production behaviour —
+    /// deleted in the same change that introduced this helper.
+    ///
+    /// Returns `(structured_system_messages, plain_text_for_estimates, breakdown)`.
+    /// Run the full context pipeline for this turn and return everything the
+    /// wire payload needs: rendered system message(s), the plain-text form for
+    /// tracing, the breakdown, the selected compaction tier, and the tier-pruned
+    /// tool schemas. Callers that only want the system text can discard the
+    /// extra fields.
+    fn run_turn_pipeline(
+        &mut self,
+        state: &mut AgenticLoopState,
+        visible_tools: &[Value],
+        provider: &str,
+        model_name: &str,
+        user_content: &str,
+    ) -> PipelineTurnOutcome {
+        use crate::turn::context_pipeline_adapter::{
+            build_external_sources, build_session_context, build_turn_state,
+        };
+        use astra_turn_core::context_sources::AgentContext;
+        use astra_turn_core::pipeline_session::AdaptiveTurnInput;
+
         let tool_names: Vec<&str> = visible_tools
             .iter()
             .filter_map(|t| {
@@ -1987,213 +1858,364 @@ impl ServerAgenticLoopHost {
                     .and_then(Value::as_str)
             })
             .collect();
-
-        // Replicate the dynamic section assembly from build_system_messages_cached.
-        let mut profile_parts = Vec::new();
-        if let Some(cwd) = self.edge_profile.get("cwd").and_then(Value::as_str) {
-            profile_parts.push(format!("cwd: {cwd}"));
-        }
-        if let Some(branch) = self.edge_profile.get("git_branch").and_then(Value::as_str) {
-            profile_parts.push(format!("git_branch: {branch}"));
-        }
-        let skill_hint = self
-            .edge_profile
-            .get("active_skills")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                let names: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
-                if names.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "\n\n## Active Output Skills\nThe user has enabled these output constraints: {}. \
-                         Follow their formatting rules strictly.",
-                        names.join(", ")
-                    )
-                }
-            })
-            .unwrap_or_default();
-        let learned_context_hint = self
-            .edge_profile
-            .get("learned_context_hint")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(|hint| format!("\n\n## Learned Runtime Context\n{hint}"))
-            .unwrap_or_default();
-        let task_type = crate::prompts::detect_task_type(user_content);
-        let profile_desc = if profile_parts.is_empty() {
-            String::new()
-        } else {
-            format!("\n\n# Project Profile\n{}", profile_parts.join("\n"))
+        let plan_hint = match self.plan_resume_hint.read() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => {
+                astra_core::agent_warn!(
+                    "pipeline",
+                    "plan_resume_hint RwLock poisoned — plan context lost for this turn"
+                );
+                poisoned.into_inner().clone()
+            }
         };
-        let memory_signal_hint = String::new();
-        let round_budget_hint = String::new(); // deprecated: circuit breaker replaces countdown budget
-        let plan_resume = self
-            .plan_resume_hint
-            .read()
-            .ok()
-            .and_then(|g| g.clone())
-            .unwrap_or_default();
-        let runtime_ctx = crate::prompts::AgentRuntimeContext {
-            model_name: self.resolved_model_name.clone(),
-            workspace_cwd: self
-                .edge_profile
-                .get("cwd")
-                .and_then(Value::as_str)
-                .map(String::from),
-            git_branch: self
-                .edge_profile
-                .get("git_branch")
-                .and_then(Value::as_str)
-                .map(String::from),
-            session_id: Some(self.session_id.clone()),
-            user_id: Some(self.user_id.clone()),
-            current_date: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
-        };
-        let runtime_identity = runtime_ctx.to_prompt_section();
-        let full_dynamic = format!(
-            "{profile_desc}{skill_hint}{learned_context_hint}{memory_signal_hint}{round_budget_hint}{plan_resume}{runtime_identity}"
-        );
-
-        crate::turn::llm_client::cached_system_prompt(
+        let external = build_external_sources(
+            &self.edge_profile,
+            state,
+            user_content,
             &tool_names,
-            &full_dynamic,
             self.selection_confidence,
-            task_type,
-        )
+            plan_hint.as_deref(),
+        );
+        let turn_state = build_turn_state(state, user_content);
+        let session_ctx = build_session_context(
+            &self.session_id,
+            state.current_run_id.as_deref(),
+            model_name,
+            state.max_turn_input_tokens,
+            &self.edge_profile,
+            provider,
+            state.project_context.as_deref(),
+        );
+        let statics = crate::prompts::build_pipeline_static_sections();
+        let agent = AgentContext {
+            tool_schemas: visible_tools.to_vec(),
+            ..Default::default()
+        };
+
+        let pipeline_sess = state
+            .pipeline_session
+            .as_mut()
+            .expect("pipeline_session must be initialized for all production paths");
+        if pipeline_sess.working_memory().is_empty() {
+            pipeline_sess.start_goal(user_content);
+        }
+        let input = AdaptiveTurnInput {
+            statics: &statics,
+            agent: &agent,
+            session: &session_ctx,
+            turn: &turn_state,
+            external: &external,
+            model_id: model_name,
+            query_source: "agentic_loop",
+        };
+
+        // Fail safe on pipeline abort: never continue with an empty system
+        // prompt, because that silently drops identity, constraints, and tool
+        // guidance. Emit a structured alert and use a minimal emergency prompt
+        // so the next provider call remains bounded and diagnosable.
+        let pipeline_output = match pipeline_sess.run_turn_adaptive(input) {
+            Ok(out) => out,
+            Err(abort) => {
+                let turn = state.llm_rounds_completed;
+                let alert = astra_turn_core::trace_alert::TraceAlert {
+                    severity: astra_turn_core::trace_alert::AlertSeverity::Error,
+                    rule: "system_prompt_abort".into(),
+                    message: format!("pipeline aborted during system-message build: {abort:?}"),
+                    turn,
+                };
+                if let Some(ref mut buf) = state.turn_event_buffer {
+                    let alert_evt =
+                        astra_turn_core::pipeline_journal::PipelineJournalEvent::from_alert(&alert);
+                    if let Ok(payload) = serde_json::to_value(&alert_evt) {
+                        buf.record(
+                            astra_services::session_journal::JournalEvent::pipeline_alert(
+                                state.current_session_id.as_deref(),
+                                turn,
+                                payload,
+                            ),
+                        );
+                    }
+                }
+                astra_core::agent_warn!(
+                    "pipeline",
+                    "pipeline aborted during system-message build: {abort:?} — \
+                     falling back to emergency system content"
+                );
+                let emergency = "You are Astra, a coding assistant. The normal context pipeline \
+                    could not build the full system prompt for this turn, so proceed cautiously: \
+                    preserve user intent, avoid destructive actions unless explicitly requested, \
+                    and surface any uncertainty instead of guessing.";
+                let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
+                    total_tokens: (emergency.len() / 4) as u32,
+                    ..Default::default()
+                };
+                // Emergency fallback: keep the original visible tools so the
+                // turn can still function; tier defaults to Normal.
+                return PipelineTurnOutcome {
+                    system_messages: vec![json!({
+                        "role": "system",
+                        "content": [{"type": "text", "text": emergency}],
+                    })],
+                    volatile_preamble: Vec::new(),
+                    system_plain: emergency.to_string(),
+                    breakdown,
+                    tier: CompactionTier::Normal,
+                    tool_schemas: visible_tools.to_vec(),
+                };
+            }
+        };
+
+        let plain = astra_turn_core::context_serializer::flatten_serialized_system_blocks(
+            &pipeline_output.serialized,
+        );
+        let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
+            total_tokens: pipeline_output.metrics.sections,
+            ..Default::default()
+        };
+
+        // Determine cache protocol: Anthropic uses explicit cache_control markers
+        // on system blocks, so all blocks stay in the system message. Prefix-only
+        // providers (DeepSeek, GLM, Qwen, OpenAI) cache based on byte-identical
+        // prefix — volatile blocks (CacheScope::None) must be moved out of the
+        // system message so it remains stable across turns.
+        //
+        // Routes through `provider_uses_anthropic_messages` / `provider_uses_bedrock_converse`
+        // (which in turn delegate to `llm_provider_protocol`) so the classification
+        // Single source of truth for cache protocol classification — lives in
+        // `llm_client::provider_uses_explicit_cache_control`. A future provider
+        // added there is automatically picked up here.
+        let is_anthropic = crate::turn::llm_client::provider_uses_explicit_cache_control(provider);
+
+        // Classify the provider's cache semantics to decide volatile
+        // placement. `CacheCapability::should_inject_volatile_on_round`
+        // is the gate — for `VolatilePlacement::CurrentUserOnly`
+        // providers (MiniMax-style strict-history cache) rounds > 0
+        // MUST skip injection or the entire turn's cache collapses
+        // (see session 986a553e regression).
+        use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
+        let cache_cap = CacheCapability::for_provider_and_model(provider, model_name);
+        let round_within_turn = state.current_round_index;
+        let inject_volatile = cache_cap.should_inject_volatile_on_round(round_within_turn);
+
+        let (system_messages, volatile_preamble) = match cache_cap.volatile_placement {
+            VolatilePlacement::MarkerIsolated => {
+                // Anthropic-protocol providers (Anthropic, Bedrock, DeepSeek's
+                // /anthropic endpoint). Earlier design kept volatile blocks
+                // INSIDE the system content array past the last cache_control
+                // marker, on the theory that the marker "isolates" them from
+                // the cached prefix.
+                //
+                // Controlled probes against Bedrock Converse and DeepSeek's
+                // /anthropic endpoint (see
+                // `astra-turn-core/tests/fixtures/deepseek_anthropic_cache_probe.py`
+                // and session 5c5cbf78 analysis) showed this is suboptimal
+                // for DeepSeek: every round's volatile-tail byte change
+                // looks like a fresh payload and the provider's cache-
+                // write/read pipeline never reaches the 2nd-warm state
+                // where tools get cached. Production cache_read stalls at
+                // ~2432 (system-prefix-only) instead of ~10K (system +
+                // tools). Bedrock is unaffected (first-call-complete
+                // caching) but also loses nothing from moving volatile to
+                // the user message.
+                //
+                // New policy: build the system content array from STABLE
+                // blocks only; volatile (CacheScope::None) blocks get
+                // promoted to the same `volatile_preamble` path that
+                // TailSuffix/CurrentUserOnly already use. That keeps the
+                // cache-control marker on the tail of the system content
+                // and makes the full system+tools+history byte-stable
+                // across rounds.
+                use astra_turn_core::section_types::CacheScope;
+                let stable_content: Vec<Value> = pipeline_output
+                    .serialized
+                    .system_blocks
+                    .iter()
+                    .filter(|b| b.scope != CacheScope::None)
+                    .map(|block| {
+                        let mut v = json!({
+                            "type": "text",
+                            "text": block.text,
+                        });
+                        if let Some(ref cc) = block.cache_control {
+                            v["cache_control"] = cc.clone();
+                        }
+                        v
+                    })
+                    .collect();
+                let volatile_text: String = pipeline_output
+                    .serialized
+                    .system_blocks
+                    .iter()
+                    .filter(|b| b.scope == CacheScope::None)
+                    .map(|b| b.text.as_str())
+                    .collect();
+                let system_msgs = vec![json!({"role": "system", "content": stable_content})];
+                let preamble = if !inject_volatile || volatile_text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![
+                        json!({
+                            "role": "user",
+                            "content": format!(
+                                "<system-reminder>\n{volatile_text}</system-reminder>"
+                            ),
+                        }),
+                        json!({
+                            "role": "assistant",
+                            "content": "Understood.",
+                        }),
+                    ]
+                };
+                (system_msgs, preamble)
+            }
+            VolatilePlacement::TailSuffix
+            | VolatilePlacement::CurrentUserOnly
+            | VolatilePlacement::Free => {
+                // Prefix-only paths: split blocks by scope. Stable
+                // content stays in the system message; volatile
+                // content goes into a preamble that `assemble_llm_messages`
+                // will prepend to the last user message (TailSuffix
+                // semantics) — UNLESS we're a round > 0 on a
+                // strict-history provider, in which case we drop
+                // volatile entirely to preserve byte-identical history.
+                use astra_turn_core::section_types::CacheScope;
+                let mut stable_text = String::new();
+                let mut volatile_text = String::new();
+                for block in &pipeline_output.serialized.system_blocks {
+                    if block.scope == CacheScope::None {
+                        volatile_text.push_str(&block.text);
+                    } else {
+                        stable_text.push_str(&block.text);
+                    }
+                }
+                let system_msgs = vec![json!({"role": "system", "content": stable_text})];
+                let preamble = if !inject_volatile || volatile_text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![
+                        json!({
+                            "role": "user",
+                            "content": format!(
+                                "<system-reminder>\n{volatile_text}</system-reminder>"
+                            ),
+                        }),
+                        json!({
+                            "role": "assistant",
+                            "content": "Understood.",
+                        }),
+                    ]
+                };
+                (system_msgs, preamble)
+            }
+        };
+        // Silence unused-var in the MarkerIsolated branch.
+        let _ = is_anthropic;
+
+        PipelineTurnOutcome {
+            system_messages,
+            volatile_preamble,
+            system_plain: plain,
+            breakdown,
+            tier: pipeline_output.plan.compact_tier,
+            tool_schemas: pipeline_output.optimized.tool_schemas,
+        }
     }
 
-    /// Build the LLM message array from loop state.
-    async fn build_llm_messages(
+    /// Run the Memoria compaction step and return the full `CompactResult`
+    /// (messages + boundary). The boundary is what the caller inspects to
+    /// decide whether to append the P2 continuation prompt — the bridge path
+    /// does this inline, so we expose the same signal here for parity.
+    async fn compact_messages_via_memoria(
         &self,
-        system_messages: Vec<Value>,
         state: &AgenticLoopState,
+        system_messages: &[Value],
         visible_tools: &[Value],
-        model_name: &str,
-        api_key: &str,
-        base_url: &str,
-        provider: &str,
-        header_overrides: &HashMap<String, String>,
-        completions_url_override: Option<&str>,
-        request_timeout: Option<Duration>,
-        cache_cfg: &PromptCacheConfig,
-    ) -> Vec<Value> {
-        let mut llm_messages = system_messages;
-
-        // Compute compaction tier
-        let budget = crate::prompts::budget_for_model(Some(model_name));
-        let tool_schema_tokens: usize = visible_tools
-            .iter()
-            .map(|t| {
-                serde_json::to_string(t)
-                    .map(|s| crate::prompts::estimate_str_tokens(&s))
-                    .unwrap_or(50)
-            })
-            .sum();
-        let mut all_msgs = llm_messages.clone();
-        all_msgs.extend(state.messages.iter().cloned());
-        let cache_est = crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
-        let tier = crate::prompts::compaction_tier_calibrated(
-            &budget,
-            cache_est.total_tokens,
-            state.last_measured_prompt_tokens,
-            state.consecutive_context_window_errors,
-        );
-        let budget_chars = budget.effective_input_limit() * 4;
-
-        // Tool result compaction is handled by compact_tool_results_adaptive
-        // in agentic_loop_lifecycle.rs. No separate analytics pass needed.
-        let micro_compacted_messages = state.messages.clone();
-
-        // Use Memoria-based compaction (async with HTTP client)
-        let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
-        let cwd = self.edge_profile.get("cwd").and_then(|v| v.as_str());
-        let (session_memory_file, session_memory_combine) =
-            crate::turn::cloud::memoria_compact::resolve_session_memory_file_options(
-                &self.session_id,
-                cwd,
-            );
-        let memoria_params = crate::turn::cloud::memoria_compact::MemoriaCompactParams {
-            budget_chars,
-            keep_chars: 2_000,
-            tier,
-            keep_recent_turns: budget.keep_recent_turns,
-            current_tokens: cache_est.total_tokens,
-            session_memory_file,
-            session_memory_combine,
-            session_facts: None,
-        };
-
-        // Try to create Memoria client from environment
-        let memoria_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
-
-        // Build summary client for LLM-based compaction (uses same model as main LLM)
+        tier: CompactionTier,
+        llm_cfg: &ResolvedTurnLlmConfig,
+    ) -> crate::turn::cloud::compaction::CompactResult {
         let compact_config = crate::prompts::CompactConfig::from_env();
         let summary_client = RequestAwareSummaryClient {
-            model_name: model_name.to_string(),
-            api_key: api_key.to_string(),
-            base_url: base_url.to_string(),
-            provider: provider.to_string(),
+            model_name: llm_cfg.model_name.clone(),
+            api_key: llm_cfg.api_key.clone(),
+            base_url: llm_cfg.base_url.clone(),
+            provider: llm_cfg.provider.clone(),
             max_output_tokens: compact_config.summary_token_budget,
-            header_overrides: header_overrides.clone(),
-            completions_url_override: completions_url_override.map(String::from),
-            request_timeout,
+            header_overrides: llm_cfg.header_overrides.clone(),
+            completions_url_override: llm_cfg.completions_url_override.clone(),
+            request_timeout: llm_cfg.request_timeout,
         };
+        let memoria_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
 
-        let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria(
-            &micro_compacted_messages,
-            Some(&self.session_id),
-            &memoria_config,
-            &memoria_params,
-            memoria_client
+        let ctx = crate::turn::wire_assembly::MemoriaContext {
+            session_id: &self.session_id,
+            model_name: &llm_cfg.model_name,
+            memoria_client: memoria_client
                 .as_ref()
                 .map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
-            Some(&compact_config),
-            Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
+            summary_client: Some(
+                &summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
+            ),
+            tier,
+            cwd: self.edge_profile.get("cwd").and_then(|v| v.as_str()),
+            session_facts: None,
+        };
+        ctx.compact(&state.messages, system_messages, visible_tools)
+            .await
+    }
+
+    /// Thin wrapper around [`wire_assembly::assemble_llm_messages`] that
+    /// extracts the server-path-specific attachments from `AgenticLoopState`
+    /// (invoked skills + recently-read files) and delegates the rest. The
+    /// shared module handles `strip_stale_reasoning`, continuation-prompt
+    /// insertion, attachment ordering, and cache annotations.
+    fn assemble_llm_messages(
+        &self,
+        system_messages: Vec<Value>,
+        volatile_preamble: Vec<Value>,
+        compacted_messages: Vec<Value>,
+        state: &mut AgenticLoopState,
+        llm_cfg: &ResolvedTurnLlmConfig,
+        cache_cfg: &PromptCacheConfig,
+    ) -> Vec<Value> {
+        // Drain the structured volatile lane BEFORE we borrow `state`
+        // immutably (via `state.skills` / `state.recent_file_reads`) —
+        // the borrow checker can't interleave a mutable drain with the
+        // later immutable reads that feed `attachments`.
+        let drained = state.take_volatile_pending();
+
+        // Sort skills most-recent-first (matches legacy ordering; shared
+        // assembler emits them in the order we supply).
+        let mut skills: Vec<_> = state.skills.invoked.values().collect();
+        skills.sort_by_key(|b| std::cmp::Reverse(b.invoked_at_turn));
+        let invoked_skills: Vec<crate::turn::wire_assembly::InvokedSkillRef<'_>> = skills
+            .iter()
+            .map(|s| crate::turn::wire_assembly::InvokedSkillRef {
+                name: s.name.as_str(),
+                content: s.content.as_str(),
+            })
+            .collect();
+        let attachments = crate::turn::wire_assembly::PostCompactAttachments {
+            invoked_skills,
+            recent_file_reads: &state.recent_file_reads,
+            cwd: self.edge_profile.get("cwd").and_then(|v| v.as_str()),
+        };
+
+        // Per-turn skill listing (ranked shortlist) now flows through the
+        // pipeline as an `extra_dynamic_sections` entry (RuntimeVolatile,
+        // None scope). See `context_pipeline_adapter` — post-hoc injection
+        // here would double up the content on the wire.
+
+        crate::turn::wire_assembly::assemble_llm_messages(
+            system_messages,
+            volatile_preamble,
+            drained,
+            compacted_messages,
+            &attachments,
+            &self.session_id,
+            &llm_cfg.provider,
+            &llm_cfg.model_name,
+            cache_cfg,
         )
-        .await;
-
-        llm_messages.extend(compact_result.messages);
-        // Strip old reasoning to reduce input tokens (see edge_ledger::strip_stale_reasoning).
-        astra_turn_core::edge_ledger::strip_stale_reasoning(
-            &mut llm_messages,
-            provider,
-            model_name,
-        );
-
-        // Post-compaction: re-inject invoked skill instructions (truncated)
-        // so the LLM retains skill context after history summarization.
-        if !state.skills.invoked.is_empty() {
-            let mut builder = astra_turn_core::cloud_attachments::AttachmentBuilder::new();
-            let mut skills: Vec<_> = state.skills.invoked.values().collect();
-            skills.sort_by_key(|b| std::cmp::Reverse(b.invoked_at_turn));
-            for skill in skills {
-                builder.add_skill(&skill.name, &skill.content);
-            }
-            let attachments = builder.build();
-            llm_messages.extend(attachments.to_messages());
-        }
-
-        // Post-compaction: re-inject recently-read file contents so the LLM
-        // retains awareness of code it was working with before compaction.
-        if !state.recent_file_reads.is_empty() {
-            let cwd = self.edge_profile.get("cwd").and_then(|v| v.as_str());
-            let file_messages = astra_turn_core::cloud_attachments::restore_recent_files(
-                &state.recent_file_reads,
-                cwd,
-            );
-            llm_messages.extend(file_messages);
-        }
-
-        // Ephemeral skill listing: injected per-turn, not stored in state.messages.
-        if let Some(ref listing) = state.skills.listing_message {
-            llm_messages.push(listing.clone());
-        }
-
-        // Add Anthropic protocol-level prompt-cache metadata on the request clone.
-        apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, &self.session_id);
-
-        llm_messages
     }
 
     /// Convert an [`LlmCallResult`] into a [`ChatTurnSseAccum`].
@@ -2416,49 +2438,75 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // provider doesn't change within a turn).
         let cache_cfg = PromptCacheConfig::latch(&llm_cfg.provider, &llm_cfg.model_name);
         self.resolved_model_name = Some(llm_cfg.model_name.clone());
+        self.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
+            model_name: llm_cfg.model_name.clone(),
+            api_key: llm_cfg.api_key.clone(),
+            base_url: llm_cfg.base_url.clone(),
+            provider: llm_cfg.provider.clone(),
+            max_output_tokens: 4096,
+        });
 
-        let (system_messages, system_prompt_plain, system_prompt_breakdown) =
-            self.build_system_messages_cached(&user_content, &visible_tools, state, &cache_cfg);
+        // ── 2b. Run the context pipeline ─────────────────────────────────
+        // Pipeline is the single source of truth for:
+        //   * system prompt content
+        //   * compaction tier selection
+        //   * tier-pruned tool schemas
+        // Runtime no longer re-derives any of these.
+        let turn_pipeline = self.run_turn_pipeline(
+            state,
+            &visible_tools,
+            &llm_cfg.provider,
+            &llm_cfg.model_name,
+            &user_content,
+        );
+        let PipelineTurnOutcome {
+            system_messages,
+            volatile_preamble,
+            system_plain: system_prompt_plain,
+            breakdown: system_prompt_breakdown,
+            tier,
+            tool_schemas: pipeline_tool_schemas,
+        } = turn_pipeline;
+
+        // Debug: dump system prompt for cache analysis (env-gated, zero cost when off).
+        if std::env::var("ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT").is_ok() {
+            let dump_path = std::env::temp_dir().join(format!(
+                "astra-pipeline-prompt-{}-turn{}.txt",
+                self.session_id, state.llm_rounds_completed
+            ));
+            let _ = std::fs::write(&dump_path, &system_prompt_plain);
+        }
         self.emit_context_meta(&system_prompt_breakdown);
 
-        let llm_messages = self
-            .build_llm_messages(
-                system_messages,
-                state,
-                &visible_tools,
-                &llm_cfg.model_name,
-                &llm_cfg.api_key,
-                &llm_cfg.base_url,
-                &llm_cfg.provider,
-                &llm_cfg.header_overrides,
-                llm_cfg.completions_url_override.as_deref(),
-                llm_cfg.request_timeout,
-                &cache_cfg,
-            )
+        // Phase 3: Memoria compaction is now a named async step, separate
+        // from the pure assembly step. `execute_turn` orchestrates both so
+        // the wire-building flow is readable and each phase is individually
+        // testable / replaceable.
+        let compact_result = self
+            .compact_messages_via_memoria(state, &system_messages, &visible_tools, tier, &llm_cfg)
             .await;
+        // Parity with the bridge path: when Memoria returned a boundary, the
+        // conversation was trimmed mid-task, so nudge the model to resume
+        // instead of asking the user a follow-up question.
+        let mut compacted_messages = compact_result.messages;
+        crate::turn::wire_assembly::maybe_append_continuation_prompt(
+            &mut compacted_messages,
+            compact_result.boundary.is_some(),
+        );
+        let llm_messages = self.assemble_llm_messages(
+            system_messages,
+            volatile_preamble,
+            compacted_messages,
+            state,
+            &llm_cfg,
+            &cache_cfg,
+        );
 
         // ── 3. Call LLM ─────────────────────────────────────────────────
         let budget = crate::prompts::budget_for_model(Some(&llm_cfg.model_name));
         let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
-        let tool_schema_tokens: usize = visible_tools
-            .iter()
-            .map(|t| {
-                serde_json::to_string(t)
-                    .map(|s| crate::prompts::estimate_str_tokens(&s))
-                    .unwrap_or(50)
-            })
-            .sum();
-        let mut est_msgs = vec![json!({"role": "system", "content": system_prompt_plain})];
-        est_msgs.extend(state.messages.iter().cloned());
-        let cache_est = crate::prompts::estimate_tokens_cache_aware(&est_msgs, tool_schema_tokens);
-        let tier = crate::prompts::compaction_tier_calibrated(
-            &budget,
-            cache_est.total_tokens,
-            state.last_measured_prompt_tokens,
-            state.consecutive_context_window_errors,
-        );
-        let mut final_tools = prune_tool_schemas(&visible_tools, tier);
+        let mut final_tools = pipeline_tool_schemas;
         // Annotate tool schemas with cache_control for Anthropic.
         annotate_tool_schemas_for_caching(&mut final_tools, &cache_cfg);
         state.last_turn_policy =
@@ -2483,6 +2531,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &final_tools,
                 Some(effective_max_output),
             );
+            state.step_recorder.begin_llm_round(&llm_cfg.model_name);
+            let llm_round_start = std::time::Instant::now();
             let llm_cancel = llm_cancel_for_state(state);
             let r = {
                 let mut attempt_text = String::new();
@@ -2535,6 +2585,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     &llm_messages,
                     &final_tools,
                     &llm_cfg.model_name,
+                    llm_cfg.wire_model_name.as_deref(),
                     &llm_cfg.api_key,
                     &llm_cfg.base_url,
                     &llm_cfg.provider,
@@ -2698,6 +2749,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     return Err(e);
                 }
             };
+
+            {
+                let u = crate::turn::token_usage::TokenUsage::from_json_map(&r.usage);
+                state.step_recorder.end_llm_round(
+                    &llm_cfg.model_name,
+                    u.input_tokens,
+                    u.output_tokens,
+                    u.cached_input_tokens,
+                    u.cache_creation_tokens,
+                    llm_round_start.elapsed().as_millis() as u64,
+                );
+            }
 
             record_full_llm_response_event(
                 state,
@@ -2953,6 +3016,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &reflection_messages,
             &[],
             &llm_cfg.model_name,
+            llm_cfg.wire_model_name.as_deref(),
             &llm_cfg.api_key,
             &llm_cfg.base_url,
             &llm_cfg.provider,
@@ -3086,6 +3150,129 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         true
     }
 
+    async fn maybe_pre_turn_compact(
+        &mut self,
+        state: &mut crate::turn::agentic_loop_host::AgenticLoopState,
+        pressure: f64,
+        quiet: bool,
+    ) {
+        if pressure < 0.80
+            || state.compact_tier_applied >= CompactionTier::CompactHistory
+            || state.messages.len() <= 10
+        {
+            return;
+        }
+        let Some(params) = self.resolved_llm_params.clone() else {
+            return;
+        };
+
+        let user_content = state
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|m| m.get("content").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string();
+
+        let mut effective_restricted = state.restricted_tools.clone();
+        if !state.widen_selection_pending {
+            merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut effective_restricted);
+        }
+        effective_restricted.extend(self.effective_allowlist_restrictions(state));
+        let interaction_mode = self.turn_interaction_mode();
+        effective_restricted.extend(interaction_scoped_tool_restrictions(interaction_mode));
+        for boosted in &state.boosted_tools {
+            effective_restricted.remove(boosted);
+        }
+        let visible_tools = self.filtered_turn_tools(&effective_restricted);
+        // We only need the system messages here — the inline summary call
+        // reuses the main turn's system prefix, not its tools.
+        let system_messages = self
+            .run_turn_pipeline(
+                state,
+                &visible_tools,
+                &params.provider,
+                &params.model_name,
+                &user_content,
+            )
+            .system_messages;
+        // Use the trait's summary_client() so gateway overrides and forwarded
+        // auth headers are respected, rather than constructing a plain client inline.
+        let Some(client) = self.summary_client() else {
+            return;
+        };
+        if let Some(summary_text) = astra_turn_core::cloud_summary::generate_inline_summary(
+            &system_messages,
+            &state.messages,
+            client.as_ref(),
+        )
+        .await
+        {
+            let old_count = state.messages.len();
+            let keep_recent = (old_count / 4).max(4);
+            let mut spill_count = old_count - keep_recent;
+            // Snap to a safe role boundary so we never split an assistant/tool pair.
+            spill_count =
+                crate::turn::agentic_loop_execution_phase::adjust_spill_boundary_for_tool_pairs(
+                    &state.messages,
+                    spill_count,
+                );
+            let spilled: Vec<_> = state.messages.drain(..spill_count).collect();
+            let tokens_freed = spilled
+                .iter()
+                .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0))
+                .sum::<usize>() as u64
+                / 4;
+
+            state.messages.insert(
+                0,
+                serde_json::json!({
+                    "role": "system",
+                    "content": format!(
+                        "[Conversation compacted — {} messages summarized]\n\n{}",
+                        spilled.len(),
+                        summary_text,
+                    )
+                }),
+            );
+            state.compact_tier_applied = CompactionTier::CompactHistory;
+
+            if let Some(ref mut sess) = state.pipeline_session {
+                sess.recovery.record_reactive_compact();
+                sess.stats.record_compaction(tokens_freed);
+            }
+            if !quiet {
+                self.emit_headless_line(
+                    HeadlessStderrStyle::Yellow,
+                    format!(
+                        "♻ Pre-turn LLM compact: freed ~{} tokens ({} → summary)",
+                        tokens_freed,
+                        spilled.len(),
+                    ),
+                );
+            }
+        } else if !quiet {
+            self.emit_headless_line(
+                HeadlessStderrStyle::Dim,
+                format!(
+                    "  ⚠ Pre-turn LLM compact failed; continuing at {:.0}% pressure",
+                    pressure * 100.0,
+                ),
+            );
+        }
+    }
+
+    fn summary_client(&self) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
+        // LLM config is resolved per-turn inside execute_turn. We cache it in
+        // `resolved_llm_params` after first successful resolution so the trait
+        // method can construct the client without re-resolving.
+        let params = self.resolved_llm_params.as_ref()?;
+        Some(Box::new(
+            astra_turn_core::cloud_summary::HttpSummaryClient::new(params.clone()),
+        ))
+    }
+
     fn valid_tool_names(&self) -> &HashSet<String> {
         &self.valid_tools
     }
@@ -3116,7 +3303,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Populate tool_schemas from the turn's advertised list so
         // per-tool drift attribution works. `system_blocks` stays
         // empty for now: the server assembles system messages via
-        // `build_system_messages_cached` per-turn and does not retain
         // the canonical byte form. A follow-up can thread the
         // system_msgs Vec<Value> through the same stash path if the
         // telemetry attribution need arises.
@@ -3136,7 +3322,29 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             captured_at_secs,
             microcompact_fired_in_turn: false,
         };
-        let _ = astra_turn_core::fork_capture::capture_parent_prefix(req, store.as_ref());
+        // Route the capture outcome to telemetry rather than discarding it —
+        // silent drops hide "child sub-run started without inheriting parent
+        // cache prefix" and "prefix store ran out of room" conditions, both
+        // of which directly degrade cache hit rate on delegated runs.
+        match astra_turn_core::fork_capture::capture_parent_prefix(req, store.as_ref()) {
+            astra_turn_core::fork_capture::ForkCaptureOutcome::Captured { prefix_id, evicted } => {
+                if !evicted.is_empty() {
+                    astra_core::agent_warn!(
+                        "fork_prefix",
+                        "parent prefix captured ({prefix_id}); evicted {} old entries to make room: {:?}",
+                        evicted.len(),
+                        evicted
+                    );
+                }
+            }
+            astra_turn_core::fork_capture::ForkCaptureOutcome::Skipped { reason } => {
+                astra_core::agent_warn!(
+                    "fork_prefix",
+                    "parent prefix capture skipped ({reason:?}) — child sub-runs in this \
+                     session will start with cold cache"
+                );
+            }
+        }
     }
 
     fn inject_tool_schema(&mut self, schema: Value) {
@@ -3297,8 +3505,33 @@ fn llm_capture_error_response(error: &astra_core::ClassifiedError) -> Value {
 fn normalize_usage_to_canonical(
     raw: &serde_json::Map<String, Value>,
 ) -> serde_json::Map<String, Value> {
-    // Pass-through when already canonical: presence of either `input_tokens`
-    // or `output_tokens` means the producer already normalized.
+    // Pass-through when already canonical: presence of `cached_input_tokens`
+    // (the canonical cache key; `input_tokens`/`output_tokens` are ambiguous
+    // because Anthropic also uses those names) means the producer already
+    // normalized. Anthropic-dialect detection below takes priority when only
+    // `input_tokens`/`output_tokens` are present alongside the anthropic
+    // cache keys.
+    let looks_anthropic = raw.contains_key("cache_read_input_tokens")
+        || raw.contains_key("cache_creation_input_tokens");
+    if !looks_anthropic
+        && (raw.contains_key("cached_input_tokens") || raw.contains_key("cache_creation_tokens"))
+    {
+        return raw.clone();
+    }
+    // Anthropic dialect (Messages API, deepseek `/anthropic` endpoint, …):
+    // `input_tokens`/`output_tokens` plus separate `cache_read_input_tokens`
+    // and `cache_creation_input_tokens`. Must be checked BEFORE the generic
+    // `input_tokens` canonical fast-path above would match, otherwise the
+    // cache fields would leak through verbatim.
+    if looks_anthropic {
+        if let Some(canonical) = crate::turn::token_usage::extract_usage(
+            crate::turn::token_usage::UsageDialect::AnthropicMessages,
+            raw,
+        ) {
+            return canonical.to_json_map();
+        }
+    }
+    // Canonical fast-path for non-anthropic already-normalized shapes.
     if raw.contains_key("input_tokens") || raw.contains_key("output_tokens") {
         return raw.clone();
     }
@@ -3415,26 +3648,37 @@ mod tests {
     /// persistence with no runtime error. This test pins both anchors.
     #[test]
     fn post_compaction_reinjects_invoked_skills() {
-        let source = include_str!("server_loop_host.rs");
-        let tests_start = source
+        // Cross-file anchor: production code lives here (extraction + ordering)
+        // while the actual attachment build has moved to the shared
+        // `wire_assembly` module. Both pieces must be present for the
+        // re-injection pipeline to work; a silent refactor that drops either
+        // is a cross-turn skill-loss bug waiting to happen.
+        let host_src = include_str!("server_loop_host.rs");
+        let host_tests_start = host_src
             .find("\n#[cfg(test)]\nmod tests {")
             .expect("cfg(test) + mod tests marker");
-        let production = &source[..tests_start];
+        let host_production = &host_src[..host_tests_start];
         assert!(
-            production.contains("state.skills.invoked"),
+            host_production.contains("state.skills.invoked"),
             "production code must consult state.skills.invoked to decide re-injection"
-        );
-        assert!(
-            production.contains("builder.add_skill(&skill.name, &skill.content)"),
-            "production code must feed invoked skills into AttachmentBuilder::add_skill \
-             so full instructions survive compaction"
         );
         // Ordering guard: most-recently invoked skill first (so the oldest
         // content sits closest to the model's current turn after to_messages
         // reverses). If this sort key flips, cross-turn ordering will break.
         assert!(
-            production.contains("std::cmp::Reverse(b.invoked_at_turn)"),
+            host_production.contains("std::cmp::Reverse(b.invoked_at_turn)"),
             "invoked skills must be sorted most-recent-first before re-injection"
+        );
+
+        let shared_src = include_str!("../turn/wire_assembly.rs");
+        let shared_tests_start = shared_src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("wire_assembly cfg(test) + mod tests marker");
+        let shared_production = &shared_src[..shared_tests_start];
+        assert!(
+            shared_production.contains("builder.add_skill(skill.name, skill.content)"),
+            "shared assembly must feed invoked skills into AttachmentBuilder::add_skill \
+             so full instructions survive compaction"
         );
     }
 
@@ -3531,6 +3775,71 @@ mod tests {
     }
 
     #[test]
+    fn llm_capture_error_response_normalizes_anthropic_usage_to_canonical() {
+        // Anthropic-dialect usage (e.g. deepseek `/anthropic` endpoint, direct
+        // Anthropic Messages API) arrives with `input_tokens`/`output_tokens`
+        // at the top level AND separate `cache_read_input_tokens` /
+        // `cache_creation_input_tokens` keys. These must be folded into the
+        // canonical `cached_input_tokens` / `cache_creation_tokens` schema so
+        // downstream cache-rate math sees the hits instead of zeros.
+        let error =
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "boom")
+                .with_details_json(
+                    json!({
+                        "usage": {
+                            "input_tokens": 25,
+                            "output_tokens": 7,
+                            "cache_read_input_tokens": 4864,
+                            "cache_creation_input_tokens": 120
+                        }
+                    })
+                    .to_string(),
+                );
+        let response = llm_capture_error_response(&error);
+        assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(25));
+        assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(7));
+        assert_eq!(
+            response["usage"]["cached_input_tokens"].as_i64(),
+            Some(4864),
+            "anthropic `cache_read_input_tokens` must be folded into canonical `cached_input_tokens`",
+        );
+        assert_eq!(
+            response["usage"]["cache_creation_tokens"].as_i64(),
+            Some(120),
+            "anthropic `cache_creation_input_tokens` must be folded into canonical `cache_creation_tokens`",
+        );
+        assert!(
+            response["usage"].get("cache_read_input_tokens").is_none(),
+            "anthropic-dialect key must not leak through after normalization",
+        );
+    }
+
+    #[test]
+    fn llm_capture_error_response_detects_anthropic_dialect_from_cache_keys_only() {
+        // Edge case: an error artifact that only carries cache fields (no
+        // top-level input/output tokens) — still unambiguously anthropic. We
+        // must recognize the dialect from `cache_read_input_tokens` alone,
+        // otherwise the pass-through branch (triggered by presence of
+        // `input_tokens`) never fires and we silently drop the cache signal.
+        let error =
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "boom")
+                .with_details_json(
+                    json!({
+                        "usage": {
+                            "cache_read_input_tokens": 2048,
+                            "cache_creation_input_tokens": 0
+                        }
+                    })
+                    .to_string(),
+                );
+        let response = llm_capture_error_response(&error);
+        assert_eq!(
+            response["usage"]["cached_input_tokens"].as_i64(),
+            Some(2048),
+        );
+    }
+
+    #[test]
     fn llm_capture_error_response_leaves_unknown_usage_dialect_untouched() {
         // If we cannot identify the dialect, preserve raw keys — dropping
         // fields silently is worse than asking downstream code to
@@ -3603,150 +3912,8 @@ mod tests {
     }
 
     #[test]
-    fn builder_defaults() {
-        let host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u".to_string(),
-            "s".to_string(),
-        )
-        .build();
-
-        assert!(host.is_quiet());
-        // When no edge tools are provided, server-side tool schemas are auto-populated
-        assert!(host.server_side_tools);
-        assert!(!host.valid_tool_names().is_empty());
-        assert!(host.valid_tool_names().contains("rollback_file_edits"));
-        assert!(host.valid_tool_names().contains("adjust_config"));
-        assert!(host.valid_tool_names().contains("prioritize_tool"));
-        assert!(host.valid_tool_names().contains("deprioritize_tool"));
-        assert!(host.valid_tool_names().contains("set_goal"));
-        assert!(host.valid_tool_names().contains("compress_context"));
-        assert!(host.valid_tool_names().contains("rollback_session_state"));
-        assert!(host.valid_tool_names().contains("task_create"));
-        assert!(host.valid_tool_names().contains("task_list"));
-        assert!(host.valid_tool_names().contains("task_get"));
-        assert!(host.valid_tool_names().contains("task_update"));
-        assert!(host.valid_tool_names().contains("task_stop"));
-        assert!(host.valid_tool_names().contains("mo_query"));
-        assert!(
-            host.valid_tool_names()
-                .contains("rollback_database_snapshots")
-        );
-        assert!(host.valid_tool_names().contains("memory_store"));
-        assert!(host.valid_tool_names().contains("multi_edit"));
-        assert!(!host.valid_tool_names().contains("powershell"));
-        assert!(host.emitted_events.is_empty());
-    }
-
-    #[test]
-    fn build_system_prompt_includes_cwd() {
-        let mut profile = Map::new();
-        profile.insert("cwd".to_string(), json!("/home/user/project"));
-        profile.insert("git_branch".to_string(), json!("main"));
-
-        let host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u1".to_string(),
-            "s1".to_string(),
-        )
-        .with_edge_tools(sample_edge_tools())
-        .with_edge_profile(profile)
-        .build();
-
-        let prompt = host.build_system_prompt("test query", &host.edge_tools);
-        assert!(
-            prompt.contains("/home/user/project"),
-            "prompt should contain cwd"
-        );
-        assert!(prompt.contains("main"), "prompt should contain git branch");
-    }
-
-    #[test]
-    fn build_system_prompt_includes_skill_hints() {
-        let mut profile = Map::new();
-        profile.insert(
-            "active_skills".to_string(),
-            json!(["code_review", "testing"]),
-        );
-
-        let host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u1".to_string(),
-            "s1".to_string(),
-        )
-        .with_edge_tools(sample_edge_tools())
-        .with_edge_profile(profile)
-        .build();
-
-        let prompt = host.build_system_prompt("test", &host.edge_tools);
-        assert!(
-            prompt.contains("code_review"),
-            "prompt should include skill names"
-        );
-    }
-
-    #[test]
-    fn build_system_prompt_includes_learned_context() {
-        let mut profile = Map::new();
-        profile.insert(
-            "learned_context_hint".to_string(),
-            json!("matrixorigin => github"),
-        );
-
-        let host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u1".to_string(),
-            "s1".to_string(),
-        )
-        .with_edge_tools(sample_edge_tools())
-        .with_edge_profile(profile)
-        .build();
-
-        let prompt = host.build_system_prompt("test", &host.edge_tools);
-        assert!(
-            prompt.contains("Learned Runtime Context"),
-            "prompt should include learned context section"
-        );
-    }
-
-    #[test]
-    fn build_system_prompt_includes_plan_resume_hint_when_set() {
-        let host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u1".to_string(),
-            "s1".to_string(),
-        )
-        .with_edge_tools(sample_edge_tools())
-        .with_plan_resume_hint(Some(
-            "\n\n## Active Plan\n[plan-resume] goal=\"Ship feature X\" · open=3 · done=1/5\n\n\
-             A plan is currently in-flight for this session."
-                .to_string(),
-        ))
-        .build();
-
-        let prompt = host.build_system_prompt("any user turn", &host.edge_tools);
-        assert!(
-            prompt.contains("[plan-resume]"),
-            "system prompt must surface the plan-resume digest when a plan is active"
-        );
-        assert!(
-            prompt.contains("Active Plan"),
-            "system prompt must include the Active Plan header"
-        );
-        assert!(
-            prompt.contains("Ship feature X"),
-            "system prompt must carry the plan's goal"
-        );
-    }
-
-    #[test]
-    fn build_system_prompt_omits_plan_resume_hint_when_none() {
-        let host = ServerAgenticLoopHostBuilder::new(
+    fn pipeline_abort_falls_back_to_emergency_prompt_and_records_alert() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
             "u1".to_string(),
@@ -3754,143 +3921,41 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .build();
-
-        let prompt = host.build_system_prompt("any user turn", &host.edge_tools);
-        assert!(
-            !prompt.contains("[plan-resume]"),
-            "system prompt must NOT mention plan-resume when no plan is active"
+        let mut state = crate::turn::agentic_loop_host::tests::make_state();
+        state.current_session_id = Some("sid-abort".into());
+        state.max_turn_input_tokens = 100_000;
+        state.turn_event_buffer = Some(
+            astra_services::session_journal::TurnEventBuffer::begin_turn(Some("sid-abort"), 1),
         );
-    }
-
-    #[test]
-    fn build_system_prompt_detects_memory_signal() {
-        let host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u1".to_string(),
-            "s1".to_string(),
-        )
-        .with_edge_tools(sample_edge_tools())
-        .build();
-
-        let prompt = host.build_system_prompt("remember that I prefer dark mode", &host.edge_tools);
-        // Memory signal detection removed — LLM decides via system prompt rules.
-        // The prompt should NOT contain the old keyword-triggered injection.
-        assert!(
-            !prompt.contains("MEMORY SIGNAL DETECTED"),
-            "keyword-based memory signal injection must be removed"
+        let mut pipeline_session = astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
         );
-    }
+        pipeline_session.recovery.consecutive_ptl_errors = 3;
+        state.pipeline_session = Some(pipeline_session);
+        let tools = host.edge_tools.clone();
 
-    #[test]
-    fn build_system_messages_cached_includes_late_round_guidance_in_dynamic_prompt() {
-        let host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u1".to_string(),
-            "s1".to_string(),
-        )
-        .with_edge_tools(sample_edge_tools())
-        .build();
-
-        let mut state = create_test_state();
-        state.current_round_index = crate::prompts::ROUND_BUDGET_THRESHOLD;
-        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD;
-        state.messages = vec![
-            json!({"role": "user", "content": "inspect the project"}),
-            json!({"role": "tool", "content": "Cargo.toml"}),
-            json!({"role": "tool", "content": "README.md"}),
-        ];
-
-        let (system_messages, plain, breakdown) = host.build_system_messages_cached(
-            "inspect the project",
-            &host.edge_tools,
-            &state,
-            &PromptCacheConfig::latch("openai", "gpt-4o"),
-        );
+        let outcome =
+            host.run_turn_pipeline(&mut state, &tools, "anthropic", "claude-sonnet", "continue");
+        let messages = outcome.system_messages;
+        let plain = outcome.system_plain;
+        let breakdown = outcome.breakdown;
 
         assert!(
-            !plain.contains("Synthesize Or Batch Now"),
-            "synthesize directive is neutered (circuit breaker replaces it)"
+            !messages.is_empty(),
+            "pipeline abort must not continue with an empty system prompt"
         );
         assert!(
-            plain.contains("2 tools executed in parallel"),
-            "plain prompt should preserve batching feedback"
+            plain.contains("normal context pipeline could not build"),
+            "fallback should clearly identify the degraded emergency path"
         );
-
-        let primary = system_messages.first().expect("primary system message");
-        let dynamic = system_messages.last().expect("dynamic system message");
-        let primary_text = primary
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let dynamic_text = dynamic
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
+        assert!(breakdown.total_tokens > 0);
         assert!(
-            !primary_text.contains("Synthesize Or Batch Now"),
-            "late-round guidance must stay out of the stable cached prefix"
+            state
+                .turn_event_buffer
+                .as_ref()
+                .is_some_and(|buffer| !buffer.is_empty()),
+            "pipeline abort should record an alert event for harness/journal analysis"
         );
-        assert!(
-            !dynamic_text.contains("Synthesize Or Batch Now"),
-            "synthesize directive is neutered (circuit breaker replaces it)"
-        );
-        assert!(!breakdown.guidance_signals.round_budget_warning);
-        assert!(!breakdown.guidance_signals.synthesize_or_batch);
-        assert!(breakdown.guidance_signals.parallel_feedback);
-    }
-
-    #[test]
-    fn build_system_messages_cached_records_dynamic_context_signals() {
-        let mut profile = Map::new();
-        profile.insert("active_skills".to_string(), json!(["concise"]));
-        profile.insert(
-            "learned_context_hint".to_string(),
-            json!("matrixorigin => github"),
-        );
-        profile.insert(
-            "system_prompt_override".to_string(),
-            json!("You are operating under a delegated reviewer contract."),
-        );
-
-        let host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u1".to_string(),
-            "s1".to_string(),
-        )
-        .with_edge_tools(sample_edge_tools())
-        .with_edge_profile(profile)
-        .build();
-
-        let mut state = create_test_state();
-        state.skills.effort = Some(crate::skills::manifest::EffortLevel::High);
-        state.skills.agent_type = Some("reviewer".to_string());
-
-        let (_, _, breakdown) = host.build_system_messages_cached(
-            "remember that I prefer dark mode",
-            &host.edge_tools,
-            &state,
-            &PromptCacheConfig::latch("openai", "gpt-4o"),
-        );
-
-        assert!(breakdown.context_signals.active_output_skills);
-        assert!(breakdown.context_signals.learned_runtime_context);
-        assert!(
-            !breakdown.context_signals.memory_signal_detected,
-            "memory signal detection removed — LLM-driven"
-        );
-        assert!(breakdown.context_signals.system_prompt_override);
-        assert!(breakdown.context_signals.effort_hint);
-        assert!(breakdown.context_signals.agent_type_hint);
-        assert!(!breakdown.context_signals.self_awareness);
-        assert!(!breakdown.context_signals.implicit_feedback);
-        assert!(!breakdown.context_signals.learned_feedback_rules);
-        assert!(!breakdown.context_signals.session_anchor);
-        assert!(breakdown.environment_tokens > 0);
-        assert!(breakdown.user_preferences_tokens > 0);
     }
 
     #[test]
@@ -4011,7 +4076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_llm_messages_includes_system_and_user() {
+    async fn assemble_llm_messages_includes_system_and_user() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -4026,24 +4091,291 @@ mod tests {
             .messages
             .push(json!({"role": "user", "content": "hello"}));
 
-        let msgs = host
-            .build_llm_messages(
-                vec![json!({"role": "system", "content": "system prompt text"})],
-                &state,
-                &host.edge_tools,
-                "gpt-4",
-                "sk-test",
-                "https://api.test.com",
-                "openai",
-                &HashMap::new(),
-                None,
-                None,
-                &PromptCacheConfig::latch("openai", "gpt-4"),
-            )
-            .await;
+        // `assemble_llm_messages` is the pure stitching step after Phase 3 —
+        // no Memoria I/O. With Normal tier Memoria passes messages through
+        // unchanged, so feeding `state.messages` directly as the compacted
+        // list is equivalent to the real runtime path here.
+        let llm_cfg = ResolvedTurnLlmConfig {
+            model_name: "gpt-4".into(),
+            wire_model_name: None,
+            api_key: String::new(),
+            base_url: String::new(),
+            provider: "openai".into(),
+            fallback_chain: Vec::new(),
+            header_overrides: HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
+        };
+        let msgs = host.assemble_llm_messages(
+            vec![json!({"role": "system", "content": "system prompt text"})],
+            Vec::new(),
+            state.messages.clone(),
+            &mut state,
+            &llm_cfg,
+            &PromptCacheConfig::latch("openai", "gpt-4"),
+        );
         assert!(msgs.len() >= 2, "should have system + user messages");
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[0]["content"], "system prompt text");
+    }
+
+    #[tokio::test]
+    async fn run_turn_pipeline_returns_tier_and_pruned_tool_schemas() {
+        // Phase 1 contract: the pipeline is the sole authority for
+        // (a) compaction tier selection and
+        // (b) tier-appropriate tool-schema pruning.
+        // Runtime no longer re-derives either — both must come back from
+        // `run_turn_pipeline` via the PipelineTurnOutcome struct.
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-turn-pipeline".to_string(),
+            "s-turn-pipeline".to_string(),
+        )
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute a shell command. Runs inside the sandbox with a 2-minute default timeout and deletes temp dirs on exit.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Command to run. Use absolute paths."}
+                    }
+                }
+            }
+        })])
+        .build();
+
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-turn-pipeline".into());
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        let outcome = host.run_turn_pipeline(&mut state, &tools, "openai", "gpt-4", "just do it");
+
+        // Tier comes from the planner, not from runtime's estimate.
+        // For this low-pressure state planner should select Normal.
+        assert_eq!(
+            outcome.tier,
+            CompactionTier::Normal,
+            "low-pressure turn should plan at CompactionTier::Normal"
+        );
+        // Tool schemas are the pipeline's Optimize output, not the raw input.
+        assert_eq!(
+            outcome.tool_schemas.len(),
+            tools.len(),
+            "Normal tier preserves tool schema count"
+        );
+        // System messages are rendered from pipeline's serialized system blocks.
+        assert!(!outcome.system_messages.is_empty());
+        assert_eq!(outcome.system_messages[0]["role"], "system");
+    }
+
+    /// Session 986a553e observed MiniMax-M2.7 cache collapsing from
+    /// 7680 to 0 across six tool-loop rounds because volatile
+    /// content (Self-Awareness with live turn/token counters) was
+    /// being re-injected every round. The new `CacheCapability`
+    /// routing classifies MiniMax as `VolatilePlacement::CurrentUserOnly`;
+    /// `run_turn_pipeline` now consults it and emits an **empty**
+    /// `volatile_preamble` on rounds > 0 so the message history bytes
+    /// stay stable across the tool loop.
+    #[tokio::test]
+    async fn run_turn_pipeline_minimax_skips_volatile_on_tool_loop_round() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-minimax".to_string(),
+            "s-minimax".to_string(),
+        )
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Shell.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })])
+        .build();
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-minimax".into());
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        // Updated contract: strict-history providers (MiniMax) must
+        // suppress volatile preamble on EVERY round, not just >0.
+        // Round-0-only injection still causes a byte mismatch at
+        // msg[1] vs round 1+ (round 0 has preamble+user_q, round 1
+        // has only user_q), so the whole turn's cache misses.
+        for round in [0u32, 1, 5] {
+            state.current_round_index = round;
+            let out = host.run_turn_pipeline(&mut state, &tools, "openai", "MiniMax-M2.7", "hi");
+            assert!(
+                out.volatile_preamble.is_empty(),
+                "MiniMax must suppress volatile preamble on every round \
+                 (strict-history provider). round={round} preamble={:?}",
+                out.volatile_preamble,
+            );
+        }
+    }
+
+    /// OpenAI auto-prefix cache can tolerate volatile-in-tail every
+    /// round, so preamble emission stays unchanged across rounds.
+    #[tokio::test]
+    async fn run_turn_pipeline_openai_keeps_volatile_on_all_rounds() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-openai".to_string(),
+            "s-openai".to_string(),
+        )
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Shell.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })])
+        .build();
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-openai".into());
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        state.current_round_index = 0;
+        let r0 = host.run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "hi");
+        state.current_round_index = 3;
+        let r3 = host.run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "hi");
+        // Identical preamble shape on OpenAI — injection gate doesn't
+        // special-case round index.
+        assert_eq!(
+            r0.volatile_preamble.len(),
+            r3.volatile_preamble.len(),
+            "OpenAI should emit identical preamble on round 0 and 3",
+        );
+    }
+
+    /// Anthropic path (MarkerIsolated) — post-fix contract: volatile
+    /// (CacheScope::None) blocks are promoted OUT of the system content
+    /// array and into `volatile_preamble` so the system content stays
+    /// byte-stable across rounds. This unblocks tool-schema caching on
+    /// DeepSeek's `/anthropic` endpoint (see session 5c5cbf78 analysis
+    /// and `tests/fixtures/deepseek_anthropic_cache_probe.py`) and is
+    /// no-op for Bedrock (which cache-writes the full payload on the
+    /// first call regardless).
+    ///
+    /// The preamble existence on a given round depends on whether the
+    /// pipeline generated any `CacheScope::None` blocks in the first
+    /// place; here we just assert the MarkerIsolated branch no longer
+    /// leaves stable and volatile content co-mingled in the system
+    /// content array.
+    #[tokio::test]
+    async fn run_turn_pipeline_anthropic_system_content_stays_byte_stable() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-anth".to_string(),
+            "s-anth".to_string(),
+        )
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Shell.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })])
+        .build();
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-anth".into());
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        // Capture system content on two different rounds and assert the
+        // byte-stable invariant. The old MarkerIsolated branch embedded
+        // the Turn/Tokens counter inside the system content, so
+        // `system_messages[0]["content"]` differed between round 0 and
+        // round 7. Post-fix: the counter rides in `volatile_preamble`
+        // and system content is identical.
+        state.current_round_index = 0;
+        let r0 = host.run_turn_pipeline(&mut state, &tools, "anthropic", "claude-sonnet-4", "hi");
+        state.current_round_index = 7;
+        let r7 = host.run_turn_pipeline(&mut state, &tools, "anthropic", "claude-sonnet-4", "hi");
+
+        assert_eq!(
+            r0.system_messages, r7.system_messages,
+            "system_messages must be byte-identical across rounds — any \
+             drift here reopens the session 5c5cbf78 cache regression. \
+             r0={:#?} r7={:#?}",
+            r0.system_messages, r7.system_messages,
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_pipeline_prunes_tool_schemas_under_pressure() {
+        // Forces the planner into TrimSchemas+ tier by driving up recovery
+        // state (PTL errors), then verifies the returned tool_schemas reflect
+        // tier-appropriate pruning — tool descriptions should be truncated.
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-prune".to_string(),
+            "s-prune".to_string(),
+        )
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute a shell command. Runs inside the sandbox with a 2-minute default timeout and deletes temp dirs on exit.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Command to run. Use absolute paths."}
+                    }
+                }
+            }
+        })])
+        .build();
+
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-prune".into());
+        state.max_turn_input_tokens = 200_000;
+        let mut ps = astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        );
+        // Force the planner to escalate beyond Normal via recovery state.
+        ps.recovery.consecutive_ptl_errors = 1;
+        state.pipeline_session = Some(ps);
+        let tools = host.edge_tools.clone();
+
+        let outcome = host.run_turn_pipeline(&mut state, &tools, "openai", "gpt-4", "continue");
+
+        assert!(
+            outcome.tier >= CompactionTier::TrimSchemas,
+            "recovery PTL=1 must escalate tier above Normal, got {:?}",
+            outcome.tier
+        );
+        // Description must have been touched by TrimSchemas (first-sentence truncation).
+        let pruned_desc = outcome.tool_schemas[0]["function"]["description"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !pruned_desc.contains("deletes temp dirs"),
+            "trailing sentence should be stripped under TrimSchemas, got: {pruned_desc:?}"
+        );
     }
 
     #[tokio::test]
@@ -4334,6 +4666,8 @@ mod tests {
 
         AgenticLoopState {
             messages: Vec::new(),
+            volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
@@ -4341,6 +4675,7 @@ mod tests {
             context_manifest_user_id: None,
             context_manifest_model_name: None,
             recursion_depth: 0,
+            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -4376,6 +4711,9 @@ mod tests {
             cancellation: Default::default(),
             messaging: Default::default(),
             error_recovery: Default::default(),
+            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+            )),
             message: "test query".to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
@@ -4396,6 +4734,8 @@ mod tests {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
+            compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -4609,8 +4949,10 @@ mod tests {
             TurnInteractionMode::Headless,
         ));
         let visible_tools = host.filtered_turn_tools(&effective_restricted);
-        let final_tools =
-            prune_tool_schemas(&visible_tools, crate::prompts::CompactionTier::Normal);
+        let final_tools = astra_turn_core::tool_schema_prune::prune_tool_schemas(
+            &visible_tools,
+            crate::prompts::CompactionTier::Normal,
+        );
         let policy =
             TurnInteractionPolicy::from_tool_schemas(TurnInteractionMode::Headless, &final_tools);
 
@@ -4641,8 +4983,10 @@ mod tests {
             host.turn_interaction_mode(),
         ));
         let visible_tools = host.filtered_turn_tools(&effective_restricted);
-        let final_tools =
-            prune_tool_schemas(&visible_tools, crate::prompts::CompactionTier::Normal);
+        let final_tools = astra_turn_core::tool_schema_prune::prune_tool_schemas(
+            &visible_tools,
+            crate::prompts::CompactionTier::Normal,
+        );
         let policy =
             TurnInteractionPolicy::from_tool_schemas(host.turn_interaction_mode(), &final_tools);
 
@@ -5369,6 +5713,140 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn maybe_pre_turn_compact_uses_inline_summary_prefix() {
+        use axum::{Router, extract::State, routing::post};
+        use tokio::net::TcpListener;
+
+        #[derive(Default)]
+        struct RequestCapture {
+            body: tokio::sync::Mutex<Option<Value>>,
+        }
+
+        async fn handler(
+            State(capture): State<Arc<RequestCapture>>,
+            request: axum::extract::Request,
+        ) -> axum::Json<Value> {
+            let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("read request body");
+            *capture.body.lock().await = Some(serde_json::from_slice(&bytes).expect("json body"));
+            axum::Json(json!({
+                "choices": [
+                    {
+                        "message": { "content": "inline summary" },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }))
+        }
+
+        let capture = Arc::new(RequestCapture::default());
+        let app = Router::new()
+            .route("/gateway/chat/completions", post(handler))
+            .with_state(capture.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-inline".to_string(),
+            "session-inline".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .build();
+        host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
+            model_name: "gpt-4o-mini".to_string(),
+            api_key: String::new(),
+            base_url: format!("http://{addr}/gateway"),
+            provider: "openai".to_string(),
+            max_output_tokens: 128,
+        });
+
+        let mut state = create_test_state();
+        state.max_turn_input_tokens = 100;
+        state.message = "Fix the regression".to_string();
+        for i in 0..6 {
+            state
+                .messages
+                .push(json!({"role": "user", "content": format!("question {i}")}));
+            state
+                .messages
+                .push(json!({"role": "assistant", "content": format!("answer {i}")}));
+        }
+
+        <ServerAgenticLoopHost as crate::turn::agentic_loop_host::AgenticLoopHost>::maybe_pre_turn_compact(
+            &mut host,
+            &mut state,
+            0.95,
+            true,
+        )
+        .await;
+        assert_eq!(
+            state.compact_tier_applied,
+            CompactionTier::CompactHistory,
+            "pre-turn compact should bump tier to CompactHistory",
+        );
+
+        let body = capture
+            .body
+            .lock()
+            .await
+            .clone()
+            .expect("summary request should be captured");
+        let messages = body["messages"]
+            .as_array()
+            .expect("openai request should contain messages");
+
+        assert!(
+            messages.len() > state.messages.len() / 2,
+            "inline summary request should include system prompt plus much of the original history"
+        );
+        assert_eq!(
+            messages
+                .first()
+                .and_then(|m| m.get("role"))
+                .and_then(Value::as_str),
+            Some("system"),
+            "inline summary request should begin with main-turn system messages"
+        );
+        assert!(
+            messages.iter().any(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("question 0"))
+            }),
+            "expected original conversation history in inline summary request"
+        );
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_str),
+            Some(astra_turn_core::cloud_summary::INLINE_COMPACT_INSTRUCTION),
+            "expected trailing inline compact instruction"
+        );
+        assert!(
+            !messages.iter().any(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("You are a conversation summarizer"))
+            }),
+            "inline path must not fall back to COMPACT_SYSTEM_PROMPT"
+        );
+
+        server.abort();
+    }
+
     // ── progress_event_to_sse tests ──
 
     #[test]
@@ -5784,47 +6262,19 @@ mod tests {
 
     // ── G2: server-side parent capture (on_turn_completed) ──
     //
-    // These tests pin three behaviors of the server host's capture
-    // path so a future refactor can't silently regress:
+    // These tests pin behaviors of the server host's capture path so
+    // a future refactor can't silently regress:
     //
     //  1. No store wired → no-op (zero overhead for callers that
     //     don't enable fork-prefix).
-    //  2. Store wired + feature flag off → capture returns
-    //     FeatureDisabled and nothing lands in the sink. This is the
-    //     dark-ship contract.
-    //  3. Store wired + flag on + non-empty run_id/messages →
-    //     prefix lands in the sink with the right run_id and the
-    //     tool_schemas are populated from the advertised edge_tools.
+    //  2. Store wired + non-empty run_id/messages → prefix lands in
+    //     the sink with the right run_id and the tool_schemas are
+    //     populated from the advertised edge_tools.
 
     mod fork_prefix_capture_g2 {
         use super::*;
-        use astra_turn_core::fork_capture::{
-            FORK_FLAG_TEST_MUTEX, restore_fork_flag_raw_for_tests, set_fork_flag_for_tests,
-        };
         use astra_turn_core::fork_prefix_store::{InMemoryPrefixStore, PrefixCaptureSink};
         use std::sync::Arc;
-
-        struct FlagGuard {
-            _lock: std::sync::MutexGuard<'static, ()>,
-            prev_raw: u8,
-        }
-        impl FlagGuard {
-            fn set(enabled: bool) -> Self {
-                let lock = FORK_FLAG_TEST_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let prev_raw = set_fork_flag_for_tests(enabled);
-                Self {
-                    _lock: lock,
-                    prev_raw,
-                }
-            }
-        }
-        impl Drop for FlagGuard {
-            fn drop(&mut self) {
-                restore_fork_flag_raw_for_tests(self.prev_raw);
-            }
-        }
 
         fn state_with_run(run_id: &str) -> AgenticLoopState {
             let mut state = crate::turn::agentic_loop_host::tests::make_state();
@@ -5850,9 +6300,8 @@ mod tests {
 
         #[test]
         fn on_turn_completed_is_noop_without_store() {
-            // No store wired, no flag touched — must not panic, must
-            // not affect any state the loop depends on.
-            let _guard = FlagGuard::set(false);
+            // No store wired — must not panic, must not affect any
+            // state the loop depends on.
             let mut host = build_host_with(None, sample_edge_tools());
             let state = state_with_run("run-1");
             host.on_turn_completed(&state);
@@ -5860,24 +6309,7 @@ mod tests {
         }
 
         #[test]
-        fn on_turn_completed_respects_feature_flag_off() {
-            let _guard = FlagGuard::set(false);
-            let store = Arc::new(InMemoryPrefixStore::new());
-            let store_arc: Arc<dyn PrefixCaptureSink> = store.clone();
-            let mut host = build_host_with(Some(store_arc), sample_edge_tools());
-            // Simulate that the loop completed one turn.
-            host.last_turn_tool_schemas = sample_edge_tools();
-            host.on_turn_completed(&state_with_run("run-off"));
-            assert_eq!(
-                store.tracked_count(),
-                0,
-                "flag off must not write to the store"
-            );
-        }
-
-        #[test]
-        fn on_turn_completed_captures_when_flag_on_and_store_wired() {
-            let _guard = FlagGuard::set(true);
+        fn on_turn_completed_captures_when_store_wired() {
             let store = Arc::new(InMemoryPrefixStore::new());
             let store_arc: Arc<dyn PrefixCaptureSink> = store.clone();
             let mut host = build_host_with(Some(store_arc), sample_edge_tools());
@@ -5887,7 +6319,7 @@ mod tests {
             assert_eq!(
                 store.tracked_count(),
                 1,
-                "flag on + store + valid run_id must produce one entry"
+                "store + valid run_id must produce one entry"
             );
             let pfx = store
                 .get_prefix("run-capture")
@@ -5905,7 +6337,6 @@ mod tests {
 
         #[test]
         fn on_turn_completed_skips_when_run_id_missing() {
-            let _guard = FlagGuard::set(true);
             let store = Arc::new(InMemoryPrefixStore::new());
             let store_arc: Arc<dyn PrefixCaptureSink> = store.clone();
             let mut host = build_host_with(Some(store_arc), sample_edge_tools());

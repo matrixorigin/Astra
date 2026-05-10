@@ -156,20 +156,22 @@ fn git_recent_commits(project_root: &Path, n: usize) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Build a human-readable environment context string for the system prompt.
-/// Includes OS, architecture, shell, CWD, git branch/status, and terminal info.
-/// This gives the LLM awareness of the runtime environment for better tool usage.
-pub fn build_environment_context(project_root: &Path) -> String {
+/// Session-stable environment facts: Platform, Shell, CWD, Home.
+///
+/// Safe to place inside a Session-scoped cache block — the content does
+/// not change during a normal session (OS doesn't swap, shell doesn't
+/// change, cwd is fixed for the lifetime of the runtime).
+///
+/// Returns an empty string if no fields can be populated.
+pub fn build_static_environment_context(project_root: &Path) -> String {
     let mut lines = Vec::new();
 
-    // OS and architecture
     lines.push(format!(
         "- Platform: {} ({})",
         std::env::consts::OS,
         std::env::consts::ARCH
     ));
 
-    // Shell
     let shell = std::env::var("SHELL")
         .or_else(|_| std::env::var("COMSPEC"))
         .unwrap_or_default();
@@ -181,61 +183,79 @@ pub fn build_environment_context(project_root: &Path) -> String {
         lines.push(format!("- Shell: {shell_name}"));
     }
 
-    // CWD
     lines.push(format!("- CWD: {}", project_root.display()));
 
-    // Git branch and status (best-effort, non-blocking)
-    if let Ok(output) = std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(project_root)
-        .output()
-        && let Ok(branch) = String::from_utf8(output.stdout)
-    {
-        let branch = branch.trim();
-        if !branch.is_empty() {
-            // Check if repo is dirty
-            let dirty = std::process::Command::new("git")
-                .args(["status", "--porcelain", "--untracked-files=no"])
-                .current_dir(project_root)
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false);
-            let status = if dirty { " (dirty)" } else { "" };
-            lines.push(format!("- Git branch: {branch}{status}"));
-
-            // Git diff summary: staged + unstaged changes (compact stat format)
-            if dirty {
-                // Staged changes
-                if let Some(staged) = git_diff_stat(project_root, true) {
-                    if !staged.is_empty() {
-                        lines.push(format!("- Staged changes:\n{staged}"));
-                    }
-                }
-                // Unstaged changes
-                if let Some(unstaged) = git_diff_stat(project_root, false) {
-                    if !unstaged.is_empty() {
-                        lines.push(format!("- Unstaged changes:\n{unstaged}"));
-                    }
-                }
-            }
-
-            // Recent commits (last 5 one-liners for context)
-            if let Some(log) = git_recent_commits(project_root, 5) {
-                if !log.is_empty() {
-                    lines.push(format!("- Recent commits:\n{log}"));
-                }
-            }
-        }
-    }
-
-    // Home directory
     if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         lines.push(format!("- Home: {home}"));
     }
 
     format!("\n\n## Environment\n{}", lines.join("\n"))
+}
+
+/// Turn-volatile environment facts: branch dirty state, staged/unstaged
+/// diff stats, recent commits. Must NOT go into the cached Session prefix
+/// — any edit / commit flips the content and invalidates the cache for
+/// every subsequent turn.
+///
+/// Returns an empty string when the project isn't a git repo or the
+/// commands fail.
+pub fn build_volatile_environment_context(project_root: &Path) -> String {
+    let mut lines = Vec::new();
+    let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(project_root)
+        .output()
+    else {
+        return String::new();
+    };
+    let Ok(branch) = String::from_utf8(output.stdout) else {
+        return String::new();
+    };
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return String::new();
+    }
+
+    let dirty = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(project_root)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let status = if dirty { " (dirty)" } else { "" };
+    lines.push(format!("- Git branch: {branch}{status}"));
+
+    if dirty {
+        if let Some(staged) = git_diff_stat(project_root, true) {
+            if !staged.is_empty() {
+                lines.push(format!("- Staged changes:\n{staged}"));
+            }
+        }
+        if let Some(unstaged) = git_diff_stat(project_root, false) {
+            if !unstaged.is_empty() {
+                lines.push(format!("- Unstaged changes:\n{unstaged}"));
+            }
+        }
+    }
+
+    // 3 commits is the sweet spot: enough for the model to orient on
+    // recent work ("what did I just do?") without spending ~160c/turn on
+    // ancient history that git_log/git_show can fetch on demand. The cap
+    // was 5; observed volatile-block sessions (69657ca7) showed commits
+    // 4-5 were always just context noise the model never cited.
+    if let Some(log) = git_recent_commits(project_root, 3) {
+        if !log.is_empty() {
+            lines.push(format!("- Recent commits:\n{log}"));
+        }
+    }
+
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n## Git State\n{}", lines.join("\n"))
+    }
 }
 
 /// Max Unicode scalar values (`char`s) kept before appending `…` (U+2026).
@@ -463,62 +483,88 @@ mod tests {
         assert!(dir_strs.contains(&"src/"), "should include src/");
     }
 
-    // ── build_environment_context tests ──────────────────────────────────
+    // ── environment context split: static + volatile ─────────────────
 
     #[test]
-    fn environment_context_contains_platform() {
+    fn static_context_contains_platform_cwd_and_no_git() {
         let tmp = tempdir().unwrap();
-        let ctx = build_environment_context(tmp.path());
-        assert!(ctx.contains("## Environment"), "should have section header");
-        assert!(ctx.contains("- Platform:"), "should contain platform info");
-        assert!(
-            ctx.contains(std::env::consts::OS),
-            "should contain current OS"
-        );
-    }
-
-    #[test]
-    fn environment_context_contains_cwd() {
-        let tmp = tempdir().unwrap();
-        let ctx = build_environment_context(tmp.path());
-        assert!(ctx.contains("- CWD:"), "should contain CWD line");
+        let ctx = build_static_environment_context(tmp.path());
+        assert!(ctx.contains("## Environment"));
+        assert!(ctx.contains("- Platform:"));
+        assert!(ctx.contains(std::env::consts::OS));
+        assert!(ctx.contains("- CWD:"));
         let tmp_str = tmp.path().to_string_lossy();
+        assert!(ctx.contains(&*tmp_str));
+        // Static path MUST NOT include git fields — those are the source
+        // of cache invalidation.
         assert!(
-            ctx.contains(&*tmp_str),
-            "should contain actual CWD path: {ctx}"
+            !ctx.contains("- Git branch:"),
+            "static ctx must not contain git branch: {ctx}"
+        );
+        assert!(
+            !ctx.contains("- Recent commits:"),
+            "static ctx must not contain recent commits: {ctx}"
+        );
+        assert!(
+            !ctx.contains("- Staged changes:"),
+            "static ctx must not contain staged diff: {ctx}"
         );
     }
 
     #[test]
-    fn environment_context_in_git_repo() {
-        // Use the actual repo root (we know it's a git repo)
+    fn volatile_context_contains_git_branch_in_repo() {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
             .unwrap();
-        let ctx = build_environment_context(repo_root);
-        assert!(
-            ctx.contains("- Git branch:"),
-            "should detect git branch in repo: {ctx}"
-        );
+        let ctx = build_volatile_environment_context(repo_root);
+        assert!(ctx.contains("## Git State"), "should have section header");
+        assert!(ctx.contains("- Git branch:"));
     }
 
     #[test]
-    fn environment_context_no_git_in_temp() {
+    fn volatile_context_empty_outside_git() {
         let tmp = tempdir().unwrap();
-        // Override GIT_CEILING_DIRECTORIES so git won't discover any repo
-        // above the temp dir (e.g. if /tmp itself is inside a worktree).
-        // SAFETY: test is single-threaded for this env var; no concurrent readers.
         unsafe {
             std::env::set_var("GIT_CEILING_DIRECTORIES", tmp.path().parent().unwrap());
         }
-        let ctx = build_environment_context(tmp.path());
+        let ctx = build_volatile_environment_context(tmp.path());
         unsafe {
             std::env::remove_var("GIT_CEILING_DIRECTORIES");
         }
         assert!(
-            !ctx.contains("- Git branch:"),
-            "temp dir should not have git branch"
+            ctx.is_empty(),
+            "outside a git repo the volatile ctx must be empty (nothing to route through volatile lane): {ctx}"
+        );
+    }
+
+    #[test]
+    fn volatile_context_includes_recent_commits_in_repo() {
+        let cwd = std::env::current_dir().unwrap();
+        let ctx = build_volatile_environment_context(&cwd);
+        assert!(ctx.contains("- Recent commits:"));
+    }
+
+    /// Pin the recent-commit cap at ≤3 so the Git State section stays lean.
+    /// The volatile lane runs on every turn; each extra commit adds ~80c.
+    /// Trim from 5→3 saved ~160c per session (observed in 69657ca7) and
+    /// 3 has consistently been the "what did I just do?" sweet spot for
+    /// the model — anything older is better fetched via git_log on demand.
+    #[test]
+    fn volatile_context_caps_recent_commits_at_three() {
+        let cwd = std::env::current_dir().unwrap();
+        let ctx = build_volatile_environment_context(&cwd);
+        let start = ctx
+            .find("- Recent commits:\n")
+            .expect("has commits section");
+        let after = &ctx[start + "- Recent commits:\n".len()..];
+        let commit_lines = after
+            .lines()
+            .take_while(|l| !l.is_empty() && !l.starts_with("- "))
+            .count();
+        assert!(
+            commit_lines <= 3,
+            "volatile Git State should cap recent commits at 3, got {commit_lines}:\n{ctx}"
         );
     }
 
@@ -564,15 +610,5 @@ mod tests {
             std::env::remove_var("GIT_CEILING_DIRECTORIES");
         }
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn environment_context_includes_git_commits_in_repo() {
-        let cwd = std::env::current_dir().unwrap();
-        let ctx = build_environment_context(&cwd);
-        assert!(
-            ctx.contains("- Recent commits:"),
-            "should include recent commits in a git repo"
-        );
     }
 }

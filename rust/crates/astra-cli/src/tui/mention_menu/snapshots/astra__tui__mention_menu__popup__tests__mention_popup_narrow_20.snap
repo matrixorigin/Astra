@@ -1,0 +1,5 @@
+---
+source: crates/astra-cli/src/tui/mention_menu/popup.rs
+expression: "render_menu(&menu, 20, 2)"
+---
+▌   a_very_long_fil…

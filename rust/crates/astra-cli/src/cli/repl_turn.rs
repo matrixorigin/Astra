@@ -260,6 +260,7 @@ pub(super) async fn handle_chat_input_with_ui(
     // explicit resume-like line, then consumed once.
     let plan_resume_digest = consume_plan_resume_if_matches(state, &line);
     let mut effective_line = build_effective_line(&line, state, ui);
+    state.diagnostics_context = None; // consumed after injection
     effective_line = apply_resume_context(effective_line, resume_guidance, plan_resume_digest);
     let turn_start = Instant::now();
 
@@ -475,6 +476,11 @@ pub(super) fn build_effective_line(
     if !state.active_system_skills.is_empty() {
         let skill_block = prompts::build_skill_instructions(&state.active_system_skills);
         effective_line = format!("{skill_block}\n\n{effective_line}");
+    }
+
+    // One-shot diagnostics context from /ask — prepended and consumed.
+    if let Some(ref diag) = state.diagnostics_context {
+        effective_line = format!("{diag}\n\n{effective_line}");
     }
 
     // Inject project instructions (.astra/instructions.md) if loaded
@@ -1049,6 +1055,7 @@ async fn run_chat_turn(
             runtime_continuity: state.runtime_continuity.as_ref(),
             turn_index: state.turn,
             evolution_service: state.evolution_service.clone(),
+            pipeline_state: None,
             pre_loaded_messages: None,
                     append_system_prompt: None,
             #[cfg(feature = "harness")]
@@ -3076,6 +3083,7 @@ fn build_manual_heavy_step_checkpoint(
         approval_overrides: None,
         consecutive_context_window_errors: 0,
         compaction_state: None,
+        pipeline_state: None,
         continuity_state: None,
     };
     StepCheckpoint::Heavy(Box::new(heavy))

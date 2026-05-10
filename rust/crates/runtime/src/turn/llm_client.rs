@@ -113,6 +113,19 @@ pub(crate) fn provider_uses_bedrock_converse(provider: &str) -> bool {
     llm_provider_protocol(provider) == LlmProviderProtocol::BedrockConverse
 }
 
+/// Single source of truth: does this provider use explicit cache_control
+/// markers (Anthropic/Bedrock) vs prefix-only caching (everyone else)?
+///
+/// Use this everywhere instead of ad-hoc `provider == "anthropic"` checks.
+/// Adding a new Anthropic-family provider here automatically propagates to
+/// all cache-splitting, annotation, and volatile-routing decisions.
+pub(crate) fn provider_uses_explicit_cache_control(provider: &str) -> bool {
+    matches!(
+        llm_provider_protocol(provider),
+        LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::BedrockConverse
+    )
+}
+
 /// Returns true only when the *provider* is known to be DashScope / Aliyun / Alibaba.
 ///
 /// We intentionally do NOT match on model name here: Qwen models are also served
@@ -810,7 +823,7 @@ fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -
         "assistant" => {
             let mut blocks = Vec::new();
             // Bedrock requires reasoningContent FIRST when thinking is enabled.
-            if include_reasoning_content
+            let has_reasoning = if include_reasoning_content
                 && let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str)
             {
                 if !rc.is_empty() {
@@ -821,12 +834,23 @@ fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -
                         }
                     }
                     blocks.push(json!({"reasoningContent": {"reasoningText": reasoning_text}}));
+                    true
+                } else {
+                    false
                 }
-            }
+            } else {
+                false
+            };
             blocks.extend(build_bedrock_text_content_blocks(msg.get("content")));
             blocks.extend(build_bedrock_tool_blocks(
                 msg.get("tool_calls").and_then(Value::as_array),
             ));
+            // Bedrock rejects assistant messages where the final block is thinking/reasoning.
+            // If reasoning was emitted but no text or tool_use followed, append a minimal
+            // text block to satisfy the constraint.
+            if has_reasoning && blocks.len() == 1 {
+                blocks.push(json!({ "text": "" }));
+            }
             blocks
         }
         _ => build_bedrock_text_content_blocks(msg.get("content")),
@@ -1283,7 +1307,35 @@ pub(crate) fn build_provider_request_body(
                 body["stream_options"] = json!({"include_usage": true});
             }
             if let Some(max_out) = max_output_tokens {
-                body["max_completion_tokens"] = json!(max_out);
+                // When thinking is active, providers like DeepSeek allocate a
+                // thinking_budget that must be LESS than max_completion_tokens.
+                // If max_out is too small, the request will 400. Bump to at
+                // least thinking_budget + a headroom for the visible answer.
+                //
+                // We honor the user's configured ceiling when it already exceeds
+                // the required floor (respects deliberate budget caps) and only
+                // bump when the configured value is demonstrably too low.
+                let effective_max = if !thinking.is_off() {
+                    let required_floor: usize = match thinking {
+                        ThinkingConfig::Enabled { budget_tokens } => {
+                            (*budget_tokens as usize).saturating_add(8192)
+                        }
+                        _ => 65536,
+                    };
+                    if max_out < required_floor {
+                        tracing::debug!(
+                            user_max = max_out,
+                            bumped_to = required_floor,
+                            "max_completion_tokens bumped to fit thinking budget"
+                        );
+                        required_floor
+                    } else {
+                        max_out
+                    }
+                } else {
+                    max_out
+                };
+                body["max_completion_tokens"] = json!(effective_max);
             }
             if let Some(temp) = temperature {
                 body["temperature"] = json!(temp);
@@ -1516,9 +1568,6 @@ fn carry_cache_annotations(src: &Value, dst: &mut Value) {
     if let Some(cc) = src.get("cache_control") {
         dst["cache_control"] = cc.clone();
     }
-    if let Some(cr) = src.get("cache_reference") {
-        dst["cache_reference"] = cr.clone();
-    }
 }
 
 fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
@@ -1547,17 +1596,23 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
         }
         "assistant" => {
             let mut blocks = Vec::new();
-            if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
-                if !rc.is_empty() {
-                    let mut thinking = json!({"type": "thinking", "thinking": rc});
-                    if let Some(sig) = msg.get("reasoning_signature").and_then(Value::as_str) {
-                        if !sig.is_empty() {
-                            thinking["signature"] = Value::String(sig.to_string());
+            let has_thinking =
+                if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
+                    if !rc.is_empty() {
+                        let mut thinking = json!({"type": "thinking", "thinking": rc});
+                        if let Some(sig) = msg.get("reasoning_signature").and_then(Value::as_str) {
+                            if !sig.is_empty() {
+                                thinking["signature"] = Value::String(sig.to_string());
+                            }
                         }
+                        blocks.push(thinking);
+                        true
+                    } else {
+                        false
                     }
-                    blocks.push(thinking);
-                }
-            }
+                } else {
+                    false
+                };
             blocks.extend(anthropic_text_blocks_from_content(msg.get("content")));
             if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
                 blocks.extend(
@@ -1566,12 +1621,55 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
                         .filter_map(openai_tool_call_to_anthropic_block),
                 );
             }
+            // Anthropic/Bedrock reject assistant messages where the final block is `thinking`.
+            // If thinking was emitted but no text or tool_use followed, append a minimal
+            // text block to satisfy the constraint.
+            if has_thinking && blocks.len() == 1 {
+                blocks.push(json!({"type": "text", "text": ""}));
+            }
             let mut out = json!({"role": "assistant", "content": blocks});
             carry_cache_annotations(msg, &mut out);
             Some(out)
         }
         "tool" => {
             let tool_use_id = msg.get("tool_call_id").and_then(Value::as_str)?;
+            // The message's `content` may already be a pre-annotated
+            // `[{type: "tool_result", ...}]` block array — this happens
+            // when `annotate_last_message_cache_breakpoint` landed on
+            // this tool message and upgraded its string content to the
+            // content-block shape. In that case we must forward the
+            // already-built tool_result verbatim (so cache_control /
+            // tool_use_id placed by the annotator survives), otherwise
+            // we'd nest `tool_result` inside another `tool_result.content`
+            // — which DeepSeek's anthropic endpoint rejects with
+            // "messages[N]: unknown variant `tool_result`".
+            if let Some(arr) = msg.get("content").and_then(Value::as_array)
+                && arr
+                    .iter()
+                    .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            {
+                let mut blocks = arr.clone();
+                // Defensively stamp `tool_use_id` on any tool_result blocks
+                // that lack them (the annotator always supplies tool_use_id
+                // but we re-check here for robustness).
+                for block in blocks.iter_mut() {
+                    if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                        continue;
+                    }
+                    let Some(obj) = block.as_object_mut() else {
+                        continue;
+                    };
+                    if !obj.contains_key("tool_use_id") {
+                        obj.insert("tool_use_id".into(), Value::String(tool_use_id.to_string()));
+                    }
+                }
+                let mut out = json!({
+                    "role": "user",
+                    "content": blocks,
+                });
+                carry_cache_annotations(msg, &mut out);
+                return Some(out);
+            }
             let content = msg
                 .get("content")
                 .and_then(Value::as_str)
@@ -1581,14 +1679,11 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
                         .cloned()
                         .unwrap_or(Value::String(String::new()))
                 });
-            let mut tool_result_block = json!({
+            let tool_result_block = json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
                 "content": content,
             });
-            if let Some(cr) = msg.get("cache_reference") {
-                tool_result_block["cache_reference"] = cr.clone();
-            }
             let mut out = json!({
                 "role": "user",
                 "content": [tool_result_block]
@@ -1642,11 +1737,6 @@ fn merge_consecutive_anthropic_messages(messages: Vec<Value>) -> Vec<Value> {
             {
                 last["cache_control"] = cache_control.clone();
             }
-            if last.get("cache_reference").is_none()
-                && let Some(cache_reference) = msg.get("cache_reference")
-            {
-                last["cache_reference"] = cache_reference.clone();
-            }
             continue;
         }
         merged.push(msg);
@@ -1667,7 +1757,7 @@ fn anthropic_content_blocks_from_openai_user(msg: &Value) -> Vec<Value> {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        matches!(ty, "tool_result" | "cache_edits" | "image" | "document")
+        matches!(ty, "tool_result" | "image" | "document")
     });
     if !has_anthropic_types {
         return Vec::new();
@@ -1858,6 +1948,7 @@ pub(crate) async fn call_llm_and_collect(
     messages: &[Value],
     tools: &[Value],
     model_name: &str,
+    wire_model_name: Option<&str>,
     api_key: &str,
     base_url: &str,
     provider: &str,
@@ -1870,6 +1961,7 @@ pub(crate) async fn call_llm_and_collect(
         messages,
         tools,
         model_name,
+        wire_model_name,
         api_key,
         base_url,
         provider,
@@ -1889,6 +1981,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
     messages: &[Value],
     tools: &[Value],
     model_name: &str,
+    wire_model_name: Option<&str>,
     api_key: &str,
     base_url: &str,
     provider: &str,
@@ -1904,6 +1997,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
         messages,
         tools,
         model_name,
+        wire_model_name,
         api_key,
         base_url,
         provider,
@@ -1924,6 +2018,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
     messages: &[Value],
     tools: &[Value],
     model_name: &str,
+    wire_model_name: Option<&str>,
     api_key: &str,
     base_url: &str,
     provider: &str,
@@ -1937,7 +2032,10 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
     mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let cooldown = rate_limit_cooldown();
+    // `model_key` indexes rate-limit state on the local row name.
     let model_key = model_name;
+    // `upstream_name` is what goes in the outbound request body + URL.
+    let upstream_name = wire_model_name.unwrap_or(model_name);
 
     let started = Instant::now();
     let total_budget = llm_total_budget();
@@ -1954,7 +2052,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
     let body = build_provider_request_body(
         &messages,
         tools,
-        model_name,
+        upstream_name,
         provider,
         max_output_tokens,
         None,
@@ -1966,7 +2064,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
         base_url,
         completions_url_override,
         provider,
-        model_name,
+        upstream_name,
         true,
     );
 
@@ -2704,6 +2802,14 @@ async fn collect_anthropic_llm_stream(
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
+    // Anthropic emits the HMAC signature for each `thinking` content block
+    // via a dedicated `signature_delta`. The next round MUST echo it
+    // verbatim on the assistant message, or the API returns HTTP 400
+    // `content[].thinking in the thinking mode must be passed back`
+    // (see session effccfcd-28d8-41f4-a4b0-ecd0ec503625 for the original
+    // failure mode; bridge_llm_stream was patched earlier, this path
+    // was the latent one).
+    let mut reasoning_signature = String::new();
     let mut tool_calls_map: HashMap<usize, Map<String, Value>> = HashMap::new();
     let mut usage_tokens = crate::turn::token_usage::TokenUsage::default();
     let mut finish_reason: Option<String> = None;
@@ -2711,6 +2817,7 @@ async fn collect_anthropic_llm_stream(
     let mut made_progress = false;
     let partial_result = |full_text: &String,
                           reasoning: &String,
+                          reasoning_signature: &String,
                           tool_calls_map: &HashMap<usize, Map<String, Value>>,
                           usage_tokens: &crate::turn::token_usage::TokenUsage,
                           finish_reason: &Option<String>| {
@@ -2723,7 +2830,7 @@ async fn collect_anthropic_llm_stream(
         LlmCallResult {
             full_text: full_text.clone(),
             reasoning: reasoning.clone(),
-            reasoning_signature: String::new(),
+            reasoning_signature: reasoning_signature.clone(),
             tool_calls,
             usage: usage_tokens.to_json_map(),
             model_used: model_name.to_string(),
@@ -2742,6 +2849,7 @@ async fn collect_anthropic_llm_stream(
                 partial: partial_result(
                     &full_text,
                     &reasoning,
+                    &reasoning_signature,
                     &tool_calls_map,
                     &usage_tokens,
                     &finish_reason,
@@ -2756,6 +2864,7 @@ async fn collect_anthropic_llm_stream(
                         partial: partial_result(
                             &full_text,
                             &reasoning,
+                            &reasoning_signature,
                             &tool_calls_map,
                             &usage_tokens,
                             &finish_reason,
@@ -2773,6 +2882,7 @@ async fn collect_anthropic_llm_stream(
                     partial: partial_result(
                         &full_text,
                         &reasoning,
+                        &reasoning_signature,
                         &tool_calls_map,
                         &usage_tokens,
                         &finish_reason,
@@ -2848,6 +2958,7 @@ async fn collect_anthropic_llm_stream(
                                     partial: partial_result(
                                         &full_text,
                                         &reasoning,
+                                        &reasoning_signature,
                                         &tool_calls_map,
                                         &usage_tokens,
                                         &finish_reason,
@@ -2872,6 +2983,7 @@ async fn collect_anthropic_llm_stream(
                                     partial: partial_result(
                                         &full_text,
                                         &reasoning,
+                                        &reasoning_signature,
                                         &tool_calls_map,
                                         &usage_tokens,
                                         &finish_reason,
@@ -2882,6 +2994,23 @@ async fn collect_anthropic_llm_stream(
                             if let Some(callback) = stream_callback.as_deref_mut() {
                                 callback(LlmStreamUpdate::ReasoningDelta(text.to_string()));
                             }
+                            made_progress = true;
+                        }
+                    }
+                    Some("signature_delta") => {
+                        // Anthropic closes a `thinking` content block with
+                        // an HMAC signature. The next turn MUST echo this
+                        // on the assistant message or the API returns
+                        // HTTP 400 `content[].thinking in the thinking
+                        // mode must be passed back`. See session
+                        // effccfcd-28d8-41f4-a4b0-ecd0ec503625 for the
+                        // original symptom on the bridge path; this
+                        // branch plugs the same hole on the server_loop
+                        // path.
+                        if let Some(sig) = delta.get("signature").and_then(Value::as_str)
+                            && !sig.is_empty()
+                        {
+                            reasoning_signature.push_str(sig);
                             made_progress = true;
                         }
                     }
@@ -2901,6 +3030,7 @@ async fn collect_anthropic_llm_stream(
                                 partial: partial_result(
                                     &full_text,
                                     &reasoning,
+                                    &reasoning_signature,
                                     &tool_calls_map,
                                     &usage_tokens,
                                     &finish_reason,
@@ -2956,6 +3086,7 @@ async fn collect_anthropic_llm_stream(
                     partial: partial_result(
                         &full_text,
                         &reasoning,
+                        &reasoning_signature,
                         &tool_calls_map,
                         &usage_tokens,
                         &finish_reason,
@@ -2975,7 +3106,7 @@ async fn collect_anthropic_llm_stream(
     Ok(LlmCallResult {
         full_text,
         reasoning,
-        reasoning_signature: String::new(),
+        reasoning_signature,
         tool_calls,
         usage: usage_tokens.to_json_map(),
         model_used: model_name.to_string(),
@@ -3319,6 +3450,12 @@ fn parse_anthropic_nonstream_response(
 ) -> LlmCallResult {
     let mut full_text = String::new();
     let mut reasoning = String::new();
+    // See `collect_anthropic_llm_stream` for the signature-echo contract.
+    // Non-stream fallback (triggered on stream idle timeout) is on the
+    // same hook — dropping the signature here would re-open the
+    // effccfcd-28d8-41f4-a4b0-ecd0ec503625 failure on the one retry path
+    // the streaming fix doesn't cover.
+    let mut reasoning_signature = String::new();
     let mut tool_calls = Vec::new();
     if let Some(content) = v.get("content").and_then(Value::as_array) {
         for block in content {
@@ -3331,6 +3468,11 @@ fn parse_anthropic_nonstream_response(
                 Some("thinking") => {
                     if let Some(text) = block.get("thinking").and_then(Value::as_str) {
                         reasoning.push_str(text);
+                    }
+                    if let Some(sig) = block.get("signature").and_then(Value::as_str)
+                        && !sig.is_empty()
+                    {
+                        reasoning_signature.push_str(sig);
                     }
                 }
                 Some("tool_use") => {
@@ -3368,7 +3510,7 @@ fn parse_anthropic_nonstream_response(
     LlmCallResult {
         full_text,
         reasoning,
-        reasoning_signature: String::new(),
+        reasoning_signature,
         tool_calls,
         usage,
         model_used: model_name.to_string(),
@@ -3718,6 +3860,7 @@ mod tests {
             &[json!({"role":"user","content":"hi"})],
             &[],
             "gpt-5-mini",
+            None,
             "",
             "https://api.openai.com/v1",
             "openai",
@@ -3780,6 +3923,7 @@ mod tests {
             &messages,
             &[],
             "gpt-5-mini",
+            None,
             "k",
             &base,
             "openai",
@@ -4850,6 +4994,79 @@ mod tests {
         assert_eq!(r.full_text, "answer");
     }
 
+    /// Regression: session ff1cbaca audit uncovered that
+    /// `collect_anthropic_llm_stream` was returning
+    /// `reasoning_signature: String::new()` unconditionally because the
+    /// parser had no `signature_delta` branch. Any thinking-model
+    /// request routed through `call_llm_and_collect` (server_loop_host
+    /// / conflict_resolver) would lose the HMAC signature and fail the
+    /// next round with HTTP 400
+    /// `content[].thinking in the thinking mode must be passed back to
+    /// the API` — the same failure mode as effccfcd-28d8-41f4-a4b0-ecd0ec503625.
+    #[tokio::test]
+    async fn collect_anthropic_stream_captures_signature_delta() {
+        let events = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"deep thought"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_abc123"}}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}),
+            json!({"type":"message_stop"}),
+        ];
+        let body = anthropic_sse(&events);
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let r = collect_anthropic_llm_stream(
+            stream,
+            "claude-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("stream should succeed");
+        assert_eq!(r.reasoning, "deep thought");
+        assert_eq!(
+            r.reasoning_signature, "sig_abc123",
+            "signature_delta must flow into reasoning_signature — otherwise the \
+             next round hits HTTP 400 (effccfcd regression via server_loop_host)",
+        );
+    }
+
+    /// Signature concatenation across multiple `thinking` content blocks
+    /// (Anthropic emits one signature per thinking block, but signed
+    /// thinking CAN be interleaved with text). Accumulator must append,
+    /// not overwrite.
+    #[tokio::test]
+    async fn collect_anthropic_stream_accumulates_multiple_signatures() {
+        let events = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"t1"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig1"}}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"t2"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"sig2"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}),
+            json!({"type":"message_stop"}),
+        ];
+        let body = anthropic_sse(&events);
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let r = collect_anthropic_llm_stream(
+            stream,
+            "claude-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("stream should succeed");
+        assert_eq!(r.reasoning_signature, "sig1sig2");
+    }
+
     #[tokio::test]
     async fn collect_anthropic_stream_tool_use() {
         let events = vec![
@@ -4949,8 +5166,14 @@ mod tests {
         assert_eq!(converted["cache_control"]["type"], "ephemeral");
     }
 
+    /// Regression guard for session 5c5cbf78 (2026-05-08): real Anthropic
+    /// `/v1/messages` returns HTTP 400 when asked to decode a `cache_reference`
+    /// top-level key on a message or inside a `tool_result` block. The
+    /// speculative wire helper that emitted those fields has been removed;
+    /// this test pins that invariant at the converter layer so an upstream
+    /// regression can't reintroduce it silently.
     #[test]
-    fn anthropic_message_conversion_preserves_cache_reference_on_tool() {
+    fn anthropic_message_conversion_drops_speculative_cache_reference_on_tool() {
         let msg = json!({
             "role": "tool",
             "tool_call_id": "call_1",
@@ -4961,14 +5184,26 @@ mod tests {
         let converted = anthropic_message_from_openai(&msg).unwrap();
         assert_eq!(converted["role"], "user");
         assert_eq!(converted["cache_control"]["type"], "ephemeral");
-        assert_eq!(converted["cache_reference"], "call_1");
+        assert!(
+            converted.get("cache_reference").is_none(),
+            "cache_reference must be stripped (not a real Anthropic field): {converted}",
+        );
         let blocks = converted["content"].as_array().unwrap();
         assert_eq!(blocks[0]["type"], "tool_result");
-        assert_eq!(blocks[0]["cache_reference"], "call_1");
+        assert!(
+            blocks[0].get("cache_reference").is_none(),
+            "tool_result block must not carry cache_reference: {:?}",
+            blocks[0],
+        );
     }
 
+    /// Companion regression: a user message with a `cache_edits` content
+    /// block — the shape that actually hit HTTP 400 on 5c5cbf78 t6_r7 —
+    /// must no longer be treated as a pass-through Anthropic-native type.
+    /// `cache_edits` isn't in Anthropic's content-block grammar, so the
+    /// converter should fall back to the text-only path and strip it.
     #[test]
-    fn anthropic_message_conversion_user_with_cache_edits_block() {
+    fn anthropic_message_conversion_drops_cache_edits_content_block() {
         let msg = json!({
             "role": "user",
             "content": [
@@ -4978,10 +5213,73 @@ mod tests {
         });
         let converted = anthropic_message_from_openai(&msg).unwrap();
         let blocks = converted["content"].as_array().unwrap();
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0]["type"], "text");
-        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
-        assert_eq!(blocks[1]["type"], "cache_edits");
+        for (i, b) in blocks.iter().enumerate() {
+            let ty = b.get("type").and_then(Value::as_str).unwrap_or("");
+            assert_ne!(
+                ty, "cache_edits",
+                "block[{i}] must not be cache_edits (5c5cbf78 regression): {b}",
+            );
+        }
+    }
+
+    // ── pre-annotated tool_result content must not be double-wrapped ────
+    //
+    // After `annotate_last_message_cache_breakpoint` runs, a tool message
+    // like `{role: "tool", tool_call_id: "c1", content: "result"}` is
+    // upgraded in place to `{role: "tool", content: [{type: "tool_result",
+    // tool_use_id: "c1", content: "result", cache_control: {...}}]}`. The
+    // old tool branch of `anthropic_message_from_openai` then wrapped the
+    // already-structured array AGAIN inside a new tool_result block's
+    // `content` field, producing a nested `tool_result → tool_result`
+    // shape. Anthropic/DeepSeek both reject it with
+    // `messages[N].content[0]: unknown variant tool_result, expected one
+    // of text, image, ...`.
+    //
+    // This test locks down the post-fix contract: when the tool message
+    // already carries a tool_result block array, forward it verbatim
+    // under `role: "user"` — no re-wrapping.
+    #[test]
+    fn anthropic_tool_message_preannotated_content_is_forwarded_without_nesting() {
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_abc",
+            "cache_reference": "call_abc",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call_abc",
+                "content": "8a08c39 feat\n14410ad fix",
+                "cache_control": {"type": "ephemeral"},
+            }],
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        assert_eq!(converted["role"], "user");
+        let blocks = converted["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "exactly one content block, not nested");
+        let block = &blocks[0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["tool_use_id"], "call_abc");
+        // `content` must be the string (or original payload) from the
+        // annotator, NOT a nested array containing another tool_result.
+        assert_eq!(block["content"], "8a08c39 feat\n14410ad fix");
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn anthropic_tool_message_string_content_wraps_into_tool_result() {
+        // The other branch: pre-annotation tool message with raw string
+        // content → must still be wrapped in a fresh tool_result block.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_xyz",
+            "content": "hello",
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        assert_eq!(converted["role"], "user");
+        let blocks = converted["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "call_xyz");
+        assert_eq!(blocks[0]["content"], "hello");
     }
 
     #[test]
@@ -5067,6 +5365,100 @@ mod tests {
         );
     }
 
+    /// Session 5c5cbf78 (2026-05-08) regression: after seven tool-loop rounds,
+    /// enough `MICRO_COMPACT_STUB`-cleared tool results had accumulated that the
+    /// now-removed `insert_cache_edits_block` helper emitted a
+    /// `{type: "cache_edits", edits: [...]}` content block on the final user
+    /// message. Real Anthropic `/v1/messages` returns HTTP 400:
+    /// `unknown variant \`cache_edits\``. Also accumulated:
+    /// `cache_reference` top-level keys on tool messages.
+    ///
+    /// Both helpers are gone. This test feeds a representative multi-round
+    /// shape through the full wire builder and asserts neither field leaks.
+    /// A future reviewer reintroducing either field will fail this test.
+    #[test]
+    fn build_anthropic_wire_never_contains_cache_edits_or_cache_reference() {
+        // Shape: system + 3 turns with tool-loop activity, including a
+        // MICRO_COMPACT_STUB-cleared tool output (the pattern that used to
+        // trigger cache_edits emission). Even hand-seeded cache_reference
+        // keys in the input must be stripped by the converter.
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "stable prompt",
+                     "cache_control": {"type": "ephemeral"}}
+                ],
+            }),
+            json!({"role": "user", "content": "turn 1"}),
+            json!({"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+            ]}),
+            json!({
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": "full result 1",
+                "cache_reference": "c1",
+            }),
+            json!({"role": "user", "content": "turn 2"}),
+            json!({"role": "assistant", "tool_calls": [
+                {"id": "c2", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+            ]}),
+            json!({
+                "role": "tool",
+                "tool_call_id": "c2",
+                "content": crate::turn::cloud::analytics::MICRO_COMPACT_STUB,
+                "cache_reference": "c2",
+            }),
+            json!({"role": "user", "content": "turn 3 continue"}),
+        ];
+
+        let (system, msgs) = build_anthropic_system_and_messages(&messages);
+
+        // Real fields we still expect:
+        assert!(!system.is_empty(), "system blocks must be emitted");
+        assert!(!msgs.is_empty(), "messages must be emitted");
+
+        // Walk every emitted message + content block + nested block and assert
+        // no speculative cache field survived.
+        for (i, m) in msgs.iter().enumerate() {
+            assert!(
+                m.get("cache_reference").is_none(),
+                "wire msg[{i}] must not carry cache_reference (5c5cbf78 regression): {m}",
+            );
+            let Some(blocks) = m.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for (j, b) in blocks.iter().enumerate() {
+                let ty = b.get("type").and_then(Value::as_str).unwrap_or("");
+                assert_ne!(
+                    ty, "cache_edits",
+                    "wire msg[{i}].content[{j}] must not be cache_edits: {b}",
+                );
+                assert!(
+                    b.get("cache_reference").is_none(),
+                    "wire msg[{i}].content[{j}] must not carry cache_reference: {b}",
+                );
+                // tool_result's nested `content` field may itself be an array
+                // (multi-part tool output) — scan one level deeper.
+                if let Some(nested) = b.get("content").and_then(Value::as_array) {
+                    for (k, nb) in nested.iter().enumerate() {
+                        let nty = nb.get("type").and_then(Value::as_str).unwrap_or("");
+                        assert_ne!(
+                            nty, "cache_edits",
+                            "wire msg[{i}].content[{j}].content[{k}] must not be cache_edits: {nb}",
+                        );
+                        assert!(
+                            nb.get("cache_reference").is_none(),
+                            "wire msg[{i}].content[{j}].content[{k}] must not carry \
+                             cache_reference: {nb}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn build_anthropic_tools_preserves_native_schema() {
         let native = json!({
@@ -5095,6 +5487,7 @@ mod tests {
             &messages,
             &[],
             "m",
+            None,
             "k",
             &base,
             "openai",
@@ -5126,6 +5519,7 @@ mod tests {
                 &messages,
                 &[],
                 "m",
+                None,
                 "k",
                 &base_clone,
                 "openai",
@@ -5157,6 +5551,7 @@ mod tests {
             &messages,
             &[],
             "m",
+            None,
             "k",
             &base,
             "openai",
@@ -5185,6 +5580,7 @@ mod tests {
             &messages,
             &[],
             "m",
+            None,
             "k",
             &base,
             "openai",
@@ -5216,6 +5612,7 @@ mod tests {
                 &messages,
                 &[],
                 "m",
+                None,
                 "k",
                 &base_clone,
                 "openai",
@@ -5277,6 +5674,7 @@ mod tests {
             &messages,
             &[],
             "m",
+            None,
             "k",
             &base,
             "openai",
@@ -5295,6 +5693,7 @@ mod tests {
             &messages,
             &[],
             "m",
+            None,
             "k",
             &base,
             "openai",
@@ -5334,6 +5733,7 @@ mod tests {
             &messages,
             &[],
             "m",
+            None,
             "k",
             &base,
             "openai",
@@ -5390,6 +5790,7 @@ mod tests {
             &messages,
             &[],
             "m",
+            None,
             "k",
             &base,
             "openai",
@@ -5428,6 +5829,7 @@ mod tests {
             &messages,
             &[],
             "m",
+            None,
             "k",
             &base,
             "openai",
@@ -5465,6 +5867,7 @@ mod tests {
             &messages,
             &[],
             "m",
+            None,
             "k",
             &base,
             "openai",
@@ -5497,6 +5900,7 @@ mod tests {
             &messages,
             &[],
             "m",
+            None,
             "k",
             &base,
             "openai",
@@ -5534,6 +5938,7 @@ mod tests {
             &messages,
             &[],
             "m",
+            None,
             "k",
             &base,
             "openai",
@@ -5567,6 +5972,7 @@ mod tests {
             &messages,
             &[],
             "m",
+            None,
             "k",
             &base,
             "openai",
@@ -5599,6 +6005,7 @@ mod tests {
             &messages,
             &[],
             "m",
+            None,
             "k",
             &base,
             "openai",
@@ -7029,6 +7436,78 @@ mod tests {
         );
     }
 
+    /// Regression: assistant message with reasoning_content but no text/tool_calls
+    /// must NOT produce a message ending with a thinking block (Bedrock 400 error).
+    #[test]
+    fn bedrock_reasoning_only_assistant_gets_trailing_text_block() {
+        let messages = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "I need to think about this...",
+                "reasoning_signature": "sig_test"
+            }),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-opus-4-6-v1:0",
+            "bedrock",
+            Some(4096),
+            None,
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+        );
+        let bedrock_msgs = body["messages"].as_array().unwrap();
+        let assistant = &bedrock_msgs[1];
+        assert_eq!(assistant["role"], "assistant");
+        let content = assistant["content"].as_array().unwrap();
+        assert!(
+            content.len() >= 2,
+            "reasoning-only assistant must have at least 2 blocks, got {}",
+            content.len()
+        );
+        assert!(
+            content[0].get("reasoningContent").is_some(),
+            "first block should be reasoningContent"
+        );
+        // Final block must NOT be reasoningContent (Bedrock rejects this)
+        let last = content.last().unwrap();
+        assert!(
+            last.get("reasoningContent").is_none(),
+            "final block must not be reasoningContent, got: {last}"
+        );
+    }
+
+    /// Same regression for the Anthropic Messages path.
+    #[test]
+    fn anthropic_reasoning_only_assistant_gets_trailing_text_block() {
+        let msg = json!({
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "Let me think...",
+            "reasoning_signature": "sig_xyz"
+        });
+        let result = anthropic_message_from_openai(&msg).unwrap();
+        let blocks = result["content"].as_array().unwrap();
+        assert!(
+            blocks.len() >= 2,
+            "reasoning-only assistant must have at least 2 blocks, got {}",
+            blocks.len()
+        );
+        assert_eq!(blocks[0]["type"], "thinking");
+        // Final block must NOT be thinking
+        let last = blocks.last().unwrap();
+        assert_ne!(
+            last["type"], "thinking",
+            "final block must not be thinking, got: {last}"
+        );
+    }
+
     /// Helper for counter tests: build a body that would violate the
     /// signature contract, catching the debug_assert panic so the test can
     /// observe the counter's post-increment state.
@@ -7322,6 +7801,39 @@ mod tests {
         assert_eq!(
             r.usage.get("total_tokens").and_then(Value::as_u64),
             Some(25)
+        );
+    }
+
+    /// Companion to `collect_anthropic_stream_captures_signature_delta`.
+    /// When the stream idles and we fall back to the non-stream endpoint,
+    /// the body is shaped like `{content: [{type: "thinking", thinking: ...,
+    /// signature: ...}, {type: "tool_use", ...}]}`. Dropping the signature
+    /// here re-opens the effccfcd failure on the one retry path the
+    /// streaming fix doesn't cover.
+    #[test]
+    fn parse_anthropic_nonstream_response_extracts_thinking_signature() {
+        let v = json!({
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "let me check",
+                    "signature": "sig_nonstream_abc",
+                },
+                {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {"cmd": "ls"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let r = parse_nonstream_response_for_provider(
+            &v,
+            "anthropic",
+            "claude-sonnet-4",
+            Instant::now(),
+        );
+        assert_eq!(r.reasoning, "let me check");
+        assert_eq!(
+            r.reasoning_signature, "sig_nonstream_abc",
+            "signature on the thinking block must survive into LlmCallResult",
         );
     }
 
@@ -7832,5 +8344,74 @@ mod tests {
         );
         // "required" at top level must survive
         assert_eq!(schema["required"], json!(["max_turns"]));
+    }
+
+    // --- Regression: max_completion_tokens bump respects user's ceiling ---
+    #[test]
+    fn max_completion_tokens_honors_user_when_above_floor() {
+        use astra_turn_core::thinking_config::ThinkingConfig;
+        // User sets 128K, thinking budget is 32K → floor = 40K → must keep 128K.
+        let thinking = ThinkingConfig::Enabled {
+            budget_tokens: 32_000,
+        };
+        let body = build_provider_request_body(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "deepseek-chat",
+            "deepseek",
+            Some(128_000),
+            None,
+            false,
+            &thinking,
+        );
+        assert_eq!(
+            body["max_completion_tokens"].as_u64(),
+            Some(128_000),
+            "user ceiling above floor must not be bumped"
+        );
+    }
+
+    #[test]
+    fn max_completion_tokens_bumps_when_user_below_floor() {
+        use astra_turn_core::thinking_config::ThinkingConfig;
+        // User sets 8K, thinking budget is 32K → floor = 32K + 8K = 40K → bump to 40K.
+        let thinking = ThinkingConfig::Enabled {
+            budget_tokens: 32_000,
+        };
+        let body = build_provider_request_body(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "deepseek-chat",
+            "deepseek",
+            Some(8_000),
+            None,
+            false,
+            &thinking,
+        );
+        assert_eq!(
+            body["max_completion_tokens"].as_u64(),
+            Some(40_192),
+            "configured max below thinking_budget+headroom must be bumped to floor"
+        );
+    }
+
+    #[test]
+    fn max_completion_tokens_unchanged_when_thinking_off() {
+        use astra_turn_core::thinking_config::ThinkingConfig;
+        let body = build_provider_request_body(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "deepseek-chat",
+            "deepseek",
+            Some(4_096),
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        assert_eq!(
+            body["max_completion_tokens"].as_u64(),
+            Some(4_096),
+            "thinking=off must never bump user's max"
+        );
     }
 }

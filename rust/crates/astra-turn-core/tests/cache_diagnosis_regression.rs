@@ -1,0 +1,222 @@
+//! End-to-end regression: real captured session → all four rules fire.
+//!
+//! Session `d0640d3d-3be0-4ce1-a4b7-e52d49601da6` (2026-05-08) exposed
+//! every cache-regression `cache_diagnosis` was designed to catch:
+//!
+//! | round-range | pathology | rule                        |
+//! | ----------- | --------- | --------------------------- |
+//! | t3 r0       | tool[20] outside cache marker       | `tool_marker_not_on_tail` |
+//! | t6 r0–r13   | rolling cc frozen in 14-round loop  | `cc_marker_frozen`        |
+//!
+//! Note: **`cache_read_collapsed` does NOT fire on this fixture**, by
+//! design. The d0640d3d bedrock pathology is that `cache_read`
+//! *stayed pinned* at 11312 across 14 rounds while message_count grew
+//! — i.e., the prefix never advanced, not that a prefix was broken and
+//! invalidated. `cache_read_collapsed` catches the *other* class of bug
+//! (prefix invalidation mid-turn, e.g. volatile content leaking into
+//! the cached block), and has its own unit test coverage in
+//! `cache_diagnosis::tests::cache_read_collapsed_*`.
+//!
+//! **`cache_creation_waste` also does NOT fire** — this was noise the
+//! rule used to emit before the threshold was tightened. Post-tighten
+//! (see `cache_creation_waste_silent_on_first_round_heavy_short_session`),
+//! t6's post-first ratio sits at 29.9%, just below the 0.3 threshold.
+//! That's the correct reading of d0640d3d: the real pathology was
+//! cc_marker_frozen (the cache wasn't churning — it wasn't *advancing*).
+//!
+//! The fixture is a scrubbed mirror of the production capture files —
+//! free-form text replaced with `<sha:len>` digests. Structural data
+//! (roles, cache_control markers, usage, tool counts) is preserved
+//! byte-for-byte, which is everything the rules actually read.
+//!
+//! If the rules change shape, this test has to change. The signal we
+//! want to preserve is: *this exact set of real-world pathologies keeps
+//! producing exactly this set of findings*, so a future refactor that
+//! accidentally silences any one of them trips this test immediately.
+
+use std::path::{Path, PathBuf};
+
+use astra_turn_core::introspect::cache_diagnosis::{
+    CacheFinding, RoundSnapshot, evaluate_all, snapshot_from_capture_json,
+};
+use serde_json::Value;
+
+fn fixture_dir(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join(name)
+}
+
+/// Load every `t{N}_r{M}.json` file in the fixture dir, sorted by
+/// (turn, round). Uses the production parser
+/// ([`snapshot_from_capture_json`]) so that fixture drift surfaces
+/// here (test) or in prod reads, never silently — they share one
+/// code path.
+fn load_fixture_rounds(name: &str) -> Vec<RoundSnapshot> {
+    let dir = fixture_dir(name);
+    let mut entries: Vec<(u32, u32, PathBuf)> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("fixture dir {dir:?} readable: {e}"))
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let path = e.path();
+            let stem = path.file_stem()?.to_str()?.to_string();
+            // Expect names like t3_r0, t6_r13 — strip prefix `t`, split on `_r`.
+            let rest = stem.strip_prefix('t')?;
+            let (t_s, r_s) = rest.split_once("_r")?;
+            let t: u32 = t_s.parse().ok()?;
+            let r: u32 = r_s.parse().ok()?;
+            Some((t, r, path))
+        })
+        .collect();
+    entries.sort_by_key(|(t, r, _)| (*t, *r));
+    entries
+        .into_iter()
+        .map(|(_, _, p)| {
+            let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
+            let v: Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {p:?}: {e}"));
+            snapshot_from_capture_json(&v)
+        })
+        .collect()
+}
+
+/// Sanity: fixture loaded at all.
+#[test]
+fn fixture_loads_19_captures() {
+    let rounds = load_fixture_rounds("cache_diagnosis_d0640d3d");
+    assert_eq!(
+        rounds.len(),
+        19,
+        "d0640d3d fixture must have 19 captures (t3 r0; t4 r0-r1; t5 r0-r1; t6 r0-r13); \
+         add/remove files? got {}",
+        rounds.len(),
+    );
+    // Spot-check the two key samples.
+    let t3 = rounds
+        .iter()
+        .find(|r| r.turn == 3 && r.round == 0)
+        .expect("t3_r0");
+    assert_eq!(t3.provider, "anthropic");
+    assert_eq!(t3.model, "deepseek-v4-pro-anthropic");
+    assert_eq!(t3.tool_count, 21);
+    assert_eq!(t3.tool_cc_index, Some(19), "t3 has cc on `skill` (idx 19)");
+
+    let t6_r0 = rounds
+        .iter()
+        .find(|r| r.turn == 6 && r.round == 0)
+        .expect("t6_r0");
+    assert_eq!(t6_r0.provider, "bedrock");
+    assert_eq!(t6_r0.cache_read_tokens, 11312);
+}
+
+/// **The regression net.**
+///
+/// Every pathology that hit us in this one live session must keep
+/// firing through the rules. If any of these asserts goes silent
+/// without an intentional rule change, a real bug is slipping through.
+#[test]
+fn d0640d3d_fixture_triggers_session_specific_rules() {
+    let rounds = load_fixture_rounds("cache_diagnosis_d0640d3d");
+    let findings: Vec<CacheFinding> = evaluate_all(&rounds);
+    let ids: Vec<&str> = findings.iter().map(|f| f.rule_id).collect();
+
+    // Two rules specifically exposed by this session's bug pattern.
+    // `cache_read_collapsed` and `cache_creation_waste` are intentionally
+    // silent — see the negative assertions below and the module docstring
+    // for rationale.
+    let expected = ["cc_marker_frozen", "tool_marker_not_on_tail"];
+    for rule in expected {
+        assert!(
+            ids.contains(&rule),
+            "expected rule {rule} to fire on d0640d3d fixture, got {ids:?}. \
+             Full findings:\n{findings:#?}",
+        );
+    }
+
+    // Negative assertions — these rules are deliberately silent on this
+    // fixture. If a future change makes them fire, the rule has become
+    // over-eager and needs retuning.
+    for silent in ["cache_read_collapsed", "cache_creation_waste"] {
+        assert!(
+            !ids.contains(&silent),
+            "{silent} must stay silent on d0640d3d: cache never collapsed \
+             and post-first-round ratio sits at 29.9% (below 0.3 threshold). \
+             Rule got over-eager? findings={findings:#?}",
+        );
+    }
+
+    // Spot-check key narratives so a renaming/refactor that changes the
+    // finding content surfaces loudly rather than silently.
+    let frozen = findings
+        .iter()
+        .find(|f| f.rule_id == "cc_marker_frozen")
+        .unwrap();
+    assert!(
+        frozen.triggered_on.len() >= 3,
+        "cc_marker_frozen should cite >=3 triggering rounds, got {} — \
+         narrative: {}",
+        frozen.triggered_on.len(),
+        frozen.narrative,
+    );
+    assert!(
+        frozen.triggered_on.iter().all(|(t, _)| *t == 6),
+        "cc_marker_frozen triggers live inside turn 6, got {:?}",
+        frozen.triggered_on,
+    );
+
+    let tool_tail = findings
+        .iter()
+        .find(|f| f.rule_id == "tool_marker_not_on_tail")
+        .unwrap();
+    assert!(
+        tool_tail.narrative.contains("index 19") && tool_tail.narrative.contains("of 21"),
+        "tool_marker_not_on_tail narrative should name the gap (19 of 21): got {}",
+        tool_tail.narrative,
+    );
+}
+
+/// Gold-standard negative fixture — session `462c485e` (2026-05-08) captured
+/// a clean 5-round Bedrock run where every cache invariant held:
+/// rolling breakpoint advanced round-to-round, tool_cc sat on the last
+/// tool, and cache_read was a flat 8426 tokens across all 5 rounds.
+///
+/// **No rule should fire on this fixture.** It's the negative counterpart
+/// to `d0640d3d_fixture_triggers_session_specific_rules` and
+/// `cache_diagnosis_986a553e`: if a future refactor makes any rule
+/// over-eager on an unambiguously healthy session, this test fails
+/// immediately instead of leaking into production as a false-positive
+/// alert.
+///
+/// See `fixtures/cache_diagnosis_462c485e_healthy/README.md` for the
+/// detailed round table.
+#[test]
+fn healthy_462c485e_fixture_produces_no_findings() {
+    let rounds = load_fixture_rounds("cache_diagnosis_462c485e_healthy");
+    assert_eq!(
+        rounds.len(),
+        5,
+        "462c485e fixture must have 5 captures (t1 r0-r4); got {}",
+        rounds.len(),
+    );
+    // Spot-check structural invariants the README promises so a future
+    // re-scrub that silently drops one of them fails here, not in the
+    // rule loop.
+    for r in &rounds {
+        assert_eq!(r.provider, "bedrock");
+        assert_eq!(r.model, "us.anthropic.claude-sonnet-4-6");
+        assert_eq!(r.cache_read_tokens, 8426);
+        assert_eq!(
+            r.tool_cc_index,
+            Some(20),
+            "tool_cc must sit on the last tool (index 20 of 21)",
+        );
+    }
+
+    let findings: Vec<CacheFinding> = evaluate_all(&rounds);
+    assert!(
+        findings.is_empty(),
+        "healthy 462c485e fixture must produce zero findings — a rule \
+         became over-eager. findings={findings:#?}",
+    );
+}

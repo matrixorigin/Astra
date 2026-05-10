@@ -29,12 +29,26 @@ pub fn render_digest(contents: &[String]) -> Option<String> {
         if cleaned.len() < MIN_CONTENT_LEN {
             continue;
         }
-        let key = cleaned.to_lowercase();
-        if !seen.insert(key) {
+        // Drop L1-protocol and session-replay fragments that Memoria
+        // sometimes surfaces from indexed session-memory docs. Mirrors the
+        // filter in `turn::memory_prefetch::is_memory_worthy` so the CLI-
+        // generated `## Memoria Recall` and the bridge-generated
+        // `## User Memories` both reject the same noise.
+        if !is_digest_worthy(&cleaned) {
             continue;
         }
         // Decode business type prefix for categorized display.
         let (cat, body) = astra_prompts::memory_types::decode(&cleaned);
+        // Dedup on the decoded body (category-agnostic, case-insensitive,
+        // trailing-punctuation-insensitive). Memoria often surfaces the
+        // same underlying memory twice — once via the full-message query,
+        // once via the entity-keyword query — sometimes with a different
+        // category prefix or punctuation drift. Hashing on `cleaned`
+        // alone (the previous behaviour) let those slip through.
+        let key = dedup_key(body);
+        if !seen.insert(key) {
+            continue;
+        }
         let label = match cat {
             Some(c) => format!(
                 "[{}] ",
@@ -61,6 +75,52 @@ pub fn render_digest(contents: &[String]) -> Option<String> {
     Some(out.trim_end().to_string())
 }
 
+/// Reject low-signal fragments before adding them to the Memoria Recall
+/// digest. Same intent as `turn::memory_prefetch::is_memory_worthy`; kept as a
+/// second copy because the two surfaces live in different crates and the
+/// filter is intentionally lenient (Recall has a hard `MAX_BULLETS=4` cap, so
+/// the cost of letting noise through is an entire useful bullet).
+fn is_digest_worthy(line: &str) -> bool {
+    // Structured tagged entries (`[@ns/type] body`) always pass — the
+    // namespace already asserts meaning.
+    if line.starts_with("[@") && line.contains('/') && line.contains(']') {
+        return true;
+    }
+    // L1 session-memory / attention protocol markers: these are replayed
+    // verbatim from `[session-memory:v1] # Session Title hi # Task …`
+    // indexed per-line and burn a whole bullet on scaffolding.
+    if line.starts_with("[session-memory:") || line.starts_with("[attention:") {
+        return false;
+    }
+    // Session-replay lines like `[session:abc] Recent conversation: …`
+    // carry inline transcript dumps that bloat the bullet and repeat the
+    // conversation history the model already has.
+    if line.starts_with("[session:") {
+        return false;
+    }
+    // Legacy pre-L2 auto-write shapes. L2 now rejects these at write,
+    // but entries that landed *before* the gate shipped still live in
+    // Memoria. Observed dominant pollution in session 72ef747f: 43 of
+    // 68 User Memories entries were `[compaction:<sid>] …` from before
+    // L2. Parity with `memory_prefetch::is_memory_worthy`.
+    if line.starts_with("[compaction:") || line.starts_with("[session-knowledge:") {
+        return false;
+    }
+    // Runtime scaffolding that leaked into conversation history and was
+    // then indexed by Memoria. Routed through the single source of truth
+    // in `astra_turn_types::SCAFFOLDING_BODY_PREFIXES` so new runtime
+    // injections added there are automatically filtered here without a
+    // per-site update. Pinned after observing the feedback loop in
+    // session 6676c7b5 where 78 runtime-correction echoes filled a
+    // 6,397c `## User Memories` block.
+    for prefix in astra_turn_types::SCAFFOLDING_BODY_PREFIXES {
+        if line.starts_with(prefix) {
+            return false;
+        }
+    }
+    true
+}
+
 fn compact_one_line(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_ws = false;
@@ -76,6 +136,21 @@ fn compact_one_line(s: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// Build the dedup key for a digest bullet.
+///
+/// Normalizes:
+/// - Unicode case (to_lowercase) so "RS256" == "rs256".
+/// - Trailing punctuation commonly drifted across imports (`.`, `!`, `?`,
+///   `;`, `:`, `,`).
+/// - Surrounding whitespace (the body has already been whitespace-
+///   collapsed by `compact_one_line`, but `decode` may leave a leading
+///   space after stripping the prefix).
+fn dedup_key(body: &str) -> String {
+    body.trim()
+        .trim_end_matches(['.', '!', '?', ';', ':', ','])
+        .to_lowercase()
 }
 
 fn truncate_with_ellipsis(s: &str, max: usize) -> String {
@@ -186,5 +261,182 @@ mod tests {
             "should not double the prefix"
         );
         assert!(out.contains("[project] merge freeze"));
+    }
+
+    // ── Semantic dedup: same body surfaced under different shapes should
+    //    collapse to a single bullet. Memoria's retrieval can return the
+    //    same underlying memory twice when hybrid queries (full message +
+    //    entity keywords) both hit it with different stored category
+    //    prefixes or punctuation.
+
+    #[test]
+    fn dedup_same_body_different_category_prefix() {
+        // Same body body stored once as `[feedback]`, once as `[user]`.
+        let hits = vec![
+            "[feedback] OceanBase is a distributed HTAP database".to_string(),
+            "[user] OceanBase is a distributed HTAP database".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        let bullet_count = out.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(
+            bullet_count, 1,
+            "expected same body under different prefixes to dedupe, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dedup_same_body_prefixed_vs_legacy() {
+        // Same body once with a typed prefix, once unprefixed (legacy import).
+        let hits = vec![
+            "[lesson] Always run `cargo test` before commit".to_string(),
+            "Always run `cargo test` before commit".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        let bullet_count = out.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(
+            bullet_count, 1,
+            "expected prefixed vs legacy with same body to dedupe, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dedup_same_body_trailing_punctuation() {
+        // Same body with and without trailing period.
+        let hits = vec![
+            "OceanBase is a distributed HTAP database.".to_string(),
+            "OceanBase is a distributed HTAP database".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        let bullet_count = out.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(
+            bullet_count, 1,
+            "expected trailing-punctuation variants to dedupe, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dedup_case_insensitive_after_prefix_strip() {
+        // Same body with case drift — already handled pre-fix because of
+        // to_lowercase(), but pin the behaviour so a future refactor
+        // doesn't regress it.
+        let hits = vec![
+            "[feedback] Use RS256 for JWT".to_string(),
+            "[feedback] use rs256 for jwt".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        let bullet_count = out.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(
+            bullet_count, 1,
+            "case drift should still dedupe, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dedup_preserves_first_seen_prefix() {
+        // When two variants collapse, keep the first (higher-ranked) one.
+        let hits = vec![
+            "[feedback] OceanBase is a distributed HTAP database".to_string(),
+            "[user] OceanBase is a distributed HTAP database".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        assert!(
+            out.contains("[feedback]"),
+            "first-seen category label should win, got:\n{out}"
+        );
+        assert!(
+            !out.contains("[user]"),
+            "losing category label should not appear, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn distinct_bodies_not_collapsed() {
+        // Guardrail against over-collapsing: different content should stay
+        // separate even if they share a prefix.
+        let hits = vec![
+            "[feedback] Use RS256 for JWT".to_string(),
+            "[feedback] Use HS512 for JWT".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        let bullet_count = out.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(
+            bullet_count, 2,
+            "distinct bodies must not collapse, got:\n{out}"
+        );
+    }
+
+    // ── Noise rejection: L1 protocol markers and session-replay fragments
+    //    burn a whole bullet (MAX_BULLETS=4) on scaffolding. Pinned after
+    //    session `69657ca7` showed `[session-memory:v1] # Session Title hi`
+    //    and `[session:…] Recent conversation: Assistant: Step 15 done…`
+    //    eating 2 of 4 bullets with no useful signal.
+
+    #[test]
+    fn rejects_session_memory_v1_marker() {
+        let hits = vec![
+            "[session-memory:v1] # Session Title hi # Task Specification hi".to_string(),
+            "User prefers Rust for CLI work.".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        assert!(
+            !out.contains("session-memory:v1"),
+            "L1 session-memory marker must be filtered, got:\n{out}"
+        );
+        assert!(out.contains("User prefers Rust"));
+    }
+
+    #[test]
+    fn rejects_attention_v1_marker() {
+        let hits = vec![
+            "[attention:v1] turn budget 2k".to_string(),
+            "Real insight worth surfacing here.".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        assert!(!out.contains("attention:v1"), "got:\n{out}");
+    }
+
+    #[test]
+    fn rejects_session_replay_lines() {
+        let hits = vec![
+            "[session:abc123] Recent conversation: Assistant: Step 15 done.".to_string(),
+            "Real fact that should survive.".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        assert!(
+            !out.contains("[session:"),
+            "session-replay line must be filtered, got:\n{out}"
+        );
+        assert!(out.contains("Real fact"));
+    }
+
+    #[test]
+    fn keeps_structured_tagged_entries() {
+        // `[@ns/type] body` is semantically distinct from `[session:…]`
+        // and must always pass — it's the canonical shape for typed
+        // context-source memories.
+        let hits = vec!["[@swap/archived] Turns 1-1 swapped out: hi → response".to_string()];
+        let out = render_digest(&hits).expect("digest");
+        assert!(
+            out.contains("[@swap/archived]"),
+            "structured-tagged entries must pass filter, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn rejects_pre_l2_compaction_and_session_knowledge() {
+        // Pre-L2 auto-writers emitted `[compaction:<sid>] <summary>`
+        // and `[session-knowledge:<sid>] ## …`. L2 now refuses those
+        // at write, but pre-existing entries linger in Memoria until
+        // their confidence decays. Filter them here for parity with
+        // `memory_prefetch::is_memory_worthy`.
+        let hits = vec![
+            "[compaction:055932d7-22bd] ### Primary Request: review PR 42".to_string(),
+            "[session-knowledge:abc] ## User Corrections - Use RS256".to_string(),
+            "Real curated fact that survives the filter.".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        assert!(!out.contains("[compaction:"), "leaked: {out}");
+        assert!(!out.contains("[session-knowledge:"), "leaked: {out}");
+        assert!(out.contains("Real curated fact"));
     }
 }

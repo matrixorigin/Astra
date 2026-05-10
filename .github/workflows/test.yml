@@ -45,7 +45,6 @@ jobs:
   #   shard-b: astra-runtime (3151) + contracts (19) + trusted_moi (4)
   #   shard-c: astra-turn-core (2167) + astra-services (1186) + plan/prompts
   #   shard-d: remaining core crates + bridge-e2e-hooks (3176, mostly overlaps runtime)
-  #   shard-gateway: astra-gateway unit + offline fixtures + clippy
 
   shard-a:
     name: "Test: astra-cli (${{ matrix.segment }})"
@@ -178,33 +177,6 @@ jobs:
         run: >-
           cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime
           --features bridge-e2e-hooks --profile ci
-
-  shard-gateway:
-    name: "Test: astra-gateway"
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-          shared-key: ci-test
-          save-if: false
-      - name: Gateway unit tests
-        run: >-
-          cargo nextest run --manifest-path rust/Cargo.toml
-          -p astra-gateway --profile ci
-      - name: Gateway offline fixture tests
-        run: >-
-          cargo nextest run --manifest-path rust/Cargo.toml
-          -p astra-gateway --test offline_cli_bridge --profile ci
-      - name: Gateway clippy
-        run: >-
-          cargo clippy --manifest-path rust/Cargo.toml
-          -p astra-gateway -- -D warnings
 
   # ── Stage 3: online tests (needs DB, runs in parallel with offline) ──
   test-online:

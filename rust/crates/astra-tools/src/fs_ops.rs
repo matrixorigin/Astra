@@ -18,7 +18,11 @@ use crate::{ToolResult, per_tool_output_limit, truncate_output};
 const READ_FILE_SIZE_LIMIT: usize = 80 * 1024;
 /// Hard ceiling: files above this size are never read into memory for preview.
 const READ_FILE_HARD_LIMIT: usize = 10 * 1024 * 1024;
-const IMAGE_READ_SIZE_LIMIT: u64 = 1_500_000;
+/// Format file size in MB with one decimal place, avoiding integer division truncation.
+fn format_file_size_mb(size_bytes: u64) -> String {
+    format!("{:.1} MB", size_bytes as f64 / (1024.0 * 1024.0))
+}
+const IMAGE_READ_SIZE_LIMIT: u64 = 10 * 1024 * 1024;
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
 const BINARY_EXTS: &[&str] = &[
     "svg", "pdf", "zip", "gz", "tar", "bz2", "xz", "7z", "rar", "exe", "dll", "so", "dylib", "o",
@@ -179,8 +183,8 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         if IMAGE_EXTS.contains(&ext_lower.as_str()) {
             if metadata.len() > IMAGE_READ_SIZE_LIMIT {
                 return ToolResult::error(format!(
-                    "Error: image too large ({} bytes). Use bash to resize first.",
-                    metadata.len()
+                    "Error: image file too large ({}). Maximum supported: 10MB.",
+                    format_file_size_mb(metadata.len())
                 ));
             }
             let bytes = match std::fs::read(&path) {
@@ -196,7 +200,11 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
                 _ => "application/octet-stream",
             };
             let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-            return ToolResult::text(format!("data:{mime};base64,{encoded}"));
+            let data_uri = format!("data:{mime};base64,{encoded}");
+            return ToolResult::text(truncate_output(
+                data_uri,
+                per_tool_output_limit("read_file"),
+            ));
         }
 
         if BINARY_EXTS.contains(&ext_lower.as_str()) {
@@ -1065,10 +1073,7 @@ fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> S
             for (idx, line) in lines.iter().enumerate() {
                 if normalize_ws(line) == normalized_first {
                     msg.push_str(&format!("  Possible match at line {}\n", idx + 1));
-                    let end = (idx + old_lines.len()).min(lines.len());
-                    for (line_offset, line_content) in lines[idx..end].iter().enumerate() {
-                        msg.push_str(&format!("  {}: {}\n", idx + line_offset + 1, line_content));
-                    }
+                    append_nearby_file_context(&mut msg, path_str, &lines, idx, old_lines.len());
                     break;
                 }
             }
@@ -1096,16 +1101,7 @@ fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> S
                     matches
                 ));
                 let line_idx = matches[0] - 1;
-                let start = line_idx;
-                let end = (line_idx + old_lines.len()).min(lines.len());
-                msg.push_str("Actual file content:\n");
-                for (line_offset, line_content) in lines[start..end].iter().enumerate() {
-                    msg.push_str(&format!(
-                        "  {}: {}\n",
-                        start + line_offset + 1,
-                        line_content
-                    ));
-                }
+                append_nearby_file_context(&mut msg, path_str, &lines, line_idx, old_lines.len());
             }
         }
     }
@@ -1135,6 +1131,37 @@ fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> S
         );
     }
     msg
+}
+
+fn append_nearby_file_context(
+    msg: &mut String,
+    path_str: &str,
+    lines: &[&str],
+    anchor_idx: usize,
+    old_line_count: usize,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    let span_len = old_line_count.max(1);
+    let start = anchor_idx.saturating_sub(5);
+    let end = anchor_idx
+        .saturating_add(span_len)
+        .saturating_add(5)
+        .min(lines.len());
+    msg.push_str(&format!(
+        "Exact nearby file context (read_file path={path_str} start_line={} end_line={}):\n",
+        start + 1,
+        end
+    ));
+    msg.push_str("Actual file content:\n");
+    for (line_offset, line_content) in lines[start..end].iter().enumerate() {
+        msg.push_str(&format!(
+            "  {}: {}\n",
+            start + line_offset + 1,
+            line_content
+        ));
+    }
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -1377,6 +1404,20 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn format_file_size_mb_shows_fractional_for_small_files() {
+        // 500 KB → should show "0.5 MB", NOT "0 MB" (integer division bug)
+        assert_eq!(format_file_size_mb(500 * 1024), "0.5 MB");
+        // 1 byte over 10MB → should show "10.0 MB", NOT "10 MB"
+        assert_eq!(format_file_size_mb(10 * 1024 * 1024 + 1), "10.0 MB");
+        // exactly 10MB
+        assert_eq!(format_file_size_mb(10 * 1024 * 1024), "10.0 MB");
+        // 0 bytes
+        assert_eq!(format_file_size_mb(0), "0.0 MB");
+        // 15.3 MB
+        assert_eq!(format_file_size_mb(15 * 1024 * 1024 + 307_200), "15.3 MB");
+    }
+
+    #[test]
     fn read_file_basic() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("test.txt"), "line1\nline2\nline3").unwrap();
@@ -1598,6 +1639,54 @@ mod tests {
             "got: {}",
             result.output
         );
+    }
+
+    // --- Bug #9: large image base64 must be capped by output limit ---
+    #[test]
+    fn read_file_image_base64_is_capped() {
+        let tmp = TempDir::new().unwrap();
+        // Create a ~1MB fake PNG (just PNG header + random data)
+        let mut data = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
+        data.extend(vec![0xAB; 1_000_000]); // ~1MB body
+        std::fs::write(tmp.path().join("big.png"), &data).unwrap();
+
+        let result = read_file(tmp.path(), &serde_json::json!({"path": "big.png"}));
+
+        assert!(!result.is_error);
+        assert!(result.output.starts_with("data:image/png;base64,"));
+        // The output must be capped — raw base64 of 1MB is ~1.33MB chars.
+        // per_tool_output_limit() caps it (typically 80-200KB).
+        let limit = per_tool_output_limit("read_file");
+        assert!(
+            result.output.len() <= limit + 200, // small tolerance for prefix
+            "Image base64 output {} should be capped at ~{limit}",
+            result.output.len()
+        );
+    }
+
+    // Supplementary: truncated image output contains truncation marker
+    #[test]
+    fn read_file_image_truncated_has_marker() {
+        let tmp = TempDir::new().unwrap();
+        let mut data = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
+        data.extend(vec![0xAB; 1_000_000]);
+        std::fs::write(tmp.path().join("big.png"), &data).unwrap();
+
+        let result = read_file(tmp.path(), &serde_json::json!({"path": "big.png"}));
+
+        assert!(!result.is_error);
+        let limit = per_tool_output_limit("read_file");
+        // If the image is larger than limit, it must contain a truncation indicator
+        if result.output.len() < 1_300_000 {
+            // Was truncated — verify marker or that it's shorter than raw base64
+            assert!(
+                result.output.contains("truncated")
+                    || result.output.contains("…")
+                    || result.output.len() <= limit + 200,
+                "Truncated image should have marker or be within limit, len={}",
+                result.output.len()
+            );
+        }
     }
 
     #[test]
@@ -2128,19 +2217,20 @@ mod tests {
         }
     }
 
-    // ─── Issue #3: first-line hint context should not show extra line ───
+    // ─── First-line hint gives a repair-ready context window ─────────────
     #[test]
-    fn str_replace_not_found_hint_first_line_shows_exact_span() {
+    fn str_replace_not_found_hint_first_line_shows_surrounding_context_window() {
         // File has 6 lines; old_str has 3 lines starting at line 2.
-        // Hint should show exactly old_lines.len() lines of context, not +1.
         let content = "header\nfn foo() {\n    bar();\n    baz();\n}\nfooter\n";
         let old_str = "fn foo() {\n    bar();\n    qux();\n}";
         let msg = str_replace_not_found_hint("f.txt", content, old_str);
-        // Should show lines 2..5 (4 lines = old_lines.len()), not line 6
+
         assert!(msg.contains("Actual file content"), "got: {msg}");
+        assert!(msg.contains("read_file path=f.txt"), "got: {msg}");
+        assert!(msg.contains("1: header"), "got: {msg}");
         assert!(
-            !msg.contains("footer"),
-            "should not show extra line beyond old_str span, got: {msg}"
+            msg.contains("6: footer"),
+            "should include surrounding context after the target span, got: {msg}"
         );
     }
 

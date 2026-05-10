@@ -20,9 +20,11 @@ help:
 	@echo "  make dev-db-connect     - Connect to MatrixOne CLI"
 	@echo ""
 	@echo "API Server:"
-	@echo "  make dev-api-start      - Start API server"
+	@echo "  make dev-api-start      - Start API server (release build)"
+	@echo "  make dev-api-start-debug - Start API server (debug build, fast)"
 	@echo "  make dev-api-stop       - Stop API server"
-	@echo "  make dev-api-restart    - Restart API server"
+	@echo "  make dev-api-restart    - Restart API server (release)"
+	@echo "  make dev-api-restart-debug - Restart API server (debug, fast)"
 	@echo "  make dev-api-logs       - Show API server logs"
 	@echo "  make dev-api-status     - Show API server status"
 	@echo ""
@@ -34,15 +36,6 @@ help:
 	@echo "  make test-contract      - Run contract tests (http/admin/config)"
 	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; offline in test-offline; remote E2E opt-in on test-online)"
 	@echo ""
-	@echo "Gateway (Chat Platform Bridge):"
-	@echo "  make gateway            - Build + start gateway (background)"
-	@echo "  make gateway-stop       - Stop gateway"
-	@echo "  make gateway-restart    - Restart gateway"
-	@echo "  make gateway-status     - Show gateway status"
-	@echo "  make gateway-logs       - Tail gateway logs"
-	@echo "  make gateway-login      - WeChat QR login"
-	@echo "  make gateway-test       - Gateway unit tests"
-	@echo ""
 	@echo "Code Quality:"
 	@echo "  make check              - Run all static checks (lint + format + type)"
 	@echo "  make ci                 - Run CI checks (check + test)"
@@ -53,14 +46,17 @@ help:
 	@echo ""
 	@echo "Build:"
 	@echo "  make build              - Build entire Rust workspace (release)"
-	@echo "  make build-release      - Build entire Rust workspace (release)"
+	@echo "  make build-debug        - Build entire Rust workspace (debug, fast)"
 	@echo "  make build-server       - Build astra-server (release)"
-	@echo "  make build-server-release - Build astra-server (release)"
+	@echo "  make build-server-debug - Build astra-server (debug, fast)"
 	@echo "  make build-cli          - Build astra + astra-admin (release)"
-	@echo "  make build-cli-release  - Build astra + astra-admin (release)"
+	@echo "  make build-cli-debug    - Build astra + astra-admin (debug, fast)"
 	@echo ""
 	@echo "Cleanup:"
-	@echo "  make clean              - Remove Rust build artifacts (target/)"
+	@echo "  make clean              - Remove ALL Rust build artifacts (target/)"
+	@echo "  make clean-stale        - Remove artifacts not accessed in 12h (override: STALE_HOURS=N)"
+	@echo "  make clean-debug        - Remove debug/ directory only"
+	@echo "  make sweep              - Remove artifacts older than 4h (runs auto before release builds)"
 	@echo ""
 	@echo "Memoria (Memory Service):"
 	@echo "  make memoria-start      - Start Memoria service"
@@ -257,10 +253,19 @@ dev-api-stop:
 	@echo "Stopping API server..."
 	@./scripts/dev/stop-api.sh
 
+.PHONY: dev-api-start-debug
+dev-api-start-debug:
+	@BUILD_MODE=debug ./scripts/dev/start-api.sh
+
 .PHONY: dev-api-restart
 dev-api-restart: dev-api-stop
 	@sleep 1
 	@$(MAKE) dev-api-start
+
+.PHONY: dev-api-restart-debug
+dev-api-restart-debug: dev-api-stop
+	@sleep 1
+	@$(MAKE) dev-api-start-debug
 
 .PHONY: dev-api-logs
 dev-api-logs:
@@ -386,25 +391,25 @@ dev-seed:
 	SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
 	run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$SQL"; }; \
 	mysql_ssl_disable_arg() { \
-		if mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1; then printf '%s\n' "--ssl-mode=DISABLED"; \
-		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1; then printf '%s\n' "--ssl=0"; \
-		elif mysql --no-defaults --skip-ssl --version >/dev/null 2>&1; then printf '%s\n' "--skip-ssl"; \
+		if mysql --no-defaults --skip-ssl --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --skip-ssl --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--skip-ssl"; \
+		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl=0 --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl=0"; \
+		elif mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl-mode=DISABLED --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl-mode=DISABLED"; \
 		fi; \
 	}; \
 	MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
 	run_mysql_ddl 2>/dev/null || { \
 		if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$MYSQL_SSL_ARG"; else run_mysql_ddl; fi; \
 	}
-	@$(MAKE) dev-api-restart build-cli-release
+	@$(MAKE) dev-api-restart-debug build-cli-debug
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
-	@NO_PROXY=localhost ./rust/target/release/astra-admin register \
+	@NO_PROXY=localhost ./rust/target/debug/astra-admin register \
 		--username admin --password 11111111 --email admin@mo.com
 	@echo "Logging in as admin..."
-	@NO_PROXY=localhost ./rust/target/release/astra-admin login \
+	@NO_PROXY=localhost ./rust/target/debug/astra-admin login \
 		--username admin --password 11111111
 	@echo "Loading models from .models.yaml..."
-	@NO_PROXY=localhost ./rust/target/release/astra-admin model load .models.yaml
+	@NO_PROXY=localhost ./rust/target/debug/astra-admin model load .models.yaml
 	@echo ""
 	@echo "✅ Seed complete — admin@mo.com / 11111111"
 
@@ -440,48 +445,26 @@ build-server-release: sweep
 	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --release --bin $(API_SERVER_BIN)
 	@echo "Binary: $(RUST_RELEASE_BIN_DIR)/$(API_SERVER_BIN)"
 
-# ============================================================================
-# Gateway
-# ============================================================================
+# --- Debug builds (no sweep, no --release => fast incremental) ---
 
-# Gateway targets delegate to the gateway crate's own Makefile.
-# For full gateway dev workflow: cd rust/crates/astra-gateway && make help
-.PHONY: gateway gateway-stop gateway-restart gateway-status gateway-logs gateway-build gateway-login gateway-setup gateway-test gateway-lint gateway-docker
+.PHONY: build-debug
+build-debug:
+	@echo "Building Rust workspace (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG)
+	@echo "✅ Debug artifacts: $(RUST_DEBUG_BIN_DIR)/"
 
-GATEWAY_DIR = rust/crates/astra-gateway
+.PHONY: build-cli-debug
+build-cli-debug:
+	@echo "Building astra + astra-admin (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli -p astra-admin-cli
+	@echo "Binaries:"
+	@for bin in $(CLI_BINS); do echo "  $(RUST_DEBUG_BIN_DIR)/$$bin"; done
 
-gateway:
-	@cd $(GATEWAY_DIR) && make start
-
-gateway-stop:
-	@cd $(GATEWAY_DIR) && make stop
-
-gateway-restart:
-	@cd $(GATEWAY_DIR) && make restart
-
-gateway-status:
-	@cd $(GATEWAY_DIR) && make status
-
-gateway-logs:
-	@cd $(GATEWAY_DIR) && make logs
-
-gateway-build:
-	@cd $(GATEWAY_DIR) && make build
-
-gateway-login:
-	@cd $(GATEWAY_DIR) && make login-weixin
-
-gateway-setup:
-	@cd $(GATEWAY_DIR) && make setup
-
-gateway-test:
-	@cd $(GATEWAY_DIR) && make test
-
-gateway-lint:
-	@cd $(GATEWAY_DIR) && make lint
-
-gateway-docker:
-	@cd $(GATEWAY_DIR) && make docker
+.PHONY: build-server-debug
+build-server-debug:
+	@echo "Building astra-server (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --bin $(API_SERVER_BIN)
+	@echo "Binary: $(RUST_DEBUG_BIN_DIR)/$(API_SERVER_BIN)"
 
 # ============================================================================
 # Cleanup
@@ -504,6 +487,31 @@ clean-incremental:
 	@echo "Cleaning incremental compilation cache..."
 	@rm -rf $(RUST_TARGET_DIR)/debug/incremental
 	@echo "✅ Incremental cache removed"
+
+# Deep cleanup: removes artifacts not accessed in STALE_HOURS hours.
+# Unlike `sweep` (time-based on mtime, runs automatically), this is manual
+# and aggressive — good for reclaiming disk when target/ has ballooned.
+# Override: make clean-stale STALE_HOURS=6
+STALE_HOURS ?= 12
+
+.PHONY: clean-stale
+clean-stale:
+	@echo "Current target/ size:"; du -sh $(RUST_TARGET_DIR) 2>/dev/null || true
+	@echo ""
+	@echo "Removing artifacts not accessed in $(STALE_HOURS)h..."
+	@STALE_MIN=$$(( $(STALE_HOURS) * 60 )); \
+	for PROFILE in debug release; do \
+		DIR=$(RUST_TARGET_DIR)/$$PROFILE; \
+		[ -d "$$DIR" ] || continue; \
+		find $$DIR/incremental -mindepth 1 -maxdepth 1 -type d -amin +$$STALE_MIN -exec rm -rf {} + 2>/dev/null || true; \
+		find $$DIR/deps -type f -amin +$$STALE_MIN -delete 2>/dev/null || true; \
+		find $$DIR/.fingerprint -mindepth 1 -maxdepth 1 -type d -amin +$$STALE_MIN -exec rm -rf {} + 2>/dev/null || true; \
+		find $$DIR/build -mindepth 1 -maxdepth 1 -type d -amin +$$STALE_MIN -exec rm -rf {} + 2>/dev/null || true; \
+		find $$DIR/examples -type f -amin +$$STALE_MIN -delete 2>/dev/null || true; \
+	done
+	@echo ""
+	@echo "After cleanup:"; du -sh $(RUST_TARGET_DIR) 2>/dev/null || true
+	@echo "✅ Stale artifacts (>$(STALE_HOURS)h) removed"
 
 # Maximum age (in hours) for build artifacts before sweep removes them.
 # Override: make sweep SWEEP_MAX_AGE_H=2
@@ -537,14 +545,7 @@ test-dashboard: ## Build astra-test and launch live dashboard
 	./rust/target/release/astra-test --live-dashboard
 
 .PHONY: test-offline
-test-offline: sweep test-workspace test-runtime-bridge-hooks test-sdk-offline test-gateway
-
-.PHONY: test-gateway
-test-gateway:
-	@echo "Running gateway unit tests..."
-	@$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-gateway --lib
-	@echo "Running gateway offline fixture tests..."
-	@$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-gateway --test offline_cli_bridge
+test-offline: sweep test-workspace test-runtime-bridge-hooks test-sdk-offline
 
 .PHONY: test-workspace
 test-workspace: sweep
@@ -616,9 +617,9 @@ test-online:
 	SQL="DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;"; \
 	run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$SQL"; }; \
 	mysql_ssl_disable_arg() { \
-		if mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1; then printf '%s\n' "--ssl-mode=DISABLED"; \
-		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1; then printf '%s\n' "--ssl=0"; \
-		elif mysql --no-defaults --skip-ssl --version >/dev/null 2>&1; then printf '%s\n' "--skip-ssl"; \
+		if mysql --no-defaults --skip-ssl --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --skip-ssl --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--skip-ssl"; \
+		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl=0 --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl=0"; \
+		elif mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl-mode=DISABLED --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl-mode=DISABLED"; \
 		fi; \
 	}; \
 	MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
@@ -656,27 +657,6 @@ test-live-llm:
 	@echo "Running live-LLM token usage tests (reads .models.yaml; one model per provider)..."
 	@ASTRA_LIVE_LLM=1 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 		--test live_token_usage_e2e -- --ignored --nocapture
-
-# Gateway live e2e — real CLI invocations (astra + claude)
-# Requires: astra binary built, .models.yaml configured, claude CLI installed
-.PHONY: test-gateway-live
-test-gateway-live:
-	@echo "Running gateway live e2e tests (real LLM: astra + claude)..."
-	@$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-gateway \
-		--test e2e_cli_bridge -- --ignored --test-threads=1 --nocapture
-
-# Gateway harness YAML tests — real LLM via astra-test-harness
-.PHONY: test-gateway-harness
-test-gateway-harness:
-	@echo "Running gateway harness YAML tests with $${MODELS:-MiniMax-M2.7}..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-test-harness --release
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --release
-	@MODELS="$${MODELS:-MiniMax-M2.7}"; \
-	./rust/target/release/astra-test \
-		--suite rust/crates/astra-test-harness/cases \
-		--force-model "$$MODELS" \
-		--filter "harness_*" \
-		--no-judger --parallel 1 --runs 1
 
 # @astra/sdk — no real HTTP API (Mode A in-process runs via ASTRA_SDK_E2E=1 in test:coverage)
 .PHONY: test-sdk-offline

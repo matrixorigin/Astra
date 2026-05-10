@@ -1788,6 +1788,7 @@ async fn plan_executor_task(
                     runtime_continuity: None,
                     turn_index: ctx.turn,
                     evolution_service: ctx.evolution_service.clone(),
+                    pipeline_state: None,
                     pre_loaded_messages: None,
                     append_system_prompt: None,
                     #[cfg(feature = "harness")]
@@ -3560,6 +3561,7 @@ All acceptance checks pass:
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
         let events = buf.drain();
         assert_eq!(events.len(), 1);
@@ -3608,6 +3610,7 @@ All acceptance checks pass:
                 source: None,
                 run_id: None,
                 tool_calls: None,
+                ..Default::default()
             });
         }
         // Emit observability events first (mirrors Ok(result) branch).
@@ -3674,6 +3677,7 @@ All acceptance checks pass:
             source: None,
             run_id: None,
             tool_calls: None,
+            ..Default::default()
         });
 
         // Simulate the plan_executor emit loop: inject subtask_id on LlmRound events.

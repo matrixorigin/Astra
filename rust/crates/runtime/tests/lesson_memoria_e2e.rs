@@ -293,31 +293,11 @@ async fn cross_session_lesson_appears_in_self_model_prompt() {
         memories.len()
     );
 
-    // ─── Convert to LessonHints (same logic as memoria_retrieve_lessons) ──
+    // ─── Convert to LessonHints using the shared production mapper ──
+    // (single source of truth — prevents drift between e2e and prod paths).
     let hints: Vec<astra_services::LessonHint> = memories
         .iter()
-        .filter_map(|m| {
-            let content = m.get("content")?.as_str()?;
-            let memory_type = m.get("memory_type")?.as_str()?;
-            if !matches!(memory_type, "semantic" | "procedural") {
-                return None;
-            }
-            let action = astra_services::sanitize_for_prompt(content);
-            let compact = if action.len() > 80 {
-                action
-                    .split_once(['.', '—', ';'])
-                    .map(|(s, _)| s.trim().to_string())
-            } else {
-                None
-            };
-            Some(astra_services::LessonHint {
-                kind: astra_services::LessonKind::PromptShape,
-                trigger_signal: "memoria".into(),
-                action,
-                compact,
-                workload_tag: None,
-            })
-        })
+        .filter_map(astra_services::memory_value_to_lesson_hint)
         .collect();
     assert!(hints.len() >= 2, "both lessons parsed to hints");
 

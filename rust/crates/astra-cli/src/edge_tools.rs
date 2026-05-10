@@ -459,6 +459,11 @@ pub struct ToolExecutor {
             std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
         >,
     >,
+    /// Budget-adaptive introspection snapshot, updated each turn by the
+    /// execution phase. The `introspect` tool reads this to return runtime
+    /// state to the model.
+    introspect_snapshot:
+        std::sync::Arc<std::sync::RwLock<Option<astra_turn_core::introspect::IntrospectSnapshot>>>,
     /// Session id for persisting self-modification state and serving `astra self`
     /// compatible diagnostics from inside the live agent loop.
     active_session_id: std::sync::Mutex<Option<String>>,
@@ -543,6 +548,7 @@ impl ToolExecutor {
             agent_id: None,
             send_message_context: std::sync::Mutex::new(None),
             observability_session: None,
+            introspect_snapshot: std::sync::Arc::new(std::sync::RwLock::new(None)),
             active_session_id: std::sync::Mutex::new(None),
             self_mod_pinned_tools: std::sync::Mutex::new(Vec::new()),
             self_mod_deprioritized_tools: std::sync::Mutex::new(Vec::new()),
@@ -692,6 +698,17 @@ impl ToolExecutor {
         if let Ok(mut g) = self.session_lessons.lock() {
             *g = lessons;
         }
+    }
+
+    /// Snapshot the currently-stashed session lessons. Used by the
+    /// injection-freshness observer (`observe_injections`) so it can
+    /// fingerprint the same slice the next SelfModel snapshot will
+    /// project into the system prompt.
+    pub fn session_lessons_snapshot(&self) -> Vec<astra_runtime::self_model::LessonHint> {
+        self.session_lessons
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     /// P3.3 seam: stash the latest auto-invoke diagnosis. Pass `None` to
@@ -936,11 +953,395 @@ impl ToolExecutor {
         .to_string()
     }
 
+    // ── Timeline tool: unified multi-agent trace ───────────────────────────────
+
+    fn render_session_timeline(&self, args: &Value) -> String {
+        let session_id = match self.active_session_id() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return "Error: no active session. Timeline requires a session.".to_string(),
+        };
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
+        let agent_filter = args.get("agent_id").and_then(Value::as_str);
+
+        let journal_path = std::path::PathBuf::from(
+            std::env::var("HOME")
+                .ok()
+                .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| ".".to_string()),
+        )
+        .join(".astra")
+        .join("sessions")
+        .join(format!("{session_id}.jsonl"));
+
+        if !journal_path.exists() {
+            return format!("Error: journal not found at {}", journal_path.display());
+        }
+
+        let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
+            Ok(content) => content
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect(),
+            Err(e) => return format!("Error reading journal: {e}"),
+        };
+
+        let mut timeline = astra_turn_core::unified_timeline::build_timeline(&events);
+
+        if let Some(filter) = agent_filter {
+            timeline.entries.retain(|e| {
+                e.agent_id.as_deref() == Some(filter)
+                    || matches!(&e.kind,
+                        astra_turn_core::unified_timeline::TimelineEntryKind::AgentSpawned { child_agent_id, .. }
+                        | astra_turn_core::unified_timeline::TimelineEntryKind::AgentCompleted { child_agent_id, .. }
+                        | astra_turn_core::unified_timeline::TimelineEntryKind::AgentFailed { child_agent_id, .. }
+                        if child_agent_id.contains(filter)
+                    )
+                    || e.agent_id.is_none() // always show parent rounds for context
+            });
+        }
+
+        astra_turn_core::unified_timeline::render_timeline(&timeline, limit)
+    }
+
+    // ── Session summary: structured overview of current session ────────────────
+
+    fn render_session_summary(&self) -> String {
+        let session_id = match self.active_session_id() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return "Error: no active session.".to_string(),
+        };
+        let journal_path = std::path::PathBuf::from(
+            dirs::home_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".".to_string()),
+        )
+        .join(".astra")
+        .join("sessions")
+        .join(format!("{session_id}.jsonl"));
+
+        let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
+            Ok(content) => content
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect(),
+            Err(_) => return "Error: journal not found.".to_string(),
+        };
+
+        let mut turns = 0u32;
+        let mut total_tokens_in = 0u64;
+        let mut total_tokens_out = 0u64;
+        let mut total_rounds = 0u32;
+        let mut errors = 0u32;
+        let mut agents_spawned = 0u32;
+        let mut agents_completed = 0u32;
+        let mut current_goal = String::new();
+
+        for evt in &events {
+            let etype = evt.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match etype {
+                "turn" => {
+                    turns += 1;
+                    if let Some(tin) = evt.get("tokens_in").and_then(|v| v.as_u64()) {
+                        total_tokens_in += tin;
+                    }
+                    if let Some(tout) = evt.get("tokens_out").and_then(|v| v.as_u64()) {
+                        total_tokens_out += tout;
+                    }
+                }
+                "llm_round" => total_rounds += 1,
+                "turn_error" => errors += 1,
+                "agent_spawned" => agents_spawned += 1,
+                "AgentTerminated" => agents_completed += 1,
+                _ => {}
+            }
+        }
+
+        // Try to get current goal from observability session
+        if let Some(obs) = self.observability_session.as_ref()
+            && let Ok(s) = obs.read()
+        {
+            if let Some(gt) = s.goal_tracker.as_ref() {
+                current_goal = gt.goal().to_string();
+            }
+        }
+
+        let mut out = String::from("## Session Summary\n");
+        out.push_str(&format!("Session: {session_id}\n"));
+        out.push_str(&format!(
+            "Turns: {turns} | LLM rounds: {total_rounds} | Errors: {errors}\n"
+        ));
+        out.push_str(&format!(
+            "Tokens: {} in + {} out = {} total\n",
+            total_tokens_in,
+            total_tokens_out,
+            total_tokens_in + total_tokens_out
+        ));
+        if agents_spawned > 0 {
+            out.push_str(&format!(
+                "Agents: {agents_spawned} spawned, {agents_completed} completed\n"
+            ));
+        }
+        if !current_goal.is_empty() {
+            out.push_str(&format!("Current goal: {current_goal}\n"));
+        }
+
+        // Task status nudge: if there are active tasks, remind the
+        // agent to update them (Claude Code parity: proactive nudge).
+        let tasks = self.task_manager.snapshot();
+        let active_tasks: Vec<_> = tasks
+            .iter()
+            .filter(|t| t.status == "pending" || t.status == "in_progress")
+            .collect();
+        if !active_tasks.is_empty() {
+            out.push_str(&format!("\nActive tasks: {}\n", active_tasks.len()));
+            for t in active_tasks.iter().take(5) {
+                let status_icon = if t.status == "in_progress" {
+                    "▶"
+                } else {
+                    "○"
+                };
+                let blocked = if !t.blocked_by.is_empty() {
+                    format!(" [blocked by: {}]", t.blocked_by.join(","))
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!(
+                    "  {status_icon} {} — {}{}\n",
+                    t.id, t.title, blocked
+                ));
+            }
+            out.push_str(
+                "Hint: update task status with `task(action=\"update\", task_id=\"...\", status=\"...\")` as you make progress.\n",
+            );
+        }
+        out
+    }
+
+    // ── Session history: recall past conversation turns ──────────────────────
+
+    fn render_session_history(&self, args: &Value) -> String {
+        let session_id = match self.active_session_id() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return "Error: no active session.".to_string(),
+        };
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+
+        let journal_path = std::path::PathBuf::from(
+            dirs::home_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".".to_string()),
+        )
+        .join(".astra")
+        .join("sessions")
+        .join(format!("{session_id}.jsonl"));
+
+        let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
+            Ok(content) => content
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect(),
+            Err(_) => return "Error: journal not found.".to_string(),
+        };
+
+        // Extract turn events with user_input + assistant_output
+        let mut turns: Vec<(u32, &str, &str)> = Vec::new();
+        for evt in &events {
+            if evt.get("type").and_then(|v| v.as_str()) != Some("turn") {
+                continue;
+            }
+            let turn_num = evt.get("turn").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let user = evt.get("user_input").and_then(|v| v.as_str()).unwrap_or("");
+            let assistant = evt
+                .get("assistant_output")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !user.is_empty() || !assistant.is_empty() {
+                turns.push((turn_num, user, assistant));
+            }
+        }
+
+        // Filter by query if provided
+        let filtered: Vec<&(u32, &str, &str)> = if query.is_empty() {
+            turns.iter().collect()
+        } else {
+            let q_lower = query.to_lowercase();
+            turns
+                .iter()
+                .filter(|(_, u, a)| {
+                    u.to_lowercase().contains(&q_lower) || a.to_lowercase().contains(&q_lower)
+                })
+                .collect()
+        };
+
+        if filtered.is_empty() {
+            return if query.is_empty() {
+                "No conversation history in this session.".to_string()
+            } else {
+                format!("No turns matching '{query}' found.")
+            };
+        }
+
+        // Take last N
+        let shown: &[&(u32, &str, &str)] = if filtered.len() > limit {
+            &filtered[filtered.len() - limit..]
+        } else {
+            &filtered
+        };
+
+        let mut out = format!(
+            "## Conversation History ({} turns{})\n",
+            filtered.len(),
+            if !query.is_empty() {
+                format!(" matching '{query}'")
+            } else {
+                String::new()
+            }
+        );
+        for (turn_num, user, assistant) in shown {
+            let user_preview: String = user.chars().take(120).collect();
+            let assist_preview: String = assistant.chars().take(200).collect();
+            out.push_str(&format!("\n**T{turn_num} User**: {user_preview}"));
+            if user.len() > 120 {
+                out.push('…');
+            }
+            out.push_str(&format!("\n**T{turn_num} Assistant**: {assist_preview}"));
+            if assistant.len() > 200 {
+                out.push('…');
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     // ── Env tool: environment variable management ─────────────────────────────
 
     /// Environment variable management tool — delegated to `env_tools` module.
     fn env_tool(&self, args: &Value) -> String {
         env_tools::env_tool(args)
+    }
+
+    fn handle_introspect(&self, args: &Value) -> String {
+        // `subtopic` routes to a specialized diagnostic. Default behavior
+        // (session health: token pressure, tool health, alerts) remains
+        // unchanged when `subtopic` is missing, empty, or "session".
+        let subtopic = args
+            .get("subtopic")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if subtopic == "cache" {
+            return self.handle_introspect_cache();
+        }
+
+        let detail_arg = args
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or("summary");
+        let detail = astra_turn_core::introspect::IntrospectDetail::from_arg(detail_arg);
+
+        let snapshot = self
+            .introspect_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| {
+                astra_core::agent_warn!("introspect", "recovering from poisoned RwLock");
+                poisoned.into_inner()
+            })
+            .clone();
+
+        // Fall back to a zero-state snapshot on the first turn (before the
+        // host has had a chance to populate one) so the model always gets
+        // structured output instead of an opaque "first turn" string.
+        let mut snap = snapshot.unwrap_or_default();
+
+        // Overlay session-scoped injection freshness. The per-turn
+        // snapshot lives on `AgenticLoopState` (not session) so the
+        // runtime leaves this empty; we fill it here from the
+        // session-scoped history maintained via `observe_injections`.
+        // Subtopic-agnostic: `render_all` and `noise` both need it.
+        if let Some(obs) = self.observability_session.as_ref()
+            && let Ok(s) = obs.read()
+        {
+            snap.injection_freshness = astra_turn_core::injection_tracking::freshness_report(
+                &s.injection_history,
+                s.turn_number,
+            );
+            snap.current_round = s.turn_number;
+        }
+
+        // Task #46: three new subtopics for fine-grained runtime
+        // self-awareness. All read from `IntrospectSnapshot`, which the
+        // runtime populates every turn — no disk I/O required.
+        match subtopic.as_str() {
+            "recent" | "recent_rounds" | "rounds" => {
+                return astra_turn_core::introspect::render_recent_rounds(&snap);
+            }
+            "volatile" | "volatile_pending" | "pending" => {
+                return astra_turn_core::introspect::render_volatile_pending(&snap);
+            }
+            "stall" | "stall_state" | "loop_guard" => {
+                return astra_turn_core::introspect::render_stall_state(&snap);
+            }
+            "noise" | "injection" | "injections" | "freshness" => {
+                return astra_turn_core::introspect::render_injection_freshness(&snap);
+            }
+            "all" => {
+                return astra_turn_core::introspect::render_all(&snap);
+            }
+            _ => {}
+        }
+
+        astra_turn_core::introspect::render_introspect(&snap, detail)
+    }
+
+    /// `introspect(subtopic="cache")` — scan recent `llm_capture_*.json`
+    /// files for the current session and run the four cache-diagnosis
+    /// rules over them. Returns a markdown report.
+    ///
+    /// Requires `full_llm_capture=true` in session metadata; otherwise
+    /// the renderer explains why no data is available so the LLM knows
+    /// how to enable it. A future task (#17) adds an in-memory per-turn
+    /// ring so diagnosis also works without full capture.
+    fn handle_introspect_cache(&self) -> String {
+        use astra_turn_core::introspect::cache_diagnosis;
+        let session_id = match self.active_session_id() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => {
+                return cache_diagnosis::render_findings_markdown(&[], &[]);
+            }
+        };
+        let session_dir = std::path::PathBuf::from(
+            std::env::var("HOME")
+                .ok()
+                .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| ".".to_string()),
+        )
+        .join(".astra")
+        .join("sessions")
+        .join(&session_id);
+        let rounds = match cache_diagnosis::load_session_captures(&session_dir) {
+            Ok(rs) => rs,
+            Err(e) => {
+                astra_core::agent_warn!(
+                    "introspect",
+                    "cache diagnosis: failed to read session dir {}: {e}",
+                    session_dir.display(),
+                );
+                Vec::new()
+            }
+        };
+        let findings = cache_diagnosis::evaluate_all(&rounds);
+        cache_diagnosis::render_findings_markdown(&rounds, &findings)
+    }
+
+    pub fn update_introspect_snapshot(
+        &self,
+        snapshot: astra_turn_core::introspect::IntrospectSnapshot,
+    ) {
+        if let Ok(mut guard) = self.introspect_snapshot.write() {
+            *guard = Some(snapshot);
+        }
     }
 
     /// Check if a variable name suggests it contains sensitive data.
@@ -1097,6 +1498,39 @@ impl ToolExecutor {
             outcome.output = output;
             return outcome;
         }
+        if name == "git" {
+            let action = args
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("status");
+            match action {
+                "commit" => {
+                    let mut outcome = self.git_commit_with_metadata(args);
+                    outcome.output = self.finalize_tool_output(outcome.output, name);
+                    self.record_output_size(outcome.output.len());
+                    return outcome;
+                }
+                "revert_commit" => {
+                    let mut outcome = self.git_revert_commit_with_metadata(args);
+                    outcome.output = self.finalize_tool_output(outcome.output, name);
+                    self.record_output_size(outcome.output.len());
+                    return outcome;
+                }
+                "stash" => {
+                    let mut outcome = self.git_stash_with_metadata(args);
+                    outcome.output = self.finalize_tool_output(outcome.output, name);
+                    self.record_output_size(outcome.output.len());
+                    return outcome;
+                }
+                "worktree" => {
+                    let mut outcome = self.git_worktree_with_metadata(args);
+                    outcome.output = self.finalize_tool_output(outcome.output, name);
+                    self.record_output_size(outcome.output.len());
+                    return outcome;
+                }
+                _ => {} // Other git actions handled in execute() below
+            }
+        }
         if name == "git_stash" {
             let mut outcome = self.git_stash_with_metadata(args);
             let output = self.finalize_tool_output(outcome.output, name);
@@ -1137,19 +1571,67 @@ impl ToolExecutor {
         } else {
             match name {
                 "bash" => self.bash(args),
+                #[cfg(windows)]
                 "powershell" => self.powershell(args),
                 "read_file" => self.read_file(args),
-                "write_file" => self.write_file(args),
-                "rollback_file_edits" => self.rollback_file_edits(args),
+                "write_file" => {
+                    // delete=true routes to delete_file handler
+                    if args.get("delete").and_then(Value::as_bool).unwrap_or(false) {
+                        self.delete_file(args)
+                    } else {
+                        self.write_file(args)
+                    }
+                }
                 "rollback_database_snapshots" => self.rollback_database_snapshots(args),
                 "rollback_session_state" => self.rollback_session_state(args),
                 "rollback_turn_actions" => self.rollback_turn_actions(args),
-                "str_replace" => self.str_replace(args),
-                "delete_file" => self.delete_file(args),
-                "multi_edit" => self.multi_edit(args),
+                "str_replace" => {
+                    // edits array routes to multi_edit handler
+                    if args.get("edits").and_then(Value::as_array).is_some() {
+                        self.multi_edit(args)
+                    } else {
+                        self.str_replace(args)
+                    }
+                }
                 "list_dir" => self.list_dir(args),
                 "grep" => self.grep(args),
                 "glob" => self.glob(args),
+                "git" => {
+                    let action = args
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or("status");
+                    match action {
+                        "status" => git_gix::git_status(&self.project_root),
+                        "diff" => git_gix::git_diff(
+                            &self.project_root,
+                            args,
+                            self.get_budget_pressure(),
+                            self.aggregate_output_bytes
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        "log" => git_gix::git_log(&self.project_root, args),
+                        "show" => git_gix::git_show(
+                            &self.project_root,
+                            args,
+                            self.get_budget_pressure(),
+                            self.aggregate_output_bytes
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        "blame" => git_gix::git_blame(&self.project_root, args),
+                        "file_history" => git_gix::git_file_history(&self.project_root, args),
+                        "log_search" => git_gix::git_log_search(&self.project_root, args),
+                        "contributors" => git_gix::git_contributors(&self.project_root, args),
+                        "commit" => self.git_commit(args),
+                        "revert_commit" => self.git_revert_commit(args),
+                        "stash" => self.git_stash(args),
+                        "checkout_file" => self.git_checkout_file(args),
+                        "worktree" => self.git_worktree(args),
+                        _ => format!(
+                            "Error: unknown git action '{action}'. Use one of: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree"
+                        ),
+                    }
+                }
                 "git_status" => git_gix::git_status(&self.project_root),
                 "git_diff" => git_gix::git_diff(
                     &self.project_root,
@@ -1205,6 +1687,17 @@ impl ToolExecutor {
                         .unwrap_or_else(|| self.project_root.to_string_lossy().to_string());
                     astra_tools::web_fetch::fetch_with_cache_scope(None, args, &cache_scope).await
                 }
+                "memory" => {
+                    let op = match args.get("action").and_then(|v| v.as_str()) {
+                        Some(a) => a,
+                        None => return "Error: missing required parameter 'action'. Use one of: store, retrieve, purge, correct, profile, search, feedback".to_string(),
+                    };
+                    let mut clean_args = args.clone();
+                    if let Some(obj) = clean_args.as_object_mut() {
+                        obj.remove("action");
+                    }
+                    self.memoria_call(op, &clean_args).await
+                }
                 "memory_retrieve" => self.memoria_call("retrieve", args).await,
                 "memory_store" => self.memoria_call("store", args).await,
                 "memory_search" => self.memoria_call("search", args).await,
@@ -1251,52 +1744,142 @@ impl ToolExecutor {
                     }).to_string()
                     }
                 }
-                "run_chain" => {
-                    match serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(
-                        args.clone(),
-                    ) {
-                        Ok(chain) => {
-                            // Validate chain steps reference known tools
-                            let known: Vec<&str> = astra_runtime::tool_registry::TOOL_CATALOG
-                                .iter()
-                                .map(|t| t.name)
-                                .collect();
-                            if let Err(errors) = chain.validate(&known) {
-                                return format!("Error: Invalid chain: {}", errors.join("; "));
-                            }
-                            let input = args
-                                .get("input")
-                                .cloned()
-                                .unwrap_or_else(|| serde_json::json!({}));
-                            self.execute_chain(&chain, input).await
+                // ── Consolidated agent tool ──────────────────────────────────
+                "agent" => {
+                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    match action {
+                        "delegate" => {
+                            "Delegation request acknowledged. The delegation engine will execute \
+                             this request and provide results in the next round."
+                                .to_string()
                         }
-                        Err(e) => format!("Error: Invalid chain format: {e}"),
+                        "run_chain" => {
+                            match serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(
+                                args.clone(),
+                            ) {
+                                Ok(chain) => {
+                                    let known: Vec<&str> =
+                                        astra_runtime::tool_registry::TOOL_CATALOG
+                                            .iter()
+                                            .map(|t| t.name)
+                                            .collect();
+                                    if let Err(errors) = chain.validate(&known) {
+                                        return format!(
+                                            "Error: Invalid chain: {}",
+                                            errors.join("; ")
+                                        );
+                                    }
+                                    let input = args
+                                        .get("input")
+                                        .cloned()
+                                        .unwrap_or_else(|| serde_json::json!({}));
+                                    self.execute_chain(&chain, input).await
+                                }
+                                Err(e) => format!("Error: Invalid chain format: {e}"),
+                            }
+                        }
+                        "spawn" => {
+                            agent_spawning::handle_spawn_agent_tool(
+                                args,
+                                self.spawn_context.as_ref(),
+                            )
+                            .await
+                        }
+                        "get_result" => {
+                            agent_spawning::handle_get_agent_result_tool(
+                                args,
+                                self.spawn_context.as_ref(),
+                            )
+                            .await
+                        }
+                        "send_message" => {
+                            let ctx = self
+                                .send_message_context
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.clone());
+                            agent_messaging::handle_send_message_tool(args, ctx.as_ref()).await
+                        }
+                        _ => format!(
+                            "Error: unknown agent action '{action}'. Use one of: delegate, run_chain, spawn, get_result, send_message"
+                        ),
                     }
                 }
-                "ask_user" => self.ask_user(args),
-                // Task management tools
+                // ── Consolidated session tool ──────────────────────────────
+                "session" => {
+                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    match action {
+                        "config" => self.adjust_config(args),
+                        "prioritize" => self.prioritize_tool(args),
+                        "deprioritize" => self.deprioritize_tool(args),
+                        "set_goal" => self.set_goal(args),
+                        "compact" => self.compress_context(args),
+                        "rollback_edits" => self.rollback_file_edits(args),
+                        "ask_user" => self.ask_user(args),
+                        "sleep" => self.sleep_tool(args).await,
+                        "tool_search" => self.tool_search(args),
+                        "timeline" => self.render_session_timeline(args),
+                        "summary" => self.render_session_summary(),
+                        "history" => self.render_session_history(args),
+                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, tool_search, timeline, summary, history".to_string(),
+                        other => format!("Unknown session action: '{other}'"),
+                    }
+                }
+                // Task management (unified tool with action param)
+                "task" => {
+                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    match action {
+                        "create" => self.task_create(args).await,
+                        "list" => self.task_list(args).await,
+                        "get" => self.task_get(args).await,
+                        "update" => self.task_update(args).await,
+                        "stop" => self.task_stop(args).await,
+                        "" => "Missing required parameter: action. Use: create, update, list, get, stop".to_string(),
+                        other => format!("Unknown task action: '{other}'. Use: create, update, list, get, stop"),
+                    }
+                }
+                // Legacy separate task_* names (backward compat)
                 "task_create" => self.task_create(args).await,
                 "task_list" => self.task_list(args).await,
                 "task_get" => self.task_get(args).await,
                 "task_update" => self.task_update(args).await,
                 "task_stop" => self.task_stop(args).await,
-                "sleep" => self.sleep_tool(args).await,
-                "tool_search" => self.tool_search(args),
                 "web_search" => self.web_search(args),
-                "send_message" => {
-                    let ctx = self
-                        .send_message_context
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.clone());
-                    agent_messaging::handle_send_message_tool(args, ctx.as_ref()).await
-                }
-                "spawn_agent" => {
-                    agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()).await
-                }
-                "get_agent_result" => {
-                    agent_spawning::handle_get_agent_result_tool(args, self.spawn_context.as_ref())
-                        .await
+                "ask_user" => self.ask_user(args),
+                "notify" => {
+                    const MAX_NOTIFY_MSG: usize = 4096;
+                    let message = args.get("message").and_then(Value::as_str).unwrap_or("");
+                    let raw_type = args
+                        .get("notification_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("normal");
+                    // Enforce the schema enum — reject anything outside the
+                    // declared set rather than silently passing through.
+                    let notification_type = match raw_type {
+                        "normal" | "proactive" => raw_type,
+                        other => {
+                            return format!(
+                                "Error: 'notification_type' must be 'normal' or 'proactive' (got '{}')",
+                                other
+                            );
+                        }
+                    };
+                    if message.is_empty() {
+                        "Error: 'message' is required".to_string()
+                    } else if message.len() > MAX_NOTIFY_MSG {
+                        format!(
+                            "Error: 'message' exceeds {} bytes ({}). Notifications should be short.",
+                            MAX_NOTIFY_MSG,
+                            message.len()
+                        )
+                    } else {
+                        serde_json::json!({
+                            "delivered": true,
+                            "notification_type": notification_type,
+                            "message": message,
+                        })
+                        .to_string()
+                    }
                 }
                 "share_context" => self.share_context(args),
                 "query_context" => self.query_context(args),
@@ -1305,6 +1888,7 @@ impl ToolExecutor {
                 this request and provide results in the next round."
                         .to_string()
                 }
+                "introspect" => self.handle_introspect(args),
                 "diagnose" => self.diagnose(args).await,
                 "lsp" => self.lsp(args),
                 "env" => self.env_tool(args),
@@ -1844,6 +2428,90 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         (dir, executor)
+    }
+
+    // ── introspect tool: first-turn behavior (regression guard) ────────
+    //
+    // Regression: `handle_introspect` used to return the string
+    // "No introspection data available yet (first turn)." whenever the
+    // snapshot had not been populated. In the CLI edge path the snapshot
+    // is only updated *after* `turn_result?` unwraps, so the model calling
+    // `introspect` during turn 1 (or mid-turn in any later turn, before
+    // that write lands) always saw the opaque string. The fix: on `None`
+    // render a zero-state snapshot so output is always structured.
+    #[test]
+    fn introspect_returns_structured_output_on_first_turn() {
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({"detail": "summary"}));
+        assert!(
+            out.contains("Session Health"),
+            "expected structured output, got: {out}"
+        );
+        assert!(
+            !out.contains("first turn"),
+            "must not return opaque first-turn placeholder, got: {out}"
+        );
+    }
+
+    #[test]
+    fn introspect_minimal_first_turn_has_metrics_not_placeholder() {
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({"detail": "minimal"}));
+        assert!(
+            out.contains("pressure=") && out.contains("turns="),
+            "expected minimal metrics line, got: {out}"
+        );
+        assert!(!out.contains("first turn"));
+    }
+
+    #[test]
+    fn introspect_reflects_updated_snapshot() {
+        let executor = test_executor();
+        // Populate a non-trivial snapshot.
+        executor.update_introspect_snapshot(astra_turn_core::introspect::IntrospectSnapshot {
+            turns_completed: 5,
+            turns_remaining: 10,
+            total_input_tokens: 12345,
+            total_output_tokens: 678,
+            compaction_tier: "None".to_string(),
+            ..Default::default()
+        });
+        let out = executor.handle_introspect(&serde_json::json!({"detail": "summary"}));
+        assert!(out.contains("Turns: 5/15"), "got: {out}");
+        assert!(out.contains("12345in"), "got: {out}");
+    }
+
+    #[test]
+    fn introspect_subtopic_cache_routes_to_cache_diagnosis() {
+        let executor = test_executor();
+        // No session set → renderer explains the "no data" path.
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "cache"}));
+        assert!(
+            out.contains("Cache Diagnosis"),
+            "subtopic=cache must produce the cache section, got: {out}",
+        );
+        assert!(
+            out.contains("No per-round cache snapshots"),
+            "without a session / captures, the renderer must explain why: {out}",
+        );
+    }
+
+    #[test]
+    fn introspect_subtopic_session_is_default_behavior() {
+        // Without subtopic the tool still shows Session Health unchanged.
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({"detail": "summary"}));
+        assert!(
+            out.contains("Session Health"),
+            "default subtopic must preserve legacy output, got: {out}",
+        );
+    }
+
+    #[test]
+    fn introspect_subtopic_cache_is_case_insensitive() {
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "Cache"}));
+        assert!(out.contains("Cache Diagnosis"), "got: {out}");
     }
 
     #[test]

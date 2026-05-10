@@ -16,7 +16,7 @@
 //! ASTRA_MAX_TOOL_RETRIES=2        # transient-error retries per tool
 //! ASTRA_RETRY_BASE_MS=500         # base backoff for retries (doubles each)
 //! ASTRA_MAX_RETRIEVED=6           # memory/knowledge docs per turn
-//! ASTRA_MAX_TURN_INPUT_TOKENS=80000 # max LLM input tokens per turn (0=unlimited)
+//! ASTRA_MAX_TURN_INPUT_TOKENS=200000 # max LLM input tokens per turn (0=unlimited)
 //! ```
 
 use std::sync::OnceLock;
@@ -68,7 +68,7 @@ impl Default for RuntimeLimits {
             max_tool_retries: 2,
             retry_base_ms: 500,
             max_retrieved: 6,
-            max_turn_input_tokens: 80_000,
+            max_turn_input_tokens: 200_000,
         }
     }
 }
@@ -110,6 +110,59 @@ impl RuntimeLimits {
             self.max_turns
         }
     }
+
+    /// Resolve the effective max_turn_input_tokens for a given model.
+    /// If the model has a known context window, use it (minus a reserve
+    /// for output). Otherwise fall back to the configured default.
+    pub fn effective_max_turn_input_tokens(&self, model: Option<&str>) -> u64 {
+        if let Some(window) = model.and_then(context_window_for_model) {
+            // Reserve ~20% for output tokens + overhead
+            let effective = (window as f64 * 0.80) as u64;
+            effective.min(self.max_turn_input_tokens)
+        } else {
+            self.max_turn_input_tokens
+        }
+    }
+}
+
+/// Known context window sizes for common models. Used by the CLI
+/// (which doesn't have access to the server-side model registry) to
+/// set per-turn token budgets correctly.
+///
+/// Returns the full context window in tokens. The caller should
+/// apply a reserve (e.g., 80% for input, 20% for output).
+pub fn context_window_for_model(model: &str) -> Option<u64> {
+    let lower = model.to_lowercase();
+    // Anthropic models
+    if lower.contains("opus-4") || lower.contains("claude-opus") {
+        return Some(200_000);
+    }
+    if lower.contains("sonnet-4") || lower.contains("claude-sonnet") {
+        return Some(200_000);
+    }
+    if lower.contains("haiku-4") || lower.contains("claude-haiku") {
+        return Some(200_000);
+    }
+    // DeepSeek
+    if lower.contains("deepseek") {
+        return Some(128_000);
+    }
+    // Qwen (most have 1M but practical limit is lower)
+    if lower.contains("qwen") {
+        return Some(128_000);
+    }
+    // MiniMax
+    if lower.contains("minimax") {
+        return Some(200_000);
+    }
+    // GPT-4o / GPT-4
+    if lower.contains("gpt-4o") || lower.contains("gpt-4-turbo") {
+        return Some(128_000);
+    }
+    if lower.contains("gpt-4") {
+        return Some(128_000);
+    }
+    None
 }
 
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {

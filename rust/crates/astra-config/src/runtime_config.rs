@@ -103,14 +103,9 @@ pub enum ForkCacheSinkKind {
 
 /// Fork-prefix pipeline configuration.
 ///
-/// When `enabled` is false, the whole pipeline is a no-op regardless
-/// of other fields — captures return `FeatureDisabled`, resolves
-/// produce `Disabled`, executors see `inherited_prefix: None`. No
-/// ForkCacheEvent ever fires.
-///
-/// When `enabled` is true, captures happen on every parent turn
-/// end, spawns with `inherit_prefix` reuse captured prefixes, and
-/// telemetry events flow to the configured `sink`.
+/// Captures happen on every parent turn end, spawns with
+/// `inherit_prefix` reuse captured prefixes, and telemetry events
+/// flow to the configured `sink`.
 ///
 /// Thresholds tune the classifier in `fork_cache_event::evaluate`.
 ///
@@ -124,16 +119,13 @@ pub enum ForkCacheSinkKind {
 /// strict config rejection should `validate()` the loaded config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ForkPrefixConfig {
-    /// Master switch for the fork-prefix pipeline. When `false`,
-    /// every stage (capture / resolve / reconstruct / probe) is a
-    /// no-op. Environment variable `ASTRA_FORK_INHERIT_PREFIX` can
-    /// override this at startup (1/true/on/yes → true, else false).
+    /// Deprecated no-op. Fork capture is now always-on. Retained
+    /// for backward-compatible TOML deserialization only.
     #[serde(default)]
     pub enabled: bool,
 
     /// Telemetry sink to install. `Noop` discards events; `Stderr`
-    /// writes JSON lines with `[fork-cache]` prefix. Ignored when
-    /// `enabled` is false.
+    /// writes JSON lines with `[fork-cache]` prefix.
     #[serde(default)]
     pub sink: ForkCacheSinkKind,
 
@@ -789,7 +781,7 @@ impl ToolSelectionConfig {
 
     /// Resolved circuit breaker stall threshold (0 → default 3, floor 2).
     pub fn effective_circuit_breaker_stall_threshold(&self) -> u32 {
-        resolve_threshold(self.circuit_breaker_stall_threshold, 3, 2)
+        resolve_threshold(self.circuit_breaker_stall_threshold, 6, 3)
     }
 
     /// Resolved circuit breaker repetition threshold (0 → default 3, floor 2).
@@ -1123,7 +1115,7 @@ pub struct TokenBudgetConfig {
 }
 
 fn default_max_turn_input_tokens() -> u32 {
-    80000
+    200_000
 }
 fn default_system_prompt_reserve() -> u32 {
     4000
@@ -1934,27 +1926,14 @@ impl RuntimeConfig {
         if let Ok(val) = std::env::var("ASTRA_CAPTURE_TRACES") {
             self.telemetry.capture_context_traces = val == "1" || val.to_lowercase() == "true";
         }
-        if let Ok(val) = std::env::var("ASTRA_FORK_INHERIT_PREFIX") {
-            self.fork_prefix.enabled = parse_fork_prefix_flag(&val);
-        }
+        // ASTRA_FORK_INHERIT_PREFIX env var is ignored — fork capture
+        // is now always-on. The `enabled` field is a deprecated no-op.
     }
 
     /// Get configuration as TOML string.
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
     }
-}
-
-/// Parse the `ASTRA_FORK_INHERIT_PREFIX` env value into a bool.
-///
-/// Recognises `1/true/on/yes` (case-insensitive) as enabled.
-/// Any other value (including `0/false/off/no`) means disabled.
-/// Absence of the variable is handled by the caller (no-op).
-pub fn parse_fork_prefix_flag(val: &str) -> bool {
-    matches!(
-        val.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "on" | "yes"
-    )
 }
 
 #[cfg(test)]
@@ -2889,37 +2868,13 @@ mod tests {
     }
 
     #[test]
-    fn fork_prefix_flag_truthy_values() {
-        for val in ["1", "true", "TRUE", "True", "on", "ON", "yes", "Yes", "YES"] {
-            assert!(parse_fork_prefix_flag(val), "{val:?} must parse as enabled");
-        }
-    }
-
-    #[test]
-    fn fork_prefix_flag_falsy_values() {
-        for val in ["0", "false", "FALSE", "off", "no", "anything", ""] {
-            assert!(
-                !parse_fork_prefix_flag(val),
-                "{val:?} must parse as disabled"
-            );
-        }
-    }
-
-    #[test]
-    fn fork_prefix_flag_trims_whitespace() {
-        assert!(parse_fork_prefix_flag("  1  "));
-        assert!(parse_fork_prefix_flag("\ttrue\n"));
-        assert!(!parse_fork_prefix_flag("  0  "));
-    }
-
-    #[test]
-    fn fork_prefix_flag_kill_switch_contract() {
-        // Explicit "0" must produce false — this is the deploy-time
-        // kill switch (applied by apply_env_overrides when the env
-        // var is present, overriding whatever TOML says).
-        let mut cfg = RuntimeConfig::default();
-        cfg.fork_prefix.enabled = true;
-        cfg.fork_prefix.enabled = parse_fork_prefix_flag("0");
-        assert!(!cfg.fork_prefix.enabled);
+    fn fork_prefix_enabled_field_is_deprecated_noop() {
+        // The `enabled` field remains for backward-compatible TOML
+        // deserialization but has no runtime effect. Fork capture is
+        // always-on.
+        let cfg = ForkPrefixConfig::default();
+        // Default value doesn't matter for runtime behavior since
+        // the field is a no-op; we just verify it deserializes.
+        let _ = cfg.enabled;
     }
 }

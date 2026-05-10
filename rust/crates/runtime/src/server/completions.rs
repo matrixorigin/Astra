@@ -109,10 +109,11 @@ pub(super) async fn completions_handler(
     // 3. Build upstream request
     let mut messages = request.messages;
     crate::turn::llm_client::strip_empty_assistant_tool_calls(&mut messages);
+    let upstream_name = resolved.upstream_model_name();
     let body = crate::turn::llm_client::build_provider_request_body(
         &messages,
         &[],
-        &resolved.model_name,
+        upstream_name,
         &resolved.provider,
         Some(request.max_tokens as usize),
         Some(request.temperature),
@@ -123,7 +124,7 @@ pub(super) async fn completions_handler(
     let url = crate::turn::llm_client::llm_request_url_for_provider(
         &resolved.base_url,
         &resolved.provider,
-        &resolved.model_name,
+        upstream_name,
         false,
     );
 

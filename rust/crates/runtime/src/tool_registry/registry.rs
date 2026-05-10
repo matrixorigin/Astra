@@ -625,6 +625,20 @@ impl ToolRegistry {
         TOOL_CATALOG.iter().map(|t| t.name).collect()
     }
 
+    /// Return all tool names from THIS registry instance (includes
+    /// dynamically injected schemas like spawn_agent, skill, etc.).
+    pub fn all_schema_names(&self) -> Vec<String> {
+        self.all_schemas
+            .iter()
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+            })
+            .collect()
+    }
+
     /// Return names of currently selected tools.
     pub fn selected_names(schemas: &[Value]) -> Vec<String> {
         schemas
@@ -866,54 +880,6 @@ mod tests {
         assert_eq!(report.selected_count as usize, out_schemas.len());
 
         restore_selector_observability_for_tests(prev);
-    }
-
-    #[test]
-    fn conversational_with_recent_tools_runs_dynamic_path() {
-        // Verify: the `recent_tools.is_empty()` guard prevents the
-        // conversational short-circuit. We test this by checking that
-        // "好的" (conversational) WITH recent_tools=["github_ci_status"]
-        // includes github_list_prs (same-category recency boost), while
-        // WITHOUT recent_tools it only returns pinned tools.
-        let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
-        let registry = ToolRegistry::new(schemas);
-
-        // Without recent tools: conversational short-circuit → pinned only
-        let (_, report_bare) = registry.select_with_report_ctx("好的", 2, 800, &[]);
-        let bare_count = report_bare.selected_count;
-
-        // With recent tools: dynamic path runs → recency boost can add tools
-        let recent = vec!["github_ci_status".to_string()];
-        let (_, report_ctx) = registry.select_with_report_ctx("好的", 2, 800, &recent);
-        let ctx_count = report_ctx.selected_count;
-
-        assert!(
-            ctx_count > bare_count,
-            "with recent_tools, dynamic path should select MORE than pinned-only: bare={bare_count} ctx={ctx_count}"
-        );
-    }
-
-    #[test]
-    fn quality_path_conversational_with_recent_tools_runs_dynamic() {
-        // Symmetric test: select_with_quality must also respect recent_tools guard.
-        let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
-        let registry = ToolRegistry::new(schemas);
-
-        // Without recent tools: quality conversational short-circuit → pinned only
-        let ((_, report_bare), _) =
-            with_obs_capture(|| registry.select_with_quality("好的", 2, 800, &[], None));
-        let bare_count = report_bare.selected_count;
-
-        // With recent tools: dynamic path
-        let recent = vec!["github_ci_status".to_string()];
-        let ((_, report_ctx), _) =
-            with_obs_capture(|| registry.select_with_quality("好的", 2, 800, &recent, None));
-        let ctx_count = report_ctx.selected_count;
-
-        assert!(
-            ctx_count > bare_count,
-            "quality path with recent_tools should select MORE than pinned-only: bare={bare_count} ctx={ctx_count}"
-        );
     }
 
     #[test]
@@ -1190,89 +1156,4 @@ mod tests {
 mod pinned_budget_tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn pinned_tools_included_even_with_tiny_budget() {
-        let schemas = vec![
-            json!({"function": {"name": "bash", "description": "Execute shell commands", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}),
-            json!({"function": {"name": "read_file", "description": "Read file contents", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}),
-            json!({"function": {"name": "str_replace", "description": "Replace text in files", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["path", "old_str", "new_str"]}}}),
-            json!({"function": {"name": "git_diff", "description": "Show git diff", "parameters": {"type": "object", "properties": {}}}}),
-            json!({"function": {"name": "git_status", "description": "Show git status", "parameters": {"type": "object", "properties": {}}}}),
-        ];
-
-        let registry = ToolRegistry::new(schemas);
-
-        // Verify pinned schemas are resolved
-        let pinned = registry.pinned_schemas();
-        let pinned_names: Vec<&str> = pinned.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(
-            pinned_names.contains(&"bash"),
-            "bash should be pinned, got: {:?}",
-            pinned_names
-        );
-        assert!(
-            pinned_names.contains(&"read_file"),
-            "read_file should be pinned, got: {:?}",
-            pinned_names
-        );
-        assert!(
-            pinned_names.contains(&"str_replace"),
-            "str_replace should be pinned, got: {:?}",
-            pinned_names
-        );
-
-        // budget_select_measured with budget=0: pinned survive, dynamic excluded.
-        let git_diff_idx = TOOL_CATALOG
-            .iter()
-            .position(|t| t.name == "git_diff")
-            .expect("git_diff must exist in TOOL_CATALOG");
-        let git_status_idx = TOOL_CATALOG
-            .iter()
-            .position(|t| t.name == "git_status")
-            .expect("git_status must exist in TOOL_CATALOG");
-
-        let ranked = vec![(git_diff_idx, 0.8), (git_status_idx, 0.5)];
-        let result = registry.budget_select_measured(&ranked, 0);
-
-        let result_names: Vec<&str> = result
-            .iter()
-            .filter_map(|s| {
-                s.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-            })
-            .collect();
-
-        // Pinned tools present (budget-exempt)
-        assert!(
-            result_names.contains(&"bash"),
-            "bash must survive zero budget, got: {:?}",
-            result_names
-        );
-        assert!(
-            result_names.contains(&"read_file"),
-            "read_file must survive zero budget, got: {:?}",
-            result_names
-        );
-        assert!(
-            result_names.contains(&"str_replace"),
-            "str_replace must survive zero budget, got: {:?}",
-            result_names
-        );
-        // Dynamic tools excluded — proves budget is actually enforced
-        assert!(
-            !result_names.contains(&"git_diff"),
-            "git_diff should be excluded at zero budget"
-        );
-        assert!(
-            !result_names.contains(&"git_status"),
-            "git_status should be excluded at zero budget"
-        );
-        assert_eq!(
-            result_names.len(),
-            3,
-            "only pinned tools should survive zero budget"
-        );
-    }
 }

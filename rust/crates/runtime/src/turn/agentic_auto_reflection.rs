@@ -699,6 +699,7 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
             source: Some("auto_reflection".into()),
             run_id: state.current_run_id.clone(),
             tool_calls: None,
+            ..Default::default()
         });
     }
 

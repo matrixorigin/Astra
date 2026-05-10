@@ -1,0 +1,14 @@
+---
+source: crates/astra-cli/src/tui/slash_menu/popup.rs
+expression: "render_menu(&menu, 80, 10)"
+---
+  /cmd02  description 2
+  /cmd03  description 3
+  /cmd04  description 4
+  /cmd05  description 5
+  /cmd06  description 6
+  /cmd07  description 7
+  /cmd08  description 8
+  /cmd09  description 9
+  /cmd10  description 10
+▌ /cmd11  description 11

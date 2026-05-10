@@ -1,26 +1,77 @@
-# Model configuration for astra-engine
+# ═══════════════════════════════════════════════════════════════════════════════
+# astra-engine — LLM Model Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
 #
-# Copy to .models.yaml and fill in your API keys:
-#   cp .models.yaml.example .models.yaml
+# Quick start:
+#   1. cp .models.yaml.example .models.yaml
+#   2. Fill in your API keys
+#   3. astra-admin model load .models.yaml    # import to running server
+#   4. astra-admin model check <name>         # activate after connectivity probe
 #
-# Load into the running server:
-#   astra-admin model load .models.yaml
+# This file defines available LLM models. Each entry is loaded into the
+# `infra_llm_models` table in MatrixOne. Models are inactive until explicitly
+# checked (connectivity probe) via `astra-admin model check`.
 #
-# Thinking capability is auto-detected at load time (provider-aware probe).
-# No YAML declaration needed.
+# ─── Field Reference ──────────────────────────────────────────────────────────
 #
-# Tags:
-#   selector  — cheap model used for memory extraction / relevance filtering
-#   code      — suitable for coding tasks
-#   chat      — suitable for conversational tasks
-#   reasoning — suitable for complex reasoning tasks
+# Required fields:
+#   name          — Unique model identifier (used in API calls and CLI /model)
+#   provider      — Protocol selector:
+#                     "openai"     — OpenAI-compatible chat/completions (default for most)
+#                     "bedrock"    — AWS Bedrock Converse API
+#                     "anthropic"  — Anthropic Messages API (direct, not via Bedrock)
+#                     "moonshot"   — Moonshot/Kimi (uses OpenAI-compatible protocol)
+#                   Any unrecognized value falls back to OpenAI-compatible protocol.
+#   api_key       — Authentication credential for the provider
+#   base_url      — API base URL (no trailing slash)
 #
-# fallback_chain: ordered list of fallback models for rate-limit recovery.
-# Example: fallback_chain: [qwen-turbo, qwen-flash]
+# Optional fields:
+#   description           — Human-readable description (shown in model list)
+#   tags                  — Capability tags (list). Used for model selection:
+#                             "selector"  — cheap model for intent/memory extraction
+#                             "code"      — suitable for coding tasks
+#                             "chat"      — suitable for conversational tasks
+#                             "reasoning" — suitable for complex reasoning/planning
+#   context_window        — Max input tokens (integer). Affects history truncation.
+#   max_completion_tokens — Max output tokens (integer). Sent to provider.
+#   pricing_prompt        — Cost per token (input), in USD. Used by /stats.
+#   pricing_completion    — Cost per token (output), in USD. Used by /stats.
+#   fallback_chain        — Ordered list of model names for rate-limit recovery.
+#                           Example: [qwen-turbo, qwen-flash]
+#   supported_parameters  — Feature flags (list of strings):
+#                             "tools" — model supports function/tool calling
+#                           Currently only "tools" is checked by the runtime.
+#
+# Thinking/reasoning capability is auto-detected at load time via provider-aware
+# probe. No YAML declaration needed.
+#
+# ─── Provider Notes ───────────────────────────────────────────────────────────
+#
+# OpenAI-compatible (provider: openai):
+#   Works with: DashScope/Qwen, DeepSeek, GLM/ZhipuAI, MiniMax, Ollama,
+#   vLLM, LiteLLM, any OpenAI-compatible endpoint.
+#   base_url examples:
+#     https://dashscope.aliyuncs.com/compatible-mode/v1  — Alibaba DashScope
+#     https://api.deepseek.com/v1                        — DeepSeek
+#     https://open.bigmodel.cn/api/paas/v4               — ZhipuAI (GLM)
+#     https://api.minimax.chat/v1                        — MiniMax
+#     http://localhost:11434/v1                           — Ollama (local)
+#
+# Bedrock (provider: bedrock):
+#   Uses AWS Bedrock Converse API. Requires a Bedrock bearer token
+#   (e.g. AWS_BEARER_TOKEN_BEDROCK), not raw AWS access key/secret.
+#   base_url: https://bedrock-runtime.<region>.amazonaws.com
+#
+# Anthropic (provider: anthropic):
+#   Direct Anthropic Messages API (not via Bedrock).
+#   base_url: https://api.anthropic.com
+#   api_key: your Anthropic API key (sk-ant-...)
+#
+# Moonshot/Kimi (provider: moonshot):
+#   Uses OpenAI-compatible protocol internally. Separate provider name
+#   enables Kimi-specific pricing/quirks detection.
 
 # ── AWS Bedrock / Claude via Converse ───────────────────────
-# Current Astra Bedrock integration expects a Bedrock bearer token
-# (for example AWS_BEARER_TOKEN_BEDROCK), not raw AWS access key/secret.
 - name: us.anthropic.claude-opus-4-6-v1
   provider: bedrock
   api_key: ABSK-your-bedrock-bearer-token

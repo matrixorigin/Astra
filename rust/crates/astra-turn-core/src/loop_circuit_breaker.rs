@@ -17,6 +17,12 @@ pub struct RoundSignal {
     pub tool_signatures: BTreeSet<String>,
     /// Whether this round produced a mutation (file write, shell with side effects).
     pub produced_mutation: bool,
+    /// Whether this round produced strong evidence that the user task is complete.
+    ///
+    /// This is a positive completion signal, not an anomaly. Callers should set
+    /// it only from structured execution evidence (for example a successful
+    /// `git_commit` round), not from natural-language completion phrases.
+    pub task_completed: bool,
     /// Number of tool calls this round.
     pub tool_count: usize,
 }
@@ -44,6 +50,9 @@ pub enum BreakerAction {
     /// Periodic self-reflection prompt. Injected every N consecutive read-only
     /// rounds. Tools remain enabled — the model decides whether to continue.
     Introspect { consecutive_read_only: usize },
+    /// Suggest that the next model round should stop unless it can identify
+    /// concrete remaining work. Tools remain enabled.
+    SoftStop,
     /// Inject a correction message (stall detected, tools disabled next round).
     InjectCorrection,
     /// Hard abort — agent did not recover after correction.
@@ -190,6 +199,13 @@ impl LoopCircuitBreaker {
         if self.rounds.len() >= self.config.absolute_max_rounds {
             self.state = BreakerState::Open;
             return BreakerAction::Abort;
+        }
+
+        if self.rounds.last().is_some_and(|round| round.task_completed) {
+            self.state = BreakerState::Closed;
+            self.half_open_rounds = 0;
+            self.consecutive_read_only = 0;
+            return BreakerAction::SoftStop;
         }
 
         match self.state {
@@ -373,7 +389,17 @@ mod tests {
         RoundSignal {
             tool_signatures: sig(tools),
             produced_mutation: mutation,
+            task_completed: false,
             tool_count: tools.len(),
+        }
+    }
+
+    fn completion_signal() -> RoundSignal {
+        RoundSignal {
+            tool_signatures: sig(&["git_commit:{\"message\":\"finish\"}"]),
+            produced_mutation: true,
+            task_completed: true,
+            tool_count: 1,
         }
     }
 
@@ -413,6 +439,33 @@ mod tests {
             cb.observe(signal(&["write_file:a.rs"], true)),
             BreakerAction::Continue
         );
+        assert_eq!(cb.state(), BreakerState::Closed);
+    }
+
+    #[test]
+    fn completion_signal_emits_soft_stop_without_opening_breaker() {
+        let mut cb = LoopCircuitBreaker::new(BreakerConfig::default());
+
+        assert_eq!(cb.observe(completion_signal()), BreakerAction::SoftStop);
+        assert_eq!(cb.state(), BreakerState::Closed);
+    }
+
+    #[test]
+    fn completion_signal_takes_precedence_over_repetition_correction() {
+        let mut cb = LoopCircuitBreaker::new(BreakerConfig::default());
+
+        assert_eq!(
+            cb.observe(signal(&["read_file:same.rs"], false)),
+            BreakerAction::Continue
+        );
+        assert_eq!(
+            cb.observe(signal(&["read_file:same.rs"], false)),
+            BreakerAction::Continue
+        );
+        let mut done = completion_signal();
+        done.tool_signatures = sig(&["read_file:same.rs"]);
+
+        assert_eq!(cb.observe(done), BreakerAction::SoftStop);
         assert_eq!(cb.state(), BreakerState::Closed);
     }
 
@@ -628,6 +681,7 @@ mod tests {
         let empty = RoundSignal {
             tool_signatures: BTreeSet::new(),
             produced_mutation: false,
+            task_completed: false,
             tool_count: 0,
         };
         // Empty rounds should not trigger repetition (they're text-only responses).
@@ -731,6 +785,7 @@ mod tests {
                 cb.observe(RoundSignal {
                     tool_signatures: BTreeSet::new(),
                     produced_mutation: false,
+                    task_completed: false,
                     tool_count: 0,
                 });
             }
@@ -754,8 +809,8 @@ mod tests {
 
     // ─── Progress-aware read_only_stall ───────────────────────────────
 
-    /// BreakerAction has exactly 4 variants. Introspect is a soft self-check;
-    /// InjectCorrection is the hard stall correction.
+    /// BreakerAction has exactly 5 variants. Introspect/SoftStop are soft
+    /// interventions; InjectCorrection is the hard stall correction.
     #[test]
     fn breaker_action_variants_are_exhaustively_handled() {
         let actions = [
@@ -763,6 +818,7 @@ mod tests {
             BreakerAction::Introspect {
                 consecutive_read_only: 12,
             },
+            BreakerAction::SoftStop,
             BreakerAction::InjectCorrection,
             BreakerAction::Abort,
         ];
@@ -771,6 +827,7 @@ mod tests {
                 BreakerAction::Continue => {}
                 BreakerAction::InjectCorrection => {}
                 BreakerAction::Introspect { .. } => {}
+                BreakerAction::SoftStop => {}
                 BreakerAction::Abort => {}
             }
         }

@@ -1,0 +1,6 @@
+---
+source: crates/astra-cli/src/tui/history_cell/tool.rs
+expression: "render(&ok_tool(\"bash\", \"ls /tmp\", 42), 80, 3)"
+---
+• Ran bash (42ms)
+  │ ls /tmp

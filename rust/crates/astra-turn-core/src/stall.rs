@@ -21,6 +21,45 @@ pub enum StallDetectionError {
 /// (e.g. read_file with different args each turn) triggered false stalls.
 pub const SERVER_STALL_WINDOW: usize = 3;
 
+/// When this many consecutive rounds emit the exact same tool-call
+/// signature, the agent is stuck in a hard loop — no amount of additional
+/// soft nudges is going to unstick it. Past this threshold we flip
+/// `force_stop` on the next verdict so the dispatcher terminates the turn
+/// with a clear reason.
+///
+/// Session 05e63cac t10 observed four identical `cargo clippy` calls
+/// (r0-r3) and later three identical `git status` calls (r43/47/48)
+/// followed by `echo ok` twice; the existing 3-nudge-limit ran out at
+/// round ~3 and the loop kept burning tool rounds until
+/// `token_budget_exceeded`. Hard-stop at >= 5 catches the pathology
+/// well past the nudge quota while leaving room for legitimate
+/// exponential-backoff retry patterns.
+pub const CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP: usize = 5;
+
+/// Count how many of the most recent `turn_sigs` entries share the same
+/// full `name+args` signature set. Used to decide whether we've crossed
+/// the [`CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP`] threshold.
+#[must_use]
+pub fn trailing_identical_sig_depth(turn_sigs: &[BTreeSet<String>]) -> usize {
+    let Some(last) = turn_sigs.last() else {
+        return 0;
+    };
+    // Trivial/degenerate inputs (empty sig set) don't represent real
+    // tool activity and shouldn't count as a stall signal.
+    if last.is_empty() {
+        return 0;
+    }
+    let mut count = 1usize;
+    for prev in turn_sigs.iter().rev().skip(1) {
+        if prev == last {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
 /// User-visible error prefix when the agentic loop exhausts the per-request remaining-turn budget.
 /// Call sites append the actual budget number, e.g. `format!("{} (budget: {} turns)", MSG, n)`.
 pub const CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG: &str = "Turn budget exhausted. To increase, set ASTRA_MAX_TURNS (interactive) or ASTRA_PLAN_SUBTASK_MAX_TURNS (plan subtasks).";
@@ -804,6 +843,44 @@ mod tests {
             .iter()
             .map(|tools| tools.iter().map(|t| format!("{}:{{}}", t)).collect())
             .collect()
+    }
+
+    #[test]
+    fn trailing_identical_sig_depth_counts_streak_from_tail() {
+        assert_eq!(trailing_identical_sig_depth(&[]), 0);
+        assert_eq!(trailing_identical_sig_depth(&make_sigs(&[&["bash"]])), 1);
+        assert_eq!(
+            trailing_identical_sig_depth(&make_sigs(&[&["bash"], &["bash"]])),
+            2,
+        );
+        assert_eq!(
+            trailing_identical_sig_depth(&make_sigs(&[
+                &["bash"],
+                &["bash"],
+                &["bash"],
+                &["bash"],
+                &["bash"],
+            ])),
+            5,
+        );
+    }
+
+    #[test]
+    fn trailing_identical_sig_depth_resets_on_different_last() {
+        // 3 identical then a different call → depth is 1 (just the last).
+        assert_eq!(
+            trailing_identical_sig_depth(&make_sigs(&[&["bash"], &["bash"], &["bash"], &["git"],])),
+            1,
+        );
+    }
+
+    #[test]
+    fn trailing_identical_sig_depth_empty_set_does_not_count() {
+        // An empty signature set (e.g. a round with no tool calls) is
+        // degenerate; treating it as "identical" would double-count
+        // round gaps. Return 0.
+        let sigs: Vec<BTreeSet<String>> = vec![BTreeSet::new(), BTreeSet::new()];
+        assert_eq!(trailing_identical_sig_depth(&sigs), 0);
     }
 
     #[test]

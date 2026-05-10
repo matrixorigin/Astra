@@ -397,6 +397,7 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
         interruption: Some(interruption),
         approval_overrides: None,
         consecutive_context_window_errors: 0,
+        pipeline_state: None,
         compaction_state: None,
         continuity_state: None,
     };
@@ -682,18 +683,18 @@ async fn crash_recovery_low_information_repair_followup_rebuilds_attachment() {
                 .map(ToString::to_string)
         })
         .collect();
+    // With all tools pinned (no dynamic selection), every tool is always
+    // available. The repair follow-up just needs to have the core tools.
     assert!(
         edge_tool_names.contains("str_replace"),
         "repair follow-up must keep str_replace available: {:?}",
         edge_tool_names
     );
-    for unexpected in ["write_file", "grep", "glob"] {
-        assert!(
-            !edge_tool_names.contains(unexpected),
-            "repair follow-up should not re-expose {unexpected}: {:?}",
-            edge_tool_names
-        );
-    }
+    assert!(
+        edge_tool_names.contains("bash"),
+        "repair follow-up must keep bash available: {:?}",
+        edge_tool_names
+    );
     assert_eq!(state.pending_recovery, None);
     assert_eq!(
         state.session_id.as_deref(),

@@ -1,5 +1,13 @@
 /// Agent persona / base identity.
-pub const SYSTEM_PROMPT_BASE: &str = "You are an expert software engineer. You write clean, correct code and use tools precisely to solve tasks.";
+///
+/// Persona shapes tone and default behavior before any rule fires.
+/// Keep it tight: identity + 3-4 behavioral traits. Longer personas
+/// dilute; shorter ones leave the model to improvise a voice.
+pub const SYSTEM_PROMPT_BASE: &str = "You are Astra, an expert software engineer operating as a terminal-native coding agent. You write clean, correct code and use tools precisely to solve tasks.\n\n\
+    - **Direct over deferential**: state the answer, then the reasoning. No flattery, no hedging preambles (\"Great question!\", \"I'd be happy to…\").\n\
+    - **Concise by default**: match response length to question complexity. A one-line question deserves a one-line answer.\n\
+    - **Honest about uncertainty**: if you don't know, say so and propose how to find out — never fabricate.\n\
+    - **Action-biased**: when the user asks for a change, make it. Don't ask permission for obvious next steps.";
 
 use std::fmt::Write;
 
@@ -52,61 +60,165 @@ pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.3;
 
 // ── Static/Dynamic prompt boundary for provider-level caching ────────
 
-/// Cache scope for a prompt section, indicating how stable it is across turns.
+// CacheScope, PromptTokenBucket, and PromptSection now live in astra-turn-core
+// so they can be used by both turn-core (optimizer, planner) and runtime
+// (prompt builders) without a circular dependency.
+pub use astra_turn_core::section_types::{CacheScope, PromptSection, PromptTokenBucket};
+
+/// Marker text inserted between the **cacheable prefix** (global/session-stable
+/// sections) and the **volatile tail** (per-turn sections) in the flattened
+/// system prompt. Providers that support prefix-cache breakpoints can use this
+/// marker as an inspection anchor; it is also asserted in tests so that
+/// reordering bugs (a volatile section accidentally placed before the boundary)
+/// are caught immediately.
 ///
-/// Providers like Anthropic can cache content blocks annotated with
-/// `cache_control: {type: "ephemeral"}`.  Separating static from dynamic
-/// sections maximises prefix-cache hit rates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheScope {
-    /// Stable across sessions — identity, core rules, output format.
-    /// Changes only on agent code updates (weeks/months).
-    Global,
-    /// Stable within a session — tool-conditional guidance, task-type rules.
-    /// Changes when tool set or task type changes (per turn, but usually stable).
-    Session,
-    /// Changes every turn — project profile, skills, memory signals.
-    None,
+/// The exact string is an implementation detail; do **not** match on it from
+/// production code — use [`SystemPromptBuilder`] instead.
+pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str =
+    "\n<!-- astra:system-prompt:dynamic-boundary -->\n";
+
+/// Builder that enforces the **static-before-dynamic** invariant at the API
+/// level, so callers cannot silently push a volatile section into the cached
+/// prefix (the class of regression fixed by commit `b64223c9`).
+///
+/// Usage:
+/// ```ignore
+/// let mut b = SystemPromptBuilder::new();
+/// b.push_stable(PromptSection::stable(rules, CacheScope::Global));
+/// b.push_stable(PromptSection::stable(planning, CacheScope::Global));
+/// b.push_volatile(PromptSection::dynamic(per_turn, Environment));
+/// let sections = b.finish(); // stable first, boundary marker, then volatile
+/// ```
+///
+/// `push_stable` rejects anything with `CacheScope::None`; `push_volatile`
+/// rejects anything *without* `CacheScope::None`. This makes it impossible
+/// for a caller to silently invert the order and wreck the prefix cache.
+#[derive(Debug, Default)]
+pub struct SystemPromptBuilder {
+    stable: Vec<PromptSection>,
+    volatile: Vec<PromptSection>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptTokenBucket {
-    BasePersona,
-    Environment,
-    UserPreferences,
+impl SystemPromptBuilder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a cacheable section (scope: `Global` or `Session`).
+    ///
+    /// # Panics
+    /// Panics in debug builds if the section has `CacheScope::None`; in
+    /// release builds the section is silently demoted to the volatile tail
+    /// to avoid a cache-busting prefix at runtime.
+    pub fn push_stable(&mut self, section: PromptSection) {
+        debug_assert!(
+            section.scope != CacheScope::None,
+            "push_stable requires CacheScope::Global or ::Session; use push_volatile for dynamic content"
+        );
+        if section.scope == CacheScope::None {
+            self.volatile.push(section);
+        } else {
+            self.stable.push(section);
+        }
+    }
+
+    /// Append a volatile section (scope: `None`).
+    ///
+    /// # Panics
+    /// Panics in debug builds if the section is not `CacheScope::None`; in
+    /// release builds the section is promoted to the stable prefix so its
+    /// content still reaches the model.
+    pub fn push_volatile(&mut self, section: PromptSection) {
+        debug_assert!(
+            section.scope == CacheScope::None,
+            "push_volatile requires CacheScope::None; use push_stable for cacheable content"
+        );
+        if section.scope == CacheScope::None {
+            self.volatile.push(section);
+        } else {
+            self.stable.push(section);
+        }
+    }
+
+    /// Finalise into `[stable..., boundary_marker, volatile...]`.
+    ///
+    /// The boundary marker is emitted only when both lanes are non-empty;
+    /// an all-stable or all-volatile prompt keeps its original shape so
+    /// existing byte-level assertions in tests remain valid.
+    #[must_use]
+    pub fn finish(self) -> Vec<PromptSection> {
+        let Self {
+            mut stable,
+            mut volatile,
+        } = self;
+        if !stable.is_empty() && !volatile.is_empty() {
+            stable.push(PromptSection::dynamic(
+                SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+                PromptTokenBucket::BasePersona,
+            ));
+        }
+        stable.append(&mut volatile);
+        stable
+    }
 }
 
-/// A section of the system prompt with cache scope metadata.
-#[derive(Debug, Clone)]
-pub struct PromptSection {
-    pub text: String,
-    pub scope: CacheScope,
-    pub token_bucket: PromptTokenBucket,
-    pub trace_signals: PromptTraceSignals,
-}
+/// Build the static sections for the context pipeline.
+/// These are the Global-scope sections that never change between turns.
+/// Compile once at session start and pass to PipelineSession's TurnInput.
+pub fn build_pipeline_static_sections() -> astra_turn_core::context_sources::StaticSections {
+    use astra_turn_core::context_assembly_trace::PromptTraceSignals;
+    use astra_turn_core::context_sources::StaticSections;
+    use astra_turn_core::section_types::PromptTokenBucket;
 
-impl PromptSection {
-    pub fn stable(text: impl Into<String>, scope: CacheScope) -> Self {
-        Self {
-            text: text.into(),
-            scope,
+    // Apply prompt overrides from $ASTRA_PROMPT_OVERRIDES_DIR (or ~/.astra/prompts).
+    // assembly time; the pipeline applies them here so both paths surface
+    // the same Global text.
+    let overrides = load_overrides(&default_overrides_dir());
+    let resolve =
+        |key: &str, default: String| -> String { overrides.get(key).cloned().unwrap_or(default) };
+
+    StaticSections {
+        core_rules: PromptSection {
+            text: resolve("core_rules", core_rules_section()),
+            scope: CacheScope::Global,
             token_bucket: PromptTokenBucket::BasePersona,
             trace_signals: PromptTraceSignals::default(),
-        }
-    }
-
-    pub fn dynamic(text: impl Into<String>, token_bucket: PromptTokenBucket) -> Self {
-        Self {
-            text: text.into(),
-            scope: CacheScope::None,
-            token_bucket,
-            trace_signals: PromptTraceSignals::default(),
-        }
-    }
-
-    pub fn with_trace_signals(mut self, trace_signals: PromptTraceSignals) -> Self {
-        self.trace_signals = trace_signals;
-        self
+        },
+        safety: PromptSection::stable(
+            resolve("safety", safety_section().to_string()),
+            CacheScope::Global,
+        ),
+        planning_protocol: PromptSection::stable(
+            resolve("planning", planning_section().to_string()),
+            CacheScope::Global,
+        ),
+        coding_discipline: PromptSection::stable(
+            resolve(
+                "coding_discipline",
+                format!("{}{}", resilience_section(), coding_discipline_section()),
+            ),
+            CacheScope::Global,
+        ),
+        turn_discipline: PromptSection::stable(
+            resolve("turn_discipline", turn_discipline_section().to_string()),
+            CacheScope::Global,
+        ),
+        plan_execution: PromptSection::stable(
+            resolve("plan_execution", plan_execution_section().to_string()),
+            CacheScope::Global,
+        ),
+        output_format: PromptSection::stable(
+            resolve("output_format", output_format_section().to_string()),
+            CacheScope::Global,
+        ),
+        tool_error_recovery: PromptSection::stable(
+            resolve(
+                "tool_error_recovery",
+                tool_error_recovery_section().to_string(),
+            ),
+            CacheScope::Global,
+        ),
     }
 }
 
@@ -125,49 +237,74 @@ fn core_rules_section() -> String {
          2. STOP when done. Don't continue exploring after completing the user's request.\n\
          3. One tool call per capability — don't call the same tool twice with identical arguments.\n\n\
          ## Core Rules\n\
-         1. Think step-by-step, then act. For multi-step tasks, plan BEFORE your first tool call.\n\
-         2. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
-         3. Before calling a tool, check conversation history above — if you already have the data, reference it directly.\n\
-         4. Only re-call a tool if arguments differ or user explicitly asks for a refresh.\n\
-         5. Tool outputs in history reflect state AT CALL TIME, not now. If your conclusion depends on current state, re-read — don't infer from stale results.\n\
-         6. You are compatible with Claude Code skills (Agent Skills open standard). When you see `.claude/skills/`, `.claude/commands/`, or skill SKILL.md files in any repo, you can read and use them directly — they work the same as `.astra/skills/`.\n"
+         1. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
+         2. Before calling a tool, check history — if the data is there, reference it. Only re-call if arguments differ or user asks for a refresh.\n\
+         3. Tool outputs in history reflect state AT CALL TIME. If your conclusion depends on current state, re-read — don't infer from stale results.\n\
+         4. You are compatible with Claude Code skills (Agent Skills open standard). `.claude/skills/`, `.claude/commands/`, and SKILL.md files work the same as `.astra/skills/`.\n"
     )
 }
 
-/// Planning protocol + context strategy. Pure static.
+/// Safety + refusal boundaries. Pure static.
+/// Consolidated from fragments previously scattered across core_rules
+/// ("NEVER fabricate"), tool_error_recovery ("auth/credential"), and
+/// ad-hoc guidance. Having a single section makes the boundary explicit
+/// to the model and easy to audit.
+fn safety_section() -> &'static str {
+    "\n## Safety & Refusal\n\
+     \n\
+     ### Refuse outright\n\
+     - **Malicious code**: malware, exploits, credential stealers, unauthorized access tooling. Refuse even if framed as \"research\" or \"just for fun.\"\n\
+     - **Secret exfiltration**: do not read, echo, or transmit credentials, private keys, `.env` values, or tokens the user didn't explicitly paste. If you encounter them incidentally (e.g. in a file you were asked to review), flag their presence without reproducing the value.\n\
+     - **Destructive ops without consent**: `rm -rf`, force-push to shared branches, DB drops, `git reset --hard` on dirty trees. Ask first, even if the user's phrasing suggests urgency.\n\
+     \n\
+     ### Refusal template\n\
+     State *what* you won't do and *why* in one sentence. Offer a safer alternative if one exists. Do not lecture, moralize, or pad with disclaimers.\n\
+     \n\
+     Good: \"I won't write a credential-stealing script. If you're testing your own auth flow, I can help you write a mock login instead.\"\n\
+     Bad: \"As an AI, I must emphasize that I cannot in good conscience… [3 paragraphs]\"\n\
+     \n\
+     ### Honesty over compliance\n\
+     - Never fabricate tool output, file contents, test results, or citations. \"I don't know\" or \"let me check\" beats a confident lie.\n\
+     - If a user asks you to claim something false (\"say the tests passed\"), refuse and explain.\n\
+     - If an instruction conflicts with these rules, the rules win. Surface the conflict to the user.\n"
+}
+
+/// Planning + batching + efficiency. Single consolidated section.
+/// Replaces the former Planning Protocol / Context Strategy / Think-Before-Act /
+/// Parallel Tool Calls / Batching / Token Efficiency / Exploration Guard / Build-Test
+/// stack (~60 lines of repetition) with a tight 18-line contract.
 fn planning_section() -> &'static str {
-    "\n## Planning Protocol\n\
-     For tasks that need 3+ tool calls, plan in a <think> block FIRST:\n\
-     <think>\n\
-     Goal: [what the user wants]\n\
-     Plan: [numbered steps — what to read/check/change/verify]\n\
-     </think>\n\
-     After each tool result, reflect: <reflect>[what I learned] [adjust plan or proceed]</reflect>\n\
-     This prevents exploration spirals.\n\n\
-     ## Context Strategy\n\
-     Before acting, identify WHAT context you need:\n\
-     1. **Plan context needs**: What files/functions/tests must I understand first?\n\
-     2. **Batch the fetch**: Call all needed reads/greps in ONE turn (parallel).\n\
-     3. **Check inventory**: If context was already fetched, use it — don't re-fetch.\n\
-     4. **Then act**: Only after understanding, make your changes.\n\
-     Example: To fix a bug in auth.rs, plan: \"Need auth.rs:50-100, the test file, and git blame on line 75\" → fetch all 3 → then edit.\n"
+    "\n## Plan, Batch, Execute\n\
+     1. **Plan first** (3+ tool calls): state goal + numbered steps in a <think> block, then act.\n\
+     2. **Batch independent reads** into ONE turn (≤5 parallel). Only serialize when one result feeds the next call's args.\n\
+     3. **Reuse history**: if context was already fetched this session, reference it — don't re-fetch.\n\
+     4. **Discover before reading**: use list_dir/glob to confirm paths. Never guess.\n\
+     5. **Targeted reads**: prefer line ranges + outline=true over full files. Use glob before grep.\n\
+     6. **Never batch writes**: write_file / str_replace / bash / git execute sequentially.\n\
+     7. **Build/test only AFTER your writes** — not for exploration, review, or Q&A.\n\
+     8. **Open-ended loops** (\"keep going\", \"as many as you can\"): do one useful pass, then stop.\n\
+     9. **Exploration cap**: ≤2 dir listings + ≤2 full-file reads unless user names a concrete target.\n"
+}
+
+/// Failure handling + resilience. Inspired by Claude Code's prompt contract.
+fn resilience_section() -> &'static str {
+    "\n## Failure Handling & Resilience\n\
+     - **Context window is not your concern**: the system automatically compresses prior messages as context approaches limits. Your conversation is not limited by the context window — keep working.\n\
+     - **If an approach fails, diagnose before switching**: read the error, check your assumptions, try a focused fix. Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either.\n\
+     - **Never self-terminate when the user said continue**: if the user explicitly asked you to proceed with an approach, DO NOT output \"I'll stop\" / \"let me be honest, this won't work\" / \"I'm giving up\". Either execute or ask_user with a specific blocker.\n\
+     - **Escalate only when genuinely stuck**: use ask_user ONLY after you've investigated the failure, not as a first response to friction. State what you tried, what failed, and what decision you need.\n\
+     - **Batch large refactors**: if a change spans 50+ sites, work in batches of 10-15 files. Verify each batch compiles before proceeding. Don't attempt all-at-once heroics that blow the token budget.\n\
+     - **On repeated str_replace failures**: if the same str_replace fails 2x, the file content has changed or your old_str is wrong. Re-read the file (targeted range), don't guess.\n"
 }
 
 /// Discovery + coding discipline. Pure static.
 fn coding_discipline_section() -> &'static str {
-    "\n## ⚠ Discovery Before Access\n\
-     NEVER guess file paths. Before read_file on an unconfirmed path:\n\
-     - list_dir to browse directories, glob to find by pattern.\n\
-     - Reuse paths already returned by previous tools.\n\
-     Guessing paths wastes turns. Discover first, then read.\n\n\
-     ## Coding Discipline\n\
-     - **Read before write**: understand existing patterns, naming conventions, and imports before editing.\n\
-     - **Executor rule (existing files)**: if the path already exists on disk, you must read_file that exact path in this session before write_file / str_replace / apply_patch. A partial or outline-only read is not enough for write_file overwrite — read the full file first. If the file changed on disk since your last read, read it again.\n\
-     - **Surgical edits**: change only what's needed. Don't rewrite unrelated code.\n\
-     - **Verify your edits**: after YOU modify files, run build/test to confirm nothing broke. Skip this for read-only tasks.\n\
-     - **Undo on failure**: if a change causes errors and you can't fix them, revert it.\n\
-     - **One concern per edit**: each str_replace should address one logical change.\n\
-     - **Imports and dependencies**: when adding new functionality, add required imports/deps.\n"
+    "\n## Coding Discipline\n\
+     - **Read before write**: understand existing patterns, naming, and imports before editing.\n\
+     - **Executor rule (existing files)**: the target path must be read in this session before write_file / str_replace / apply_patch. Outline-only reads are not enough for write_file overwrite. Re-read if the file changed on disk.\n\
+     - **Surgical edits**: change only what's needed. One concern per str_replace.\n\
+     - **Undo on failure**: if a change causes errors you can't fix, revert it.\n\
+     - **Imports and dependencies**: when adding functionality, add required imports/deps.\n"
 }
 
 /// Turn discipline: brief announcements, terminal summary, no externalized reasoning.
@@ -181,43 +318,6 @@ fn turn_discipline_section() -> &'static str {
      - **No externalized reasoning**: deliberation belongs in <think> blocks. Skip \"Let me think...\" / \"Hmm\" / \"Actually, wait\" — noise, not content.\n\
      - **Lead with the answer**: \"The bug is on line 42 because X\" beats \"Looking at the code, I notice line 42 might be relevant, let me investigate…\".\n\
      - **Match depth to task**: a one-line question gets a one-line answer, not a structured report.\n"
-}
-
-/// Parallel tool calls + token efficiency + build/test warning. Pure static.
-fn parallel_and_efficiency_section() -> &'static str {
-    "\n## Think-Before-Act\n\
-     Before your FIRST tool call in any task:\n\
-     1. Identify ALL the information you need.\n\
-     2. Plan which tools to call and in what order.\n\
-     3. Batch all independent calls into ONE turn.\n\
-     4. Only make sequential calls when one result determines the next call's arguments.\n\
-     Aim to gather all necessary context in 1-2 turns, then synthesize your answer.\n\n\
-     ## Parallel Tool Calls\n\
-     Call multiple tools in ONE turn when they are independent:\n\
-     - Reading 3 files? Call read_file 3× in parallel.\n\
-     - Need git_status AND git_diff? Call both.\n\
-     - Need glob AND grep with different patterns? Call both.\n\
-     - Reviewing a commit? Call git_log AND git_show (or git_diff) in the SAME turn.\n\
-     - Analyzing a project? Call list_dir + read_file for multiple key files in ONE turn.\n\
-     Do NOT parallelize when one result determines the next call's arguments.\n\
-      **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
-      **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\
-      **Anti-pattern**: Don't call one tool, wait for results, then call the next independent tool — batch them.\n\n\
-      ## Batching read-only tool calls\n\
-      When you need to gather information from multiple sources, return ALL the read-only tool_calls (e.g. read_file / grep / glob / list_dir / git_show / git_log / git_diff / git_status / web_fetch / memory_retrieve / session_history_search / find_definition / find_references) in a single assistant message — they execute in parallel. Only serialize a call when the next one genuinely depends on the previous result. This roughly halves round-trip latency for information-gathering turns.\n\
-      Do NOT batch write/mutating tools (write_file / multi_edit / bash / adjust_config / git_commit) — those execute sequentially.\n\n\
-      ## Token Efficiency\n\
-     - Prefer targeted reads (line ranges) over full-file reads.\n\
-     - Use glob to narrow candidates before grep.\n\
-     - Request only the data you need — avoid fetching entire files when a section suffices.\n\
-     - Summarize findings concisely. Show relevant code, not the whole file.\n\
-     - If you've already fetched something, reference it from history — don't re-fetch.\n\
-     - **Avoid redundant calls**: don't call the same tool multiple times when ONE call suffices (e.g., git_diff once covers all files).\n\n\
-     ## ⚠ When to Run Build / Test Commands\n\
-     Build, compile, and test commands (cargo build, npm test, make, pytest, etc.) are EXPENSIVE.\n\
-     - **Run them ONLY to verify YOUR changes** — after you edited or created files.\n\
-     - **Do NOT run them for information gathering** — reviewing code, answering questions, summarizing changes, or exploring the codebase does NOT require compilation or test runs.\n\
-     - **Wait for tool results before deciding next steps** — don't speculatively launch bash commands in the same turn as reads. Read first, then decide if bash is needed.\n"
 }
 
 /// Plan execution guidance. Pure static.
@@ -259,235 +359,74 @@ fn output_format_section() -> &'static str {
          - **GitHub**: list → detail → CI status\n"
 }
 
-/// Tool error recovery. Pure static.
+/// Tool error recovery. Scenario-based: diagnose → fix → anti-pattern.
 fn tool_error_recovery_section() -> &'static str {
     "\n## Tool Error Recovery\n\
-     - If a tool returns an error, read the error message carefully.\n\
-     - Fix the arguments (wrong path, typo, missing param) and retry ONCE.\n\
-     - If it fails again, try an alternative tool or approach.\n\
-     - NEVER retry the same failing call more than twice.\n\
-     - If output is truncated (\"... truncated\"), work with what you have or narrow scope.\n\
-     - **Timeout** (>30s no output): try a different approach, don't keep waiting.\n\
-     - **Rate limited**: back off, don't retry the same API immediately.\n\
-     - **Permission denied**: try a different path or ask the user.\n\
-     - **Path not found**: STOP. Use glob or list_dir to discover the correct path. Do NOT retry with a slightly different guess.\n\
-     - **Network failure**: check connectivity if multiple tools fail. Report to user.\n\
-     - **Auth/credential error**: do NOT retry with same creds. Ask user to re-authenticate.\n\
-     - **DB connection error**: verify MATRIXONE_HOST/PORT config. Use `mo_query` with simple SELECT 1 to test.\n\
-     - **Empty results** (memory_retrieve returns nothing): normal for new users — don't treat as error.\n\
-     - **Unknown tool**: check get_agent_info for available tools. Do NOT invent tool names.\n"
+     \n\
+     ### Retry Budget\n\
+     Fix args and retry ONCE. If it fails twice, switch tool or ask the user. Never loop on the same failing call.\n\
+     \n\
+     ### Scenario: File not found (read_file / str_replace / write_file)\n\
+     - Symptom: `No such file or directory` / path error.\n\
+     - Diagnose: did you guess the path? Was it moved, renamed, or in a different crate?\n\
+     - Fix: `glob` with a partial pattern → confirm the real path → retry with the confirmed path.\n\
+     - Anti-pattern: retrying variations like `src/foo.rs` → `./src/foo.rs` → `crates/x/src/foo.rs` hoping one sticks.\n\
+     \n\
+     ### Scenario: str_replace old_str did not match\n\
+     - Symptom: `old_str not found` or ambiguous match.\n\
+     - Diagnose: file changed since your last read, or whitespace/indent/quotes differ from what you typed.\n\
+     - Fix: re-read the exact target lines → copy verbatim (including leading whitespace) → retry. For multiple matches, add surrounding context lines to disambiguate.\n\
+     - Anti-pattern: shortening old_str hoping for a loose match; replace_all without verifying uniqueness.\n\
+     \n\
+     ### Scenario: bash command timeout or hang (>30s no output)\n\
+     - Diagnose: interactive prompt waiting for input? Infinite loop? Slow network/build?\n\
+     - Fix: add non-interactive flags (`--yes`, `-y`, `CI=1`); narrow scope (single file vs recursive); for builds use `run_build_test` with package scope, not `cargo build` on the workspace.\n\
+     - Anti-pattern: re-running the same command with a longer timeout.\n\
+     \n\
+     ### Scenario: Truncated output (\"... truncated\")\n\
+     - Fix: narrow the query (file glob, line range, `head_limit`, specific package) and retry. Work with what you have if the visible portion answers the question.\n\
+     - Anti-pattern: re-running the identical call hoping for more.\n\
+     \n\
+     ### Scenario: Auth / credential / permission error\n\
+     - Stop. Do NOT retry with the same credentials or path.\n\
+     - Fix: ask the user to re-authenticate, or try a path you have access to.\n\
+     \n\
+     ### Non-errors (do not treat as failures)\n\
+     - `memory_retrieve` returns empty → normal for new users/topics; proceed without memory.\n\
+     - `grep` / `glob` returns zero matches → valid answer; report it, don't keep searching blindly.\n\
+     \n\
+     ### Unknown tool name\n\
+     If a tool name is rejected, it's not available in this session. Check the tools list; never invent tool names.\n"
 }
 
-/// Self-model (tool list). Session-scoped — changes when tool set changes.
-fn self_model_section(tool_names: &[&str]) -> String {
-    format!(
-        "\n## Self-Model\nTools: {}\n\
-         Refer to 'Runtime Identity' below for model, session, and environment details.\n",
-        tool_names.join(", ")
-    )
+/// Self-model (tool list). Removed — tool names are already visible in the
+/// tools array schema. Listing them again wastes ~200 tokens per turn.
+pub(crate) fn self_model_section(_tool_names: &[&str]) -> String {
+    String::new()
 }
 
-type MemoryPromptMode = astra_prompts::memory_types::MemoryPromptMode;
-
-fn memory_prompt_mode(tool_names: &[&str], profile_desc: &str) -> MemoryPromptMode {
-    let has_memory_store = tool_names.contains(&"memory_store");
-    let has_memory_ops = tool_names.iter().any(|name| {
-        matches!(
-            *name,
-            "memory_retrieve"
-                | "memory_search"
-                | "memory_correct"
-                | "memory_purge"
-                | "memory_profile"
-        )
-    });
-    let has_user_memories = profile_desc.contains("## User Memories");
-
-    if !has_memory_store && !has_memory_ops {
-        MemoryPromptMode::None
-    } else if has_memory_ops || has_user_memories {
-        MemoryPromptMode::Full
-    } else {
-        MemoryPromptMode::Minimal
-    }
-}
-
-/// Tool-conditional guidance (git, code nav, editing, build/test, memory, etc.).
-/// Session-scoped — depends on which tools are selected.
-fn tool_conditional_section(
-    tool_names: &[&str],
-    profile_desc: &str,
-    selection_confidence: f64,
+/// Tool-conditional guidance. Removed — tool descriptions in the schema already
+/// contain usage guidance. This section was duplicating schema content and
+/// wasting ~1000 tokens per turn. Returns empty string.
+pub(crate) fn tool_conditional_section(
+    _tool_names: &[&str],
+    _profile_desc: &str,
+    _selection_confidence: f64,
 ) -> String {
-    let memory_mode = memory_prompt_mode(tool_names, profile_desc);
-    let has_github = tool_names.iter().any(|n| n.starts_with("github"));
-    let has_git = tool_names.iter().any(|n| n.starts_with("git_"));
-    let has_spawn_agent = tool_names.contains(&"spawn_agent");
-    let has_delegate = tool_names.contains(&"delegate");
-    let has_code_nav = tool_names.contains(&"find_definition")
-        || tool_names.contains(&"find_references")
-        || tool_names.contains(&"lsp");
-    let has_call_graph = tool_names.contains(&"call_graph");
-    let has_multi_edit = tool_names.contains(&"multi_edit");
-    let has_build_test = tool_names.contains(&"run_build_test");
-    let has_git_mutations = tool_names.contains(&"git_commit");
-    let has_git_revert = tool_names.contains(&"git_revert_commit");
-    let has_git_worktree = tool_names.contains(&"git_worktree");
-    let has_session_state_rollback = tool_names.contains(&"rollback_session_state");
-    let has_turn_rollback = tool_names.contains(&"rollback_turn_actions");
-    let has_session_history = tool_names.contains(&"session_history_search")
-        || tool_names.contains(&"session_history_page")
-        || tool_names.contains(&"session_history_around");
+    String::new()
+}
 
-    let mut s = String::new();
-
-    if has_git || has_github {
-        s.push_str(
-            "7. Git/GitHub: use git_status, git_diff (stat_only:true ≈ `git diff --stat`), git_show, git_log, github_* for SINGLE operations.\n\
-             For COMPOUND git operations (e.g., log + diff + show in one step), prefer bash with && chaining: `git log -1 --format='%H %s' && git diff HEAD~1`.\n",
-        );
-    }
-    if has_github {
-        s.push_str(
-            "8. For GitHub data: use github_list_prs / github_list_issues / github_repo_stats directly.\n",
-        );
-    }
-    if has_spawn_agent && !has_delegate {
-        s.push_str(
-            "\n## Sub-agents\n\
-             - Use `spawn_agent` for sub-agent work.\n\
-             - Do NOT call `delegate` unless it appears in the current tool list — it is an internal, conditional tool in some runtimes.\n",
-        );
-    }
-    if has_delegate {
-        s.push_str(
-            "\n## Delegation\n\
-             Use `delegate` when the user asks for multi-agent help (e.g., \"have agents help me\", \"让多个agent帮我\", \"并行分析\"):\n\
-             - **fan_out**: Parallel execution for independent tasks (default when agents >1).\n\
-             - **sequential**: Agents run one by one, each seeing prior outputs.\n\
-             - **pipeline**: Each agent's output becomes the next's input.\n\
-             - **adversarial**: Producer + reviewer iterate until consensus.\n\
-             Available agents: 'coder' (code tasks), 'reviewer' (code review), 'writer' (docs).\n\
-             Example: delegate(task=\"analyze auth module\", agents=[\"coder\", \"reviewer\"], pattern=\"adversarial\")\n",
-        );
-    }
-    if has_code_nav {
-        s.push_str(
-            "\n## Code Navigation\n\
-             - **find_definition**: Where a symbol is defined. tree-sitter AST — more accurate than grep.\n\
-             - **find_references**: All usages of a symbol. Use `kind` (definition/import/call/usage) to filter.\n\
-             - **symbols**: File outline. Use `calls=true` to see what each function calls inline.\n\
-             Use these BEFORE grep for code symbols. They understand syntax, grep doesn't.\n",
-        );
-    }
-    if has_call_graph {
-        s.push_str(
-            "- **call_graph**: Call relationships. `callers=true` finds who calls a function. `scope='project'` searches cross-file.\n",
-        );
-    }
-    if tool_names.contains(&"rename_symbol") {
-        s.push_str(
-            "- **rename_symbol**: Rename across project. AST-validated, skips comments/strings. dry_run=true previews.\n",
-        );
-    }
-    if tool_names.contains(&"dead_code") {
-        s.push_str("- **dead_code**: Find unused symbols before cleanup.\n");
-    }
-    if tool_names.contains(&"extract_members") {
-        s.push_str(
-            "- **extract_members**: Struct/class/enum fields+methods. Point at any line inside.\n",
-        );
-    }
-    if tool_names.contains(&"type_hierarchy") {
-        s.push_str("- **type_hierarchy**: Who implements trait / what traits a type has.\n");
-    }
-    if tool_names.contains(&"lsp") {
-        s.push_str(
-            "- **lsp**: Prefer this for symbol-aware navigation, autocomplete, quick fixes, auto-imports, signature help, diagnostics, rename/code actions, code lenses, and other follow-up actions that grep cannot infer. Advanced editor-rendering operations such as document highlights/links, inlay hints, folding ranges, colors, semantic tokens, selection ranges, and linked editing are available but usually lower ROI unless the task explicitly needs IDE-style rendering details. Use `action_index` to apply a chosen code action, `item_index` to resolve or execute/apply a returned completion or code lens, and `dry_run=false` only for supported write operations. On Rust files, `code_lenses` first use native rust-analyzer Run/Debug lenses from `textDocument/codeLens`; if those come back empty, they can still fall back to rust-analyzer runnables. Rust hover can also include runnable action links on symbols like tests when the server provides them. Rust signature help can include precise parameter label offsets, Rust completions now expose richer postfix/snippet-style candidates when the server provides them, Rust diagnostics can use standard `textDocument/diagnostic` pull results when available, and Rust code actions can surface real assists such as import fixes. Both code-lens paths support `item_index` + `dry_run=false` execution.\n",
-        );
-    }
-    if has_multi_edit {
-        s.push_str(
-            "\n## Editing Strategy\n\
-             - Use **multi_edit** for multiple related changes to one file — it's atomic (all-or-nothing) and more token-efficient than sequential str_replace.\n\
-             - Use **str_replace(dry_run=true)** to preview changes before applying. Great for complex edits where you want to verify first.\n\
-             - Use **delete_file** to remove files (safe: refuses .git/, directories, paths outside project root).\n\
-             - For risky refactors: dry_run first → review diff → apply if correct.\n",
-        );
-    }
-    if has_build_test {
-        s.push_str(
-            "\n## Build & Test Loop\n\
-             - Use **run_build_test** instead of bash for build/test commands. It returns structured errors WITH source context.\n\
-             - Each error shows: 🔧 Trivial (mechanical fix), 🔨 Fixable (needs reasoning), or Complex.\n\
-             - Errors include 💡 hints — follow them for quick resolution.\n\
-             - Each error location includes surrounding code — fix directly with str_replace, no extra read_file needed.\n\
-             - ⚡ Cascading errors: when the tool says \"fix root cause FIRST\", do that — downstream errors often resolve automatically.\n\
-             - If >3 errors in the same file, fix the FIRST one — later errors are often cascading.\n\
-             - Set **auto_fix: true** for trivial fixes (unused imports/vars). The tool auto-applies high-confidence fixes and re-runs (max 3 iterations).\n\
-             - Auto-fix aborts on regression (more errors after fix) and reverts the offending changes automatically.\n\
-             - Set **report_only: true** to preview what auto-fix would do without applying — useful for checking before committing.\n\
-             - After fixing, call run_build_test again with the SAME command. The tool tracks iterations:\n\
-             - It shows ✅ Fixed, 🆕 New, ⏳ Persistent errors — use this to gauge your fix progress.\n\
-             - If you see ⚠ REGRESSION (more errors after your fix), revert the change and try a different approach.\n\
-             - Repeat until clean. Aim to fix ALL errors, not just the first one.\n",
-        );
-    }
-    if has_git_mutations || has_git_worktree {
-        s.push_str(
-            "\n## Git Workflow\n\
-             - Use **git_commit** to commit changes (stages automatically). Write clear, concise commit messages.\n\
-             - Use **git_stash** push/apply/pop to save and restore work-in-progress.\n\
-             - Use **git_checkout_file** to revert a file to its last committed state if an edit goes wrong.\n\
-             - Commit after each logical milestone — don't accumulate too many uncommitted changes.\n",
-        );
-        if has_git_revert {
-            s.push_str(
-                "             - Use **git_revert_commit** with a captured commit_sha to create a compensating revert commit when rolling back a dedicated git_commit.\n",
-            );
-        }
-        if has_git_worktree {
-            if has_turn_rollback {
-                s.push_str(
-                    "             - Use **git_worktree** for isolated parallel branch work; clean worktrees created by `enter`/`add` can participate in `rollback_turn_actions`, but explicit `remove` or `exit_action=remove` is still the destructive manual boundary once that worktree has diverged.\n",
-                );
-            }
-        }
-    }
-    if has_session_state_rollback {
-        s.push_str(
-            "\n## Session-State Rollback\n\
-             - Use **rollback_session_state** to restore bounded self-mod or task mutations from the current turn (or inspect recorded handles with `scope=list`).\n\
-",
-        );
-        if has_turn_rollback {
-            s.push_str(
-                "             - `rollback_turn_actions` now also includes recorded session-state mutations alongside file/database/git rollback journals for mixed-turn recovery.\n",
-            );
-        }
-    }
-    {
-        let memory_section = astra_prompts::memory_types::build_memory_prompt(memory_mode);
-        if !memory_section.is_empty() {
-            s.push_str(&memory_section);
-        }
-    }
-    if has_session_history {
-        s.push_str(
-            "\n## Session History Recall\n\
-             - Use **session_history_search** when the user references an earlier topic in this chat and the current context is insufficient.\n\
-             - Use **session_history_around** on a returned item_seq to recover exact surrounding details before continuing old work.\n\
-             - Use **session_history_page** for time-ordered browsing with before_seq/after_seq cursors. Do not ask the user to repeat details until these tools fail or return ambiguous results.\n",
-        );
-    }
-    if selection_confidence < LOW_CONFIDENCE_THRESHOLD {
-        s.push_str(
-            "\n## ⚠ Low-Confidence Tool Selection\n\
-             Tool selection confidence is LOW. If available tools seem insufficient, ASK the user to clarify.\n\
-             Do NOT guess with bash/find/read_file when a more specific tool would be needed.\n",
-        );
-    }
-    s
+/// Per-turn advisory for tool-selector uncertainty.
+///
+/// This must stay out of Session-scoped prompt blocks: confidence is computed
+/// per turn from the current request and selected tools.
+pub(crate) fn low_confidence_tool_selection_section(selection_confidence: f64) -> Option<String> {
+    (selection_confidence < LOW_CONFIDENCE_THRESHOLD).then(|| {
+        "\n## ⚠ Low-Confidence Tool Selection\n\
+         Tool selection confidence is LOW. If available tools seem insufficient, ASK the user to clarify.\n\
+         Do NOT guess with bash/find/read_file when a more specific tool would be needed.\n"
+            .to_string()
+    })
 }
 
 /// Task-type specific strategy. Session-scoped — depends on detected task type.
@@ -734,13 +673,13 @@ pub fn build_system_prompt_sections_with_style(
     // ── Global sections (stable across sessions) ──
     let mut sections = vec![
         PromptSection::stable(core_rules_section(), CacheScope::Global),
+        PromptSection::stable(safety_section().to_string(), CacheScope::Global),
         PromptSection::stable(planning_section().to_string(), CacheScope::Global),
-        PromptSection::stable(coding_discipline_section().to_string(), CacheScope::Global),
-        PromptSection::stable(turn_discipline_section().to_string(), CacheScope::Global),
         PromptSection::stable(
-            parallel_and_efficiency_section().to_string(),
+            format!("{}{}", resilience_section(), coding_discipline_section()),
             CacheScope::Global,
         ),
+        PromptSection::stable(turn_discipline_section().to_string(), CacheScope::Global),
         PromptSection::stable(plan_execution_section().to_string(), CacheScope::Global),
         PromptSection::stable(output_format_section().to_string(), CacheScope::Global),
         PromptSection::stable(
@@ -749,25 +688,43 @@ pub fn build_system_prompt_sections_with_style(
         ),
     ];
 
-    // ── Session sections (stable within a session) ──
-    sections.push(PromptSection::stable(
+    // ── Tool-dependent sections (CacheScope::None — change when tool selector
+    //    picks different tools per turn, so they MUST go after the cache marker
+    //    to keep the Global prefix stable) ──
+    sections.push(PromptSection::dynamic(
         self_model_section(tool_names),
-        CacheScope::Session,
+        PromptTokenBucket::BasePersona,
     ));
 
     let tool_cond = tool_conditional_section(tool_names, profile_desc, selection_confidence);
     if !tool_cond.is_empty() {
-        sections.push(PromptSection::stable(tool_cond, CacheScope::Session));
+        sections.push(PromptSection::dynamic(
+            tool_cond,
+            PromptTokenBucket::BasePersona,
+        ));
+    }
+
+    if let Some(low_confidence) = low_confidence_tool_selection_section(selection_confidence) {
+        sections.push(PromptSection::dynamic(
+            low_confidence,
+            PromptTokenBucket::Environment,
+        ));
     }
 
     let tt = task_type_section(task_type);
     if !tt.is_empty() {
-        sections.push(PromptSection::stable(tt.to_string(), CacheScope::Session));
+        sections.push(PromptSection::dynamic(
+            tt.to_string(),
+            PromptTokenBucket::BasePersona,
+        ));
     }
 
     let ss = search_strategy_section(tool_names);
     if !ss.is_empty() {
-        sections.push(PromptSection::stable(ss.to_string(), CacheScope::Session));
+        sections.push(PromptSection::dynamic(
+            ss.to_string(),
+            PromptTokenBucket::BasePersona,
+        ));
     }
 
     // ── Dynamic sections (change every turn) ──
@@ -815,11 +772,11 @@ pub fn self_awareness_prompt_section(
 
 /// Flatten sections into a single string (backward-compatible convenience).
 pub fn sections_to_string(sections: &[PromptSection]) -> String {
-    sections
-        .iter()
-        .map(|s| s.text.as_str())
-        .collect::<Vec<_>>()
-        .join("")
+    let serialized = astra_turn_core::context_serializer::serialize_prompt_sections(
+        sections,
+        &astra_turn_core::pipeline_config::ProviderCachePolicy::default(),
+    );
+    astra_turn_core::context_serializer::flatten_serialized_system_blocks(&serialized)
 }
 
 // ─── Prompt Section Overrides ─────────────────────────────────────────────
@@ -829,17 +786,17 @@ use std::path::{Path, PathBuf};
 
 /// Section name → override text mapping.
 /// Keys use snake_case matching the section builder function names:
-/// `core_rules`, `planning`, `coding_discipline`, `parallel_and_efficiency`,
+/// `core_rules`, `safety`, `planning`, `coding_discipline`, `turn_discipline`,
 /// `plan_execution`, `output_format`, `tool_error_recovery`.
 pub type PromptOverrides = HashMap<String, String>;
 
 /// Section names in order, matching the Global sections in `build_system_prompt_sections_with_style`.
 const SECTION_NAMES: &[&str] = &[
     "core_rules",
+    "safety",
     "planning",
     "coding_discipline",
     "turn_discipline",
-    "parallel_and_efficiency",
     "plan_execution",
     "output_format",
     "tool_error_recovery",
@@ -1144,7 +1101,7 @@ const TASK_TYPE_KEYWORDS: &[(&str, &[&str])] = &[
             "analysis",
             "research",
             "investigate",
-            "diagnose",
+            "introspect",
             "root cause",
             "why does",
             "why is",
@@ -1255,12 +1212,19 @@ pub fn parallel_batching_nudge_directive(messages: &[serde_json::Value]) -> Stri
     if streak < PARALLEL_BATCHING_NUDGE_THRESHOLD {
         return String::new();
     }
+    // Compacted from a 3-bullet form (~450c) to one line (~165c). The
+    // long form explained *why* parallel is cheaper and enumerated
+    // examples — both derivable from the header and the model's
+    // existing tool-use training. What the directive has to assert is
+    // just: "you did N single-tool rounds in a row; batch the next
+    // independent calls". Rides the volatile lane once the streak
+    // threshold trips, so bytes here are per-turn waste until the
+    // model batches (which resets the streak).
     format!(
         "\n\n## ⚠ Sequential Tool Calls Detected\n\
-         Your last {streak} rounds each ran exactly ONE tool. This is the most expensive way to gather information.\n\
-         - Look at the next set of files / commands you intend to inspect.\n\
-         - If they are independent (different files, different greps, different reads), batch them ALL into the next single round in parallel.\n\
-         - Reserve sequential single-tool rounds for cases where each call genuinely depends on the previous result.\n"
+         Last {streak} rounds each ran one tool. Batch independent calls \
+         (different files, greps, reads) into a single parallel round; \
+         keep sequential rounds only when a call depends on the previous result.\n"
     )
 }
 
@@ -1284,12 +1248,31 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
     if role == Some("system") {
         return true;
     }
-    role == Some("user")
-        && message
-            .get("content")
-            .and_then(|content| content.as_str())
-            .is_some_and(is_attention_manifest_content)
+    if role != Some("user") {
+        return false;
+    }
+    let Some(content) = message.get("content").and_then(|c| c.as_str()) else {
+        return false;
+    };
+    // Attention manifests carry the `[attention:v1]\n...` prefix.
+    if is_attention_manifest_content(content) {
+        return true;
+    }
+    // Session 8d9e5903 regression: every outbound request ends with a
+    // role=user `<system-reminder>` wrapper produced by the volatile
+    // lane (wire_assembly / bridge_inprocess / server_loop_host). This
+    // is runtime scaffolding, not a user query, and must not break
+    // round-cadence detection — otherwise the single-tool-streak
+    // counter always returns 0 on live sessions and the
+    // parallel-batching force never fires.
+    content.starts_with(SYSTEM_REMINDER_WRAPPER_PREFIX)
 }
+
+/// Wrapper tag applied by the volatile lane to mark runtime-injected
+/// scaffolding carried on a `role=user` message (git state / self-
+/// awareness / volatile nudges). See `wire_assembly`, `bridge_inprocess`,
+/// and `server_loop_host` for producers.
+const SYSTEM_REMINDER_WRAPPER_PREFIX: &str = "<system-reminder>";
 
 /// Returns true when `content` begins with the attention-manifest prefix
 /// followed by a newline. Allocation-free — safe to call in hot loops over
@@ -1666,50 +1649,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prompt_includes_tool_names() {
-        let p = build_main_system_prompt(&["bash", "git_diff"], "", 0.5, None);
-        assert!(p.contains("bash, git_diff"));
-    }
-
-    #[test]
-    fn prompt_includes_memory_rules_when_memory_tools_present() {
-        let p = build_main_system_prompt(&["memory_store", "memory_retrieve"], "", 0.5, None);
-        assert!(p.contains("Memory Rules"));
-        assert!(p.contains("<types>"));
-        assert!(p.contains("<name>user</name>"));
-    }
-
-    #[test]
-    fn prompt_memory_search_alias_triggers_full_mode() {
-        let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 0.5, None);
-        assert!(
-            p.contains("<types>"),
-            "memory_search (server-side alias) must trigger Full mode with type taxonomy"
-        );
-    }
-
-    #[test]
-    fn prompt_memory_store_only_uses_minimal_rules() {
-        let p = build_main_system_prompt(&["memory_store"], "", 0.5, None);
-        assert!(p.contains("Memory Rules"));
-        assert!(p.contains("Do NOT ask"));
-        assert!(
-            !p.contains("<types>"),
-            "minimal mode should not include type taxonomy"
-        );
-    }
+    // Tests for `## Self-Model\nTools: ...` list, `## Memory Rules` /
+    // `<types>` taxonomy, and `GitHub data` / `memory_store` guidance
+    // were deleted: those Markdown sections were emitted by
+    // `self_model_section` / `tool_conditional_section`, which are now
+    // no-ops (commit a1187f76 — the tools array schema already carries
+    // that guidance per-tool).
 
     #[test]
     fn prompt_no_memory_rules_without_memory_tools() {
         let p = build_main_system_prompt(&["bash", "git_diff"], "", 0.5, None);
         assert!(!p.contains("Memory Rules"));
-    }
-
-    #[test]
-    fn prompt_includes_github_rules_when_github_tools_present() {
-        let p = build_main_system_prompt(&["github_list_prs", "github_list_issues"], "", 0.5, None);
-        assert!(p.contains("GitHub data"));
     }
 
     #[test]
@@ -1797,9 +1747,8 @@ mod tests {
     #[test]
     fn prompt_includes_planning_protocol() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
-        assert!(p.contains("Planning Protocol"));
+        assert!(p.contains("Plan, Batch, Execute"));
         assert!(p.contains("<think>"));
-        assert!(p.contains("<reflect>"));
     }
 
     #[test]
@@ -1809,34 +1758,29 @@ mod tests {
         assert!(p.contains("Read before write"));
         assert!(p.contains("Executor rule (existing files)"));
         assert!(p.contains("Surgical edits"));
-        assert!(p.contains("Verify your edits"));
+        assert!(p.contains("One concern per str_replace"));
     }
 
     #[test]
     fn prompt_includes_parallel_tool_calls() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
-        assert!(p.contains("Parallel Tool Calls"));
+        assert!(p.contains("Batch independent reads"));
         assert!(p.contains("ONE turn"));
     }
 
     #[test]
     fn prompt_includes_token_efficiency() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
-        assert!(p.contains("Token Efficiency"));
-        assert!(p.contains("targeted reads"));
+        assert!(p.contains("Targeted reads"));
+        assert!(p.contains("line ranges"));
     }
 
     #[test]
     fn prompt_includes_build_test_guidance() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
-        assert!(p.contains("When to Run Build / Test"));
         assert!(
-            p.contains("ONLY to verify YOUR changes"),
+            p.contains("Build/test only AFTER your writes"),
             "should restrict build/test to post-edit verification"
-        );
-        assert!(
-            p.contains("Do NOT run them for information gathering"),
-            "should discourage speculative build/test"
         );
     }
 
@@ -1853,32 +1797,27 @@ mod tests {
     fn prompt_includes_error_recovery() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
         assert!(p.contains("Tool Error Recovery"));
+        assert!(p.contains("Retry Budget"));
         assert!(p.contains("retry ONCE"));
-        assert!(p.contains("truncated"));
-        assert!(p.contains("Timeout"));
-        assert!(p.contains("Rate limited"));
-        assert!(p.contains("Permission denied"));
-        assert!(p.contains("Path not found"));
-        // New error recovery entries
-        assert!(p.contains("Network failure"));
-        assert!(p.contains("Auth/credential error"));
-        assert!(p.contains("DB connection error"));
-        assert!(p.contains("Empty results"));
-        assert!(p.contains("Unknown tool"));
+        // Scenario headers
+        assert!(p.contains("File not found"));
+        assert!(p.contains("str_replace old_str did not match"));
+        assert!(p.contains("bash command timeout"));
+        assert!(p.contains("Truncated output"));
+        assert!(p.contains("Auth / credential / permission error"));
+        assert!(p.contains("Non-errors"));
+        assert!(p.contains("Unknown tool name"));
+        // Key anti-patterns preserved
+        assert!(p.contains("Anti-pattern"));
+        assert!(p.contains("memory_retrieve"));
     }
 
     #[test]
-    fn prompt_git_tool_guidance_for_compound_ops() {
-        let p = build_main_system_prompt(&["git_diff", "git_log", "bash"], "", 0.5, None);
-        assert!(p.contains("git_status, git_diff"));
-        assert!(p.contains("COMPOUND git operations"));
-    }
-
-    #[test]
-    fn prompt_prefers_spawn_agent_over_internal_delegate_when_delegate_absent() {
-        let p = build_main_system_prompt(&["spawn_agent", "bash"], "", 0.5, None);
-        assert!(p.contains("Use `spawn_agent`"));
-        assert!(p.contains("Do NOT call `delegate`"));
+    fn prompt_bounds_runaway_file_exploration() {
+        let p = build_main_system_prompt(&["bash", "read_file", "list_dir"], "", 0.5, None);
+        assert!(p.contains("Open-ended loops"));
+        assert!(p.contains("\"as many as you can\""));
+        assert!(p.contains("≤2 dir listings"));
     }
 
     #[test]
@@ -1986,21 +1925,6 @@ mod tests {
         assert!(p.contains("CI status"));
     }
 
-    // ── Tool precedence guidance ──
-
-    #[test]
-    fn prompt_includes_tool_precedence() {
-        let p = build_main_system_prompt(&["bash"], "", 0.5, None);
-        assert!(p.contains("Tool Precedence"));
-        assert!(p.contains("File search"));
-        assert!(p.contains("Code edit"));
-        assert!(p.contains("Git"));
-        // Memory line only when memory tools present
-        assert!(!p.contains("Memory:"));
-        let p_mem = build_main_system_prompt(&["memory_store"], "", 0.5, None);
-        assert!(p_mem.contains("Memory"));
-    }
-
     #[test]
     fn prompt_includes_search_strategy_when_search_tools_present() {
         let p = build_main_system_prompt(&["glob", "grep", "read_file"], "", 0.5, None);
@@ -2014,31 +1938,6 @@ mod tests {
     fn prompt_omits_search_strategy_without_search_tools() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
         assert!(!p.contains("Search Strategy"));
-    }
-
-    // ── Enhanced memory rules ──
-
-    #[test]
-    fn prompt_memory_rules_include_dedup_and_negative() {
-        let p = build_main_system_prompt(&["memory_store", "memory_retrieve"], "", 0.5, None);
-        assert!(p.contains("memory_correct"));
-        assert!(p.contains("don't want"));
-        assert!(p.contains("What NOT to save"));
-    }
-
-    #[test]
-    fn prompt_user_memories_upgrade_memory_rules_to_full() {
-        let p = build_main_system_prompt(
-            &["memory_store"],
-            "\n## User Memories\nprefers Rust\n",
-            0.5,
-            None,
-        );
-        assert!(
-            p.contains("<types>"),
-            "User Memories should upgrade to full mode"
-        );
-        assert!(p.contains("memory_correct"));
     }
 
     // ── Task type count invariant ──
@@ -2070,52 +1969,11 @@ mod tests {
     }
 
     #[test]
-    fn code_nav_guidance_present_when_tools_available() {
-        let p = build_main_system_prompt(
-            &["find_definition", "find_references", "symbols"],
-            "",
-            0.5,
-            Some("implementation"),
-        );
-        assert!(
-            p.contains("Code Navigation"),
-            "should include code nav section"
-        );
-        assert!(
-            p.contains("find_definition"),
-            "should mention find_definition"
-        );
-        assert!(
-            p.contains("tree-sitter"),
-            "should mention tree-sitter advantage"
-        );
-    }
-
-    #[test]
     fn code_nav_guidance_absent_without_tools() {
         let p = build_main_system_prompt(&["bash", "read_file"], "", 0.5, Some("implementation"));
         assert!(
             !p.contains("Code Navigation"),
             "should NOT include code nav without tools"
-        );
-    }
-
-    #[test]
-    fn build_test_guidance_present_when_tool_available() {
-        let p = build_main_system_prompt(
-            &["run_build_test", "str_replace"],
-            "",
-            0.5,
-            Some("implementation"),
-        );
-        assert!(
-            p.contains("Build & Test Loop"),
-            "should include build/test section"
-        );
-        assert!(p.contains("run_build_test"), "should mention the tool");
-        assert!(
-            p.contains("structured errors"),
-            "should describe structured output"
         );
     }
 
@@ -2143,78 +2001,11 @@ mod tests {
     }
 
     #[test]
-    fn git_mutations_guidance_present_when_tools_available() {
-        let p = build_main_system_prompt(
-            &[
-                "git_commit",
-                "git_revert_commit",
-                "git_stash",
-                "git_checkout_file",
-                "git_worktree",
-            ],
-            "",
-            0.5,
-            Some("implementation"),
-        );
-        assert!(
-            p.contains("Git Workflow"),
-            "should include git workflow section"
-        );
-        assert!(p.contains("git_commit"), "should mention git_commit");
-        assert!(
-            p.contains("git_revert_commit"),
-            "should mention git_revert_commit"
-        );
-        assert!(p.contains("git_worktree"), "should mention git_worktree");
-        assert!(p.contains("git_stash"), "should mention git_stash");
-        assert!(
-            p.contains("git_checkout_file"),
-            "should mention git_checkout_file"
-        );
-    }
-
-    #[test]
     fn git_mutations_guidance_absent_without_tools() {
         let p = build_main_system_prompt(&["git_diff", "git_log"], "", 0.5, None);
         assert!(
             !p.contains("Git Workflow"),
             "should NOT include git mutations without commit tool"
-        );
-    }
-
-    #[test]
-    fn session_state_rollback_guidance_omits_turn_rollback_when_unavailable() {
-        let p = build_main_system_prompt(
-            &["rollback_session_state", "adjust_config"],
-            "",
-            0.5,
-            Some("implementation"),
-        );
-        assert!(
-            p.contains("Session-State Rollback"),
-            "should include session rollback section"
-        );
-        assert!(
-            !p.contains("rollback_turn_actions"),
-            "should not mention unavailable mixed-surface rollback tool"
-        );
-    }
-
-    #[test]
-    fn session_state_rollback_guidance_mentions_turn_rollback_when_available() {
-        let p = build_main_system_prompt(
-            &[
-                "rollback_session_state",
-                "rollback_turn_actions",
-                "adjust_config",
-            ],
-            "",
-            0.5,
-            Some("implementation"),
-        );
-        assert!(
-            p.contains("rollback_turn_actions"),
-            "should mention mixed-surface rollback when tool is available"
         );
     }
 
@@ -2265,7 +2056,12 @@ mod tests {
             "should have multiple Global sections, got {}",
             globals.len()
         );
-        assert!(!sessions.is_empty(), "should have Session sections");
+        // NOTE: tool-dependent sections (self-model, tool-conditional, task-type,
+        // search-strategy) are intentionally `CacheScope::None` so they sit
+        // AFTER the cache marker and can change per turn without invalidating
+        // the cached prefix. The Session scope remains available for future
+        // use but is not populated by the current build_system_prompt_sections.
+        let _ = sessions; // kept to document the intent; no assertion on count
 
         // First section should be Global
         assert_eq!(
@@ -2274,15 +2070,15 @@ mod tests {
             "first section should be Global"
         );
 
-        // Profile section should be CacheScope::None
-        let profile = sections.iter().find(|s| s.scope == CacheScope::None);
+        // Profile lives in the None-scoped post-cache segment alongside
+        // other tool-dependent sections. Search by content rather than
+        // by scope+first-match.
+        let profile = sections
+            .iter()
+            .find(|s| s.scope == CacheScope::None && s.text.contains("cwd: /tmp"));
         assert!(
             profile.is_some(),
-            "should have a None-scoped profile section"
-        );
-        assert!(
-            profile.unwrap().text.contains("cwd: /tmp"),
-            "profile section should contain the cwd"
+            "should have a None-scoped profile section containing cwd"
         );
     }
 
@@ -2306,12 +2102,12 @@ mod tests {
             "should contain core rules"
         );
         assert!(
-            global_text.contains("Planning Protocol"),
+            global_text.contains("Plan, Batch, Execute"),
             "should contain planning"
         );
         assert!(
-            global_text.contains("Context Strategy"),
-            "should contain context strategy"
+            global_text.contains("Reuse history"),
+            "should contain context reuse rule"
         );
         assert!(
             global_text.contains("Claude Code skills"),
@@ -2320,27 +2116,31 @@ mod tests {
     }
 
     #[test]
-    fn sections_session_contains_tool_guidance() {
+    fn sections_task_type_strategy_lands_in_none_scope() {
+        // Task-type strategy (e.g. Debugging Strategy) still routes to the
+        // None-scoped post-cache segment. `Code Navigation` guidance used
+        // to live there too but was emitted by `tool_conditional_section`,
+        // now a no-op.
         let tools = vec!["bash", "find_definition", "find_references", "git_commit"];
         let sections = build_system_prompt_sections(&tools, "", 0.8, Some("debugging"));
 
-        let session_text: String = sections
+        let post_cache_text: String = sections
             .iter()
-            .filter(|s| s.scope == CacheScope::Session)
+            .filter(|s| s.scope == CacheScope::None)
             .map(|s| s.text.as_str())
             .collect();
         assert!(
-            session_text.contains("Code Navigation"),
-            "session should include code nav guidance"
-        );
-        assert!(
-            session_text.contains("Debugging Strategy"),
-            "session should include task-type strategy"
+            post_cache_text.contains("Debugging Strategy"),
+            "task-type strategy should land in None-scoped (post-cache) segment"
         );
     }
 
     #[test]
-    fn sections_no_profile_when_empty() {
+    fn sections_profile_and_toolset_populate_none_scope() {
+        // Even with empty profile, the None segment still holds tool-dependent
+        // sections (self-model, tool-conditional guidance, etc.). Prior to
+        // the cache-stability refactor this was empty; now it's the
+        // per-turn dynamic bucket.
         let tools = vec!["bash"];
         let sections = build_system_prompt_sections(&tools, "", 0.8, None);
 
@@ -2349,27 +2149,22 @@ mod tests {
             .filter(|s| s.scope == CacheScope::None)
             .collect();
         assert!(
-            none_scoped.is_empty(),
-            "no None-scoped section when profile is empty"
+            !none_scoped.is_empty(),
+            "None-scoped segment should carry tool-dependent sections (self-model, etc.)"
         );
     }
 
     #[test]
-    fn sections_to_string_contains_all_content() {
+    fn sections_to_string_contains_core_and_task_content() {
         let tools = vec!["bash", "read_file", "glob"];
         let profile = "cwd: /test\ngit_branch: main";
 
         let sections = build_system_prompt_sections(&tools, profile, 0.8, Some("implementation"));
         let result = sections_to_string(&sections);
 
-        // All key content should appear in the concatenated output
         assert!(
             result.contains(SYSTEM_PROMPT_BASE),
             "should contain identity"
-        );
-        assert!(
-            result.contains("bash, read_file, glob"),
-            "should contain tools"
         );
         assert!(result.contains("Core Rules"), "should contain core rules");
         assert!(
@@ -2402,18 +2197,21 @@ mod tests {
     }
 
     #[test]
-    fn sections_low_confidence_in_session_scope() {
+    fn sections_low_confidence_in_post_cache_segment() {
+        // Low-confidence advisory is tool-selector-driven (depends on which
+        // tools were chosen), so it lives in the None-scoped post-cache
+        // segment alongside other per-turn content.
         let tools = vec!["bash"];
         let sections = build_system_prompt_sections(&tools, "", 0.1, None);
 
-        let session_text: String = sections
+        let post_cache_text: String = sections
             .iter()
-            .filter(|s| s.scope == CacheScope::Session)
+            .filter(|s| s.scope == CacheScope::None)
             .map(|s| s.text.as_str())
             .collect();
         assert!(
-            session_text.contains("Low-Confidence Tool Selection"),
-            "low confidence advisory should be in session section"
+            post_cache_text.contains("Low-Confidence Tool Selection"),
+            "low confidence advisory should land in None-scoped post-cache segment"
         );
     }
 
@@ -2448,40 +2246,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prompt_rename_symbol_guidance_when_present() {
-        let p = build_main_system_prompt(&["rename_symbol"], "", 0.5, None);
-        assert!(p.contains("rename_symbol"));
-        assert!(p.contains("AST-validated"));
-        assert!(p.contains("dry_run=true"));
-    }
-
-    #[test]
-    fn prompt_dead_code_extract_members_type_hierarchy() {
-        let p = build_main_system_prompt(
-            &["dead_code", "extract_members", "type_hierarchy"],
-            "",
-            0.5,
-            None,
-        );
-        assert!(p.contains("dead_code"));
-        assert!(p.contains("Find unused symbols"));
-        assert!(p.contains("extract_members"));
-        assert!(p.contains("fields+methods"));
-        assert!(p.contains("type_hierarchy"));
-        assert!(p.contains("implements trait"));
-    }
-
     // ── Editing strategy (multi_edit) ────────────────────────────
-
-    #[test]
-    fn prompt_multi_edit_includes_editing_strategy() {
-        let p = build_main_system_prompt(&["multi_edit"], "", 0.5, None);
-        assert!(p.contains("Editing Strategy"));
-        assert!(p.contains("multi_edit"));
-        assert!(p.contains("atomic"));
-        assert!(p.contains("delete_file"));
-    }
 
     #[test]
     fn prompt_editing_strategy_absent_without_multi_edit() {
@@ -2518,31 +2283,6 @@ mod tests {
         );
     }
 
-    // ── git_ vs github_ tool distinction ─────────────────────────
-
-    #[test]
-    fn prompt_git_prefix_without_github_omits_github_rule() {
-        let p = build_main_system_prompt(&["git_diff", "git_log"], "", 0.5, None);
-        assert!(
-            p.contains("git_status, git_diff"),
-            "git_ prefix triggers tool preference"
-        );
-        assert!(
-            !p.contains("GitHub data"),
-            "should NOT have GitHub-specific rule without github_ tools"
-        );
-    }
-
-    #[test]
-    fn prompt_github_tools_trigger_both_rules() {
-        let p = build_main_system_prompt(&["github_list_prs"], "", 0.5, None);
-        assert!(p.contains("github_*"), "github_ triggers preference rule");
-        assert!(
-            p.contains("GitHub data"),
-            "github_ triggers GitHub-specific rule"
-        );
-    }
-
     // ── Profile desc in no-tools path ────────────────────────────
 
     #[test]
@@ -2561,50 +2301,6 @@ mod tests {
             result.is_empty(),
             "empty sections should produce empty string"
         );
-    }
-
-    // ── All code-nav tools in session scope ──────────────────────
-
-    #[test]
-    fn sections_all_code_nav_tools_in_session_scope() {
-        let tools = vec![
-            "find_definition",
-            "find_references",
-            "call_graph",
-            "rename_symbol",
-            "dead_code",
-            "extract_members",
-            "type_hierarchy",
-            "lsp",
-        ];
-        let sections = build_system_prompt_sections(&tools, "", 0.8, None);
-        let session_text: String = sections
-            .iter()
-            .filter(|s| s.scope == CacheScope::Session)
-            .map(|s| s.text.as_str())
-            .collect();
-        assert!(session_text.contains("Code Navigation"));
-        assert!(session_text.contains("call_graph"));
-        assert!(session_text.contains("rename_symbol"));
-        assert!(session_text.contains("dead_code"));
-        assert!(session_text.contains("extract_members"));
-        assert!(session_text.contains("type_hierarchy"));
-        assert!(session_text.contains("lsp"));
-    }
-
-    #[test]
-    fn sections_lsp_alone_adds_code_navigation_guidance() {
-        let sections = build_system_prompt_sections(&["lsp"], "", 0.8, None);
-        let session_text: String = sections
-            .iter()
-            .filter(|s| s.scope == CacheScope::Session)
-            .map(|s| s.text.as_str())
-            .collect();
-        assert!(session_text.contains("Code Navigation"));
-        assert!(session_text.contains("item_index"));
-        assert!(session_text.contains("action_index"));
-        assert!(session_text.contains("quick fixes"));
-        assert!(session_text.contains("autocomplete"));
     }
 
     // ── Empty-tools + empty-profile section behavior ─────────────
@@ -2712,8 +2408,8 @@ mod tests {
 
         assert_eq!(sections[0].text, "Custom core rules content");
         assert_eq!(sections[0].scope, CacheScope::Global);
-        // Other sections should be unchanged
-        assert!(sections[1].text.contains("Planning Protocol"));
+        // Other sections should be unchanged (safety is now [1], planning is [2])
+        assert!(sections[2].text.contains("Plan, Batch, Execute"));
     }
 
     #[test]
@@ -3179,6 +2875,60 @@ mod tests {
         );
     }
 
+    /// Session 8d9e5903 regression: every outbound request has a
+    /// `role=user` message with a `<system-reminder>` wrapper at the
+    /// tail (volatile-lane injection carrying Git State / self-awareness
+    /// / volatile nudges). This is runtime scaffolding, not a user
+    /// query. Before the fix, `is_trailing_runtime_scaffolding_message`
+    /// only recognized attention-manifest user content, so the streak
+    /// detector broke at the first `<system-reminder>` it saw and
+    /// returned 0 — which meant the parallel-batching force never fired
+    /// despite 18 consecutive single-tool rounds in T11. The fix
+    /// extends scaffolding detection to any user message whose content
+    /// starts with `<system-reminder>`, which is a stable runtime
+    /// marker applied by every provider path (bridge_inprocess /
+    /// server_loop_host / wire_assembly).
+    #[test]
+    fn trailing_single_tool_streak_skips_system_reminder_wrapper() {
+        let mut msgs = rounds_pattern(&[1, 1, 1, 1]);
+        // The real shape seen in session 8d9e5903 captures:
+        msgs.push(serde_json::json!({
+            "role": "user",
+            "content": "<system-reminder>\n\n\n## Git State\n- Git branch: improve_promts\n</system-reminder>"
+        }));
+        assert_eq!(
+            trailing_single_tool_round_streak(&msgs),
+            4,
+            "runtime-injected <system-reminder> at tail must be treated as scaffolding \
+             so the single-tool streak detector can see the real round cadence; \
+             otherwise parallel-batching force never fires on live Astra sessions"
+        );
+        assert!(
+            parallel_batching_nudge_directive(&msgs).contains("Sequential Tool Calls Detected"),
+            "nudge must fire despite the <system-reminder> tail"
+        );
+    }
+
+    #[test]
+    fn trailing_single_tool_streak_skips_multiple_scaffolding_tails() {
+        // Realistic Astra tail: attention manifest + system-reminder +
+        // potentially a volatile-wrapper system message stacked up.
+        let mut msgs = rounds_pattern(&[1, 1, 1, 1, 1]);
+        msgs.push(serde_json::json!({
+            "role": "system",
+            "content": "(runtime-injected nudge)"
+        }));
+        msgs.push(serde_json::json!({
+            "role": "user",
+            "content": "<system-reminder>\nTurn: 5 | Tokens: 12000\n</system-reminder>"
+        }));
+        assert_eq!(
+            trailing_single_tool_round_streak(&msgs),
+            5,
+            "multiple stacked scaffolding tails must all be peeled off"
+        );
+    }
+
     #[test]
     fn tool_round_guidance_includes_batching_nudge_and_signals_it() {
         let msgs = rounds_pattern(&[1, 1, 1, 1]);
@@ -3197,5 +2947,85 @@ mod tests {
         assert!(!signals.round_budget_warning);
         // Single-tool last round → no positive parallel_feedback either.
         assert!(!signals.parallel_feedback);
+    }
+
+    // ── SystemPromptBuilder invariants ─────────────────────────────────
+
+    #[test]
+    fn system_prompt_builder_emits_stable_then_boundary_then_volatile() {
+        let mut b = SystemPromptBuilder::new();
+        b.push_stable(PromptSection::stable("RULES", CacheScope::Global));
+        b.push_stable(PromptSection::stable("SESSION", CacheScope::Session));
+        b.push_volatile(PromptSection::dynamic(
+            "ENV",
+            PromptTokenBucket::Environment,
+        ));
+        let out = b.finish();
+
+        assert_eq!(out.len(), 4, "expected 2 stable + boundary + 1 volatile");
+        assert_eq!(out[0].text, "RULES");
+        assert_eq!(out[0].scope, CacheScope::Global);
+        assert_eq!(out[1].text, "SESSION");
+        assert_eq!(out[1].scope, CacheScope::Session);
+        // Boundary marker — scope None so it sits on the dynamic side
+        assert_eq!(out[2].text, SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
+        assert_eq!(out[2].scope, CacheScope::None);
+        assert_eq!(out[3].text, "ENV");
+        assert_eq!(out[3].scope, CacheScope::None);
+
+        // Rendered text: stable prefix must come before the marker, and
+        // the marker must come before any volatile content.
+        let rendered = sections_to_string(&out);
+        let rules_pos = rendered.find("RULES").unwrap();
+        let marker_pos = rendered.find(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).unwrap();
+        let env_pos = rendered.find("ENV").unwrap();
+        assert!(
+            rules_pos < marker_pos && marker_pos < env_pos,
+            "order must be stable → boundary → volatile; got rules={rules_pos} marker={marker_pos} env={env_pos}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_builder_omits_boundary_when_all_stable() {
+        let mut b = SystemPromptBuilder::new();
+        b.push_stable(PromptSection::stable("RULES", CacheScope::Global));
+        let out = b.finish();
+        assert_eq!(out.len(), 1);
+        assert!(
+            !out.iter().any(|s| s.text == SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+            "no boundary marker when volatile lane is empty"
+        );
+    }
+
+    #[test]
+    fn system_prompt_builder_omits_boundary_when_all_volatile() {
+        let mut b = SystemPromptBuilder::new();
+        b.push_volatile(PromptSection::dynamic(
+            "ENV",
+            PromptTokenBucket::Environment,
+        ));
+        let out = b.finish();
+        assert_eq!(out.len(), 1);
+        assert!(
+            !out.iter().any(|s| s.text == SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+            "no boundary marker when stable lane is empty"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "push_stable requires")]
+    fn system_prompt_builder_rejects_volatile_in_stable_lane() {
+        let mut b = SystemPromptBuilder::new();
+        b.push_stable(PromptSection::dynamic(
+            "oops",
+            PromptTokenBucket::Environment,
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "push_volatile requires")]
+    fn system_prompt_builder_rejects_stable_in_volatile_lane() {
+        let mut b = SystemPromptBuilder::new();
+        b.push_volatile(PromptSection::stable("oops", CacheScope::Global));
     }
 }

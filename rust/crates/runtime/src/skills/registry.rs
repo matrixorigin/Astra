@@ -564,12 +564,16 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
     }
 
     fn available_skills(&self) -> Vec<SkillToolInfo> {
-        self.registry
+        // Sort by name for deterministic ordering — the skill registry's cache is a
+        // HashMap whose iteration order changes per call. Any byte drift in the
+        // rendered tool schema (skill enum, <available_skills> listing) breaks
+        // Bedrock/Anthropic prompt cache hits.
+        let mut out: Vec<SkillToolInfo> = self
+            .registry
             .all_manifests()
             .into_iter()
             .filter(|m| m.user_invocable)
             .filter(|m| {
-                // Exclude conditional skills that haven't been activated
                 if m.is_conditional() {
                     self.registry.is_skill_activated(&m.name)
                 } else {
@@ -586,7 +590,9 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
                 tags: m.tags,
                 triggers: m.triggers,
             })
-            .collect()
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 }
 
@@ -1385,6 +1391,64 @@ Shared MCP.
         let resolver = UnifiedSkillResolver::new(Arc::new(registry));
         let result = resolver.resolve("nonexistent-alias");
         assert!(result.is_err());
+    }
+
+    /// Regression test: prompt cache hits require `available_skills()` output
+    /// to be byte-stable across calls. The underlying cache is a HashMap, so
+    /// without an explicit sort the iteration order varies between calls,
+    /// which invalidates the `skill` tool schema's `enum` and the
+    /// `<available_skills>` system block, breaking Bedrock/Anthropic cache hits.
+    #[tokio::test]
+    async fn available_skills_is_deterministic_across_calls() {
+        let mut registry = UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(StubProvider {
+            skills: vec![
+                (
+                    SkillManifest {
+                        name: "zeta".into(),
+                        description: "z".into(),
+                        ..Default::default()
+                    },
+                    "".into(),
+                ),
+                (
+                    SkillManifest {
+                        name: "alpha".into(),
+                        description: "a".into(),
+                        ..Default::default()
+                    },
+                    "".into(),
+                ),
+                (
+                    SkillManifest {
+                        name: "middle".into(),
+                        description: "m".into(),
+                        ..Default::default()
+                    },
+                    "".into(),
+                ),
+            ],
+        }));
+        registry.discover_all().await.unwrap();
+
+        let resolver = UnifiedSkillResolver::new(Arc::new(registry));
+        let first: Vec<String> = resolver
+            .available_skills()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(first, vec!["alpha", "middle", "zeta"]);
+
+        // Every subsequent call must produce the identical order, regardless of
+        // HashMap iteration variance.
+        for _ in 0..50 {
+            let names: Vec<String> = resolver
+                .available_skills()
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+            assert_eq!(names, first);
+        }
     }
 
     #[tokio::test]

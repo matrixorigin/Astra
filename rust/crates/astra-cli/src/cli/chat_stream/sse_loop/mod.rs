@@ -34,7 +34,6 @@ use astra_runtime::{
     turn::skill_tool::SkillResolver,
     turn::stop_hooks_yaml::detect_turn_hook_sets,
     turn::tool_health::ToolHealthTracker,
-    turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
 };
 
@@ -338,7 +337,9 @@ pub(crate) async fn stream_chat_sse(
     // side because the spawner is a CLI-level dependency.
     maybe_pin_spawn_agent_schema(&mut registry, p.agent_spawner.is_some());
     let pinned_schema_tokens = registry.total_pinned_token_cost() as u64;
-    let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
+    // Build valid_tool_names from the registry (includes dynamically injected
+    // spawn_agent/get_agent_result), not from the pre-injection all_schemas vec.
+    let valid_tool_names: HashSet<String> = registry.all_schema_names().into_iter().collect();
 
     // --allowed-tools: if set, restrict to only the specified tools
     let mut initial_restricted: HashSet<String> =
@@ -565,6 +566,8 @@ pub(crate) async fn stream_chat_sse(
 
     let mut state = AgenticLoopState {
         messages,
+        volatile_pending: Vec::new(),
+        recent_rounds: Vec::new(),
         tool_results: Vec::new(),
         current_session_id,
         current_run_id: Some(parent_turn_run_id.clone()),
@@ -572,6 +575,7 @@ pub(crate) async fn stream_chat_sse(
         context_manifest_user_id: None,
         context_manifest_model_name: None,
         recursion_depth: 0,
+        attention_manifest_text: None,
         final_text: String::new(),
         final_text_streamed: false,
         total_prompt: 0,
@@ -612,6 +616,7 @@ pub(crate) async fn stream_chat_sse(
             forced_execution_retry: false,
             forced_execution_escalation: false,
             forced_parallel_batching: false,
+            forced_parallel_batching_escalated: false,
             forced_round_budget_phase1: false,
             forced_round_budget_phase2: false,
             introspection_count: 0,
@@ -626,6 +631,7 @@ pub(crate) async fn stream_chat_sse(
             ),
             guardrail_tuner: astra_runtime::guardrail_tuning::GuardrailTuner::default(),
             guardrail_tuner_records_cursor: 0,
+            forced_completion_soft_stop: false,
         },
         telemetry: TelemetryState {
             explain_turns: Vec::new(),
@@ -691,6 +697,21 @@ pub(crate) async fn stream_chat_sse(
             consecutive_same_error: 0,
             last_error_category: None,
         },
+        pipeline_session: Some({
+            let config = astra_turn_core::pipeline_config::PipelineConfig::default();
+            match p.pipeline_state.as_ref().and_then(|v| {
+                serde_json::from_value::<astra_turn_core::pipeline_session::PipelineSessionSnapshot>(
+                    v.clone(),
+                ).ok()
+            }) {
+                Some(snapshot) => {
+                    astra_turn_core::pipeline_session::PipelineSession::from_snapshot(
+                        config, snapshot,
+                    )
+                }
+                None => astra_turn_core::pipeline_session::PipelineSession::new(config),
+            }
+        }),
         message: p.message.to_string(),
         recent_tools: p.recent_tools.to_vec(),
         task_profile,
@@ -709,8 +730,10 @@ pub(crate) async fn stream_chat_sse(
         consecutive_context_window_errors: 0,
         compaction_effectiveness: Default::default(),
         pinned_tool_schema_tokens: pinned_schema_tokens,
-        max_turn_input_tokens: RuntimeLimits::global().max_turn_input_tokens,
+        max_turn_input_tokens: RuntimeLimits::global().effective_max_turn_input_tokens(p.model),
         budget_wrapup_injected: false,
+        budget_wrapup_ignored_rounds: 0,
+        compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
         skill_produced_output: false,
         max_cumulative_tokens: 0,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -906,12 +929,10 @@ fn load_turn_messages(
 /// which defaults to pinned. Models then see spawn_agent every turn
 /// exactly when it's callable (spawner present) and never when it's
 /// not — no dead schema, no wasted tokens.
-fn maybe_pin_spawn_agent_schema(registry: &mut ToolRegistry, spawner_wired: bool) {
-    if !spawner_wired {
-        return;
-    }
-    registry.upsert_schema(astra_runtime::orchestration::spawn_agent_schema());
-    registry.upsert_schema(crate::edge_tools::agent_spawning::get_agent_result_schema());
+fn maybe_pin_spawn_agent_schema(_registry: &mut ToolRegistry, _spawner_wired: bool) {
+    // No-op: spawn/get_result/send_message are now actions within the
+    // consolidated `agent` schema (in all_tool_schemas). No separate
+    // schema injection needed.
 }
 
 #[cfg(test)]
@@ -935,10 +956,10 @@ mod tests {
             &astra_config::runtime_config::ToolSelectionConfig::default(),
         );
 
-        assert_eq!(cfg.stall_threshold, 3);
+        assert_eq!(cfg.stall_threshold, 6);
         assert_eq!(cfg.repetition_threshold, 3);
         assert_eq!(cfg.read_only_stall_threshold, 12);
-        // `0` in user config means "use default (3)", NOT the BreakerConfig sentinel "unbounded".
+        // `0` in user config means "use default", NOT the BreakerConfig sentinel "unbounded".
         assert_eq!(cfg.max_introspect_emissions, 3);
         assert_eq!(cfg.half_open_patience, 2);
         assert_eq!(cfg.absolute_max_rounds, 200);
@@ -959,12 +980,16 @@ mod tests {
 
         let cfg = circuit_breaker_config_from_tool_selection(&tool_selection);
 
-        assert_eq!(cfg.stall_threshold, 2);
+        // stall: resolve(1, 6, 3) = max(1, 3) = 3 (floored)
+        assert_eq!(cfg.stall_threshold, 3);
+        // repetition: resolve(7, 3, 2) = max(7, 2) = 7
         assert_eq!(cfg.repetition_threshold, 7);
+        // read_only: resolve(2, 12, 4) = max(2, 4) = 4 (floored)
         assert_eq!(cfg.read_only_stall_threshold, 4);
-        // user=0 means "use default" → 3, never unbounded (BreakerConfig.0 sentinel)
+        // introspect: resolve(0, 3, 1) = 3 (default)
         assert_eq!(cfg.max_introspect_emissions, 3);
         assert_eq!(cfg.half_open_patience, 5);
+        // absolute: resolve(10, 200, 20) = max(10, 20) = 20 (floored)
         assert_eq!(cfg.absolute_max_rounds, 20);
     }
 
@@ -1096,7 +1121,10 @@ hooks:
     }
 
     #[test]
-    fn blocked_patterns_seed_initial_restrictions_from_observability_hub() {
+    fn blocked_patterns_do_not_restrict_pinned_tools() {
+        // All tools are pinned after consolidation, so pattern-library
+        // blocks have no effect on tool restrictions. Only non-pinned
+        // (dynamic) tools can be blocked.
         let pattern_library = Arc::new(Mutex::new(PatternLibrary::new()));
         {
             let mut lib = pattern_library.lock().unwrap();
@@ -1111,7 +1139,8 @@ hooks:
         let mut restricted = HashSet::new();
         extend_restricted_with_blocked_tools(&mut restricted, Some(&hub));
 
-        assert!(restricted.contains("grep"));
+        // grep is pinned → not restricted even when blocked
+        assert!(!restricted.contains("grep"));
     }
 
     // ── G3: spawn_agent visibility gate ──
@@ -1122,39 +1151,10 @@ hooks:
     // visible iff the spawner is wired, so the model sees it exactly
     // when calls would succeed.
 
+    // spawn_agent is now subsumed into the consolidated `agent` tool.
+    // maybe_pin_spawn_agent_schema is a no-op — no separate schema injection needed.
     #[test]
-    fn maybe_pin_spawn_agent_schema_adds_pinned_entry_when_spawner_wired() {
-        use super::maybe_pin_spawn_agent_schema;
-        use crate::edge_tools;
-        use astra_runtime::tool_registry::ToolRegistry;
-
-        let mut registry = ToolRegistry::new(edge_tools::all_tool_schemas());
-        let initial_pinned: std::collections::HashSet<String> = registry
-            .pinned_schemas()
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-        // spawn_agent is in all_schemas but not pinned by default —
-        // that's the bug G3 fixes.
-        assert!(
-            !initial_pinned.contains("spawn_agent"),
-            "pre-fix invariant: spawn_agent starts NOT pinned; if this fails the catalog changed"
-        );
-
-        maybe_pin_spawn_agent_schema(&mut registry, true);
-        let after_pinned: std::collections::HashSet<String> = registry
-            .pinned_schemas()
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-        assert!(
-            after_pinned.contains("spawn_agent"),
-            "spawn_agent must be pinned after helper runs with spawner wired"
-        );
-    }
-
-    #[test]
-    fn maybe_pin_spawn_agent_schema_is_noop_without_spawner() {
+    fn maybe_pin_spawn_agent_schema_is_noop_always() {
         use super::maybe_pin_spawn_agent_schema;
         use crate::edge_tools;
         use astra_runtime::tool_registry::ToolRegistry;
@@ -1166,7 +1166,7 @@ hooks:
             .map(|(n, _)| n.clone())
             .collect();
 
-        maybe_pin_spawn_agent_schema(&mut registry, false);
+        maybe_pin_spawn_agent_schema(&mut registry, true);
         let after: std::collections::HashSet<String> = registry
             .pinned_schemas()
             .iter()
@@ -1175,12 +1175,7 @@ hooks:
 
         assert_eq!(
             before, after,
-            "no-spawner branch must leave the pinned set unchanged — \
-             pinning a dead schema would waste tokens and mislead the LLM"
-        );
-        assert!(
-            !after.contains("spawn_agent"),
-            "spawn_agent must NOT become visible without a spawner"
+            "maybe_pin_spawn_agent_schema is now a no-op (spawn is an agent action)"
         );
     }
 }

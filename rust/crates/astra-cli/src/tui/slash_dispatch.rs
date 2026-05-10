@@ -9,8 +9,7 @@ use crate::command_registry;
 use crate::repl_state::ReplState;
 use crate::tui::bottom_pane::BottomPane;
 use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
-use crate::tui::chat_cell::ChatCell;
-use crate::tui::chat_cell::system_cell::SystemChatCell;
+use crate::tui::history_cell::system::SystemCell;
 use crate::tui::terminal::TerminalGuard;
 
 pub(crate) enum SlashResult {
@@ -26,20 +25,33 @@ pub(crate) struct DispatchContext<'a> {
     pub state: &'a mut ReplState,
     pub guard: &'a mut TerminalGuard,
     pub bottom_pane: &'a mut BottomPane,
+    pub chat_widget: &'a mut crate::tui::chat_widget::ChatWidget,
     pub width: u16,
 }
 
 impl<'a> DispatchContext<'a> {
+    /// Free-floating informational line (dim, no corner glyph).
+    /// Use for passive state ("No history yet", "astra v0.1.0"),
+    /// NOT for command acknowledgements — those should visually pair
+    /// with the `› /cmd` prompt above them; see `show_response`.
+    ///
+    /// Routed through `ChatWidget::commit_system` so the line lands
+    /// in both the on-screen scrollback AND the JSONL transcript —
+    /// resume will surface it, Ctrl+O will include it, the model's
+    /// next turn will see it in history.
     fn show_info(&mut self, msg: String) {
-        let cell = SystemChatCell::info(msg);
-        self.guard
-            .queue_history_lines(cell.display_lines(self.width));
+        self.chat_widget.commit_system(SystemCell::info(msg));
+    }
+
+    /// Slash-command response ("Set model to Opus 4.6", "Permission
+    /// mode → auto"). Rendered with the `⎿` corner glyph on the first
+    /// line so the eye visually threads `› /cmd` → `⎿ …`.
+    fn show_response(&mut self, msg: String) {
+        self.chat_widget.commit_system(SystemCell::response(msg));
     }
 
     fn show_error(&mut self, msg: String) {
-        let cell = SystemChatCell::error(msg);
-        self.guard
-            .queue_history_lines(cell.display_lines(self.width));
+        self.chat_widget.commit_system(SystemCell::error(msg));
     }
 }
 
@@ -74,13 +86,28 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
+        // ── Auth forms (inline TUI card instead of dropping out to
+        //    bare-terminal prompts that looked disjoint and stole keys) ─
+        "/login" => {
+            use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
+            ctx.bottom_pane
+                .push_view(Box::new(LoginView::new(LoginMode::Login)));
+            SlashResult::Handled
+        }
+        "/register" => {
+            use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
+            ctx.bottom_pane
+                .push_view(Box::new(LoginView::new(LoginMode::Register)));
+            SlashResult::Handled
+        }
+
         // ── Model selector ──────────────────────────────────────────
         "/model" => {
             if !args.is_empty() {
                 // /model <name> — set directly
                 ctx.state.model = Some(args.to_string());
                 ctx.bottom_pane.footer.model = Some(args.to_string());
-                ctx.show_info(format!("Model set to: {args}"));
+                ctx.show_response(format!("Set model to {args}"));
                 return SlashResult::Handled;
             }
             let token = crate::repl_runtime::current_access_token(ctx.profile);
@@ -114,7 +141,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         "/stats" => {
             if !args.is_empty() {
                 // Direct subcommand: /stats history, /stats tools, etc.
-                show_stats_view(args, ctx.state, ctx.guard, ctx.bottom_pane);
+                show_stats_view(args, ctx.state, ctx.bottom_pane);
                 return SlashResult::Handled;
             }
             let items = vec![
@@ -228,17 +255,17 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }
                 "all" | "auto" => {
                     ctx.state.perm_manager.set_mode(PermissionMode::Auto);
-                    ctx.show_info("Permission mode → auto (all tools auto-approved)".into());
+                    ctx.show_response("Permission mode → auto (all tools auto-approved)".into());
                     SlashResult::Handled
                 }
                 "prompt" => {
                     ctx.state.perm_manager.set_mode(PermissionMode::Prompt);
-                    ctx.show_info("Permission mode → prompt".into());
+                    ctx.show_response("Permission mode → prompt".into());
                     SlashResult::Handled
                 }
                 "deny" => {
                     ctx.state.perm_manager.set_mode(PermissionMode::Deny);
-                    ctx.show_info("Permission mode → deny".into());
+                    ctx.show_response("Permission mode → deny".into());
                     SlashResult::Handled
                 }
                 "rules" | "status" => {
@@ -264,6 +291,176 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Fallback
         }
 
+        // ── Context panel (TUI-native) ──────────────────────────────
+        //
+        // `/context` with no args pops a live breakdown view built from
+        // the most recent turn's `TokenBudgetTrace`. Subcommands
+        // (`breakdown`, `explain`, `cognition`) fall through to the
+        // existing rustyline-style printer via Fallback.
+        "/context" => {
+            if !args.is_empty() {
+                return SlashResult::Fallback;
+            }
+            use crate::tui::bottom_pane::context_panel_view::ContextPanelView;
+            use crate::tui::context_panel::ContextBreakdown;
+            let breakdown = match ctx.state.observability_session.as_ref() {
+                Some(session) => {
+                    let guard = session.read().unwrap_or_else(|e| e.into_inner());
+                    match guard.context_traces.last() {
+                        Some(trace) => ContextBreakdown::from_trace(&trace.token_budget),
+                        None => ContextBreakdown::empty(),
+                    }
+                }
+                None => ContextBreakdown::empty(),
+            };
+            ctx.bottom_pane
+                .push_view(Box::new(ContextPanelView::new(breakdown)));
+            SlashResult::Handled
+        }
+
+        // ── SQL table view (TUI-native, astra-unique) ───────────────
+        //
+        // Runs a SQL query against MatrixOne via the existing `mo_query`
+        // tool, parses the mysql-client ASCII output, and renders it as
+        // a navigable ratatui table. Read-only-by-default: the safety
+        // guard in mo_query blocks DROP/DELETE/TRUNCATE/ALTER without
+        // an explicit flag, and we don't expose that flag here.
+        "/table" => {
+            if args.trim().is_empty() {
+                ctx.show_info(
+                    "Usage: /table <sql>\nExample: /table SELECT * FROM users LIMIT 20".into(),
+                );
+                return SlashResult::Handled;
+            }
+            // Paint a BusyView over the bottom pane so the user sees
+            // *something* while the SQL runs. We force an immediate
+            // draw because nothing else will redraw until the
+            // spawn_blocking future resolves.
+            use crate::tui::bottom_pane::busy_view::BusyView;
+            ctx.bottom_pane.push_view(Box::new(
+                BusyView::new("Running SQL query…").with_title(" /table "),
+            ));
+            let _ = crate::tui::do_draw(ctx.guard, crate::tui::ActiveView::Empty, ctx.bottom_pane);
+
+            // `mo_query` shells out to the mysql client (blocking IO) —
+            // park it on a blocking thread so we don't freeze the async
+            // event loop while the query runs.
+            let sql_text = args.to_string();
+            let output = tokio::task::spawn_blocking(move || {
+                let executor = crate::edge_tools::ToolExecutor::new(
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                );
+                executor.mo_query(&serde_json::json!({ "sql": sql_text }))
+            })
+            .await
+            .unwrap_or_else(|e| format!("Error: SQL execution task failed: {e}"));
+
+            // Remove the BusyView — a real panel (or info message)
+            // takes its place below.
+            let _ = ctx.bottom_pane.pop_view();
+            use crate::tui::bottom_pane::table_view::TablePanelView;
+            use crate::tui::table_view::parse;
+            match parse(&output) {
+                Some(table) => {
+                    ctx.bottom_pane
+                        .push_view(Box::new(TablePanelView::new(table)));
+                }
+                None => {
+                    // Parser rejected — show raw output to scrollback so
+                    // the user can see the error or "OK (no results)".
+                    ctx.show_info(output);
+                }
+            }
+            SlashResult::Handled
+        }
+
+        // ── Panels cheat sheet ──────────────────────────────────────
+        "/panels" => {
+            use crate::tui::bottom_pane::info_view::InfoView;
+            let body = build_panels_cheat_sheet_lines();
+            ctx.bottom_pane.push_view(Box::new(
+                InfoView::from_plain("TUI panels", body).with_reopen("/panels"),
+            ));
+            SlashResult::Handled
+        }
+
+        // ── Worktrees (TUI-native) ──────────────────────────────────
+        "/worktrees" => {
+            use crate::tui::bottom_pane::worktrees_view::WorktreesView;
+            use crate::tui::worktrees::{WorktreeList, parse};
+
+            // `git worktree list --porcelain` on a blocking thread.
+            let porcelain = tokio::task::spawn_blocking(|| {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let out = std::process::Command::new("git")
+                    .args(["worktree", "list", "--porcelain"])
+                    .current_dir(&cwd)
+                    .output();
+                match out {
+                    Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+                    _ => String::new(),
+                }
+            })
+            .await
+            .unwrap_or_default();
+
+            let mut entries = parse(&porcelain);
+            // Enrich each entry with session count (best-effort; any
+            // errors collapse to zero).
+            for e in entries.iter_mut() {
+                let sessions =
+                    astra_services::session_workspace::list_sessions_by_git_root(&e.path, None, 50);
+                e.session_count = sessions.len();
+                e.last_session_at = sessions.first().map(|s| s.updated_at.clone());
+            }
+
+            if entries.is_empty() {
+                ctx.show_info("No worktrees found (or `git worktree list` failed).".into());
+                return SlashResult::Handled;
+            }
+            let list = WorktreeList::new(entries);
+            ctx.bottom_pane
+                .push_view(Box::new(WorktreesView::new(list)));
+            SlashResult::Handled
+        }
+
+        // ── Session timeline (TUI-native) ───────────────────────────
+        "/timeline" => {
+            use crate::tui::bottom_pane::timeline_view::TimelineView;
+            use crate::tui::timeline::{JournalTurnSource, Timeline};
+            let Some(sid) = ctx.state.session_id.clone() else {
+                ctx.show_info("No active session — /timeline needs a session id.".into());
+                return SlashResult::Handled;
+            };
+            let timeline = Timeline::new(JournalTurnSource::new(), &sid);
+            if timeline.is_empty() {
+                ctx.show_info(format!("No turns recorded yet for session {sid}."));
+                return SlashResult::Handled;
+            }
+            ctx.bottom_pane
+                .push_view(Box::new(TimelineView::new(timeline)));
+            SlashResult::Handled
+        }
+
+        // ── Resume picker (TUI-native) ──────────────────────────────
+        "/resume" => {
+            if !args.is_empty() {
+                // `/resume <id>` — direct path takes the rustyline-compatible
+                // fallback so we go through the full restore pipeline.
+                return SlashResult::Fallback;
+            }
+            use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
+            use crate::tui::session_picker::{FsSessionSource, SessionDiscovery};
+            let disco = SessionDiscovery::new(FsSessionSource::new(), 50);
+            if disco.total() == 0 {
+                ctx.show_info("No previous sessions found.".into());
+                return SlashResult::Handled;
+            }
+            ctx.bottom_pane
+                .push_view(Box::new(SessionPickerView::new(disco)));
+            SlashResult::Handled
+        }
+
         // ── Copy last response ──────────────────────────────────────
         "/copy" => {
             match &ctx.state.last_response {
@@ -272,7 +469,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     if crate::slash_info::copy_to_clipboard(resp) {
                         let preview: String = resp.chars().take(60).collect();
                         let suffix = if n > 60 { "…" } else { "" };
-                        ctx.show_info(format!("Copied {n} chars: {preview}{suffix}"));
+                        ctx.show_response(format!("Copied {n} chars: {preview}{suffix}"));
                     } else {
                         ctx.show_error("No clipboard tool found (install xclip or xsel)".into());
                     }
@@ -284,7 +481,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Version ─────────────────────────────────────────────────
         "/version" => {
-            ctx.show_info(format!("astra v{}", env!("CARGO_PKG_VERSION")));
+            ctx.show_response(format!("astra v{}", env!("CARGO_PKG_VERSION")));
             SlashResult::Handled
         }
 
@@ -444,7 +641,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     {
                         let lines = instructions.lines().count();
                         ctx.state.project_instructions = Some(instructions);
-                        ctx.show_info(format!("Reloaded project instructions ({lines} lines)"));
+                        ctx.show_response(format!("Reloaded project instructions ({lines} lines)"));
                     } else {
                         ctx.state.project_instructions = None;
                         ctx.show_info("No .astra/instructions.md found".into());
@@ -453,7 +650,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 }
                 "off" => {
                     ctx.state.project_instructions = None;
-                    ctx.show_info("Project instructions disabled for this session".into());
+                    ctx.show_response("Project instructions disabled for this session".into());
                     SlashResult::Handled
                 }
                 _ => {
@@ -468,14 +665,78 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
     }
 }
 
+/// Cheat sheet content for `/panels`. Pure — separate from the
+/// dispatch wiring so it can be snapshot-tested.
+pub(crate) fn build_panels_cheat_sheet_lines() -> Vec<String> {
+    // (command, one-line purpose, key hint)
+    const PANELS: &[(&str, &str, &str)] = &[
+        (
+            "/resume",
+            "pick and restore a recent session",
+            "↑↓ navigate · type to filter · Enter resume · Esc close",
+        ),
+        (
+            "/context",
+            "visualise the current turn's token budget",
+            "Enter / q / Esc close",
+        ),
+        (
+            "/timeline",
+            "browse this session's turn-by-turn journal",
+            "↑↓ navigate · PgUp/PgDn page · q / Esc close",
+        ),
+        (
+            "/table <sql>",
+            "run a SQL query and render a navigable table",
+            "↑↓ rows · ←→ cols · Home/End jump · q / Esc close",
+        ),
+        (
+            "/worktrees",
+            "list git worktrees with per-worktree session counts",
+            "↑↓ navigate · q / Esc close",
+        ),
+        (
+            "/help",
+            "list every slash command grouped by category",
+            "↑↓ browse · Esc close",
+        ),
+    ];
+    let mut out = Vec::with_capacity(PANELS.len() * 3);
+    for (cmd, desc, hint) in PANELS {
+        out.push(format!("  {cmd}"));
+        out.push(format!("      {desc}"));
+        out.push(format!("      {hint}"));
+        out.push(String::new());
+    }
+    // Trim trailing blank so InfoView scrolls cleanly.
+    while out.last().is_some_and(|s| s.trim().is_empty()) {
+        out.pop();
+    }
+    out
+}
+
+/// Detect the conventional "sess_<…>" / uuid-like session id shape.
+pub(crate) fn looks_like_session_id(s: &str) -> bool {
+    if s.starts_with("sess_") {
+        return true;
+    }
+    // Fallback: UUID-like 36 chars with 4 dashes.
+    s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
+}
+
 /// Handle a ViewCompleted result from a BottomPaneView.
 pub(crate) fn handle_view_result(
     name: &str,
     state: &mut ReplState,
-    guard: &mut TerminalGuard,
     bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
 ) {
-    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+    // Session picker result is handled by the outer event loop (it
+    // needs to run the async resume pipeline); this sync fn just
+    // lets it pass through — see `is_session_id` below.
+    if looks_like_session_id(name) {
+        return;
+    }
 
     // Skill menu actions
     if name == "List skills" {
@@ -483,8 +744,7 @@ pub(crate) fn handle_view_result(
         return;
     }
     if name == "Skill info" {
-        let msg = SystemChatCell::info("Use /skill info <name> for details".into());
-        guard.queue_history_lines(msg.display_lines(w));
+        chat_widget.commit_system(SystemCell::info("Use /skill info <name> for details"));
         return;
     }
 
@@ -505,7 +765,7 @@ pub(crate) fn handle_view_result(
         _ => None,
     };
     if let Some(sub) = stats_sub {
-        show_stats_view(sub, state, guard, bottom_pane);
+        show_stats_view(sub, state, bottom_pane);
         return;
     }
 
@@ -523,10 +783,9 @@ pub(crate) fn handle_view_result(
                     .with_reopen("/instructions"),
                 ));
             } else {
-                let msg = SystemChatCell::info(
-                    "No project instructions loaded. Create .astra/instructions.md".into(),
-                );
-                guard.queue_history_lines(msg.display_lines(w));
+                chat_widget.commit_system(SystemCell::info(
+                    "No project instructions loaded. Create .astra/instructions.md",
+                ));
             }
             return;
         }
@@ -535,20 +794,18 @@ pub(crate) fn handle_view_result(
             {
                 let lc = instructions.lines().count();
                 state.project_instructions = Some(instructions);
-                let msg =
-                    SystemChatCell::info(format!("Reloaded project instructions ({lc} lines)"));
-                guard.queue_history_lines(msg.display_lines(w));
+                chat_widget.commit_system(SystemCell::response(format!(
+                    "Reloaded project instructions ({lc} lines)"
+                )));
             } else {
                 state.project_instructions = None;
-                let msg = SystemChatCell::info("No .astra/instructions.md found".into());
-                guard.queue_history_lines(msg.display_lines(w));
+                chat_widget.commit_system(SystemCell::info("No .astra/instructions.md found"));
             }
             return;
         }
         "Off" => {
             state.project_instructions = None;
-            let msg = SystemChatCell::info("Project instructions disabled".into());
-            guard.queue_history_lines(msg.display_lines(w));
+            chat_widget.commit_system(SystemCell::response("Project instructions disabled"));
             return;
         }
         _ => {}
@@ -559,22 +816,19 @@ pub(crate) fn handle_view_result(
         "Auto" => {
             use crate::permission_manager::PermissionMode;
             state.perm_manager.set_mode(PermissionMode::Auto);
-            let msg = SystemChatCell::info("Permission mode → auto".into());
-            guard.queue_history_lines(msg.display_lines(w));
+            chat_widget.commit_system(SystemCell::response("Permission mode → auto"));
             return;
         }
         "Prompt" => {
             use crate::permission_manager::PermissionMode;
             state.perm_manager.set_mode(PermissionMode::Prompt);
-            let msg = SystemChatCell::info("Permission mode → prompt".into());
-            guard.queue_history_lines(msg.display_lines(w));
+            chat_widget.commit_system(SystemCell::response("Permission mode → prompt"));
             return;
         }
         "Deny" => {
             use crate::permission_manager::PermissionMode;
             state.perm_manager.set_mode(PermissionMode::Deny);
-            let msg = SystemChatCell::info("Permission mode → deny".into());
-            guard.queue_history_lines(msg.display_lines(w));
+            chat_widget.commit_system(SystemCell::response("Permission mode → deny"));
             return;
         }
         "Rules" => {
@@ -601,16 +855,10 @@ pub(crate) fn handle_view_result(
     // Model name → apply
     state.model = Some(name.to_string());
     bottom_pane.footer.model = Some(name.to_string());
-    let msg = SystemChatCell::info(format!("Model set to: {name}"));
-    guard.queue_history_lines(msg.display_lines(w));
+    chat_widget.commit_system(SystemCell::response(format!("Set model to {name}")));
 }
 
-fn show_stats_view(
-    sub: &str,
-    state: &ReplState,
-    _guard: &mut TerminalGuard,
-    bottom_pane: &mut BottomPane,
-) {
+fn show_stats_view(sub: &str, state: &ReplState, bottom_pane: &mut BottomPane) {
     use crate::tui::bottom_pane::info_view::InfoView;
     use astra_services::{session_analytics, session_journal};
 
@@ -919,5 +1167,123 @@ fn parse_slash(text: &str) -> (&str, &str) {
     match text.find(' ') {
         Some(pos) => (&text[..pos], text[pos..].trim()),
         None => (text, ""),
+    }
+}
+
+#[cfg(test)]
+mod panels_tests {
+    use super::build_panels_cheat_sheet_lines;
+
+    #[test]
+    fn cheat_sheet_lists_every_tui_native_panel() {
+        let text = build_panels_cheat_sheet_lines().join("\n");
+        for cmd in ["/resume", "/context", "/timeline", "/table", "/worktrees"] {
+            assert!(text.contains(cmd), "cheat sheet missing {cmd}; got: {text}");
+        }
+    }
+
+    #[test]
+    fn cheat_sheet_shows_key_hints() {
+        let text = build_panels_cheat_sheet_lines().join("\n");
+        assert!(text.contains("↑"));
+        assert!(text.contains("Esc"));
+    }
+
+    #[test]
+    fn cheat_sheet_has_stable_snapshot() {
+        insta::assert_snapshot!(
+            "panels_cheat_sheet",
+            build_panels_cheat_sheet_lines().join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod view_result_tests {
+    use super::handle_view_result;
+    use crate::permission_manager::PermissionMode;
+    use crate::repl_state::ReplState;
+    use crate::tui::bottom_pane::BottomPane;
+    use crate::tui::chat_widget::ChatWidget;
+    use crate::tui::history_cell::system::SystemCell;
+
+    fn last_system_message(widget: &ChatWidget) -> Option<String> {
+        widget
+            .history()
+            .last()
+            .and_then(|cell| cell.as_any_ref().downcast_ref::<SystemCell>())
+            .map(|cell| cell.message().to_string())
+    }
+
+    #[test]
+    fn session_picker_result_is_reserved_for_outer_resume_pipeline() {
+        let mut state = ReplState::default();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = ChatWidget::new("");
+
+        handle_view_result(
+            "sess_1234567890",
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+        );
+
+        assert!(chat_widget.history().is_empty());
+        assert!(bottom_pane.composer.is_empty());
+        assert_eq!(state.model, None);
+    }
+
+    #[test]
+    fn permission_selection_updates_state_and_commits_feedback() {
+        let mut state = ReplState::default();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = ChatWidget::new("");
+
+        handle_view_result("Auto", &mut state, &mut bottom_pane, &mut chat_widget);
+
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Auto);
+        assert_eq!(
+            last_system_message(&chat_widget).as_deref(),
+            Some("Permission mode → auto")
+        );
+    }
+
+    #[test]
+    fn slash_command_selection_returns_command_to_composer() {
+        let mut state = ReplState::default();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = ChatWidget::new("");
+
+        handle_view_result("/resume", &mut state, &mut bottom_pane, &mut chat_widget);
+
+        assert_eq!(bottom_pane.composer.text(), "/resume ");
+        assert!(
+            chat_widget.history().is_empty(),
+            "selecting a command hint should not emit scrollback noise"
+        );
+    }
+
+    #[test]
+    fn model_selection_updates_footer_and_commits_feedback() {
+        let mut state = ReplState::default();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = ChatWidget::new("");
+
+        handle_view_result(
+            "claude-sonnet-4.6",
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+        );
+
+        assert_eq!(state.model.as_deref(), Some("claude-sonnet-4.6"));
+        assert_eq!(
+            bottom_pane.footer.model.as_deref(),
+            Some("claude-sonnet-4.6")
+        );
+        assert_eq!(
+            last_system_message(&chat_widget).as_deref(),
+            Some("Set model to claude-sonnet-4.6")
+        );
     }
 }

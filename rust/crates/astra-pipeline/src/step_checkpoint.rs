@@ -508,6 +508,7 @@ mod tests {
             approval_overrides: None,
             consecutive_context_window_errors: 0,
             compaction_state: None,
+            pipeline_state: None,
             continuity_state: None,
         }
     }

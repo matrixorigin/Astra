@@ -60,6 +60,11 @@ impl TextArea {
         self.invalidate_wrap();
     }
 
+    /// Current cursor byte offset within `text()`.
+    pub fn cursor_byte(&self) -> usize {
+        self.cursor_pos
+    }
+
     pub fn desired_height(&self, width: u16) -> u16 {
         if width == 0 {
             return 1;
@@ -102,6 +107,13 @@ impl TextArea {
             }
             KeyCode::Char('k') if ctrl => {
                 self.kill_to_end_of_line();
+                TextAreaAction::Changed
+            }
+            KeyCode::Char('u') if ctrl => {
+                // Readline convention: kill from cursor back to the
+                // start of the current line. Captured into kill_buffer
+                // so Ctrl+Y yanks it back.
+                self.kill_to_start_of_line();
                 TextAreaAction::Changed
             }
             KeyCode::Char('y') if ctrl => {
@@ -177,7 +189,7 @@ impl TextArea {
         self.invalidate_wrap();
     }
 
-    fn insert_str(&mut self, s: &str) {
+    pub(super) fn insert_str(&mut self, s: &str) {
         self.text.insert_str(self.cursor_pos, s);
         self.cursor_pos += s.len();
         self.preferred_col = None;
@@ -201,6 +213,21 @@ impl TextArea {
         }
         let next = self.next_grapheme_boundary(self.cursor_pos);
         self.text.drain(self.cursor_pos..next);
+        self.preferred_col = None;
+        self.invalidate_wrap();
+    }
+
+    fn kill_to_start_of_line(&mut self) {
+        let line_start = self.text[..self.cursor_pos]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if line_start == self.cursor_pos {
+            return;
+        }
+        self.kill_buffer = self.text[line_start..self.cursor_pos].to_string();
+        self.text.drain(line_start..self.cursor_pos);
+        self.cursor_pos = line_start;
         self.preferred_col = None;
         self.invalidate_wrap();
     }

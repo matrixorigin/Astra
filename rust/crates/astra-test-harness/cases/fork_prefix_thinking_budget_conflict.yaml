@@ -27,7 +27,7 @@ criteria:
   - type: exit_code
     code: 0
   - type: tool_called
-    name: spawn_agent
+    name: agent
   # Note: ThinkingBudgetConflict takes a non-deterministic path. If the
   # clamp actually triggers the resolver short-circuits via
   # `PrefixResolveOutcome::Failed` and NO `[fork-cache]` event is

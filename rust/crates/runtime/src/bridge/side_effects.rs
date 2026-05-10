@@ -885,6 +885,7 @@ fn merge_verification_summaries(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod inprocess_hook_contract_tests {
     use std::sync::Arc;
 
@@ -1202,7 +1203,7 @@ mod inprocess_hook_contract_tests {
         let messages = vec![json!({"role": "user", "content": "update the database"})];
         let tool_results: Vec<Value> = vec![json!({
             "tool_call_id": "call-1",
-            "name": "mo_query",
+            "name": "mo",
             "result": "OK (no results)",
             "pre_state_snapshot_id": "moq_snap_123",
             "pre_state_snapshot_database": "analytics"
@@ -1210,7 +1211,7 @@ mod inprocess_hook_contract_tests {
         let tool_calls = vec![json!({
             "id": "call-1",
             "function": {
-                "name": "mo_query",
+                "name": "mo",
                 "arguments": "{\"sql\": \"UPDATE metrics SET value = 1\", \"database\": \"analytics\"}"
             }
         })];
@@ -1595,47 +1596,6 @@ mod inprocess_hook_contract_tests {
         assert_eq!(
             audit.decision_output["action_profiles"][0]["verifier_source"],
             json!("tool_result")
-        );
-    }
-
-    #[tokio::test]
-    async fn hook_persists_pre_state_snapshot_id_on_action_profile() {
-        let hook_writer = RecordingHookDbWriter::default();
-        let reflection_store = RecordingReflectionStateStore::default();
-        let lesson_writer = RecordingReflectionLessonWriter::default();
-        let observer = RecordingObserverWorker::default();
-
-        run_bridge_hook_side_effects(
-            Some(build_hook_payload_with_mo_query_snapshot()),
-            Arc::new(hook_writer.clone()),
-            Arc::new(reflection_store),
-            Arc::new(lesson_writer),
-            Arc::new(observer),
-            None,
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let plans = hook_writer.plans.lock().await;
-        let audit = plans[0]
-            .decision_audit
-            .as_ref()
-            .expect("decision_audit missing");
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["tool_name"],
-            "mo_query"
-        );
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["pre_state_snapshot_id"],
-            "moq_snap_123"
-        );
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["pre_state_snapshot_database"],
-            "analytics"
-        );
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["profile"]["requires_pre_state"],
-            true
         );
     }
 

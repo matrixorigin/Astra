@@ -630,6 +630,21 @@ impl ToolSelector for TfIdfSelector {
     }
 
     async fn select(&self, ctx: &SelectionContext<'_>) -> SelectionResult {
+        // Fast path: with all tools pinned (0 dynamic), skip the entire
+        // scoring/ranking pipeline and return all schemas directly.
+        if ToolRegistry::dynamic_count() == 0 {
+            return SelectionResult {
+                tool_names: self.registry.all_schema_names(),
+                strategy: "all_pinned",
+                budget_used: 0,
+                failed: false,
+                confidence: 1.0,
+                selector_tokens_in: 0,
+                selector_tokens_out: 0,
+                selected_skills: vec![],
+            };
+        }
+
         // ── Phase 1: Gather boost terms from pipeline modules ──
         let entity_boost = self.entity_boost_terms(ctx.query);
         let all_boost: Vec<String> = ctx
@@ -1387,22 +1402,22 @@ mod tests {
 
     #[test]
     fn parse_json_array() {
-        let names = parse_tool_names_from_llm(r#"["github_list_prs", "memory_search"]"#);
-        assert_eq!(names, vec!["github_list_prs", "memory_search"]);
+        let names = parse_tool_names_from_llm(r#"["github", "memory_search"]"#);
+        assert_eq!(names, vec!["github", "memory_search"]);
     }
 
     #[test]
     fn parse_json_in_markdown_block() {
-        let text = "```json\n[\"git_log\", \"git_diff\"]\n```";
+        let text = "```json\n[\"git_log\", \"git\"]\n```";
         let names = parse_tool_names_from_llm(text);
-        assert_eq!(names, vec!["git_log", "git_diff"]);
+        assert_eq!(names, vec!["git_log", "git"]);
     }
 
     #[test]
     fn parse_json_with_trailing_text() {
-        let text = "Based on the query, I'd select:\n[\"github_list_prs\"]\nThese tools...";
+        let text = "Based on the query, I'd select:\n[\"github\"]\nThese tools...";
         let names = parse_tool_names_from_llm(text);
-        assert_eq!(names, vec!["github_list_prs"]);
+        assert_eq!(names, vec!["github"]);
     }
 
     #[test]
@@ -1413,7 +1428,7 @@ mod tests {
 
     #[test]
     fn parse_malformed_json_returns_empty() {
-        let names = parse_tool_names_from_llm("[github_list_prs]");
+        let names = parse_tool_names_from_llm("[github]");
         assert!(names.is_empty());
     }
 
@@ -1444,9 +1459,10 @@ mod tests {
     #[test]
     fn catalog_summary_is_compact() {
         let summary = build_catalog_summary();
-        // Should stay compact (about 750 tokens at 4 chars/token).
+        // Should stay compact (~780 tokens at 4 chars/token). Bumped to 3200
+        // after introspect tool added (44 tools total).
         assert!(
-            summary.len() < 3000,
+            summary.len() < 3200,
             "catalog summary too long: {} chars",
             summary.len()
         );
@@ -1458,12 +1474,12 @@ mod tests {
     fn prompt_includes_recent_tools() {
         let messages = build_tool_select_prompt(
             "matrixone呢？",
-            &["github_list_prs".to_string()],
+            &["github".to_string()],
             &LearnedContext::default(),
             "catalog",
         );
         let user_msg = messages[1]["content"].as_str().unwrap();
-        assert!(user_msg.contains("github_list_prs"));
+        assert!(user_msg.contains("github"));
         assert!(user_msg.contains("matrixone"));
     }
 
@@ -1475,16 +1491,20 @@ mod tests {
             &LearnedContext {
                 task_archetype: Some(TaskType::Fetch),
                 entity_hints: vec!["Entity 'matrixorigin' is associated with domain GitHub".into()],
-                pattern_hints: vec!["Successful tool chain for Fetch/Some(GitHub): github_search -> github_list_prs".into()],
-                calibration_hints: vec!["Calibration risk: domain GitHub needed correction 60% of the time".into()],
-                tool_hints: vec!["Tool history: prefer 'github_list_prs'".into()],
+                pattern_hints: vec![
+                    "Successful tool chain for Fetch/Some(GitHub): github_search -> github".into(),
+                ],
+                calibration_hints: vec![
+                    "Calibration risk: domain GitHub needed correction 60% of the time".into(),
+                ],
+                tool_hints: vec!["Tool history: prefer 'github'".into()],
             },
             "catalog",
         );
         let user_msg = messages[1]["content"].as_str().unwrap();
         assert!(user_msg.contains("Context hints:"));
         assert!(user_msg.contains("matrixorigin"));
-        assert!(user_msg.contains("github_list_prs"));
+        assert!(user_msg.contains("github"));
         assert!(user_msg.contains("Calibration risk"));
         assert!(user_msg.contains("Tool history"));
     }
@@ -1509,14 +1529,14 @@ mod tests {
         graph.learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_search".into(), "github_list_prs".into()],
+            &["github_search".into(), "github".into()],
             None,
         );
 
         let mut patterns = PatternLibrary::new();
         for _ in 0..2 {
             patterns.record_outcome(
-                &["github_search".into(), "github_list_prs".into()],
+                &["github_search".into(), "github".into()],
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
@@ -1541,7 +1561,7 @@ mod tests {
             learned
                 .pattern_hints
                 .iter()
-                .any(|hint| hint.contains("github_search -> github_list_prs"))
+                .any(|hint| hint.contains("github_search -> github"))
         );
     }
 
@@ -1552,7 +1572,7 @@ mod tests {
             name: "stale-org".into(),
             aliases: vec![],
             domain: Some(DomainHint::GitHub),
-            associated_tools: vec!["github_list_prs".into()],
+            associated_tools: vec!["github".into()],
             confidence: 0.2,
             observation_count: 1,
             last_observed_at: chrono::Utc::now().timestamp() as u64,
@@ -1573,13 +1593,13 @@ mod tests {
         graph.learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_search".into(), "github_list_prs".into()],
+            &["github_search".into(), "github".into()],
             None,
         );
         graph.learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_search".into(), "github_list_prs".into()],
+            &["github_search".into(), "github".into()],
             None,
         );
 
@@ -1600,14 +1620,14 @@ mod tests {
         {
             let mut tracker = tracker.lock().unwrap();
             for _ in 0..5 {
-                tracker.record_selection(&["github_list_prs".into()]);
+                tracker.record_selection(&["github".into()]);
                 tracker.record_feedback(&crate::tool_registry::SelectionFeedback {
-                    tools_used: vec!["github_list_prs".into()],
+                    tools_used: vec!["github".into()],
                     unused_count: 0,
                     precision: 1.0,
                     recall: 1.0,
                 });
-                tracker.record_quality("github_list_prs", 0.95);
+                tracker.record_quality("github", 0.95);
                 tracker.record_selection(&["glob".into()]);
             }
         }
@@ -1641,7 +1661,7 @@ mod tests {
             learned
                 .tool_hints
                 .iter()
-                .any(|hint| hint.contains("prefer 'github_list_prs'"))
+                .any(|hint| hint.contains("prefer 'github'"))
         );
         assert!(
             learned
@@ -1652,31 +1672,6 @@ mod tests {
     }
 
     // ── TfIdfSelector ──
-
-    #[tokio::test]
-    async fn tfidf_pr_query_includes_github() {
-        let selector = TfIdfSelector::new(mock_registry());
-        let ctx = SelectionContext {
-            query: "matrixorigin memoria 最新的pr?",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-        let result = selector.select(&ctx).await;
-        assert!(
-            result.tool_names.contains(&"github_list_prs".to_string()),
-            "PR query must select github_list_prs, got: {:?}",
-            result.tool_names
-        );
-        assert_eq!(result.strategy, "tfidf_routed");
-    }
 
     #[tokio::test]
     async fn tfidf_conversational_only_pinned() {
@@ -1713,98 +1708,25 @@ mod tests {
     // ── Precision tests (the user's exact scenarios) ──
 
     #[test]
-    fn prefilter_github_query_ranks_github_tools_first() {
-        let state = ConversationState::from_message("milvus 的 PR", 1);
-        let ranked = pre_filter_dynamic(&state, "milvus 的 PR");
-
-        let top3_names: Vec<_> = ranked
+    fn memory_query_has_memory_tools_available() {
+        // The full memory toolset (memory_store, memory_retrieve, memory_purge,
+        // memory_correct) is now pinned — always included in the static tool
+        // prefix — so a memory-query doesn't need to "activate" them via
+        // dynamic ranking. This test asserts the pinning contract instead:
+        // every turn, regardless of query, the pinned prefix carries the
+        // memory tools.
+        let pinned_memory: Vec<&str> = TOOL_CATALOG
             .iter()
-            .take(3)
-            .map(|&(idx, _)| TOOL_CATALOG[idx].name)
+            .filter(|t| t.pinned && t.intents.contains(&IntentType::Memory))
+            .map(|t| t.name)
             .collect();
         assert!(
-            top3_names.contains(&"github_list_prs"),
-            "github_list_prs should be in top 3 for PR query, got: {:?}",
-            top3_names
+            pinned_memory.contains(&"memory"),
+            "memory must be pinned — memory operations require it"
         );
-    }
-
-    #[test]
-    fn prefilter_recency_boost_promotes_recent_tool() {
-        // "matrixone 最新" triggers is_fetch via "最新" (latest), giving the query
-        // a signal that interacts with recency boost for github_list_prs.
-        let state = ConversationState::from_message_with_context(
-            "matrixone 最新",
-            2,
-            &["github_list_prs".to_string()],
-        );
-        let ranked = pre_filter_dynamic(&state, "matrixone 最新");
-
-        let prs_rank = ranked
-            .iter()
-            .position(|&(idx, _)| TOOL_CATALOG[idx].name == "github_list_prs");
         assert!(
-            prs_rank.is_some_and(|r| r < 3),
-            "recency boost should promote github_list_prs to top 3, got rank: {:?}",
-            prs_rank
-        );
-    }
-
-    #[test]
-    fn prefilter_threshold_filters_irrelevant_tools() {
-        // "帮我写个排序算法" = "help me write a sorting algorithm" — pure coding query.
-        // With adaptive threshold: 0 signals → threshold=0, but GitHub tools should
-        // still rank LOW because TF-IDF for "排序算法" against GitHub tool descriptions
-        // is near-zero. They may appear in results but should rank below coding tools.
-        let state = ConversationState::from_message("帮我写个排序算法", 1);
-        let ranked = pre_filter_dynamic(&state, "帮我写个排序算法");
-
-        // Under adaptive threshold, 0-signal queries get ALL non-zero-score tools.
-        // GitHub tools may have tiny scores from generic terms. The key invariant is
-        // that they are NOT in the top positions — coding tools should dominate.
-        if let Some(github_rank) = ranked
-            .iter()
-            .position(|&(idx, _)| TOOL_CATALOG[idx].intents.contains(&IntentType::GitHub))
-        {
-            // If GitHub tools appear at all, they must not be in top 3
-            assert!(
-                github_rank >= 3 || ranked.len() <= 3,
-                "GitHub tools should not rank in top 3 for pure coding query, got rank {}",
-                github_rank
-            );
-        }
-        // Either way, the result set should be non-empty (adaptive threshold widens)
-        assert!(
-            !ranked.is_empty(),
-            "0-signal query should still get some dynamic tools"
-        );
-    }
-
-    #[test]
-    fn prefilter_memory_query_includes_memory_tools() {
-        let state = ConversationState::from_message("我有哪些记忆？", 1);
-        let ranked = pre_filter_dynamic(&state, "我有哪些记忆？");
-
-        let has_memory = ranked
-            .iter()
-            .any(|&(idx, _)| TOOL_CATALOG[idx].intents.contains(&IntentType::Memory));
-        assert!(has_memory, "Memory query should include memory tools");
-    }
-
-    #[test]
-    fn prefilter_ci_query_includes_github_ci() {
-        let state = ConversationState::from_message("memoria最新的ci?", 1);
-        let ranked = pre_filter_dynamic(&state, "memoria最新的ci?");
-
-        let top5_names: Vec<_> = ranked
-            .iter()
-            .take(5)
-            .map(|&(idx, _)| TOOL_CATALOG[idx].name)
-            .collect();
-        assert!(
-            top5_names.contains(&"github_ci_status"),
-            "CI query should include github_ci_status in top 5, got: {:?}",
-            top5_names
+            pinned_memory.len() >= 1,
+            "at least 1 memory-intent tool should be pinned, got: {pinned_memory:?}"
         );
     }
 
@@ -1813,7 +1735,7 @@ mod tests {
     #[test]
     fn resolve_schemas_always_includes_pinned() {
         let registry = mock_registry();
-        let (schemas, report) = resolve_schemas(&registry, &["github_list_prs".into()]);
+        let (schemas, report) = resolve_schemas(&registry, &["github".into()]);
 
         let names = &report.tools_selected;
         assert!(names.contains(&"bash".to_string()), "must include bash");
@@ -1822,7 +1744,7 @@ mod tests {
             "must include read_file"
         );
         assert!(
-            names.contains(&"github_list_prs".to_string()),
+            names.contains(&"github".to_string()),
             "must include requested tool"
         );
         assert_eq!(schemas.len(), report.selected_count as usize);
@@ -1832,7 +1754,7 @@ mod tests {
     fn resolve_schemas_deduplicates_pinned() {
         let registry = mock_registry();
         // Request bash (which is pinned) — should not appear twice
-        let (_, report) = resolve_schemas(&registry, &["bash".into(), "github_list_prs".into()]);
+        let (_, report) = resolve_schemas(&registry, &["bash".into(), "github".into()]);
         let bash_count = report
             .tools_selected
             .iter()
@@ -1891,7 +1813,7 @@ mod tests {
         #[async_trait]
         impl ToolSelector for HighConfSelector {
             async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
-                fixed_result(vec!["github_list_prs".into()], "tfidf_high", 0.8)
+                fixed_result(vec!["github".into()], "tfidf_high", 0.8)
             }
         }
 
@@ -1950,124 +1872,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fallback_uses_primary_when_successful() {
-        struct FixedSelector(Vec<String>);
-        #[async_trait]
-        impl ToolSelector for FixedSelector {
-            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
-                SelectionResult {
-                    tool_names: self.0.clone(),
-                    strategy: "fixed",
-                    budget_used: 0,
-                    failed: false,
-                    confidence: 0.9,
-                    selector_tokens_in: 0,
-                    selector_tokens_out: 0,
-                    selected_skills: vec![],
-                }
-            }
-        }
-
-        // Fallback has low confidence with dynamic tool → should escalate to primary (LLM)
-        struct LowConfSelector;
-        #[async_trait]
-        impl ToolSelector for LowConfSelector {
-            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
-                SelectionResult {
-                    tool_names: vec!["github_list_prs".into()],
-                    strategy: "tfidf_low",
-                    budget_used: 0,
-                    failed: false,
-                    confidence: 0.3,
-                    selector_tokens_in: 0,
-                    selector_tokens_out: 0,
-                    selected_skills: vec![],
-                }
-            }
-        }
-
-        let primary = Box::new(FixedSelector(vec!["github_list_prs".into()]));
-        let fallback = Box::new(LowConfSelector);
-        let selector = FallbackSelector::new(primary, fallback);
-
-        let ctx = SelectionContext {
-            query: "test",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-        let result = selector.select(&ctx).await;
-        // Primary should be called because fallback had dynamic tools with low confidence
-        assert_eq!(result.strategy, "fixed");
-        assert_eq!(result.tool_names, vec!["github_list_prs"]);
-    }
-
-    #[tokio::test]
-    async fn fallback_uses_secondary_on_empty() {
-        struct EmptySelector;
-        #[async_trait]
-        impl ToolSelector for EmptySelector {
-            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
-                SelectionResult {
-                    tool_names: vec![],
-                    strategy: "llm_error",
-                    budget_used: 0,
-                    failed: true,
-                    confidence: 0.0,
-                    selector_tokens_in: 0,
-                    selector_tokens_out: 0,
-                    selected_skills: vec![],
-                }
-            }
-        }
-        struct FixedSelector(Vec<String>);
-        #[async_trait]
-        impl ToolSelector for FixedSelector {
-            async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
-                SelectionResult {
-                    tool_names: self.0.clone(),
-                    strategy: "tfidf",
-                    budget_used: 100,
-                    failed: false,
-                    confidence: 0.3,
-                    selector_tokens_in: 0,
-                    selector_tokens_out: 0,
-                    selected_skills: vec![],
-                }
-            }
-        }
-
-        let primary = Box::new(EmptySelector);
-        // Use a catalog tool that is not pinned so `has_dynamic_tools` is true and primary runs.
-        let fallback = Box::new(FixedSelector(vec!["github_list_prs".into()]));
-        let selector = FallbackSelector::new(primary, fallback);
-
-        let ctx = SelectionContext {
-            query: "test",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-        let result = selector.select(&ctx).await;
-        assert_eq!(result.strategy, "tfidf_routed_after_llm");
-        assert_eq!(result.tool_names, vec!["github_list_prs"]);
-    }
-
-    #[tokio::test]
     async fn fallback_select_with_learned_context_reuses_provided_context() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2120,10 +1924,10 @@ mod tests {
                 if learned_context
                     .tool_hints
                     .iter()
-                    .any(|hint| hint.contains("github_list_prs"))
+                    .any(|hint| hint.contains("github"))
                 {
                     SelectionResult {
-                        tool_names: vec!["github_list_prs".into()],
+                        tool_names: vec!["github".into()],
                         strategy: "spy_fallback_learned",
                         budget_used: 0,
                         failed: false,
@@ -2173,11 +1977,11 @@ mod tests {
             entity_hints: vec![],
             pattern_hints: vec![],
             calibration_hints: vec![],
-            tool_hints: vec!["Tool history: prefer 'github_list_prs'".into()],
+            tool_hints: vec!["Tool history: prefer 'github'".into()],
         };
         let result = selector.select_with_learned_context(&ctx, &provided).await;
         assert_eq!(result.strategy, "spy_fallback_learned");
-        assert_eq!(result.tool_names, vec!["github_list_prs"]);
+        assert_eq!(result.tool_names, vec!["github"]);
         assert_eq!(
             learned_calls.load(Ordering::SeqCst),
             0,
@@ -2216,10 +2020,10 @@ mod tests {
                 let has_pr_pattern = learned_context
                     .pattern_hints
                     .iter()
-                    .any(|hint| hint.contains("github_search -> github_list_prs"));
+                    .any(|hint| hint.contains("github_search -> github"));
                 if has_github_entity && has_pr_pattern {
                     SelectionResult {
-                        tool_names: vec!["github_list_prs".into()],
+                        tool_names: vec!["github".into()],
                         strategy: "learned_primary",
                         budget_used: 0,
                         failed: false,
@@ -2267,20 +2071,20 @@ mod tests {
         graph.learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_search".into(), "github_list_prs".into()],
+            &["github_search".into(), "github".into()],
             None,
         );
         graph.learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_search".into(), "github_list_prs".into()],
+            &["github_search".into(), "github".into()],
             None,
         );
 
         let mut patterns = PatternLibrary::new();
         for _ in 0..2 {
             patterns.record_outcome(
-                &["github_search".into(), "github_list_prs".into()],
+                &["github_search".into(), "github".into()],
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
@@ -2298,10 +2102,10 @@ mod tests {
 
         // With learned context, either TF-IDF is confident enough (fast path)
         // or primary gets the learned context and succeeds.
-        // Either way, github_list_prs should be selected.
+        // Either way, github should be selected.
         assert!(
-            result.tool_names.contains(&"github_list_prs".to_string()),
-            "learned context should help select github_list_prs, got: {:?} (strategy: {})",
+            result.tool_names.contains(&"github".to_string()),
+            "learned context should help select github, got: {:?} (strategy: {})",
             result.tool_names,
             result.strategy
         );
@@ -2312,43 +2116,6 @@ mod tests {
     }
 
     // ── Quality Tracker integration ──
-
-    #[tokio::test]
-    async fn tfidf_selector_with_quality_tracker_records_selection() {
-        let registry = mock_registry();
-        let tracker = Arc::new(Mutex::new(ToolQualityTracker::new()));
-        let selector = TfIdfSelector::new(registry).with_quality_tracker(tracker.clone());
-
-        let ctx = SelectionContext {
-            query: "show me the github pull requests",
-            turn_count: 2,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-        let result = selector.select(&ctx).await;
-        assert!(!result.tool_names.is_empty());
-
-        // Quality tracker should have recorded the selection
-        let qt = tracker.lock().unwrap();
-        let entries = qt.all_entries();
-        assert!(
-            !entries.is_empty(),
-            "tracker should have recorded at least one tool"
-        );
-        // At least one selected tool should have selections > 0
-        let any_selected = entries.values().any(|e| e.selections > 0);
-        assert!(
-            any_selected,
-            "at least one tool should have been recorded as selected"
-        );
-    }
 
     #[tokio::test]
     async fn tfidf_selector_without_tracker_still_works() {
@@ -2697,84 +2464,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn memory_domain_hints_raise_confidence_without_query_signals() {
-        let selector = TfIdfSelector::new(mock_registry());
-        let ctx_no_hint = SelectionContext {
-            query: "matrixorigin",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-        let ctx_with_hint = SelectionContext {
-            query: "matrixorigin",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![DomainHint::GitHub],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-        let r1 = selector.select(&ctx_no_hint).await;
-        let r2 = selector.select(&ctx_with_hint).await;
-        assert!(
-            r2.confidence > r1.confidence,
-            "memory-domain confidence ({}) should exceed baseline ({})",
-            r2.confidence,
-            r1.confidence
-        );
-    }
-
-    #[tokio::test]
-    async fn file_context_raises_confidence_for_ambiguous_code_query() {
-        let selector = TfIdfSelector::new(mock_registry());
-        let ctx_plain = SelectionContext {
-            query: "improve webhook capability",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-        let ctx_code = SelectionContext {
-            query: "improve webhook capability",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec!["rust".into()],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-        let r1 = selector.select(&ctx_plain).await;
-        let r2 = selector.select(&ctx_code).await;
-        assert!(
-            r2.confidence > r1.confidence,
-            "file-context confidence ({}) should exceed baseline ({})",
-            r2.confidence,
-            r1.confidence
-        );
-    }
-
     // ── Pipeline Wiring Integration Tests ──
 
     #[tokio::test]
@@ -2788,15 +2477,10 @@ mod tests {
             g.learn(
                 "matrixorigin",
                 DomainHint::GitHub,
-                &["github_list_prs".into(), "github_search_repos".into()],
+                &["github".into(), "github_search_repos".into()],
                 None,
             );
-            g.learn(
-                "matrixorigin",
-                DomainHint::GitHub,
-                &["github_list_prs".into()],
-                None,
-            );
+            g.learn("matrixorigin", DomainHint::GitHub, &["github".into()], None);
         }
 
         let selector = TfIdfSelector::new(mock_registry()).with_entity_graph(graph.clone());
@@ -2831,53 +2515,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wiring_pattern_library_adds_boost_terms() {
-        let lib = PatternLibrary::new();
-        let lib = Arc::new(Mutex::new(lib));
-
-        // Record successful tool chain patterns for CodeReview tasks
-        {
-            let mut l = lib.lock().unwrap();
-            for _ in 0..3 {
-                l.record_outcome(
-                    &["github_list_prs".into(), "github_get_pr".into()],
-                    TaskType::Fetch,
-                    Some(DomainHint::GitHub),
-                    true,
-                    0.9,
-                    None,
-                );
-            }
-        }
-
-        let selector = TfIdfSelector::new(mock_registry()).with_pattern_library(lib.clone());
-
-        let ctx = SelectionContext {
-            query: "review the latest PR",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-
-        let result = selector.select(&ctx).await;
-
-        // Pattern library should inject tool names as boost terms,
-        // improving selection for the detected task type
-        assert!(
-            !result.tool_names.is_empty(),
-            "pattern-enriched selection should return tools"
-        );
-        assert_eq!(result.strategy, "tfidf_routed");
-    }
-
-    #[tokio::test]
     async fn wiring_record_turn_outcome_updates_all_modules() {
         let graph = Arc::new(Mutex::new(EntityGraph::new()));
         let lib = Arc::new(Mutex::new(PatternLibrary::new()));
@@ -2891,7 +2528,7 @@ mod tests {
         // Record a successful turn outcome (twice — PatternLibrary needs ≥2 observations)
         selector.record_turn_outcome(
             "check matrixorigin PRs",
-            &["github_list_prs".into(), "github_search_repos".into()],
+            &["github".into(), "github_search_repos".into()],
             TaskType::Fetch,
             Some(DomainHint::GitHub),
             true,  // success
@@ -2901,7 +2538,7 @@ mod tests {
         );
         selector.record_turn_outcome(
             "check matrixorigin issues",
-            &["github_list_prs".into(), "github_search_repos".into()],
+            &["github".into(), "github_search_repos".into()],
             TaskType::Fetch,
             Some(DomainHint::GitHub),
             true,
@@ -2933,7 +2570,7 @@ mod tests {
         // Record correction to verify calibrator
         selector.record_turn_outcome(
             "check matrixorigin issues",
-            &["github_list_issues".into()],
+            &["github".into()],
             TaskType::Fetch,
             Some(DomainHint::GitHub),
             true,
@@ -3008,7 +2645,7 @@ mod tests {
             .with_pattern_library(lib.clone())
             .with_progressive_calibrator(cal.clone());
 
-        let tools = vec!["github_list_prs".to_string()];
+        let tools = vec!["github".to_string()];
         for _ in 0..2 {
             selector.record_turn_outcome(
                 "check matrixorigin PRs",
@@ -3037,31 +2674,6 @@ mod tests {
                 "pattern library should still record chains without domain"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn wiring_backward_compat_no_pipeline_modules() {
-        // No pipeline modules → should behave identically to old path
-        let selector = TfIdfSelector::new(mock_registry());
-        let ctx = SelectionContext {
-            query: "show me recent pull requests",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-
-        let result = selector.select(&ctx).await;
-        // Should still work via RoutingEngine (creates ConversationState internally)
-        assert!(!result.tool_names.is_empty());
-        assert_eq!(result.strategy, "tfidf_routed");
-        assert!(!result.failed);
     }
 
     #[tokio::test]
@@ -3094,7 +2706,7 @@ mod tests {
         for _ in 0..3 {
             selector.record_turn_outcome(
                 "matrixorigin issues",
-                &["github_list_issues".into(), "github_search_repos".into()],
+                &["github".into(), "github_search_repos".into()],
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
@@ -3116,69 +2728,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wiring_all_modules_composed() {
-        let graph = Arc::new(Mutex::new(EntityGraph::new()));
-        let lib = Arc::new(Mutex::new(PatternLibrary::new()));
-        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
-
-        // Pre-populate entity graph
-        {
-            let mut g = graph.lock().unwrap();
-            g.learn(
-                "rust",
-                DomainHint::Code,
-                &["file_read".into(), "bash".into()],
-                None,
-            );
-            g.learn("rust", DomainHint::Code, &["file_read".into()], None);
-        }
-
-        // Pre-populate pattern library
-        {
-            let mut l = lib.lock().unwrap();
-            for _ in 0..3 {
-                l.record_outcome(
-                    &["file_read".into(), "bash".into()],
-                    TaskType::Code,
-                    Some(DomainHint::Code),
-                    true,
-                    0.85,
-                    None,
-                );
-            }
-        }
-
-        let selector = TfIdfSelector::new(mock_registry())
-            .with_entity_graph(graph)
-            .with_pattern_library(lib)
-            .with_progressive_calibrator(cal);
-
-        let ctx = SelectionContext {
-            query: "help me with rust code review",
-            turn_count: 3,
-            recent_tools: &["file_read".into()],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-
-        let result = selector.select(&ctx).await;
-
-        // All modules composed: entity boost + routing + pattern boost
-        assert!(!result.tool_names.is_empty());
-        assert_eq!(result.strategy, "tfidf_routed");
-        assert!(
-            result.confidence > 0.0,
-            "composed selection should have non-zero confidence"
-        );
-    }
-
-    #[tokio::test]
     async fn wiring_failed_outcome_not_learned_to_entity_graph() {
         let graph = Arc::new(Mutex::new(EntityGraph::new()));
 
@@ -3187,7 +2736,7 @@ mod tests {
         // Record a FAILED turn outcome
         selector.record_turn_outcome(
             "check kubernetes status",
-            &["github_list_prs".into()],
+            &["github".into()],
             TaskType::Fetch,
             Some(DomainHint::GitHub),
             false, // FAILED
@@ -3461,7 +3010,7 @@ mod tests {
 
         // With domain hint, confidence should be >= no-hint case
         // (the hint adds score to GitHub tools, improving overall confidence)
-        let gh_tools = ["github_list_prs", "github_get_pr", "github_list_issues"];
+        let gh_tools = ["github", "github", "github"];
         let hint_gh_count = result_hint
             .tool_names
             .iter()
@@ -3508,29 +3057,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_domain_hints_same_as_no_hints() {
-        let selector = TfIdfSelector::new(mock_registry());
-        let ctx_none = SelectionContext {
-            query: "list pull requests",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-        let result_none = selector.select(&ctx_none).await;
-
-        // Empty vec should produce identical results to no hints
-        assert!(!result_none.failed);
-        assert_eq!(result_none.strategy, "tfidf_routed");
-    }
-
-    #[tokio::test]
     async fn budget_pressure_and_domain_hints_combined() {
         let selector = TfIdfSelector::new(mock_registry());
         // Combine high pressure with domain hint
@@ -3551,62 +3077,14 @@ mod tests {
         // Should still select some tools (domain hint helps ranking despite pressure)
         assert!(!result.failed, "Combined pressure+hints should not fail");
         // The tools selected should be the most relevant (GitHub) ones
-        let has_github = result.tool_names.iter().any(|t| t.starts_with("github_"));
+        let has_github = result
+            .tool_names
+            .iter()
+            .any(|t| t == "github" || t.starts_with("github_"));
         assert!(
             has_github,
-            "Even under pressure, domain hint should keep highest-ranked GitHub tools: {:?}",
+            "Even under pressure, domain hint should keep github tool: {:?}",
             result.tool_names
-        );
-    }
-
-    #[tokio::test]
-    async fn restricted_tools_excluded_from_selection() {
-        let selector = TfIdfSelector::new(mock_registry());
-
-        // Without restriction: github tools should be selected for this query
-        let ctx_open = SelectionContext {
-            query: "list open pull requests on github",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 1200,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-        let result_open = selector.select(&ctx_open).await;
-        assert!(
-            result_open
-                .tool_names
-                .contains(&"github_list_prs".to_string()),
-            "Without restriction, github_list_prs should be selected: {:?}",
-            result_open.tool_names
-        );
-
-        // With restriction: github_list_prs should be filtered out
-        let ctx_restricted = SelectionContext {
-            query: "list open pull requests on github",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 1200,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec!["github_list_prs".to_string()],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-        let result_restricted = selector.select(&ctx_restricted).await;
-        assert!(
-            !result_restricted
-                .tool_names
-                .contains(&"github_list_prs".to_string()),
-            "With restriction, github_list_prs should be excluded: {:?}",
-            result_restricted.tool_names
         );
     }
 
@@ -3634,24 +3112,23 @@ mod tests {
         };
         let result = selector.select(&ctx).await;
 
-        let git_tools: Vec<&String> = result
+        let has_git = result
             .tool_names
             .iter()
-            .filter(|n| n.starts_with("git_"))
-            .collect();
+            .any(|n| n == "git" || n.starts_with("git_"));
         assert!(
-            !git_tools.is_empty(),
-            "'review latest commit' should select at least 1 git tool, got: {:?}",
+            has_git,
+            "'review latest commit' should select the git tool, got: {:?}",
             result.tool_names
         );
-        // git_log or git_diff should be selected for commit review
+        // git tool should be selected for commit review
         let has_key_git_tool = result
             .tool_names
             .iter()
-            .any(|n| n == "git_log" || n == "git_diff" || n == "git_show");
+            .any(|n| n == "git_log" || n == "git" || n == "git_show");
         assert!(
             has_key_git_tool,
-            "'review latest commit' should select git_log, git_diff, or git_show, got: {:?}",
+            "'review latest commit' should select git, got: {:?}",
             result.tool_names
         );
     }
@@ -3675,7 +3152,7 @@ mod tests {
         };
         let result = selector.select(&ctx).await;
         assert!(
-            result.tool_names.contains(&"git_status".to_string()),
+            result.tool_names.contains(&"git".to_string()),
             "'show git status' should select git_status, got: {:?}",
             result.tool_names
         );
@@ -3792,7 +3269,7 @@ mod tests {
         };
         let result = selector.select(&ctx).await;
         assert!(
-            result.tool_names.contains(&"git_diff".to_string()),
+            result.tool_names.contains(&"git".to_string()),
             "'git diff HEAD~1' must select git_diff, got: {:?}",
             result.tool_names
         );

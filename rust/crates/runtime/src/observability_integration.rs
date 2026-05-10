@@ -187,6 +187,14 @@ pub struct ObservabilitySession {
     /// Recent `AutoTuningEngine` feedback signals mirrored onto the session so
     /// SelfModel can render them. Bounded to the most recent 16 entries.
     pub last_feedback_signals: Vec<FeedbackSignal>,
+
+    /// Per-channel fingerprint history for runtime-injected prompt signals
+    /// (recent_failing_tests, outcome_bias, lessons, volatile_pending).
+    /// Observed once per SelfModel snapshot build so the
+    /// `introspect subtopic=noise` renderer can flag channels that have
+    /// been re-rendered unchanged for many turns — session f85a02bb's
+    /// 58-round stale-signal case.
+    pub injection_history: astra_turn_core::injection_tracking::InjectionHistory,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +299,7 @@ impl ObservabilitySession {
             cached_skill_names: Vec::new(),
             last_tool_health_export: Vec::new(),
             last_feedback_signals: Vec::new(),
+            injection_history: astra_turn_core::injection_tracking::InjectionHistory::new(),
         }
     }
 
@@ -336,12 +345,100 @@ impl ObservabilitySession {
             cached_skill_names: Vec::new(),
             last_tool_health_export: Vec::new(),
             last_feedback_signals: Vec::new(),
+            injection_history: astra_turn_core::injection_tracking::InjectionHistory::new(),
         }
     }
 
     /// Get the current scenario (if detected).
     pub fn current_scenario(&self) -> Option<Scenario> {
         self.profile.current_scenario
+    }
+
+    /// Observe the four tracked prompt-injection channels for the
+    /// current turn. Idempotent per fingerprint — calling this multiple
+    /// times in the same turn with identical content only bumps the
+    /// `last_seen_round` of the current run. A content change opens a
+    /// new run so the freshness report reports `rounds_alive=0` and
+    /// clears a stale status.
+    ///
+    /// Call site: CLI's `build_self_model_for_agent` (edge_tools.rs)
+    /// after the session has been repopulated with the per-turn signals
+    /// but before the SelfModel snapshot is built.
+    pub fn observe_injections(&mut self, lessons_text: &str, volatile_text: &str) {
+        use astra_turn_core::injection_tracking::{InjectionChannel, InjectionFingerprint};
+        let round = self.turn_number;
+
+        let failing_text = self.recent_failing_tests.join(",");
+        self.injection_history.observe(
+            round,
+            InjectionChannel::RecentFailingTests,
+            InjectionFingerprint::from_content(&failing_text),
+        );
+
+        let bias_text = self
+            .outcome_bias
+            .iter()
+            .map(|(t, b)| format!("{t}={b:.3}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        self.injection_history.observe(
+            round,
+            InjectionChannel::OutcomeBias,
+            InjectionFingerprint::from_content(&bias_text),
+        );
+
+        self.injection_history.observe(
+            round,
+            InjectionChannel::Lessons,
+            InjectionFingerprint::from_content(lessons_text),
+        );
+
+        self.injection_history.observe(
+            round,
+            InjectionChannel::VolatilePending,
+            InjectionFingerprint::from_content(volatile_text),
+        );
+    }
+
+    /// Partial observation for call sites that cannot see the per-turn
+    /// volatile lane (e.g. the CLI `prepare_chat_turn_payload` path).
+    ///
+    /// Observing a volatile lane with an empty string from a call site
+    /// that never sees the real content would make the channel appear
+    /// permanently `Empty` in `introspect subtopic=noise`, masking
+    /// genuine staleness. This method observes only the three channels
+    /// that ARE reachable from the CLI path — failing tests, outcome
+    /// bias, and lessons — and deliberately leaves the volatile lane
+    /// untouched so the dedicated volatile-aware observation point
+    /// (full `observe_injections`, called further downstream) owns it.
+    pub fn observe_lessons_only(&mut self, lessons_text: &str) {
+        use astra_turn_core::injection_tracking::{InjectionChannel, InjectionFingerprint};
+        let round = self.turn_number;
+
+        let failing_text = self.recent_failing_tests.join(",");
+        self.injection_history.observe(
+            round,
+            InjectionChannel::RecentFailingTests,
+            InjectionFingerprint::from_content(&failing_text),
+        );
+
+        let bias_text = self
+            .outcome_bias
+            .iter()
+            .map(|(t, b)| format!("{t}={b:.3}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        self.injection_history.observe(
+            round,
+            InjectionChannel::OutcomeBias,
+            InjectionFingerprint::from_content(&bias_text),
+        );
+
+        self.injection_history.observe(
+            round,
+            InjectionChannel::Lessons,
+            InjectionFingerprint::from_content(lessons_text),
+        );
     }
 
     /// Publish the four SelfModel inputs that were previously hard-coded to
@@ -578,6 +675,25 @@ impl ObservabilitySession {
             let drop = self.recent_failing_tests.len() - MAX_NAMES;
             self.recent_failing_tests.drain(0..drop);
         }
+    }
+
+    /// Tier 1 expiry: clear the bounded failing-test ring because a
+    /// later build/test run came back green. Called by the shell
+    /// handler when parsed output reports `passed == true` and no error
+    /// messages — at that point, any previously-recorded failures are
+    /// either (a) actually fixed, or (b) not part of the scope being
+    /// validated; in either case the signal is stale and should not be
+    /// re-rendered into the self-awareness block for the next turn.
+    ///
+    /// If the scope-b case is relevant (operator ran only a subset and
+    /// other tests remain broken), the next red test run will
+    /// re-populate the ring within one turn — so clearing is self-
+    /// healing, not information-destroying. This fixes the f85a02bb
+    /// regression where a mis-cwd Cargo.toml failure recorded on round
+    /// 0 persisted for 58 consecutive rounds after every later cargo
+    /// invocation succeeded.
+    pub fn clear_failing_tests(&mut self) {
+        self.recent_failing_tests.clear();
     }
 
     /// Gap 3: record a permission rejection with its reason. Dedups by
@@ -1348,6 +1464,107 @@ mod tests {
         assert!(session.read().unwrap_or_else(|e| e.into_inner()).user_id == "user1");
     }
 
+    // ── Injection-freshness observer (Tier 4 observability) ──
+    //
+    // These guard the f85a02bb regression: the runtime re-rendered the
+    // same `Recent test failures` string for 58 consecutive rounds after
+    // the underlying cause had been fixed, because nothing tracked
+    // whether the signal was fresh. The observer below must flag it as
+    // STALE so the introspect tool can surface the drift.
+
+    #[test]
+    fn observe_injections_stale_after_unchanged_signal_across_many_turns() {
+        use astra_turn_core::injection_tracking::{
+            ChannelStatus, InjectionChannel, freshness_report,
+        };
+        let mut session = ObservabilitySession::new_simple("sess-f85a02bb");
+        session.recent_failing_tests = vec!["could not find Cargo.toml".to_string()];
+        // Simulate 58 consecutive turns with identical content (the
+        // f85a02bb number — any N ≥ DEFAULT_STALE_THRESHOLD works).
+        for t in 0..=58 {
+            session.turn_number = t;
+            session.observe_injections("", "");
+        }
+        let report = freshness_report(&session.injection_history, session.turn_number);
+        let failing = report
+            .iter()
+            .find(|c| c.channel == InjectionChannel::RecentFailingTests)
+            .expect("recent_failing_tests must be in the report");
+        match &failing.status {
+            ChannelStatus::Stale { rounds_alive } => assert_eq!(*rounds_alive, 58),
+            other => panic!(
+                "58 rounds of identical Recent test failures must be reported as STALE, got: {other:?}"
+            ),
+        }
+        assert!(
+            failing.preview.contains("Cargo.toml"),
+            "preview must surface the actual payload so operators can identify the stuck signal: {failing:?}"
+        );
+    }
+
+    #[test]
+    fn observe_injections_returns_to_fresh_when_content_changes() {
+        use astra_turn_core::injection_tracking::{
+            ChannelStatus, InjectionChannel, freshness_report,
+        };
+        let mut session = ObservabilitySession::new_simple("sess-tier4");
+        session.recent_failing_tests = vec!["old failure".to_string()];
+        for t in 0..20 {
+            session.turn_number = t;
+            session.observe_injections("", "");
+        }
+        // Content changes on turn 20 — e.g., the underlying bug was
+        // fixed and a new unrelated test fails next.
+        session.turn_number = 20;
+        session.recent_failing_tests = vec!["different failure".to_string()];
+        session.observe_injections("", "");
+        let report = freshness_report(&session.injection_history, session.turn_number);
+        let failing = report
+            .iter()
+            .find(|c| c.channel == InjectionChannel::RecentFailingTests)
+            .unwrap();
+        match &failing.status {
+            ChannelStatus::Fresh { rounds_alive: 0 } => {}
+            other => panic!(
+                "content change must reset rounds_alive to 0 and drop Stale status, got: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn observe_injections_tracks_each_channel_independently() {
+        use astra_turn_core::injection_tracking::{
+            ChannelStatus, InjectionChannel, freshness_report,
+        };
+        let mut session = ObservabilitySession::new_simple("sess-chan-sep");
+        session.outcome_bias.insert("bash".to_string(), 0.10);
+        // OutcomeBias stable; lessons change every turn.
+        for t in 0..15 {
+            session.turn_number = t;
+            let lessons = format!("lesson-v{t}");
+            session.observe_injections(&lessons, "");
+        }
+        let report = freshness_report(&session.injection_history, session.turn_number);
+        let bias = report
+            .iter()
+            .find(|c| c.channel == InjectionChannel::OutcomeBias)
+            .unwrap();
+        let lessons = report
+            .iter()
+            .find(|c| c.channel == InjectionChannel::Lessons)
+            .unwrap();
+        assert!(
+            matches!(bias.status, ChannelStatus::Stale { .. }),
+            "stable bias over 15 rounds should be Stale, got: {:?}",
+            bias.status
+        );
+        assert!(
+            matches!(lessons.status, ChannelStatus::Fresh { rounds_alive: 0 }),
+            "lessons changing every turn should always be Fresh at rounds_alive=0, got: {:?}",
+            lessons.status
+        );
+    }
+
     #[test]
     fn record_low_confidence_tools_replaces_and_propagates_to_sessions() {
         let hub = ObservabilityHub::new();
@@ -1677,6 +1894,115 @@ mod tests {
         s.record_failing_test_names(more);
         assert_eq!(s.recent_failing_tests.len(), 8);
         assert!(s.recent_failing_tests.contains(&"t9".to_string()));
+    }
+
+    // ── Tier 1 expiry: clear_failing_tests + freshness interaction ──
+
+    #[test]
+    fn clear_failing_tests_empties_the_ring() {
+        let mut s = ObservabilitySession::new_simple("sess-clear");
+        s.record_failing_test_names(vec!["t1".into(), "t2".into(), "t3".into()]);
+        assert_eq!(s.recent_failing_tests.len(), 3);
+        s.clear_failing_tests();
+        assert!(
+            s.recent_failing_tests.is_empty(),
+            "clear_failing_tests must empty the ring"
+        );
+    }
+
+    #[test]
+    fn clear_failing_tests_is_idempotent_on_empty_ring() {
+        let mut s = ObservabilitySession::new_simple("sess-idempotent");
+        s.clear_failing_tests();
+        s.clear_failing_tests();
+        assert!(s.recent_failing_tests.is_empty());
+    }
+
+    #[test]
+    fn clear_failing_tests_does_not_touch_other_injection_channels() {
+        let mut s = ObservabilitySession::new_simple("sess-scope");
+        s.record_failing_test_names(vec!["t1".into()]);
+        s.outcome_bias.insert("bash".to_string(), 0.10);
+        s.recent_rejections
+            .push(crate::self_model::RejectionSummary {
+                tool: "write_file".to_string(),
+                reason: "denied".to_string(),
+            });
+        s.recent_correction_excerpts
+            .push("please use X".to_string());
+
+        s.clear_failing_tests();
+
+        assert!(s.recent_failing_tests.is_empty());
+        assert_eq!(
+            s.outcome_bias.get("bash"),
+            Some(&0.10),
+            "outcome_bias must not be cleared by clear_failing_tests"
+        );
+        assert_eq!(
+            s.recent_rejections.len(),
+            1,
+            "recent_rejections is scope-separate"
+        );
+        assert_eq!(
+            s.recent_correction_excerpts.len(),
+            1,
+            "recent_correction_excerpts is scope-separate"
+        );
+    }
+
+    #[test]
+    fn pass_after_fail_clears_stale_status_in_freshness_report() {
+        // End-to-end Tier 1 regression: a test run records a failure,
+        // the signal goes stale after many turns, a later pass clears
+        // it, the next observation reports the channel as Empty (no
+        // content) rather than Stale.
+        use astra_turn_core::injection_tracking::{
+            ChannelStatus, InjectionChannel, freshness_report,
+        };
+        let mut s = ObservabilitySession::new_simple("sess-tier1-e2e");
+
+        // r0: record the initial cwd-failure (f85a02bb shape).
+        s.turn_number = 0;
+        s.record_failing_test_names(vec!["could not find Cargo.toml".into()]);
+        s.observe_injections("", "");
+
+        // r1..r20: signal persists (the agent can't clear it without Tier 1).
+        for t in 1..=20 {
+            s.turn_number = t;
+            s.observe_injections("", "");
+        }
+        let stale_report = freshness_report(&s.injection_history, s.turn_number);
+        let stale_entry = stale_report
+            .iter()
+            .find(|c| c.channel == InjectionChannel::RecentFailingTests)
+            .unwrap();
+        assert!(
+            matches!(stale_entry.status, ChannelStatus::Stale { .. }),
+            "precondition: signal must be Stale before the fix fires, got: {:?}",
+            stale_entry.status
+        );
+
+        // r21: cargo invocation passes → Tier 1 expiry clears the ring.
+        s.turn_number = 21;
+        s.clear_failing_tests();
+        s.observe_injections("", "");
+
+        let fresh_report = freshness_report(&s.injection_history, s.turn_number);
+        let cleared = fresh_report
+            .iter()
+            .find(|c| c.channel == InjectionChannel::RecentFailingTests)
+            .unwrap();
+        assert!(
+            matches!(
+                cleared.status,
+                ChannelStatus::Empty {
+                    first_seen_round: 21
+                }
+            ),
+            "after clearing, the channel must report as Empty(at_turn=21), not Stale — the signal has been actively expired by the Tier 1 rule. got: {:?}",
+            cleared.status
+        );
     }
 
     #[test]

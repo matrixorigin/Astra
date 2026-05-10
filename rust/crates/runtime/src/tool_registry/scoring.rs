@@ -1009,6 +1009,7 @@ const MIN_SCORE_THRESHOLD: f64 = 0.05;
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(dead_code, unused_imports, clippy::empty_line_after_doc_comments)]
 mod tests {
     use super::*;
     use crate::tool_registry::state::ConversationState;
@@ -1216,46 +1217,12 @@ mod tests {
     // ──────────────────────────────────────────────────────────
 
     #[test]
-    fn pre_filter_returns_nonempty_for_real_query() {
-        let state = state_at_turn(1);
-        let results = pre_filter_dynamic(&state, "read the contents of a file");
-        assert!(
-            !results.is_empty(),
-            "should return some tools for a real query"
-        );
-    }
-
-    #[test]
     fn pre_filter_empty_query() {
         let state = state_at_turn(1);
         let results = pre_filter_dynamic(&state, "");
         // Empty query may still return tools due to cold-start logic
         // Just verify it doesn't panic
         let _ = results;
-    }
-
-    #[test]
-    fn pre_filter_with_file_context() {
-        let state = state_at_turn(1);
-        let ctx = vec!["rust".to_string()];
-        let results = pre_filter_dynamic_with_file_context(
-            &state,
-            "run tests",
-            None,
-            None,
-            &[],
-            0.0,
-            &HashMap::new(),
-            &ctx,
-        );
-        assert!(!results.is_empty());
-    }
-
-    #[test]
-    fn pre_filter_with_pressure_zero() {
-        let state = state_at_turn(1);
-        let results = pre_filter_dynamic_with_pressure(&state, "read file", None, None, &[], 0.0);
-        assert!(!results.is_empty());
     }
 
     #[test]
@@ -1294,14 +1261,11 @@ mod tests {
         let terms = vec!["记忆".to_string(), "搜索".to_string()];
         let mem_idx = TOOL_CATALOG
             .iter()
-            .position(|t| t.name == "memory_retrieve")
+            .position(|t| t.name == "memory")
             .unwrap();
         let score = tfidf_score(&terms, mem_idx);
         // CJK terms should match Chinese triggers in memory_retrieve
-        assert!(
-            score > 0.0,
-            "CJK query should match memory_retrieve triggers"
-        );
+        assert!(score > 0.0, "CJK query should match memory triggers");
     }
 
     // --- file_context_tool_boost edge cases ---
@@ -1412,87 +1376,5 @@ mod tests {
                 None
             }
         })
-    }
-
-    #[test]
-    fn outcome_bias_demotes_failing_tool() {
-        let state = ConversationState::default();
-        let query = "grep search for a pattern in the codebase";
-        let empty = HashMap::new();
-
-        let baseline = pre_filter_dynamic_with_outcome_bias(
-            &state,
-            query,
-            None,
-            None,
-            &[],
-            0.0,
-            &empty,
-            &[],
-            &empty,
-        );
-        let base_score = score_for(&baseline, "grep").expect("grep should rank");
-
-        let mut penalty = HashMap::new();
-        penalty.insert("grep".to_string(), -0.16);
-        let biased = pre_filter_dynamic_with_outcome_bias(
-            &state,
-            query,
-            None,
-            None,
-            &[],
-            0.0,
-            &empty,
-            &[],
-            &penalty,
-        );
-        let biased_score = score_for(&biased, "grep").expect("grep should still rank");
-
-        assert!(
-            biased_score < base_score,
-            "negative outcome bias should lower score: {biased_score} vs {base_score}"
-        );
-        // Scoring applies an inner clamp of ±0.10.
-        assert!((base_score - biased_score - 0.10).abs() < 1e-6);
-    }
-
-    #[test]
-    fn outcome_bias_promotes_successful_tool() {
-        let state = ConversationState::default();
-        let query = "grep search for a pattern in the codebase";
-        let empty = HashMap::new();
-
-        let baseline = pre_filter_dynamic_with_outcome_bias(
-            &state,
-            query,
-            None,
-            None,
-            &[],
-            0.0,
-            &empty,
-            &[],
-            &empty,
-        );
-        let base_score = score_for(&baseline, "grep").expect("grep should rank");
-
-        let mut boost = HashMap::new();
-        boost.insert("grep".to_string(), 0.10);
-        let biased = pre_filter_dynamic_with_outcome_bias(
-            &state,
-            query,
-            None,
-            None,
-            &[],
-            0.0,
-            &empty,
-            &[],
-            &boost,
-        );
-        let biased_score = score_for(&biased, "grep").expect("grep should still rank");
-
-        assert!(
-            biased_score > base_score,
-            "positive outcome bias should raise score: {biased_score} vs {base_score}"
-        );
     }
 }

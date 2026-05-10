@@ -144,6 +144,8 @@ mod tests {
     fn make_state() -> AgenticLoopState {
         AgenticLoopState {
             messages: Vec::new(),
+            volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
@@ -151,6 +153,7 @@ mod tests {
             context_manifest_user_id: None,
             context_manifest_model_name: None,
             recursion_depth: 0,
+            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -186,6 +189,7 @@ mod tests {
             cancellation: Default::default(),
             messaging: Default::default(),
             error_recovery: Default::default(),
+            pipeline_session: None,
             message: "test query".to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
@@ -206,6 +210,8 @@ mod tests {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
+            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -270,8 +276,10 @@ mod tests {
 
     // ── Tests ───────────────────────────────────────────────────────────────
 
+    // send_message is now an action in the consolidated `agent` tool.
+    // No separate schema injection is needed — the agent schema is always present.
     #[tokio::test]
-    async fn preamble_injects_send_message_schema_when_mailbox_present() {
+    async fn preamble_no_longer_injects_send_message_schema() {
         let (_router, _parent, child_mb, _dt) = setup_two_agents().await;
 
         let mut host = MockHost::new(vec![text_result("done")]);
@@ -281,17 +289,17 @@ mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
-        // Preamble should have injected send_message schema.
+        // send_message is no longer a separate injected schema — it's an
+        // action in the always-present `agent` tool.
         let has_send_msg = host.injected_schemas.iter().any(|s| {
             s.get("function")
                 .and_then(|f| f.get("name"))
                 .and_then(Value::as_str)
                 == Some("send_message")
         });
-        assert!(has_send_msg, "send_message schema should be injected");
         assert!(
-            host.valid_tools.contains("send_message"),
-            "send_message should be in valid_tools"
+            !has_send_msg,
+            "send_message should NOT be separately injected (it's an agent action now)"
         );
     }
 
@@ -354,21 +362,16 @@ mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
-        // The loop should have injected a system message with the drained mailbox content.
-        let has_mailbox_msg = state.messages.iter().any(|m| {
-            m.get("role").and_then(Value::as_str) == Some("system")
-                && m.get("content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|c| c.contains("📬") && c.contains("orchestrator"))
-        });
+        // Post-Task #45: drained mailbox rides the structured volatile
+        // lane (Kind::Mailbox) instead of state.messages.
+        let has_mailbox_msg = state
+            .volatile_pending
+            .iter()
+            .any(|inj| inj.content.contains("📬") && inj.content.contains("orchestrator"));
         assert!(
             has_mailbox_msg,
-            "should have system message with drained mailbox: {:?}",
-            state
-                .messages
-                .iter()
-                .filter(|m| m.get("role").and_then(Value::as_str) == Some("system"))
-                .collect::<Vec<_>>()
+            "should have mailbox injection in volatile_pending: {:?}",
+            state.volatile_pending,
         );
     }
 

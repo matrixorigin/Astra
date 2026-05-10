@@ -59,16 +59,23 @@ impl CaseExecutor for AstraCliExecutor {
     fn reproducer(&self, case: &Case, model: &str) -> String {
         // Mirrors the args assembled below. Quote the prompt so it
         // survives a copy-paste.
+        let has_session_id_in_extras = case.extra_cli_args.iter().any(|a| a == "--session-id");
         let mut parts = vec![
             shell_escape(self.cfg.astra_bin.display().to_string()),
             "chat".into(),
             "-m".into(),
             shell_escape(case.prompt.clone()),
+        ];
+        if !has_session_id_in_extras {
+            parts.push("--session-id".into());
+            parts.push(shell_escape(uuid::Uuid::new_v4().to_string()));
+        }
+        parts.extend([
             "--model".into(),
             shell_escape(model.to_string()),
             "--json".into(),
             "-y".into(),
-        ];
+        ]);
         for extra in &case.extra_cli_args {
             parts.push(shell_escape(extra.clone()));
         }
@@ -108,18 +115,24 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     if let Some(ref profile) = cfg.profile {
         cmd.arg("--profile").arg(profile);
     }
-    cmd.arg("chat")
-        .arg("-m")
-        .arg(&case.prompt)
-        .arg("--model")
-        .arg(model)
-        .arg("--json")
-        .arg("-y");
+    cmd.arg("chat").arg("-m").arg(&case.prompt);
+    // Only add --session-id if the caller hasn't already provided one in extra_cli_args.
+    // Multi-turn step cases inject --session-id via extra_cli_args to thread the parent's
+    // session id across steps; we must not emit a second --session-id there.
+    let has_session_id_in_extras = case.extra_cli_args.iter().any(|a| a == "--session-id");
+    if !has_session_id_in_extras {
+        cmd.arg("--session-id")
+            .arg(uuid::Uuid::new_v4().to_string());
+    }
+    cmd.arg("--model").arg(model).arg("--json").arg("-y");
     if let Some(ref wd) = cfg.working_dir {
         cmd.current_dir(wd);
     }
     for extra in &case.extra_cli_args {
         cmd.arg(extra);
+    }
+    for (k, v) in &case.env {
+        cmd.env(k, v);
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -452,11 +465,13 @@ mod tests {
             difficulty: None,
             weight: 1.0,
             steps: vec![],
+            env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
         };
         let repro = exec.reproducer(&case, "qwen-flash");
         assert!(repro.contains("/usr/local/bin/astra"));
+        assert!(repro.contains("--session-id"));
         assert!(repro.contains("--model"));
         assert!(repro.contains("qwen-flash"));
         assert!(repro.contains("--verbose"));
@@ -543,6 +558,7 @@ mod tests {
             difficulty: None,
             weight: 1.0,
             steps: vec![],
+            env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
         };
@@ -613,6 +629,7 @@ mod tests {
             difficulty: None,
             weight: 1.0,
             steps: vec![],
+            env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
         };
@@ -642,6 +659,7 @@ mod tests {
             difficulty: None,
             weight: 1.0,
             steps: vec![],
+            env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
         }

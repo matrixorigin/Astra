@@ -1,0 +1,268 @@
+//! Detect runtime-injected scaffolding messages.
+//!
+//! The astra runtime synthesizes several kinds of *scaffolding* messages into
+//! the LLM message stream: parallel-batching nudges, execution-escalation
+//! corrections, attention manifests, verification directives, error-budget
+//! notices, self-check injections, tool-call rollups. These are
+//! **ephemeral** — they steer a single turn's behavior — and should never be
+//! treated as conversational content.
+//!
+//! When scaffolding leaks into persistent stores (Memoria working-memory,
+//! session journals, conversation compaction), it creates feedback loops:
+//! the runtime injects text, the store indexes it, a later retrieval pulls
+//! it back in, the runtime re-reads its own output. Observed in session
+//! `6676c7b5` where one turn saw 78 such scaffolding echoes inflate the
+//! volatile-lane `## User Memories` block to 6.4 KB.
+//!
+//! This module is the **single source of truth** for "is this message
+//! scaffolding?" — callers in compaction, memory-writing, and prompt
+//! assembly should route through [`is_runtime_scaffolding_message`] rather
+//! than duplicating detection logic.
+
+use serde_json::Value;
+
+use crate::continuity::ATTENTION_PREFIX;
+
+/// Prefixes that mark a message body as runtime-injected scaffolding.
+///
+/// Any message whose trimmed content starts with one of these strings is
+/// scaffolding — no exceptions. Keep this list sorted by how frequently the
+/// prefix appears so hot-path iteration exits early.
+///
+/// When adding a new runtime injection, add its prefix here so Memoria and
+/// compaction automatically skip it without per-site plumbing.
+pub const SCAFFOLDING_BODY_PREFIXES: &[&str] = &[
+    // Rollups
+    "Tools used:",
+    // Attention / task-focus manifests
+    "[Active task attachment]",
+    "[Self-check",
+    // Batching / parallel feedback
+    "✓ Previous round:",
+    "♻ Duplicate calls detected",
+    // Runtime directives
+    "⚠️ VERIFICATION REQUIRED",
+    "🔄 ERROR BUDGET",
+    // Runtime correction / warning headers
+    "## ⤴",
+    "## ⚠",
+    "Runtime correction:",
+];
+
+/// True when `message` is a runtime-synthesized scaffolding message.
+///
+/// Detection rules (applied in order):
+///
+/// 1. `role == "system"` messages with no content → runtime-injected nudge
+///    (the runtime never emits user-typed system turns mid-conversation).
+/// 2. `role == "user"` messages whose content begins with the attention
+///    manifest prefix (`[attention:v1]\n`) — these are synthetic user
+///    messages carrying turn-state continuity.
+/// 3. Any message whose trimmed `content` starts with one of
+///    [`SCAFFOLDING_BODY_PREFIXES`] (applies across all roles — assistant
+///    messages can carry runtime-stamped directives too).
+///
+/// Returns `false` for genuine user/assistant conversational turns.
+///
+/// This is deliberately **shape-based** (role + prefix match) rather than
+/// attribute-based (e.g. looking for an `"astra_scaffolding": true` field)
+/// because the runtime currently synthesizes these messages through several
+/// paths without a unified metadata flag. The prefix list is the
+/// narrowest-waist detector that works for all paths today.
+pub fn is_runtime_scaffolding_message(message: &Value) -> bool {
+    let role = message.get("role").and_then(Value::as_str);
+
+    if role == Some("system") {
+        return true;
+    }
+
+    let content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let trimmed = content.trim_start();
+
+    if role == Some("user") && trimmed.starts_with(ATTENTION_PREFIX) {
+        return true;
+    }
+
+    for prefix in SCAFFOLDING_BODY_PREFIXES {
+        if trimmed.starts_with(prefix) {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn msg(role: &str, content: &str) -> Value {
+        json!({"role": role, "content": content})
+    }
+
+    // ── Positive cases: scaffolding is detected ─────────────────────────
+
+    #[test]
+    fn system_role_is_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "system",
+            "anything at all"
+        )));
+    }
+
+    #[test]
+    fn system_role_empty_content_is_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&json!({"role": "system"})));
+    }
+
+    #[test]
+    fn attention_manifest_user_message_is_scaffolding() {
+        let content = format!("{ATTENTION_PREFIX}\nGoal: fix bug");
+        assert!(is_runtime_scaffolding_message(&msg("user", &content)));
+    }
+
+    #[test]
+    fn parallel_feedback_nudge_is_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "assistant",
+            "✓ Previous round: 3 tools executed in parallel — excellent."
+        )));
+    }
+
+    #[test]
+    fn duplicate_calls_nudge_is_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "♻ Duplicate calls detected: [read_file (3x)]."
+        )));
+    }
+
+    #[test]
+    fn verification_directive_is_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "⚠️ VERIFICATION REQUIRED: Before you finish, run these checks"
+        )));
+    }
+
+    #[test]
+    fn error_budget_directive_is_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "🔄 ERROR BUDGET EXHAUSTED: hit Unknown errors 3 turns in a row"
+        )));
+    }
+
+    #[test]
+    fn runtime_correction_headers_are_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "## ⤴ Execution Escalation Runtime correction:"
+        )));
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "## ⤴ Parallel Batching Force"
+        )));
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "## ⚠ Sequential Tool Calls Detected"
+        )));
+    }
+
+    #[test]
+    fn self_check_nudge_is_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "[Self-check — round 12] You have been reading/exploring"
+        )));
+    }
+
+    #[test]
+    fn active_task_attachment_is_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "[Active task attachment] Resume the active task below"
+        )));
+    }
+
+    #[test]
+    fn tools_used_rollup_is_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "assistant",
+            "Tools used: bash, read_file, grep"
+        )));
+    }
+
+    #[test]
+    fn runtime_correction_inline_prefix_is_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "Runtime correction: your previous response answered without tools"
+        )));
+    }
+
+    #[test]
+    fn leading_whitespace_tolerated() {
+        // Some injection paths prepend a blank line — still scaffolding.
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "\n\n✓ Previous round: 2 tools executed in parallel"
+        )));
+    }
+
+    // ── Negative cases: genuine turns are NOT scaffolding ────────────────
+
+    #[test]
+    fn regular_user_message_is_not_scaffolding() {
+        assert!(!is_runtime_scaffolding_message(&msg(
+            "user",
+            "Can you review the latest commits on this branch?"
+        )));
+    }
+
+    #[test]
+    fn regular_assistant_message_is_not_scaffolding() {
+        assert!(!is_runtime_scaffolding_message(&msg(
+            "assistant",
+            "I found three commits that touch the volatile block."
+        )));
+    }
+
+    #[test]
+    fn tool_role_is_not_scaffolding() {
+        // Tool results are their own category — compaction handles them
+        // separately and they must not be misclassified as scaffolding.
+        assert!(!is_runtime_scaffolding_message(&msg(
+            "tool",
+            "file contents..."
+        )));
+    }
+
+    #[test]
+    fn assistant_message_mentioning_tools_used_mid_body_is_not_scaffolding() {
+        // Only *starts with* triggers detection — a conversational answer
+        // discussing "Tools used" shouldn't be dropped.
+        assert!(!is_runtime_scaffolding_message(&msg(
+            "assistant",
+            "In that session, Tools used: by the agent included bash."
+        )));
+    }
+
+    #[test]
+    fn user_message_with_attention_prefix_not_at_start_is_not_scaffolding() {
+        // The attention check requires the prefix to start the content —
+        // embedded mentions in natural user text are not scaffolding.
+        let content = format!("I saw the tag {ATTENTION_PREFIX} earlier, what is it?");
+        assert!(!is_runtime_scaffolding_message(&msg("user", &content)));
+    }
+
+    #[test]
+    fn empty_content_non_system_is_not_scaffolding() {
+        assert!(!is_runtime_scaffolding_message(&msg("user", "")));
+        assert!(!is_runtime_scaffolding_message(&msg("assistant", "")));
+    }
+}

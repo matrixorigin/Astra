@@ -144,6 +144,7 @@ mod repl_state;
 mod repl_turn;
 #[path = "cli/repl_ui.rs"]
 mod repl_ui;
+mod sandbox_retry;
 #[path = "cli/self_command.rs"]
 mod self_command;
 #[path = "cli/session_cleanup.rs"]
@@ -509,18 +510,29 @@ async fn run_chat_repl(
                             };
                             let _ = tx.send(response);
                             if autorun {
+                                let was_auto = matches!(
+                                    state.perm_manager.mode(),
+                                    permission_manager::PermissionMode::Auto
+                                );
                                 state
                                     .perm_manager
                                     .set_mode(permission_manager::PermissionMode::Auto);
-                                eprintln!(
-                                    "  {} {} All tools auto-approved for this session.",
-                                    "⚡".yellow(),
-                                    "Auto-run enabled!".bold().yellow()
-                                );
-                                eprintln!(
-                                    "  {}",
-                                    "  Use /allow prompt to restore confirmation prompts.".dim()
-                                );
+                                if !was_auto {
+                                    // Transition-only banner — repeat '!' while
+                                    // already in Auto is a no-op so the user
+                                    // doesn't see the banner fire twice
+                                    // (observed in session c6e18730).
+                                    eprintln!(
+                                        "  {} {} All tools auto-approved for this session.",
+                                        "⚡".yellow(),
+                                        "Auto-run enabled!".bold().yellow()
+                                    );
+                                    eprintln!(
+                                        "  {}",
+                                        "  Use /allow prompt to restore confirmation prompts."
+                                            .dim()
+                                    );
+                                }
                             } else if approved {
                                 eprintln!("  {} Approved", theme::icon_ok());
                             } else {
@@ -569,6 +581,22 @@ async fn run_chat_repl(
                                 &pipeline_modules.pattern_library,
                                 &pipeline_modules.calibrator,
                             );
+                        }
+
+                        // /ask (and future slash commands) can queue a message for
+                        // immediate dispatch — send it as if the user typed it.
+                        if let Some(queued) = state.queued_message.take() {
+                            handle_chat_input(
+                                queued,
+                                current_token.as_deref(),
+                                &mut state,
+                                ReplTurnContext {
+                                    api,
+                                    profile,
+                                    selector: &*selector,
+                                },
+                            )
+                            .await?;
                         }
 
                         // If /plan auto triggered execution, start the background executor

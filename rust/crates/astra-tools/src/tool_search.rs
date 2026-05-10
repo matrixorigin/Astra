@@ -27,6 +27,10 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         .min(20) as usize;
 
     // Direct selection mode: select:tool_name or select:a,b,c
+    // Returns the FULL schema (name + full description + parameters) so the
+    // caller can invoke the tool immediately. This is the "deferred tool
+    // activation" pattern — the LLM saw the tool name elsewhere, asked for
+    // its schema, now has everything needed to call it.
     if let Some(tool_names) = query.strip_prefix("select:") {
         let requested: Vec<&str> = tool_names
             .split(',')
@@ -51,11 +55,18 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                         .get("description")
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    let short_desc: String = desc.chars().take(100).collect();
-                    found.push(json!({
+                    let mut entry = json!({
                         "name": tool_name,
-                        "description": if desc.len() > 100 { format!("{}...", short_desc) } else { desc.to_string() }
-                    }));
+                        "description": desc,
+                    });
+                    // Include parameters if present so the LLM can call the
+                    // tool without another round-trip.
+                    if let Some(params) = func.get("parameters")
+                        && let Some(obj) = entry.as_object_mut()
+                    {
+                        obj.insert("parameters".to_string(), params.clone());
+                    }
+                    found.push(entry);
                 }
             } else {
                 missing.push(name.to_string());
@@ -223,5 +234,98 @@ mod tests {
         let schemas = sample_schemas();
         let result = tool_search(&schemas, &json!({"query": ""}));
         assert!(result.contains("Error"));
+    }
+
+    // ── select: mode must return FULL schema (parameters included) ────────
+    // The LLM needs parameter shapes to call the tool. Previously we only
+    // returned name + truncated description which meant the tool couldn't
+    // actually be invoked after "search" — defeating the whole deferred-
+    // tool workflow. See ClaudeCode's ToolSearch → <functions>{...}</functions>
+    // encoding for the canonical pattern.
+
+    fn schemas_with_params() -> Vec<Value> {
+        vec![json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read file contents from the workspace",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        })]
+    }
+
+    #[test]
+    fn select_mode_returns_full_parameters_schema() {
+        let schemas = schemas_with_params();
+        let result = tool_search(&schemas, &json!({"query": "select:read_file"}));
+        let parsed: Value = serde_json::from_str(&result).expect("valid json");
+        let first = &parsed["matches"][0];
+        // Full parameters object must be present so the LLM can call the tool.
+        assert!(
+            first.get("parameters").is_some(),
+            "select mode must return full parameters, got: {result}"
+        );
+        let params = &first["parameters"];
+        assert!(params["properties"]["path"]["type"].as_str() == Some("string"));
+    }
+
+    #[test]
+    fn select_mode_returns_full_description_not_truncated() {
+        let long_desc = "x".repeat(500);
+        let schemas = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "big",
+                "description": long_desc.clone(),
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let result = tool_search(&schemas, &json!({"query": "select:big"}));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let desc = parsed["matches"][0]["description"].as_str().unwrap();
+        // Full description for select: mode (LLM just invoked it explicitly,
+        // we owe it the whole thing — no ellipsis truncation).
+        assert_eq!(desc.len(), 500, "select mode must not truncate description");
+        assert!(!desc.contains('…'));
+    }
+
+    #[test]
+    fn keyword_search_still_truncates_description() {
+        // Keyword search is a browsing mode — many results, must stay
+        // compact. Truncation is OK here; user/LLM can then select: to
+        // unlock full schema.
+        let long_desc = "x".repeat(500);
+        let schemas = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "big",
+                "description": long_desc,
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let result = tool_search(&schemas, &json!({"query": "big"}));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let desc = parsed["matches"][0]["description"].as_str().unwrap();
+        assert!(desc.len() <= 200, "keyword search should stay compact");
+    }
+
+    #[test]
+    fn keyword_search_does_not_return_parameters() {
+        // Keyword mode: just name + short desc, no parameters — encourages
+        // the caller to narrow down with select: before committing to the
+        // full schema.
+        let schemas = schemas_with_params();
+        let result = tool_search(&schemas, &json!({"query": "file"}));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed["matches"][0].get("parameters").is_none(),
+            "keyword search should not include full parameters"
+        );
     }
 }

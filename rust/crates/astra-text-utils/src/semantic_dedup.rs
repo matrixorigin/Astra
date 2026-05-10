@@ -233,6 +233,43 @@ fn semantic_bash_git_key(args: &Value) -> Option<String> {
 /// Returns 0.0-1.0. Outputs shorter than MIN_OUTPUT_LEN are not compared.
 const MIN_OUTPUT_LEN: usize = 30;
 
+/// Conservative read-only allowlist used to decide whether a short cached
+/// output can be safely re-executed. Anything not on this list is treated as
+/// potentially side-effectful — we'd rather return a short cached body than
+/// re-run a mutation.
+///
+/// NOTE: the consolidated `git` / `github` entry-point tools are deliberately
+/// excluded — they dispatch on an `action` arg that can be read or write
+/// (e.g. `git(action="commit")`, `github(action="create_pr")`), so treating
+/// them as read-only here would allow a mutation to be silently replayed.
+/// Legacy per-action names (`git_status`, `github_list_prs`, …) are still
+/// listed because those remain statically read-only.
+fn is_read_only_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file"
+            | "list_dir"
+            | "grep"
+            | "glob"
+            | "symbols"
+            | "git_status"
+            | "git_diff"
+            | "git_log"
+            | "git_show"
+            | "git_blame"
+            | "git_file_history"
+            | "github_list_prs"
+            | "github_list_issues"
+            | "github_get_pr"
+            | "github_get_issue"
+            | "github_ci_status"
+            | "github_repo_stats"
+            | "find_definition"
+            | "find_references"
+            | "lsp"
+    )
+}
+
 pub fn output_similarity(output1: &str, output2: &str) -> f64 {
     // Too-short outputs aren't meaningful for similarity comparison
     if output1.len() < MIN_OUTPUT_LEN || output2.len() < MIN_OUTPUT_LEN {
@@ -321,9 +358,25 @@ impl SemanticDedup {
         if current_turn <= *prev_turn {
             return None;
         }
-        // Find the most recent output from the same tool in output_log
+        // Find the most recent output from the same tool in output_log.
+        // Skip outputs that have been microcompact-cleared or are stubs —
+        // returning "[Cleared]" or a short placeholder instead of real content
+        // would leave the caller with nothing useful, forcing them to re-fetch
+        // anyway. In that case, allow the tool to re-execute.
+        //
+        // The short-output bypass is gated to read-only tools: a write/mutation
+        // tool that happens to return a short "OK" / "Done" body must NOT be
+        // re-executed — the side-effect already happened. For write tools we
+        // return the cached short output as-is so the caller short-circuits.
+        let tool_is_read_only = is_read_only_tool(tool_name);
         for (prev_tool, _out_turn, prev_output) in self.output_log.iter().rev() {
             if prev_tool == tool_name {
+                if prev_output.starts_with("[Cleared") || prev_output.starts_with("(cached") {
+                    return None; // Force re-execution — cached content is gone
+                }
+                if tool_is_read_only && prev_output.len() < 20 {
+                    return None; // Read-only + trivial output → cheap to re-run
+                }
                 return Some((*prev_turn, prev_output.clone()));
             }
         }
@@ -1120,6 +1173,66 @@ mod tests {
         );
         let block = dedup.pre_check_block("read_file", &json!({"path": "src/main.rs/"}), 1);
         assert!(block.is_some(), "normalized path should match");
+    }
+
+    /// When microcompact has cleared the cached output to `[Cleared]`,
+    /// pre_check_block must allow re-execution rather than returning a
+    /// useless stub. Without this, long sessions hit a deadlock:
+    /// old content cleared for pressure → agent tries to re-read →
+    /// dedup blocks because "same file seen before" → agent stuck.
+    #[test]
+    fn pre_check_block_allows_reexecution_when_output_cleared() {
+        let mut dedup = SemanticDedup::new(0.75);
+        // First call — record a real output
+        dedup.check_and_record(
+            "read_file",
+            &json!({"path": "src/lib.rs"}),
+            "pub fn important() { /* ... */ }",
+            0,
+        );
+        // Simulate microcompact clearing the output_log entry
+        for entry in dedup.output_log.iter_mut() {
+            if entry.0 == "read_file" {
+                entry.2 = "[Cleared]".to_string();
+            }
+        }
+        // Re-read same file — must NOT be blocked (content is gone)
+        let block = dedup.pre_check_block("read_file", &json!({"path": "src/lib.rs"}), 2);
+        assert!(
+            block.is_none(),
+            "must allow re-execution when cached output is [Cleared]"
+        );
+    }
+
+    /// Same as above but for the "(cached — identical call)" stub that an
+    /// earlier dedup pass may have stored into output_log.
+    #[test]
+    fn pre_check_block_allows_reexecution_when_output_is_dedup_stub() {
+        let mut dedup = SemanticDedup::new(0.75);
+        dedup.check_and_record(
+            "read_file",
+            &json!({"path": "Cargo.toml"}),
+            "(cached — identical call already executed in this conversation. Re-read the file only if you need the content again.)",
+            0,
+        );
+        let block = dedup.pre_check_block("read_file", &json!({"path": "Cargo.toml"}), 1);
+        assert!(
+            block.is_none(),
+            "must allow re-execution when prior output was itself a dedup stub"
+        );
+    }
+
+    /// Very short outputs (< 20 chars) are likely placeholders or errors,
+    /// not meaningful cached content. Allow re-execution.
+    #[test]
+    fn pre_check_block_allows_reexecution_for_trivially_short_output() {
+        let mut dedup = SemanticDedup::new(0.75);
+        dedup.check_and_record("read_file", &json!({"path": "x.rs"}), "err", 0);
+        let block = dedup.pre_check_block("read_file", &json!({"path": "x.rs"}), 1);
+        assert!(
+            block.is_none(),
+            "trivially short output should not block re-execution"
+        );
     }
 
     // ── P1-H: Semantic dedup behavioral tests ───────────────────────

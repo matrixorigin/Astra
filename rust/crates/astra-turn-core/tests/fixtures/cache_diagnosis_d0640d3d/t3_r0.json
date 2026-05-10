@@ -1,0 +1,236 @@
+{
+  "model": "deepseek-v4-pro-anthropic",
+  "outcome": "success",
+  "provider": "anthropic",
+  "request": {
+    "message_count": 6,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "<024dbd2bebefa43f:5954>",
+            "type": "text"
+          },
+          {
+            "text": "<e908c6ff44e4857e:4062>",
+            "type": "text"
+          },
+          {
+            "cache_control": {
+              "type": "ephemeral"
+            },
+            "text": "<cc71499069cfeb4d:197>",
+            "type": "text"
+          },
+          {
+            "text": "<7d80a27a9f73da92:2502>",
+            "type": "text"
+          }
+        ],
+        "role": "system"
+      },
+      {
+        "content": "hi",
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "cache_control": {
+              "type": "ephemeral"
+            },
+            "text": "Hi! How can I help you today?",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": "hello",
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "cache_control": {
+              "type": "ephemeral"
+            },
+            "text": "<3236b57b0c02ff02:139>",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": "hi",
+        "role": "user"
+      }
+    ],
+    "tool_count": 21,
+    "tools": [
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<f036392ee6ecad0a:481>",
+          "name": "bash"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<a5c1724998bc2627:610>",
+          "name": "read_file"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<32c9d2f246f0cd4a:443>",
+          "name": "write_file"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<80ba8de0af921882:946>",
+          "name": "str_replace"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<169dd2d6b97d457a:332>",
+          "name": "list_dir"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<9737c05e630a9475:893>",
+          "name": "grep"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<a4a2cad08abafcd8:827>",
+          "name": "glob"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<ecdbd9a0ab98dc81:344>",
+          "name": "introspect"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<17dae0e631c586b4:1717>",
+          "name": "lsp"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<db30cbd4649dc53c:2552>",
+          "name": "git"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<31e1a0b3e9863d8b:510>",
+          "name": "github"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<7b6c83b45c9f85b4:814>",
+          "name": "web_fetch"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<38a3a5b392734f26:683>",
+          "name": "memory"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<8f7eb16c3ba1f11c:1540>",
+          "name": "session"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<6f50aa59ce23b0f4:412>",
+          "name": "mo"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<b76aaafca238b8af:1629>",
+          "name": "agent"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<6099cf86e756edc5:1008>",
+          "name": "symbols"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<a0167fcc5daafadb:421>",
+          "name": "powershell"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<605bc90866fa1dcd:1726>",
+          "name": "run_script"
+        },
+        "type": "function"
+      },
+      {
+        "cache_control": {
+          "type": "ephemeral"
+        },
+        "function": {
+          "_scrubbed_schema_digest": "<21b8adc67b35d234:1049>",
+          "name": "skill"
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "_scrubbed_schema_digest": "<d9324ec6f5265316:750>",
+          "name": "web_search"
+        },
+        "type": "function"
+      }
+    ]
+  },
+  "response": {
+    "finish_reason": "stop",
+    "usage": {
+      "cache_creation_tokens": 0,
+      "cached_input_tokens": 2432,
+      "input_tokens": 6097,
+      "output_tokens": 46,
+      "total_tokens": 8529
+    }
+  },
+  "round": 0,
+  "session_id": "d0640d3d-SCRUBBED",
+  "turn": 3
+}

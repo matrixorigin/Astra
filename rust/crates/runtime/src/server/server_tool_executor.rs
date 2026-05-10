@@ -834,7 +834,6 @@ fn persist_manual_compression(
 
 fn supports_server_tool_name(tool: &str) -> bool {
     astra_tools::schemas::SERVER_EXECUTOR_TOOL_NAMES.contains(&tool)
-        || matches!(tool, "enter_plan_mode" | "exit_plan_mode")
 }
 
 fn json_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -973,10 +972,7 @@ fn is_plan_mode_blocked_tool(tool: &str) -> bool {
         "bash"
             | "write_file"
             | "str_replace"
-            | "multi_edit"
-            | "delete_file"
-            | "rollback_file_edits"
-            | "mo_query"
+            | "mo"
             | "rollback_database_snapshots"
             | "git_commit"
             | "git_stash"
@@ -1149,6 +1145,11 @@ pub struct ServerToolExecutor {
     self_mod_deprioritized_tools: Mutex<Vec<String>>,
     /// Per-turn mutation accounting for adjust_config governor.
     self_mod_mutation_counter: Mutex<(u32, u32)>,
+    /// Budget-adaptive introspection snapshot, updated each turn by the
+    /// execution phase. The `introspect` tool reads this to return runtime
+    /// state without coupling to AgenticLoopState.
+    introspect_snapshot:
+        Arc<std::sync::RwLock<Option<astra_turn_core::introspect::IntrospectSnapshot>>>,
     /// Shared default executor for delegating common tool logic.
     default_executor: DefaultToolExecutor,
     /// Optional remote workspace artifact store for publishing workspace metadata.
@@ -1238,6 +1239,7 @@ impl ServerToolExecutor {
             resource_governor: None,
             edge_connection_pool: None,
             observability_session: None,
+            introspect_snapshot: Arc::new(std::sync::RwLock::new(None)),
             self_mod_pinned_tools: Mutex::new(pinned_tools),
             self_mod_deprioritized_tools: Mutex::new(deprioritized_tools),
             self_mod_mutation_counter: Mutex::new((0, 0)),
@@ -1725,13 +1727,34 @@ impl ServerToolExecutor {
 
         let mut result = match name {
             // ── Memory tools (HTTP proxy) ──────────────────────────────
+            "memory" => {
+                let op = match args.get("action").and_then(|v| v.as_str()) {
+                    Some(a) => a,
+                    None => return tool_result_from_output("Error: missing required parameter 'action'. Use: store, retrieve, purge, correct, profile, search, feedback".to_string()),
+                };
+                let mut isolated_args = args.clone();
+                if let Some(obj) = isolated_args.as_object_mut() {
+                    obj.remove("action"); // Memoria API doesn't expect this field
+                    obj.insert(
+                        "session_id".to_string(),
+                        Value::String(self.user_id.clone()),
+                    );
+                    obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
+                }
+                let output = self.memoria_client.call(op, &isolated_args).await;
+                if output.starts_with("Error") {
+                    astra_tools::ToolResult::error(output)
+                } else {
+                    astra_tools::ToolResult::text(output)
+                }
+            }
+            // Legacy aliases
             "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
             | "memory_correct" | "memory_profile" => {
                 let op = name.strip_prefix("memory_").unwrap_or(name);
-                // Force-inject user_id and session_id for per-user isolation,
-                // mirroring the server's /memory/* proxy in auth_handlers.rs.
                 let mut isolated_args = args.clone();
                 if let Some(obj) = isolated_args.as_object_mut() {
+                    obj.remove("action"); // defensive: strip if present
                     obj.insert(
                         "session_id".to_string(),
                         Value::String(self.user_id.clone()),
@@ -1755,29 +1778,64 @@ impl ServerToolExecutor {
                 }
             }
             "ask_user" => self.server_ask_user(args).await,
-            "session_history_page" => self.tool_session_history_page(args).await,
-            "session_history_search" => self.tool_session_history_search(args).await,
-            "session_history_around" => self.tool_session_history_around(args).await,
-            // ── Plan-mode lifecycle tools ──────────────────────────────
-            "enter_plan_mode" => {
-                astra_tools::ToolResult::text(self.tool_enter_plan_mode(args).await)
-            }
-            "exit_plan_mode" => astra_tools::ToolResult::text(self.tool_exit_plan_mode(args).await),
             // ── File operations ─────────────────────────────────────────
             // Write operations use server-specific journal recording.
             // Read-only operations delegate to DefaultToolExecutor.
             "web_fetch" => self.default_executor.execute("web_fetch", args).await,
             "read_file" => self.default_executor.execute("read_file", args).await,
-            "write_file" => tool_result_from_output(self.server_write_file(args)),
-            "str_replace" => tool_result_from_output(self.server_str_replace(args)),
-            "multi_edit" => tool_result_from_output(self.server_multi_edit(args)),
-            "delete_file" => tool_result_from_output(self.server_delete_file(args)),
-            "rollback_file_edits" => tool_result_from_output(self.rollback_file_edits(args)),
+            "write_file" => {
+                // delete=true routes to delete_file handler
+                if args
+                    .get("delete")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    tool_result_from_output(self.server_delete_file(args))
+                } else {
+                    tool_result_from_output(self.server_write_file(args))
+                }
+            }
+            "str_replace" => {
+                // edits array routes to multi_edit handler
+                if args.get("edits").and_then(|v| v.as_array()).is_some() {
+                    tool_result_from_output(self.server_multi_edit(args))
+                } else {
+                    tool_result_from_output(self.server_str_replace(args))
+                }
+            }
             "list_dir" => self.default_executor.execute("list_dir", args).await,
-            // ── Session-state tools ─────────────────────────────────────
-            "adjust_config" => tool_result_from_output(self.adjust_config(args)),
+            // ── Consolidated session tool ──────────────────────────────
+            "session" => {
+                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                match action {
+                    "config" => tool_result_from_output(self.adjust_config(args)),
+                    "prioritize" => tool_result_from_output(self.prioritize_tool(args)),
+                    "deprioritize" => tool_result_from_output(self.deprioritize_tool(args)),
+                    "set_goal" => tool_result_from_output(self.set_goal(args)),
+                    "compact" => tool_result_from_output(self.compress_context(args)),
+                    "enter_plan" => {
+                        astra_tools::ToolResult::text(self.tool_enter_plan_mode(args).await)
+                    }
+                    "exit_plan" => {
+                        astra_tools::ToolResult::text(self.tool_exit_plan_mode(args).await)
+                    }
+                    "rollback_edits" => tool_result_from_output(self.rollback_file_edits(args)),
+                    "ask_user" => self.server_ask_user(args).await,
+                    "sleep" => self.default_executor.execute("sleep", args).await,
+                    "tool_search" => tool_result_from_output(astra_tools::tool_search::tool_search(
+                        &astra_tools::schemas::server_executor_tool_schemas(),
+                        args,
+                    )),
+                    "history_page" => self.tool_session_history_page(args).await,
+                    "history_search" => self.tool_session_history_search(args).await,
+                    "history_around" => self.tool_session_history_around(args).await,
+                    "" => tool_result_from_output("Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep, tool_search, history_page, history_search, history_around".to_string()),
+                    other => tool_result_from_output(format!("Unknown session action: '{other}'")),
+                }
+            }
             "prioritize_tool" => tool_result_from_output(self.prioritize_tool(args)),
             "deprioritize_tool" => tool_result_from_output(self.deprioritize_tool(args)),
+            "introspect" => tool_result_from_output(self.handle_introspect(args)),
             "set_goal" => tool_result_from_output(self.set_goal(args)),
             "compress_context" => tool_result_from_output(self.compress_context(args)),
             "rollback_session_state" => tool_result_from_output(self.rollback_session_state(args)),
@@ -1786,12 +1844,25 @@ impl ServerToolExecutor {
             "task_get" => tool_result_from_output(self.task_get(args)),
             "task_update" => tool_result_from_output(self.task_update(args)),
             "task_stop" => tool_result_from_output(self.task_stop(args)),
-            "sleep" => self.default_executor.execute("sleep", args).await,
-            "tool_search" => tool_result_from_output(astra_tools::tool_search::tool_search(
-                &astra_tools::schemas::server_executor_tool_schemas(),
-                args,
-            )),
-            // ── MatrixOne operations ────────────────────────────────────
+            // ── Consolidated mo tool ───────────────────────────────────
+            "mo" => {
+                let action = args
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("query");
+                match action {
+                    "query" => self.server_mo_query(args),
+                    "snapshot" | "branch" => {
+                        self.default_executor
+                            .execute(&format!("mo_{action}"), args)
+                            .await
+                    }
+                    other => tool_result_from_output(format!(
+                        "Unknown mo action: '{other}'. Use: query, snapshot, branch"
+                    )),
+                }
+            }
+            // Legacy alias
             "mo_query" => self.server_mo_query(args),
             "rollback_database_snapshots" => {
                 tool_result_from_output(self.rollback_database_snapshots(args))
@@ -1804,6 +1875,7 @@ impl ServerToolExecutor {
             "glob" => self.default_executor.execute("glob", args).await,
             // ── Git operations ─────────────────────────────────────────
             // All git ops delegate to DefaultToolExecutor.
+            "git" => self.default_executor.execute("git", args).await,
             "git_status" => self.default_executor.execute("git_status", args).await,
             "git_diff" => self.default_executor.execute("git_diff", args).await,
             "git_log" => self.default_executor.execute("git_log", args).await,
@@ -1859,7 +1931,25 @@ impl ServerToolExecutor {
             }
             // ── Agent introspection ────────────────────────────────────
             "get_agent_info" => tool_result_from_output(self.server_get_agent_info(args)),
-            // ── Delegation placeholder ─────────────────────────────────
+            // ── Consolidated agent tool ────────────────────────────────
+            "agent" => {
+                let action = args
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("delegate");
+                match action {
+                    "delegate" => astra_tools::ToolResult::text(
+                        "Delegation request acknowledged. The delegation engine will execute \
+                         this request and provide results in the next round."
+                            .to_string(),
+                    ),
+                    "run_chain" => self.default_executor.execute("run_chain", args).await,
+                    other => tool_result_from_output(format!(
+                        "Unknown agent action: '{other}'. Use: delegate, run_chain"
+                    )),
+                }
+            }
+            // Legacy alias
             "delegate" => astra_tools::ToolResult::text(
                 "Delegation request acknowledged. The delegation engine will execute \
                  this request and provide results in the next round."
@@ -2356,7 +2446,7 @@ impl ServerToolExecutor {
         snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
     ) {
         self.record_session_state_rollback(
-            "set_goal".to_string(),
+            "session".to_string(),
             SessionStateRollbackAction::GoalOverride {
                 previous_goal,
                 snapshot,
@@ -3110,6 +3200,35 @@ impl ServerToolExecutor {
             "deprioritized_tools": deprioritized.clone(),
         })
         .to_string()
+    }
+
+    /// Update the introspect snapshot from the agentic loop state each turn.
+    pub fn update_introspect_snapshot(
+        &self,
+        snapshot: astra_turn_core::introspect::IntrospectSnapshot,
+    ) {
+        if let Ok(mut guard) = self.introspect_snapshot.write() {
+            *guard = Some(snapshot);
+        }
+    }
+
+    fn handle_introspect(&self, args: &Value) -> String {
+        let detail_arg = args
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or("summary");
+        let detail = astra_turn_core::introspect::IntrospectDetail::from_arg(detail_arg);
+
+        let snapshot = self
+            .introspect_snapshot
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+
+        match snapshot {
+            Some(snap) => astra_turn_core::introspect::render_introspect(&snap, detail),
+            None => "No introspection data available yet (first turn).".to_string(),
+        }
     }
 
     fn set_goal(&self, args: &Value) -> String {
@@ -4124,6 +4243,7 @@ impl ToolExecutor for ServerToolExecutor {
 }
 
 #[cfg(test)]
+#[allow(dead_code, unused_imports, clippy::empty_line_after_doc_comments)]
 mod tests {
     use std::ffi::OsString;
     use std::path::Path;
@@ -4169,7 +4289,7 @@ mod tests {
     }
 
     #[test]
-    fn session_history_tools_are_server_visible_and_read_only() {
+    fn session_history_actions_are_advertised_on_session_tool() {
         let names: std::collections::HashSet<String> =
             astra_tools::schemas::server_executor_tool_schemas()
                 .into_iter()
@@ -4181,22 +4301,29 @@ mod tests {
                 })
                 .collect();
 
-        for name in [
-            "session_history_page",
-            "session_history_search",
-            "session_history_around",
-        ] {
+        assert!(
+            names.contains("session"),
+            "session must be advertised to the web-agent LLM"
+        );
+        assert!(
+            supports_server_tool_name("session"),
+            "session must be accepted by ServerToolExecutor"
+        );
+
+        let session_schema = astra_tools::schemas::server_executor_tool_schemas()
+            .into_iter()
+            .find(|schema| {
+                schema.pointer("/function/name").and_then(Value::as_str) == Some("session")
+            })
+            .expect("session schema should exist");
+        let actions = session_schema
+            .pointer("/function/parameters/properties/action/enum")
+            .and_then(Value::as_array)
+            .expect("session action enum should exist");
+        for action in ["history_page", "history_search", "history_around"] {
             assert!(
-                names.contains(name),
-                "{name} must be advertised to the web-agent LLM"
-            );
-            assert!(
-                supports_server_tool_name(name),
-                "{name} must be accepted by ServerToolExecutor"
-            );
-            assert!(
-                astra_turn_core::tool_categories::registry().is_read_only(name),
-                "{name} must be read-only so it can be used during recall/planning"
+                actions.iter().any(|value| value.as_str() == Some(action)),
+                "session action {action} must be advertised for web-agent history recall"
             );
         }
     }
@@ -4378,8 +4505,9 @@ esac
 
         let result = exec
             .execute_with_metadata(
-                "ask_user",
+                "session",
                 &json!({
+                    "action": "ask_user",
                     "question": "Which option?",
                     "choices": ["first", "second"],
                     "default": "first"
@@ -4402,7 +4530,10 @@ esac
     async fn ask_user_requires_interactive_gate() {
         let (exec, _dir) = test_executor();
         let result = exec
-            .execute_with_metadata("ask_user", &json!({"question": "Continue?"}))
+            .execute_with_metadata(
+                "session",
+                &json!({"action": "ask_user", "question": "Continue?"}),
+            )
             .await;
 
         assert!(result.is_error);
@@ -4414,8 +4545,8 @@ esac
         let (exec, _dir) = test_executor();
         let result = exec
             .execute_with_metadata(
-                "ask_user",
-                &json!({"question": "Pick one", "choices": ["only-one"]}),
+                "session",
+                &json!({"action": "ask_user", "question": "Pick one", "choices": ["only-one"]}),
             )
             .await;
 
@@ -4668,7 +4799,10 @@ esac
         std::fs::write(&target, "temp").unwrap();
         assert!(target.exists());
         let result = exec
-            .execute("delete_file", &json!({"path": "to_delete.txt"}))
+            .execute(
+                "write_file",
+                &json!({"path": "to_delete.txt", "delete": true}),
+            )
             .await;
         assert!(result.contains("Successfully deleted"));
         assert!(!target.exists());
@@ -4678,7 +4812,7 @@ esac
     async fn delete_file_nonexistent_returns_error() {
         let (exec, _dir) = test_executor();
         let result = exec
-            .execute("delete_file", &json!({"path": "ghost.txt"}))
+            .execute("write_file", &json!({"path": "ghost.txt", "delete": true}))
             .await;
         assert!(result.contains("File not found"));
     }
@@ -4698,7 +4832,10 @@ esac
         assert!(second.contains("Successfully wrote"));
 
         let rollback = exec
-            .execute("rollback_file_edits", &json!({"scope": "current_turn"}))
+            .execute(
+                "session",
+                &json!({"action": "rollback_edits", "scope": "current_turn"}),
+            )
             .await;
         let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
         assert_eq!(
@@ -4722,7 +4859,7 @@ esac
 
         let edited = exec
             .execute(
-                "multi_edit",
+                "str_replace",
                 &json!({
                     "path": "edit.txt",
                     "edits": [
@@ -4736,7 +4873,10 @@ esac
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "AAA bbb CCC");
 
         let rollback = exec
-            .execute("rollback_file_edits", &json!({"scope": "current_turn"}))
+            .execute(
+                "session",
+                &json!({"action": "rollback_edits", "scope": "current_turn"}),
+            )
             .await;
         let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
         assert_eq!(
@@ -4755,15 +4895,15 @@ esac
         std::fs::write(&target, "restore me").unwrap();
 
         let deleted = exec
-            .execute("delete_file", &json!({"path": "gone.txt"}))
+            .execute("write_file", &json!({"path": "gone.txt", "delete": true}))
             .await;
         assert!(deleted.contains("Successfully deleted"));
         assert!(!target.exists());
 
         let rollback = exec
             .execute(
-                "rollback_file_edits",
-                &json!({"scope": "file", "path": "gone.txt"}),
+                "session",
+                &json!({"action": "rollback_edits", "scope": "file", "path": "gone.txt"}),
             )
             .await;
         let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
@@ -4979,13 +5119,14 @@ esac
     }
 
     #[tokio::test]
-    async fn multi_edit_is_available_in_server_mode() {
+    async fn str_replace_multi_edit_is_available_in_server_mode() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("edit.txt"), "foo bar baz").unwrap();
 
+        // multi_edit is now accessed via str_replace with an `edits` array
         let result = exec
             .execute(
-                "multi_edit",
+                "str_replace",
                 &json!({
                     "path": "edit.txt",
                     "edits": [
@@ -5008,25 +5149,12 @@ esac
     async fn sleep_is_available_in_server_mode() {
         let (exec, _dir) = test_executor();
         let start = std::time::Instant::now();
-        let result = exec.execute("sleep", &json!({"duration_ms": 20})).await;
+        let result = exec
+            .execute("session", &json!({"action": "sleep", "duration_ms": 20}))
+            .await;
         assert!(result.contains("Slept"), "{result}");
         assert!(start.elapsed().as_millis() >= 15);
         assert!(!result.contains("not available in server-side execution mode"));
-    }
-
-    #[tokio::test]
-    async fn tool_search_uses_server_surface() {
-        let (exec, _dir) = test_executor();
-        let result = exec
-            .execute("tool_search", &json!({"query": "select:memory_store"}))
-            .await;
-        let parsed: Value = serde_json::from_str(&result).expect("tool_search json");
-        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("memory_store"));
-        assert_eq!(
-            parsed["missing"].as_array().map(Vec::len),
-            Some(0),
-            "{result}"
-        );
     }
 
     #[tokio::test]
@@ -5197,7 +5325,7 @@ esac
         exec.set_turn_index(11);
 
         let result = exec
-            .execute_with_metadata("mo_query", &json!({"sql": "UPDATE metrics SET value = 1"}))
+            .execute_with_metadata("mo", &json!({"sql": "UPDATE metrics SET value = 1"}))
             .await;
         assert!(!result.is_error, "got: {}", result.output);
         let fields = result.metadata.as_ref().expect("mo_query metadata");
@@ -5226,104 +5354,6 @@ esac
         );
         assert_eq!(rollback_json["turn_index"].as_u64(), Some(11));
         assert_eq!(rollback_json["restored"].as_array().map(Vec::len), Some(1));
-    }
-
-    #[tokio::test]
-    async fn rollback_session_state_current_turn_restores_server_self_mod_and_tasks() {
-        let (exec, _dir, session_id, session) = session_state_test_executor(13);
-        let original_top_k = session.read().unwrap().config.memory.retrieval_top_k;
-        let new_top_k = if original_top_k < 20 {
-            original_top_k + 1
-        } else {
-            original_top_k.saturating_sub(1)
-        };
-
-        let adjust: Value = serde_json::from_str(
-            &exec
-                .execute(
-                    "adjust_config",
-                    &json!({"path": "memory.retrieval_top_k", "value": new_top_k}),
-                )
-                .await,
-        )
-        .unwrap();
-        assert_eq!(adjust["status"].as_str(), Some("ok"));
-
-        let prioritize: Value = serde_json::from_str(
-            &exec
-                .execute("prioritize_tool", &json!({"tool": "bash"}))
-                .await,
-        )
-        .unwrap();
-        assert_eq!(prioritize["status"].as_str(), Some("ok"));
-
-        let goal: Value = serde_json::from_str(
-            &exec
-                .execute("set_goal", &json!({"goal": "ship parity"}))
-                .await,
-        )
-        .unwrap();
-        assert_eq!(goal["status"].as_str(), Some("ok"));
-
-        let compress: Value = serde_json::from_str(
-            &exec
-                .execute("compress_context", &json!({"reason": "manual"}))
-                .await,
-        )
-        .unwrap();
-        assert_eq!(compress["status"].as_str(), Some("ok"));
-
-        let created: Value =
-            serde_json::from_str(&exec.execute("task_create", &json!({"title": "demo"})).await)
-                .unwrap();
-        let task_id = created["task_id"].as_str().unwrap().to_string();
-
-        let updated: Value = serde_json::from_str(
-            &exec
-                .execute(
-                    "task_update",
-                    &json!({"task_id": task_id.as_str(), "status": "in_progress"}),
-                )
-                .await,
-        )
-        .unwrap();
-        assert_eq!(updated["success"].as_bool(), Some(true));
-
-        let stopped: Value = serde_json::from_str(
-            &exec
-                .execute(
-                    "task_stop",
-                    &json!({"task_id": task_id.as_str(), "reason": "rollback test"}),
-                )
-                .await,
-        )
-        .unwrap();
-        assert_eq!(stopped["success"].as_bool(), Some(true));
-
-        let rollback: Value =
-            serde_json::from_str(&exec.execute("rollback_session_state", &json!({})).await)
-                .unwrap();
-        assert_eq!(rollback["success"].as_bool(), Some(true), "got: {rollback}");
-        assert_eq!(rollback["turn_index"].as_u64(), Some(13));
-        assert_eq!(rollback["restored"].as_array().map(Vec::len), Some(7));
-
-        let session = session.read().unwrap();
-        assert_eq!(session.config.memory.retrieval_top_k, original_top_k);
-        assert!(session.original_query.is_none());
-        assert!(session.goal_tracker.is_none());
-        assert!(session.compressed_turns.is_empty());
-        drop(session);
-
-        let task_list = exec.execute("task_list", &json!({})).await;
-        assert!(task_list.contains("No tasks found"));
-
-        let workspace = astra_services::session_workspace::read_workspace(&session_id).unwrap();
-        assert!(workspace.session_goal.is_none());
-        assert!(workspace.pinned_tools.is_empty());
-        assert!(workspace.deprioritized_tools.is_empty());
-        assert!(workspace.tuned_config_json.is_none());
-
-        cleanup_session_artifacts(&session_id);
     }
 
     // ── Memory tool user isolation ─────────────────────────────────────
@@ -5776,7 +5806,7 @@ esac
 
         // ── Phase 2: exit_plan_mode(approved=true) unblocks ──────────────
         let exit_result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
+            .execute("session", &json!({"action": "exit_plan", "approved": true}))
             .await;
         assert!(
             exit_result.contains("unlocked"),

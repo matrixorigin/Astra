@@ -1,0 +1,61 @@
+name: compaction_dedup_reread_after_clear
+description: |
+  **What**: Read a file, do many other operations to push context, then re-read
+  the SAME file. Verifies the dedup system allows re-execution after compaction
+  clears the original output.
+  **Tests**: SemanticDedup + microcompact interaction — the fix from commit a9c07593.
+  If pre_check_block returns a [Cleared] stub instead of allowing re-execution,
+  the agent gets stuck with empty content.
+  **Why**: Regression guard for the dedup/compaction deadlock:
+    Turn 1: read_file("X") → real content
+    Turn N: microcompact clears it → "[Cleared]"
+    Turn N+1: agent tries to re-read → dedup must NOT return the stub
+  **Pass means**: Agent successfully re-reads the file and extracts correct info.
+  **Fail means**: Dedup returned [Cleared] stub, agent has wrong/empty content.
+prompt: |
+  Read rust/crates/astra-turn-core/Cargo.toml and tell me the version number.
+capability: tool_use
+difficulty: 3
+weight: 2.0
+timeout_seconds: 240
+env:
+  ASTRA_MAX_TURN_INPUT_TOKENS: "35000"
+steps:
+  - prompt: |
+      Now read these files (to fill the context):
+      1. rust/crates/runtime/Cargo.toml
+      2. rust/crates/services/Cargo.toml
+      3. rust/crates/astra-cli/Cargo.toml
+      4. rust/crates/astra-tools/Cargo.toml
+      5. Makefile
+      Just confirm each one read successfully. Say "reads-done" at the end.
+    criteria:
+      - type: text_contains
+        needle: reads-done
+      - type: tool_called
+        name: read_file
+  - prompt: |
+      I need you to read rust/crates/astra-turn-core/Cargo.toml AGAIN
+      (yes, the same file from the first turn). Tell me the package name
+      and version from it. You MUST use read_file — do not answer from memory.
+    criteria:
+      - type: tool_called
+        name: read_file
+      - type: judger
+        question: |
+          The agent was asked to re-read rust/crates/astra-turn-core/Cargo.toml
+          and report its package name and version. The correct answers are:
+          - package name: astra-turn-core
+          - version: 0.1.0
+          Did the agent successfully re-read the file (not return [Cleared] or error)
+          and provide the correct package name and version?
+          Score 1.0 if both correct, 0.5 if partially, 0.0 if it failed to re-read.
+        threshold: 0.7
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: read_file
+  - type: turn_rounds_between
+    min: 3
+    max: 30

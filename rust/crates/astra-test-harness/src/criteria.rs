@@ -159,11 +159,37 @@ pub enum Criterion {
         min_calls: u32,
     },
 
-    /// Passes when provider prompt-cache accounting reports both the
-    /// cache-read and cache-creation buckets at or above the expected
-    /// minimums. This is distinct from `cache_rate_above`, which checks
-    /// the local idempotent tool-result cache.
-    PromptCacheTokens { min_read: u64, min_creation: u64 },
+    /// Passes when provider prompt-cache accounting reports the cache-read
+    /// and cache-creation buckets within the expected bounds.
+    ///
+    /// - `min_read` — floor on cumulative `cached_input_tokens`. Fails when
+    ///   the prefix doesn't hit enough (cache prefix broken).
+    /// - `min_creation` — floor on `cache_creation_tokens`. Rarely used; set
+    ///   to 0 for backward compatibility.
+    /// - `max_creation` — ceiling on `cache_creation_tokens`. When set, fails
+    ///   if cache is being rebuilt excessively (partial-hit regressions where
+    ///   reads look healthy but creations explode).
+    ///
+    /// Distinct from `cache_rate_above`, which checks the local idempotent
+    /// tool-result cache.
+    PromptCacheTokens {
+        min_read: u64,
+        min_creation: u64,
+        #[serde(default)]
+        max_creation: Option<u64>,
+    },
+
+    /// Passes when any nested deterministic criterion passes.
+    ///
+    /// Use for cases with multiple acceptable high-quality behaviors, such
+    /// as "called the requested tool" OR "safely refused a runaway prompt".
+    AnyOf { criteria: Vec<Criterion> },
+
+    /// Passes when every nested deterministic criterion passes.
+    ///
+    /// Useful for making a set of normally-soft metric bounds a hard case
+    /// requirement without changing their default severity globally.
+    AllOf { criteria: Vec<Criterion> },
 }
 
 fn default_cache_min_calls() -> u32 {
@@ -226,7 +252,9 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::ToolCalled { .. }
         | Criterion::TextContains { .. }
         | Criterion::ToolSequence { .. }
-        | Criterion::ForkCacheOutcome { .. } => CriterionSeverity::Hard,
+        | Criterion::ForkCacheOutcome { .. }
+        | Criterion::AnyOf { .. }
+        | Criterion::AllOf { .. } => CriterionSeverity::Hard,
 
         Criterion::ToolsCountBetween { .. }
         | Criterion::TokensBetween { .. }
@@ -367,6 +395,78 @@ fn evaluate_one(
                         "text does NOT contain {needle:?} (text len={})",
                         outcome.text.len()
                     )
+                },
+                full_detail: None,
+                score: None,
+            }
+        }
+        Criterion::AnyOf { criteria } => {
+            let mut nested = Vec::new();
+            let mut passed = false;
+            for criterion in criteria {
+                let result = evaluate_one(criterion, outcome, session);
+                passed = result.passed;
+                nested.push(result);
+                if passed {
+                    break;
+                }
+            }
+            let detail = nested
+                .iter()
+                .enumerate()
+                .map(|(idx, result)| {
+                    format!(
+                        "#{idx}:{}:{}",
+                        if result.passed { "pass" } else { "fail" },
+                        result.detail
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed,
+                detail: if passed {
+                    format!("any_of passed ({detail})")
+                } else {
+                    format!("any_of failed ({detail})")
+                },
+                full_detail: None,
+                score: None,
+            }
+        }
+        Criterion::AllOf { criteria } => {
+            let mut nested = Vec::new();
+            let mut passed = true;
+            for criterion in criteria {
+                let result = evaluate_one(criterion, outcome, session);
+                passed = result.passed;
+                nested.push(result);
+                if !passed {
+                    break;
+                }
+            }
+            let detail = nested
+                .iter()
+                .enumerate()
+                .map(|(idx, result)| {
+                    format!(
+                        "#{idx}:{}:{}",
+                        if result.passed { "pass" } else { "fail" },
+                        result.detail
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed,
+                detail: if passed {
+                    format!("all_of passed ({detail})")
+                } else {
+                    format!("all_of failed ({detail})")
                 },
                 full_detail: None,
                 score: None,
@@ -621,19 +721,30 @@ fn evaluate_one(
         Criterion::PromptCacheTokens {
             min_read,
             min_creation,
+            max_creation,
         } => {
-            let passed = outcome.cached_input_tokens >= *min_read
-                && outcome.cache_creation_tokens >= *min_creation;
+            let read_ok = outcome.cached_input_tokens >= *min_read;
+            let creation_floor_ok = outcome.cache_creation_tokens >= *min_creation;
+            let creation_ceiling_ok = match max_creation {
+                Some(max) => outcome.cache_creation_tokens <= *max,
+                None => true,
+            };
+            let passed = read_ok && creation_floor_ok && creation_ceiling_ok;
+            let ceiling_desc = match max_creation {
+                Some(max) => format!(", creation<={max}"),
+                None => String::new(),
+            };
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed,
                 detail: format!(
-                    "prompt_cache read={} creation={}, expected read>={} creation>={}",
+                    "prompt_cache read={} creation={}, expected read>={} creation>={}{}",
                     outcome.cached_input_tokens,
                     outcome.cache_creation_tokens,
                     min_read,
-                    min_creation
+                    min_creation,
+                    ceiling_desc
                 ),
                 full_detail: None,
                 score: None,
@@ -685,7 +796,13 @@ fn parse_fork_cache_outcomes(stderr: &str) -> Vec<String> {
 ///
 /// Called by `Case::from_path` at load time so the whole suite fails
 /// fast on a typo rather than at runtime.
+const MAX_COMPOSITE_DEPTH: usize = 4;
+
 pub fn validate_criterion(c: &Criterion) -> Result<(), String> {
+    validate_criterion_at_depth(c, 0)
+}
+
+fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<(), String> {
     match c {
         Criterion::ToolsCountBetween { min, max } => {
             if min > max {
@@ -785,16 +902,55 @@ pub fn validate_criterion(c: &Criterion) -> Result<(), String> {
         Criterion::PromptCacheTokens {
             min_read,
             min_creation,
+            max_creation,
         } => {
-            if *min_read == 0 && *min_creation == 0 {
+            if *min_read == 0 && *min_creation == 0 && max_creation.is_none() {
                 return Err(
-                    "PromptCacheTokens requires min_read or min_creation to be greater than 0"
+                    "PromptCacheTokens requires min_read, min_creation, or max_creation to be set"
                         .into(),
                 );
             }
+            if let Some(max) = max_creation
+                && *max < *min_creation
+            {
+                return Err(format!(
+                    "PromptCacheTokens.max_creation ({max}) must be >= min_creation ({min_creation})"
+                ));
+            }
             Ok(())
         }
+        Criterion::AnyOf { criteria } => {
+            validate_composite_criteria("AnyOf", criteria, composite_depth + 1)
+        }
+        Criterion::AllOf { criteria } => {
+            validate_composite_criteria("AllOf", criteria, composite_depth + 1)
+        }
     }
+}
+
+fn validate_composite_criteria(
+    label: &str,
+    criteria: &[Criterion],
+    composite_depth: usize,
+) -> Result<(), String> {
+    if composite_depth > MAX_COMPOSITE_DEPTH {
+        return Err(format!(
+            "{label}.criteria exceeds max composite depth {MAX_COMPOSITE_DEPTH}"
+        ));
+    }
+    if criteria.is_empty() {
+        return Err(format!("{label}.criteria must not be empty"));
+    }
+    for (idx, criterion) in criteria.iter().enumerate() {
+        if matches!(criterion, Criterion::Judger { .. }) {
+            return Err(format!(
+                "{label}.criteria[{idx}]: Judger is evaluated by the runner and cannot be nested"
+            ));
+        }
+        validate_criterion_at_depth(criterion, composite_depth)
+            .map_err(|err| format!("{label}.criteria[{idx}]: {err}"))?;
+    }
+    Ok(())
 }
 
 /// Validate every criterion in a list. Returns the first offender's
@@ -850,6 +1006,133 @@ mod tests {
             &out,
         );
         assert!(!miss[0].passed);
+    }
+
+    #[test]
+    fn any_of_passes_when_one_nested_criterion_passes() {
+        let out = outcome_with_tools(&["read_file"]);
+        let r = evaluate_deterministic(
+            &[Criterion::AnyOf {
+                criteria: vec![
+                    Criterion::ToolCalled {
+                        name: "bash".into(),
+                    },
+                    Criterion::ToolCalled {
+                        name: "read_file".into(),
+                    },
+                ],
+            }],
+            &out,
+        );
+
+        assert!(r[0].passed);
+    }
+
+    #[test]
+    fn any_of_short_circuits_after_first_passing_criterion() {
+        let out = outcome_with_tools(&["bash"]);
+        let r = evaluate_deterministic(
+            &[Criterion::AnyOf {
+                criteria: vec![
+                    Criterion::ToolCalled {
+                        name: "bash".into(),
+                    },
+                    Criterion::TextContains {
+                        needle: "sentinel-not-evaluated".into(),
+                    },
+                ],
+            }],
+            &out,
+        );
+
+        assert!(r[0].passed);
+        assert!(
+            !r[0].detail.contains("sentinel-not-evaluated"),
+            "AnyOf should not evaluate criteria after the first pass"
+        );
+    }
+
+    #[test]
+    fn any_of_fails_when_all_nested_criteria_fail() {
+        let out = outcome_with_tools(&["read_file"]);
+        let r = evaluate_deterministic(
+            &[Criterion::AnyOf {
+                criteria: vec![
+                    Criterion::ToolCalled {
+                        name: "bash".into(),
+                    },
+                    Criterion::TextContains {
+                        needle: "busy-loop".into(),
+                    },
+                ],
+            }],
+            &out,
+        );
+
+        assert!(!r[0].passed);
+    }
+
+    #[test]
+    fn all_of_passes_only_when_every_nested_criterion_passes() {
+        let mut out = outcome_with_tools(&["bash"]);
+        out.turn_rounds = 4;
+        out.duration_ms = 20_000;
+        out.prompt_tokens = 40_000;
+        let r = evaluate_deterministic(
+            &[Criterion::AllOf {
+                criteria: vec![
+                    Criterion::ToolCalled {
+                        name: "bash".into(),
+                    },
+                    Criterion::TurnRoundsBetween { min: 1, max: 6 },
+                    Criterion::DurationBetween {
+                        min_ms: 1,
+                        max_ms: 60_000,
+                    },
+                    Criterion::TokensBetween {
+                        min: 1,
+                        max: 100_000,
+                    },
+                ],
+            }],
+            &out,
+        );
+
+        assert!(r[0].passed);
+
+        out.turn_rounds = 14;
+        let r = evaluate_deterministic(
+            &[Criterion::AllOf {
+                criteria: vec![Criterion::TurnRoundsBetween { min: 1, max: 6 }],
+            }],
+            &out,
+        );
+        assert!(!r[0].passed);
+        assert_eq!(r[0].severity, CriterionSeverity::Hard);
+    }
+
+    #[test]
+    fn all_of_short_circuits_after_first_failing_criterion() {
+        let out = outcome_with_tools(&["read_file"]);
+        let r = evaluate_deterministic(
+            &[Criterion::AllOf {
+                criteria: vec![
+                    Criterion::ToolCalled {
+                        name: "bash".into(),
+                    },
+                    Criterion::TextContains {
+                        needle: "sentinel-not-evaluated".into(),
+                    },
+                ],
+            }],
+            &out,
+        );
+
+        assert!(!r[0].passed);
+        assert!(
+            !r[0].detail.contains("sentinel-not-evaluated"),
+            "AllOf should not evaluate criteria after the first failure"
+        );
     }
 
     #[test]
@@ -1083,6 +1366,40 @@ mod tests {
             };
             assert!(validate_criterion(&c).is_ok(), "threshold {t} should pass");
         }
+    }
+
+    #[test]
+    fn validate_composite_criteria_reject_nested_judger() {
+        let judger = Criterion::Judger {
+            question: "q".into(),
+            threshold: 0.7,
+            model: None,
+        };
+
+        let any_err = validate_criterion(&Criterion::AnyOf {
+            criteria: vec![judger.clone()],
+        })
+        .expect_err("judger is evaluated by the runner and cannot be nested");
+        assert!(any_err.contains("Judger"));
+
+        let all_err = validate_criterion(&Criterion::AllOf {
+            criteria: vec![judger],
+        })
+        .expect_err("judger is evaluated by the runner and cannot be nested");
+        assert!(all_err.contains("Judger"));
+    }
+
+    #[test]
+    fn validate_composite_criteria_rejects_excessive_depth() {
+        let mut criterion = Criterion::ExitCode { code: 0 };
+        for _ in 0..=MAX_COMPOSITE_DEPTH {
+            criterion = Criterion::AnyOf {
+                criteria: vec![criterion],
+            };
+        }
+
+        let err = validate_criterion(&criterion).expect_err("over-depth composite should fail");
+        assert!(err.contains("max composite depth"), "err = {err}");
     }
 
     #[test]
@@ -1442,6 +1759,7 @@ mod tests {
         let c = Criterion::PromptCacheTokens {
             min_read: 10,
             min_creation: 5,
+            max_creation: None,
         };
         let mut out = RunOutcome::new("m");
         out.cached_input_tokens = 12;
@@ -1452,5 +1770,73 @@ mod tests {
         out.cached_input_tokens = 9;
         let r = evaluate_one(&c, &out, None);
         assert!(!r.passed, "{r:?}");
+    }
+
+    /// `max_creation` flags excessive cache-rebuild. Catches the failure mode
+    /// where cache_read is healthy but cache_creation is also huge — i.e. the
+    /// prefix is hitting partially but something after the marker is forcing
+    /// re-creation every turn (silent 40-60% hit-rate regressions).
+    #[test]
+    fn prompt_cache_tokens_max_creation_catches_churn() {
+        let c = Criterion::PromptCacheTokens {
+            min_read: 10000,
+            min_creation: 0,
+            max_creation: Some(15_000),
+        };
+        let mut out = RunOutcome::new("m");
+
+        // Healthy: read well past min, creation within ceiling.
+        out.cached_input_tokens = 30_000;
+        out.cache_creation_tokens = 4_000;
+        let r = evaluate_one(&c, &out, None);
+        assert!(r.passed, "healthy cache should pass: {r:?}");
+
+        // Regression: plenty of reads, but creation explodes — partial cache hit.
+        out.cached_input_tokens = 30_000;
+        out.cache_creation_tokens = 25_000;
+        let r = evaluate_one(&c, &out, None);
+        assert!(
+            !r.passed,
+            "max_creation must fire when cache creation exceeds the ceiling: {r:?}"
+        );
+        assert!(
+            r.detail.contains("25000") && r.detail.contains("15000"),
+            "detail must surface both observed and ceiling: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn prompt_cache_tokens_max_creation_defaults_to_unbounded() {
+        // YAML case omitting `max_creation` must remain backward-compatible.
+        let c = Criterion::PromptCacheTokens {
+            min_read: 10,
+            min_creation: 0,
+            max_creation: None,
+        };
+        let mut out = RunOutcome::new("m");
+        out.cached_input_tokens = 100;
+        out.cache_creation_tokens = 999_999;
+        let r = evaluate_one(&c, &out, None);
+        assert!(
+            r.passed,
+            "unlimited creation must pass when max_creation is None: {r:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_tokens_validation_catches_inverted_bounds() {
+        // min_creation > max_creation is unreachable — validation must reject
+        // it so YAML authors notice typos at parse time, not run time.
+        let c = Criterion::PromptCacheTokens {
+            min_read: 100,
+            min_creation: 5_000,
+            max_creation: Some(1_000),
+        };
+        let err = validate_criterion(&c).unwrap_err();
+        assert!(
+            err.contains("max_creation"),
+            "validate must mention the offending field: {err}"
+        );
     }
 }

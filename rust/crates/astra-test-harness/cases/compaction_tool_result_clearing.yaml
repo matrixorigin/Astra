@@ -1,0 +1,56 @@
+name: compaction_tool_result_clearing
+description: |
+  **What**: Force tool result compaction by reading many files to push context pressure
+  above 60%, then verify the agent still recalls content from the MOST RECENT read.
+  **Tests**: Microcompact adaptive clearing — old tool results get replaced with summaries
+  while recent ones (keep_recent=4-6) survive intact.
+  **Why**: Tool result clearing is the primary mechanism to keep long sessions under context
+  limits. If clearing breaks tool_use/tool_result pairing or drops recent results, the
+  agent loses coherence and starts re-reading files.
+  **Pass means**: Agent recalls the LAST file's content after 8+ tool calls without
+  re-reading. Budget pressure rose above 50% (compaction eligible).
+  **Fail means**: Compaction broke message pairing (crash/error), or agent lost recent
+  state and had to re-read.
+prompt: |
+  Read the following files ONE BY ONE using read_file (do NOT batch them):
+  1. rust/Cargo.toml
+  2. rust/crates/core/Cargo.toml
+  3. rust/crates/runtime/Cargo.toml
+  4. rust/crates/astra-cli/Cargo.toml
+  5. rust/crates/astra-tools/Cargo.toml
+  6. rust/crates/services/Cargo.toml
+  7. rust/crates/astra-turn-core/Cargo.toml
+  8. Makefile
+
+  After reading ALL files, answer this question from memory (do NOT re-read):
+  What is the package name defined in rust/crates/astra-turn-core/Cargo.toml?
+capability: tool_use
+difficulty: 3
+weight: 2.0
+timeout_seconds: 180
+env:
+  ASTRA_MAX_TURN_INPUT_TOKENS: "35000"
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: read_file
+  - type: tools_count_between
+    min: 6
+    max: 12
+  - type: text_contains
+    needle: astra-turn-core
+  - type: turn_rounds_between
+    min: 2
+    max: 20
+  - type: session_event_count
+    event_type: CompactionFired
+    min: 1
+  - type: judger
+    question: |
+      The agent was asked to read 8 files and then recall the package name
+      from rust/crates/astra-turn-core/Cargo.toml WITHOUT re-reading.
+      Did the agent correctly state "astra-turn-core" as the package name?
+      Score 1.0 if correct, 0.5 if close but wrong, 0.0 if the agent
+      re-read the file or didn't answer.
+    threshold: 0.7

@@ -1,8 +1,0 @@
-name: evaluate-session
-version: "1.0.0"
-description: "Evaluate agent session performance and provide optimization recommendations"
-author: "astra-engine"
-
-tools:
-  - bash
-  - read_file

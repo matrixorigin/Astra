@@ -125,6 +125,7 @@ mod tests {
             parent_run_id: "run-parent".into(),
             provider: ProviderKind::Anthropic,
             prefix_messages: vec![],
+            frozen_tool_schemas: None,
             expected_cache_read_tokens: 10_000,
         }
     }
@@ -271,6 +272,7 @@ mod tests {
             parent_run_id: "run-parent-XYZ".into(),
             provider: ProviderKind::Anthropic,
             prefix_messages: vec![],
+            frozen_tool_schemas: None,
             expected_cache_read_tokens: 500,
         };
         maybe_emit_fork_cache_probe(

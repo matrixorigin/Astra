@@ -77,6 +77,7 @@ async fn cache_breakpoint_persists_turn_over_turn() {
     .build();
 
     let mut state = make_test_loop_state();
+    state.max_turn_input_tokens = 200_000;
     // Three user turns, with growing history between them.
     for i in 0..3 {
         state.messages.push(json!({

@@ -227,6 +227,29 @@ fn update_runtime_todo_from_tool_records(
     state.session_facts = state.continuity.facts.clone();
 }
 
+fn record_recent_read_file_path(
+    recent_file_reads: &mut Vec<(String, u32)>,
+    tool_name: &str,
+    args: &Value,
+    turn_num: u32,
+) {
+    if tool_name != "read_file" {
+        return;
+    }
+    let Some(path) = extract_file_path_from_tool(tool_name, args) else {
+        return;
+    };
+    if let Some(existing) = recent_file_reads.iter_mut().find(|(p, _)| p == &path) {
+        existing.1 = turn_num;
+    } else {
+        recent_file_reads.push((path, turn_num));
+    }
+    if recent_file_reads.len() > MAX_TRACKED_FILE_READS {
+        recent_file_reads.sort_by_key(|(_, t)| *t);
+        recent_file_reads.remove(0);
+    }
+}
+
 const EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK: &str = "turn_rollback";
 
 struct ServerRollbackBoundary {
@@ -797,17 +820,75 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         turn_result,
     } = phase;
 
-    // ── Budget wrapup enforcement ─────────────────────────────────────
+    // ── Budget wrapup enforcement (Task #43 hybrid) ───────────────────
     // If the LLM was already told to wrap up (budget_wrapup_injected) but
-    // still returned tool calls, skip tool execution and force-complete.
-    // This prevents wasting tokens and time on tools that will be discarded.
-    if state.budget_wrapup_injected && !turn_result.accum.tool_calls.is_empty() {
+    // still returned tool calls, apply a two-tier response so we keep the
+    // wrap-up promise ("Do NOT call any more tools") without discarding
+    // any partial text that arrived alongside the tool_calls:
+    //
+    //   round 1 post-wrap-up: physical lockout — drop the tool_calls,
+    //     populate `restricted_tools` (same mechanism as
+    //     `round_budget_phase1_message`), inject a short terminal reminder,
+    //     and continue the loop so the model gets one more LLM call to
+    //     produce text.
+    //   round 2+ post-wrap-up: abort the turn with an interruption. One
+    //     lockout round is a fair chance; ignoring it twice means the
+    //     model is not going to comply.
+    //
+    // Counted in `state.budget_wrapup_ignored_rounds` so we can tell the
+    // two cases apart across tool-phase re-entries within the same turn.
+    // The model can ask for tool execution via two channels: server-side
+    // `accum.tool_calls` and edge-side `edge_tool_round`. The wrap-up
+    // promise covers BOTH, so check both.
+    let post_wrapup_tool_calls_present = state.budget_wrapup_injected
+        && (!turn_result.accum.tool_calls.is_empty() || !turn_result.edge_tool_round.is_empty());
+    if post_wrapup_tool_calls_present {
+        let dropped_count = turn_result.accum.tool_calls.len() + turn_result.edge_tool_round.len();
+        state.budget_wrapup_ignored_rounds = state.budget_wrapup_ignored_rounds.saturating_add(1);
+        if state.budget_wrapup_ignored_rounds == 1 {
+            if !prep.quiet {
+                host.emit_headless_line(
+                    super::agentic_headless_round::HeadlessStderrStyle::Yellow,
+                    format!(
+                        "⚠ Budget wrapup active — dropping {dropped_count} tool call(s) and restricting tools for one more round.",
+                    ),
+                );
+            }
+            // Physical lockout: tool_selector + policy.rs both consult
+            // `restricted_tools`. Any tool call the model emits on the
+            // next round will be filtered / blocked rather than executed.
+            for name in host.valid_tool_names() {
+                state.restricted_tools.insert(name.clone());
+            }
+            state.push_volatile(
+                super::agentic_loop_host::VolatileKind::BudgetAdvisory,
+                "Wrap-up lockout active: the runtime has dropped the tool \
+                 calls in your previous response and restricted tool access. \
+                 Any tool calls you emit next WILL BE DROPPED before \
+                 execution. Produce a final text-only answer now: summarize \
+                 progress, name what you verified, and flag anything that \
+                 remains unfinished.",
+            );
+            tracing::warn!(
+                target: "astra::loop_guard",
+                tier = "budget_wrapup_lockout",
+                round = state.llm_rounds_completed,
+                dropped_tool_calls = dropped_count,
+                "budget wrapup ignored — tool-call lockout engaged",
+            );
+            // NOTE: no `observe_turn_end_without_tools` here. The lockout
+            // round is an intra-turn continuation, not a turn boundary;
+            // the next iteration (either the normal no-tool branch below
+            // or the abort branch above on repeat) will emit the single
+            // turn-end observation. Emitting it here would double-count
+            // turn-end signals on the happy path (lockout → text reply).
+            return Ok(TurnToolPhaseControl::ContinueLoop);
+        }
         if !prep.quiet {
             host.emit_headless_line(
                 super::agentic_headless_round::HeadlessStderrStyle::Yellow,
                 format!(
-                    "⚠ Budget wrapup active — skipping {} tool call(s), force-completing.",
-                    turn_result.accum.tool_calls.len(),
+                    "⛔ Budget wrapup ignored twice — aborting turn after {dropped_count} tool call(s).",
                 ),
             );
         }
@@ -816,9 +897,20 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             astra_turn_core::interruption::ResumeAction::ContinueImmediately,
             super::agentic_loop_lifecycle::interruption_state_summary(
                 state,
-                Some("LLM ignored wrapup instruction and attempted tool calls".to_string()),
+                Some(
+                    "LLM ignored wrapup instruction and restricted-tools lockout; \
+                     attempted tool calls on two consecutive rounds"
+                        .to_string(),
+                ),
             ),
         ));
+        tracing::warn!(
+            target: "astra::loop_guard",
+            tier = "budget_wrapup_abort",
+            round = state.llm_rounds_completed,
+            ignored_rounds = state.budget_wrapup_ignored_rounds,
+            "budget wrapup ignored after lockout — aborting turn",
+        );
         observe_turn_end_without_tools(
             state,
             turn_index,
@@ -838,6 +930,58 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         &mut state.stall.events,
         &mut state.turn_guard,
     );
+
+    // ── Force-stop on consecutive identical signatures ───────────────────
+    // `apply_cli_agentic_stall_preflight` pushes a
+    // `FORCE_STOP_CONSECUTIVE_EVENT` once the streak of identical tool-call
+    // signatures crosses `CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP`. At that
+    // point soft nudges have already fired and been ignored; we terminate
+    // the turn with a clear interruption reason instead of burning rounds
+    // until `token_budget_exceeded`. Session 05e63cac t10 regression:
+    // 4 identical `cargo clippy` calls tripped nudges, LLM ignored them
+    // and continued for ~50 rounds before budget cutoff.
+    let force_stop_fired = state.stall.events.iter().any(|(name, _)| {
+        name == astra_turn_core::agentic_stall_preflight::FORCE_STOP_CONSECUTIVE_EVENT
+    });
+    if force_stop_fired {
+        let last_sig = state
+            .stall
+            .turn_sigs
+            .last()
+            .and_then(|s| s.iter().next().cloned())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        if !prep.quiet {
+            host.emit_headless_line(
+                super::agentic_headless_round::HeadlessStderrStyle::Yellow,
+                format!(
+                    "⚠ Hard-stop: {} consecutive identical tool calls ({}); \
+                     soft nudges were ignored. Terminating turn.",
+                    astra_turn_core::stall::CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP,
+                    last_sig,
+                ),
+            );
+        }
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            super::agentic_loop_lifecycle::interruption_state_summary(
+                state,
+                Some(format!(
+                    "force_stop_consecutive: {} identical tool-call signatures \
+                     in a row; soft nudges had no effect",
+                    astra_turn_core::stall::CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP,
+                )),
+            ),
+        ));
+        observe_turn_end_without_tools(
+            state,
+            turn_index,
+            prep.turn_start_time,
+            turn_result.ttft_ms,
+        );
+        finalize_and_render(host, state).await;
+        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
+    }
 
     let valid_tool_names = host.valid_tool_names().clone();
     let DelegationInterceptionResult {
@@ -900,6 +1044,12 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             .as_ref()
             .map(|b| b.current_round())
             .unwrap_or(0);
+        // Update introspect snapshot so the tool can return fresh state.
+        if let Some(executor) = state.server_tool_executor.as_deref() {
+            let snapshot = build_introspect_snapshot(state);
+            executor.update_introspect_snapshot(snapshot);
+        }
+
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index,
             quiet: headless_quiet,
@@ -941,10 +1091,17 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     // Record LLM round in the turn event buffer and advance the round counter.
     // Also post-process new ToolCallRecords to set batch_id and parallel flags.
     let new_records_start = evo_records_before;
-    let round_tool_calls = {
+    // Scope the mutable slice borrow so `state.push_volatile` (another
+    // mutable borrow) can run after the slice is released. We record the
+    // "executed N tools in parallel" count while we still hold the slice
+    // and defer the volatile push to outside the block.
+    let (round_tool_calls, coaching_count): (_, Option<usize>) = {
         let new_records = &mut state.stall.tool_call_records[new_records_start..];
+        let mut parallel_count_emit: Option<usize> = None;
         if !new_records.is_empty() && turn_result.accum.tool_calls.len() > 1 {
             let batch_id = state.turn_event_buffer.as_mut().map(|b| b.next_batch_id());
+            // Re-borrow after consuming turn_event_buffer's mutable access.
+            let new_records = &mut state.stall.tool_call_records[new_records_start..];
             let has_parallel = new_records
                 .iter()
                 .filter(|r| !r.is_synthetic_placeholder())
@@ -959,38 +1116,75 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     rec.parallel = Some(true);
                 }
             }
-            // B4: Inject positive reinforcement when LLM successfully batched tools.
             if has_parallel {
-                let parallel_count = new_records
-                    .iter()
-                    .filter(|r| !r.is_synthetic_placeholder())
-                    .count();
-                state.messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": format!(
-                        "✓ {parallel_count} tools executed in parallel — excellent. Keep batching independent operations."
-                    )
-                }));
+                parallel_count_emit = Some(
+                    new_records
+                        .iter()
+                        .filter(|r| !r.is_synthetic_placeholder())
+                        .count(),
+                );
             }
         }
-        new_records.to_vec()
+        let snapshot = state.stall.tool_call_records[new_records_start..].to_vec();
+        (snapshot, parallel_count_emit)
     };
+    // B4: Inject positive reinforcement when LLM successfully batched tools.
+    if let Some(parallel_count) = coaching_count {
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::ToolBatchCoaching,
+            format!(
+                "✓ {parallel_count} tools executed in parallel — excellent. Keep batching independent operations."
+            ),
+        );
+    }
     update_runtime_todo_from_tool_records(state, &round_tool_calls);
 
     let agentic_step = current_agentic_step(state);
     let run_id = state.current_run_id.clone();
+    let tool_names: Vec<String> = turn_result
+        .accum
+        .tool_calls
+        .iter()
+        .filter_map(|tc| {
+            tc.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .map(String::from)
+        })
+        .collect();
+
+    // Populate the in-memory round ring unconditionally (regardless of
+    // whether `full_llm_capture` / turn_event_buffer is active). This is
+    // what powers `introspect(subtopic=recent)` — the agent can ask
+    // "what were my last few rounds doing?" without any disk I/O.
+    //
+    // provider/model aren't plumbed through `AgenticLoopState` today;
+    // leave empty. Introspect readers care most about tokens +
+    // tool_calls + duration — those are all fed from `turn_result`.
+    let round_duration_ms = prep.turn_start_time.elapsed().as_millis() as u64;
+    let recent_summary = super::agentic_loop_host::RecentRoundSummary {
+        turn: state.session_turn,
+        round: state.current_round_index,
+        provider: String::new(),
+        model: String::new(),
+        prompt_tokens: turn_result.accum.prompt_tokens,
+        cache_read_tokens: turn_result.accum.cache_read_tokens,
+        cache_creation_tokens: 0,
+        completion_tokens: turn_result.accum.completion_tokens,
+        tool_calls_returned: turn_result.accum.tool_calls.len() as u32,
+        tool_call_names: tool_names.clone(),
+        duration_ms: round_duration_ms,
+        finish_reason: Some(
+            super::agentic_loop_host::synthesise_finish_reason(
+                None,
+                !turn_result.accum.tool_calls.is_empty(),
+            )
+            .to_string(),
+        ),
+    };
+    state.push_recent_round(recent_summary);
+
     if let Some(ref mut buf) = state.turn_event_buffer {
-        let tool_names: Vec<String> = turn_result
-            .accum
-            .tool_calls
-            .iter()
-            .filter_map(|tc| {
-                tc.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .map(String::from)
-            })
-            .collect();
         buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
             ttft_ms: turn_result.ttft_ms,
             duration_ms: prep.turn_start_time.elapsed().as_millis() as u64,
@@ -1018,6 +1212,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             source: Some("agentic_loop".into()),
             run_id,
             tool_calls: Some(round_tool_calls),
+            ..Default::default()
         });
     }
 
@@ -1141,10 +1336,10 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             let hint_parts = apply_tactical_actions(state, &step_actions);
             if !hint_parts.is_empty() {
                 let hint_text = format!("[Tactical Adaptation]\n{}", hint_parts.join("\n"));
-                state.messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": hint_text
-                }));
+                state.push_volatile(
+                    super::agentic_loop_host::VolatileKind::TacticalAdaptation,
+                    hint_text,
+                );
             }
         }
     }
@@ -1171,18 +1366,12 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     {
         let turn_num = (state.max_turns - state.remaining_turns) as u32;
         for edge_result in &turn_result.edge_tool_round {
-            if let Some(path) = extract_file_path_from_tool(&edge_result.tool, &edge_result.args) {
-                if let Some(existing) = state.recent_file_reads.iter_mut().find(|(p, _)| p == &path)
-                {
-                    existing.1 = turn_num;
-                } else {
-                    state.recent_file_reads.push((path, turn_num));
-                }
-                if state.recent_file_reads.len() > MAX_TRACKED_FILE_READS {
-                    state.recent_file_reads.sort_by_key(|(_, t)| *t);
-                    state.recent_file_reads.remove(0);
-                }
-            }
+            record_recent_read_file_path(
+                &mut state.recent_file_reads,
+                &edge_result.tool,
+                &edge_result.args,
+                turn_num,
+            );
         }
     }
 
@@ -1223,9 +1412,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     &visible,
                     open_skill_name,
                 ));
-                if open_skill_name {
-                    host.inject_tool_schema(crate::turn::skill_tool::discover_skills_tool_schema());
-                }
             }
         }
     }
@@ -1256,22 +1442,28 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 state.error_recovery.last_error_category = dominant;
             }
             if state.error_recovery.consecutive_same_error >= CONSECUTIVE_ERROR_BUDGET {
-                let cat_name = state
-                    .error_recovery
-                    .last_error_category
-                    .map(|c| format!("{c:?}"))
-                    .unwrap_or_else(|| "Unknown".into());
-                state.messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": format!(
-                        "🔄 ERROR BUDGET EXHAUSTED: You've hit {cat_name} errors \
-                         {n} turns in a row. Your current approach is not working. \
-                         STOP repeating the same strategy. You MUST try a fundamentally \
-                         different approach: different tool, different file, different \
-                         method. If you cannot make progress, explain what's blocking you.",
-                        n = state.error_recovery.consecutive_same_error,
-                    )
-                }));
+                // In Auto mode the user opted to let the model drive —
+                // drop the error-budget nudge (it's another "stop doing
+                // that" message that breaks cache + interrupts flow).
+                // The counter still resets so other paths remain sane.
+                if !host.turn_interaction_mode().suppresses_loop_nudges() {
+                    let cat_name = state
+                        .error_recovery
+                        .last_error_category
+                        .map(|c| format!("{c:?}"))
+                        .unwrap_or_else(|| "Unknown".into());
+                    let n = state.error_recovery.consecutive_same_error;
+                    state.push_volatile(
+                        super::agentic_loop_host::VolatileKind::Corrective,
+                        format!(
+                            "🔄 ERROR BUDGET EXHAUSTED: You've hit {cat_name} errors \
+                             {n} turns in a row. Your current approach is not working. \
+                             STOP repeating the same strategy. You MUST try a fundamentally \
+                             different approach: different tool, different file, different \
+                             method. If you cannot make progress, explain what's blocking you.",
+                        ),
+                    );
+                }
                 state.error_recovery.consecutive_same_error = 0;
             }
         } else {
@@ -1454,7 +1646,98 @@ fn observe_gate_cancelled(
     }
 }
 
+fn build_introspect_snapshot(
+    state: &super::agentic_loop_host::AgenticLoopState,
+) -> astra_turn_core::introspect::IntrospectSnapshot {
+    let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
+    let cache_ratio = if total_in > 0 {
+        state.total_cache_read as f64 / total_in as f64
+    } else {
+        0.0
+    };
+    let working_mem = state
+        .pipeline_session
+        .as_ref()
+        .map(|s| s.working_memory().render_prompt_section())
+        .unwrap_or_default();
+
+    // Task #46: populate the in-memory self-awareness fields from state.
+    let recent_rounds = state
+        .recent_rounds
+        .iter()
+        .map(|r| astra_turn_core::introspect::RoundSnapshotEntry {
+            turn: r.turn,
+            round: r.round,
+            provider: r.provider.clone(),
+            model: r.model.clone(),
+            prompt_tokens: r.prompt_tokens,
+            cache_read_tokens: r.cache_read_tokens,
+            cache_creation_tokens: r.cache_creation_tokens,
+            completion_tokens: r.completion_tokens,
+            tool_calls_returned: r.tool_calls_returned,
+            tool_call_names: r.tool_call_names.clone(),
+            duration_ms: r.duration_ms,
+            finish_reason: r.finish_reason.clone(),
+        })
+        .collect();
+    let volatile_pending = state
+        .volatile_pending
+        .iter()
+        .map(|inj| astra_turn_core::introspect::VolatileSnapshotEntry {
+            kind: format!("{:?}", inj.kind),
+            content: inj.content.clone(),
+            round_index: inj.round_index,
+        })
+        .collect();
+    let events: Vec<String> = state
+        .stall
+        .events
+        .iter()
+        .map(|(name, turn)| format!("{name} @ turn {turn}"))
+        .collect();
+    let stall_state = astra_turn_core::introspect::StallSnapshotSummary {
+        nudge_count: state.stall.nudge_count,
+        events,
+        introspection_count: state.stall.introspection_count,
+        forced_execution_escalation: state.stall.forced_execution_escalation,
+        forced_parallel_batching: state.stall.forced_parallel_batching,
+        forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
+        forced_redundant_reads_corrective: state.stall.forced_redundant_reads_corrective,
+        forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
+        forced_exploration_family_phase2: state.stall.forced_exploration_family_phase2,
+        forced_exploration_family_corrective: state.stall.forced_exploration_family_corrective,
+    };
+
+    // Injection-freshness is session-scoped (lives on ObservabilitySession,
+    // not on the per-turn AgenticLoopState). The CLI edge_tools path
+    // overlays it on the snapshot just before rendering — see
+    // `build_self_model_for_agent` companion hook. Server-path builds of
+    // this snapshot (e.g., for server-side introspect API) leave it empty.
+    let current_round = state.current_round_index;
+
+    astra_turn_core::introspect::IntrospectSnapshot {
+        token_pressure: 0.0, // TODO: wire from pipeline_session.stats when available
+        cache_hit_ratio: cache_ratio,
+        turns_completed: state.llm_rounds_completed,
+        turns_remaining: state.remaining_turns as u32,
+        compaction_tier: format!("{:?}", state.compact_tier_applied),
+        alerts: Vec::new(),
+        tool_health: Vec::new(), // TODO: wire from step_recorder.tool_timings
+        working_memory_summary: working_mem,
+        total_input_tokens: state.total_prompt + state.total_cache_read,
+        total_output_tokens: state.total_completion,
+        cache_read_tokens: state.total_cache_read,
+        cache_creation_tokens: state.total_cache_creation,
+        recent_rounds,
+        volatile_pending,
+        stall_state,
+        injection_freshness: Vec::new(),
+        current_round,
+    }
+}
+
 #[cfg(test)]
+#[allow(dead_code, unused_imports, clippy::empty_line_after_doc_comments)]
 mod tests {
     use super::*;
 
@@ -1487,6 +1770,20 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn recent_file_cache_tracks_only_read_file_results() {
+        let mut reads = Vec::new();
+        record_recent_read_file_path(&mut reads, "str_replace", &json!({"path": "src/lib.rs"}), 1);
+        record_recent_read_file_path(
+            &mut reads,
+            "read_file",
+            &json!({"path": "src/lib.rs", "start_line": 10, "end_line": 20}),
+            2,
+        );
+
+        assert_eq!(reads, vec![("src/lib.rs".to_string(), 2)]);
     }
 
     #[test]
@@ -1887,8 +2184,10 @@ esac
         (executor, session)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_commits_successful_turn() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-file-boundary-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
@@ -1940,8 +2239,10 @@ esac
         cleanup_session_artifacts(&session_id);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_aborts_and_rolls_back_failed_turn() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-file-boundary-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
@@ -2012,8 +2313,10 @@ esac
         cleanup_session_artifacts(&session_id);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_aborts_and_rolls_back_when_multi_edit_fails() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-file-boundary-multi-edit-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
@@ -2082,8 +2385,10 @@ esac
         cleanup_session_artifacts(&session_id);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_git_boundary_aborts_and_reverts_failed_turn() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-git-boundary-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         std::process::Command::new("git")
@@ -2182,160 +2487,6 @@ esac
         cleanup_session_artifacts(&session_id);
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn server_database_boundary_aborts_and_rolls_back_failed_turn() {
-        let fake_bin = tempfile::TempDir::new().unwrap();
-        write_fake_mysql(fake_bin.path());
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let joined = std::env::join_paths(
-            std::iter::once(fake_bin.path().to_path_buf()).chain(std::env::split_paths(&path)),
-        )
-        .unwrap();
-        let _path_guard = set_env_var("PATH", joined);
-
-        let session_id = format!("server-db-boundary-{}", uuid::Uuid::new_v4());
-        let dir = tempfile::TempDir::new().unwrap();
-        let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            session_id.clone(),
-            None,
-            None,
-        );
-        executor.set_turn_index(11);
-
-        let active = open_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            11,
-            &[json!({"function": {"name": "mo_query", "arguments": "{}"}})],
-        )
-        .expect("boundary should open for mo_query");
-
-        let query_out = executor
-            .execute("mo_query", &json!({"sql": "UPDATE metrics SET value = 1"}))
-            .await;
-        assert!(query_out.contains("Query OK"), "got: {query_out}");
-
-        finalize_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            &active,
-            &[
-                tool_record("mo_query", true),
-                // A second mutator (mo_query) in the same round fails → rollback MUST fire.
-                tool_record("mo_query", false),
-            ],
-            &[],
-        )
-        .await;
-
-        let events = read_journal_events(&session_id);
-        let boundary_events: Vec<_> = events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event.event_type,
-                    JournalEventType::ExecutionBoundaryOpened
-                        | JournalEventType::ExecutionBoundaryAborted
-                )
-            })
-            .collect();
-        assert_eq!(boundary_events.len(), 2);
-        let boundary = &boundary_events[1].metadata.as_ref().unwrap()["execution_boundary"];
-        assert_eq!(boundary["kind"].as_str(), Some("turn_rollback"));
-        assert_eq!(boundary["reason"].as_str(), Some("tool_error"));
-        assert_eq!(boundary["trigger_tool_name"].as_str(), Some("mo_query"));
-        assert_eq!(
-            boundary["rollback"]["database_snapshots"]["restored"]
-                .as_array()
-                .map(Vec::len),
-            Some(1)
-        );
-
-        cleanup_session_artifacts(&session_id);
-    }
-
-    #[tokio::test]
-    async fn server_session_state_boundary_aborts_and_rolls_back_failed_turn() {
-        let session_id = format!("server-session-boundary-{}", uuid::Uuid::new_v4());
-        let dir = tempfile::TempDir::new().unwrap();
-        let (executor, session) = session_state_executor(&session_id, &dir, 9);
-        let original_top_k = session.read().unwrap().config.memory.retrieval_top_k;
-        let new_top_k = if original_top_k < 20 {
-            original_top_k + 1
-        } else {
-            original_top_k.saturating_sub(1)
-        };
-
-        let active = open_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            9,
-            &[json!({"function": {"name": "adjust_config", "arguments": "{}"}})],
-        )
-        .expect("boundary should open for adjust_config");
-
-        let adjust_out = executor
-            .execute(
-                "adjust_config",
-                &json!({"path": "memory.retrieval_top_k", "value": new_top_k}),
-            )
-            .await;
-        let adjust_json: Value = serde_json::from_str(&adjust_out).unwrap();
-        assert_eq!(adjust_json["status"].as_str(), Some("ok"));
-        assert_eq!(
-            session.read().unwrap().config.memory.retrieval_top_k,
-            new_top_k
-        );
-
-        finalize_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            &active,
-            &[
-                tool_record("adjust_config", true),
-                // A second session-state mutator fails → rollback MUST fire.
-                tool_record("prioritize_tool", false),
-            ],
-            &[],
-        )
-        .await;
-
-        let events = read_journal_events(&session_id);
-        let boundary_events: Vec<_> = events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event.event_type,
-                    JournalEventType::ExecutionBoundaryOpened
-                        | JournalEventType::ExecutionBoundaryAborted
-                )
-            })
-            .collect();
-        assert_eq!(boundary_events.len(), 2);
-        let boundary = &boundary_events[1].metadata.as_ref().unwrap()["execution_boundary"];
-        assert_eq!(boundary["kind"].as_str(), Some("turn_rollback"));
-        assert_eq!(boundary["reason"].as_str(), Some("tool_error"));
-        assert_eq!(
-            boundary["trigger_tool_name"].as_str(),
-            Some("prioritize_tool")
-        );
-        assert_eq!(
-            boundary["rollback"]["session_state"]["restored"]
-                .as_array()
-                .map(Vec::len),
-            Some(1)
-        );
-        assert_eq!(
-            session.read().unwrap().config.memory.retrieval_top_k,
-            original_top_k
-        );
-
-        cleanup_session_artifacts(&session_id);
-    }
-
     // --------------------------------------------------------------------------
     // Rollback scoping rule: only mutator failures roll back mutator successes.
     // --------------------------------------------------------------------------
@@ -2389,8 +2540,10 @@ esac
     /// before the fix, a `grep` returning `!ok` would blow away the
     /// `write_file` it was scheduled next to and leave the model's action
     /// history diverged from disk state.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_commits_when_only_read_only_tool_fails() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-scope-readonly-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
@@ -2456,8 +2609,10 @@ esac
 
     /// Multiple read-only tools all fail in a mutator round. Still commits —
     /// no number of read-only errors should cascade into a rollback.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_commits_when_multiple_read_only_tools_fail() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-scope-multi-readonly-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = crate::server::server_tool_executor::ServerToolExecutor::new(

@@ -3,7 +3,17 @@ use super::terminal_palette::{best_color, default_bg};
 use ratatui::style::{Color, Style};
 
 pub(crate) fn user_message_style() -> Style {
-    user_message_style_for(default_bg())
+    // Previously: if the terminal-bg query failed (crossterm 0.28
+    // removed it), we returned `Style::default()` and the user turn
+    // had no tint at all — visually indistinguishable from assistant
+    // cells. Now fall back to the theme's `selected_bg`, which is a
+    // concrete color under both dark and light presets, so the cell
+    // always has a visible band.
+    if let Some(bg) = default_bg() {
+        return Style::default().bg(user_message_bg(bg));
+    }
+    let theme = super::theme::current();
+    Style::default().bg(theme.selected_bg)
 }
 
 #[allow(dead_code)]

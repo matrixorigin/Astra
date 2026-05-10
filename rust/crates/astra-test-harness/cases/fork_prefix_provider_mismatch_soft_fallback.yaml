@@ -30,7 +30,7 @@ criteria:
   - type: exit_code
     code: 0
   - type: tool_called
-    name: spawn_agent
+    name: agent
   # Note on observability: the current runtime signals validation
   # failures via `PrefixResolveOutcome::Failed` (spawner returns a
   # SpawnError), NOT via a `[fork-cache]` stderr event. So this case

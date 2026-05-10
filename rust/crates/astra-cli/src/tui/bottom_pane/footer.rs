@@ -1,11 +1,12 @@
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Color, Style},
-    text::{Line, Span},
-    widgets::Widget,
-};
-use unicode_width::UnicodeWidthStr;
+//! Thin compatibility shim over [`crate::tui::status_line::StatusLine`].
+//!
+//! The rendered bottom strip is now composed by [`StatusLine`] from a
+//! pure [`StatusContext`]; this struct remains as the mutable container
+//! the event loop writes into, to avoid churn across call sites.
+
+use ratatui::{buffer::Buffer, layout::Rect};
+
+use crate::tui::status_line::{PermissionMode, StatusContext, StatusLine};
 
 pub(crate) struct Footer {
     pub model: Option<String>,
@@ -14,6 +15,10 @@ pub(crate) struct Footer {
     pub cwd: Option<String>,
     pub is_turn_active: bool,
     pub permission_mode: Option<String>,
+    pub cost_usd: Option<f64>,
+    pub git_branch: Option<String>,
+    pub token_budget: Option<(u64, u64)>,
+    pub pending_approvals: usize,
 }
 
 impl Footer {
@@ -34,85 +39,37 @@ impl Footer {
             cwd,
             is_turn_active: false,
             permission_mode: None,
+            cost_usd: None,
+            git_branch: None,
+            token_budget: None,
+            pending_approvals: 0,
+        }
+    }
+
+    fn permission_mode_enum(&self) -> PermissionMode {
+        match self.permission_mode.as_deref() {
+            Some("auto") => PermissionMode::Auto,
+            Some("deny") => PermissionMode::Deny,
+            Some("bypass") => PermissionMode::Bypass,
+            _ => PermissionMode::Ask,
+        }
+    }
+
+    fn to_context(&self) -> StatusContext {
+        StatusContext {
+            model: self.model.clone(),
+            cwd: self.cwd.clone(),
+            token_budget: self.token_budget,
+            permission_mode: self.permission_mode_enum(),
+            turn_active: self.is_turn_active,
+            session_id: self.session_id.clone(),
+            cost_usd: self.cost_usd,
+            git_branch: self.git_branch.clone(),
+            pending_approvals: self.pending_approvals,
         }
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-
-        let dim = Style::default().fg(Color::DarkGray);
-        let sep = Span::styled(" · ", dim);
-
-        // Build right side: model · dir · tokens
-        let mut right_parts: Vec<Span> = Vec::new();
-
-        if let Some(ref model) = self.model {
-            right_parts.push(Span::styled(model.clone(), dim));
-        }
-
-        if let Some(ref cwd) = self.cwd {
-            if !right_parts.is_empty() {
-                right_parts.push(sep.clone());
-            }
-            let display = if cwd.chars().count() > 25 {
-                let suffix: String = cwd
-                    .chars()
-                    .rev()
-                    .take(24)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
-                format!("…{suffix}")
-            } else {
-                cwd.clone()
-            };
-            right_parts.push(Span::styled(display, dim));
-        }
-
-        if let Some(ref usage) = self.token_usage {
-            if !right_parts.is_empty() {
-                right_parts.push(sep.clone());
-            }
-            right_parts.push(Span::styled(usage.clone(), dim));
-        }
-
-        // Build left side
-        let mut left_parts: Vec<Span> = Vec::new();
-        left_parts.push(Span::raw("  ")); // 2-space indent
-        if self.is_turn_active {
-            left_parts.push(Span::styled("Ctrl+C interrupt", dim));
-        } else {
-            left_parts.push(Span::styled(
-                "/ commands · $ skills · Ctrl+O transcript",
-                dim,
-            ));
-        }
-
-        // Show non-default permission mode as a warning indicator
-        if let Some(ref mode) = self.permission_mode {
-            if mode != "prompt" {
-                let mode_style = if mode == "auto" {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default().fg(Color::Red)
-                };
-                left_parts.push(Span::styled(" · ", dim));
-                left_parts.push(Span::styled(format!("⚡{mode}"), mode_style));
-            }
-        }
-
-        // Compose: left ... padding ... right
-        let left_w: usize = left_parts.iter().map(|s| s.content.width()).sum();
-        let right_w: usize = right_parts.iter().map(|s| s.content.width()).sum();
-        let padding = (area.width as usize).saturating_sub(left_w + right_w + 2); // +2 for trailing margin
-
-        let mut all_spans = left_parts;
-        all_spans.push(Span::raw(" ".repeat(padding)));
-        all_spans.extend(right_parts);
-
-        Widget::render(Line::from(all_spans), area, buf);
+        StatusLine::from_context(&self.to_context()).render(area, buf);
     }
 }

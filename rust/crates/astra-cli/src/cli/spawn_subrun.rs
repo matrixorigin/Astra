@@ -48,21 +48,39 @@ pub struct CliSpawnAgentExecutor {
     /// prepend the parent prefix — but no ForkCacheEvent is emitted.
     /// Zero-cost when unset.
     fork_cache_sink: Option<Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>>,
+    /// Parent session journal writer for unified timeline.
+    journal: Option<std::sync::Arc<astra_services::session_journal::JournalWriter>>,
 }
 
 /// Build the child agent's message array from system prompt, optional
 /// inherited prefix, and the child task. Ensures role alternation is
 /// valid for providers that require strict user/assistant alternation
 /// (e.g. Bedrock Converse).
+///
+/// **Fork mode** (`prefix_messages` is `Some`): The prefix already
+/// contains the parent's system message at [0] plus its full
+/// conversation history — reconstructed byte-for-byte from the
+/// captured `ForkPrefix.canonical_prefix_bytes`. We do NOT prepend a
+/// fresh system message because that would:
+/// - Create a duplicate system message (providers only expect one)
+/// - Break byte-for-byte prefix cache reuse (the extra bytes shift
+///   the cache key so the parent's cached KV is unusable)
+///
+/// The child's identity ("You are agent_id, specialized sub-agent…")
+/// is communicated via the child_task user message, not via a system
+/// block, so the fork child still knows its role.
+///
+/// **Fresh mode** (`prefix_messages` is `None`): the child gets a
+/// system message with its identity, then the child task as a user
+/// message — same as before fork support.
 pub(crate) fn build_child_messages(
     system_prompt: &str,
     prefix_messages: Option<&[Value]>,
     child_task: &str,
 ) -> Vec<Value> {
-    let prefix_len = prefix_messages.map_or(0, |p| p.len());
-    let mut messages = Vec::with_capacity(3 + prefix_len);
-    messages.push(json!({ "role": "system", "content": system_prompt }));
     if let Some(prefix) = prefix_messages {
+        // Fork mode: reuse parent prefix verbatim for cache alignment.
+        let mut messages = Vec::with_capacity(prefix.len() + 2);
         messages.extend(prefix.iter().cloned());
         // Bedrock Converse requires strict role alternation. If the
         // prefix ends with user or tool role, inserting the child task
@@ -79,9 +97,15 @@ pub(crate) fn build_child_messages(
                 "content": "I'll now work on the delegated task."
             }));
         }
+        messages.push(json!({ "role": "user", "content": child_task }));
+        messages
+    } else {
+        // Fresh mode: system prompt + child task only.
+        vec![
+            json!({ "role": "system", "content": system_prompt }),
+            json!({ "role": "user", "content": child_task }),
+        ]
     }
-    messages.push(json!({ "role": "user", "content": child_task }));
-    messages
 }
 
 impl CliSpawnAgentExecutor {
@@ -102,7 +126,17 @@ impl CliSpawnAgentExecutor {
             skill_search: SkillSearchSettings::default(),
             active_session_id: None,
             fork_cache_sink: None,
+            journal: None,
         }
+    }
+
+    /// Install the parent session's journal writer for unified timeline.
+    pub fn with_journal(
+        mut self,
+        journal: std::sync::Arc<astra_services::session_journal::JournalWriter>,
+    ) -> Self {
+        self.journal = Some(journal);
+        self
     }
 
     /// Install a fork-cache event sink. When present, every child
@@ -193,6 +227,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             inherited_prefix: config.inherited_prefix.clone(),
             fork_cache_sink: self.fork_cache_sink.clone(),
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: self.journal.clone(),
         };
 
         // Build system message from agent type definition
@@ -283,6 +318,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 
         let mut state = AgenticLoopState {
             messages,
+            volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: server_session_id,
             current_run_id: Some(config.run_id.clone()),
@@ -290,6 +327,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             context_manifest_user_id: None,
             context_manifest_model_name: None,
             recursion_depth: config.recursion_depth,
+            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -344,6 +382,9 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 token: self.cancel_token.clone(),
             },
             error_recovery: Default::default(),
+            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+            )),
             message: config.task.clone(),
             recent_tools: Vec::new(),
             task_profile,
@@ -365,6 +406,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
+            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -625,15 +668,18 @@ mod tests {
     }
 
     /// When prefix ends with assistant, no bridge is needed.
+    /// Fork mode: prefix is used verbatim (no system prepend).
     #[test]
     fn prefix_ending_with_assistant_needs_no_bridge() {
         let prefix_messages = vec![
+            json!({"role": "system", "content": "parent system prompt"}),
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": "hello"}),
         ];
-        let messages = build_child_messages("system", Some(&prefix_messages), "child task");
+        let messages = build_child_messages("ignored", Some(&prefix_messages), "child task");
 
-        // Should be: system, user, assistant, user(child task) — no extra assistant
+        // Fork mode: prefix verbatim + child task. No bridge needed
+        // because prefix ends with assistant → child task (user) is valid.
         let roles: Vec<&str> = messages
             .iter()
             .filter_map(|m| m.get("role").and_then(|r| r.as_str()))

@@ -85,12 +85,25 @@ mod tests {
     fn send_and_receive() {
         let (sender, receiver) = adjust_channel(4);
 
-        let handle = std::thread::spawn(move || receiver.drain(&noop_handler));
+        // `drain` is non-blocking (`try_recv`), so the drainer thread
+        // must keep polling until at least one command has been handled;
+        // otherwise it can run before the main thread's send lands and
+        // exit with count=0 (observed under nextest's higher scheduler
+        // contention). `sender.send` blocks on the handler's response,
+        // so the main thread provides the synchronization.
+        let drain_handle = std::thread::spawn(move || {
+            let mut total = 0;
+            while total == 0 {
+                total += receiver.drain(&noop_handler);
+                std::thread::yield_now();
+            }
+            total
+        });
 
         let resp = sender.send(AdjustCommand::ClearBreakpoints);
         assert!(matches!(resp, Some(AdjustResponse::Ok { .. })));
 
-        let count = handle.join().unwrap();
+        let count = drain_handle.join().unwrap();
         assert_eq!(count, 1);
     }
 

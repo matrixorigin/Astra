@@ -59,6 +59,11 @@ fn create_tool_selector_with_quality_internal(
     };
 
     let all_schemas = edge_tools::all_tool_schemas();
+    // spawn_agent, get_agent_result, send_message are now consolidated into
+    // the `agent` tool schema (actions: spawn, get_result, send_message).
+    // Individual schemas kept only for backward compat in the executor dispatch.
+    // The `skill` tool is dynamically injected by the agentic loop
+    // (skill_tool::skill_tool_schema) based on discovered skills each turn.
     let mut registry = tool_registry::ToolRegistry::new(all_schemas);
 
     // Load skill manifests from skills/ directory and register plugin tools

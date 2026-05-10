@@ -16,7 +16,7 @@
 //!
 //! - PR 1: [`ForkPrefix`] type
 //! - PR 2: [`PrefixCaptureSink`] trait + in-memory store
-//! - PR 3: capture-site helper + feature flag
+//! - PR 3: capture-site helper
 //! - **PR 4 (this)**: spawn-side resolver + `SpawnAgentInput`
 //!   extensions. Still NOT wired into the live spawner.
 //! - PR 4.5: spawner calls the resolver; reconstructor consumes
@@ -27,9 +27,9 @@
 //!
 //! `InheritPrefixSpec.required` encodes the caller's intent:
 //! - `required: false` (default) — prefix reuse is opportunistic.
-//!   Missing / incompatible / flag-disabled ⇒ spawn still proceeds
-//!   without the prefix. This is the right default for most skills:
-//!   cache reuse is a latency/cost win, not a correctness property.
+//!   Missing / incompatible ⇒ spawn still proceeds without the
+//!   prefix. This is the right default for most skills: cache reuse
+//!   is a latency/cost win, not a correctness property.
 //! - `required: true` — caller specifically depends on the prefix
 //!   (e.g. a skill that only makes sense when running against a
 //!   specific parent context). Missing ⇒ hard failure so the caller
@@ -39,7 +39,6 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::fork_capture::is_fork_inherit_prefix_enabled;
 use crate::fork_prefix::{ForkPrefix, ForkValidationError, ProviderKind, SpawnValidationContext};
 use crate::fork_prefix_store::PrefixCaptureSink;
 use crate::orchestration_spawn_tool::InheritPrefixSpec;
@@ -56,13 +55,6 @@ use crate::orchestration_spawn_tool::InheritPrefixSpec;
 /// level (Failed vs Fallback wrapping the same `ResolveFailure`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolveFailure {
-    /// The fork-inherit-prefix feature flag is off.
-    ///
-    /// This fires **even when a captured prefix exists** in the
-    /// sink — the flag is a kill switch, not a "feature never
-    /// used" signal. Telemetry should treat this as an operator
-    /// decision to stop inheriting, not as a bug.
-    FeatureDisabled,
     /// No prefix captured for `run_id`. Either the parent never
     /// captured (skill-level choice), the capture was Skipped
     /// (microcompact, empty, oversized — see [`crate::fork_capture::SkipReason`]),
@@ -164,14 +156,6 @@ pub fn resolve_inherit_prefix(
         return PrefixResolveOutcome::Disabled;
     };
 
-    // Feature flag gate. Even if a prefix was captured when the flag
-    // was on, turning it off should stop resolution (mirror the
-    // capture-side contract). Caller's `required` still decides
-    // hard-fail vs fallback.
-    if !is_fork_inherit_prefix_enabled() {
-        return dispatch(spec.required, ResolveFailure::FeatureDisabled);
-    }
-
     // Determine which run's prefix to look up. Explicit non-empty
     // `from_run_id` wins; else fall back to caller's own run.
     // Empty strings in either slot are treated as "missing" because
@@ -237,44 +221,11 @@ fn dispatch(required: bool, reason: ResolveFailure) -> PrefixResolveOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fork_capture::{
-        CaptureRequest, FORK_FLAG_TEST_MUTEX, FORK_INHERIT_PREFIX_ENV, ForkCaptureOutcome,
-        capture_parent_prefix, restore_fork_flag_raw_for_tests, set_fork_flag_for_tests,
-    };
+    use crate::fork_capture::{CaptureRequest, ForkCaptureOutcome, capture_parent_prefix};
     use crate::fork_prefix::{
         CacheMode, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry, hash_tool_schema,
     };
     use crate::fork_prefix_store::InMemoryPrefixStore;
-
-    // Resolver tests share the crate-global flag mutex with
-    // fork_capture tests (defined at the fork_capture definition
-    // site). Sharing one lock across modules is what keeps the
-    // feature-flag state consistent under `cargo test --lib fork`
-    // which runs both modules' tests in parallel.
-
-    struct FlagGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        prev_raw: u8,
-    }
-
-    impl FlagGuard {
-        fn set(enabled: bool) -> Self {
-            let lock = FORK_FLAG_TEST_MUTEX
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let prev_raw = set_fork_flag_for_tests(enabled);
-            Self {
-                _lock: lock,
-                prev_raw,
-            }
-        }
-    }
-
-    impl Drop for FlagGuard {
-        fn drop(&mut self) {
-            restore_fork_flag_raw_for_tests(self.prev_raw);
-        }
-    }
 
     fn wall_now_secs() -> u64 {
         std::time::SystemTime::now()
@@ -294,7 +245,7 @@ mod tests {
     }
 
     /// Capture a prefix into a fresh store under the given run id.
-    /// Returns the populated store. Requires the flag already on.
+    /// Returns the populated store.
     fn populated_store(run_id: &str, thinking_budget: Option<u32>) -> InMemoryPrefixStore {
         let store = InMemoryPrefixStore::new();
         let thinking = thinking_budget.map(|b| ThinkingConfigSlice {
@@ -342,7 +293,6 @@ mod tests {
 
     #[test]
     fn returns_disabled_when_no_spec_provided() {
-        let _g = FlagGuard::set(true);
         let store = InMemoryPrefixStore::new();
         let out = resolve_inherit_prefix(None, &matching_ctx(), &store);
         assert!(matches!(out, PrefixResolveOutcome::Disabled));
@@ -350,48 +300,10 @@ mod tests {
         assert!(out.prefix().is_none());
     }
 
-    // --- Feature flag --------------------------------------------------
-
-    #[test]
-    fn feature_off_soft_falls_back() {
-        let _g = FlagGuard::set(false);
-        let store = InMemoryPrefixStore::new(); // empty — doesn't matter
-        let spec = InheritPrefixSpec {
-            from_run_id: None,
-            required: false,
-        };
-        let out = resolve_inherit_prefix(Some(&spec), &matching_ctx(), &store);
-        match out {
-            PrefixResolveOutcome::Fallback {
-                reason: ResolveFailure::FeatureDisabled,
-            } => {}
-            other => panic!("expected Fallback{{FeatureDisabled}}, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn feature_off_required_hard_fails() {
-        let _g = FlagGuard::set(false);
-        let store = InMemoryPrefixStore::new();
-        let spec = InheritPrefixSpec {
-            from_run_id: None,
-            required: true,
-        };
-        let out = resolve_inherit_prefix(Some(&spec), &matching_ctx(), &store);
-        match out {
-            PrefixResolveOutcome::Failed {
-                reason: ResolveFailure::FeatureDisabled,
-            } => {}
-            other => panic!("expected Failed{{FeatureDisabled}}, got {other:?}"),
-        }
-        assert!(!out.proceed(), "required + missing must stop the spawn");
-    }
-
     // --- NotFound --------------------------------------------------
 
     #[test]
     fn not_found_soft_falls_back() {
-        let _g = FlagGuard::set(true);
         let store = InMemoryPrefixStore::new();
         let spec = InheritPrefixSpec {
             from_run_id: None,
@@ -410,7 +322,6 @@ mod tests {
 
     #[test]
     fn not_found_required_hard_fails() {
-        let _g = FlagGuard::set(true);
         let store = InMemoryPrefixStore::new();
         let spec = InheritPrefixSpec {
             from_run_id: Some("run-never-captured".into()),
@@ -429,7 +340,6 @@ mod tests {
 
     #[test]
     fn resolved_returns_arc_from_sink() {
-        let _g = FlagGuard::set(true);
         let store = populated_store("run-parent", None);
         let spec = InheritPrefixSpec {
             from_run_id: None, // default to caller_run_id
@@ -443,7 +353,6 @@ mod tests {
 
     #[test]
     fn resolved_uses_explicit_from_run_id_over_caller() {
-        let _g = FlagGuard::set(true);
         let store = populated_store("run-other-parent", None);
         let spec = InheritPrefixSpec {
             from_run_id: Some("run-other-parent".into()),
@@ -460,7 +369,6 @@ mod tests {
 
     #[test]
     fn provider_mismatch_soft_falls_back() {
-        let _g = FlagGuard::set(true);
         let store = populated_store("run-parent", None);
         let spec = InheritPrefixSpec {
             from_run_id: None,
@@ -483,7 +391,6 @@ mod tests {
 
     #[test]
     fn model_mismatch_required_hard_fails() {
-        let _g = FlagGuard::set(true);
         let store = populated_store("run-parent", None);
         let spec = InheritPrefixSpec {
             from_run_id: None,
@@ -506,7 +413,6 @@ mod tests {
 
     #[test]
     fn thinking_budget_clamp_soft_falls_back() {
-        let _g = FlagGuard::set(true);
         let store = populated_store("run-parent", Some(16_000));
         let spec = InheritPrefixSpec {
             from_run_id: None,
@@ -536,7 +442,6 @@ mod tests {
         // Empty string is never a legitimate run id; treating it
         // the same as None prevents a DashMap lookup on "" and
         // surfaces the wiring bug consistently.
-        let _g = FlagGuard::set(true);
         let store = InMemoryPrefixStore::new();
         let spec = InheritPrefixSpec {
             from_run_id: None,
@@ -557,7 +462,6 @@ mod tests {
     fn empty_from_run_id_falls_back_to_caller() {
         // Explicit `from_run_id: Some("")` must not override the
         // caller_run_id — empty string is not a legitimate run id.
-        let _g = FlagGuard::set(true);
         let store = populated_store("run-parent", None);
         let spec = InheritPrefixSpec {
             from_run_id: Some(String::new()),
@@ -572,7 +476,6 @@ mod tests {
     fn caller_run_id_missing_always_fails_even_when_not_required() {
         // This is a spawner wiring bug, not a user-facing failure.
         // Hard-fail regardless of `required` so the bug is loud.
-        let _g = FlagGuard::set(true);
         let store = InMemoryPrefixStore::new();
         let spec = InheritPrefixSpec {
             from_run_id: None,
@@ -619,12 +522,5 @@ mod tests {
         assert!(disabled.prefix().is_none());
         assert!(fallback.prefix().is_none());
         assert!(failed.prefix().is_none());
-    }
-
-    // --- Tripwire --------------------------------------------------
-
-    #[test]
-    fn env_var_name_unchanged() {
-        assert_eq!(FORK_INHERIT_PREFIX_ENV, "ASTRA_FORK_INHERIT_PREFIX");
     }
 }

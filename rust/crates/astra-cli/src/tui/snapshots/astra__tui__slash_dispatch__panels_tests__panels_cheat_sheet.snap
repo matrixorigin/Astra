@@ -1,0 +1,27 @@
+---
+source: crates/astra-cli/src/tui/slash_dispatch.rs
+expression: "build_panels_cheat_sheet_lines().join(\"\\n\")"
+---
+  /resume
+      pick and restore a recent session
+      ↑↓ navigate · type to filter · Enter resume · Esc close
+
+  /context
+      visualise the current turn's token budget
+      Enter / q / Esc close
+
+  /timeline
+      browse this session's turn-by-turn journal
+      ↑↓ navigate · PgUp/PgDn page · q / Esc close
+
+  /table <sql>
+      run a SQL query and render a navigable table
+      ↑↓ rows · ←→ cols · Home/End jump · q / Esc close
+
+  /worktrees
+      list git worktrees with per-worktree session counts
+      ↑↓ navigate · q / Esc close
+
+  /help
+      list every slash command grouped by category
+      ↑↓ browse · Esc close

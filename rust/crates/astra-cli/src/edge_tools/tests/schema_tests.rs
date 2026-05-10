@@ -46,6 +46,8 @@ fn tool_schemas_include_core_tools() {
                 .map(String::from)
         })
         .collect();
+    // Consolidated tools: git, github, memory, session, mo, agent cover
+    // the legacy individual tools (git_status, github_ci_status, etc.)
     for expected in &[
         "bash",
         "read_file",
@@ -54,27 +56,17 @@ fn tool_schemas_include_core_tools() {
         "list_dir",
         "grep",
         "glob",
-        "git_status",
-        "git_blame",
-        "git_file_history",
-        "git_contributors",
-        "git_log_search",
-        "mo_query",
-        "mo_snapshot",
-        "mo_branch",
-        "rollback_file_edits",
-        "rollback_database_snapshots",
-        "rollback_turn_actions",
-        "github_ci_status",
-        "github_repo_stats",
-        "memory_store",
-        "adjust_config",
-        "prioritize_tool",
-        "deprioritize_tool",
-        "set_goal",
-        "compress_context",
-        "reflect",
-        "run_chain",
+        "git",
+        "github",
+        "memory",
+        "session",
+        "mo",
+        "agent",
+        "introspect",
+        "lsp",
+        "web_fetch",
+        "web_search",
+        "symbols",
     ] {
         assert!(
             names.contains(&expected.to_string()),
@@ -107,7 +99,8 @@ fn every_catalog_tool_has_schema() {
     // Tools with dynamically constructed schemas (not in static all_tool_schemas).
     // This list is self-validated below — if a tool listed here gains a static
     // schema or is removed from the catalog, the test will catch it.
-    const DYNAMIC_SCHEMA_TOOLS: &[&str] = &["delegate"];
+    // After tool consolidation, all catalog tools have static schemas.
+    const DYNAMIC_SCHEMA_TOOLS: &[&str] = &[];
 
     let schemas = all_tool_schemas();
     let schema_names: std::collections::HashSet<&str> = schemas
@@ -154,7 +147,7 @@ fn every_catalog_tool_has_schema() {
 // ── new tool schema coverage ──────────────────────────────────────────────
 
 #[test]
-fn schemas_include_new_coding_tools() {
+fn schemas_include_consolidated_tools() {
     let schemas = all_tool_schemas();
     let names: Vec<&str> = schemas
         .iter()
@@ -164,110 +157,33 @@ fn schemas_include_new_coding_tools() {
                 .and_then(|n| n.as_str())
         })
         .collect();
-    assert!(names.contains(&"git_commit"), "missing git_commit schema");
-    assert!(
-        names.contains(&"git_revert_commit"),
-        "missing git_revert_commit schema"
-    );
-    assert!(names.contains(&"git_stash"), "missing git_stash schema");
-    assert!(
-        names.contains(&"git_checkout_file"),
-        "missing git_checkout_file schema"
-    );
-    assert!(
-        names.contains(&"find_definition"),
-        "missing find_definition schema"
-    );
-    assert!(
-        names.contains(&"find_references"),
-        "missing find_references schema"
-    );
-    assert!(
-        names.contains(&"run_build_test"),
-        "missing run_build_test schema"
-    );
+    // Consolidated tools cover the old individual tools
+    assert!(names.contains(&"git"), "missing git schema");
+    assert!(names.contains(&"github"), "missing github schema");
+    assert!(names.contains(&"lsp"), "missing lsp schema");
+    assert!(names.contains(&"agent"), "missing agent schema");
 }
 
-#[test]
-fn bounded_batch_transaction_fields_are_discoverable() {
-    let schemas = all_tool_schemas();
-    for tool in [
-        "read_file",
-        "write_file",
-        "delete_file",
-        "str_replace",
-        "multi_edit",
-        "rename_symbol",
-        "git_commit",
-        "git_checkout_file",
-        "git_stash",
-        "notebook_edit",
-        "mo_query",
-    ] {
-        let properties = schemas
-            .iter()
-            .find(|schema| schema["function"]["name"].as_str() == Some(tool))
-            .and_then(|schema| schema["function"]["parameters"]["properties"].as_object())
-            .unwrap_or_else(|| panic!("missing properties for {tool}"));
-        assert!(
-            properties.contains_key("transaction_id"),
-            "{tool} missing transaction_id"
-        );
-        assert!(
-            properties.contains_key("rollback_on_failure"),
-            "{tool} missing rollback_on_failure"
-        );
-    }
-}
+// Transaction fields (transaction_id, rollback_on_failure) have been removed
+// from tool schemas as part of the tool consolidation. Transaction support is
+// now handled at the execution layer, not advertised per-schema.
 
 #[test]
-fn git_stash_schema_exposes_apply_and_stash_ref() {
+fn git_schema_has_stash_action() {
     let schemas = all_tool_schemas();
-    let properties = schemas
+    let git_schema = schemas
         .iter()
-        .find(|schema| schema["function"]["name"].as_str() == Some("git_stash"))
-        .and_then(|schema| schema["function"]["parameters"]["properties"].as_object())
-        .expect("missing git_stash properties");
-    let actions = schemas
-        .iter()
-        .find(|schema| schema["function"]["name"].as_str() == Some("git_stash"))
-        .and_then(|schema| {
-            schema["function"]["parameters"]["properties"]["action"]["enum"].as_array()
-        })
-        .expect("missing git_stash action enum");
-
-    assert!(
-        actions.iter().any(|value| value.as_str() == Some("apply")),
-        "git_stash schema should expose apply"
-    );
-    assert!(
-        properties.contains_key("stash_ref"),
-        "git_stash schema should expose stash_ref"
-    );
-}
-
-#[test]
-fn git_revert_commit_schema_requires_commit_sha() {
-    let schemas = all_tool_schemas();
-    let schema = schemas
-        .iter()
-        .find(|schema| schema["function"]["name"].as_str() == Some("git_revert_commit"))
-        .expect("missing git_revert_commit schema");
-    let properties = schema["function"]["parameters"]["properties"]
-        .as_object()
-        .expect("missing git_revert_commit properties");
-    let required = schema["function"]["parameters"]["required"]
+        .find(|schema| schema["function"]["name"].as_str() == Some("git"))
+        .expect("missing consolidated git schema");
+    let actions = git_schema["function"]["parameters"]["properties"]["action"]["enum"]
         .as_array()
-        .expect("missing git_revert_commit required list");
-
+        .expect("missing git action enum");
     assert!(
-        properties.contains_key("commit_sha"),
-        "git_revert_commit schema should expose commit_sha"
+        actions.iter().any(|v| v.as_str() == Some("stash")),
+        "git schema should have stash action"
     );
     assert!(
-        required
-            .iter()
-            .any(|value| value.as_str() == Some("commit_sha")),
-        "git_revert_commit schema should require commit_sha"
+        actions.iter().any(|v| v.as_str() == Some("revert_commit")),
+        "git schema should have revert_commit action"
     );
 }

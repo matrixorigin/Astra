@@ -1,0 +1,8 @@
+---
+source: crates/astra-cli/src/tui/mention_menu/popup.rs
+expression: "render_menu(&menu, 80, 4)"
+---
+  ▸ src
+  ▸ tests
+▌   Cargo.toml
+    README.md

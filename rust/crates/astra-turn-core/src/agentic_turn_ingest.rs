@@ -316,8 +316,12 @@ fn record_prompt_calibration_success(
     st: &mut AgenticTurnIngestMut<'_>,
 ) {
     *st.consecutive_context_window_errors = 0;
-    if snap.has_usage && snap.prompt_tokens > 0 {
-        *st.last_measured_prompt_tokens = Some(snap.prompt_tokens);
+    let billable_input = snap
+        .prompt_tokens
+        .saturating_add(snap.cache_read_tokens)
+        .saturating_add(snap.cache_creation_tokens);
+    if snap.has_usage && billable_input > 0 {
+        *st.last_measured_prompt_tokens = Some(billable_input);
     }
 }
 

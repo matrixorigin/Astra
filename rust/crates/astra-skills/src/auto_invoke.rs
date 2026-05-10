@@ -1,7 +1,7 @@
 //! Auto-invocation of diagnostic skills based on runtime self-observation.
 //!
 //! The agent already owns three LLM-facing diagnostic skills —
-//! `analyze_session`, `optimize_prompt`, `evaluate_session`. Before P0.2 they
+//! `analyze_session`, `optimize_prompt`, `analyze_session`. Before P0.2 they
 //! were only reachable through a user-typed slash command. This module makes
 //! them fire when the session itself starts misbehaving, so the agent can
 //! inspect its own runtime footprint without waiting for the human to ask.
@@ -20,7 +20,7 @@
 //! * **≥3 session stalls** → invoke `analyze_session` (cooldown 60s)
 //! * **budget pressure > 0.85** → invoke `optimize_prompt` (cooldown 120s)
 //! * **≥3 user corrections in the trailing window** → invoke
-//!   `evaluate_session --focus corrections` (cooldown 180s)
+//!   `analyze_session --focus corrections` (cooldown 180s)
 //!
 //! Cooldown is tracked *per cause* — a single stall storm must not burn
 //! through every diagnostic in one turn.
@@ -91,7 +91,7 @@ pub struct SessionSignals {
 pub const STALL_TRIGGER_COUNT: u32 = 5;
 /// Minimum budget pressure (`0.0..=1.0`) to fire `optimize_prompt`.
 pub const PRESSURE_TRIGGER_LEVEL: f64 = 0.85;
-/// Minimum user corrections in the window to fire `evaluate_session`.
+/// Minimum user corrections in the window to fire `analyze_session`.
 pub const CORRECTION_TRIGGER_COUNT: u32 = 5;
 
 const STALL_COOLDOWN: Duration = Duration::from_secs(60);
@@ -120,46 +120,66 @@ impl AutoInvokeGate {
     /// the gate's cooldown for its cause.
     ///
     /// `now` is injected to keep the state machine deterministic under test.
+    ///
+    /// Per-turn de-duplication: if multiple triggers map to the same skill
+    /// (e.g. `SessionStalls` + `RepeatedCorrections` both → `analyze_session`),
+    /// only the first firing in the returned vec is kept. The losing trigger
+    /// still records its cooldown so it doesn't keep trying next turn.
     #[must_use]
     pub fn evaluate(&mut self, signals: &SessionSignals, now: Instant) -> Vec<AutoInvokeRequest> {
-        let mut out = Vec::new();
+        let mut out: Vec<AutoInvokeRequest> = Vec::new();
+
+        let push_if_new = |out: &mut Vec<AutoInvokeRequest>, req: AutoInvokeRequest| {
+            if !out.iter().any(|existing| existing.skill == req.skill) {
+                out.push(req);
+            }
+        };
 
         if signals.session_stalls >= STALL_TRIGGER_COUNT
             && Self::cooldown_elapsed(self.last_stall_fire, now, STALL_COOLDOWN)
         {
-            out.push(AutoInvokeRequest {
-                skill: "analyze_session",
-                focus: "stalls",
-                cause: AutoInvokeCause::SessionStalls {
-                    count: signals.session_stalls,
+            push_if_new(
+                &mut out,
+                AutoInvokeRequest {
+                    skill: "analyze_session",
+                    focus: "stalls",
+                    cause: AutoInvokeCause::SessionStalls {
+                        count: signals.session_stalls,
+                    },
                 },
-            });
+            );
             self.last_stall_fire = Some(now);
         }
 
         if signals.budget_pressure > PRESSURE_TRIGGER_LEVEL
             && Self::cooldown_elapsed(self.last_pressure_fire, now, PRESSURE_COOLDOWN)
         {
-            out.push(AutoInvokeRequest {
-                skill: "optimize_prompt",
-                focus: "budget",
-                cause: AutoInvokeCause::BudgetPressure {
-                    level: signals.budget_pressure,
+            push_if_new(
+                &mut out,
+                AutoInvokeRequest {
+                    skill: "optimize_prompt",
+                    focus: "budget",
+                    cause: AutoInvokeCause::BudgetPressure {
+                        level: signals.budget_pressure,
+                    },
                 },
-            });
+            );
             self.last_pressure_fire = Some(now);
         }
 
         if signals.recent_corrections >= CORRECTION_TRIGGER_COUNT
             && Self::cooldown_elapsed(self.last_correction_fire, now, CORRECTION_COOLDOWN)
         {
-            out.push(AutoInvokeRequest {
-                skill: "evaluate_session",
-                focus: "corrections",
-                cause: AutoInvokeCause::RepeatedCorrections {
-                    count: signals.recent_corrections,
+            push_if_new(
+                &mut out,
+                AutoInvokeRequest {
+                    skill: "analyze_session",
+                    focus: "corrections",
+                    cause: AutoInvokeCause::RepeatedCorrections {
+                        count: signals.recent_corrections,
+                    },
                 },
-            });
+            );
             self.last_correction_fire = Some(now);
         }
 
@@ -633,12 +653,12 @@ mod tests {
     }
 
     #[test]
-    fn correction_threshold_fires_evaluate_session() {
+    fn correction_threshold_fires_analyze_session() {
         let mut gate = AutoInvokeGate::new();
         let now = Instant::now();
         let out = gate.evaluate(&signals(0, 0.1, 5), now);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].skill, "evaluate_session");
+        assert_eq!(out[0].skill, "analyze_session");
         assert_eq!(out[0].focus, "corrections");
         assert_eq!(
             out[0].cause,
@@ -648,14 +668,14 @@ mod tests {
 
     #[test]
     fn all_three_triggers_fire_in_one_evaluation() {
+        // Stalls + corrections both map to analyze_session; the gate
+        // dedupes so only the first is emitted. Budget pressure stays
+        // distinct.
         let mut gate = AutoInvokeGate::new();
         let now = Instant::now();
         let out = gate.evaluate(&signals(5, 0.95, 5), now);
         let names: Vec<&str> = out.iter().map(|r| r.skill).collect();
-        assert_eq!(
-            names,
-            vec!["analyze_session", "optimize_prompt", "evaluate_session"]
-        );
+        assert_eq!(names, vec!["analyze_session", "optimize_prompt"]);
     }
 
     #[test]
@@ -690,7 +710,7 @@ mod tests {
         let second = gate.evaluate(&signals(5, 0.95, 5), t0);
         // stalls are on cooldown (0s elapsed), but pressure & corrections are fresh
         let names: Vec<&str> = second.iter().map(|r| r.skill).collect();
-        assert_eq!(names, vec!["optimize_prompt", "evaluate_session"]);
+        assert_eq!(names, vec!["optimize_prompt", "analyze_session"]);
     }
 
     #[test]
@@ -754,7 +774,7 @@ mod tests {
         // Multi-byte characters must not split: each '喵' is 3 bytes.
         let cause = AutoInvokeCause::RepeatedCorrections { count: 5 };
         let long: String = "喵".repeat(200);
-        let diag = SkillDiagnosis::new("evaluate_session", &cause, long, [], None);
+        let diag = SkillDiagnosis::new("analyze_session", &cause, long, [], None);
         // Must be valid UTF-8 (String roundtrip) and within char budget.
         assert!(diag.headline.chars().count() <= MAX_HEADLINE_LEN);
         // Round-trip via JSON to confirm no invalid bytes leaked through.
@@ -797,7 +817,7 @@ mod tests {
     fn diagnosis_serde_roundtrip() {
         let cause = AutoInvokeCause::RepeatedCorrections { count: 5 };
         let diag = SkillDiagnosis::new(
-            "evaluate_session",
+            "analyze_session",
             &cause,
             "repeated scope corrections",
             ["user re-scoped 5× in 8 turns".to_string()],

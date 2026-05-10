@@ -11,11 +11,11 @@ arguments:
     description: "Review focus: 'bugs', 'security', 'logic', 'api', 'tests', or 'all' (default: all)"
     required: false
 allowed_tools:
-  - git_diff
-  - git_status
+  - git
+  - git
   - git_show
   - git_log
-  - github_get_pr
+  - github
   - read_file
   - grep
   - glob
@@ -51,9 +51,20 @@ Call `git_diff(stat_only: true)` (or `git_show(sha, stat_only: true)` for a comm
 | `staged` | `git_diff(staged: true)` |
 | `branch:<name>` | `git_diff(ref: "main")` |
 | `commit:<sha>` / `latest commit` | `git_log()` once → `git_show(sha)` |
+| `commits:N` / `latest N commits` / `review the latest N commits` | `git_log(limit=N)` once → `git_show(sha)` for **all N** shas |
 | `pr:<number>` / GitHub PR URL | `bash("gh pr diff N --repo owner/repo 2>&1")` |
 
-No changes? `git_status`, try `staged: true`. Still nothing? Ask user.
+No changes? `git {action: "status"}`, try `staged: true`. Still nothing? Ask user.
+
+**🛑 Postcondition — "latest N commits" mode (P1, session 8d9e5903 regression):**
+
+When the user asked you to review **N commits**, you MUST have exactly N `git_show` (or equivalent full-diff) fetches in your context before writing the report. The common failure mode is: fetch 3 out of 5, tell yourself "I have enough signal from the commit messages", and write the review anyway. This is a lie to yourself — you don't know what's in the 2 you skipped.
+
+**Rule**: if your fetched-diff count < requested N, you have two choices and only two:
+1. Keep fetching until count == N, OR
+2. Explicitly tell the user "I only fetched K of N commits because [reason]; here is a partial review" — BEFORE the report.
+
+Do NOT write a full "## Code Review" header and act as if you covered everything when you didn't. The phrases "I have enough", "enough signal", "without more fetches" are banned in this mode unless count == N.
 
 ---
 
@@ -78,7 +89,7 @@ Fetch the full diff. Scan for signals and decide which checks to run in Step 3.
 
 **Context budget:** at most 3 `read_file` calls total. Before each one, name the exact question it answers. If you can't, skip it.
 
-Do not call `git_show` or `git_diff` more than once on the same target. Do not invoke `skill(review-changes)` again in the same session.
+Do not call `git_show` or `git {action: "diff"}` more than once on the same target. Do not invoke `skill(review-changes)` again in the same session.
 
 ---
 

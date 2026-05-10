@@ -1,0 +1,631 @@
+//! Context pipeline Plan phase — pure function, zero I/O.
+//!
+//! The planner reads immutable state (token counts, model config, latches,
+//! recovery, statistics) and produces a `ContextPlan` describing what the
+//! turn needs: which sections to include, their budgets, the compaction
+//! tier, and the cache strategy.
+
+use serde::{Deserialize, Serialize};
+
+use crate::compaction_types::CompactionTier;
+use crate::context_budget::{TokenBudget, select_tier_gated};
+use crate::context_pressure::{ContextPressure, ContextReserves};
+use crate::microcompact::PromptCacheProtocol;
+use crate::pipeline_config::ProviderCachePolicy;
+use crate::pipeline_stats::PipelineStats;
+use crate::recovery_state::RecoveryState;
+use crate::section_types::{
+    CacheScope, CompressionPriority, PlannedSection, SectionKind, SectionSource,
+};
+use crate::session_latches::SessionLatches;
+use crate::token_accounting::TokenAccounting;
+
+/// Cache strategy selected by the planner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheStrategy {
+    pub protocol: PromptCacheProtocol,
+    pub use_global_scope: bool,
+    pub max_markers: u32,
+}
+
+/// The output of the Plan phase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextPlan {
+    pub sections: Vec<PlannedSection>,
+    pub budget: TokenBudget,
+    pub compact_tier: CompactionTier,
+    pub cache_strategy: CacheStrategy,
+    pub pressure: ContextPressure,
+    pub reserves: ContextReserves,
+}
+
+/// Inputs to the planner — everything it needs to make a decision.
+/// All references are immutable (Plan is a pure function).
+pub struct PlanInput<'a> {
+    pub tokens: &'a TokenAccounting,
+    pub model_limit: u32,
+    pub recovery: &'a RecoveryState,
+    pub latches: &'a SessionLatches,
+    pub stats: &'a PipelineStats,
+    pub provider_policy: &'a ProviderCachePolicy,
+    /// Whether memory text has already been retrieved by the runtime.
+    pub has_memory: bool,
+    /// Model ID for reserve estimation bucketing.
+    pub model_id: &'a str,
+    /// Query source for reserve estimation bucketing.
+    pub query_source: &'a str,
+}
+
+/// Plan a turn: compute pressure, select tier, allocate budgets, choose cache strategy.
+///
+/// This is a pure function with no I/O. It produces a `ContextPlan` that
+/// the Bind and Optimize phases will execute.
+#[must_use]
+pub fn plan_turn(input: &PlanInput<'_>) -> ContextPlan {
+    // 1. Compute reserves from historical response data
+    let reserves = input.stats.response_token_estimates.reserve_for(
+        input.model_id,
+        input.query_source,
+        input.recovery,
+    );
+
+    // 2. Compute raw and predictive pressure
+    let pressure = ContextPressure::compute(
+        input.tokens.total_input_u32_saturating(),
+        input.model_limit,
+        reserves,
+    );
+
+    // 3. Select compaction tier (gated: predictive can escalate, not de-escalate)
+    let tier =
+        select_tier_gated(pressure.raw, pressure.value).escalate_for_recovery(input.recovery);
+
+    // 4. Allocate token budgets per section
+    let section_history = input.stats.section_token_history();
+    let budget = TokenBudget::allocate(input.model_limit, tier, &section_history);
+
+    // 5. Choose cache strategy based on provider policy + latches
+    let cache_strategy = plan_cache_strategy(input.provider_policy, input.latches);
+
+    // 6. Build section manifest
+    let sections = plan_section_manifest(&budget, input.has_memory);
+
+    ContextPlan {
+        sections,
+        budget,
+        compact_tier: tier,
+        cache_strategy,
+        pressure,
+        reserves,
+    }
+}
+
+/// Determine the cache strategy from provider policy and session latches.
+fn plan_cache_strategy(policy: &ProviderCachePolicy, latches: &SessionLatches) -> CacheStrategy {
+    let use_global_scope = policy.supports_global_scope
+        && latches
+            .cache_scope
+            .map_or(true, |s| s == CacheScope::Global);
+
+    CacheStrategy {
+        protocol: policy.protocol,
+        use_global_scope,
+        max_markers: policy.max_markers,
+    }
+}
+
+/// Build the section manifest: which sections to include and with what properties.
+///
+/// Identity and Constraints are always present. Memory is included only if
+/// retrieval has already produced concrete snippets. Conversation history
+/// travels in the provider messages array, not as a hollow system section.
+/// Emergent sections are always included (the Bind phase will produce empty
+/// BoundSections if there's nothing to inject).
+fn plan_section_manifest(budget: &TokenBudget, has_memory: bool) -> Vec<PlannedSection> {
+    let mut sections = vec![
+        PlannedSection {
+            kind: SectionKind::Identity,
+            scope: CacheScope::Global,
+            estimated_tokens: budget.budget_for(SectionKind::Identity),
+            priority: CompressionPriority::Never,
+            source: SectionSource::Static,
+        },
+        PlannedSection {
+            kind: SectionKind::Constraints,
+            scope: CacheScope::Global,
+            estimated_tokens: budget.budget_for(SectionKind::Constraints),
+            priority: CompressionPriority::Never,
+            source: SectionSource::Static,
+        },
+        PlannedSection {
+            kind: SectionKind::SelfModel,
+            scope: CacheScope::Session,
+            estimated_tokens: budget.budget_for(SectionKind::SelfModel),
+            priority: CompressionPriority::LastResort,
+            source: SectionSource::Environment,
+        },
+        PlannedSection {
+            kind: SectionKind::ProjectContext,
+            scope: CacheScope::Session,
+            estimated_tokens: budget.budget_for(SectionKind::ProjectContext),
+            priority: CompressionPriority::LastResort,
+            source: SectionSource::Environment,
+        },
+        PlannedSection {
+            kind: SectionKind::Skills,
+            scope: CacheScope::Session,
+            estimated_tokens: budget.budget_for(SectionKind::Skills),
+            priority: CompressionPriority::Normal,
+            source: SectionSource::Skill,
+        },
+        // Session-stable runtime identity: typed model / cwd / branch +
+        // fragments that only change at session boundaries
+        // (`system_override`, `extra_stable_sections`). Tool-dependent,
+        // self-awareness, and learned_context fragments are per-turn in
+        // dynamic-tool-selection flows and must sit after the Session→None
+        // cache marker in `RuntimeVolatile`.
+        // Placing these in `Session` scope is the cache optimization that
+        // gives a 2nd marker its target — everything up through here sits in
+        // the cached prefix, only truly per-turn content is re-sent.
+        PlannedSection {
+            kind: SectionKind::RuntimeIdentity,
+            scope: CacheScope::Session,
+            estimated_tokens: budget.budget_for(SectionKind::RuntimeIdentity),
+            priority: CompressionPriority::Normal,
+            source: SectionSource::Environment,
+        },
+        // Turn-volatile runtime fragments: tool-round guidance (uses current
+        // messages), effort hint (depends on active skill), plan_context,
+        // and `extra_dynamic_sections` (bridge escape hatch — session anchor,
+        // feedback, memoria insights). These drift every turn so they must
+        // sit AFTER the marker.
+        PlannedSection {
+            kind: SectionKind::RuntimeVolatile,
+            scope: CacheScope::None,
+            estimated_tokens: budget.budget_for(SectionKind::RuntimeVolatile),
+            priority: CompressionPriority::Normal,
+            source: SectionSource::Environment,
+        },
+        // Goal/task continuity is turn-facing by nature: current decisions,
+        // blockers, and next action may change every turn. Keep it after the
+        // Session→None cache marker while giving it LastResort priority so
+        // pressure pruning preserves intent longer than ordinary guidance.
+        PlannedSection {
+            kind: SectionKind::WorkingMemory,
+            scope: CacheScope::None,
+            estimated_tokens: budget.budget_for(SectionKind::WorkingMemory),
+            priority: CompressionPriority::LastResort,
+            source: SectionSource::Environment,
+        },
+    ];
+
+    if has_memory {
+        sections.push(PlannedSection {
+            kind: SectionKind::Memory,
+            scope: CacheScope::None,
+            estimated_tokens: budget.budget_for(SectionKind::Memory),
+            priority: CompressionPriority::Normal,
+            source: SectionSource::Memory,
+        });
+    }
+
+    // Emergent sections always present (Bind produces empty if nothing to inject)
+    for kind in [
+        SectionKind::EmergentSkills,
+        SectionKind::EmergentMemory,
+        SectionKind::EmergentSummary,
+    ] {
+        sections.push(PlannedSection {
+            kind,
+            scope: CacheScope::None,
+            estimated_tokens: 0,
+            priority: CompressionPriority::First,
+            source: SectionSource::Emergent,
+        });
+    }
+
+    sections
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline_config::ProviderCachePolicy;
+
+    fn default_input() -> (
+        TokenAccounting,
+        RecoveryState,
+        SessionLatches,
+        PipelineStats,
+        ProviderCachePolicy,
+    ) {
+        (
+            TokenAccounting::default(),
+            RecoveryState::default(),
+            SessionLatches::default(),
+            PipelineStats::default(),
+            ProviderCachePolicy::default(),
+        )
+    }
+
+    fn make_plan_input<'a>(
+        tokens: &'a TokenAccounting,
+        recovery: &'a RecoveryState,
+        latches: &'a SessionLatches,
+        stats: &'a PipelineStats,
+        policy: &'a ProviderCachePolicy,
+    ) -> PlanInput<'a> {
+        PlanInput {
+            tokens,
+            model_limit: 100_000,
+            recovery,
+            latches,
+            stats,
+            provider_policy: policy,
+            has_memory: true,
+            model_id: "test-model",
+            query_source: "repl",
+        }
+    }
+
+    #[test]
+    fn plan_normal_pressure_selects_normal_tier() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+        assert_eq!(plan.compact_tier, CompactionTier::Normal);
+        assert!(plan.pressure.raw < 0.60);
+    }
+
+    #[test]
+    fn plan_high_pressure_selects_compact_history() {
+        let (mut tokens, recovery, latches, stats, policy) = default_input();
+        tokens.prompt = 80_000; // 80% of 100K
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+        assert!(plan.compact_tier >= CompactionTier::CompactHistory);
+    }
+
+    #[test]
+    fn plan_huge_token_accounting_saturates_instead_of_truncating() {
+        let (mut tokens, recovery, latches, stats, policy) = default_input();
+        tokens.prompt = u64::from(u32::MAX) + 10;
+
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+
+        assert!(
+            plan.pressure.raw > 1.0,
+            "huge token accounting must not wrap to low pressure"
+        );
+        assert_eq!(plan.compact_tier, CompactionTier::AggressivePrune);
+    }
+
+    #[test]
+    fn plan_recovery_escalates_tier() {
+        let (tokens, mut recovery, latches, stats, policy) = default_input();
+        recovery.record_ptl_error();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+        assert!(
+            plan.compact_tier >= CompactionTier::TrimSchemas,
+            "1 PTL error should escalate from Normal"
+        );
+    }
+
+    #[test]
+    fn plan_section_manifest_always_includes_identity_and_constraints() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+        assert!(
+            plan.sections
+                .iter()
+                .any(|s| s.kind == SectionKind::Identity)
+        );
+        assert!(
+            plan.sections
+                .iter()
+                .any(|s| s.kind == SectionKind::Constraints)
+        );
+    }
+
+    #[test]
+    fn plan_section_manifest_excludes_memory_when_unavailable() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let mut input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        input.has_memory = false;
+        let plan = plan_turn(&input);
+        assert!(!plan.sections.iter().any(|s| s.kind == SectionKind::Memory));
+    }
+
+    #[test]
+    fn plan_section_manifest_includes_memory_when_available() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+        assert!(plan.sections.iter().any(|s| s.kind == SectionKind::Memory));
+    }
+
+    #[test]
+    fn section_feedback_changes_next_turn_plan_budget_with_floor() {
+        let (tokens, recovery, latches, mut stats, policy) = default_input();
+        let mut usage = std::collections::HashMap::new();
+        usage.insert(SectionKind::Memory, 1);
+        stats.record_section_usage(&usage);
+
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+
+        assert_eq!(plan.budget.budget_for(SectionKind::History), 0);
+        assert_eq!(plan.budget.budget_for(SectionKind::Memory), 256);
+        let planned_memory = plan
+            .sections
+            .iter()
+            .find(|section| section.kind == SectionKind::Memory)
+            .expect("memory section should be planned when memory is available");
+        assert_eq!(planned_memory.estimated_tokens, 256);
+    }
+
+    #[test]
+    fn plan_section_manifest_does_not_emit_hollow_history_section() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+        assert!(!plan.sections.iter().any(|s| s.kind == SectionKind::History));
+    }
+
+    #[test]
+    fn plan_budget_total_never_exceeds_limit() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+        assert!(
+            plan.budget.total_allocated() <= input.model_limit,
+            "allocated={} > limit={}",
+            plan.budget.total_allocated(),
+            input.model_limit,
+        );
+    }
+
+    #[test]
+    fn plan_cache_strategy_varies_by_provider() {
+        let (tokens, recovery, latches, stats, _) = default_input();
+
+        let anthropic = ProviderCachePolicy::anthropic();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &anthropic);
+        let plan_a = plan_turn(&input);
+        assert_eq!(
+            plan_a.cache_strategy.protocol,
+            PromptCacheProtocol::AnthropicCacheControl
+        );
+        assert!(plan_a.cache_strategy.use_global_scope);
+
+        let openai = ProviderCachePolicy::openai_compatible();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &openai);
+        let plan_o = plan_turn(&input);
+        assert_eq!(plan_o.cache_strategy.protocol, PromptCacheProtocol::Prefix);
+        assert!(!plan_o.cache_strategy.use_global_scope);
+    }
+
+    #[test]
+    fn plan_predictive_escalates_but_never_below_raw() {
+        // Raw pressure is high (0.80 → CompactHistory),
+        // but predictive with reserves would be even higher
+        let (mut tokens, recovery, latches, mut stats, policy) = default_input();
+        tokens.prompt = 80_000;
+        // Feed the estimator so reserves are non-zero
+        let feedback = crate::context_feedback::ContextFeedback::from_usage(0, 0, 0, 5000, false);
+        stats
+            .response_token_estimates
+            .record("test-model", "repl", &feedback);
+
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+        // Predictive pressure should be >= raw pressure
+        assert!(plan.pressure.value >= plan.pressure.raw);
+        // Tier should be at least CompactHistory (from raw)
+        assert!(plan.compact_tier >= CompactionTier::CompactHistory);
+    }
+
+    #[test]
+    fn plan_includes_emergent_sections() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+        assert!(
+            plan.sections
+                .iter()
+                .any(|s| s.kind == SectionKind::EmergentSkills)
+        );
+        assert!(
+            plan.sections
+                .iter()
+                .any(|s| s.kind == SectionKind::EmergentMemory)
+        );
+        assert!(
+            plan.sections
+                .iter()
+                .any(|s| s.kind == SectionKind::EmergentSummary)
+        );
+    }
+
+    /// Golden test: locks the canonical system-prompt section order.
+    ///
+    /// The **order** of sections emitted by `plan_section_manifest` is load-bearing:
+    /// Anthropic prompt-cache breakpoints key off the literal prefix, so any
+    /// reshuffle silently invalidates cache even if the *set* of sections is
+    /// unchanged. This test is the tripwire for future edits to `plan_section_manifest`.
+    ///
+    /// The order below matches `system_prompt_semantic_order_stable` in the
+    /// optimizer and the binder's `bind_all` emission order.
+    #[test]
+    fn canonical_section_order_is_stable_without_memory() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let mut input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        input.has_memory = false;
+        let plan = plan_turn(&input);
+
+        let kinds: Vec<SectionKind> = plan.sections.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SectionKind::Identity,
+                SectionKind::Constraints,
+                SectionKind::SelfModel,
+                SectionKind::ProjectContext,
+                SectionKind::Skills,
+                SectionKind::RuntimeIdentity,
+                SectionKind::RuntimeVolatile,
+                SectionKind::WorkingMemory,
+                SectionKind::EmergentSkills,
+                SectionKind::EmergentMemory,
+                SectionKind::EmergentSummary,
+            ],
+            "canonical section order drifted — this breaks Anthropic prompt-cache prefix. \
+             RuntimeIdentity (Session) must precede RuntimeVolatile (None) so the 2nd cache \
+             marker falls at the Session→None boundary."
+        );
+    }
+
+    #[test]
+    fn canonical_section_order_is_stable_with_memory() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+
+        let kinds: Vec<SectionKind> = plan.sections.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SectionKind::Identity,
+                SectionKind::Constraints,
+                SectionKind::SelfModel,
+                SectionKind::ProjectContext,
+                SectionKind::Skills,
+                SectionKind::RuntimeIdentity,
+                SectionKind::RuntimeVolatile,
+                SectionKind::WorkingMemory,
+                SectionKind::Memory,
+                SectionKind::EmergentSkills,
+                SectionKind::EmergentMemory,
+                SectionKind::EmergentSummary,
+            ],
+            "canonical section order (with memory) drifted — WorkingMemory and Memory must sit between RuntimeVolatile and Emergent*"
+        );
+    }
+
+    /// Global-scope anchors (Identity, Constraints) MUST appear before any
+    /// Session-scope section. This is what lets Global-scope content survive
+    /// across sessions in provider-level caches.
+    /// Session-scope sections MUST appear before any None-scope section.
+    /// This is the second half of the "ascending-volatility prefix" rule —
+    /// the 2nd cache marker (placed at the Session→None boundary) only works
+    /// if there's a clean boundary, i.e. no None-scope block sneaks in
+    /// between Session-scope blocks.
+    ///
+    /// Concrete test: `RuntimeIdentity (Session)` must strictly precede
+    /// `RuntimeVolatile (None)`. Otherwise turn-volatile content leaks into
+    /// the cached region and defeats the whole split.
+    #[test]
+    fn session_scope_sections_precede_none_scope_sections() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+
+        let first_none_pos = plan
+            .sections
+            .iter()
+            .position(|s| s.scope == CacheScope::None);
+        let last_session_pos = plan
+            .sections
+            .iter()
+            .rposition(|s| s.scope == CacheScope::Session);
+
+        if let (Some(first_none), Some(last_session)) = (first_none_pos, last_session_pos) {
+            assert!(
+                last_session < first_none,
+                "Session-scope sections must precede all None-scope sections so the \
+                 2nd cache marker falls at a clean Session→None boundary. \
+                 RuntimeVolatile (None) appearing between Session blocks would leak \
+                 per-turn drift into the cached prefix."
+            );
+        }
+
+        // Specifically assert RuntimeIdentity(Session) precedes RuntimeVolatile(None)
+        let identity_pos = plan
+            .sections
+            .iter()
+            .position(|s| s.kind == SectionKind::RuntimeIdentity);
+        let volatile_pos = plan
+            .sections
+            .iter()
+            .position(|s| s.kind == SectionKind::RuntimeVolatile);
+        assert!(
+            identity_pos.is_some() && volatile_pos.is_some(),
+            "both RuntimeIdentity and RuntimeVolatile must be emitted"
+        );
+        assert!(
+            identity_pos.unwrap() < volatile_pos.unwrap(),
+            "RuntimeIdentity (stable, Session-scoped) must precede RuntimeVolatile (None-scoped)"
+        );
+    }
+
+    /// The split itself: `RuntimeIdentity` is Session, `RuntimeVolatile` is None.
+    /// If either scope changes we lose the cache strengthening this split was
+    /// designed for.
+    #[test]
+    fn runtime_identity_split_has_correct_scopes() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+
+        let identity = plan
+            .sections
+            .iter()
+            .find(|s| s.kind == SectionKind::RuntimeIdentity)
+            .expect("RuntimeIdentity section must be planned");
+        assert_eq!(
+            identity.scope,
+            CacheScope::Session,
+            "RuntimeIdentity (session-stable: model/cwd/branch/session + self-model + profile) \
+             must be Session-scoped so the 2nd cache marker captures it"
+        );
+
+        let volatile = plan
+            .sections
+            .iter()
+            .find(|s| s.kind == SectionKind::RuntimeVolatile)
+            .expect("RuntimeVolatile section must be planned");
+        assert_eq!(
+            volatile.scope,
+            CacheScope::None,
+            "RuntimeVolatile (tool_guidance/effort/plan_context/extras) must be None-scoped \
+             so turn-to-turn drift doesn't invalidate the cached prefix"
+        );
+    }
+
+    #[test]
+    fn global_scope_sections_precede_session_scope_sections() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+
+        let first_session_pos = plan
+            .sections
+            .iter()
+            .position(|s| s.scope == CacheScope::Session);
+        let last_global_pos = plan
+            .sections
+            .iter()
+            .rposition(|s| s.scope == CacheScope::Global);
+
+        if let (Some(first_session), Some(last_global)) = (first_session_pos, last_global_pos) {
+            assert!(
+                last_global < first_session,
+                "Global-scope anchors (Identity/Constraints) must precede all Session-scope sections \
+                 to preserve cache prefix"
+            );
+        }
+    }
+}

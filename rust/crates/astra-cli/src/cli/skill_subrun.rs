@@ -61,6 +61,10 @@ pub(crate) struct SubRunHost {
     pub(crate) all_schemas: Vec<Value>,
     pub(crate) valid_tool_names: HashSet<String>,
     pub(crate) perm_manager: PermissionManager,
+    /// Shared journal writer from the parent session. When present,
+    /// child LLM rounds are written to the parent's journal with an
+    /// `agent_id` tag so the unified timeline can interleave them.
+    pub(crate) journal: Option<std::sync::Arc<astra_services::session_journal::JournalWriter>>,
     /// Per-response completion token limit from the skill manifest.
     pub(crate) max_completion_tokens: Option<u32>,
     /// Effort level from the skill manifest.
@@ -162,6 +166,18 @@ impl AgenticLoopHost for SubRunHost {
                 }
             }));
 
+        // Session c47c2dca regression fix: drain runtime volatile lane so
+        // stall nudges / circuit-breaker / budget advisories reach the
+        // LLM on subrun paths too. Using `_appended_to` keeps the
+        // outgoing payload protocol-valid (no consecutive role=user
+        // pairs → no Bedrock HTTP 400).
+        let augmented_messages: Option<Vec<serde_json::Value>> =
+            state.take_volatile_pending_appended_to(state.messages.clone());
+        let messages_slice: &[serde_json::Value] = match augmented_messages.as_ref() {
+            Some(vec) => vec.as_slice(),
+            None => state.messages.as_slice(),
+        };
+
         let effective_model = state
             .skills
             .model_override
@@ -175,7 +191,7 @@ impl AgenticLoopHost for SubRunHost {
             .extend(interaction_scoped_restrictions.iter().cloned());
 
         let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
-            messages: &state.messages,
+            messages: messages_slice,
             session_id: state.current_session_id.as_deref(),
             agent_id: Some(self.agent_id.as_str()),
             model: effective_model,
@@ -202,10 +218,18 @@ impl AgenticLoopHost for SubRunHost {
         payload["skill_search"] =
             serde_json::to_value(&state.skills.search).unwrap_or_else(|_| json!({}));
 
-        // Attach tool schemas directly (no selector).
+        // Attach tool schemas. In fork mode, prefer the parent's frozen
+        // canonical schemas so the tool-schema hash matches the parent's
+        // cached prefix (cache key alignment). Falls back to live
+        // registry if no frozen schemas are available.
+        let schemas_to_use = self
+            .inherited_prefix
+            .as_ref()
+            .and_then(|ip| ip.frozen_tool_schemas.clone())
+            .unwrap_or_else(|| self.all_schemas.clone());
         astra_runtime::turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools(
             &mut payload,
-            self.all_schemas.clone(),
+            schemas_to_use,
             &mut state.restricted_tools,
             None,  // no selection report
             0.5,   // neutral confidence
@@ -334,12 +358,6 @@ impl AgenticLoopHost for SubRunHost {
     fn on_turn_completed(&mut self, state: &AgenticLoopState) {
         // PR 5.6: probe the first successful ingested turn's
         // cache_read_input_tokens against the parent-side estimate.
-        // Subsequent turns no-op. Sink may be None — runtime is
-        // harmless without telemetry. We pass the *accumulated*
-        // total_cache_read because ingest has already added the
-        // current turn's cache_read_input_tokens into it, and this
-        // is the first call after ingest, so the accumulator IS the
-        // first-turn value.
         if let Some(ref sink) = self.fork_cache_sink {
             astra_runtime::orchestration::maybe_emit_fork_cache_probe(
                 &mut self.fork_cache_probe_state,
@@ -349,6 +367,42 @@ impl AgenticLoopHost for SubRunHost {
                 astra_turn_core::fork_cache_event::ForkCacheThresholds::default(),
                 sink.as_ref(),
             );
+        }
+
+        // Unified timeline: emit the LATEST round event tagged with
+        // agent_id to the parent's journal so the timeline renderer
+        // can interleave child rounds with parent rounds.
+        //
+        // NOTE: `state.recent_rounds` is a **ring buffer** (capacity
+        // RECENT_ROUNDS_RING_CAPACITY=32) that accumulates across
+        // turns. Iterating the whole ring here would re-journal every
+        // historical round on every turn end, causing duplicate
+        // entries and inflated token accounting in the parent
+        // timeline. Only the most recent entry — the round that just
+        // completed — should be emitted.
+        if let Some(ref journal) = self.journal {
+            if let Some(round_summary) = state.recent_rounds.last() {
+                let mut buf = astra_services::session_journal::TurnEventBuffer::begin_turn(
+                    state.current_session_id.as_deref(),
+                    state.current_round_index.saturating_add(1),
+                );
+                buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
+                    duration_ms: round_summary.duration_ms,
+                    prompt_tokens: round_summary.prompt_tokens,
+                    completion_tokens: round_summary.completion_tokens,
+                    cache_read_tokens: round_summary.cache_read_tokens,
+                    cache_creation_tokens: round_summary.cache_creation_tokens,
+                    tool_calls_returned: round_summary.tool_calls_returned,
+                    tool_call_names: round_summary.tool_call_names.clone(),
+                    finish_reason: round_summary.finish_reason.clone(),
+                    source: Some("child_agent".to_string()),
+                    run_id: state.current_run_id.clone(),
+                    agent_id: Some(self.agent_id.clone()),
+                    ..Default::default()
+                });
+                let events = buf.drain();
+                let _ = journal.append_bulk_no_sync(&events);
+            }
         }
     }
 }
@@ -488,6 +542,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: None,
         };
 
         let messages = vec![
@@ -538,6 +593,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
 
         let mut state = AgenticLoopState {
             messages,
+            volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
@@ -545,6 +602,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             context_manifest_user_id: None,
             context_manifest_model_name: None,
             recursion_depth: child_recursion_depth,
+            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -597,6 +655,9 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
                 token: self.cancel_token.clone(),
             },
             error_recovery: Default::default(),
+            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+            )),
             message: task_context.to_string(),
             recent_tools: Vec::new(),
             task_profile: infer_task_execution_profile(task_context),
@@ -617,6 +678,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
+            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: SUBRUN_MAX_CUMULATIVE_TOKENS,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -699,6 +762,7 @@ mod tests {
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: None,
         };
         assert!(host.is_quiet());
     }
@@ -727,6 +791,7 @@ mod tests {
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: None,
         };
         assert!(!host.is_quiet());
     }
@@ -754,6 +819,7 @@ mod tests {
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: None,
         };
         let schema = json!({
             "type": "function",
@@ -837,5 +903,38 @@ mod tests {
     #[test]
     fn cli_subrun_max_cumulative_tokens_is_exactly_120_000() {
         assert_eq!(SUBRUN_MAX_CUMULATIVE_TOKENS, 120_000);
+    }
+
+    // Session c47c2dca regression guard. Same invariant as
+    // `cli_loop_host::tests::execute_turn_drains_volatile_lane_into_outgoing_messages`
+    // but for the skill-subrun path (sub-agents also run the stall
+    // detection machinery and their nudges must reach their LLM too).
+    #[test]
+    fn subrun_execute_turn_drains_volatile_lane() {
+        // Session c47c2dca regression guard. Same shape as
+        // `cli_loop_host::tests::execute_turn_drains_volatile_lane_into_outgoing_messages`
+        // but for skill-subrun. Split the expected method name so this
+        // test's literals don't self-match.
+        let source = include_str!("skill_subrun.rs");
+        // Look for the protocol-safe call syntax (`.method(`) assembled
+        // via concat! so this test literal can't self-match. Do not
+        // quote the call form verbatim anywhere in this test body.
+        let safe_call = concat!(".take_volatile_pending", "_appended_to(");
+        assert!(
+            source.contains(safe_call),
+            "skill_subrun::execute_turn must invoke the protocol-safe \
+             drain method so runtime nudges reach the subrun LLM \
+             (session c47c2dca regression + consecutive-user guard)."
+        );
+        assert!(
+            source.contains("augmented.push(msg)"),
+            "skill_subrun::execute_turn must append the drained volatile \
+             msg to a local clone of state.messages"
+        );
+        assert!(
+            source.contains("messages_slice"),
+            "skill_subrun::execute_turn must pass an augmented messages_slice \
+             to chat_turn_base_payload, not raw &state.messages"
+        );
     }
 }

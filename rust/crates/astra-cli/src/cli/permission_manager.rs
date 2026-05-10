@@ -66,6 +66,61 @@ pub(super) fn format_denied_message(reason: &str) -> String {
     }
 }
 
+/// Canonicalize an existing path, or a missing path whose parent chain
+/// resolves cleanly.
+///
+/// This deliberately fails closed for unresolved roots and lexical `..`
+/// segments. It lets a user trust an existing outside directory once and
+/// later create/read a new child beneath it, while avoiding raw-string
+/// prefix checks that can be bypassed with symlinks.
+fn canonicalize_existing_or_parent(p: &Path) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind};
+    use std::path::Component;
+
+    if let Ok(cp) = std::fs::canonicalize(p) {
+        return Ok(cp);
+    }
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "path contains unresolved parent traversal",
+        ));
+    }
+
+    let mut cur = p;
+    let mut suffix = Vec::new();
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            suffix.push(name.to_os_string());
+        }
+        if let Ok(mut base) = std::fs::canonicalize(parent) {
+            for component in suffix.iter().rev() {
+                base.push(component);
+            }
+            return Ok(base);
+        }
+        if parent == cur {
+            break;
+        }
+        cur = parent;
+    }
+
+    Err(Error::new(
+        ErrorKind::NotFound,
+        "no existing parent could be canonicalized",
+    ))
+}
+
+/// Extract the `'{path}'` target from a sandbox-denied reason string.
+/// Returns the first single-quoted path (the one before the word "outside").
+fn parse_sandbox_target_path(reason: &str) -> Option<PathBuf> {
+    let needle = "Path '";
+    let start = reason.find(needle)? + needle.len();
+    let rest = &reason[start..];
+    let end = rest.find('\'')?;
+    Some(PathBuf::from(&rest[..end]))
+}
+
 ///
 /// For shell/execute tools, extracts the command prefix (e.g. `git commit`).
 /// For file/write tools, extracts the path pattern (e.g. `src/turn/**`).
@@ -287,6 +342,11 @@ pub(super) struct PermissionManager {
     /// Gap 3: ring of the most recent `(tool, reason)` rejections for the
     /// SelfModel surface. Newest at the back, capped at ~5 entries.
     recent_rejections: std::collections::VecDeque<(String, String)>,
+    /// Session-scoped trusted roots for sandbox escapes. Pressing
+    /// "Always" on a sandbox-expand prompt adds the target path here so
+    /// later requests under the same subtree (regardless of which tool)
+    /// are auto-allowed without re-prompting.
+    trusted_sandbox_roots: Vec<PathBuf>,
 }
 
 impl PermissionManager {
@@ -401,6 +461,7 @@ impl PermissionManager {
                 astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
             denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker::default(),
             recent_rejections: std::collections::VecDeque::new(),
+            trusted_sandbox_roots: Vec::new(),
             settings: PermissionSettings::default(),
             project_root: None,
             cached_allow: Vec::new(),
@@ -437,6 +498,7 @@ impl PermissionManager {
                 astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
             denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker::default(),
             recent_rejections: std::collections::VecDeque::new(),
+            trusted_sandbox_roots: Vec::new(),
             settings,
             project_root: Some(project_root.to_path_buf()),
             cached_allow,
@@ -474,6 +536,7 @@ impl PermissionManager {
                 astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
             denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker::default(),
             recent_rejections: std::collections::VecDeque::new(),
+            trusted_sandbox_roots: Vec::new(),
             settings,
             project_root: Some(project_root.to_path_buf()),
             cached_allow,
@@ -594,12 +657,15 @@ impl PermissionManager {
             return match Self::prompt_approval(ApprovalPromptKind::ConfirmOnce) {
                 'y' => ApprovalDecision::Allow,
                 '!' => {
+                    let was_auto = matches!(self.mode, PermissionMode::Auto);
                     self.set_mode(PermissionMode::Auto);
-                    eprintln!(
-                        "  {}",
-                        "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
-                            .yellow()
-                    );
+                    if !was_auto {
+                        eprintln!(
+                            "  {}",
+                            "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
+                                .yellow()
+                        );
+                    }
                     ApprovalDecision::Allow
                 }
                 _ => ApprovalDecision::Deny,
@@ -678,12 +744,15 @@ impl PermissionManager {
             return match ch {
                 'y' => ApprovalDecision::Allow,
                 '!' => {
+                    let was_auto = matches!(self.mode, PermissionMode::Auto);
                     self.set_mode(PermissionMode::Auto);
-                    eprintln!(
-                        "  {}",
-                        "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
-                            .yellow()
-                    );
+                    if !was_auto {
+                        eprintln!(
+                            "  {}",
+                            "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
+                                .yellow()
+                        );
+                    }
                     ApprovalDecision::Allow
                 }
                 _ => ApprovalDecision::Deny,
@@ -1458,6 +1527,18 @@ impl PermissionManager {
         name: &str,
         args: &serde_json::Value,
     ) -> PermissionDecision {
+        /// Strip the trailing "Ask the user for permission..." instruction
+        /// from sandbox-denied tool output before handing it to the UI.
+        fn trim_sandbox_reason_for_ui(raw: &str) -> String {
+            const INSTRUCTION: &str =
+                "Ask the user for permission before accessing files outside the project.";
+            raw.trim()
+                .trim_end_matches(INSTRUCTION)
+                .trim()
+                .trim_end_matches('.')
+                .to_string()
+                + "."
+        }
         // Sandbox expansion requests always require explicit user approval,
         // regardless of permission mode (except Auto which trusts everything).
         if let Some(inner_tool) = name.strip_prefix("sandbox_expand:") {
@@ -1465,6 +1546,18 @@ impl PermissionManager {
                 .get("reason")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("Access to path outside project boundary");
+
+            // Trusted-root check: `Always` on a previous sandbox prompt
+            // adds the target path to a session-scoped trust list. Any
+            // later request whose target sits under that subtree is
+            // auto-allowed — regardless of which tool (read_file,
+            // glob, bash …) is doing the access.
+            if let Some(target) = parse_sandbox_target_path(reason)
+                && self.path_under_trusted_root(&target)
+            {
+                return PermissionDecision::Allow;
+            }
+
             // Check session overrides first
             if let Some(allowed) = self
                 .session_overrides
@@ -1483,9 +1576,15 @@ impl PermissionManager {
                 }
                 PermissionMode::Prompt => PermissionDecision::NeedApproval {
                     tool: name.to_string(),
-                    header: format!("Sandbox: {inner_tool} needs access outside project"),
-                    detail: Some(reason.to_string()),
-                    reason: "Path is outside the project sandbox boundary".to_string(),
+                    header: format!("{inner_tool} wants to read outside the project"),
+                    // `reason` carries the authoritative message from the
+                    // underlying fs/shell tool (with path + project root);
+                    // leave `detail` empty so it isn't repeated verbatim
+                    // right below the header. Strip the trailing
+                    // "Ask the user for permission..." instruction — it's
+                    // meant for the model, not the human.
+                    detail: None,
+                    reason: trim_sandbox_reason_for_ui(reason),
                 },
             };
         }
@@ -1697,6 +1796,41 @@ impl PermissionManager {
     /// Whether this manager has a project root (for scope display).
     pub(crate) fn has_project_root(&self) -> bool {
         self.project_root.is_some()
+    }
+
+    /// Add a trusted sandbox-escape root. Any later sandbox_expand
+    /// request whose target path sits under this root (any tool) is
+    /// auto-allowed within this session.
+    ///
+    /// Only canonical, existing paths are trusted. Non-existent paths
+    /// are ignored rather than remembered as raw strings because a path
+    /// can later appear as a symlink to a different subtree.
+    pub(super) fn trust_sandbox_root(&mut self, root: PathBuf) {
+        let Ok(canonical) = std::fs::canonicalize(root) else {
+            return;
+        };
+        if !self.trusted_sandbox_roots.iter().any(|r| r == &canonical) {
+            self.trusted_sandbox_roots.push(canonical);
+        }
+    }
+
+    /// Parse the target path out of a sandbox-denied reason string and
+    /// trust it. Expected format:
+    /// `Path '{target}' is outside the project directory '{root}'. …`
+    pub(super) fn trust_sandbox_root_from_reason(&mut self, reason: &str) {
+        if let Some(p) = parse_sandbox_target_path(reason) {
+            self.trust_sandbox_root(p);
+        }
+    }
+
+    /// Does the given path sit under any trusted sandbox root?
+    fn path_under_trusted_root(&self, candidate: &Path) -> bool {
+        let Ok(abs) = canonicalize_existing_or_parent(candidate) else {
+            return false;
+        };
+        self.trusted_sandbox_roots
+            .iter()
+            .any(|root| abs.starts_with(root))
     }
 
     /// Summary of current permission state for `/allow rules`.
@@ -2581,6 +2715,40 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_expand_prompt_does_not_echo_reason_into_detail() {
+        // Regression: the UI used to show the same sandbox message in
+        // header, detail, and reason because both stream_render and
+        // permission_manager appended their own copy. The approval now
+        // carries detail=None and a trimmed reason (no "Ask the user…").
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let raw_fs_msg = "Path '/home/x/outside' is outside the project directory '/home/x/inside'. \
+                          Ask the user for permission before accessing files outside the project.";
+        let args = serde_json::json!({"reason": raw_fs_msg});
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        match decision {
+            PermissionDecision::NeedApproval {
+                header,
+                detail,
+                reason,
+                ..
+            } => {
+                assert_eq!(header, "read_file wants to read outside the project");
+                assert_eq!(detail, None, "detail must be empty — it would echo reason");
+                assert!(
+                    !reason.contains("Ask the user"),
+                    "model-facing instruction should be trimmed from UI reason; got: {reason:?}"
+                );
+                assert!(
+                    reason.contains("/home/x/outside"),
+                    "reason keeps the path + project root; got: {reason:?}"
+                );
+            }
+            other => panic!("expected NeedApproval, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn sandbox_expand_session_override_remembered() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
@@ -2588,6 +2756,177 @@ mod tests {
         let args = serde_json::json!({"reason": "path outside project"});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
         assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn sandbox_expand_trust_covers_subtree_across_tools() {
+        // Scenario: the user approves "Always" for read_file on an
+        // existing outside directory. Later, a different tool (glob,
+        // bash, list_dir…) hits a path under the SAME root — it must
+        // not prompt again.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let trusted_root = outside.path().join("ink");
+        std::fs::create_dir(&trusted_root).unwrap();
+        let child_dir = trusted_root.join("screens");
+        std::fs::create_dir(&child_dir).unwrap();
+        let child_file = child_dir.join("REPL.tsx");
+        std::fs::write(&child_file, "component").unwrap();
+
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        // Simulate pressing Always on a first prompt via read_file.
+        let args_a = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                trusted_root.display(),
+                dir.path().display()
+            ),
+        });
+        pm.trust_sandbox_root_from_reason(
+            args_a.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
+        );
+
+        // Second prompt: different tool, sub-path of the trusted root.
+        let args_b = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                child_file.display(),
+                dir.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:glob", &args_b);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "glob on a sub-path of the trusted root should be auto-allowed; got {decision:?}"
+        );
+
+        // Third prompt: a DIFFERENT outside path — should still prompt.
+        let unrelated = outside.path().join("elsewhere.txt");
+        std::fs::write(&unrelated, "secret").unwrap();
+        let args_c = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                unrelated.display(),
+                dir.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args_c);
+        assert!(
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "an unrelated outside path must still prompt; got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn sandbox_expand_trust_allows_missing_child_under_existing_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let trusted_root = outside.path().join("scratch");
+        std::fs::create_dir(&trusted_root).unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        pm.trust_sandbox_root(trusted_root.clone());
+
+        let future_child = trusted_root.join("new").join("file.txt");
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                future_child.display(),
+                dir.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:write_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "missing descendants under a trusted existing directory should keep the Always UX"
+        );
+    }
+
+    #[test]
+    fn sandbox_expand_does_not_trust_nonexistent_root_later_created_as_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sensitive = tempfile::tempdir().unwrap();
+        let missing_root = outside.path().join("future-link");
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        pm.trust_sandbox_root(missing_root.clone());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(sensitive.path(), &missing_root).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(sensitive.path(), &missing_root).unwrap();
+
+        let escaped = missing_root.join("secret.txt");
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                escaped.display(),
+                dir.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "a non-existent approved path must not become trusted after it appears as a symlink"
+        );
+    }
+
+    #[test]
+    fn sandbox_expand_trusted_root_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let trusted_root = outside.path().join("trusted");
+        std::fs::create_dir(&trusted_root).unwrap();
+        let sensitive = tempfile::tempdir().unwrap();
+        let link = trusted_root.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(sensitive.path(), &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(sensitive.path(), &link).unwrap();
+
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        pm.trust_sandbox_root(trusted_root);
+
+        let escaped = link.join("secret.txt");
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                escaped.display(),
+                dir.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "canonicalized candidate should point at the symlink target, not the trusted root"
+        );
+    }
+
+    #[test]
+    fn sandbox_expand_always_remembered_across_different_paths() {
+        // Regression: pressing "Always" on one sandbox-escape prompt
+        // should silence prompts for later requests to the same tool
+        // EVEN IF the second request's `reason` string mentions a
+        // different path. (The fingerprint for sandbox_expand:* is
+        // path-free so this is expected to work.)
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        // First call: approved with Always.
+        let args_a = serde_json::json!({"reason": "Path '/a' is outside the project '/root'."});
+        pm.record_approval("sandbox_expand:read_file", Some(&args_a), true);
+        let rule = PermissionManager::make_allow_rule("sandbox_expand:read_file", &args_a);
+        pm.add_allow_rule(&rule);
+
+        // Second call, different path string.
+        let args_b =
+            serde_json::json!({"reason": "Path '/b/deeper' is outside the project '/root'."});
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args_b);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "second sandbox_expand:read_file should be auto-allowed; got {decision:?}"
+        );
     }
 
     #[test]

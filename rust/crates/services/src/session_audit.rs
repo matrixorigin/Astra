@@ -111,6 +111,25 @@ pub struct TurnListResponse {
     pub per_page: u32,
 }
 
+/// A single context-assembly trace entry surfaced via the audit API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextTraceEntry {
+    /// Turn ordinal as recorded in the journal (0 when absent).
+    pub turn: u32,
+    /// ISO-8601 timestamp (`ts`) of the journal event.
+    pub timestamp: String,
+    /// Raw `ContextAssemblyTrace` JSON (opaque to the audit service).
+    pub trace: serde_json::Value,
+}
+
+/// Response wrapper for `GET /sessions/{id}/audit/context-traces`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextTraceListResponse {
+    pub session_id: String,
+    pub total: u32,
+    pub traces: Vec<ContextTraceEntry>,
+}
+
 /// Full detail for a single turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnDetail {
@@ -569,6 +588,14 @@ pub trait SessionAuditService: Send + Sync {
         session_id: &str,
         turn: u32,
     ) -> AuditResult<TurnDetail>;
+
+    /// List full ContextAssemblyTrace entries recorded for a session.
+    /// Returns all journal turns that carry a `context_assembly_trace` payload.
+    async fn list_context_traces(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> AuditResult<ContextTraceListResponse>;
 
     /// Get per-tool analytics for a session.
     async fn get_tool_analytics(
@@ -1257,6 +1284,39 @@ impl SessionAuditService for DatabaseSessionAuditService {
                 .map(String::from),
             created_at,
             child_events,
+        })
+    }
+
+    async fn list_context_traces(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> AuditResult<ContextTraceListResponse> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        self.verify_session_owner(&pool, session_id, user_id)
+            .await?;
+
+        // Traces are persisted on `JournalEvent.context_assembly_trace` in the
+        // session journal file; read and filter events that carry a trace.
+        let events = crate::session_journal::read_journal(session_id)
+            .map_err(|e| internal_error(format!("journal read failed: {e}")))?;
+
+        let mut traces: Vec<ContextTraceEntry> = events
+            .into_iter()
+            .filter_map(|evt| {
+                evt.context_assembly_trace.map(|trace| ContextTraceEntry {
+                    turn: evt.turn.unwrap_or(0),
+                    timestamp: evt.ts,
+                    trace,
+                })
+            })
+            .collect();
+        traces.sort_by_key(|entry| entry.turn);
+
+        Ok(ContextTraceListResponse {
+            session_id: session_id.to_string(),
+            total: traces.len() as u32,
+            traces,
         })
     }
 
@@ -2062,6 +2122,9 @@ impl SessionAuditService for UnconfiguredSessionAuditService {
         Err(internal_error("audit service not configured"))
     }
     async fn get_turn_detail(&self, _: &str, _: &str, _: u32) -> AuditResult<TurnDetail> {
+        Err(internal_error("audit service not configured"))
+    }
+    async fn list_context_traces(&self, _: &str, _: &str) -> AuditResult<ContextTraceListResponse> {
         Err(internal_error("audit service not configured"))
     }
     async fn get_tool_analytics(&self, _: &str, _: &str) -> AuditResult<Vec<ToolAnalytics>> {

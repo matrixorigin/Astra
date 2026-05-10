@@ -160,6 +160,14 @@ pub fn headless_timeout_aborted_tool_names(
         .collect()
 }
 
+/// Sentinel prefix for cache-hit / duplicate-call stubs. All messages
+/// produced by [`idempotency_cache_hit_message`] start with this exact
+/// string, and downstream detectors (see list on that function's doc
+/// comment) use `starts_with(CACHED_SENTINEL)` to recognise replayed
+/// tool output across compaction boundaries. Changing this value is a
+/// breaking change across crates — audit before touching.
+pub const CACHED_SENTINEL: &str = "(cached";
+
 /// User-facing error when the LLM names a tool not in the local registry.
 pub fn unknown_local_tool_error_message(name: &str, valid_tool_names: &HashSet<String>) -> String {
     let mut names: Vec<_> = valid_tool_names.iter().cloned().collect();
@@ -169,15 +177,72 @@ pub fn unknown_local_tool_error_message(name: &str, valid_tool_names: &HashSet<S
 
 /// User-visible `tool` message body when replaying an idempotent cache hit.
 ///
-/// Returns a short stub instead of the full cached output. The original
-/// content is already in an earlier tool_result message in the conversation,
-/// so re-sending it wastes tokens. The LLM can re-read the file if needed.
+/// Session 0e37eb46 regression: the previous implementation returned a
+/// bare "(cached — identical call already executed …)" stub that the
+/// LLM routinely misread as "empty result, try something else". The
+/// model would call `read_file` → cache-hit → stub → assume nothing
+/// there → call a variant (different offset, bash cat, etc.) burning
+/// rounds re-reading content it already had.
+///
+/// New contract: include enough of the cached content that the LLM
+/// can tell the result is MEANINGFUL and matches what it saw earlier.
+///   * Short output (≤ [`IDEMPOTENCY_INLINE_MAX_BYTES`]): return it
+///     inline, tagged as cached. Token cost is negligible and the LLM
+///     gets the full signal.
+///   * Larger output: return a preview header (`N chars`) +
+///     first ~500 chars + explicit pointer to the earlier tool_result
+///     for the rest. The preview makes the cached status obvious; the
+///     byte count + head prove the content is real.
+///
+/// Both forms start with [`CACHED_SENTINEL`] so downstream detectors
+/// (memory writability gates, adaptive tuning signals, compaction
+/// replay guards in `context_compression::SYNTHETIC_USER_SENTINELS`,
+/// regression test `compaction_survival`) that look for that sentinel
+/// continue to work. Keep this single source of truth — if you change
+/// the sentinel, audit every `starts_with("(cached")` / fixed-string
+/// match in `astra-text-utils`, `astra-turn-core`, and `runtime`.
 #[must_use]
-pub fn idempotency_cache_hit_message(_cached_output: &str) -> String {
-    "(cached — identical call already executed in this conversation. \
-     Re-read the file only if you need the content again.)"
-        .to_string()
+pub fn idempotency_cache_hit_message(cached_output: &str) -> String {
+    let trimmed = cached_output.trim_end();
+    if trimmed.is_empty() {
+        return "(cached — identical call already executed; original output was empty)".to_string();
+    }
+    if trimmed.len() <= IDEMPOTENCY_INLINE_MAX_BYTES {
+        // If the cached output itself already starts with the sentinel
+        // (e.g. a replay across a compaction boundary where the stored
+        // value is an earlier cache-hit stub), don't double-wrap — the
+        // original stub already carries the sentinel that downstream
+        // detectors look for.
+        if trimmed.starts_with(CACHED_SENTINEL) {
+            return trimmed.to_string();
+        }
+        return format!("(cached — identical call already executed)\n{trimmed}");
+    }
+    // Large: preview + pointer. Char boundary safe for UTF-8.
+    let preview_end = trimmed
+        .char_indices()
+        .take_while(|(i, _)| *i < IDEMPOTENCY_PREVIEW_BYTES)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let preview = &trimmed[..preview_end];
+    format!(
+        "(cached — identical call already executed; {} bytes total, preview:)\n{preview}\n\
+         […truncated. The full content is in the earlier tool_result with the \
+         same call signature — scroll back if you need the rest.]",
+        trimmed.len()
+    )
 }
+
+/// Outputs at or below this size are returned inline on cache-hit.
+/// Chosen so the common case (a single file read under ~2k) stays
+/// fully visible; larger outputs fall through to the preview path.
+pub const IDEMPOTENCY_INLINE_MAX_BYTES: usize = 2000;
+
+/// Preview size for the large-output cache-hit path. Enough for the
+/// LLM to recognize the content; short enough that token cost stays
+/// bounded even if the cache-hit fires repeatedly.
+pub const IDEMPOTENCY_PREVIEW_BYTES: usize = 500;
 
 /// `tool` / `tool_results` body when the same signature was already executed this headless round.
 pub const HEADLESS_DUPLICATE_WITHIN_TURN_BODY: &str =
@@ -704,17 +769,90 @@ mod tests {
         assert_eq!(m, "Unknown tool 'foo'. Available: alpha, zebra");
     }
 
+    // ── Session 0e37eb46 regression: cache-hit must NOT look empty ──
+    //
+    // The previous stub "(cached — identical call already executed…)"
+    // was routinely misread by LLMs as "nothing here" → model called
+    // a variant of the same read to re-fetch. Burned 3 rounds in
+    // t5 r6/r7/r12 of session 0e37eb46 alone.
+    //
+    // New contract (see `idempotency_cache_hit_message` doc):
+    //   * Always starts with "(cached" so sentinel detectors work.
+    //   * Short outputs (≤ 2000 bytes) come back INLINE — the model
+    //     sees real content and knows it's cached, no ambiguity.
+    //   * Large outputs come back with a preview + byte count +
+    //     explicit scroll-back pointer. The preview and size prove
+    //     there's real content and that it's NOT the "empty result"
+    //     the model previously assumed.
+
     #[test]
-    fn idempotency_cache_hit_message_is_stub() {
-        let m = idempotency_cache_hit_message("huge output that should not appear");
+    fn idempotency_cache_hit_short_output_inlined() {
+        let out = "file content line 1\nfile content line 2\n";
+        let m = idempotency_cache_hit_message(out);
+        assert!(m.starts_with("(cached"), "must start with (cached sentinel");
         assert!(
-            !m.contains("huge output"),
-            "cache hit should return stub, not full content"
+            m.contains("file content line 1"),
+            "short output must be inlined so the LLM can see real content \
+             (session 0e37eb46 regression)"
         );
-        assert!(m.contains("cached"), "stub should mention caching");
+    }
+
+    #[test]
+    fn idempotency_cache_hit_large_output_preview_has_content_and_size() {
+        // Build an output larger than IDEMPOTENCY_INLINE_MAX_BYTES.
+        let big = format!(
+            "HEADER_SIGNAL\n{}",
+            "x".repeat(IDEMPOTENCY_INLINE_MAX_BYTES + 500)
+        );
+        let m = idempotency_cache_hit_message(&big);
+        assert!(m.starts_with("(cached"), "sentinel preserved");
+        // Byte count must be visible so the model KNOWS there's real
+        // content, not empty.
         assert!(
-            m.contains("Re-read"),
-            "stub should tell LLM to re-read if needed"
+            m.contains(&format!("{}", big.len())),
+            "large-output path must include byte count so the model knows \
+             the cache-hit has real content: {m}"
+        );
+        // Preview must include the actual beginning of content, not
+        // just a generic stub.
+        assert!(
+            m.contains("HEADER_SIGNAL"),
+            "preview must include head of actual content (session 0e37eb46 \
+             r6/r7/r12 pattern: LLM reads bare stub as 'empty' and retries): {m}"
+        );
+        // Explicit hint telling the model where to find the full
+        // content — not a vague "re-read if needed".
+        assert!(
+            m.to_lowercase().contains("scroll back")
+                || m.to_lowercase().contains("earlier tool_result"),
+            "large-output path must point at the earlier tool_result: {m}"
+        );
+    }
+
+    #[test]
+    fn idempotency_cache_hit_empty_output_is_explicit() {
+        // Empty-in, empty-meta-out: still NOT a bare stub that looks
+        // like "nothing here" — state that the original was empty.
+        let m = idempotency_cache_hit_message("");
+        assert!(m.starts_with("(cached"));
+        assert!(
+            m.to_lowercase().contains("empty"),
+            "empty-output cache-hit must say so explicitly: {m}"
+        );
+    }
+
+    #[test]
+    fn idempotency_cache_hit_never_returns_bare_stub_placeholder() {
+        // The failure mode we're protecting against is the model
+        // reading the cache-hit as "no content, try something else".
+        // Whatever the output shape, the message must NOT be just the
+        // old placeholder with no signal about the actual content.
+        let too_vague = "(cached — identical call already executed in this conversation. \
+                         Re-read the file only if you need the content again.)";
+        let m = idempotency_cache_hit_message("real output here");
+        assert_ne!(
+            m, too_vague,
+            "cache-hit must not regress to the content-free stub"
         );
     }
 

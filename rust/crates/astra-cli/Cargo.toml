@@ -83,6 +83,7 @@ libc.workspace = true
 clap_complete = "4.6.0"
 inquire = "0.7"
 urlencoding = "2.1.3"
+nucleo-matcher = "0.3"
 
 [dev-dependencies]
 itertools = "0.13"
@@ -92,3 +93,4 @@ serial_test = "3"
 tempfile = "3"
 temp-env = "0.3"
 wiremock = "0.6"
+insta.workspace = true

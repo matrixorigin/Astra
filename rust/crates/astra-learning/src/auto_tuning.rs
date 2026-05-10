@@ -1463,27 +1463,51 @@ pub fn default_rules() -> Vec<EvolutionRule> {
         .with_cooldown(Duration::from_secs(600)),
         // ── Token/context-window surface ──
         // High token usage → reduce turn budget to prevent runaway
-        EvolutionRule::new(
-            "high-tokens-reduce-budget",
-            EvolutionTrigger::HighTokenUsage {
-                threshold_tokens: 70_000,
-                window_secs: 600,
-                min_samples: 1,
-            },
-            EvolutionAction::AdjustConfig {
-                path: "token_budget.max_turn_input_tokens".to_string(),
-                delta: -5000.0,
-                min: Some(30_000.0),
-                max: None,
-            },
-        )
-        .with_name("Reduce token budget on high usage")
-        .with_cooldown(Duration::from_secs(300)),
-        // High token usage → also lower compression threshold to compress sooner
+        // cost. Session 0e37eb46 regression: the original parameters
+        // (−5000 per fire, 300s cooldown, 30k floor) spiraled the
+        // budget from 80k down to ~37k inside a single debug session,
+        // which fired compaction every few rounds and eventually
+        // left the model with too little working memory to continue.
+        //
+        // Tuned to be non-overkill:
+        //   • delta -2000: gentler descent, still converges.
+        //   • floor 60_000: leaves room for system + tool schemas +
+        //     a realistic tool-loop history even after the rule fires.
+        //   • cooldown 30min: prevents firing multiple times inside a
+        //     single long task, while still shrinking over a
+        //     multi-hour session with genuinely runaway usage.
+        //
+        // The 30-minute floor is load-bearing — see the regression test
+        // `high_tokens_reduce_budget_rule_cooldown_is_at_least_30min`,
+        // Keep the const and the test's lower bound in lockstep so a
+        // future tuning that lowers this value fails loudly instead of
+        // silently re-introducing the 0e37eb46 spiral.
+        // "high-tokens-reduce-budget" rule REMOVED.
+        //
+        // Previously: when a turn used >70K tokens, the adaptive tuner
+        // shrank max_turn_input_tokens by 2K (floor 60K, cooldown 30min).
+        // This caused the "compaction spiral" (session 0e37eb46) and the
+        // "80K→60K budget starvation" (session fea922a7) — the agent
+        // never recovered from the shrinkage.
+        //
+        // Claude Code's architecture: no per-turn budget cap reduction.
+        // When tokens approach the context window, auto-compact fires
+        // (already implemented in handle_token_budget). The compact-and-
+        // continue logic is the correct pressure relief; dynamically
+        // shrinking the budget only makes things worse.
+        //
+        // The "compress-earlier" rule below is still active — it lowers
+        // the *compaction threshold* (when to compact) rather than the
+        // *budget ceiling* (when to abort). This is the right lever.
+        //
+        // High token usage → lower compression threshold to compress sooner.
+        // Trigger at 150K (75% of default 200K budget) so it doesn't fire
+        // at normal usage levels. On smaller windows this may never fire —
+        // that's fine, the reactive compact in handle_token_budget covers it.
         EvolutionRule::new(
             "high-tokens-compress-earlier",
             EvolutionTrigger::HighTokenUsage {
-                threshold_tokens: 70_000,
+                threshold_tokens: 150_000,
                 window_secs: 600,
                 min_samples: 1,
             },
@@ -1916,12 +1940,11 @@ mod tests {
     #[test]
     fn test_default_rules() {
         let rules = default_rules();
-        assert_eq!(rules.len(), 11);
+        assert_eq!(rules.len(), 10);
         assert!(rules.iter().any(|r| r.id == "low-success-boost-confidence"));
         assert!(rules.iter().any(|r| r.id == "correction-raise-strictness"));
         assert!(rules.iter().any(|r| r.id == "churn-expand-memory"));
         assert!(rules.iter().any(|r| r.id == "drift-trim-history"));
-        assert!(rules.iter().any(|r| r.id == "high-tokens-reduce-budget"));
         assert!(rules.iter().any(|r| r.id == "high-tokens-compress-earlier"));
         assert!(rules.iter().any(|r| r.id == "quick-followup-trim-history"));
         assert!(rules.iter().any(|r| r.id == "long-pause-expand-memory"));
@@ -2542,4 +2565,27 @@ mod tests {
         engine.record_streaming_speculation(25, 1, 0, 5);
         assert!(engine.should_disable_streaming_speculation());
     }
+
+    // ── Session 0e37eb46 compaction-spiral regression guards ───────────
+    //
+    // Users hit a positive-feedback loop where repeated long turns fire
+    // `high-tokens-reduce-budget` enough times to shrink
+    // max_turn_input_tokens from 80k all the way to ~37k. At that point
+    // compaction fires every few rounds, the aggressive_pipeline keeps
+    // only 4 tail msgs, and the model loses enough working memory to
+    // give up with a "progress summary" instead of continuing.
+    //
+    // The rule MUST stay — runaway cost protection is real. But it has
+    // to be gentle enough that one heavy debug session doesn't wedge
+    // the user into an unrecoverable state. These tests lock the
+    // non-overkill parameters so a future refactor that accidentally
+    // restores the aggressive defaults fails loudly.
+
+    // "high-tokens-reduce-budget" rule regression tests REMOVED.
+    //
+    // The rule itself was removed — adaptive budget reduction causes
+    // compaction spirals (0e37eb46) and budget starvation (fea922a7).
+    // The correct mechanism is reactive compaction (handle_token_budget)
+    // which fires when tokens actually approach the window, not a
+    // proactive shrink that permanently reduces the ceiling.
 }

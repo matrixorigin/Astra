@@ -305,7 +305,31 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     };
     // Persist compaction effectiveness state for enriched resume guidance.
     heavy.compaction_state = Some(state.compaction_effectiveness.to_json());
-    heavy.continuity_state = serde_json::to_value(&state.continuity).ok();
+    heavy.continuity_state = match serde_json::to_value(&state.continuity) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            astra_core::agent_warn!(
+                "checkpoint",
+                "continuity_state serialize failed (NaN/non-finite float?); \
+                 checkpoint written without continuity — resume guidance degraded: {e}"
+            );
+            None
+        }
+    };
+    // Persist context pipeline state for warm-start on resume (includes emergent context).
+    if let Some(ref sess) = state.pipeline_session {
+        heavy.pipeline_state = match serde_json::to_value(sess.snapshot_full_state()) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                astra_core::agent_warn!(
+                    "checkpoint",
+                    "pipeline_state serialize failed (NaN cache ratio / bad histogram?); \
+                     resume will start cold — cache hit rate, feedback history, latches lost: {e}"
+                );
+                None
+            }
+        };
+    }
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
     if let Err(e) = step_checkpoint::write_step_checkpoint(sid, ckpt_num, &cp) {
         astra_core::agent_warn!(
@@ -503,8 +527,10 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     state.stall.forced_execution_retry = false;
     state.stall.forced_execution_escalation = false;
     state.stall.forced_parallel_batching = false;
+    state.stall.forced_parallel_batching_escalated = false;
     state.stall.forced_round_budget_phase1 = false;
     state.stall.forced_round_budget_phase2 = false;
+    state.stall.forced_completion_soft_stop = false;
     state.stall.forced_redundant_reads_corrective = false;
     state.stall.forced_cache_waste_corrective = false;
     state.stall.forced_exploration_family_corrective = false;
@@ -513,6 +539,14 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     // Clear tool restrictions injected by exploration-family correctives so
     // they don't leak into the next user turn.
     state.restricted_tools.clear();
+    // Task #43 wrap-up state also belongs to the just-completed turn —
+    // next user turn starts fresh. Without this reset, the lockout/abort
+    // hybrid in `agentic_loop_tool_phase::execute_tool_phase` short-
+    // circuits on the first round of the new turn (because
+    // `budget_wrapup_injected` is still true from the previous turn),
+    // which was exactly the stale-state bug the code-review called out.
+    state.budget_wrapup_injected = false;
+    state.budget_wrapup_ignored_rounds = 0;
 }
 
 /// Build a synthetic JournalEvent from the current turn's tool_call_records
@@ -960,6 +994,11 @@ mod tests {
         state.stall.exploration_family_corrective_family = Some("diff".into());
         state.restricted_tools.insert("git_diff".into());
         state.restricted_tools.insert("git_log".into());
+        // Task #43 wrap-up hybrid state: must also reset across turns
+        // so the NEXT user turn doesn't see a stale "already-wrapped-up"
+        // shortcut. Code-review called this out as Important #3.
+        state.budget_wrapup_injected = true;
+        state.budget_wrapup_ignored_rounds = 2;
 
         finalize_and_render(&mut host, &mut state).await;
 
@@ -985,6 +1024,17 @@ mod tests {
             state.restricted_tools.is_empty(),
             "restricted_tools must be cleared across turns"
         );
+        assert!(
+            !state.budget_wrapup_injected,
+            "budget_wrapup_injected must reset after a turn finalizes — \
+             otherwise the NEXT turn's first round short-circuits on stale state"
+        );
+        assert_eq!(
+            state.budget_wrapup_ignored_rounds, 0,
+            "budget_wrapup_ignored_rounds must reset to 0 per turn; \
+             otherwise Task #43 hybrid abort triggers too early on the \
+             next turn"
+        );
     }
 
     #[tokio::test]
@@ -1001,6 +1051,7 @@ mod tests {
                 turns_completed: 4,
                 remaining_turns: 0,
                 error_detail: None,
+                stall_signal: None,
             },
         ));
 

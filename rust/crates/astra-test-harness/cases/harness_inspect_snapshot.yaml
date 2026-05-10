@@ -1,19 +1,41 @@
 name: harness_inspect_snapshot
 description: |
-  **What**: Verify /inspect command shows harness snapshot data after a tool call.
-  **Tests**: Harness observation pipeline: hook fires → snapshot captured → /inspect reads it.
-  **Why**: Core harness UX — if /inspect shows nothing, the feature is useless.
-  **Pass means**: Harness is wired end-to-end in the CLI.
-  **Fail means**: Harness sink not connected, or /inspect not reading from sink.
+  **What**: Verify headless chat appends /inspect harness snapshot data after a tool call.
+  **Tests**: Harness observation pipeline: hook fires → snapshot captured → headless /inspect reads it.
+  **Why**: Core harness UX — if /inspect shows nothing in CLI harness mode, the feature is useless.
+  **Pass means**: Harness sink is wired end-to-end and JSON text includes the real snapshot.
+  **Fail means**: Harness sink not connected, or headless /inspect not reading from sink.
 prompt: |
   Use bash to run: echo "harness-test-ok"
-  Then use /inspect to show the harness snapshot.
+  Return one short sentence. Do not run astra, cargo, or any inspect command yourself.
+  After you finish, the harness runner automatically appends the /inspect snapshot.
 timeout_seconds: 120
 criteria:
   - type: exit_code
     code: 0
   - type: tool_called
     name: bash
-  - type: turn_rounds_between
-    min: 1
-    max: 10
+  - type: text_contains
+    needle: harness-test-ok
+  - type: text_contains
+    needle: Harness Snapshot
+  - type: text_contains
+    needle: "Tool calls:"
+  - type: text_contains
+    needle: "Unique tools:"
+  - type: text_contains
+    needle: bash
+  - type: all_of
+    criteria:
+      - type: turn_rounds_between
+        min: 1
+        max: 4
+      - type: tools_count_between
+        min: 1
+        max: 3
+      - type: duration_between
+        min_ms: 1
+        max_ms: 60000
+      - type: tokens_between
+        min: 1
+        max: 100000

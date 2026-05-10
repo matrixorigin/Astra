@@ -584,8 +584,35 @@ fn build_working_memory_content(messages: &[Value], max_chars: usize) -> String 
     let mut parts = Vec::new();
     let mut total_chars = 0;
 
-    // Extract key information from recent messages
-    for msg in messages.iter().rev().take(10) {
+    // Extract key information from recent messages.
+    //
+    // Write-time gate: route every candidate through
+    // `should_store_in_memory`. That predicate composes the
+    // scaffolding-message check (runtime-injected nudges / attention
+    // manifests / correction headers / tool-rollups) with the
+    // ephemeral-ack length gate (rejects "继续啊", "修复", "hi",
+    // "好", "ok" and similar short user inputs that carry no durable
+    // signal).
+    //
+    // Both filters run at WRITE time so Memoria never indexes them —
+    // read-time filters (is_memory_worthy / is_digest_worthy) are now
+    // defense-in-depth for legacy-polluted sessions, not the primary
+    // cleanup path. Single source of truth:
+    // `astra_turn_types::should_store_in_memory`.
+    //
+    // Systematic rather than whack-a-mole: Claude Code's memdir design
+    // (see docs/design/memoria-compared-to-claude-code.md) makes the
+    // type-and-description frontmatter mandatory at store time; this
+    // is L1 of porting that principle — reject obvious non-memories
+    // before they ever reach the index. L2 (require [@ns/type] prefix
+    // on stored bodies) and L3 (replace Memoria with file-based
+    // memdir) are follow-ups.
+    for msg in messages
+        .iter()
+        .rev()
+        .filter(|m| astra_turn_types::should_store_in_memory(m))
+        .take(10)
+    {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("unknown");
         let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
 
@@ -683,6 +710,86 @@ fn adjusted_message_budget_chars(
     summary_reserve_chars: usize,
 ) -> usize {
     budget_chars.saturating_sub(memory_content_chars.saturating_add(summary_reserve_chars))
+}
+
+/// Build the `[@episode/compaction]`-tagged memory body for storing a
+/// compaction summary as semantic memory.
+///
+/// The LLM summary is usually multi-paragraph; we need a one-line
+/// abstract (30–150 chars) for the compact view plus the full summary
+/// as detail so future sessions can `memory_expand` on demand.
+///
+/// Strategy:
+/// 1. Take the first sentence (or line). If it fits 30–150 chars after
+///    collapsing whitespace, use it verbatim as the abstract.
+/// 2. Otherwise synthesize a deterministic fallback:
+///    `"Compaction of session <sid-prefix>: <N>-char summary"`.
+///
+/// Returns `None` when the summary is empty — caller skips the store.
+fn build_compaction_layered_body(session_id: &str, summary: &str) -> Option<String> {
+    let summary_trimmed = summary.trim();
+    if summary_trimmed.is_empty() {
+        return None;
+    }
+
+    let abstract_ = compaction_abstract_from_summary(session_id, summary_trimmed);
+    let detail = format!("session={session_id}\n\n{summary_trimmed}");
+
+    Some(
+        astra_prompts::memory_proto::MemoryEntry::new(
+            astra_prompts::memory_proto::NS_EPISODE,
+            "compaction",
+            &astra_prompts::memory_proto::encode_body_layers(&abstract_, None, Some(&detail)),
+        )
+        .encode(),
+    )
+}
+
+/// Try the summary's first sentence as the abstract; fall back to a
+/// deterministic count-based line if the sentence doesn't fit.
+fn compaction_abstract_from_summary(session_id: &str, summary: &str) -> String {
+    let min = astra_prompts::memory_proto::ABSTRACT_MIN_CHARS;
+    let max = astra_prompts::memory_proto::ABSTRACT_MAX_CHARS;
+
+    // First-sentence candidate: everything up to the first `. `, `。`,
+    // `\n`, or EOF — whichever comes first. Collapsed whitespace, no
+    // leading/trailing space.
+    let first = first_sentence(summary);
+    let first_chars = first.chars().count();
+    if (min..=max).contains(&first_chars) {
+        return first;
+    }
+
+    // Fallback: deterministic, bounded. `session_id` is truncated to
+    // 12 chars (same convention as session_end_governance).
+    let sid_short: String = session_id.chars().take(12).collect();
+    let summary_chars = summary.chars().count();
+    format!("Compaction of session {sid_short}: {summary_chars}-char summary")
+}
+
+fn first_sentence(s: &str) -> String {
+    // Terminators: `\n`, `。`, or `.` followed by whitespace/EOF.
+    // The `.` case needs lookahead — `v1.0` shouldn't split at the
+    // dot, but `axum over actix.` should.
+    let terminator_pos = s
+        .char_indices()
+        .find_map(|(i, c)| {
+            let is_terminator = match c {
+                '\n' | '。' => true,
+                '.' => s[i + c.len_utf8()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|n| n.is_whitespace() || n == '\n'),
+                _ => false,
+            };
+            is_terminator.then_some(i)
+        })
+        .unwrap_or(s.len());
+
+    s[..terminator_pos]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn truncate_summary_for_budget(summary: String, summary_token_budget: usize) -> String {
@@ -1011,26 +1118,39 @@ pub async fn compact_with_memoria(
                     cfg.summary_token_budget
                 );
 
-                // Step 6b: Store compaction summary as semantic memory for cross-session retrieval.
-                // The LLM summary is already generated (zero additional LLM cost);
-                // storing it as "semantic" makes it persist beyond session working memory cleanup.
-                // Prefix includes a stable session tag so re-compaction can be identified.
-                // NOTE: Memoria has no delete-by-id API, so prior compaction summaries for
-                // the same session will accumulate. Dedup relies on Memoria's natural vector
-                // similarity detection (high similarity scores for same-session entries).
-                if config.store_on_compact {
-                    let tag = format!("[compaction:{}]", sid);
-                    let semantic_content = format!("{} {}", tag, summary);
-                    if let Err(e) = client
-                        .store(
-                            &semantic_content,
-                            "semantic",
-                            Some(sid),
-                            Some(astra_prompts::memory_proto::TIER_INFERRED),
-                        )
-                        .await
-                    {
-                        eprintln!("[compact] Failed to store compaction summary as semantic: {e}");
+                // Step 6b: Store compaction summary as semantic memory
+                // for cross-session retrieval. Wrapped in the
+                // `[@episode/compaction]` structural envelope with a
+                // layered body — abstract = first sentence (or a
+                // deterministic fallback), detail = full summary. The
+                // abstract is what the compact view ships to future
+                // sessions, so it stays within the 150-char cap even
+                // when summaries are long.
+                if config.store_on_compact
+                    && let Some(semantic_content) = build_compaction_layered_body(sid, &summary)
+                {
+                    match astra_turn_types::should_store_persistent_memory(
+                        &semantic_content,
+                        "semantic",
+                    ) {
+                        Ok(()) => {
+                            if let Err(e) = client
+                                .store(
+                                    &semantic_content,
+                                    "semantic",
+                                    Some(sid),
+                                    Some(astra_prompts::memory_proto::TIER_INFERRED),
+                                )
+                                .await
+                            {
+                                eprintln!(
+                                    "[compact] Failed to store compaction summary as semantic: {e}"
+                                );
+                            }
+                        }
+                        Err(reason) => {
+                            eprintln!("[compact] L2 rejected compaction summary write: {reason}");
+                        }
                     }
                 }
             }
@@ -1041,26 +1161,6 @@ pub async fn compact_with_memoria(
     }
 
     result
-}
-
-/// Synchronous wrapper that checks for Memoria availability.
-///
-/// If Memoria is not configured, falls back to pure truncation.
-pub fn compact_with_memoria_sync(
-    messages: &[Value],
-    _session_id: Option<&str>,
-    _config: &MemoriaCompactConfig,
-    params: &MemoriaCompactParams,
-) -> CompactResult {
-    // For sync contexts, we can't use Memoria (requires async HTTP).
-    // Fall back to pure truncation.
-    compact_tiered_with_result(
-        messages,
-        params.budget_chars,
-        params.keep_chars,
-        params.tier,
-        params.keep_recent_turns,
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1612,24 +1712,6 @@ mod tests {
             has_facts,
             "facts-only injection should work without narrative"
         );
-    }
-
-    #[test]
-    fn sync_wrapper_falls_back() {
-        let msgs = vec![user("hello"), assistant("hi")];
-        let config = MemoriaCompactConfig::default();
-        let params = MemoriaCompactParams {
-            budget_chars: 10000,
-            keep_chars: 2000,
-            tier: CompactionTier::Normal,
-            keep_recent_turns: 4,
-            current_tokens: 1000,
-            session_memory_file: None,
-            session_memory_combine: SessionMemoryFileCombine::None,
-            session_facts: None,
-        };
-        let result = compact_with_memoria_sync(&msgs, Some("sess1"), &config, &params);
-        assert_eq!(result.messages.len(), 2);
     }
 
     // ── Summary integration tests ────────────────────────────────────────────
@@ -2248,16 +2330,28 @@ mod tests {
 
     #[test]
     fn working_memory_user_and_assistant() {
-        let msgs = vec![user("hello"), assistant("world")];
+        // User messages must clear the should_store_in_memory length
+        // gate (20+ unicode scalars), else they're treated as
+        // ephemeral acks and skipped. Use realistic prose.
+        let msgs = vec![
+            user("please review the auth middleware refactor"),
+            assistant("Reviewed. Found one issue with the token compare path."),
+        ];
         let r = build_working_memory_content(&msgs, 10000);
-        assert!(r.contains("User: hello"));
-        assert!(r.contains("Assistant: world"));
+        assert!(r.contains("review the auth middleware"));
+        assert!(r.contains("Reviewed. Found one issue"));
     }
 
     #[test]
     fn working_memory_skips_tool_role() {
         let tool_msg = json!({"role": "tool", "content": "tool output", "tool_call_id": "t1"});
-        let msgs = vec![user("q"), tool_msg, assistant("a")];
+        // Long user msg passes the length gate so we have signal in the
+        // output; assertion is on tool_msg NOT appearing.
+        let msgs = vec![
+            user("look up the current build state of the repo"),
+            tool_msg,
+            assistant("Build is green."),
+        ];
         let r = build_working_memory_content(&msgs, 10000);
         assert!(!r.contains("tool output"));
     }
@@ -2269,7 +2363,10 @@ mod tests {
             "content": null,
             "tool_calls": [{"function": {"name": "bash", "arguments": "{}"}}]
         });
-        let msgs = vec![user("run it"), a];
+        // User msg long enough to pass the write-time gate, so the
+        // assistant tool_calls line has a preceding user line to
+        // anchor the format.
+        let msgs = vec![user("kick off the build and report the result"), a];
         let r = build_working_memory_content(&msgs, 10000);
         assert!(r.contains("[tools: bash]"));
     }
@@ -2280,6 +2377,201 @@ mod tests {
         let r = build_working_memory_content(&msgs, 100);
         // Should be capped and not include all content
         assert!(r.len() <= 500); // generous but capped
+    }
+
+    // ── Scaffolding filter (closes runtime→Memoria feedback loop) ─────
+    // The volatile block was being polluted by Memoria retrieving back
+    // the runtime's own scaffolding messages from prior turns. Root
+    // cause was `build_working_memory_content` walking messages[] and
+    // emitting every user/assistant role line into the stored working-
+    // memory blob. When a later turn's retrieval matched any of those
+    // lines, they returned as `**Context:** …` memories. Fix: filter
+    // `is_runtime_scaffolding_message` before storing. The retrieval-
+    // time filter is defense-in-depth; the real cut is here, at the
+    // write path.
+
+    #[test]
+    fn working_memory_skips_parallel_feedback_nudge() {
+        let msgs = vec![
+            user("review the latest commits"),
+            assistant("✓ Previous round: 2 tools executed in parallel — excellent."),
+            assistant("Here are the three commits…"),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(
+            !r.contains("Previous round"),
+            "parallel-feedback nudge must not reach Memoria: {r}"
+        );
+        assert!(r.contains("review the latest commits"));
+        assert!(r.contains("three commits"));
+    }
+
+    #[test]
+    fn working_memory_skips_runtime_correction_headers() {
+        // Long enough user msgs to pass the write-time length gate —
+        // these carry real intent that's worth storing. The short
+        // acks "continue" / "fix it" are now (correctly) rejected as
+        // ephemeral, but the scaffolding-filter assertion below still
+        // holds.
+        let msgs = vec![
+            user("please continue from where the last turn left off"),
+            assistant("## ⤴ Execution Escalation Runtime correction: ten read-only calls"),
+            assistant("## ⚠ Sequential Tool Calls Detected. Last 4 rounds each ran one tool."),
+            user("fix the broken migration and verify it runs cleanly"),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(!r.contains("⤴"), "correction header leaked: {r}");
+        assert!(!r.contains("Sequential Tool Calls Detected"), "leaked: {r}");
+        assert!(r.contains("continue from where"));
+        assert!(r.contains("broken migration"));
+    }
+
+    #[test]
+    fn working_memory_skips_attention_manifest() {
+        use astra_turn_types::continuity::ATTENTION_PREFIX;
+        let attention = format!("{ATTENTION_PREFIX}\nGoal: fix bug");
+        let msgs = vec![
+            user(&attention),
+            user("actually review the branch"),
+            assistant("Reviewing now."),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(
+            !r.contains(ATTENTION_PREFIX),
+            "attention manifest leaked: {r}"
+        );
+        assert!(r.contains("review the branch"));
+    }
+
+    #[test]
+    fn working_memory_skips_verification_and_error_budget() {
+        let msgs = vec![
+            user("⚠️ VERIFICATION REQUIRED: Before you finish"),
+            user("🔄 ERROR BUDGET EXHAUSTED: hit 3 errors"),
+            user("skip the verification nudges and just fix the test assertion"),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(!r.contains("VERIFICATION REQUIRED"), "leaked: {r}");
+        assert!(!r.contains("ERROR BUDGET"), "leaked: {r}");
+        assert!(r.contains("just fix the test assertion"));
+    }
+
+    #[test]
+    fn working_memory_skips_tools_used_rollup() {
+        let msgs = vec![
+            user("explore the repo and summarize the top-level layout"),
+            assistant("Tools used: bash, grep, read_file"),
+            assistant("Found three relevant files."),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(!r.contains("Tools used:"), "rollup leaked: {r}");
+        assert!(r.contains("three relevant files"));
+    }
+
+    #[test]
+    fn working_memory_skips_system_role_even_if_it_somehow_appears() {
+        // Defensive: system messages should never reach compaction, but
+        // if they do, they are scaffolding by definition.
+        let sys = json!({"role": "system", "content": "runtime injected guidance"});
+        let msgs = vec![
+            sys,
+            user("please walk through the pipeline compaction logic"),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(!r.contains("runtime injected"), "system leaked: {r}");
+        assert!(r.contains("pipeline compaction logic"));
+    }
+
+    #[test]
+    fn working_memory_pure_scaffolding_produces_empty_output() {
+        // When every message is scaffolding, nothing should be stored —
+        // Memoria must not receive a `[session:…] Recent conversation:\n`
+        // wrapper with no body, which would just be noise in the index.
+        let msgs = vec![
+            user("## ⤴ Runtime correction: ten calls"),
+            assistant("Tools used: bash"),
+            user("✓ Previous round: 2 tools in parallel"),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(
+            r.is_empty(),
+            "pure-scaffolding input must yield empty working memory: {r:?}"
+        );
+    }
+
+    // ── L1 memory-writability gate ────────────────────────────────────
+    // `should_store_in_memory` rejects short user messages (below 20
+    // unicode scalars) as ephemeral acks / imperatives. Regression
+    // for session `c6e18730` where "继续啊", "修复啊！", "hi", "好"
+    // polluted Memoria's index on every compaction write. Real
+    // signal-bearing user messages still pass through — the gate is
+    // length-based, not prefix-based, because the bad content had no
+    // consistent prefix to filter on.
+
+    #[test]
+    fn working_memory_rejects_short_user_acks() {
+        let msgs = vec![
+            user("hi"),       // English single-word
+            user("好"),       // CJK single char
+            user("继续啊"),   // CJK 3 chars + particle
+            user("修复啊！"), // CJK 3 chars + punctuation
+            user("ok"),
+            user("yes"),
+            user("continue"),
+            user("just fix it"), // 11 chars — still below threshold
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(
+            r.is_empty(),
+            "short ephemeral user acks must not reach Memoria; got: {r:?}"
+        );
+    }
+
+    #[test]
+    fn working_memory_keeps_substantive_user_intent() {
+        // Long user messages — the kind that carry durable signal —
+        // pass through unchanged. The gate is narrow by design.
+        let msgs = vec![
+            user(
+                "Add OAuth2 support with JWT tokens and refresh-token rotation, \
+                 using RS256 for signing.",
+            ),
+            user(
+                "Focus on the auth middleware path, not the schema migration \
+                 that's already in flight.",
+            ),
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        assert!(r.contains("Add OAuth2 support"));
+        assert!(r.contains("auth middleware path"));
+    }
+
+    #[test]
+    fn working_memory_mixed_user_acks_and_signal() {
+        // Realistic mixed sequence from session `c6e18730`: short
+        // imperatives interleaved with substantive requests. Only the
+        // substantive ones survive into working memory.
+        let msgs = vec![
+            user("continue"),                                       // reject
+            user("please review the delegation fan-out code path"), // keep
+            assistant("Reviewed — three potential issues."),        // keep
+            user("修复啊！"),                                       // reject
+            user("fix the ordering bug in the prefix-store write"), // keep
+        ];
+        let r = build_working_memory_content(&msgs, 10000);
+        // Kept content present
+        assert!(r.contains("delegation fan-out"));
+        assert!(r.contains("three potential issues"));
+        assert!(r.contains("ordering bug"));
+        // Rejected content absent
+        assert!(
+            !r.contains("User: continue"),
+            "short ack 'continue' leaked into output: {r}"
+        );
+        assert!(
+            !r.contains("修复啊"),
+            "short CJK imperative leaked into output: {r}"
+        );
     }
 
     // ──────────────────────────────────────────────────────────
@@ -2505,12 +2797,97 @@ mod tests {
             semantic_entries.len()
         );
         let (content, _) = &semantic_entries[0];
+        // L2 structural envelope + layered body. The abstract is
+        // drawn from the summary's first sentence (or a deterministic
+        // fallback when that doesn't fit 30–150 chars). The summary
+        // text always lives in detail, so we assert there — the
+        // pipeline sometimes prefixes a section-hint warning which
+        // would otherwise dominate the abstract.
         assert!(
-            content.starts_with("[compaction:sess-test-42]"),
-            "should have session tag prefix, got: {}",
+            content.starts_with("[@episode/compaction]"),
+            "should have L2 structural envelope, got: {}",
             &content[..50.min(content.len())]
         );
-        assert!(content.contains("JWT"), "should contain the summary text");
+        let entry =
+            astra_prompts::memory_proto::MemoryEntry::parse(content).expect("wire form must parse");
+        let abs_chars = entry.abstract_layer().chars().count();
+        assert!(
+            (30..=150).contains(&abs_chars),
+            "abstract must clear the L2 gate, got {} chars: {}",
+            abs_chars,
+            entry.abstract_layer(),
+        );
+        let detail = entry.detail_layer().expect("detail layer emitted");
+        assert!(
+            detail.contains("session=sess-test-42"),
+            "detail should embed the session id"
+        );
+        assert!(detail.contains("JWT"), "detail must carry the summary text");
+        // The stored content must pass the L2 gate by construction;
+        // if a future refactor weakens the envelope this assertion
+        // catches it immediately.
+        assert!(
+            astra_turn_types::should_store_persistent_memory(content, "semantic").is_ok(),
+            "auto-stored compaction summary must satisfy L2 gate"
+        );
+    }
+
+    // Unit-level coverage for the summary→layered-body helper. Direct
+    // tests for each branch so future changes to the fallback rule
+    // don't silently regress.
+
+    #[test]
+    fn compaction_body_uses_first_sentence_when_it_fits() {
+        // 30–150 chars, ends with `. ` → verbatim abstract.
+        let sid = "sess-xyz";
+        let summary =
+            "User picked axum over actix for its tower stack. Then wired sqlx for persistence.";
+        let body = build_compaction_layered_body(sid, summary).unwrap();
+        let entry = astra_prompts::memory_proto::MemoryEntry::parse(&body).unwrap();
+        assert_eq!(
+            entry.abstract_layer(),
+            "User picked axum over actix for its tower stack"
+        );
+        assert!(entry.detail_layer().unwrap().contains(summary));
+    }
+
+    #[test]
+    fn compaction_body_falls_back_when_first_sentence_too_short() {
+        // First sentence is 14 chars — under the 30-char minimum.
+        // Fallback abstract must take over and still pass the L2 gate.
+        let sid = "sess-short";
+        let summary = "OK done. Details: we refactored the auth path, added refresh rotation, and migrated the session table to MatrixOne.";
+        let body = build_compaction_layered_body(sid, summary).unwrap();
+        assert!(astra_turn_types::should_store_persistent_memory(&body, "semantic").is_ok());
+        let entry = astra_prompts::memory_proto::MemoryEntry::parse(&body).unwrap();
+        // Fallback format is stable.
+        assert!(
+            entry.abstract_layer().starts_with("Compaction of session"),
+            "got: {}",
+            entry.abstract_layer()
+        );
+    }
+
+    #[test]
+    fn compaction_body_falls_back_when_first_sentence_too_long() {
+        // No `. ` terminator and no newlines → the whole summary is
+        // the "first sentence", which is likely way over 150 chars.
+        let sid = "sess-long";
+        let summary = "a".repeat(500);
+        let body = build_compaction_layered_body(sid, &summary).unwrap();
+        assert!(astra_turn_types::should_store_persistent_memory(&body, "semantic").is_ok());
+        let entry = astra_prompts::memory_proto::MemoryEntry::parse(&body).unwrap();
+        assert!(entry.abstract_layer().starts_with("Compaction of session"));
+        assert!(
+            entry.abstract_layer().chars().count()
+                <= astra_prompts::memory_proto::ABSTRACT_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn compaction_body_returns_none_for_empty_summary() {
+        assert!(build_compaction_layered_body("sid", "").is_none());
+        assert!(build_compaction_layered_body("sid", "   \n  ").is_none());
     }
 
     #[tokio::test]

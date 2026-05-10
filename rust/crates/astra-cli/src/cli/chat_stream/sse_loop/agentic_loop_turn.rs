@@ -357,10 +357,24 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         thinking: thinking_config,
     });
 
-    // Inject ephemeral prefix (e.g., skill listing) at the start of messages.
+    // Route skill listing through edge_profile → bridge volatile lane, so
+    // it lands in RuntimeVolatile (post-cache-marker) rather than becoming a
+    // leading role:system message that breaks the prefix cache on
+    // prefix-only providers (DeepSeek, GLM, Qwen). The skill selector
+    // re-ranks each turn, so the content changes — it must not live in the
+    // system prefix or it invalidates the cache every turn.
     if let Some(prefix) = ctx.ephemeral_prefix {
-        if let Some(arr) = payload.get_mut("messages").and_then(Value::as_array_mut) {
-            arr.insert(0, prefix.clone());
+        if let Some(content) = prefix.get("content").and_then(serde_json::Value::as_str)
+            && !content.is_empty()
+            && let Some(root) = payload.as_object_mut()
+            && let Some(ep) = root.get_mut("edge_profile")
+            && let Some(ep_obj) = ep.as_object_mut()
+        {
+            ep_obj.insert(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_SKILL_LISTING_TEXT
+                    .to_string(),
+                json!(content),
+            );
         }
     }
     let active_skills = detect_active_system_skills_in_message(ctx.message);
@@ -752,12 +766,42 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                 .map(|hub| hub.tuning().recent_signals())
                 .unwrap_or_default();
             session.ingest_self_model_inputs(skills, tool_health_entries, scenario, recent_signals);
+
+            // Observe the prompt-injection lessons channel for this
+            // round so `introspect subtopic=noise` can report whether
+            // lessons have been re-rendered unchanged for many turns
+            // (the f85a02bb stale-signal case). Lessons are owned by
+            // the executor and reachable here.
+            //
+            // NOTE: the per-turn volatile lane is NOT observed from
+            // this CLI path — it is injected further downstream and
+            // is not visible here. Observing it with an empty string
+            // would falsely report `Empty` for every round and mask
+            // genuine staleness. The volatile-aware observation point
+            // lives in runtime/observability_integration.rs.
+            //
+            // Fingerprint uses `LessonKind::as_str()` (stable snake_case
+            // DB tag), NOT `Debug`, so enum-variant renames do not flip
+            // every channel from Stale→Fresh for one round.
+            let lessons_text = ctx
+                .executor
+                .session_lessons_snapshot()
+                .iter()
+                .map(|l| format!("{}:{}:{}", l.kind.as_str(), l.trigger_signal, l.action))
+                .collect::<Vec<_>>()
+                .join("|");
+            session.observe_lessons_only(&lessons_text);
         }
     }
     if let Some(self_model) = ctx.executor.build_self_model_snapshot() {
-        let text = self_model.to_system_prompt_section();
-        if text.len() > 30 {
-            if let Some(root) = payload.as_object_mut()
+        // Gate on signal content, not raw length. A bare `Turn: N\nTokens: …`
+        // header easily passes a length threshold but carries no actionable
+        // signal for the LLM — emitting it every turn wastes ~500 tokens
+        // (and the tokens are in the volatile lane, so they never cache).
+        if self_model.has_meaningful_self_awareness() {
+            let text = self_model.to_system_prompt_section();
+            if !text.trim().is_empty()
+                && let Some(root) = payload.as_object_mut()
                 && let Some(ep) = root.get_mut("edge_profile")
                 && let Some(ep_obj) = ep.as_object_mut()
             {

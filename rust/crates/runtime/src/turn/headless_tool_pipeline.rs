@@ -274,8 +274,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         // Phase 3: post-process + record serially (fast, needs &mut self).
         for (execution, idem_key) in executions {
-            let is_err =
-                astra_turn_core::tool_result_semantics::is_tool_error(&execution.result_str);
+            let is_err = matches!(
+                astra_turn_core::tool_result_semantics::classify_tool_error(
+                    &execution.name,
+                    &execution.result_str,
+                ),
+                astra_turn_core::tool_result_semantics::ToolErrorSeverity::HardError
+            );
             let executed_ms = if execution.is_edge_tool && execution.edge_duration_ms > 0 {
                 execution.edge_duration_ms
             } else {
@@ -802,7 +807,6 @@ mod tests {
                 false,
                 true,
             ),
-            ("git_checkout_file", json!({ "path": "a.txt" }), false, true),
             (
                 "bash",
                 json!({ "command": "printf new > a.txt" }),
@@ -994,7 +998,10 @@ mod tests {
         assert!(dir.path().join("turn.txt").exists());
 
         let rollback = server_exec
-            .execute("rollback_file_edits", &json!({"scope": "current_turn"}))
+            .execute(
+                "session",
+                &json!({"action": "rollback_edits", "scope": "current_turn"}),
+            )
             .await;
         let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
         assert_eq!(

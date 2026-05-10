@@ -119,6 +119,17 @@ fn apply_optional_yaml_fields(
             qobj.insert("fallback_chain".into(), serde_json::json!(chain));
         }
     }
+    // `wire_model_name` — literal name to send in the upstream LLM `model`
+    // field when the local row's `name` differs (e.g. two rows pointing at
+    // the same upstream model id but configured under different providers
+    // or endpoints). Routed through `quirks_json` like `fallback_chain`,
+    // so no DB migration was needed.
+    if let Some(wire) = yaml_str(entry, "wire_model_name") {
+        let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
+        if let Some(qobj) = quirks.as_object_mut() {
+            qobj.insert("wire_model_name".into(), serde_json::json!(wire));
+        }
+    }
 }
 
 fn build_model_update_payload(

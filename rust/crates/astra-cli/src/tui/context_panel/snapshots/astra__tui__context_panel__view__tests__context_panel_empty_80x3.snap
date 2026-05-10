@@ -1,0 +1,7 @@
+---
+source: crates/astra-cli/src/tui/context_panel/view.rs
+expression: "render_panel(&b, 80, 3)"
+---
+┌ Context window (0% · low) ───────────────────────────────────────────────────┐
+│  no context trace yet — run a turn first                                     │
+└──────────────────────────────────────────────────────────────────────────────┘

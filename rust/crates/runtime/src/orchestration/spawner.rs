@@ -158,6 +158,12 @@ pub struct SpawnRunConfig {
     /// child will simply run without cache inheritance (equivalent to
     /// the PR 4 soft-fallback path).
     pub inherited_prefix: Option<InheritedChildPrefix>,
+    /// True when this child inherited a parent prefix (fork mode).
+    /// Fork children are NOT allowed to fork again — prevents
+    /// degenerate case where a forked child forks with its own prefix
+    /// (which differs from the original parent's, breaking the cache
+    /// reuse chain). Same semantics as Claude Code's `isInForkChild()`.
+    pub is_fork_child: bool,
 }
 
 /// Payload an executor needs to consume an inherited prefix.
@@ -183,6 +189,14 @@ pub struct InheritedChildPrefix {
     /// called on the prefix with no additional suffix (the executor
     /// appends its own child task message).
     pub prefix_messages: Vec<serde_json::Value>,
+    /// Frozen tool schemas from the parent's capture — each entry
+    /// deserialized from `ToolSchemaEntry.canonical_bytes`. When
+    /// present, the executor should use these instead of the live
+    /// registry to ensure tool-schema-hash stability with the parent
+    /// (cache key alignment). `None` if the prefix has no tool
+    /// schemas (e.g., older captures, or capture happened before
+    /// tool_schema hashing was wired).
+    pub frozen_tool_schemas: Option<Vec<serde_json::Value>>,
     /// Estimated cache-eligible tokens from the parent's perspective.
     /// Used as the `expected_cache_read_tokens` baseline when the
     /// executor evaluates the child's first response for a
@@ -632,8 +646,26 @@ impl DynamicAgentSpawner {
             permission_context,
             // Skills inherited from parent
             inherited_skills: context.inherited_skills.clone(),
+            is_fork_child: inherited_prefix.is_some(),
             inherited_prefix,
         };
+
+        // Emit agent_spawned journal event for unified timeline.
+        if let Some(ref sid) = self.session_id {
+            let evt = astra_services::session_journal::JournalEvent::agent_spawned(
+                Some(sid),
+                &agent_id,
+                &run_id,
+                &context.parent_run_id,
+                &run_config.agent_type,
+                &input.description,
+                &run_config.model,
+                run_config.inherited_prefix.is_some(),
+            );
+            if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
+                let _ = writer.append(&evt);
+            }
+        }
 
         // 8. Execute or launch
         if input.background {
@@ -1276,21 +1308,32 @@ pub(crate) fn build_inherited_child_prefix(
     // "reconstruct failed" event here; currently no sink is wired
     // through so the failure is silent.
     match reconstruct_messages(prefix, Vec::new()) {
-        Ok(r) => Some(InheritedChildPrefix {
-            prefix_id: prefix.prefix_id.clone(),
-            parent_run_id: prefix.parent_run_id.clone(),
-            provider: prefix.provider.clone(),
-            prefix_messages: r.messages,
-            // Best-effort estimate. PR 1 doesn't carry a cache-token
-            // estimate on ForkPrefix itself; the capture site could
-            // plumb one through in a future PR. For now we pass 0 so
-            // the evaluator's degenerate branch classifies early
-            // observations as Miss or ExceededExpected until a real
-            // estimate is wired — neither label is a false positive
-            // against "cache worked", which preserves dashboard
-            // integrity.
-            expected_cache_read_tokens: 0,
-        }),
+        Ok(r) => {
+            let frozen_tools: Option<Vec<serde_json::Value>> = {
+                let entries = prefix.tool_schemas();
+                if entries.is_empty() {
+                    None
+                } else {
+                    let parsed: Vec<serde_json::Value> = entries
+                        .iter()
+                        .filter_map(|e| serde_json::from_slice(&e.canonical_bytes).ok())
+                        .collect();
+                    if parsed.is_empty() {
+                        None
+                    } else {
+                        Some(parsed)
+                    }
+                }
+            };
+            Some(InheritedChildPrefix {
+                prefix_id: prefix.prefix_id.clone(),
+                parent_run_id: prefix.parent_run_id.clone(),
+                provider: prefix.provider.clone(),
+                prefix_messages: r.messages,
+                frozen_tool_schemas: frozen_tools,
+                expected_cache_read_tokens: 0,
+            })
+        }
         Err(_) => None,
     }
 }
@@ -2207,10 +2250,7 @@ mod tests {
     //    → spawn succeeds; resolve outcome is `Fallback`.
     // ---------------------------------------------------------------
 
-    use astra_turn_core::fork_capture::{
-        CaptureRequest, FORK_FLAG_TEST_MUTEX, capture_parent_prefix,
-        restore_fork_flag_raw_for_tests, set_fork_flag_for_tests,
-    };
+    use astra_turn_core::fork_capture::{CaptureRequest, capture_parent_prefix};
     use astra_turn_core::fork_prefix::{
         CacheMode, ProviderKind, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry,
         hash_tool_schema,
@@ -2218,30 +2258,6 @@ mod tests {
     use astra_turn_core::fork_prefix_store::{InMemoryPrefixStore, PrefixCaptureSink};
     use astra_turn_core::fork_resolve::PrefixResolveOutcome;
     use astra_turn_core::orchestration_spawn_tool::InheritPrefixSpec;
-
-    /// RAII guard copied from fork_capture tests: set flag to
-    /// `enabled` for the test duration, restore raw u8 on drop.
-    struct FlagGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        prev_raw: u8,
-    }
-    impl FlagGuard {
-        fn set(enabled: bool) -> Self {
-            let lock = FORK_FLAG_TEST_MUTEX
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let prev_raw = set_fork_flag_for_tests(enabled);
-            Self {
-                _lock: lock,
-                prev_raw,
-            }
-        }
-    }
-    impl Drop for FlagGuard {
-        fn drop(&mut self) {
-            restore_fork_flag_raw_for_tests(self.prev_raw);
-        }
-    }
 
     fn wall_now_secs() -> u64 {
         std::time::SystemTime::now()
@@ -2336,7 +2352,6 @@ mod tests {
         // additive-only property. Even with inherit_prefix set in
         // the input, spawn must succeed (prefix request silently
         // has no effect without a store).
-        let _g = FlagGuard::set(true);
         let spawner = DynamicAgentSpawner::new(mock_router());
         let input = child_with_inherit(false);
         let ctx = parent_context("parent-unused");
@@ -2349,7 +2364,6 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_resolves_matching_captured_prefix() {
-        let _g = FlagGuard::set(true);
         let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
         let spawner = DynamicAgentSpawner::new(mock_router()).with_prefix_store(store.clone());
         let model = explore_agent_model(&spawner);
@@ -2374,7 +2388,6 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_with_required_and_missing_prefix_hard_fails() {
-        let _g = FlagGuard::set(true);
         let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
         let spawner = DynamicAgentSpawner::new(mock_router()).with_prefix_store(store);
         // No capture — store is empty.
@@ -2389,7 +2402,6 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_with_optional_and_missing_prefix_falls_back() {
-        let _g = FlagGuard::set(true);
         let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
         let spawner = DynamicAgentSpawner::new(mock_router()).with_prefix_store(store);
         let input = child_with_inherit(false); // not required
@@ -2410,7 +2422,6 @@ mod tests {
     async fn spawn_without_inherit_spec_records_disabled() {
         // inherit_prefix=None → outcome should be Disabled, regardless
         // of whether a store is configured or the flag is on.
-        let _g = FlagGuard::set(true);
         let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
         let spawner = DynamicAgentSpawner::new(mock_router()).with_prefix_store(store);
         let input = SpawnAgentInput {
@@ -2442,7 +2453,6 @@ mod tests {
 
     #[tokio::test]
     async fn resolved_prefix_populates_spawn_run_config_inherited_prefix() {
-        let _g = FlagGuard::set(true);
         let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
         let exec = Arc::new(CapturingPrefixExecutor::new());
         let spawner = DynamicAgentSpawner::new(mock_router())
@@ -2480,7 +2490,6 @@ mod tests {
         // Resolver Fallback (no matching parent capture) must yield
         // `inherited_prefix: None` on the config — executor can tell
         // from the config alone that it should run fresh.
-        let _g = FlagGuard::set(true);
         let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
         let exec = Arc::new(CapturingPrefixExecutor::new());
         let spawner = DynamicAgentSpawner::new(mock_router())
@@ -2503,7 +2512,6 @@ mod tests {
     async fn disabled_outcome_leaves_inherited_prefix_none() {
         // No inherit_prefix spec at all (most common path) — outcome
         // is Disabled and inherited_prefix is None, same as Fallback.
-        let _g = FlagGuard::set(true);
         let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
         let exec = Arc::new(CapturingPrefixExecutor::new());
         let spawner = DynamicAgentSpawner::new(mock_router())
@@ -2533,7 +2541,6 @@ mod tests {
         // prefix_messages, when re-serialized, must equal the bytes
         // the capture recorded. Without this, no prompt cache hit is
         // possible on the child's first API call.
-        let _g = FlagGuard::set(true);
         let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
         let exec = Arc::new(CapturingPrefixExecutor::new());
         let spawner = DynamicAgentSpawner::new(mock_router())

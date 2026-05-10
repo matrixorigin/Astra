@@ -48,6 +48,68 @@ pub(super) fn handle_inspect_command(arg: &str, state: &ReplState) {
     }
 }
 
+#[cfg(feature = "harness")]
+pub(super) fn format_snapshot_summary(s: &astra_harness::RuntimeSnapshot) -> String {
+    let turns = match s.turns_limit {
+        Some(limit) => format!("{} / {}", s.turns_used, limit),
+        None => format!("{}", s.turns_used),
+    };
+    let total = s
+        .context_total_tokens
+        .map(|t| format_tokens(t as u64))
+        .unwrap_or_else(|| "-".into());
+    let budget = s
+        .context_budget_tokens
+        .map(|t| format_tokens(t as u64))
+        .unwrap_or_else(|| "unlimited".into());
+    let util = s
+        .context_utilization
+        .map(|u| format!("{:.1}%", u * 100.0))
+        .unwrap_or_else(|| "-".into());
+    let unique_tools = if s.unique_tools_used.is_empty() {
+        "-".to_string()
+    } else {
+        s.unique_tools_used.join(", ")
+    };
+    let last = s.last_tool_called.as_deref().unwrap_or("-");
+
+    let mut out = String::new();
+    out.push_str("─── Harness Snapshot ────────────────────────────\n");
+    out.push_str(&format!("  {:<20} {}\n", "Turns:", turns));
+    out.push_str(&format!(
+        "  {:<20} {}\n",
+        "Tokens (session):",
+        format_tokens(s.tokens_used_session)
+    ));
+    out.push_str(&format!(
+        "  {:<20} {}\n",
+        "Elapsed:",
+        format_duration(s.elapsed_millis)
+    ));
+    out.push('\n');
+    out.push_str(&format!("  {:<20} {}\n", "Context tokens:", total));
+    out.push_str(&format!("  {:<20} {}\n", "Context budget:", budget));
+    out.push_str(&format!("  {:<20} {}\n", "Utilization:", util));
+    out.push_str(&format!(
+        "  {:<20} {}\n",
+        "Messages:", s.context_message_count
+    ));
+    out.push('\n');
+    out.push_str(&format!(
+        "  {:<20} {}\n",
+        "Tool calls:", s.tool_calls_this_session
+    ));
+    out.push_str(&format!("  {:<20} {}\n", "Unique tools:", unique_tools));
+    out.push_str(&format!("  {:<20} {}", "Last tool:", last));
+    if s.consecutive_same_tool > 1 {
+        out.push_str(&format!(
+            "\n  {:<20} {} (consecutive)",
+            "Same tool streak:", s.consecutive_same_tool
+        ));
+    }
+    out
+}
+
 #[cfg(not(feature = "harness"))]
 pub(super) fn handle_inspect_command(_arg: &str, _state: &ReplState) {
     eprintln!(

@@ -374,6 +374,27 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Core,
     )
     .with_arg_hint("[session_id]"),
+    CommandMeta::new(
+        "/timeline",
+        "Browse this session's turn-by-turn journal timeline",
+        CommandGroup::Core,
+    ),
+    CommandMeta::new(
+        "/table",
+        "Run a SQL query and render the result as a navigable table",
+        CommandGroup::Core,
+    )
+    .with_arg_hint("<sql>"),
+    CommandMeta::new(
+        "/worktrees",
+        "List git worktrees for this repo with per-worktree session counts",
+        CommandGroup::Core,
+    ),
+    CommandMeta::new(
+        "/panels",
+        "Cheat sheet of all TUI-native panels",
+        CommandGroup::Core,
+    ),
     CommandMeta::new("/exit", "Exit the REPL", CommandGroup::Core),
     CommandMeta::new(
         "/quit",

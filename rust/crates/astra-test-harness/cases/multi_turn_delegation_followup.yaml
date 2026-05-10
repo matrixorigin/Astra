@@ -36,7 +36,7 @@ criteria:
 - type: exit_code
   code: 0
 - type: tool_called
-  name: spawn_agent
+  name: agent
 - type: turn_rounds_between
   min: 1
   max: 50

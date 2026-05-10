@@ -1269,6 +1269,7 @@ pub(super) async fn handle_info_command(
                 runtime_continuity: None,
                 turn_index: 0,
                 evolution_service: state.evolution_service.clone(),
+                pipeline_state: None,
                 pre_loaded_messages: None,
                 append_system_prompt: None,
                 #[cfg(feature = "harness")]
@@ -1544,6 +1545,26 @@ pub(super) async fn handle_info_command(
             // /context cognition — cognitive runtime flags
             if sub_cmd == "cognition" || sub_cmd == "cog" {
                 print_cognition_view(state);
+                return Ok(());
+            }
+
+            // /context explain — narrative explanation of last trace's decisions
+            if sub_cmd == "explain" {
+                let session = state.observability_session.as_ref();
+                if let Some(session) = session {
+                    let guard = session.read().unwrap_or_else(|e| e.into_inner());
+                    if guard.context_traces.is_empty() {
+                        eprintln!(
+                            "{}",
+                            "  No context assembly traces yet. Complete a turn first.".yellow()
+                        );
+                    } else {
+                        let trace = guard.context_traces.last().unwrap();
+                        print_context_explain(trace);
+                    }
+                } else {
+                    eprintln!("{}", "  No observability session active.".yellow());
+                }
                 return Ok(());
             }
 
@@ -2021,6 +2042,106 @@ fn parse_continuation_anchor(anchor: &str) -> ContinuationAnchorParts {
     }
 
     ContinuationAnchorParts { task, direction }
+}
+
+fn print_context_explain(trace: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace) {
+    use astra_turn_core::context_assembly_trace::DecisionType;
+
+    let header = format!("─── Context Explain — {} ──────────────────", trace.turn_id);
+    eprintln!("\n{}", header.bold().cyan());
+
+    let total_tokens = trace.token_budget.total_used;
+    let limit = trace.token_budget.max_tokens;
+    let pressure = if limit > 0 {
+        (total_tokens as f64 / limit as f64) * 100.0
+    } else {
+        0.0
+    };
+    eprintln!(
+        "  {:<14}  {} tokens used of {} limit ({:.1}%)",
+        "budget".cyan(),
+        total_tokens.to_string().dim(),
+        limit.to_string().dim(),
+        pressure
+    );
+    eprintln!(
+        "  {:<14}  system prompt: {} tokens",
+        "system".cyan(),
+        trace.system_prompt.total_tokens.to_string().dim()
+    );
+
+    let retained = trace.history.turns_retained.len();
+    let compressed = trace.history.turns_compressed.len();
+    let dropped = trace.history.turns_dropped.len();
+    eprintln!(
+        "  {:<14}  retained={} compressed={} dropped={}",
+        "history".cyan(),
+        retained.to_string().green(),
+        compressed.to_string().yellow(),
+        dropped.to_string().red()
+    );
+
+    let memory_selected = trace.memory.memories_selected.len();
+    eprintln!(
+        "  {:<14}  selected {} memories ({} tokens)",
+        "memory".cyan(),
+        memory_selected.to_string().dim(),
+        trace.memory.total_tokens.to_string().dim()
+    );
+
+    let tools_selected = trace.tools.tools_selected.len();
+    let tool_tokens: u32 = trace.tools.tools_selected.iter().map(|t| t.tokens).sum();
+    eprintln!(
+        "  {:<14}  selected {} tools ({} tokens)",
+        "tools".cyan(),
+        tools_selected.to_string().dim(),
+        tool_tokens.to_string().dim()
+    );
+
+    if !trace.explanations.is_empty() {
+        eprintln!("\n  {}", "Decisions & Reasoning".bold());
+        for (idx, exp) in trace.explanations.iter().enumerate() {
+            let label = match &exp.decision_type {
+                DecisionType::ToolSelection { tools } => {
+                    format!("tool selection ({} tools)", tools.len())
+                }
+                DecisionType::HistoryCompression { turns_affected } => {
+                    format!("history compression ({} turns)", turns_affected.len())
+                }
+                DecisionType::MemoryRetrieval { memories } => {
+                    format!("memory retrieval ({} memories)", memories.len())
+                }
+                DecisionType::StrategyChoice { strategy } => {
+                    format!("strategy: {strategy}")
+                }
+            };
+            eprintln!(
+                "    {}. {} {}",
+                (idx + 1).to_string().dim(),
+                label.bold(),
+                format!("(confidence {:.2})", exp.confidence).dim()
+            );
+            eprintln!("       {} {}", "why:".dim(), exp.reasoning);
+            if !exp.alternatives_considered.is_empty() {
+                eprintln!(
+                    "       {} {} alternative(s) considered",
+                    "alts:".dim(),
+                    exp.alternatives_considered.len()
+                );
+                for alt in &exp.alternatives_considered {
+                    eprintln!(
+                        "         - {} (score {:.2}) — {}",
+                        alt.description,
+                        alt.score,
+                        alt.why_not_chosen.as_str().dim()
+                    );
+                }
+            }
+        }
+    } else {
+        eprintln!("\n  {}", "No explanations recorded for this turn.".dim());
+    }
+    eprintln!();
 }
 
 fn print_context_breakdown(trace: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace) {

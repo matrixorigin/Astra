@@ -19,6 +19,7 @@ pub mod chat_turn_selection_context;
 pub mod cloud;
 pub mod compaction_replay;
 pub mod context_compression;
+pub(crate) mod context_pipeline_adapter;
 pub mod harness_adapter;
 pub mod headless_tool_pipeline;
 /// Re-exported from astra-turn-types
@@ -47,6 +48,7 @@ pub mod skill_tool;
 pub mod token_usage;
 pub(crate) mod tool_side_effects;
 pub mod turn_trace_collector;
+pub(crate) mod wire_assembly;
 
 #[cfg(feature = "bridge-e2e-hooks")]
 pub mod stream_idle_test_hooks {

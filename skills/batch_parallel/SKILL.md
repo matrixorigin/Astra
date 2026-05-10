@@ -29,7 +29,7 @@ allowed_tools:
   - glob
   - git_worktree
   - git_commit
-  - git_diff
+  - git
   - git_log
 when_to_use: "When the user wants to perform multiple independent code changes, refactors, or tasks in parallel — especially when tasks touch different files and benefit from isolation."
 model: null

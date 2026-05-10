@@ -265,6 +265,8 @@ mod tests {
     fn test_state(message: &str) -> AgenticLoopState {
         AgenticLoopState {
             messages: vec![json!({"role": "user", "content": message})],
+            volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
@@ -272,6 +274,7 @@ mod tests {
             context_manifest_user_id: None,
             context_manifest_model_name: None,
             recursion_depth: 0,
+            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -307,6 +310,9 @@ mod tests {
             messaging: Default::default(),
             cancellation: Default::default(),
             error_recovery: Default::default(),
+            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+            )),
             message: message.to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
@@ -327,6 +333,8 @@ mod tests {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
+            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,

@@ -5,9 +5,15 @@ set -e
 
 PID_FILE="api_server.pid"
 LOG_FILE="api_server.log"
-BIN_PATH="rust/target/release/astra-server"
 
-echo "Starting API server..."
+BUILD_MODE="${BUILD_MODE:-release}"
+if [ "$BUILD_MODE" = "debug" ]; then
+    BIN_PATH="rust/target/debug/astra-server"
+else
+    BIN_PATH="rust/target/release/astra-server"
+fi
+
+echo "Starting API server (mode: $BUILD_MODE)..."
 
 # Check if already running
 if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
@@ -42,9 +48,18 @@ for i in {1..15}; do
     fi
 done
 
-echo "Building release API binary..."
-cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --release --bin astra-server
-echo "✅ Using $BIN_PATH"
+# Skip build entirely with SKIP_BUILD=1 for fast iteration.
+if [ "${SKIP_BUILD:-}" = "1" ] && [ -f "$BIN_PATH" ]; then
+    echo "⏩ Skipping build (SKIP_BUILD=1)"
+elif [ "$BUILD_MODE" = "debug" ]; then
+    echo "Building debug API binary..."
+    cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --bin astra-server
+    echo "✅ Using $BIN_PATH"
+else
+    echo "Building release API binary..."
+    cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --release --bin astra-server
+    echo "✅ Using $BIN_PATH"
+fi
 
 start_detached() {
     if command -v setsid >/dev/null 2>&1; then

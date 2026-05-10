@@ -1,0 +1,14 @@
+---
+source: crates/astra-cli/src/tui/timeline/view.rs
+expression: "render_tl(&tl, 100, 10)"
+---
+┌ Timeline · 3 turns · 2.5k in 1.2k out ───────────────────────────────────────────────────────────┐
+│▌ #1    1.6s  0t     500/200  hi                           turn 1                                 │
+│  #2    1.7s  2t     800/400  read the file                started 10:01:00                       │
+│  #3    1.8s  1t    1.2k/600  fix the bug                  took    1.6s                           │
+│                                                           tokens  500 / 200                      │
+│                                                           cum in  500                            │
+│                                                           cum out 200                            │
+│                                                           tools   0                              │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

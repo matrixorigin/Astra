@@ -7,11 +7,11 @@ use serde_json::Value;
 use super::agentic_adaptive_tuning::apply_adaptive_execution_profile;
 use super::agentic_headless_round::HeadlessStderrStyle;
 use super::agentic_loop_host::{
-    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, delegate_tool_schema,
-    try_write_heavy_checkpoint,
+    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, try_write_heavy_checkpoint,
 };
 use crate::orchestration::permission_sync::PermissionResponseMessaging;
 use astra_services::SessionArtifactStore;
+use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::interruption::{
     InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
 };
@@ -128,6 +128,16 @@ fn recent_turns_are_repetitive(state: &AgenticLoopState) -> bool {
 }
 
 fn recent_progress_is_real(state: &AgenticLoopState) -> bool {
+    if is_open_ended_file_exploration(&state.message) {
+        return state
+            .stall
+            .tool_call_records
+            .iter()
+            .rev()
+            .take(6)
+            .any(tool_record_is_workspace_mutation);
+    }
+
     // Note: `tool_record_is_workspace_mutation` no longer treats every `bash`
     // call as mutating — only commands that actually modify state qualify.
     // This is intentional: a loop that only runs `grep`/`cat`/`ls` should not
@@ -189,6 +199,57 @@ fn recent_progress_is_real(state: &AgenticLoopState) -> bool {
     false
 }
 
+const OPEN_ENDED_EXPLORATION_MAX_TURNS: usize = 4;
+const OPEN_ENDED_EXPLORATION_MAX_TOOLS_PER_TURN: u32 = 2;
+const OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE: &str = "Open-ended file exploration budget is active: do at most one bounded useful pass with no more than two tool calls per turn, then summarize. Do not keep listing/reading files recursively.";
+
+fn is_open_ended_file_exploration(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let has_list_operation =
+        lower.contains("list") || lower.contains("ls ") || lower.contains("directory");
+    let has_read_operation = lower.contains("read") || lower.contains("cat ");
+    let asks_for_many_files = lower.contains("as many files") || lower.contains("many files as");
+    let repeated_file_loop = has_list_operation
+        && has_read_operation
+        && (lower.contains("keep going")
+            || lower.contains("as many")
+            || lower.contains("list again")
+            || lower.contains("read again"));
+    let explicit_file_loop = asks_for_many_files
+        || lower.contains("as many")
+            && lower.contains("files")
+            && (has_read_operation || has_list_operation);
+    repeated_file_loop || explicit_file_loop
+}
+
+fn apply_open_ended_exploration_budget(state: &mut AgenticLoopState) -> bool {
+    if !is_open_ended_file_exploration(&state.message) {
+        return false;
+    }
+
+    state.max_turns = state.max_turns.min(OPEN_ENDED_EXPLORATION_MAX_TURNS);
+    state.remaining_turns = state.remaining_turns.min(state.max_turns);
+    state.max_tools_per_turn = state
+        .max_tools_per_turn
+        .min(OPEN_ENDED_EXPLORATION_MAX_TOOLS_PER_TURN);
+    // Previously-pushed exploration-budget messages lived in
+    // state.messages; no-op today because the structured lane drains
+    // per-call and the old `any(|m| content == MSG)` guard never finds
+    // them. Keep the single-push-per-turn semantics via the lane: if
+    // any prior injection this turn already queued the message, skip.
+    let already_queued = state
+        .volatile_pending
+        .iter()
+        .any(|inj| inj.content == OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE);
+    if !already_queued {
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::ExplorationBudget,
+            OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE,
+        );
+    }
+    true
+}
+
 fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
     let budget = state.agentic_turn_budget;
     if budget.extension_turns == 0
@@ -222,10 +283,10 @@ fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
         additional_turns,
         budget.hard_turn_limit,
     );
-    state.messages.push(serde_json::json!({
-        "role": "system",
-        "content": review_message,
-    }));
+    state.push_volatile(
+        super::agentic_loop_host::VolatileKind::BudgetReview,
+        review_message.clone(),
+    );
     Some(review_message)
 }
 
@@ -234,12 +295,22 @@ pub(crate) fn interruption_state_summary(
     state: &AgenticLoopState,
     error_detail: Option<String>,
 ) -> InterruptionStateSummary {
+    // Compute a stall-signal breadcrumb from the single-tool streak at
+    // interruption time. Lets the resumed session see *why* it was cut
+    // (e.g. `"single_tool_streak=18"`) without re-scanning history.
+    let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+    let stall_signal = if streak >= 3 {
+        Some(format!("single_tool_streak={streak}"))
+    } else {
+        None
+    };
     InterruptionStateSummary {
         has_checkpoint: state.stall.last_heavy_checkpoint.is_some(),
         tool_calls_completed: completed_tool_calls(state),
         turns_completed: current_agentic_step(state),
         remaining_turns: state.remaining_turns as u32,
         error_detail,
+        stall_signal,
     }
 }
 
@@ -247,6 +318,8 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
+    apply_open_ended_exploration_budget(state);
+
     if state
         .skills
         .session_event_hooks
@@ -275,14 +348,6 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
         }
     }
 
-    if state.delegation_engine.is_some() {
-        host.inject_tool_schema(delegate_tool_schema());
-    }
-
-    if state.messaging.mailbox.is_some() {
-        host.inject_tool_schema(astra_messaging::send_tool::send_message_tool_schema());
-    }
-
     if let Some(resolver) = &state.skills.resolver {
         let full = resolver.available_skills();
         if !full.is_empty() {
@@ -300,22 +365,16 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
                 &visible,
                 open_skill_name,
             ));
-            if open_skill_name {
-                host.inject_tool_schema(crate::turn::skill_tool::discover_skills_tool_schema());
-            }
         }
     }
 
-    if let Some(ref ctx) = state.project_context {
-        state.messages.push(serde_json::json!({
-            "role": "system",
-            "content": format!(
-                "## Cross-Session Project Context\n\
-                 Below are summaries of recent sessions in this project. \
-                 Use them for continuity — avoid re-asking questions already answered.\n\n{ctx}"
-            )
-        }));
-    }
+    // NOTE: Cross-Session Project Context used to be injected into
+    // `state.messages` here as a system message. It has moved into the
+    // context pipeline's `ProjectContext` section (bound from
+    // `SessionContext.project_context`) so it sits in `CacheScope::Session`
+    // BEFORE the Session→None marker — now it participates in the cached
+    // session prefix instead of being re-sent after the marker every turn.
+    // See `context_pipeline_adapter::build_session_context` + `bind_project_context`.
 
     if let Some(ref evo) = state.evolution_service {
         let turn_id = state.current_run_id.as_deref().unwrap_or("unknown");
@@ -689,10 +748,10 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     if has_more { "+, more queued" } else { "" },
                     parts.join("\n")
                 );
-                state.messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": mailbox_text,
-                }));
+                state.push_volatile(
+                    super::agentic_loop_host::VolatileKind::Mailbox,
+                    mailbox_text,
+                );
             }
         }
     }
@@ -733,6 +792,15 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
 
     if turn_index > 0 {
+        // Working-set + inventory snapshots go through the structured
+        // volatile lane so they stay out of `state.messages[]` — the
+        // wire layer drains them into volatile_preamble for each LLM
+        // call. Previously these were pushed as trailing `role=system`
+        // messages and had to be re-deduped before every push, which
+        // still broke Anthropic/DeepSeek prefix caching (session
+        // 05e63cac / c0905eab). Legacy retains() stay for a grace
+        // period to scrub checkpoints restored from pre-migration
+        // sessions.
         const WORKING_SET_HEADER: &str = "[working-set:v1]\n";
         state.messages.retain(|m| {
             m.get("role").and_then(Value::as_str) != Some("system")
@@ -741,10 +809,11 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     .and_then(Value::as_str)
                     .is_some_and(|c| c.starts_with(WORKING_SET_HEADER))
         });
-        state.messages.push(serde_json::json!({
-            "role": "system",
-            "content": state.session_facts.to_working_set_injection(&state.message),
-        }));
+        let working_set_text = state.session_facts.to_working_set_injection(&state.message);
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::WorkingSet,
+            working_set_text,
+        );
 
         const INVENTORY_HEADER: &str = "## Already Fetched (do NOT re-read/re-grep these)\n";
         state.messages.retain(|m| {
@@ -756,10 +825,10 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         });
         let inventory = state.semantic_dedup.context_inventory();
         if !inventory.is_empty() {
-            state.messages.push(serde_json::json!({
-                "role": "system",
-                "content": format!("{INVENTORY_HEADER}{inventory}"),
-            }));
+            state.push_volatile(
+                super::agentic_loop_host::VolatileKind::AlreadyFetched,
+                format!("{INVENTORY_HEADER}{inventory}"),
+            );
         }
     }
 
@@ -787,10 +856,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     state.stall.nudge_count as usize,
                 );
                 let nudge = reflection.to_nudge_message();
-                state.messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": nudge,
-                }));
+                state.push_volatile(super::agentic_loop_host::VolatileKind::StallNudge, nudge);
                 state.stall.nudge_count += 1;
                 if !quiet {
                     host.emit_headless_line(
@@ -804,15 +870,10 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             }
         }
 
-        // Compute context pressure from a fresh estimate that includes
-        // per-message overhead, calibrated system-prompt overhead, and
-        // (when available) measured tool-schema tokens — not the stale
-        // `last_measured_prompt_tokens` from the previous round.
-        //
-        // Using `estimate_tokens_precise` with the calibrated 14 000-token
-        // system-prompt default (vs. the legacy 3 000-token `FIXED_OVERHEAD`)
-        // keeps the 0.75 / 0.90 microcompact gates from firing too late and
-        // matches the pre-request accounting used by `/chat` budget pressure.
+        // Context pressure estimation + adaptive compaction.
+        // When pipeline_session is active, use its pressure model (predictive
+        // with reserves) and cascade-aware limits. Otherwise fall back to
+        // legacy inline estimation.
         let pressure = if state.max_turn_input_tokens > 0 {
             let fresh_estimate = crate::prompts::estimate_tokens_precise(
                 &state.messages,
@@ -824,16 +885,38 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             0.0
         };
 
+        // Pre-turn LLM compact: if pressure exceeds 80%, let the host run an
+        // optional cache-friendly inline-summary pass before the next LLM call.
+        // Server hosts can build the exact system prompt + history prefix;
+        // generic hosts keep the default no-op behavior. When it succeeds the
+        // host bumps `state.compact_tier_applied` so the later budget guard
+        // won't re-run mechanical compression.
+        if pressure >= 0.80
+            && state.compact_tier_applied < CompactionTier::CompactHistory
+            && state.messages.len() > 10
+        {
+            host.maybe_pre_turn_compact(state, pressure, quiet).await;
+        }
+
         // Adaptive microcompact: scale aggressiveness with context pressure.
-        // Use state-aware variant when SessionFacts has active files (pin list).
-        // Persist cleared content to disk when a session directory is available.
+        // When pipeline_session is active, cascade detection suppresses clearing
+        // to break infinite compaction loops.
+        let pipeline_allows_clearing = state
+            .pipeline_session
+            .as_ref()
+            .map(|sess| !sess.stats.has_compaction_cascade())
+            .unwrap_or(true);
+
         let strategy = state.compact_strategy;
         let session_dir = state.current_session_id.as_deref().and_then(|sid| {
             astra_services::local_session_artifact_store()
                 .session_dir(sid)
                 .ok()
         });
-        let mc = if !state.session_facts.active_files.is_empty() {
+        let mc = if !pipeline_allows_clearing {
+            // Cascade detected: skip clearing this turn to break the loop.
+            astra_turn_core::microcompact::CompactStats::default()
+        } else if !state.session_facts.active_files.is_empty() {
             astra_turn_core::microcompact::compact_tool_results_state_aware_with_persistence(
                 &mut state.messages,
                 pressure,
@@ -850,16 +933,31 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 session_dir.as_deref(),
             )
         };
-        if mc.results_compacted > 0 && !quiet {
-            host.emit_headless_line(
-                HeadlessStderrStyle::Dim,
-                format!(
-                    "  ♻ Compacted {} old tool result(s), ~{} tokens saved (pressure {:.0}%)",
-                    mc.results_compacted,
-                    mc.tokens_saved,
-                    pressure * 100.0,
-                ),
+        if mc.results_compacted > 0 {
+            if !quiet {
+                host.emit_headless_line(
+                    HeadlessStderrStyle::Dim,
+                    format!(
+                        "  ♻ Compacted {} old tool result(s), ~{} tokens saved (pressure {:.0}%)",
+                        mc.results_compacted,
+                        mc.tokens_saved,
+                        pressure * 100.0,
+                    ),
+                );
+            }
+            state.step_recorder.record_compaction(
+                mc.results_compacted as u32,
+                mc.tokens_saved as u64,
+                pressure,
             );
+            if let Some(ref mut sess) = state.pipeline_session {
+                sess.record_compaction_audit(
+                    "tool_result_clearing",
+                    mc.results_compacted.min(u32::MAX as usize) as u32,
+                    mc.tokens_saved.min(u32::MAX as usize) as u32,
+                );
+                sess.stats.record_compaction(mc.tokens_saved as u64);
+            }
         }
 
         // Re-estimate pressure after microcompact (messages may have shrunk).
@@ -900,6 +998,19 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                         post_mc_pressure * 100.0,
                     ),
                 );
+                // Record compression audit for pipeline journal
+                if let Some(ref mut sess) = state.pipeline_session {
+                    sess.record_compaction_audit(
+                        if post_mc_pressure >= 0.90 {
+                            "aggressive_compression"
+                        } else {
+                            "default_compression"
+                        },
+                        outcome.layer_results.len() as u32,
+                        outcome.total_tokens_freed.min(u32::MAX as u64) as u32,
+                    );
+                    sess.stats.record_compaction(outcome.total_tokens_freed);
+                }
             }
         }
     }
@@ -953,57 +1064,69 @@ mod tests {
     use serde_json::json;
 
     use crate::turn::agentic_loop_host::run_agentic_loop_with_host;
-    use crate::turn::agentic_loop_host::tests::{
-        MockHost, make_state, make_test_delegation_engine, text_result,
-    };
+    use crate::turn::agentic_loop_host::tests::{MockHost, make_state, text_result};
 
     use super::*;
 
-    #[tokio::test]
-    async fn auto_inject_delegate_schema_when_engine_present() {
-        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
-        let mut state = make_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "hello"}));
-        state.delegation_engine = Some(make_test_delegation_engine());
-
-        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        assert_eq!(host.injected_schemas.len(), 1);
-        let injected = &host.injected_schemas[0];
-        let name = injected["function"]["name"].as_str().unwrap();
-        assert_eq!(name, "delegate");
-        assert!(host.valid_tools.contains("delegate"));
+    #[test]
+    fn open_ended_file_exploration_detection_requires_file_and_loop_signal() {
+        assert!(is_open_ended_file_exploration(
+            "List files, read one, list again, then read again. Keep going."
+        ));
+        assert!(!is_open_ended_file_exploration(
+            "Read README.md and summarize it."
+        ));
+        assert!(!is_open_ended_file_exploration(
+            "Keep going on the implementation plan."
+        ));
+        assert!(!is_open_ended_file_exploration(
+            "Read the failing tests, keep going with the refactor until they pass."
+        ));
+        assert!(!is_open_ended_file_exploration(
+            "Read the design doc again, then write the implementation."
+        ));
     }
 
-    #[tokio::test]
-    async fn no_inject_when_delegation_engine_absent() {
-        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
+    #[test]
+    fn open_ended_file_exploration_budget_caps_turns_and_tools() {
         let mut state = make_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "hello"}));
+        state.message =
+            "List files using bash, read one, list again, then read again. Keep going.".into();
+        state.max_turns = 10;
+        state.remaining_turns = 10;
+        state.max_tools_per_turn = 15;
 
-        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(apply_open_ended_exploration_budget(&mut state));
 
-        assert!(host.injected_schemas.is_empty());
-        assert!(!host.valid_tools.contains("delegate"));
-    }
+        assert_eq!(state.max_turns, OPEN_ENDED_EXPLORATION_MAX_TURNS);
+        assert_eq!(state.remaining_turns, OPEN_ENDED_EXPLORATION_MAX_TURNS);
+        assert_eq!(
+            state.max_tools_per_turn,
+            OPEN_ENDED_EXPLORATION_MAX_TOOLS_PER_TURN
+        );
+        // Post-Task #45: exploration-budget message goes into the
+        // structured volatile lane, not state.messages. The singleton
+        // dedup in `push_volatile` enforces idempotence.
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .any(|inj| inj.content.contains("Open-ended file exploration budget")),
+            "expected exploration-budget injection in volatile lane; got {:?}",
+            state.volatile_pending,
+        );
 
-    #[tokio::test]
-    async fn injected_schema_matches_delegate_tool_schema() {
-        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
-        let mut state = make_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "hello"}));
-        state.delegation_engine = Some(make_test_delegation_engine());
-
-        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        let expected = delegate_tool_schema();
-        assert_eq!(host.injected_schemas[0], expected);
+        assert!(apply_open_ended_exploration_budget(&mut state));
+        let budget_entries = state
+            .volatile_pending
+            .iter()
+            .filter(|inj| inj.content == OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE)
+            .count();
+        assert_eq!(
+            budget_entries, 1,
+            "budget injection must be idempotent (singleton dedup); pending={:?}",
+            state.volatile_pending,
+        );
     }
 
     #[tokio::test]
@@ -1027,19 +1150,46 @@ mod tests {
             .await
             .expect("prepare next turn");
 
+        // Post-Task #45: working-set lives in the structured volatile lane,
+        // not in state.messages. The lane drains per LLM call so at
+        // prepare-turn time we see at most ONE pending entry (the
+        // current turn's snapshot) — second-call replace, not accumulate.
         let working_sets: Vec<_> = state
-            .messages
+            .volatile_pending
             .iter()
-            .filter_map(|m| m.get("content").and_then(serde_json::Value::as_str))
-            .filter(|content| content.starts_with("[working-set:v1]\n"))
+            .filter(|inj| inj.content.starts_with("[working-set:v1]\n"))
             .collect();
         assert_eq!(
             working_sets.len(),
             1,
-            "working set injection should be replaced, not accumulated"
+            "working set lane must hold exactly one entry per prepare cycle, \
+             got {} in pending={:?} and messages={:?}",
+            working_sets.len(),
+            state.volatile_pending,
+            state.messages,
         );
-        assert!(working_sets[0].contains("goal: continue fixing context continuity"));
-        assert!(working_sets[0].contains("- src/main.rs [write t1]"));
+        assert_eq!(
+            working_sets[0].kind,
+            super::super::agentic_loop_host::VolatileKind::WorkingSet,
+        );
+        assert!(
+            working_sets[0]
+                .content
+                .contains("goal: continue fixing context continuity")
+        );
+        assert!(working_sets[0].content.contains("- src/main.rs [write t1]"));
+        // And messages[] must stay clean of working-set content.
+        let msg_working_sets: Vec<_> = state
+            .messages
+            .iter()
+            .filter_map(|m| m.get("content").and_then(serde_json::Value::as_str))
+            .filter(|c| c.starts_with("[working-set:v1]\n"))
+            .collect();
+        assert!(
+            msg_working_sets.is_empty(),
+            "working-set must NEVER end up in state.messages (byte-stable \
+             history invariant); leaked into: {msg_working_sets:?}",
+        );
     }
 
     #[test]

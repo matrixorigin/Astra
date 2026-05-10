@@ -475,7 +475,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_three_triggers_fire_executor_thrice_and_return_three_diagnoses() {
+    async fn all_three_triggers_fire_executor_twice_with_dedup() {
+        // Stalls + repeated-corrections both map to `analyze_session`; the
+        // gate dedupes so only the first firing in the returned vec is
+        // kept. Budget pressure stays distinct. See commit dba1e945.
         let exec = Arc::new(
             StubExecutor::new()
                 .with(
@@ -493,26 +496,15 @@ mod tests {
                         "budget_pressure",
                         "prompt bloated",
                     )),
-                )
-                .with(
-                    "evaluate_session",
-                    Some(well_formed_reply(
-                        "evaluate_session",
-                        "repeated_corrections",
-                        "scope drift",
-                    )),
                 ),
         );
         let mut h = AutoInvokeHandler::new(exec.clone());
 
         let out = h.maybe_fire(&signals(5, 0.95, 5), Instant::now()).await;
-        assert_eq!(out.len(), 3);
+        assert_eq!(out.len(), 2);
         let skills: Vec<&str> = out.iter().map(|d| d.skill.as_str()).collect();
-        assert_eq!(
-            skills,
-            vec!["analyze_session", "optimize_prompt", "evaluate_session"],
-        );
-        assert_eq!(exec.calls().len(), 3);
+        assert_eq!(skills, vec!["analyze_session", "optimize_prompt"]);
+        assert_eq!(exec.calls().len(), 2);
     }
 
     #[tokio::test]
@@ -659,7 +651,7 @@ mod tests {
                 "budget_pressure",
             ),
             (
-                "evaluate_session",
+                "analyze_session",
                 AutoInvokeCause::RepeatedCorrections { count: 5 },
                 "repeated_corrections",
             ),
@@ -732,7 +724,7 @@ mod tests {
         let skills: std::collections::HashSet<&str> =
             out.iter().map(|d| d.skill.as_str()).collect();
         assert!(skills.contains("analyze_session"));
-        assert!(skills.contains("evaluate_session"));
+        assert!(skills.contains("analyze_session"));
         for diag in &out {
             assert_eq!(diag.schema_version, SKILL_DIAGNOSIS_SCHEMA_VERSION);
             assert_eq!(diag.source, DiagnosisSource::SyntheticFallback);
@@ -824,9 +816,9 @@ mod tests {
                     )),
                 )
                 .with(
-                    "evaluate_session",
+                    "analyze_session",
                     Some(well_formed_reply(
-                        "evaluate_session",
+                        "analyze_session",
                         "repeated_corrections",
                         "corrections",
                     )),
@@ -838,7 +830,7 @@ mod tests {
         let skills: std::collections::HashSet<&str> =
             out.iter().map(|d| d.skill.as_str()).collect();
         assert!(skills.contains("analyze_session"));
-        assert!(skills.contains("evaluate_session"));
+        assert!(skills.contains("analyze_session"));
     }
 
     // ── R5: unwired metric fail-safe ────────────────────────────────────────
