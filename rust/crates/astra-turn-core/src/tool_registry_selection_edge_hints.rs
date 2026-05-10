@@ -21,6 +21,79 @@ pub fn top_unpinned_tool_names_from_report(report: &SelectionReport, max: usize)
         .collect()
 }
 
+/// Parse scenario tags from a hint prefix like `[code_review,coding] rest of hint`.
+///
+/// Returns `(Some(tags), remaining_hint)` when the hint starts with `[tag1,tag2]`
+/// (comma-separated, whitespace-trimmed). Returns `(None, whole_hint)` when there
+/// is no recognized tag prefix — those hints are treated as unconditional.
+///
+/// This is used by [`apply_selector_hints_to_edge_profile`] to suppress hints that
+/// were learned under a different scenario than the current one (e.g. a
+/// `[code_review]` hint should not leak into a `coding` turn where it is noise).
+fn parse_hint_scenarios(hint: &str) -> (Option<Vec<&str>>, &str) {
+    let hint = hint.trim_start();
+    if !hint.starts_with('[') {
+        return (None, hint);
+    }
+    let Some(close) = hint.find(']') else {
+        return (None, hint);
+    };
+    let inside = &hint[1..close];
+    // Tags must be ident-ish (letters, digits, `_`, `-`, `,`, whitespace).
+    // Anything else → this isn't a scenario tag, just a regular bracketed hint.
+    if !inside
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ',' | ' ' | '\t'))
+    {
+        return (None, hint);
+    }
+    let tags: Vec<&str> = inside
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tags.is_empty() {
+        return (None, hint);
+    }
+    let remaining = hint[close + 1..].trim_start();
+    (Some(tags), remaining)
+}
+
+/// Decide whether a (possibly scenario-tagged) hint should be injected for the
+/// current scenario. Untagged hints are always kept (backward-compat). Tagged
+/// hints are kept iff `current_scenario` matches one of the declared tags
+/// (case-insensitive). When `current_scenario` is `None`, tagged hints are
+/// dropped — we have no way to know they apply.
+///
+/// Returns the hint body to inject (without the tag prefix), or `None` when
+/// the hint should be suppressed.
+pub fn hint_body_for_scenario<'a>(
+    hint: &'a str,
+    current_scenario: Option<&str>,
+) -> Option<&'a str> {
+    if hint.is_empty() {
+        return None;
+    }
+    let (tags, body) = parse_hint_scenarios(hint);
+    match tags {
+        None => Some(body),
+        Some(tags) => match current_scenario {
+            None => None,
+            Some(sc) => {
+                let sc_lower = sc.to_ascii_lowercase();
+                if tags
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(&sc_lower) || t.eq_ignore_ascii_case(sc))
+                {
+                    Some(body)
+                } else {
+                    None
+                }
+            }
+        },
+    }
+}
+
 /// Merge selector guidance into an existing `edge_profile` JSON object (mutates in place).
 pub fn apply_selector_hints_to_edge_profile(
     edge_profile: &mut Value,
@@ -45,10 +118,13 @@ pub fn apply_selector_hints_to_edge_profile(
     if !learned_context_hint.is_empty()
         && let Some(obj) = edge_profile.as_object_mut()
     {
-        obj.insert(
-            "learned_context_hint".to_string(),
-            json!(learned_context_hint),
-        );
+        let scenario = learned_task_type;
+        if let Some(body) = hint_body_for_scenario(learned_context_hint, scenario) {
+            obj.insert(
+                "learned_context_hint".to_string(),
+                json!(body),
+            );
+        }
     }
     if let Some(tt) = learned_task_type
         && let Some(obj) = edge_profile.as_object_mut()
@@ -116,6 +192,100 @@ mod tests {
         );
         assert_eq!(ep["learned_context_hint"], "hint");
         assert_eq!(ep["selection_task_type"], "fetch");
+    }
+
+    #[test]
+    fn untagged_hint_is_always_kept_for_backward_compat() {
+        // Plain hints with no `[scenario]` prefix must still inject regardless
+        // of the current scenario — otherwise existing learned hints would
+        // suddenly disappear after this change.
+        let mut ep = json!({});
+        apply_selector_hints_to_edge_profile(
+            &mut ep,
+            None,
+            ConfidenceInterval::exact(1.0),
+            "plain hint with no tag",
+            Some("code_review"),
+        );
+        assert_eq!(ep["learned_context_hint"], "plain hint with no tag");
+    }
+
+    #[test]
+    fn tagged_hint_kept_when_scenario_matches() {
+        let mut ep = json!({});
+        apply_selector_hints_to_edge_profile(
+            &mut ep,
+            None,
+            ConfidenceInterval::exact(1.0),
+            "[code_review] prefer grep over broad read_file",
+            Some("code_review"),
+        );
+        assert_eq!(
+            ep["learned_context_hint"],
+            "prefer grep over broad read_file",
+            "tag prefix must be stripped on injection"
+        );
+    }
+
+    #[test]
+    fn tagged_hint_dropped_when_scenario_mismatches() {
+        let mut ep = json!({});
+        apply_selector_hints_to_edge_profile(
+            &mut ep,
+            None,
+            ConfidenceInterval::exact(1.0),
+            "[code_review] prefer grep over broad read_file",
+            Some("coding"),
+        );
+        assert!(
+            ep.get("learned_context_hint").is_none(),
+            "hint learned under code_review must not leak into coding turn"
+        );
+    }
+
+    #[test]
+    fn tagged_hint_dropped_when_scenario_missing() {
+        let mut ep = json!({});
+        apply_selector_hints_to_edge_profile(
+            &mut ep,
+            None,
+            ConfidenceInterval::exact(1.0),
+            "[code_review] hint body",
+            None,
+        );
+        assert!(
+            ep.get("learned_context_hint").is_none(),
+            "no current scenario → tagged hint has no way to verify applicability → drop"
+        );
+    }
+
+    #[test]
+    fn tagged_hint_with_multiple_tags_matches_any() {
+        let mut ep = json!({});
+        apply_selector_hints_to_edge_profile(
+            &mut ep,
+            None,
+            ConfidenceInterval::exact(1.0),
+            "[code_review, coding] hint body",
+            Some("coding"),
+        );
+        assert_eq!(ep["learned_context_hint"], "hint body");
+    }
+
+    #[test]
+    fn non_scenario_bracket_prefix_is_treated_as_body() {
+        // `[P1]` is not ident-only but contains punctuation we don't allow — treat
+        // as regular prose, not a scenario tag.
+        let mut ep = json!({});
+        apply_selector_hints_to_edge_profile(
+            &mut ep,
+            None,
+            ConfidenceInterval::exact(1.0),
+            "[P1!] urgent hint",
+            Some("coding"),
+        );
+        // The `!` makes it non-ident → parse_hint_scenarios returns None → keep whole body.
+        assert_eq!(ep["learned_context_hint"], "[P1!] urgent hint");
     }
 
     #[test]
