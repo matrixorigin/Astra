@@ -4,6 +4,7 @@ pub mod agent_lessons;
 pub mod agents;
 pub mod auth;
 pub mod branches;
+pub mod config_version_cloud;
 pub mod context;
 pub mod contract_generator;
 pub mod coordination;

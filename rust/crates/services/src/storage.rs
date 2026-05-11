@@ -1449,6 +1449,18 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
+    // ─── Content-addressed config versions (Step 4a) ────────────────────────────
+    //
+    // One row per unique RuntimeConfig hash per tenant. Populated by
+    // the CLI via enqueue_journal_events → IngestionEvent::ConfigVersionSaved,
+    // consumed by `astra config sync pull` on new machines. See
+    // `crate::config_version_cloud` for the DDL string and bind helpers
+    // that the push / pull pipeline uses.
+
+    query(crate::config_version_cloud::CONFIG_VERSIONS_CREATE_SQL)
+        .execute(&pool)
+        .await?;
+
     // ─── Schema migration tracking ──────────────────────────────────────────────
 
     query(
@@ -1623,6 +1635,29 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
          ADD COLUMN trace_id VARCHAR(64) DEFAULT NULL, \
          ADD COLUMN message_count INT DEFAULT NULL, \
          ADD INDEX idx_csl_turn (session_id, turn)",
+    )
+    .await?;
+
+    // Step 4a — content-addressed config versions.
+    //
+    // Two migrations so fresh DBs get everything via the CREATE TABLE
+    // above and existing DBs catch up here.
+
+    run_migration(
+        pool,
+        10,
+        "create config_versions table (Step 4a cloud mirror of local version store)",
+        crate::config_version_cloud::CONFIG_VERSIONS_CREATE_SQL,
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        11,
+        "add config_version_id pointer to agent_sessions",
+        "ALTER TABLE agent_sessions \
+         ADD COLUMN config_version_id VARCHAR(24) DEFAULT NULL, \
+         ADD INDEX idx_agent_sessions_config_version (config_version_id)",
     )
     .await?;
 

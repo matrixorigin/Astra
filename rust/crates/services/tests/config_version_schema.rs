@@ -26,8 +26,8 @@
 //! final column set.
 
 use astra_services::config_version_cloud::{
-    CONFIG_VERSIONS_CREATE_SQL, config_versions_insert_params, parse_config_version_row,
-    ConfigVersionRow,
+    CONFIG_VERSIONS_CREATE_SQL, ConfigVersionRow, config_versions_insert_params,
+    parse_config_version_row,
 };
 
 #[test]
