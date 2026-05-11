@@ -1,5 +1,6 @@
 pub(crate) mod busy_view;
 pub(crate) mod chat_composer;
+pub(crate) mod config_edit_view;
 pub(crate) mod context_panel_view;
 pub(crate) mod footer;
 pub(crate) mod help_view;
@@ -18,6 +19,8 @@ pub(crate) mod worktrees_view;
 
 #[cfg(test)]
 mod approval_integration_tests;
+#[cfg(test)]
+mod config_edit_tests;
 #[cfg(test)]
 mod hint_tests;
 #[cfg(test)]
