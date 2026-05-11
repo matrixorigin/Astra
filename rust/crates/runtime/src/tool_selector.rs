@@ -910,11 +910,17 @@ pub fn prune_schema(mut schema: Value, level: PruneLevel) -> Value {
     schema
 }
 
-/// Collect every field name that's required by *any* branch of the
-/// schema — top-level `required` plus every `allOf[].then.required`
-/// block. Used by AggressivePrune so consolidated tools don't lose
-/// their per-action required properties when the aggressive tier
-/// strips "optional" properties.
+/// Collect every field name that's required by *any* action of the
+/// schema — top-level `required` plus every field listed under
+/// `x-astra-per-action-required` (shape: `{action: [fields]}`).
+/// Used by AggressivePrune so consolidated tools don't lose their
+/// per-action required properties when the aggressive tier strips
+/// "optional" properties.
+///
+/// See [`astra_turn_core::tool_schema_prune::collect_required_union`]
+/// for the full rationale — Anthropic/Bedrock reject top-level
+/// `allOf` in `input_schema`, so per-action required lives in a
+/// vendor-prefixed extension instead.
 fn collect_schema_required_union(params: &Value) -> std::collections::HashSet<String> {
     let mut union = std::collections::HashSet::new();
     if let Some(arr) = params.get("required").and_then(Value::as_array) {
@@ -924,13 +930,12 @@ fn collect_schema_required_union(params: &Value) -> std::collections::HashSet<St
             }
         }
     }
-    if let Some(branches) = params.get("allOf").and_then(Value::as_array) {
-        for branch in branches {
-            if let Some(arr) = branch
-                .get("then")
-                .and_then(|t| t.get("required"))
-                .and_then(Value::as_array)
-            {
+    if let Some(map) = params
+        .get("x-astra-per-action-required")
+        .and_then(Value::as_object)
+    {
+        for (_action, fields) in map {
+            if let Some(arr) = fields.as_array() {
                 for v in arr {
                     if let Some(s) = v.as_str() {
                         union.insert(s.to_string());

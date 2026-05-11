@@ -1093,6 +1093,13 @@ fn build_bedrock_tools(tools: &[Value]) -> Vec<Value> {
 /// type, description, properties, required, items, enum.
 /// Fields like "default", "minimum", "maximum", "minItems", "maxItems",
 /// "pattern", "format" cause HTTP 400 "The provided request is not valid".
+///
+/// Also strips top-level composition keywords (`allOf`/`oneOf`/`anyOf`)
+/// which Bedrock rejects with "input_schema does not support oneOf,
+/// allOf, or anyOf at the top level", and the `x-astra-per-action-required`
+/// vendor extension we use internally for per-action required hints
+/// (stripped defensively — providers should ignore `x-` keys, but
+/// some strict validators don't).
 fn strip_unsupported_schema_fields(value: &mut Value) {
     const UNSUPPORTED: &[&str] = &[
         "default",
@@ -1106,6 +1113,13 @@ fn strip_unsupported_schema_fields(value: &mut Value) {
         "title",
         "$schema",
         "additionalProperties",
+        "allOf",
+        "oneOf",
+        "anyOf",
+        "if",
+        "then",
+        "else",
+        "x-astra-per-action-required",
     ];
     if let Some(obj) = value.as_object_mut() {
         for key in UNSUPPORTED {
@@ -1777,7 +1791,15 @@ fn build_anthropic_tools(tools: &[Value]) -> Vec<Value> {
         .iter()
         .filter_map(|tool| {
             if tool.get("name").is_some() && tool.get("input_schema").is_some() {
-                return Some(tool.clone());
+                // Pre-shaped native Anthropic tool — still strip
+                // composition keywords + the `x-astra-…`
+                // extension in case the schema came from our
+                // consolidated tool registry.
+                let mut out = tool.clone();
+                if let Some(schema) = out.get_mut("input_schema") {
+                    strip_unsupported_schema_fields(schema);
+                }
+                return Some(out);
             }
             let function = tool.get("function")?.as_object()?;
             let name = function.get("name")?.clone();
@@ -1786,13 +1808,18 @@ fn build_anthropic_tools(tools: &[Value]) -> Vec<Value> {
             if let Some(description) = function.get("description").cloned() {
                 out.insert("description".to_string(), description);
             }
-            out.insert(
-                "input_schema".to_string(),
-                function
-                    .get("parameters")
-                    .cloned()
-                    .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
-            );
+            let mut input_schema = function
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            // Strip keywords Anthropic rejects at the top level
+            // (allOf/oneOf/anyOf) and our internal vendor extension
+            // (x-astra-per-action-required). Anthropic tolerates the
+            // other "unsupported" fields (default/minimum/etc.) —
+            // but the helper is shared and idempotent, so we just
+            // call it.
+            strip_unsupported_schema_fields(&mut input_schema);
+            out.insert("input_schema".to_string(), input_schema);
             if let Some(cache_control) = tool.get("cache_control").cloned() {
                 out.insert("cache_control".to_string(), cache_control);
             }
@@ -8226,6 +8253,83 @@ mod tests {
         );
         // "required" at top level must survive
         assert_eq!(schema["required"], json!(["max_turns"]));
+    }
+
+    #[test]
+    fn bedrock_tools_strip_top_level_composition_and_vendor_extensions() {
+        // Regression (session 2026-05-12): Bedrock returned
+        // HTTP 400 "input_schema does not support oneOf, allOf, or
+        // anyOf at the top level" because the consolidated `agent`
+        // schema had an `allOf` block for per-action required
+        // fields. We moved the per-action required into the
+        // vendor-prefixed `x-astra-per-action-required` extension
+        // and defensively strip both from the wire representation.
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "agent",
+                "description": "Multi-agent ops",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["spawn", "delegate"]},
+                        "description": {"type": "string"},
+                        "prompt": {"type": "string"}
+                    },
+                    "required": ["action"],
+                    "allOf": [
+                        {"if": {"properties": {"action": {"const": "spawn"}}},
+                         "then": {"required": ["description", "prompt"]}}
+                    ],
+                    "oneOf": [{"required": ["description"]}],
+                    "anyOf": [{"required": ["prompt"]}],
+                    "x-astra-per-action-required": {"spawn": ["description", "prompt"]}
+                }
+            }
+        })];
+        let bedrock = build_bedrock_tools(&tools);
+        let schema = &bedrock[0]["toolSpec"]["inputSchema"]["json"];
+        assert!(schema.get("allOf").is_none(), "allOf must be stripped");
+        assert!(schema.get("oneOf").is_none(), "oneOf must be stripped");
+        assert!(schema.get("anyOf").is_none(), "anyOf must be stripped");
+        assert!(
+            schema.get("x-astra-per-action-required").is_none(),
+            "internal vendor extension must not leak to the wire"
+        );
+        // Top-level required + properties + enum must survive.
+        assert_eq!(schema["required"], json!(["action"]));
+        assert!(schema["properties"]["action"].get("enum").is_some());
+    }
+
+    #[test]
+    fn anthropic_tools_strip_top_level_composition_and_vendor_extensions() {
+        // Same contract for the native Anthropic path — the
+        // Messages API (non-Bedrock) rejects top-level allOf too.
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "agent",
+                "description": "Multi-agent ops",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string"},
+                        "description": {"type": "string"}
+                    },
+                    "required": ["action"],
+                    "allOf": [{"required": ["description"]}],
+                    "x-astra-per-action-required": {"spawn": ["description"]}
+                }
+            }
+        })];
+        let mapped = build_anthropic_tools(&tools);
+        let schema = &mapped[0]["input_schema"];
+        assert!(schema.get("allOf").is_none(), "allOf must be stripped");
+        assert!(
+            schema.get("x-astra-per-action-required").is_none(),
+            "internal vendor extension must not leak to the wire"
+        );
+        assert_eq!(schema["required"], json!(["action"]));
     }
 
     // --- Regression: max_completion_tokens bump respects user's ceiling ---

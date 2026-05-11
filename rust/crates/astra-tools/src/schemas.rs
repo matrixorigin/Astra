@@ -364,7 +364,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "git",
-                "description": "Git operations. Per-action required fields enforced via allOf: commit→message, revert_commit→commit_sha, file_history→file, log_search→query, stash→sub_action, checkout_file→path+ref. Other actions have no extra required fields.",
+                "description": "Git operations. Per-action required fields: commit→message, revert_commit→commit_sha, file_history→file, log_search→query, stash→sub_action, checkout_file→path+ref. Other actions have no extra required fields.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -435,22 +435,15 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         }
                     },
                     "required": ["action"],
-                    "allOf": [
-                        {"if": {"properties": {"action": {"const": "commit"}}, "required": ["action"]},
-                         "then": {"required": ["message"]}},
-                        {"if": {"properties": {"action": {"const": "revert_commit"}}, "required": ["action"]},
-                         "then": {"required": ["commit_sha"]}},
-                        {"if": {"properties": {"action": {"const": "file_history"}}, "required": ["action"]},
-                         "then": {"required": ["file"]}},
-                        {"if": {"properties": {"action": {"const": "log_search"}}, "required": ["action"]},
-                         "then": {"required": ["query"]}},
-                        {"if": {"properties": {"action": {"const": "stash"}}, "required": ["action"]},
-                         "then": {"required": ["sub_action"]}},
-                        {"if": {"properties": {"action": {"const": "checkout_file"}}, "required": ["action"]},
-                         "then": {"required": ["path", "ref"]}},
-                        {"if": {"properties": {"action": {"const": "worktree"}}, "required": ["action"]},
-                         "then": {"required": ["sub_action"]}}
-                    ]
+                    "x-astra-per-action-required": {
+                        "commit": ["message"],
+                        "revert_commit": ["commit_sha"],
+                        "file_history": ["file"],
+                        "log_search": ["query"],
+                        "stash": ["sub_action"],
+                        "checkout_file": ["path", "ref"],
+                        "worktree": ["sub_action"]
+                    }
                 }
             }
         }),
@@ -458,7 +451,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "github",
-                "description": "GitHub operations. Per-action required fields enforced via allOf: get_pr/ci_status→pr_number, get_issue→issue_number, create_issue→title. `repo` (owner/name or bare name) is inferred from git remote when omitted.",
+                "description": "GitHub operations. Per-action required fields: get_pr/ci_status→pr_number, get_issue→issue_number, create_issue→title. `repo` (owner/name or bare name) is inferred from git remote when omitted.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -473,16 +466,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "detail": {"type": "string", "enum": ["minimal","normal","full"], "description": "Response verbosity. Default normal."}
                     },
                     "required": ["action"],
-                    "allOf": [
-                        {"if": {"properties": {"action": {"const": "get_pr"}}, "required": ["action"]},
-                         "then": {"required": ["pr_number"]}},
-                        {"if": {"properties": {"action": {"const": "ci_status"}}, "required": ["action"]},
-                         "then": {"required": ["pr_number"]}},
-                        {"if": {"properties": {"action": {"const": "get_issue"}}, "required": ["action"]},
-                         "then": {"required": ["issue_number"]}},
-                        {"if": {"properties": {"action": {"const": "create_issue"}}, "required": ["action"]},
-                         "then": {"required": ["title"]}}
-                    ]
+                    "x-astra-per-action-required": {
+                        "get_pr": ["pr_number"],
+                        "ci_status": ["pr_number"],
+                        "get_issue": ["issue_number"],
+                        "create_issue": ["title"]
+                    }
                 }
             }
         }),
@@ -490,7 +479,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Memory operations. Per-action required fields enforced via allOf: store→content; retrieve/search→query; correct→new_content+reason (plus `memory_id` OR `query` to target); feedback→memory_id+signal. `purge` needs either `memory_id` or `topic` (not schema-enforced — document level).",
+                "description": "Memory operations. Per-action required fields: store→content; retrieve/search→query; correct→new_content+reason (plus `memory_id` OR `query` to target); feedback→memory_id+signal. `purge` needs either `memory_id` or `topic` (not schema-enforced — document level).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -508,18 +497,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "agent_type": {"type": "string", "description": "Scope to a specific agent type (explore, code-review, task, general-purpose). When set on store, tags the memory; on retrieve/search, filters to only that type's memories + unscoped globals."}
                     },
                     "required": ["action"],
-                    "allOf": [
-                        {"if": {"properties": {"action": {"const": "store"}}, "required": ["action"]},
-                         "then": {"required": ["content"]}},
-                        {"if": {"properties": {"action": {"const": "retrieve"}}, "required": ["action"]},
-                         "then": {"required": ["query"]}},
-                        {"if": {"properties": {"action": {"const": "search"}}, "required": ["action"]},
-                         "then": {"required": ["query"]}},
-                        {"if": {"properties": {"action": {"const": "correct"}}, "required": ["action"]},
-                         "then": {"required": ["new_content", "reason"]}},
-                        {"if": {"properties": {"action": {"const": "feedback"}}, "required": ["action"]},
-                         "then": {"required": ["memory_id", "signal"]}}
-                    ]
+                    "x-astra-per-action-required": {
+                        "store": ["content"],
+                        "retrieve": ["query"],
+                        "search": ["query"],
+                        "correct": ["new_content", "reason"],
+                        "feedback": ["memory_id", "signal"]
+                    }
                 }
             }
         }),
@@ -527,7 +511,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle and introspection. Per-action required fields enforced via allOf: config→path+value; prioritize/deprioritize→tool; ask_user→question; tool_search→query. Other actions (compact, rollback_edits, sleep, timeline, summary, history) have no extra required fields.",
+                "description": "Session lifecycle and introspection. Per-action required fields: config→path+value; prioritize/deprioritize→tool; ask_user→question; tool_search→query. Other actions (compact, rollback_edits, sleep, timeline, summary, history) have no extra required fields.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -549,18 +533,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "max_results": {"type": "integer", "description": "Max results (tool_search, default 5)."}
                     },
                     "required": ["action"],
-                    "allOf": [
-                        {"if": {"properties": {"action": {"const": "config"}}, "required": ["action"]},
-                         "then": {"required": ["path", "value"]}},
-                        {"if": {"properties": {"action": {"const": "prioritize"}}, "required": ["action"]},
-                         "then": {"required": ["tool"]}},
-                        {"if": {"properties": {"action": {"const": "deprioritize"}}, "required": ["action"]},
-                         "then": {"required": ["tool"]}},
-                        {"if": {"properties": {"action": {"const": "ask_user"}}, "required": ["action"]},
-                         "then": {"required": ["question"]}},
-                        {"if": {"properties": {"action": {"const": "tool_search"}}, "required": ["action"]},
-                         "then": {"required": ["query"]}}
-                    ]
+                    "x-astra-per-action-required": {
+                        "config": ["path", "value"],
+                        "prioritize": ["tool"],
+                        "deprioritize": ["tool"],
+                        "ask_user": ["question"],
+                        "tool_search": ["query"]
+                    }
                 }
             }
         }),
@@ -568,7 +547,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "mo",
-                "description": "MatrixOne database operations. Per-action required fields enforced via allOf: query→sql; snapshot/branch→sub_action (create/list/drop/restore). For sub_action=create/drop/restore on snapshot, `name` is required.",
+                "description": "MatrixOne database operations. Per-action required fields: query→sql; snapshot/branch→sub_action (create/list/drop/restore). For sub_action=create/drop/restore on snapshot, `name` is required.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -579,14 +558,11 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "database": {"type": "string", "description": "Target database name (snapshot scope). Defaults to current."}
                     },
                     "required": ["action"],
-                    "allOf": [
-                        {"if": {"properties": {"action": {"const": "query"}}, "required": ["action"]},
-                         "then": {"required": ["sql"]}},
-                        {"if": {"properties": {"action": {"const": "snapshot"}}, "required": ["action"]},
-                         "then": {"required": ["sub_action"]}},
-                        {"if": {"properties": {"action": {"const": "branch"}}, "required": ["action"]},
-                         "then": {"required": ["sub_action"]}}
-                    ]
+                    "x-astra-per-action-required": {
+                        "query": ["sql"],
+                        "snapshot": ["sub_action"],
+                        "branch": ["sub_action"]
+                    }
                 }
             }
         }),
@@ -594,7 +570,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agent",
-                "description": "Multi-agent operations. Per-action required fields are enforced via `allOf`/`if-then` — spawn requires `description`+`prompt`; delegate requires `task`; run_chain requires `steps`; get_result requires `agent_id`; send_message requires `to`+`message`.",
+                "description": "Multi-agent operations. Per-action required fields: spawn requires `description`+`prompt`; delegate requires `task`; run_chain requires `steps`; get_result requires `agent_id`; send_message requires `to`+`message`.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -618,18 +594,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "priority": {"type": "string", "enum": ["low","normal","high"]}
                     },
                     "required": ["action"],
-                    "allOf": [
-                        {"if": {"properties": {"action": {"const": "spawn"}}, "required": ["action"]},
-                         "then": {"required": ["description", "prompt"]}},
-                        {"if": {"properties": {"action": {"const": "delegate"}}, "required": ["action"]},
-                         "then": {"required": ["task"]}},
-                        {"if": {"properties": {"action": {"const": "run_chain"}}, "required": ["action"]},
-                         "then": {"required": ["steps"]}},
-                        {"if": {"properties": {"action": {"const": "get_result"}}, "required": ["action"]},
-                         "then": {"required": ["agent_id"]}},
-                        {"if": {"properties": {"action": {"const": "send_message"}}, "required": ["action"]},
-                         "then": {"required": ["to", "message"]}}
-                    ]
+                    "x-astra-per-action-required": {
+                        "spawn": ["description", "prompt"],
+                        "delegate": ["task"],
+                        "run_chain": ["steps"],
+                        "get_result": ["agent_id"],
+                        "send_message": ["to", "message"]
+                    }
                 }
             }
         }),
@@ -686,7 +657,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task",
-                "description": "Track work progress for multi-step tasks. Per-action required fields enforced via allOf: create→title; update/get/stop→task_id.",
+                "description": "Track work progress for multi-step tasks. Per-action required fields: create→title; update/get/stop→task_id.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -722,16 +693,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "error_message": {"type": "string", "description": "(update) Reason for failure"}
                     },
                     "required": ["action"],
-                    "allOf": [
-                        {"if": {"properties": {"action": {"const": "create"}}, "required": ["action"]},
-                         "then": {"required": ["title"]}},
-                        {"if": {"properties": {"action": {"const": "update"}}, "required": ["action"]},
-                         "then": {"required": ["task_id"]}},
-                        {"if": {"properties": {"action": {"const": "get"}}, "required": ["action"]},
-                         "then": {"required": ["task_id"]}},
-                        {"if": {"properties": {"action": {"const": "stop"}}, "required": ["action"]},
-                         "then": {"required": ["task_id"]}}
-                    ]
+                    "x-astra-per-action-required": {
+                        "create": ["title"],
+                        "update": ["task_id"],
+                        "get": ["task_id"],
+                        "stop": ["task_id"]
+                    }
                 }
             }
         }),

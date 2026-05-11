@@ -204,26 +204,42 @@ fn tool_schema<'a>(schemas: &'a [serde_json::Value], name: &str) -> &'a serde_js
 }
 
 /// Returns the list of field names that are required when `action ==
-/// target_action`, by inspecting `parameters.allOf[].then.required`
-/// branches whose `if.properties.action.const == target_action`.
+/// target_action`, by inspecting the
+/// `parameters["x-astra-per-action-required"]` extension map. This
+/// replaces the previous `allOf` block — Anthropic/Bedrock reject
+/// `allOf` at the top level of `input_schema`, so per-action
+/// required fields live in a vendor-prefixed extension that
+/// providers ignore but our prune code honours.
 fn conditional_required_for(schema: &serde_json::Value, target_action: &str) -> Vec<String> {
-    let all_of = schema["function"]["parameters"]["allOf"]
+    schema["function"]["parameters"]["x-astra-per-action-required"][target_action]
         .as_array()
         .cloned()
-        .unwrap_or_default();
-    for branch in all_of {
-        let action_const = branch["if"]["properties"]["action"]["const"].as_str();
-        if action_const == Some(target_action) {
-            return branch["then"]["required"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect()
+}
+
+/// Anthropic/Bedrock Messages API rejects `tools[].input_schema`
+/// that contains `allOf`, `oneOf`, or `anyOf` at the top level
+/// (HTTP 400: "input_schema does not support oneOf, allOf, or anyOf
+/// at the top level"). Regression guard: every tool schema's
+/// `parameters` object must be free of these three keys.
+#[test]
+fn no_schema_uses_top_level_composition_keywords() {
+    for schema in all_tool_schemas() {
+        let name = schema["function"]["name"].as_str().unwrap_or("<unnamed>");
+        let params = &schema["function"]["parameters"];
+        for banned in &["allOf", "oneOf", "anyOf"] {
+            assert!(
+                params.get(*banned).is_none(),
+                "tool `{name}` parameters contain top-level `{banned}`, which \
+                 Anthropic/Bedrock reject with HTTP 400. Encode per-action required \
+                 fields via the `x-astra-per-action-required` extension + description \
+                 prose instead."
+            );
         }
     }
-    Vec::new()
 }
 
 #[test]

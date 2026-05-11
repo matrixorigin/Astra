@@ -120,16 +120,19 @@ fn strip_optional_params(func: &mut Value) {
     }
 }
 
-/// Collect every field name that's required by *any* branch of the
-/// schema — top-level `required`, plus `allOf[].then.required` for
-/// consolidated tools that express per-action required fields via
-/// JSON-Schema conditionals (e.g. the `agent` tool requires
-/// `description`+`prompt` only when `action=="spawn"`).
+/// Collect every field name that's required by *any* action of the
+/// schema — top-level `required` plus every field name listed in the
+/// `x-astra-per-action-required` vendor-prefixed extension map
+/// (shape: `{"action_name": ["field1", "field2"], ...}`).
 ///
-/// The union matters for `AggressivePrune`: if we took only the
-/// top-level `required` list we'd strip `description` etc. off
-/// `agent`'s properties, and the LLM would be unable to spawn a
-/// sub-agent under context pressure.
+/// Background: we originally encoded per-action required fields via
+/// JSON-Schema `allOf + if/then/required`, but Anthropic/Bedrock
+/// reject those keywords at the top level of `input_schema` (HTTP
+/// 400: "input_schema does not support oneOf, allOf, or anyOf at
+/// the top level"). The vendor-prefixed extension (`x-...`) is
+/// ignored by providers but honoured here so `AggressivePrune`
+/// doesn't strip per-action required properties when the LLM is
+/// under context pressure.
 fn collect_required_union(params: &serde_json::Map<String, Value>) -> HashSet<String> {
     let mut union: HashSet<String> = HashSet::new();
     if let Some(arr) = params.get("required").and_then(Value::as_array) {
@@ -139,13 +142,12 @@ fn collect_required_union(params: &serde_json::Map<String, Value>) -> HashSet<St
             }
         }
     }
-    if let Some(branches) = params.get("allOf").and_then(Value::as_array) {
-        for branch in branches {
-            let then = branch.get("then");
-            if let Some(arr) = then
-                .and_then(|t| t.get("required"))
-                .and_then(Value::as_array)
-            {
+    if let Some(map) = params
+        .get("x-astra-per-action-required")
+        .and_then(Value::as_object)
+    {
+        for (_action, fields) in map {
+            if let Some(arr) = fields.as_array() {
                 for v in arr {
                     if let Some(s) = v.as_str() {
                         union.insert(s.to_string());
@@ -434,10 +436,12 @@ mod tests {
     }
 
     #[test]
-    fn prune_aggressive_keeps_allof_conditional_required_fields() {
+    fn prune_aggressive_keeps_per_action_required_fields() {
         // Regression: consolidated tools express per-action required
-        // via `allOf[].then.required`. If AggressivePrune only looked
-        // at top-level `required`, the LLM would lose the ability to
+        // via the `x-astra-per-action-required` vendor extension
+        // (moved from `allOf` because Bedrock HTTP 400s on top-level
+        // allOf/oneOf/anyOf). If AggressivePrune only looked at
+        // top-level `required`, the LLM would lose the ability to
         // call `agent spawn` (description/prompt stripped), `git
         // commit` (message stripped), etc. under context pressure.
         let tool = json!({
@@ -455,18 +459,16 @@ mod tests {
                         "background": {"type": "boolean"}
                     },
                     "required": ["action"],
-                    "allOf": [
-                        {"if": {"properties": {"action": {"const": "spawn"}}, "required": ["action"]},
-                         "then": {"required": ["description", "prompt"]}},
-                        {"if": {"properties": {"action": {"const": "delegate"}}, "required": ["action"]},
-                         "then": {"required": ["task"]}}
-                    ]
+                    "x-astra-per-action-required": {
+                        "spawn": ["description", "prompt"],
+                        "delegate": ["task"]
+                    }
                 }
             }
         });
         let result = prune_tool_schemas(&[tool], CompactionTier::AggressivePrune);
         let props = &result[0]["function"]["parameters"]["properties"];
-        // Union of all `then.required` across branches must survive
+        // Union of every per-action required list must survive
         // pruning even though they aren't in top-level `required`.
         assert!(
             props.get("description").is_some(),
