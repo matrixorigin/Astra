@@ -4,8 +4,12 @@
 
 use super::model::{CategoryKind, ContextBreakdown, PressureBand};
 use astra_turn_core::context_assembly_trace::{
-    ContextAssemblyTrace, MemorySelection, MemorySource, SkillInjection, SystemPromptBreakdown,
-    TokenBudgetTrace, ToolSelected,
+    CompressionMethod, ContextAssemblyTrace, HistorySelectionTrace, MemorySelection, MemorySource,
+    SkillInjection, SystemPromptBreakdown, TokenBudgetTrace, ToolSelected, TurnCompression,
+    TurnRetention,
+};
+use astra_turn_core::skill_selector_metrics::{
+    SkillSelectorShortlistEntry, SkillSelectorShortlistTrace,
 };
 
 fn trace(max: u32, sys: u32, hist: u32, mem: u32, tools: u32, user: u32) -> ContextAssemblyTrace {
@@ -261,6 +265,131 @@ fn skills_sorted_desc_by_tokens() {
     let b = ContextBreakdown::from_trace(&t);
     let names: Vec<&str> = b.skills.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, vec!["huge", "tiny"]);
+}
+
+// ─── Skill-selector fallback ──────────────────────────────────────
+
+#[test]
+fn skills_fall_back_to_selector_shortlist_when_no_injected_tokens() {
+    // Runtime recorded a selector shortlist but never populated
+    // `skills_injected` with per-skill token counts. The panel
+    // should still show the shortlist names so the user knows
+    // which skills were considered.
+    let mut t = trace(100_000, 1_000, 1_000, 0, 0, 0);
+    t.skill_selector = Some(SkillSelectorShortlistTrace {
+        open_catalog: false,
+        visible_skill_count: 2,
+        skills: vec![
+            SkillSelectorShortlistEntry {
+                rank: 1,
+                skill_name: "review_changes".into(),
+                aliases: Vec::new(),
+                description: "Review code changes".into(),
+                source: "built-in".into(),
+                category: None,
+            },
+            SkillSelectorShortlistEntry {
+                rank: 2,
+                skill_name: "verify_task".into(),
+                aliases: Vec::new(),
+                description: "Verify task completion".into(),
+                source: "built-in".into(),
+                category: None,
+            },
+        ],
+        telemetry: Default::default(),
+    });
+    let b = ContextBreakdown::from_trace(&t);
+    let names: Vec<&str> = b.skills.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["review_changes", "verify_task"]);
+    assert!(
+        b.skills.iter().all(|s| s.tokens == 0),
+        "shortlist fallback carries no token counts",
+    );
+}
+
+#[test]
+fn injected_skills_take_precedence_over_shortlist_fallback() {
+    // When both present, the rich `skills_injected` data wins.
+    let mut t = trace(100_000, 1_000, 1_000, 0, 0, 0);
+    t.system_prompt = SystemPromptBreakdown {
+        skills_injected: vec![SkillInjection {
+            skill_name: "real_skill".into(),
+            skill_version: None,
+            tokens: 400,
+            selection_reason: String::new(),
+        }],
+        ..SystemPromptBreakdown::default()
+    };
+    t.skill_selector = Some(SkillSelectorShortlistTrace {
+        open_catalog: false,
+        visible_skill_count: 1,
+        skills: vec![SkillSelectorShortlistEntry {
+            rank: 1,
+            skill_name: "fallback_only".into(),
+            aliases: Vec::new(),
+            description: String::new(),
+            source: "built-in".into(),
+            category: None,
+        }],
+        telemetry: Default::default(),
+    });
+    let b = ContextBreakdown::from_trace(&t);
+    let names: Vec<&str> = b.skills.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["real_skill"]);
+    assert_eq!(b.skills[0].tokens, 400);
+}
+
+// ─── History summary ───────────────────────────────────────────────
+
+#[test]
+fn history_summary_counts_retained_compressed_dropped() {
+    let mut t = trace(100_000, 1_000, 5_000, 0, 0, 0);
+    t.history = HistorySelectionTrace {
+        total_turns_available: 10,
+        turns_retained: vec![TurnRetention {
+            turn_index: 0,
+            role: "user".into(),
+            tokens: 200,
+            has_tool_calls: false,
+        }],
+        turns_compressed: vec![
+            TurnCompression {
+                turn_index: 1,
+                role: "assistant".into(),
+                original_tokens: 400,
+                compressed_tokens: 80,
+                compression_method: CompressionMethod::ReactiveCompact,
+                information_lost: Vec::new(),
+            },
+            TurnCompression {
+                turn_index: 2,
+                role: "assistant".into(),
+                original_tokens: 300,
+                compressed_tokens: 60,
+                compression_method: CompressionMethod::ReactiveCompact,
+                information_lost: Vec::new(),
+            },
+        ],
+        turns_dropped: vec![3, 4, 5],
+        compression_ratio: 0.2,
+        tokens_before: 10_000,
+        tokens_after: 2_000,
+    };
+    let b = ContextBreakdown::from_trace(&t);
+    assert_eq!(b.history.total_turns, 10);
+    assert_eq!(b.history.retained, 1);
+    assert_eq!(b.history.compressed, 2);
+    assert_eq!(b.history.dropped, 3);
+    assert_eq!(b.history.tokens_before, 10_000);
+    assert_eq!(b.history.tokens_after, 2_000);
+}
+
+#[test]
+fn history_summary_is_empty_when_trace_has_no_history_data() {
+    let t = trace(100_000, 1_000, 5_000, 0, 0, 0);
+    let b = ContextBreakdown::from_trace(&t);
+    assert!(b.history.is_empty());
 }
 
 #[test]

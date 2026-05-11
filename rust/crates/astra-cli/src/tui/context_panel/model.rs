@@ -18,6 +18,7 @@
 use astra_turn_core::context_assembly_trace::{
     ContextAssemblyTrace, MemorySelection, SkillInjection, ToolSelected,
 };
+use astra_turn_core::skill_selector_metrics::SkillSelectorShortlistEntry;
 use ratatui::style::Color;
 
 /// The full breakdown the panel renders.  Aggregates the top-level
@@ -37,6 +38,32 @@ pub(crate) struct ContextBreakdown {
     pub memories: Vec<MemoryItem>,
     pub skills: Vec<SkillItem>,
     pub system_sections: Vec<SectionItem>,
+    pub history: HistorySummary,
+}
+
+/// Aggregate summary of the history slice the context carried into
+/// the most recent turn.  The view renders this as a labelled
+/// section so the user can see how aggressively the compactor is
+/// trimming their backlog.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct HistorySummary {
+    pub total_turns: u32,
+    pub retained: u32,
+    pub compressed: u32,
+    pub dropped: u32,
+    pub tokens_before: u32,
+    pub tokens_after: u32,
+    pub compression_ratio: f64,
+}
+
+impl HistorySummary {
+    pub fn is_empty(&self) -> bool {
+        self.total_turns == 0
+            && self.retained == 0
+            && self.compressed == 0
+            && self.dropped == 0
+            && self.tokens_before == 0
+    }
 }
 
 /// Categorical share of the context window. Category ordering drives
@@ -148,6 +175,7 @@ impl ContextBreakdown {
             memories: Vec::new(),
             skills: Vec::new(),
             system_sections: Vec::new(),
+            history: HistorySummary::default(),
         }
     }
 
@@ -216,8 +244,11 @@ impl ContextBreakdown {
             .collect();
         memories.sort_by_key(|m| std::cmp::Reverse(m.tokens));
 
-        // Skills injected into the system prompt (from the per-turn
-        // skill selector / injector).  Same sort rule as memories.
+        // Skills: prefer the rich `skills_injected` list — it has
+        // per-skill token counts.  When the runtime only records a
+        // selector shortlist (common for providers that don't break
+        // down per-skill cost), fall back to those names with
+        // tokens=0 so the section still renders something useful.
         let mut skills: Vec<SkillItem> = trace
             .system_prompt
             .skills_injected
@@ -229,12 +260,38 @@ impl ContextBreakdown {
             })
             .collect();
         skills.sort_by_key(|s| std::cmp::Reverse(s.tokens));
+        if skills.is_empty()
+            && let Some(shortlist) = trace.skill_selector.as_ref()
+        {
+            skills = shortlist
+                .skills
+                .iter()
+                .map(|e: &SkillSelectorShortlistEntry| SkillItem {
+                    name: e.skill_name.clone(),
+                    tokens: 0,
+                })
+                .collect();
+        }
 
         // System-prompt sub-rows: the trace doesn't currently split
         // the system prompt into named sections, so we synthesize a
         // coarse split from the known scalar fields.  Zero-token
         // rows are dropped.
         let system_sections = build_system_sections(trace);
+
+        // History summary: counts + pre/post-compression token shape.
+        // Rendered as a dedicated section so users can see how much
+        // of their backlog survived the compactor this turn.
+        let h = &trace.history;
+        let history = HistorySummary {
+            total_turns: h.total_turns_available,
+            retained: h.turns_retained.len() as u32,
+            compressed: h.turns_compressed.len() as u32,
+            dropped: h.turns_dropped.len() as u32,
+            tokens_before: h.tokens_before,
+            tokens_after: h.tokens_after,
+            compression_ratio: h.compression_ratio,
+        };
 
         Self {
             total_used: budget.total_used,
@@ -247,6 +304,7 @@ impl ContextBreakdown {
             memories,
             skills,
             system_sections,
+            history,
         }
     }
 

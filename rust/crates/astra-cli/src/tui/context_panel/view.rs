@@ -161,14 +161,9 @@ pub(crate) fn build_lines(b: &ContextBreakdown, inner_width: u16) -> Vec<Line<'s
         |t| format!(" {}", t.name),
         |t| t.tokens,
     );
-    append_section(
-        &mut out,
-        "Skills · /skills",
-        &b.skills,
-        |s| format!(" {}", s.name),
-        |s| s.tokens,
-    );
+    append_skill_section(&mut out, &b.skills);
     append_memory_section(&mut out, &b.memories);
+    append_history_section(&mut out, &b.history);
 
     // Drop the last blank line if we pushed one — trailing blanks
     // render as empty lines at the bottom of the scroll view which
@@ -361,6 +356,78 @@ fn append_section<T, F, G>(
     out.push(Line::default());
 }
 
+/// Skills sub-section. Distinct from the generic `append_section`
+/// because skills have a `tokens=0` fallback: when the runtime only
+/// records a selector shortlist (no per-skill token counts), we
+/// still want to list the skill names so the user knows which
+/// skills the selector believed were in play — just without the
+/// trailing "N tokens" suffix.
+fn append_skill_section(out: &mut Vec<Line<'static>>, skills: &[super::model::SkillItem]) {
+    if skills.is_empty() {
+        return;
+    }
+    let all_zero = skills.iter().all(|s| s.tokens == 0);
+    let heading = if all_zero {
+        "Skills · /skills (shortlist)"
+    } else {
+        "Skills · /skills"
+    };
+    out.push(section_heading(heading));
+    for s in skills {
+        if s.tokens == 0 {
+            out.push(Line::from(vec![
+                Span::raw("    └ "),
+                Span::raw(s.name.clone()),
+            ]));
+        } else {
+            out.push(section_row(&format!(" {}", s.name), s.tokens));
+        }
+    }
+    out.push(Line::default());
+}
+
+fn append_history_section(out: &mut Vec<Line<'static>>, h: &super::model::HistorySummary) {
+    if h.is_empty() {
+        return;
+    }
+    out.push(section_heading("History · conversation turns"));
+    // Line 1 — turn breakdown (retained / compressed / dropped).
+    let mut turn_spans: Vec<Span<'static>> = vec![Span::raw("    └ ")];
+    turn_spans.push(Span::raw(format!("{} turns", h.total_turns)));
+    if h.retained > 0 || h.compressed > 0 || h.dropped > 0 {
+        turn_spans.push(Span::styled(
+            format!(
+                "  ({} retained · {} compressed · {} dropped)",
+                h.retained, h.compressed, h.dropped
+            ),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    out.push(Line::from(turn_spans));
+    // Line 2 — compression shape. Only when compression actually
+    // fired; otherwise the numbers are meaningless.
+    if h.tokens_before > 0 && h.tokens_before != h.tokens_after {
+        let pct_saved = if h.tokens_before == 0 {
+            0.0
+        } else {
+            (1.0 - h.tokens_after as f64 / h.tokens_before as f64) * 100.0
+        };
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::raw(format!(
+                "{} → {} tokens",
+                fmt_tokens(h.tokens_before),
+                fmt_tokens(h.tokens_after)
+            )),
+            Span::styled(
+                format!("  (−{pct_saved:.0}%)"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    out.push(Line::default());
+}
+
 fn append_memory_section(out: &mut Vec<Line<'static>>, memories: &[MemoryItem]) {
     if memories.is_empty() {
         return;
@@ -440,8 +507,12 @@ mod tests {
     use super::*;
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
     use astra_turn_core::context_assembly_trace::{
-        ContextAssemblyTrace, MemorySelection, MemorySource, SkillInjection, SystemPromptBreakdown,
-        TokenBudgetTrace, ToolSelected,
+        CompressionMethod, ContextAssemblyTrace, HistorySelectionTrace, MemorySelection,
+        MemorySource, SkillInjection, SystemPromptBreakdown, TokenBudgetTrace, ToolSelected,
+        TurnCompression, TurnRetention,
+    };
+    use astra_turn_core::skill_selector_metrics::{
+        SkillSelectorShortlistEntry, SkillSelectorShortlistTrace,
     };
 
     fn trace(
@@ -511,6 +582,125 @@ mod tests {
     fn snapshot_empty_no_trace_80x3() {
         let b = ContextBreakdown::empty();
         insta::assert_snapshot!("context_panel_empty_80x3", render_panel(&b, 80, 3));
+    }
+
+    #[test]
+    fn snapshot_with_history_and_shortlist_80x28() {
+        // Mirrors a real runtime trace: the selector recorded a
+        // shortlist (no per-skill tokens) and the compactor trimmed
+        // the history aggressively. Both sections must render.
+        let mut t = trace(102_400, 6_000, 22_000, 0, 6_300, 227);
+        t.skill_selector = Some(SkillSelectorShortlistTrace {
+            open_catalog: false,
+            visible_skill_count: 3,
+            skills: vec![
+                SkillSelectorShortlistEntry {
+                    rank: 1,
+                    skill_name: "review_changes".into(),
+                    aliases: Vec::new(),
+                    description: String::new(),
+                    source: "built-in".into(),
+                    category: None,
+                },
+                SkillSelectorShortlistEntry {
+                    rank: 2,
+                    skill_name: "verify_task".into(),
+                    aliases: Vec::new(),
+                    description: String::new(),
+                    source: "built-in".into(),
+                    category: None,
+                },
+            ],
+            telemetry: Default::default(),
+        });
+        t.history = HistorySelectionTrace {
+            total_turns_available: 8,
+            turns_retained: vec![TurnRetention {
+                turn_index: 0,
+                role: "user".into(),
+                tokens: 300,
+                has_tool_calls: false,
+            }],
+            turns_compressed: vec![TurnCompression {
+                turn_index: 1,
+                role: "assistant".into(),
+                original_tokens: 20_000,
+                compressed_tokens: 5_000,
+                compression_method: CompressionMethod::ReactiveCompact,
+                information_lost: Vec::new(),
+            }],
+            turns_dropped: vec![2, 3],
+            compression_ratio: 0.25,
+            tokens_before: 32_000,
+            tokens_after: 22_000,
+        };
+        t.tools.tools_selected = vec![
+            ToolSelected {
+                tool_name: "bash".into(),
+                score: 0.9,
+                tokens: 189,
+                selection_factors: Vec::new(),
+            },
+            ToolSelected {
+                tool_name: "read_file".into(),
+                score: 0.8,
+                tokens: 152,
+                selection_factors: Vec::new(),
+            },
+        ];
+        let b = ContextBreakdown::from_trace(&t);
+        insta::assert_snapshot!("context_panel_history_shortlist_80x28", render_panel(&b, 80, 28));
+    }
+
+    #[test]
+    fn build_lines_renders_history_section_when_populated() {
+        let mut t = trace(100_000, 2_000, 8_000, 0, 0, 0);
+        t.history.total_turns_available = 5;
+        t.history.turns_retained = vec![TurnRetention {
+            turn_index: 0,
+            role: "user".into(),
+            tokens: 50,
+            has_tool_calls: false,
+        }];
+        let b = ContextBreakdown::from_trace(&t);
+        let text: String = build_lines(&b, 80)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("History"), "history header missing: {text}");
+        assert!(text.contains("5 turns"), "turn count missing: {text}");
+    }
+
+    #[test]
+    fn build_lines_renders_shortlist_skills_without_tokens() {
+        let mut t = trace(100_000, 1_000, 1_000, 0, 0, 0);
+        t.skill_selector = Some(SkillSelectorShortlistTrace {
+            open_catalog: false,
+            visible_skill_count: 1,
+            skills: vec![SkillSelectorShortlistEntry {
+                rank: 1,
+                skill_name: "my_skill".into(),
+                aliases: Vec::new(),
+                description: String::new(),
+                source: "built-in".into(),
+                category: None,
+            }],
+            telemetry: Default::default(),
+        });
+        let b = ContextBreakdown::from_trace(&t);
+        let text: String = build_lines(&b, 80)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("shortlist"), "shortlist label missing: {text}");
+        assert!(text.contains("my_skill"), "skill name missing: {text}");
+        // No fake "0 tokens" noise for shortlist entries.
+        assert!(
+            !text.contains("my_skill   0 tokens"),
+            "shortlist row should not show 0-token count: {text}"
+        );
     }
 
     #[test]
