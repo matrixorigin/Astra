@@ -308,41 +308,98 @@ fn thought_header_lines(line_count: usize) -> Vec<Line<'static>> {
     ])]
 }
 
-/// While `<think>` is open and the model is still streaming,
-/// show a dim one-line "Thinking…" indicator plus the most recent
-/// line of thinking content so the user can see something is
-/// happening. Full thinking body stays hidden to avoid dumping
-/// 40+ lines of internal monologue on screen; the closed-think
-/// header is what the user sees once the block finishes.
-fn render_live_thinking(think_partial: &str, _width: u16) -> Vec<Line<'static>> {
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    // Last non-blank line is the most useful "where are we now"
-    // preview. Truncate to fit without wrapping to keep the
-    // viewport stable while content scrolls in.
-    let last_line = think_partial
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    const MAX_PREVIEW: usize = 80;
-    let preview: String = if last_line.chars().count() > MAX_PREVIEW {
-        let truncated: String = last_line.chars().take(MAX_PREVIEW).collect();
-        format!("{truncated}…")
-    } else {
-        last_line.to_string()
-    };
+/// Max body rows shown beneath the `✻ Thinking…` header while the
+/// `<think>` block is open. Mirrors `ReasoningCell::LIVE_PREVIEW_MAX_ROWS`:
+/// once the window fills, the oldest row scrolls off and a
+/// `⋯ +N more` counter takes the top slot, so the preview stays
+/// fixed-height instead of pushing the composer off-screen on a
+/// long internal monologue.
+const LIVE_THINK_PREVIEW_MAX_ROWS: usize = 6;
 
-    let mut out = vec![Line::from(vec![
-        Span::raw("  "),
-        Span::styled("✻ ", dim),
-        Span::styled("Thinking…", dim),
-    ])];
-    if !preview.is_empty() {
+/// While `<think>` is open and the model is still streaming, show a
+/// shimmering "Thinking…" header plus a fixed-height scrolling
+/// preview of the latest thinking content. Matches `ReasoningCell`'s
+/// live-preview grammar so the two paths (inline `<think>` vs.
+/// provider reasoning channel) feel consistent to the user. Full
+/// thinking body stays hidden — once `</think>` arrives this whole
+/// block collapses to a one-line `✻ Thought (N lines)` header.
+fn render_live_thinking(think_partial: &str, width: u16) -> Vec<Line<'static>> {
+    let dim_italic = Style::default()
+        .add_modifier(Modifier::DIM)
+        .add_modifier(Modifier::ITALIC);
+
+    // Header line — shimmered so there's a visible "still working"
+    // cue even if the preview body happens to be empty for a tick.
+    let mut header_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+    header_spans.push(Span::styled("✻ ", dim_italic));
+    header_spans.extend(crate::tui::shimmer::shimmer_spans("Thinking…"));
+    let mut out = vec![Line::from(header_spans)];
+
+    // Soft-wrap the partial thinking content, then render the most
+    // recent N rows, with a `⋯ +M more` counter in the first slot
+    // once overflow starts. Rendered at width-6 because we prefix
+    // each body row with "    " (4 cols of indent) and the outer
+    // frame already reserves 2 cols for its border — total 6.
+    let inner_w = (width as usize).saturating_sub(6).max(10);
+    let mut body_rows: Vec<String> = Vec::new();
+    for logical in think_partial.lines() {
+        if logical.trim().is_empty() {
+            continue;
+        }
+        for row in soft_wrap_preview(logical, inner_w) {
+            body_rows.push(row);
+        }
+    }
+
+    let total = body_rows.len();
+    let visible_start = if total > LIVE_THINK_PREVIEW_MAX_ROWS {
+        // Row 0 of the body shows the overflow counter; the window
+        // displays the last `LIVE_THINK_PREVIEW_MAX_ROWS - 1` rows.
+        let tail = LIVE_THINK_PREVIEW_MAX_ROWS - 1;
+        let hidden = total - tail;
         out.push(Line::from(vec![
             Span::raw("    "),
-            Span::styled(preview, dim),
+            Span::styled(format!("⋯ +{hidden} more"), dim_italic),
         ]));
+        total - tail
+    } else {
+        0
+    };
+    for row in body_rows.into_iter().skip(visible_start) {
+        out.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(row, dim_italic),
+        ]));
+    }
+    out
+}
+
+/// Break a logical line into visual rows at `width` display cells —
+/// same behaviour as `ReasoningCell::soft_wrap`, duplicated here so
+/// the assistant cell can preview leaked-`<think>` content without
+/// pulling in the reasoning module.
+fn soft_wrap_preview(input: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    if width == 0 {
+        return vec![input.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut current_w = 0usize;
+    for ch in input.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if current_w + cw > width && !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+            current_w = 0;
+        }
+        current.push(ch);
+        current_w += cw;
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    if out.is_empty() {
+        out.push(String::new());
     }
     out
 }
@@ -554,26 +611,54 @@ mod tests {
     }
 
     #[test]
-    fn streaming_think_shows_indicator_and_latest_line() {
-        // While the think block is still open, we show "Thinking…"
-        // + the most recent line of internal monologue so the
-        // user sees motion.
+    fn streaming_think_shows_indicator_and_recent_lines() {
+        // While the `<think>` block is still open we show
+        // `✻ Thinking…` plus a scrolling preview of the latest
+        // rows of internal monologue (see `LIVE_THINK_PREVIEW_MAX_ROWS`).
+        // With only two lines of content, the whole body fits in
+        // the preview window — no overflow counter, both rows
+        // visible.
         let mut c = AssistantCell::new_streaming();
         c.push_delta("<think>\nstep one\nstep two in progres");
-        let out = render(&c, 80, 3);
+        let out = render(&c, 80, 5);
         assert!(out.contains("Thinking…"), "live indicator missing: {out}");
         assert!(
             out.contains("step two in progres"),
             "latest thinking line missing: {out}"
         );
         assert!(
-            !out.contains("step one"),
-            "only the most recent line should preview (keeps viewport stable): {out}"
+            out.contains("step one"),
+            "earlier line must stay visible under the window cap: {out}"
         );
         // Body hasn't arrived yet — no `┃ ` gutter.
         assert!(
             !out.contains('┃'),
             "body gutter shouldn't render while still thinking: {out}"
+        );
+    }
+
+    #[test]
+    fn streaming_think_preview_caps_and_shows_counter_on_overflow() {
+        // Once the running think body exceeds the preview window,
+        // the oldest rows drop off and a `⋯ +N more` counter takes
+        // the first slot so the user sees there's hidden content.
+        let mut c = AssistantCell::new_streaming();
+        let total_rows = LIVE_THINK_PREVIEW_MAX_ROWS + 4;
+        let padding: Vec<String> = (1..=total_rows).map(|i| format!("row {i}")).collect();
+        c.push_delta(&format!("<think>\n{}", padding.join("\n")));
+        let out = render(&c, 80, (LIVE_THINK_PREVIEW_MAX_ROWS + 2) as u16);
+        let hidden = total_rows - (LIVE_THINK_PREVIEW_MAX_ROWS - 1);
+        assert!(
+            out.contains(&format!("⋯ +{hidden} more")),
+            "overflow counter missing: {out}"
+        );
+        assert!(
+            !out.contains("row 1 "),
+            "oldest row must have scrolled off: {out}"
+        );
+        assert!(
+            out.contains(&format!("row {total_rows}")),
+            "most recent row must be visible: {out}"
         );
     }
 
@@ -711,6 +796,9 @@ mod tests {
     fn snapshot_streaming_think_preview_80() {
         let mut c = AssistantCell::new_streaming();
         c.push_delta("<think>\nFirst, let me think about the structure.\nActually, the user wants a concise answer.");
-        insta::assert_snapshot!("assistant_think_streaming_80", render(&c, 80, 3));
+        // Height 4: header + 2 preview rows (under cap) + one spare
+        // row. The preview no longer single-lines — it scrolls like
+        // `ReasoningCell` — so both thinking rows must appear.
+        insta::assert_snapshot!("assistant_think_streaming_80", render(&c, 80, 4));
     }
 }

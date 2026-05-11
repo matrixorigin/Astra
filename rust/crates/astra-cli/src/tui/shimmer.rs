@@ -14,6 +14,48 @@ fn elapsed_since_start() -> Duration {
     start.elapsed()
 }
 
+/// RGB color for a given "position along a border" (0..len) at the
+/// current moment in time. Produces a flowing rainbow-ish gradient
+/// that cycles around the frame — warm pinks → cool blues → back.
+/// Hue advances with time and along the border, giving a "wave
+/// travelling around the frame" effect.
+///
+/// Used by `LiveFramedCell` to color each border character while the
+/// active cell is still streaming.
+pub(crate) fn gradient_color_at(pos: usize, len: usize, period_seconds: f32) -> (u8, u8, u8) {
+    let t = elapsed_since_start().as_secs_f32();
+    // Normalize position to [0, 1) along the border, then add a
+    // time-varying phase so the hue slides along the frame.
+    let len = len.max(1) as f32;
+    let phase = (t / period_seconds).fract();
+    let u = ((pos as f32 / len) + phase).fract();
+    hue_to_rgb(u)
+}
+
+/// Simple HSV-like hue sweep (S=0.55, V=1.0). Output is a soft pastel
+/// wheel so the animation reads as flowing, not strobing.
+fn hue_to_rgb(h: f32) -> (u8, u8, u8) {
+    let h6 = (h.rem_euclid(1.0)) * 6.0;
+    let c = 0.55_f32;
+    let x = c * (1.0 - ((h6 % 2.0) - 1.0).abs());
+    let (r, g, b) = if h6 < 1.0 {
+        (c, x, 0.0)
+    } else if h6 < 2.0 {
+        (x, c, 0.0)
+    } else if h6 < 3.0 {
+        (0.0, c, x)
+    } else if h6 < 4.0 {
+        (0.0, x, c)
+    } else if h6 < 5.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    let m = 1.0 - c;
+    let to_u8 = |v: f32| (((v + m).clamp(0.0, 1.0)) * 255.0) as u8;
+    (to_u8(r), to_u8(g), to_u8(b))
+}
+
 pub(crate) fn shimmer_spans(text: &str) -> Vec<Span<'static>> {
     let chars: Vec<char> = text.chars().collect();
     if chars.is_empty() {

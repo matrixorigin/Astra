@@ -1,6 +1,7 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/assistant.rs
-expression: "render(&c, 80, 3)"
+expression: "render(&c, 80, 4)"
 ---
   ✻ Thinking…
+    First, let me think about the structure.
     Actually, the user wants a concise answer.

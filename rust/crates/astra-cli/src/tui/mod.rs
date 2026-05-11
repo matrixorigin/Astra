@@ -81,6 +81,12 @@ pub(crate) enum ActiveView {
     Active {
         kind: ActiveKind,
         lines: Vec<ratatui::text::Line<'static>>,
+        /// `true` while the cell is still streaming — enables the
+        /// flowing-gradient border animation. `false` for rare cases
+        /// where a finalized cell lingers in the active slot (never
+        /// happens in practice, but the flag keeps the render path
+        /// honest).
+        live: bool,
     },
 }
 
@@ -128,7 +134,8 @@ fn active_viewport(
         let lines = cell.display_lines(inner_w);
         if !lines.is_empty() {
             let kind = classify_active(cell).unwrap_or(ActiveKind::Assistant);
-            return ActiveView::Active { kind, lines };
+            let live = cell.is_live();
+            return ActiveView::Active { kind, lines, live };
         }
     }
     if let Some(line) = status.render() {
@@ -1053,6 +1060,17 @@ pub(crate) async fn run_tui_repl(
                 // next event edge.
                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                 flush_chat_widget(&mut guard, &mut chat_widget, w);
+                // If a cell is streaming, request a redraw so the
+                // gradient-border animation on `LiveFramedCell` keeps
+                // flowing. Without this the frame only redraws on
+                // incoming delta/state events and freezes visually
+                // between them.
+                if chat_widget
+                    .active_cell()
+                    .is_some_and(|c| c.is_live())
+                {
+                    frame_requester.schedule_frame();
+                }
             }
         }
     };
@@ -1060,12 +1078,152 @@ pub(crate) async fn run_tui_repl(
     result
 }
 
+/// A rounded-frame renderable whose border characters carry a
+/// time-varying gradient — one colour per cell, sweeping around the
+/// perimeter. Used in place of a plain `Block`-wrapped paragraph while
+/// the active cell is still streaming, so the user sees the frame
+/// "breathing" and immediately knows output isn't frozen.
+///
+/// On freeze (`live == false`) the border collapses to a solid colour
+/// chosen by the cell kind — matches the pre-animation behaviour. The
+/// static pink `┃ ` gutter used in scrollback is unrelated to this
+/// frame; it's painted by `render_body_with_gutter` only after the
+/// cell leaves the active slot.
+struct LiveFramedCell {
+    lines: Vec<ratatui::text::Line<'static>>,
+    title: &'static str,
+    /// Border colour when NOT live (or fallback for non-truecolor
+    /// terminals).
+    solid_color: ratatui::style::Color,
+    live: bool,
+}
+
+impl render::renderable::Renderable for LiveFramedCell {
+    fn render(&self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
+        use ratatui::style::{Modifier, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Paragraph, Widget};
+
+        if area.width < 2 || area.height < 2 {
+            return;
+        }
+
+        // Inner paragraph area (leave 1 cell on each side for border).
+        let inner = ratatui::layout::Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+
+        // Paint inner content first (border is drawn over edge cells
+        // below, which the paragraph never touches).
+        let para = Paragraph::new(ratatui::text::Text::from(self.lines.clone()));
+        Widget::render(para, inner, buf);
+
+        // Draw the rounded border character by character, assigning
+        // each cell a gradient colour when live.
+        let x0 = area.x;
+        let y0 = area.y;
+        let x1 = area.x + area.width - 1;
+        let y1 = area.y + area.height - 1;
+
+        let perimeter = 2 * (area.width as usize + area.height as usize - 2);
+        // Sweep once around the perimeter every N seconds. Slow enough
+        // that the eye reads "flowing", fast enough that it isn't stuck.
+        let period = 3.0_f32;
+
+        let color_at = |idx: usize| -> ratatui::style::Color {
+            if !self.live {
+                return self.solid_color;
+            }
+            let (r, g, b) = shimmer::gradient_color_at(idx, perimeter, period);
+            ratatui::style::Color::Rgb(r, g, b)
+        };
+
+        let mut idx: usize = 0;
+        // Top edge: ╭ ── ╮
+        set_char(buf, x0, y0, '╭', color_at(idx));
+        idx += 1;
+        for x in (x0 + 1)..x1 {
+            set_char(buf, x, y0, '─', color_at(idx));
+            idx += 1;
+        }
+        set_char(buf, x1, y0, '╮', color_at(idx));
+        idx += 1;
+        // Right edge
+        for y in (y0 + 1)..y1 {
+            set_char(buf, x1, y, '│', color_at(idx));
+            idx += 1;
+        }
+        // Bottom edge: ╰ ── ╯ (traverse right-to-left to keep the
+        // gradient continuous around the perimeter)
+        set_char(buf, x1, y1, '╯', color_at(idx));
+        idx += 1;
+        for x in ((x0 + 1)..x1).rev() {
+            set_char(buf, x, y1, '─', color_at(idx));
+            idx += 1;
+        }
+        set_char(buf, x0, y1, '╰', color_at(idx));
+        idx += 1;
+        // Left edge (bottom → top)
+        for y in ((y0 + 1)..y1).rev() {
+            set_char(buf, x0, y, '│', color_at(idx));
+            idx += 1;
+        }
+        let _ = idx;
+
+        // Title overlay (dim, on top border). Uses the solid colour so
+        // the label stays legible against the animated border.
+        let title = format!(" {} ", self.title.trim());
+        let title_span = Span::styled(
+            title.clone(),
+            Style::default()
+                .fg(self.solid_color)
+                .add_modifier(Modifier::DIM),
+        );
+        // Anchor title at x0 + 2 so it doesn't overlap the corner.
+        let title_x = x0 + 2;
+        if title_x + title.chars().count() as u16 <= x1 {
+            let line_widget = Line::from(title_span);
+            let line_area = ratatui::layout::Rect {
+                x: title_x,
+                y: y0,
+                width: title.chars().count() as u16,
+                height: 1,
+            };
+            ratatui::widgets::WidgetRef::render_ref(&line_widget, line_area, buf);
+        }
+    }
+
+    fn desired_height(&self, _width: u16) -> u16 {
+        // border(2) + content lines
+        (self.lines.len() as u16).saturating_add(2)
+    }
+}
+
+/// Write a single character cell into the buffer with the given fg.
+fn set_char(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    ch: char,
+    fg: ratatui::style::Color,
+) {
+    if x >= buf.area.x + buf.area.width || y >= buf.area.y + buf.area.height {
+        return;
+    }
+    let cell = &mut buf[(x, y)];
+    cell.set_char(ch);
+    cell.set_style(ratatui::style::Style::default().fg(fg));
+}
+
 pub(super) fn do_draw(
     guard: &mut TerminalGuard,
     active: ActiveView,
     bottom_pane: &mut BottomPane,
 ) -> Result<(), String> {
-    use ratatui::widgets::{Block, Borders, Paragraph};
+    use ratatui::widgets::Paragraph;
     use render::renderable::{FlexRenderable, Renderable, RenderableItem};
 
     bottom_pane.pre_draw_tick(std::time::Instant::now());
@@ -1084,26 +1242,23 @@ pub(super) fn do_draw(
         // Active cell gets a rounded bordered box in a colour that
         // matches the cell kind, so the user sees "this is the live
         // thing" at a glance — as opposed to the flat scrollback
-        // above. Cursor/Kiro style.
-        ActiveView::Active { kind, lines } => {
+        // above. While `live` (still streaming), the frame pulses
+        // through a flowing gradient; once finalized the border
+        // collapses to a solid colour. Cursor/Kiro style.
+        ActiveView::Active { kind, lines, live } => {
             let theme = crate::tui::theme::current();
-            let (border_color, title) = match kind {
-                ActiveKind::Tool => (theme.accent, " tool "),
-                ActiveKind::Assistant => (theme.gutter, " assistant "),
-                ActiveKind::Reasoning => (theme.dim, " thinking "),
+            let (solid_color, title) = match kind {
+                ActiveKind::Tool => (theme.accent, "tool"),
+                ActiveKind::Assistant => (theme.gutter, "assistant"),
+                ActiveKind::Reasoning => (theme.dim, "thinking"),
             };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(ratatui::widgets::BorderType::Rounded)
-                .border_style(ratatui::style::Style::default().fg(border_color))
-                .title(ratatui::text::Span::styled(
-                    title.to_string(),
-                    ratatui::style::Style::default()
-                        .fg(border_color)
-                        .add_modifier(ratatui::style::Modifier::DIM),
-                ));
-            let para = Paragraph::new(ratatui::text::Text::from(lines)).block(block);
-            RenderableItem::Owned(Box::new(para))
+            let framed = LiveFramedCell {
+                lines,
+                title,
+                solid_color,
+                live,
+            };
+            RenderableItem::Owned(Box::new(framed))
         }
     };
 
