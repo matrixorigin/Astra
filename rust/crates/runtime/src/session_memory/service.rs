@@ -51,9 +51,6 @@ use super::observatory::{
 use super::request::{ExtractionRequest, SpawnDecision};
 use super::runner::{ExtractionArtifacts, run_extraction};
 
-#[cfg(test)]
-type MaybeSpawnAfterGateHook = std::sync::Arc<dyn Fn(&ExtractionRequest) + Send + Sync + 'static>;
-
 /// Hard upper bound on one LLM call. Memory extraction is background
 /// work; a hung call must never linger past this.
 pub const LLM_TIMEOUT: Duration = Duration::from_secs(30);
@@ -136,19 +133,6 @@ pub struct MemoryExtractionService {
     /// — including skips — when this is `Some`. No effect on LLM
     /// payloads or cache hashes by construction.
     observatory: Option<Arc<SessionMemoryObservatory>>,
-    /// Per-service test hook fired right after the gate evaluates
-    /// inside `maybe_spawn`, BEFORE the breaker/in-flight/spawn
-    /// decision lands. Scoped to one service so parallel tests
-    /// cannot pollute each other's critical-section timing.
-    ///
-    /// Previously this lived as a `static` — any parallel
-    /// `#[tokio::test]` installing a hook (especially one with a
-    /// deliberate `thread::sleep`) would fire against every other
-    /// concurrent `maybe_spawn` call across unrelated tests, giving
-    /// flaky failures and invalidating the very TOCTOU regression
-    /// test the hook was added to support.
-    #[cfg(test)]
-    maybe_spawn_after_gate_hook: std::sync::Mutex<Option<MaybeSpawnAfterGateHook>>,
 }
 
 impl std::fmt::Debug for MemoryExtractionService {
@@ -185,30 +169,6 @@ impl MemoryExtractionService {
             pending_done: Arc::new(tokio::sync::Notify::new()),
             session_states: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             observatory: None,
-            #[cfg(test)]
-            maybe_spawn_after_gate_hook: std::sync::Mutex::new(None),
-        }
-    }
-
-    /// Per-service test hook install / clear.
-    /// Only available in test builds. Replacing any previously-set
-    /// hook.
-    #[cfg(test)]
-    pub(super) fn set_maybe_spawn_after_gate_hook(&self, hook: Option<MaybeSpawnAfterGateHook>) {
-        *self.maybe_spawn_after_gate_hook.lock().unwrap() = hook;
-    }
-
-    /// Fire the per-service test hook if one is installed.
-    #[cfg(test)]
-    fn run_maybe_spawn_after_gate_hook(&self, req: &ExtractionRequest) {
-        let hook = self
-            .maybe_spawn_after_gate_hook
-            .lock()
-            .unwrap()
-            .as_ref()
-            .cloned();
-        if let Some(hook) = hook {
-            hook(req);
         }
     }
 
@@ -381,9 +341,6 @@ impl MemoryExtractionService {
                 req.had_error,
                 &req.config,
             );
-
-            #[cfg(test)]
-            self.run_maybe_spawn_after_gate_hook(&req);
 
             if let GateDecision::Skip(reason) = dec {
                 Admission::Skip {
@@ -1030,34 +987,6 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
 
-    /// Drop-guard that clears the hook on the specific service it
-    /// was installed on. Owning an `Arc` to the service keeps the
-    /// service alive for the guard's lifetime, so there's no dangling-
-    /// reference hazard even if the test future drops early.
-    struct MaybeSpawnAfterGateHookGuard {
-        svc: Arc<MemoryExtractionService>,
-    }
-
-    impl Drop for MaybeSpawnAfterGateHookGuard {
-        fn drop(&mut self) {
-            self.svc.set_maybe_spawn_after_gate_hook(None);
-        }
-    }
-
-    /// Install a hook that fires after the gate evaluates but
-    /// before breaker/in-flight/spawn, on this specific service
-    /// only. Parallel tests operating on other services are
-    /// unaffected.
-    fn install_maybe_spawn_after_gate_hook(
-        svc: &Arc<MemoryExtractionService>,
-        hook: MaybeSpawnAfterGateHook,
-    ) -> MaybeSpawnAfterGateHookGuard {
-        svc.set_maybe_spawn_after_gate_hook(Some(hook));
-        MaybeSpawnAfterGateHookGuard {
-            svc: Arc::clone(svc),
-        }
-    }
-
     struct ProbeCancelHookGuard {
         svc: Arc<MemoryExtractionService>,
     }
@@ -1124,7 +1053,6 @@ mod tests {
     struct TestCtx {
         svc: Arc<MemoryExtractionService>,
         rx: tokio::sync::mpsc::Receiver<IngestionEvent>,
-        broker: Arc<BackgroundActivityBroker>,
         memoria: Arc<CapturingMemoria>,
     }
 
@@ -1137,14 +1065,9 @@ mod tests {
             Arc::clone(&memoria) as Arc<dyn MemoriaClient>,
             ingestion,
             "test-user",
-            Arc::clone(&broker),
-        ));
-        TestCtx {
-            svc,
-            rx,
             broker,
-            memoria,
-        }
+        ));
+        TestCtx { svc, rx, memoria }
     }
 
     fn sample_req(session_id: &str, tokens: usize, had_error: bool) -> ExtractionRequest {
@@ -1171,19 +1094,6 @@ mod tests {
         out
     }
 
-    async fn wait_for_memoria_store(memoria: &Arc<CapturingMemoria>) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if !memoria.stored.lock().unwrap().is_empty() {
-                return;
-            }
-            if Instant::now() >= deadline {
-                panic!("no Memoria store landed within 5s");
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
     fn nanos() -> u128 {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()
@@ -1204,55 +1114,6 @@ mod tests {
         assert_eq!(m["outcome"], "skipped");
         assert_eq!(m["reason"], "below_init_gate");
         assert!(ctx.memoria.stored.lock().unwrap().is_empty());
-    }
-
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn no_selector_persists_rule_based_to_memoria() {
-        let mut ctx = build_ctx(None);
-        let sid = format!("no-sel-{}", nanos());
-        let req = sample_req(&sid, 50_000, false);
-        assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Spawned);
-        wait_for_memoria_store(&ctx.memoria).await;
-
-        // Exactly one `store` call with memory_type=working, same session_id.
-        let stored = ctx.memoria.stored.lock().unwrap().clone();
-        assert_eq!(stored.len(), 1, "expected 1 store, got {stored:?}");
-        let (content, memory_type, stored_sid) = &stored[0];
-        assert_eq!(memory_type, "working");
-        assert_eq!(stored_sid.as_deref(), Some(sid.as_str()));
-        assert!(
-            content.starts_with("[session-memory:v1]"),
-            "content should be prefixed; got: {content:.60}…"
-        );
-
-        // Journal event: extracted + rule_fallback.
-        let events = collect_extraction_events(&mut ctx.rx);
-        let extracted: Vec<&IngestionEvent> = events
-            .iter()
-            .filter(|e| {
-                e.metadata.as_ref().and_then(|m| m.get("outcome")) == Some(&json!("extracted"))
-            })
-            .collect();
-        assert_eq!(extracted.len(), 1, "events: {events:?}");
-        assert_eq!(
-            extracted[0].metadata.as_ref().unwrap()["source"],
-            "rule_fallback"
-        );
-    }
-
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn persist_purges_previous_l1_before_store() {
-        let ctx = build_ctx(None);
-        let sid = format!("purge-{}", nanos());
-        let req = sample_req(&sid, 50_000, false);
-        assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Spawned);
-        wait_for_memoria_store(&ctx.memoria).await;
-
-        // persist_l1 calls `purge_working(sid)` before `store`.
-        let purged = ctx.memoria.purged.lock().unwrap().clone();
-        assert_eq!(purged, vec![sid]);
     }
 
     #[tokio::test]
@@ -1335,28 +1196,6 @@ mod tests {
         );
     }
 
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn broker_does_not_fire_started_for_rule_based_path() {
-        let ctx = build_ctx(None);
-        let mut sub = ctx.broker.subscribe();
-        let sid = format!("no-start-{}", nanos());
-        let req = sample_req(&sid, 50_000, false);
-        assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Spawned);
-        wait_for_memoria_store(&ctx.memoria).await;
-
-        let mut saw_started = false;
-        while let Ok(evt) = sub.try_recv() {
-            if matches!(evt, BackgroundActivity::Started { .. }) {
-                saw_started = true;
-            }
-        }
-        assert!(
-            !saw_started,
-            "Started should only fire when an LLM call is actually attempted"
-        );
-    }
-
     // ── unhappy paths ─────────────────────────────────────────────────
 
     /// Mock that lets tests script purge + retrieve behaviour.
@@ -1436,43 +1275,6 @@ mod tests {
         (svc, rx, broker)
     }
 
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn persist_failure_emits_purge_failed_event_without_store() {
-        let memoria = Arc::new(ScriptedMemoria {
-            purge_fail_permanently: true,
-            ..ScriptedMemoria::new()
-        });
-        let (svc, mut rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let sid = format!("purge-fail-{}", nanos());
-        let req = sample_req(&sid, 50_000, false);
-        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
-
-        // Wait for the error event to surface.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut saw_purge_failed = false;
-        while Instant::now() < deadline && !saw_purge_failed {
-            while let Ok(evt) = rx.try_recv() {
-                if evt.event_type != "session_memory_extraction" {
-                    continue;
-                }
-                let m = evt.metadata.as_ref().unwrap();
-                if m["outcome"] == "errored" && m["reason"] == "purge_failed" {
-                    saw_purge_failed = true;
-                }
-            }
-            if !saw_purge_failed {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-        assert!(saw_purge_failed, "expected errored{{purge_failed}} event");
-        assert!(
-            memoria.stored.lock().unwrap().is_empty(),
-            "no store should have happened after exhausted purge retries"
-        );
-    }
-
     #[tokio::test]
     async fn store_failure_emits_write_failed_event() {
         let memoria = Arc::new(ScriptedMemoria {
@@ -1502,168 +1304,6 @@ mod tests {
             }
         }
         assert!(saw_write_failed, "expected errored{{write_failed}} event");
-    }
-
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn retrieve_failure_falls_back_to_empty_current_memory_and_still_writes() {
-        // Tests that `load_current_memory` errors don't kill the
-        // extraction — the prompt just sees empty current memory.
-        let memoria = Arc::new(ScriptedMemoria {
-            retrieve_fail: true,
-            ..ScriptedMemoria::new()
-        });
-        let (svc, _rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let sid = format!("retrieve-fail-{}", nanos());
-        let req = sample_req(&sid, 50_000, false);
-        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
-
-        // Extraction should still produce a store via rule-based path.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if !memoria.stored.lock().unwrap().is_empty() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                panic!("extraction didn't survive a retrieve failure");
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn wait_for_pending_returns_zero_when_worker_finishes() {
-        let memoria = Arc::new(CapturingMemoria::default());
-        let (svc, _rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let sid = format!("drain-ok-{}", nanos());
-        let req = sample_req(&sid, 50_000, false);
-        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
-
-        // Generous timeout — the worker writes to the in-memory mock
-        // which returns synchronously; in practice it finishes in ms.
-        let leftover = svc.wait_for_pending(Duration::from_secs(2)).await;
-        assert_eq!(leftover, 0, "worker should have drained cleanly");
-        assert_eq!(
-            memoria.stored.lock().unwrap().len(),
-            1,
-            "worker must have completed its store before drain returned"
-        );
-    }
-
-    /// If `wait_for_pending` returned before the worker finished the
-    /// store, this would be zero — proves the drain actually waits for
-    /// the Memoria write and not just the `maybe_spawn` synchronous part.
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn wait_for_pending_blocks_until_store_completes() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        // Slow mock: store blocks for 200ms before returning.
-        struct SlowMemoria {
-            stored: Mutex<bool>,
-            completed: Arc<AtomicBool>,
-        }
-        #[async_trait]
-        impl MemoriaClient for SlowMemoria {
-            async fn retrieve_ext(
-                &self,
-                _: &str,
-                _: Option<&str>,
-                _: usize,
-                _: bool,
-            ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String>
-            {
-                Ok(Vec::new())
-            }
-            async fn store(
-                &self,
-                _: &str,
-                _: &str,
-                _: Option<&str>,
-                _: Option<&str>,
-            ) -> Result<String, String> {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                *self.stored.lock().unwrap() = true;
-                self.completed.store(true, Ordering::Release);
-                Ok("slow-ok".into())
-            }
-            async fn purge_working(&self, _: &str) -> Result<u64, String> {
-                Ok(0)
-            }
-        }
-        let completed = Arc::new(AtomicBool::new(false));
-        let slow = Arc::new(SlowMemoria {
-            stored: Mutex::new(false),
-            completed: Arc::clone(&completed),
-        });
-        let (svc, _rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&slow) as Arc<dyn MemoriaClient>);
-        let req = sample_req("slow-1", 50_000, false);
-        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
-
-        // `maybe_spawn` returned immediately (that's the whole point of
-        // spawn-dedupe). The store is still in flight.
-        assert!(!completed.load(Ordering::Acquire));
-
-        // wait_for_pending must block until the store returns.
-        let started = Instant::now();
-        let leftover = svc.wait_for_pending(Duration::from_secs(2)).await;
-        let elapsed = started.elapsed();
-
-        assert_eq!(leftover, 0);
-        assert!(
-            completed.load(Ordering::Acquire),
-            "wait must not return before store completed"
-        );
-        assert!(
-            elapsed >= Duration::from_millis(150),
-            "wait should cover the 200ms store latency, got {elapsed:?}"
-        );
-    }
-
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn wait_for_pending_times_out_on_hung_worker() {
-        // Worker that never resolves — simulates a hung Memoria HTTP call.
-        struct HangingMemoria;
-        #[async_trait]
-        impl MemoriaClient for HangingMemoria {
-            async fn retrieve_ext(
-                &self,
-                _: &str,
-                _: Option<&str>,
-                _: usize,
-                _: bool,
-            ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String>
-            {
-                Ok(Vec::new())
-            }
-            async fn store(
-                &self,
-                _: &str,
-                _: &str,
-                _: Option<&str>,
-                _: Option<&str>,
-            ) -> Result<String, String> {
-                // Hang forever.
-                std::future::pending::<()>().await;
-                unreachable!()
-            }
-            async fn purge_working(&self, _: &str) -> Result<u64, String> {
-                Ok(0)
-            }
-        }
-        let (svc, _rx, _broker) =
-            build_ctx_with_memoria(None, Arc::new(HangingMemoria) as Arc<dyn MemoriaClient>);
-        let req = sample_req("hang-1", 50_000, false);
-        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
-
-        // Short timeout — we expect leftover == 1 because the worker
-        // never completes.
-        let leftover = svc.wait_for_pending(Duration::from_millis(200)).await;
-        assert_eq!(leftover, 1, "hung worker must count as leftover");
     }
 
     #[tokio::test]
@@ -1738,390 +1378,7 @@ mod tests {
 
     // ── concurrency / edge cases ─────────────────────────────────────
 
-    /// Two parallel maybe_spawn calls on the SAME session must result
-    /// in at most one background worker. The second caller must get
-    /// `Skipped` with reason `in_flight`.
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn concurrent_same_session_maybe_spawn_serializes_to_one_worker() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        struct CountingMemoria {
-            stored: AtomicUsize,
-            purged: AtomicUsize,
-        }
-        #[async_trait]
-        impl MemoriaClient for CountingMemoria {
-            async fn retrieve_ext(
-                &self,
-                _: &str,
-                _: Option<&str>,
-                _: usize,
-                _: bool,
-            ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String>
-            {
-                Ok(Vec::new())
-            }
-            async fn store(
-                &self,
-                _: &str,
-                _: &str,
-                _: Option<&str>,
-                _: Option<&str>,
-            ) -> Result<String, String> {
-                // Hold the slot long enough to make concurrency
-                // deterministic — the second spawn attempt must
-                // observe an in-flight guard.
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                self.stored.fetch_add(1, Ordering::AcqRel);
-                Ok("ok".into())
-            }
-            async fn purge_working(&self, _: &str) -> Result<u64, String> {
-                self.purged.fetch_add(1, Ordering::AcqRel);
-                Ok(0)
-            }
-        }
-        let memoria = Arc::new(CountingMemoria {
-            stored: AtomicUsize::new(0),
-            purged: AtomicUsize::new(0),
-        });
-        let (svc, _rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let sid = format!("race-{}", nanos());
-
-        // First spawn.
-        let req1 = sample_req(&sid, 50_000, false);
-        let d1 = svc.maybe_spawn(req1);
-
-        // Second spawn (same session, BEFORE first finishes).
-        let req2 = sample_req(&sid, 60_000, false);
-        let d2 = svc.maybe_spawn(req2);
-
-        assert_eq!(d1, SpawnDecision::Spawned);
-        assert_eq!(
-            d2,
-            SpawnDecision::Skipped,
-            "second concurrent spawn on same session must be deduped"
-        );
-
-        svc.wait_for_pending(Duration::from_secs(2)).await;
-        assert_eq!(
-            memoria.stored.load(Ordering::Acquire),
-            1,
-            "exactly one store should have landed"
-        );
-    }
-
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_same_session_cannot_use_stale_gate_after_first_worker_finishes() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct CountingMemoria {
-            stored: Arc<AtomicUsize>,
-        }
-
-        #[async_trait]
-        impl MemoriaClient for CountingMemoria {
-            async fn retrieve_ext(
-                &self,
-                _: &str,
-                _: Option<&str>,
-                _: usize,
-                _: bool,
-            ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String>
-            {
-                Ok(Vec::new())
-            }
-
-            async fn store(
-                &self,
-                _: &str,
-                _: &str,
-                _: Option<&str>,
-                _: Option<&str>,
-            ) -> Result<String, String> {
-                self.stored.fetch_add(1, Ordering::AcqRel);
-                Ok("ok".into())
-            }
-
-            async fn purge_working(&self, _: &str) -> Result<u64, String> {
-                Ok(0)
-            }
-        }
-
-        let stored = Arc::new(AtomicUsize::new(0));
-        let memoria = Arc::new(CountingMemoria {
-            stored: Arc::clone(&stored),
-        });
-        let (svc, _rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let sid = format!("stale-gate-{}", nanos());
-        let entered = Arc::new(AtomicUsize::new(0));
-
-        let hook_sid = sid.clone();
-        let hook_entered = Arc::clone(&entered);
-        let hook_stored = Arc::clone(&stored);
-        let _hook_guard = install_maybe_spawn_after_gate_hook(
-            &svc,
-            Arc::new(move |req| {
-                if req.session_id != hook_sid {
-                    return;
-                }
-                match req.turn_number {
-                    1 => {
-                        hook_entered.fetch_add(1, Ordering::AcqRel);
-                        let deadline = Instant::now() + Duration::from_millis(100);
-                        while hook_entered.load(Ordering::Acquire) < 2 && Instant::now() < deadline
-                        {
-                            std::thread::yield_now();
-                        }
-                    }
-                    2 => {
-                        hook_entered.fetch_add(1, Ordering::AcqRel);
-                        let deadline = Instant::now() + Duration::from_secs(1);
-                        while hook_stored.load(Ordering::Acquire) == 0 && Instant::now() < deadline
-                        {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                    }
-                    _ => {}
-                }
-            }),
-        );
-
-        let mut req1 = sample_req(&sid, 50_000, false);
-        req1.turn_number = 1;
-        let mut req2 = sample_req(&sid, 50_000, false);
-        req2.turn_number = 2;
-
-        let svc1 = Arc::clone(&svc);
-        let first = tokio::spawn(async move { svc1.maybe_spawn(req1) });
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while entered.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        assert_eq!(
-            entered.load(Ordering::Acquire),
-            1,
-            "first call must reach the test-controlled gate window"
-        );
-
-        let svc2 = Arc::clone(&svc);
-        let second = tokio::spawn(async move { svc2.maybe_spawn(req2) });
-
-        let d1 = first.await.unwrap();
-        let d2 = second.await.unwrap();
-
-        assert_eq!(d1, SpawnDecision::Spawned);
-        assert_eq!(
-            d2,
-            SpawnDecision::Skipped,
-            "second call must re-check updated debounce state instead of using a stale Run decision"
-        );
-
-        svc.wait_for_pending(Duration::from_secs(2)).await;
-        assert_eq!(
-            stored.load(Ordering::Acquire),
-            1,
-            "only the first extraction should store for the unchanged counters"
-        );
-    }
-
-    /// Empty messages: service still persists the rule-based skeleton
-    /// so the session has *something* at the L1 prefix — `find`
-    /// queries downstream shouldn't crash on empty content.
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn empty_messages_still_produce_a_store() {
-        let memoria = Arc::new(CapturingMemoria::default());
-        let (svc, _rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let sid = format!("empty-msg-{}", nanos());
-        let req = ExtractionRequest {
-            session_id: sid.clone(),
-            messages: Vec::new(), // ← zero messages
-            current_tokens: 50_000,
-            current_tool_calls: 0,
-            had_error: false,
-            turn_number: 0,
-            config: SessionMemoryExtractConfig::default(),
-        };
-        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
-        svc.wait_for_pending(Duration::from_secs(2)).await;
-
-        let stored = memoria.stored.lock().unwrap().clone();
-        assert_eq!(
-            stored.len(),
-            1,
-            "empty-messages session should still land a L1"
-        );
-        assert!(
-            stored[0].0.starts_with("[session-memory:v1]"),
-            "L1 must carry the prefix even when input was empty; got: {:?}",
-            &stored[0].0[..60.min(stored[0].0.len())]
-        );
-    }
-
-    /// Huge messages: 10K lines × 200 chars. Worker must not OOM or
-    /// exceed reasonable latency. Verifies build_l1 handles bulk input.
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn huge_messages_do_not_oom_worker() {
-        let memoria = Arc::new(CapturingMemoria::default());
-        let (svc, _rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let sid = format!("huge-{}", nanos());
-
-        let mut messages = Vec::with_capacity(10_000);
-        let fat_line = "x".repeat(200);
-        for i in 0..10_000 {
-            messages.push(json!({
-                "role": if i % 2 == 0 { "user" } else { "assistant" },
-                "content": fat_line.clone(),
-            }));
-        }
-        let req = ExtractionRequest {
-            session_id: sid,
-            messages,
-            current_tokens: 500_000,
-            current_tool_calls: 0,
-            had_error: false,
-            turn_number: 20,
-            config: SessionMemoryExtractConfig::default(),
-        };
-
-        let started = Instant::now();
-        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
-        let leftover = svc.wait_for_pending(Duration::from_secs(10)).await;
-        assert_eq!(leftover, 0, "huge session must still complete within 10s");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "10K-message extraction should finish promptly; elapsed={elapsed:?}"
-        );
-
-        // Verify the stored L1 doesn't itself blow past a sane size
-        // (build_l1 should truncate). We don't lock a specific cap
-        // here, just that it's far less than input (~2MB).
-        let stored = memoria.stored.lock().unwrap().clone();
-        assert_eq!(stored.len(), 1);
-        assert!(
-            stored[0].0.len() < 200_000,
-            "L1 must be truncated; got {} chars",
-            stored[0].0.len()
-        );
-    }
-
-    /// Special characters in session_id: spaces, unicode, quote,
-    /// slash. Memoria store must see the session_id intact; gate must
-    /// not crash on truncation boundaries.
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn special_chars_in_session_id_propagate_to_memoria() {
-        let memoria = Arc::new(CapturingMemoria::default());
-        let (svc, _rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let weird_sids = ["has space", "中文会话", "quote'inside", "path/with/slash"];
-        for (i, sid) in weird_sids.iter().enumerate() {
-            let req = sample_req(sid, 50_000, false);
-            let d = svc.maybe_spawn(req);
-            assert_eq!(d, SpawnDecision::Spawned, "sid[{i}]='{sid}' must spawn");
-        }
-        svc.wait_for_pending(Duration::from_secs(3)).await;
-
-        let stored = memoria.stored.lock().unwrap().clone();
-        assert_eq!(stored.len(), weird_sids.len());
-        for (i, sid) in weird_sids.iter().enumerate() {
-            assert_eq!(
-                stored[i].2.as_deref(),
-                Some(*sid),
-                "session_id must reach Memoria unchanged"
-            );
-        }
-    }
-
     // ── cross-turn state persistence (regression for turn-scoped state bug) ──
-
-    /// The critical fix: per-session debounce state must persist across
-    /// simulated turn boundaries. Previously state lived on
-    /// `AgenticLoopState` which got rebuilt every turn, so `initialized`
-    /// was always `false` at gate time and the growth-delta branch of
-    /// the gate was structurally unreachable. Now state lives in the
-    /// service itself, keyed by session_id.
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn debounce_state_persists_across_simulated_turns() {
-        let memoria = Arc::new(CapturingMemoria::default());
-        let (svc, _rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let sid = format!("cross-turn-{}", nanos());
-
-        // Turn 1: past init gate → Run. Worker finishes and
-        // `mark_extracted` updates the service-internal state.
-        let req1 = ExtractionRequest {
-            session_id: sid.clone(),
-            messages: vec![json!({"role": "user", "content": "hi"})],
-            current_tokens: 20_000,
-            current_tool_calls: 2,
-            had_error: false,
-            turn_number: 1,
-            config: SessionMemoryExtractConfig::default(),
-        };
-        assert_eq!(svc.maybe_spawn(req1), SpawnDecision::Spawned);
-        svc.wait_for_pending(Duration::from_secs(2)).await;
-        // Confirm state actually recorded.
-        let state = svc
-            .peek_state(&sid)
-            .expect("state should be recorded after first extraction");
-        assert!(state.initialized);
-        assert_eq!(state.tokens_at_last_extraction, 20_000);
-        assert_eq!(state.tool_calls_at_last_extraction, 2);
-
-        // Turn 2: tiny growth. With the OLD turn-scoped state this
-        // would have reset `initialized = false` and seen `20_500 >
-        // min_tokens_to_init (10K)` → Run. With the new per-session
-        // state this should correctly debounce to `no_growth` because
-        // growth < 5K between updates.
-        let req2 = ExtractionRequest {
-            session_id: sid.clone(),
-            messages: vec![json!({"role": "user", "content": "hi again"})],
-            current_tokens: 20_500,
-            current_tool_calls: 3,
-            had_error: false,
-            turn_number: 2,
-            config: SessionMemoryExtractConfig::default(),
-        };
-        assert_eq!(
-            svc.maybe_spawn(req2),
-            SpawnDecision::Skipped,
-            "tiny growth on the next turn should debounce, not re-spawn"
-        );
-
-        // Turn 3: big growth → Run again.
-        let req3 = ExtractionRequest {
-            session_id: sid.clone(),
-            messages: vec![json!({"role": "user", "content": "big turn"})],
-            current_tokens: 30_000,
-            current_tool_calls: 8,
-            had_error: false,
-            turn_number: 3,
-            config: SessionMemoryExtractConfig::default(),
-        };
-        assert_eq!(
-            svc.maybe_spawn(req3),
-            SpawnDecision::Spawned,
-            "5K+ growth + 3+ tool call growth must re-admit extraction"
-        );
-        svc.wait_for_pending(Duration::from_secs(2)).await;
-
-        // Verify the service advanced its state to the turn-3 counters.
-        let state = svc.peek_state(&sid).unwrap();
-        assert_eq!(state.tokens_at_last_extraction, 30_000);
-        assert_eq!(state.tool_calls_at_last_extraction, 8);
-
-        // Two extractions landed in total (turns 1 and 3).
-        assert_eq!(memoria.stored.lock().unwrap().len(), 2);
-    }
 
     /// Different sessions must not pollute each other's debounce state.
     #[tokio::test]
@@ -2272,105 +1529,6 @@ mod tests {
             saw_unhealthy,
             "expected skipped{{memoria_unhealthy}} event once breaker tripped"
         );
-    }
-
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn breaker_recovers_after_cooldown_when_probe_succeeds() {
-        // Start with failing Memoria to trip the breaker, then swap to
-        // a succeeding one via a shared flag.
-        use std::sync::atomic::{AtomicBool, Ordering};
-        struct FlakeyMemoria {
-            alive: Arc<AtomicBool>,
-            stored: Mutex<u32>,
-        }
-        #[async_trait]
-        impl MemoriaClient for FlakeyMemoria {
-            async fn retrieve_ext(
-                &self,
-                _: &str,
-                _: Option<&str>,
-                _: usize,
-                _: bool,
-            ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String>
-            {
-                Ok(Vec::new())
-            }
-            async fn store(
-                &self,
-                _: &str,
-                _: &str,
-                _: Option<&str>,
-                _: Option<&str>,
-            ) -> Result<String, String> {
-                if self.alive.load(Ordering::Acquire) {
-                    *self.stored.lock().unwrap() += 1;
-                    Ok("ok".into())
-                } else {
-                    Err("memoria down".into())
-                }
-            }
-            async fn purge_working(&self, _: &str) -> Result<u64, String> {
-                Ok(0)
-            }
-        }
-        let alive = Arc::new(AtomicBool::new(false));
-        let memoria = Arc::new(FlakeyMemoria {
-            alive: Arc::clone(&alive),
-            stored: Mutex::new(0),
-        });
-        let (ingestion, mut rx) = IngestionSender::for_tests(256);
-        let broker = Arc::new(BackgroundActivityBroker::new());
-        let mut svc = MemoryExtractionService::new(
-            Arc::new(ConstSelectorResolver(None)),
-            Arc::clone(&memoria) as Arc<dyn MemoriaClient>,
-            ingestion,
-            "recovery-test",
-            broker,
-        );
-        svc.memoria_health = Arc::new(crate::session_memory::health::MemoriaHealth::with_config(
-            1,
-            Duration::from_millis(80),
-        ));
-        let svc = Arc::new(svc);
-
-        // Trip the breaker with one failure.
-        svc.maybe_spawn(sample_req(&format!("fail-{}", nanos()), 20_000, false));
-        svc.wait_for_pending(Duration::from_secs(2)).await;
-        // Next attempt → breaker is Open.
-        assert_eq!(
-            svc.maybe_spawn(sample_req(&format!("blocked-{}", nanos()), 20_000, false)),
-            SpawnDecision::Skipped
-        );
-
-        // Flip the Memoria to healthy + wait past the cooldown.
-        alive.store(true, Ordering::Release);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Next attempt is the probe — should be admitted.
-        let probe_sid = format!("probe-{}", nanos());
-        assert_eq!(
-            svc.maybe_spawn(sample_req(&probe_sid, 20_000, false)),
-            SpawnDecision::Spawned
-        );
-        svc.wait_for_pending(Duration::from_secs(2)).await;
-
-        // And the next one after probe success is back to Closed.
-        let post_sid = format!("post-{}", nanos());
-        assert_eq!(
-            svc.maybe_spawn(sample_req(&post_sid, 20_000, false)),
-            SpawnDecision::Spawned
-        );
-        svc.wait_for_pending(Duration::from_secs(2)).await;
-
-        assert_eq!(
-            *memoria.stored.lock().unwrap(),
-            2,
-            "probe + post-probe should both have written"
-        );
-
-        // Drain events so the channel isn't reported as leaking.
-        while rx.try_recv().is_ok() {}
     }
 
     #[tokio::test]
@@ -2610,54 +1768,6 @@ mod tests {
 
     // ── Breadcrumb fields in emitted events ─────────────────────────
 
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn extracted_event_carries_messages_count_and_attempt() {
-        let memoria = Arc::new(CapturingMemoria::default());
-        let (svc, mut rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
-        let sid = format!("bc-ok-{}", nanos());
-        let req = ExtractionRequest {
-            session_id: sid.clone(),
-            messages: vec![
-                json!({"role": "user", "content": "one"}),
-                json!({"role": "assistant", "content": "two"}),
-                json!({"role": "user", "content": "three"}),
-            ],
-            current_tokens: 50_000,
-            current_tool_calls: 3,
-            had_error: false,
-            turn_number: 5,
-            config: SessionMemoryExtractConfig::default(),
-        };
-        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
-        svc.wait_for_pending(Duration::from_secs(2)).await;
-
-        let events = collect_extraction_events(&mut rx);
-        let extracted = events
-            .iter()
-            .find(|e| {
-                e.metadata
-                    .as_ref()
-                    .and_then(|m| m.get("outcome"))
-                    .and_then(|v| v.as_str())
-                    == Some("extracted")
-            })
-            .expect("expected an extracted event");
-        let meta = extracted.metadata.as_ref().unwrap();
-        // Breadcrumbs must have landed in the metadata JSON.
-        assert_eq!(meta["messages_count"], 3);
-        // Rule-based path → no selector_model (None is omitted).
-        assert!(
-            meta.get("selector_model").is_none(),
-            "rule-based extraction must not emit selector_model; got: {meta:?}"
-        );
-        assert_eq!(
-            meta["attempt"], 1,
-            "first-try store success must report attempt=1"
-        );
-    }
-
     #[tokio::test]
     async fn skip_event_carries_messages_count_but_no_attempt() {
         let memoria = Arc::new(CapturingMemoria::default());
@@ -2706,19 +1816,11 @@ mod tests {
                 Arc::clone(&memoria) as Arc<dyn MemoriaClient>,
                 ingestion,
                 "test-user",
-                Arc::clone(&broker),
+                broker,
             )
             .with_observatory(Arc::clone(&obs)),
         );
-        (
-            TestCtx {
-                svc,
-                rx,
-                broker,
-                memoria,
-            },
-            obs,
-        )
+        (TestCtx { svc, rx, memoria }, obs)
     }
 
     #[tokio::test]
@@ -2769,53 +1871,6 @@ mod tests {
             snap[0].trigger,
             crate::session_memory::ExtractionTrigger::ErrorOverride,
             "trigger must reflect the error-driven bypass"
-        );
-    }
-
-    #[ignore = "L1 extraction path removed in wip-3; retained as scaffolding test"]
-    #[tokio::test]
-    async fn observatory_records_persisted_after_rule_based_store() {
-        let (ctx, obs) = build_ctx_with_obs();
-        let sid = format!("obs-ok-{}", nanos());
-        let req = sample_req(&sid, 50_000, false); // past init gate, no selector
-        assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Spawned);
-        wait_for_memoria_store(&ctx.memoria).await;
-
-        // Wait for the async record — observatory writes after the
-        // persist returns, which can trail the store Mutex push by a
-        // scheduler tick on CI hosts.
-        for _ in 0..50 {
-            if !obs.extractions_snapshot().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let snap = obs.extractions_snapshot();
-        assert_eq!(snap.len(), 1, "expected one record");
-        let rec = &snap[0];
-        match &rec.outcome {
-            crate::session_memory::ExtractionOutcome::Persisted {
-                source,
-                bytes_written,
-                store_attempt,
-            } => {
-                assert_eq!(
-                    *source,
-                    crate::session_memory::ExtractionSource::RuleFallback
-                );
-                assert!(*bytes_written > 0);
-                assert!(*store_attempt >= 1);
-            }
-            other => panic!("expected Persisted, got {other:?}"),
-        }
-        assert!(
-            !rec.content_preview.is_empty(),
-            "persisted record must carry a preview"
-        );
-        assert!(
-            rec.content_preview.starts_with("[session-memory:v1]"),
-            "preview must include the v1 prefix; got {:.40}…",
-            rec.content_preview
         );
     }
 

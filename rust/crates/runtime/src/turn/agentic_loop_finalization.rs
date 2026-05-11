@@ -1339,54 +1339,6 @@ mod tests {
         (rx, memoria)
     }
 
-    async fn wait_for_memoria_store(memoria: &std::sync::Arc<CapturingMemoriaForFinalize>) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if !memoria.stored.lock().unwrap().is_empty() {
-                return;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!("no Memoria store landed within 5s");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    #[ignore = "L1 extraction path removed in wip-3; session memory no longer persisted"]
-    #[tokio::test]
-    async fn finalize_and_render_persists_session_memory_on_error() {
-        let sid = format!(
-            "finalize-writes-sm-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.current_session_id = Some(sid.clone());
-        state.error_recovery.consecutive_same_error = 1;
-        state
-            .messages
-            .push(serde_json::json!({"role": "user", "content": "rule-based marker FOO"}));
-        state.total_prompt = 15_000; // past 10K init gate
-        let (_rx, memoria) = attach_memory_extraction_service(&mut state);
-
-        finalize_and_render(&mut host, &mut state).await;
-        wait_for_memoria_store(&memoria).await;
-
-        let stored = memoria.stored.lock().unwrap().clone();
-        assert_eq!(stored.len(), 1, "expected 1 Memoria store, got {stored:?}");
-        let (content, memory_type, stored_sid) = &stored[0];
-        assert_eq!(memory_type, "working");
-        assert_eq!(stored_sid.as_deref(), Some(sid.as_str()));
-        assert!(
-            content.contains("rule-based marker FOO"),
-            "rule-based L1 should carry the user message; content: {content}"
-        );
-    }
-
     #[tokio::test]
     async fn finalize_and_render_without_session_id_does_not_panic() {
         let mut host = MockHost::new(Vec::new());
@@ -1445,70 +1397,6 @@ mod tests {
         assert!(
             saw_below_init_gate,
             "expected a skipped{{below_init_gate}} event"
-        );
-    }
-
-    /// Regression guard for the token-count bug: when prompt-cache hits
-    /// dominate, `total_prompt` stays small while `total_cache_read`
-    /// carries most of the context. The gate must see the SUM, not
-    /// just `total_prompt`, or extraction never fires on cache-heavy
-    /// sessions (real production scenario).
-    #[ignore = "L1 extraction path removed in wip-3; session memory no longer persisted"]
-    #[tokio::test]
-    async fn finalize_and_render_counts_cached_tokens_toward_init_gate() {
-        let sid = format!(
-            "finalize-cached-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.current_session_id = Some(sid.clone());
-        state.error_recovery.consecutive_same_error = 0;
-        state
-            .messages
-            .push(serde_json::json!({"role": "user", "content": "cache-heavy turn"}));
-        // Realistic cache-heavy numbers: uncached prompt is tiny (1K)
-        // but cache reads carry 40K of context. Sum is 41K, well past
-        // the 10K init gate.
-        state.total_prompt = 1_000;
-        state.total_cache_read = 40_000;
-        state.total_cache_creation = 0;
-        let (mut rx, memoria) = attach_memory_extraction_service(&mut state);
-
-        finalize_and_render(&mut host, &mut state).await;
-        wait_for_memoria_store(&memoria).await;
-
-        // The store must have landed (gate saw ~41K total, not 1K).
-        assert_eq!(
-            memoria.stored.lock().unwrap().len(),
-            1,
-            "cache-heavy turn should still trigger extraction; if this \
-             fails the gate is back to using raw total_prompt"
-        );
-
-        // And the event should be `extracted`, not `below_init_gate`.
-        let mut saw_extracted = false;
-        let mut saw_below_init = false;
-        while let Ok(evt) = rx.try_recv() {
-            if evt.event_type != "session_memory_extraction" {
-                continue;
-            }
-            let meta = evt.metadata.as_ref().unwrap();
-            if meta["outcome"] == "extracted" {
-                saw_extracted = true;
-            }
-            if meta["outcome"] == "skipped" && meta["reason"] == "below_init_gate" {
-                saw_below_init = true;
-            }
-        }
-        assert!(saw_extracted, "expected an `extracted` event");
-        assert!(
-            !saw_below_init,
-            "cache-heavy session must NOT report below_init_gate"
         );
     }
 
