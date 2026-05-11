@@ -227,9 +227,12 @@ name = "astra-config"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "chrono",
  "dirs 6.0.0",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror 1.0.69",
  "toml 1.1.2+spec-1.1.0",
 ]

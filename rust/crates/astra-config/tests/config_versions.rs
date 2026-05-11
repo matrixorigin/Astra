@@ -58,7 +58,7 @@ fn same_content_produces_same_id() {
 #[test]
 fn different_content_produces_different_id() {
     let (_dir, store) = tmp_store();
-    let mut a = RuntimeConfig::default();
+    let a = RuntimeConfig::default();
     let mut b = RuntimeConfig::default();
     b.token_budget.max_turn_input_tokens = a.token_budget.max_turn_input_tokens + 1;
 
@@ -206,9 +206,10 @@ fn list_returns_versions_in_newest_first_order() {
 fn put_records_session_id_and_parent_metadata() {
     let (_dir, store) = tmp_store();
     let cfg = RuntimeConfig::default();
-    let mut meta = PutMetadata::default();
-    meta.source_session = Some("sess_abc123".into());
-    meta.parent = Some(VersionId::from_str_for_test("cfg_0000000000000000"));
+    let meta = PutMetadata {
+        source_session: Some("sess_abc123".into()),
+        parent: Some(VersionId::from_str_for_test("cfg_0000000000000000")),
+    };
     let id = store.put(&cfg, meta).unwrap();
 
     let entries = store.list().unwrap();
@@ -235,10 +236,14 @@ fn duplicate_put_with_different_metadata_keeps_first_blob_records_second_index_r
     // rewritten.
     let (_dir, store) = tmp_store();
     let cfg = RuntimeConfig::default();
-    let mut meta_a = PutMetadata::default();
-    meta_a.source_session = Some("sess_A".into());
-    let mut meta_b = PutMetadata::default();
-    meta_b.source_session = Some("sess_B".into());
+    let meta_a = PutMetadata {
+        source_session: Some("sess_A".into()),
+        parent: None,
+    };
+    let meta_b = PutMetadata {
+        source_session: Some("sess_B".into()),
+        parent: None,
+    };
     let id_a = store.put(&cfg, meta_a).unwrap();
     let id_b = store.put(&cfg, meta_b).unwrap();
     assert_eq!(id_a, id_b);
