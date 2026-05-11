@@ -105,21 +105,12 @@ fn truncate_to_first_sentence(desc: &str) -> &str {
 
 fn strip_optional_params(func: &mut Value) {
     if let Some(params) = func.get_mut("parameters").and_then(Value::as_object_mut) {
-        let required: Vec<String> = params
-            .get("required")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let required = collect_required_union(params);
 
         if let Some(props) = params.get_mut("properties").and_then(Value::as_object_mut) {
             let keys_to_remove: Vec<String> = props
                 .keys()
-                .filter(|k| !required.contains(k))
+                .filter(|k| !required.contains(k.as_str()))
                 .cloned()
                 .collect();
             for key in keys_to_remove {
@@ -127,6 +118,43 @@ fn strip_optional_params(func: &mut Value) {
             }
         }
     }
+}
+
+/// Collect every field name that's required by *any* branch of the
+/// schema — top-level `required`, plus `allOf[].then.required` for
+/// consolidated tools that express per-action required fields via
+/// JSON-Schema conditionals (e.g. the `agent` tool requires
+/// `description`+`prompt` only when `action=="spawn"`).
+///
+/// The union matters for `AggressivePrune`: if we took only the
+/// top-level `required` list we'd strip `description` etc. off
+/// `agent`'s properties, and the LLM would be unable to spawn a
+/// sub-agent under context pressure.
+fn collect_required_union(params: &serde_json::Map<String, Value>) -> HashSet<String> {
+    let mut union: HashSet<String> = HashSet::new();
+    if let Some(arr) = params.get("required").and_then(Value::as_array) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                union.insert(s.to_string());
+            }
+        }
+    }
+    if let Some(branches) = params.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            let then = branch.get("then");
+            if let Some(arr) = then
+                .and_then(|t| t.get("required"))
+                .and_then(Value::as_array)
+            {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        union.insert(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    union
 }
 
 fn strip_property_descriptions(func: &mut Value) {

@@ -10,7 +10,10 @@ pub(crate) struct ToolCallGroup<'a> {
 
 impl ToolCallGroup<'_> {
     pub(crate) fn ok_count(&self) -> usize {
-        self.calls.iter().filter(|c| c.ok).count()
+        self.calls
+            .iter()
+            .filter(|c| !super::journal_digest::is_effective_failure(c))
+            .count()
     }
 
     pub(crate) fn fail_count(&self) -> usize {

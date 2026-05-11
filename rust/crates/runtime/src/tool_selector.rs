@@ -877,17 +877,15 @@ pub fn prune_schema(mut schema: Value, level: PruneLevel) -> Value {
 
     // Prune parameter descriptions
     if let Some(params) = func.get_mut("parameters") {
-        // Extract required names first (before mutable borrow of properties)
+        // Extract required names first (before mutable borrow of properties).
+        // Include every field required by *any* branch of a consolidated
+        // tool's `allOf` / `if-then-required` chain, not just the top-level
+        // `required`. Otherwise AggressivePrune would strip per-action
+        // required fields (e.g. `agent.spawn` needs `description`+`prompt`
+        // only when `action=="spawn"`), leaving the LLM unable to call the
+        // branch under context pressure.
         let required_names: std::collections::HashSet<String> = if level == PruneLevel::Aggressive {
-            params
-                .get("required")
-                .and_then(|r| r.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default()
+            collect_schema_required_union(params)
         } else {
             std::collections::HashSet::new()
         };
@@ -910,6 +908,38 @@ pub fn prune_schema(mut schema: Value, level: PruneLevel) -> Value {
     }
 
     schema
+}
+
+/// Collect every field name that's required by *any* branch of the
+/// schema — top-level `required` plus every `allOf[].then.required`
+/// block. Used by AggressivePrune so consolidated tools don't lose
+/// their per-action required properties when the aggressive tier
+/// strips "optional" properties.
+fn collect_schema_required_union(params: &Value) -> std::collections::HashSet<String> {
+    let mut union = std::collections::HashSet::new();
+    if let Some(arr) = params.get("required").and_then(Value::as_array) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                union.insert(s.to_string());
+            }
+        }
+    }
+    if let Some(branches) = params.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            if let Some(arr) = branch
+                .get("then")
+                .and_then(|t| t.get("required"))
+                .and_then(Value::as_array)
+            {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        union.insert(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    union
 }
 
 /// Truncate a string at a word boundary, safely handling multi-byte UTF-8.
