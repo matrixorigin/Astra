@@ -12,8 +12,8 @@ pub(crate) mod view;
 
 #[allow(unused_imports)]
 pub(crate) use model::{
-    Category, CategoryKind, ContextBreakdown, HistorySummary, MemoryItem, PressureBand, Section,
-    SectionItem, SkillItem, ToolItem, TurnDetail,
+    Category, CategoryKind, ContextBreakdown, ContextSnapshot, HistorySummary, MemoryItem,
+    PressureBand, Section, SectionItem, SkillItem, ToolItem, TurnDetail,
 };
 
 #[cfg(test)]

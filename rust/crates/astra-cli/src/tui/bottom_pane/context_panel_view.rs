@@ -125,6 +125,32 @@ impl ContextPanelView {
             self.expanded = Some(focus);
         }
     }
+
+    /// Adjust scroll so the currently-focused section's heading is
+    /// visible. Lands the heading a couple rows from the top when
+    /// the section starts deep in the line list — close to Claude
+    /// Code's behavior where Tab jumps your eye to the new row.
+    /// No-op when there's no focus or the breakdown has no content.
+    fn scroll_to_focus(&mut self) {
+        let Some(focus) = self.focus else { return };
+        let inner_w = self.last_inner_width.get();
+        let inner_h = self.last_viewport_rows.get();
+        if inner_w == 0 || inner_h == 0 {
+            return;
+        }
+        let state = self.view_state();
+        let Some(line_idx) = panel_view::section_line_index(&self.breakdown, inner_w, state, focus)
+        else {
+            return;
+        };
+        // Leave two rows above the heading when possible so users
+        // see the grid + compression hint instead of the heading
+        // being pinned to row 0. Clamp to max_scroll so the end of
+        // the content doesn't get empty space below.
+        let target = line_idx.saturating_sub(2);
+        let max = self.max_scroll();
+        self.scroll = target.min(max);
+    }
 }
 
 impl BottomPaneView for ContextPanelView {
@@ -166,10 +192,9 @@ impl BottomPaneView for ContextPanelView {
             (KeyCode::Enter, _) => {
                 if self.focus.is_some() {
                     self.toggle_expand();
-                    // Reset scroll to the top on expand/collapse so
-                    // the user lands on the section heading they
-                    // just acted on instead of mid-section.
-                    self.scroll = 0;
+                    // Re-anchor the scroll so the heading stays
+                    // visible after the expansion grew the content.
+                    self.scroll_to_focus();
                 } else {
                     self.completed = true;
                 }
@@ -179,7 +204,9 @@ impl BottomPaneView for ContextPanelView {
                 let reverse = matches!(key.code, KeyCode::BackTab)
                     || key.modifiers.contains(KeyModifiers::SHIFT);
                 self.focus_next(reverse);
-                self.scroll = 0;
+                // Land the newly-focused heading in view — the
+                // previous "scroll=0" forced users to scan for it.
+                self.scroll_to_focus();
             }
             // Fine scroll.
             (KeyCode::Down | KeyCode::Char('j'), _) => self.scroll_by(1),
@@ -551,14 +578,54 @@ mod tests {
     }
 
     #[test]
-    fn expand_resets_scroll_to_top() {
-        // Expansion grows the content; leaving the scroll position
-        // where it was before would land the user mid-section.
+    fn tab_anchors_focused_heading_in_view() {
+        // Tabbing onto a later section should reposition the
+        // scroll so the heading is visible near the top (≈2 rows
+        // of padding above).
         let mut v = ContextPanelView::new(big_breakdown());
         prime_viewport(&v, 80, 10);
-        v.scroll = 4;
         v.handle_key(press(KeyCode::Tab));
+        let first_scroll = v.scroll;
+        v.handle_key(press(KeyCode::Tab));
+        let second_scroll = v.scroll;
+        // System prompt comes first → scroll may still be near 0,
+        // but the second section's heading is deeper so the scroll
+        // must advance.
+        assert!(
+            second_scroll >= first_scroll,
+            "Tab must scroll forward to reach later sections: {first_scroll} → {second_scroll}"
+        );
+    }
+
+    #[test]
+    fn expand_reanchors_scroll_on_heading() {
+        let mut v = ContextPanelView::new(big_breakdown());
+        prime_viewport(&v, 80, 10);
+        v.handle_key(press(KeyCode::Tab));
+        let before = v.scroll;
         v.handle_key(press(KeyCode::Enter));
-        assert_eq!(v.scroll, 0);
+        // After expansion we re-anchor; the scroll value is deterministic
+        // relative to the heading, so it should either stay the same
+        // or adjust (but never drift so far that the heading leaves
+        // the viewport).
+        let heading = crate::tui::context_panel::view::section_line_index(
+            &v.breakdown,
+            v.last_inner_width.get(),
+            v.view_state(),
+            v.focus.unwrap(),
+        )
+        .unwrap();
+        let page = v.last_viewport_rows.get();
+        assert!(
+            v.scroll <= heading,
+            "heading must be at or below scroll top after expand (scroll={}, heading={})",
+            v.scroll,
+            heading
+        );
+        assert!(
+            heading < v.scroll.saturating_add(page),
+            "heading must stay within the visible viewport after expand"
+        );
+        let _ = before;
     }
 }

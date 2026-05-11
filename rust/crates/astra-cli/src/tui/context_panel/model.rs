@@ -149,16 +149,26 @@ pub(crate) struct TurnDetail {
     /// `None` when this turn was retained; `Some(method)` when
     /// compressed with that method.
     pub compressed_from: Option<(u32, String)>,
+    /// Short content preview taken from the turn body (first
+    /// non-blank line, truncated). Empty when the caller didn't
+    /// attach transcript text — in that case the expanded view
+    /// renders only tokens + markers.
+    pub preview: String,
 }
+
 
 /// A labelled sub-section of the system prompt (e.g. "Environment",
 /// "Guidance signals").  We keep the structure flat — the trace
 /// doesn't currently surface named sections, so most deployments
-/// will see just the aggregated system total.
+/// will see just the aggregated system total.  `preview` is
+/// synthesized locally at /context-build time (e.g. cwd + git
+/// branch for Environment) — populated when the caller passes
+/// [`ContextSnapshot`] with env details.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SectionItem {
     pub name: String,
     pub tokens: u32,
+    pub preview: Option<String>,
 }
 
 /// Which nested section the user currently has focused. Drives
@@ -254,6 +264,28 @@ impl PressureBand {
     }
 }
 
+/// Auxiliary data the caller supplies alongside a trace. The
+/// trace itself captures token counts only; this snapshot carries
+/// the human-readable previews the expanded view renders under
+/// each item (first line of each history turn's text, cwd + git
+/// branch for Environment, etc). All fields are optional so
+/// callers can opt in incrementally.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ContextSnapshot<'a> {
+    /// Per-history-turn plain-text preview, indexed by turn number
+    /// matching [`TurnRetention::turn_index`] / [`TurnCompression::turn_index`].
+    pub history_previews: std::collections::HashMap<u32, String>,
+    /// Current model identifier (for the System-prompt Persona row).
+    pub model: Option<&'a str>,
+    /// cwd rendered as a display string, e.g. `~/github/astra`.
+    pub cwd: Option<String>,
+    /// Current git branch, e.g. `improve_tui3`.
+    pub git_branch: Option<String>,
+    /// Path to the user-rules file backing the User-preferences
+    /// section (e.g. `~/.claude/rules/…`).
+    pub user_rules_path: Option<String>,
+}
+
 impl ContextBreakdown {
     /// Empty breakdown used when no trace is available.
     pub fn empty() -> Self {
@@ -273,10 +305,17 @@ impl ContextBreakdown {
     }
 
     /// Build from the most recent full [`ContextAssemblyTrace`].
-    /// This is the richer source — in addition to the stacked-bar
-    /// categories it populates the nested tool / memory / skill
-    /// lists that render below the grid.
+    /// Equivalent to [`from_trace_with`] with an empty snapshot —
+    /// no content previews, just the counts the trace carries.
     pub fn from_trace(trace: &ContextAssemblyTrace) -> Self {
+        Self::from_trace_with(trace, &ContextSnapshot::default())
+    }
+
+    /// Build from a trace plus an auxiliary [`ContextSnapshot`] of
+    /// human-readable previews.  The caller passes what it knows
+    /// (history text, cwd, git branch, user-rules path) and the
+    /// expanded view renders them alongside the raw token counts.
+    pub fn from_trace_with(trace: &ContextAssemblyTrace, snap: &ContextSnapshot<'_>) -> Self {
         let budget = &trace.token_budget;
         let limit = budget.max_tokens;
         let pct = |tokens: u32| -> f64 {
@@ -386,8 +425,10 @@ impl ContextBreakdown {
         // System-prompt sub-rows: the trace doesn't currently split
         // the system prompt into named sections, so we synthesize a
         // coarse split from the known scalar fields.  Zero-token
-        // rows are dropped.
-        let system_sections = build_system_sections(trace);
+        // rows are dropped.  Per-row previews come from the caller's
+        // snapshot — cwd + git branch for Environment, model name
+        // for Persona, user-rules path for User preferences.
+        let system_sections = build_system_sections(trace, snap);
 
         // History summary: counts + pre/post-compression token shape.
         // Rendered as a dedicated section so users can see how much
@@ -396,6 +437,12 @@ impl ContextBreakdown {
         let mut turns: Vec<TurnDetail> = Vec::with_capacity(
             h.turns_retained.len() + h.turns_compressed.len(),
         );
+        let preview_of = |idx: u32| -> String {
+            snap.history_previews
+                .get(&idx)
+                .cloned()
+                .unwrap_or_default()
+        };
         for r in &h.turns_retained {
             turns.push(TurnDetail {
                 index: r.turn_index,
@@ -403,6 +450,7 @@ impl ContextBreakdown {
                 tokens: r.tokens,
                 has_tool_calls: r.has_tool_calls,
                 compressed_from: None,
+                preview: preview_of(r.turn_index),
             });
         }
         for c in &h.turns_compressed {
@@ -412,6 +460,7 @@ impl ContextBreakdown {
                 tokens: c.compressed_tokens,
                 has_tool_calls: false,
                 compressed_from: Some((c.original_tokens, format!("{:?}", c.compression_method))),
+                preview: preview_of(c.turn_index),
             });
         }
         // Sort ascending by turn index so the expanded view reads
@@ -465,18 +514,30 @@ impl ContextBreakdown {
     }
 }
 
-fn build_system_sections(trace: &ContextAssemblyTrace) -> Vec<SectionItem> {
+fn build_system_sections(
+    trace: &ContextAssemblyTrace,
+    snap: &ContextSnapshot<'_>,
+) -> Vec<SectionItem> {
     let sp = &trace.system_prompt;
-    let raw = [
-        ("Persona", sp.base_persona_tokens),
-        ("Environment", sp.environment_tokens),
-        ("User preferences", sp.user_preferences_tokens),
+    let persona_preview = snap.model.map(|m| format!("model: {m}"));
+    let env_preview = match (snap.cwd.as_deref(), snap.git_branch.as_deref()) {
+        (Some(cwd), Some(branch)) => Some(format!("{cwd}  ·  git: {branch}")),
+        (Some(cwd), None) => Some(cwd.to_string()),
+        (None, Some(branch)) => Some(format!("git: {branch}")),
+        (None, None) => None,
+    };
+    let prefs_preview = snap.user_rules_path.clone();
+    let raw: [(&str, u32, Option<String>); 3] = [
+        ("Persona", sp.base_persona_tokens, persona_preview),
+        ("Environment", sp.environment_tokens, env_preview),
+        ("User preferences", sp.user_preferences_tokens, prefs_preview),
     ];
     raw.into_iter()
-        .filter(|(_, t)| *t > 0)
-        .map(|(name, tokens)| SectionItem {
+        .filter(|(_, t, _)| *t > 0)
+        .map(|(name, tokens, preview)| SectionItem {
             name: name.to_string(),
             tokens,
+            preview,
         })
         .collect()
 }

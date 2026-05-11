@@ -303,7 +303,29 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 return SlashResult::Fallback;
             }
             use crate::tui::bottom_pane::context_panel_view::ContextPanelView;
-            use crate::tui::context_panel::ContextBreakdown;
+            use crate::tui::context_panel::{ContextBreakdown, ContextSnapshot};
+
+            // Collect human-readable previews the trace doesn't
+            // carry: per-turn transcript snippets (from the chat
+            // widget's history) and process-state bits for the
+            // System-prompt sub-rows (model id, cwd, git branch,
+            // user-rules path).  The panel renders these under the
+            // count rows when the user expands a section.
+            let mut snap = ContextSnapshot::default();
+            snap.model = ctx.state.model.as_deref();
+            if let Ok(cwd) = std::env::current_dir() {
+                snap.cwd = Some(display_path(&cwd));
+            }
+            snap.git_branch = detect_git_branch();
+            snap.user_rules_path = find_user_rules_path();
+
+            // Walk the committed history cells and pair them with
+            // the trace's turn indices.  We use the cell ordering
+            // (user/assistant pairs) as a rough proxy — the trace
+            // doesn't emit a stable cell→turn_index mapping today,
+            // so we populate by position.
+            snap.history_previews = collect_history_previews(ctx.chat_widget);
+
             let breakdown = match ctx.state.observability_session.as_ref() {
                 Some(session) => {
                     let guard = session.read().unwrap_or_else(|e| e.into_inner());
@@ -314,7 +336,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                         // category bar. Old code only passed the
                         // scalar TokenBudgetTrace which lost that
                         // detail.
-                        Some(trace) => ContextBreakdown::from_trace(trace),
+                        Some(trace) => ContextBreakdown::from_trace_with(trace, &snap),
                         None => ContextBreakdown::empty(),
                     }
                 }
@@ -1193,6 +1215,111 @@ fn parse_slash(text: &str) -> (&str, &str) {
         Some(pos) => (&text[..pos], text[pos..].trim()),
         None => (text, ""),
     }
+}
+
+/// Render a filesystem path for the `/context` Environment row.
+/// Replaces `$HOME` with `~` so absolute paths stay short.
+fn display_path(path: &std::path::Path) -> String {
+    let s = path.display().to_string();
+    if let Ok(home) = std::env::var("HOME") {
+        if let Some(rest) = s.strip_prefix(&home) {
+            return format!("~{rest}");
+        }
+    }
+    s
+}
+
+/// Detect current git branch via `gix`. Returns `None` when the cwd
+/// isn't a git repo, in detached HEAD, or on any I/O error — in any
+/// of those cases the Environment row falls back to just the cwd.
+fn detect_git_branch() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let repo = gix::discover(cwd).ok()?;
+    let head = repo.head().ok()?;
+    let name = head.referent_name()?;
+    Some(name.shorten().to_string())
+}
+
+/// Locate the first user-rules file that ships with the current
+/// profile (Claude Code keeps them in `~/.claude/rules/`, astra in
+/// `~/.astra/rules/`).  Returns the first path that exists, or
+/// `None` if neither directory is present.  The path is rendered
+/// with `display_path` so it lands in the snapshot already
+/// home-shortened.
+fn find_user_rules_path() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    for sub in &[".astra/rules", ".claude/rules"] {
+        let p = std::path::PathBuf::from(&home).join(sub);
+        if p.exists() {
+            return Some(display_path(&p));
+        }
+    }
+    None
+}
+
+/// Build a `turn_index → one-line preview` map from the chat
+/// widget's committed scrollback.  Turn indices come from the
+/// trace side of the API, but the trace doesn't store text — we
+/// use the cell position within each user-turn as the index.
+///
+/// The mapping is heuristic (cells don't carry a turn id) but
+/// matches the common case: each user/assistant pair is one turn.
+fn collect_history_previews(
+    chat: &crate::tui::chat_widget::ChatWidget,
+) -> std::collections::HashMap<u32, String> {
+    use crate::tui::history_cell::{
+        assistant::AssistantCell, reasoning::ReasoningCell, user::UserCell,
+    };
+    let mut out = std::collections::HashMap::new();
+    // Walk history cells; each user cell advances the turn index.
+    // Assistant / reasoning text for turn N preview the user cell
+    // of turn N's reply — what the user usually wants to scan for.
+    let mut turn_idx: u32 = 0;
+    for cell in chat.history() {
+        let any = cell.as_any_ref();
+        if let Some(u) = any.downcast_ref::<UserCell>() {
+            insert_preview(&mut out, turn_idx, u.text());
+            turn_idx = turn_idx.saturating_add(1);
+        } else if let Some(a) = any.downcast_ref::<AssistantCell>() {
+            // Assistant preview improves over the user prompt when
+            // the user asks "what was #2" — show the model reply
+            // if it hasn't been captured by a user cell already.
+            // Only fill if the slot is still empty so we don't
+            // clobber a concrete user message.
+            if !out.contains_key(&turn_idx.saturating_sub(1)) {
+                insert_preview(&mut out, turn_idx.saturating_sub(1), a.source());
+            }
+        } else if let Some(r) = any.downcast_ref::<ReasoningCell>() {
+            // Reasoning rarely wins — only fill when absolutely
+            // nothing else is populated.
+            let slot = turn_idx.saturating_sub(1);
+            out.entry(slot)
+                .or_insert_with(|| one_line_preview(r.text()));
+        }
+    }
+    out
+}
+
+fn insert_preview(
+    out: &mut std::collections::HashMap<u32, String>,
+    idx: u32,
+    text: &str,
+) {
+    let preview = one_line_preview(text);
+    if preview.is_empty() {
+        return;
+    }
+    out.insert(idx, preview);
+}
+
+fn one_line_preview(text: &str) -> String {
+    text.lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(200)
+        .collect()
 }
 
 #[cfg(test)]

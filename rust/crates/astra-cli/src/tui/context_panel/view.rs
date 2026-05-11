@@ -147,6 +147,45 @@ pub(crate) fn line_count_with(b: &ContextBreakdown, inner_width: u16, state: Vie
     build_lines_with(b, inner_width, state).len() as u16
 }
 
+/// Line index of the given section's heading in the rendered line
+/// list at the given width + state. Used by the BottomPaneView
+/// wrapper to auto-scroll a newly-focused (or newly-expanded)
+/// section into the visible window.
+///
+/// Returns `None` when the section has no content in the
+/// breakdown (so it wasn't rendered).
+pub(crate) fn section_line_index(
+    b: &ContextBreakdown,
+    inner_width: u16,
+    state: ViewState,
+    target: Section,
+) -> Option<u16> {
+    if !b.section_non_empty(target) {
+        return None;
+    }
+    let lines = build_lines_with(b, inner_width, state);
+    let heading_text = match target {
+        Section::SystemPrompt | Section::History => target.label(),
+        Section::Tools => "Tools · /tool",
+        Section::Memory => "Memory · /memory",
+        Section::Skills => {
+            // Skills heading varies depending on whether we're in
+            // the shortlist-fallback form or the full one.  Match
+            // on the core label, ignoring the ` (shortlist)` suffix.
+            "Skills · /skills"
+        }
+    };
+    lines
+        .iter()
+        .position(|l| line_contains(l, heading_text))
+        .map(|i| i as u16)
+}
+
+fn line_contains(line: &Line<'_>, needle: &str) -> bool {
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    text.contains(needle)
+}
+
 pub(crate) fn desired_height(b: &ContextBreakdown) -> u16 {
     // Overlay reserves 2 rows for the border. The content itself is
     // capped at 20 rows here; the view wrapper enables scrolling
@@ -246,6 +285,17 @@ fn render_section(
             out.push(section_heading_for(Section::SystemPrompt, focused, expanded));
             for s in &b.system_sections {
                 out.push(section_row(&format!(" {}", s.name), s.tokens));
+                if expanded
+                    && let Some(preview) = &s.preview
+                {
+                    out.push(Line::from(vec![
+                        Span::raw("        "),
+                        Span::styled(
+                            truncate_preview(preview, 120),
+                            Style::default().add_modifier(Modifier::DIM),
+                        ),
+                    ]));
+                }
             }
             out.push(Line::default());
         }
@@ -535,7 +585,7 @@ fn append_history_section(
                 Span::styled("Retained", Style::default().add_modifier(Modifier::BOLD)),
             ]));
             for t in retained {
-                out.push(turn_detail_line(t, false));
+                out.extend(turn_detail_lines(t, false));
             }
         }
         if !compressed.is_empty() {
@@ -544,7 +594,7 @@ fn append_history_section(
                 Span::styled("Compressed", Style::default().add_modifier(Modifier::BOLD)),
             ]));
             for t in compressed {
-                out.push(turn_detail_line(t, true));
+                out.extend(turn_detail_lines(t, true));
             }
         }
         if !h.dropped_indices.is_empty() {
@@ -559,7 +609,8 @@ fn append_history_section(
     out.push(Line::default());
 }
 
-fn turn_detail_line(t: &TurnDetail, compressed: bool) -> Line<'static> {
+fn turn_detail_lines(t: &TurnDetail, compressed: bool) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
     let mut spans: Vec<Span<'static>> = vec![Span::raw("        └ ")];
     spans.push(Span::raw(format!("#{} {}", t.index, t.role)));
     if compressed {
@@ -589,7 +640,20 @@ fn turn_detail_line(t: &TurnDetail, compressed: bool) -> Line<'static> {
             ));
         }
     }
-    Line::from(spans)
+    out.push(Line::from(spans));
+    // Content preview under the turn row, indented deeper so the
+    // eye can trace "which row does this belong to".
+    if !t.preview.is_empty() {
+        let preview = truncate_preview(&t.preview, 140);
+        out.push(Line::from(vec![
+            Span::raw("             "),
+            Span::styled(
+                format!("“{preview}”"),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+    out
 }
 
 fn append_tools_expanded(out: &mut Vec<Line<'static>>, tools: &[ToolItem]) {
@@ -1040,6 +1104,104 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(!text.contains("Free space"), "should be hidden: {text}");
+    }
+
+    #[test]
+    fn expanded_history_includes_turn_previews_when_snapshot_provides_them() {
+        use super::super::model::ContextSnapshot;
+        let mut t = trace(100_000, 2_000, 8_000, 0, 0, 0);
+        t.history.total_turns_available = 2;
+        t.history.turns_retained = vec![
+            TurnRetention {
+                turn_index: 0,
+                role: "user".into(),
+                tokens: 50,
+                has_tool_calls: false,
+            },
+            TurnRetention {
+                turn_index: 1,
+                role: "assistant".into(),
+                tokens: 1_200,
+                has_tool_calls: true,
+            },
+        ];
+        let mut snap = ContextSnapshot::default();
+        snap.history_previews
+            .insert(0, "can you refactor the auth module".into());
+        snap.history_previews
+            .insert(1, "I'll start by reading auth.rs…".into());
+        let b = ContextBreakdown::from_trace_with(&t, &snap);
+        let state = ViewState {
+            focus: Some(Section::History),
+            expanded: Some(Section::History),
+        };
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("can you refactor the auth module"),
+            "user preview missing: {text}"
+        );
+        assert!(
+            text.contains("I'll start by reading auth.rs"),
+            "assistant preview missing: {text}"
+        );
+    }
+
+    #[test]
+    fn expanded_system_prompt_shows_env_preview() {
+        use super::super::model::ContextSnapshot;
+        let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
+        t.system_prompt.environment_tokens = 500;
+        t.system_prompt.base_persona_tokens = 400;
+        let mut snap = ContextSnapshot::default();
+        snap.cwd = Some("~/github/astra".into());
+        snap.git_branch = Some("improve_tui3".into());
+        snap.model = Some("claude-sonnet-4.6");
+        let b = ContextBreakdown::from_trace_with(&t, &snap);
+        let state = ViewState {
+            focus: Some(Section::SystemPrompt),
+            expanded: Some(Section::SystemPrompt),
+        };
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("~/github/astra"),
+            "cwd preview missing: {text}"
+        );
+        assert!(
+            text.contains("improve_tui3"),
+            "git branch missing: {text}"
+        );
+        assert!(
+            text.contains("claude-sonnet-4.6"),
+            "model persona missing: {text}"
+        );
+    }
+
+    #[test]
+    fn collapsed_system_prompt_omits_env_preview() {
+        use super::super::model::ContextSnapshot;
+        let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
+        t.system_prompt.environment_tokens = 500;
+        let mut snap = ContextSnapshot::default();
+        snap.cwd = Some("~/code".into());
+        let b = ContextBreakdown::from_trace_with(&t, &snap);
+        let state = ViewState::collapsed(Some(Section::SystemPrompt));
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !text.contains("~/code"),
+            "env preview must stay hidden until expansion: {text}"
+        );
     }
 
     #[test]
