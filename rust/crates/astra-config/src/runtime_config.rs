@@ -1209,6 +1209,21 @@ pub struct ContextWindowConfig {
     /// Tokens reserved for error recovery retries.
     #[serde(default = "default_error_recovery_reserve")]
     pub error_recovery_reserve: u32,
+
+    /// Enables the "at 85% usage, lower `max_turn_input_tokens` by ~10%"
+    /// path in `agentic_adaptive_tuning`. Default: OFF.
+    ///
+    /// Why off by default: the logic is a self-defeating shrink spiral. At
+    /// high pressure it LOWERS the ceiling the next turn must fit under,
+    /// which raises the probability of another high-pressure event, which
+    /// lowers the ceiling again. Session 0e37eb46 hit 36968 tokens via this
+    /// path and the model gave up with a progress summary. The compaction
+    /// pipeline is the right tool for pressure; the budget should stay put.
+    ///
+    /// Leave reachable via config for environments that explicitly want
+    /// quota-style protection over per-turn headroom.
+    #[serde(default)]
+    pub adaptive_budget_reduction: bool,
 }
 
 fn default_compression_threshold_min() -> f64 {
@@ -1233,6 +1248,7 @@ impl Default for ContextWindowConfig {
             compression_threshold_max: default_compression_threshold_max(),
             remaining_turn_factor: default_remaining_turn_factor(),
             error_recovery_reserve: default_error_recovery_reserve(),
+            adaptive_budget_reduction: false,
         }
     }
 }
@@ -1723,6 +1739,7 @@ impl RuntimeConfig {
             compression_threshold_max,
             remaining_turn_factor,
             error_recovery_reserve,
+            adaptive_budget_reduction,
         } = context_window;
         merge_if_non_default(&mut self.context_window.adaptive, adaptive, default_true());
         merge_if_non_default(
@@ -1749,6 +1766,11 @@ impl RuntimeConfig {
             &mut self.context_window.error_recovery_reserve,
             error_recovery_reserve,
             default_error_recovery_reserve(),
+        );
+        merge_if_non_default(
+            &mut self.context_window.adaptive_budget_reduction,
+            adaptive_budget_reduction,
+            false,
         );
 
         // ── Adaptive Tuning ──
@@ -2066,6 +2088,7 @@ mod tests {
                 compression_threshold_max: 0.98,
                 remaining_turn_factor: 0.5,
                 error_recovery_reserve: 12000,
+                adaptive_budget_reduction: true,
             },
             adaptive_tuning: AdaptiveTuningConfig {
                 scenario_cooldown_turns: 10,

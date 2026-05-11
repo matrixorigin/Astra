@@ -569,8 +569,19 @@ pub(crate) fn apply_per_turn_adaptation(state: &mut AgenticLoopState, turn_token
 
     // ── 1. Dynamic token budget ──
     // Anti-flap: detect direction oscillation and suppress rapid reversals.
+    //
+    // Gated on BOTH `adaptive` (global adaptive-tuning switch) AND the more
+    // specific `adaptive_budget_reduction` opt-in. Default off: lowering the
+    // ceiling at high pressure is a shrink spiral that makes the next turn
+    // more likely to trip the same check. Compaction is the correct pressure
+    // handler; the budget should stay put unless an operator explicitly
+    // wants quota-style protection. See session 0e37eb46 for the regression
+    // that motivated this gate.
     let budget_cooldown = config.adaptive_tuning.budget_cooldown_turns;
-    if config.context_window.adaptive && turn_tokens_used > 0 {
+    if config.context_window.adaptive
+        && config.context_window.adaptive_budget_reduction
+        && turn_tokens_used > 0
+    {
         let max_budget = config.token_budget.max_turn_input_tokens;
         let threshold = (max_budget as f64 * 0.85) as u64;
         if turn_tokens_used > threshold && max_budget > 30_000 {

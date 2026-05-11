@@ -13,6 +13,7 @@ pub mod bridge_inprocess;
 pub mod bridge_llm_stream;
 pub mod bridge_observability;
 pub mod bridge_sse_helpers;
+pub mod budget_messaging;
 pub mod chat_turn_budget_pressure;
 pub mod chat_turn_selection_context;
 pub mod cloud;

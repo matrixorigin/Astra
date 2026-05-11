@@ -2337,14 +2337,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
             // test locks the contract.
             state.push_volatile(
                 super::agentic_loop_host::VolatileKind::CompactResume,
-                "Context compacted: the runtime just compressed your older \
-                 conversation history to reduce token pressure. Your \
-                 original task and the most recent tool activity are \
-                 still above — CONTINUE the task where you left off. \
-                 Do NOT summarize progress or ask the user to restate \
-                 the goal. If the previous attempt left a failing test \
-                 or an error, FIX IT next. Treat this compaction as a \
-                 transparent runtime event, not an instruction to stop.",
+                super::budget_messaging::COMPACT_RESUME_DIRECTIVE,
             );
             state.budget_wrapup_injected = true;
             try_write_heavy_checkpoint(state);
@@ -2365,10 +2358,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
     }
     state.push_volatile(
         super::agentic_loop_host::VolatileKind::BudgetAdvisory,
-        "You have reached the token budget limit for this turn. \
-         Do NOT call any more tools. Summarize your progress so far and \
-         present your results to the user. If you have partial work, \
-         explain what remains to be done.",
+        super::budget_messaging::BUDGET_REACHED_ADVISORY,
     );
     try_write_heavy_checkpoint(state);
     Some(TurnExecutionControl::ContinueLoop)

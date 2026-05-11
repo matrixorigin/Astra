@@ -6339,6 +6339,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
             let mut guard = session.write().unwrap();
             guard.config.token_budget.max_turn_input_tokens = 80_000;
             guard.config.context_window.adaptive = true;
+            // Opt in to the (off-by-default) shrink path.
+            guard.config.context_window.adaptive_budget_reduction = true;
         }
         state.max_turn_input_tokens = 80_000;
 
@@ -6358,6 +6360,32 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert_eq!(
             state.max_turn_input_tokens, guard.config.token_budget.max_turn_input_tokens as u64,
             "loop state should stay in sync"
+        );
+    }
+
+    #[test]
+    fn per_turn_adaptation_does_not_shrink_by_default() {
+        // Regression guard: adaptive_budget_reduction is OFF by default.
+        // Session 0e37eb46 shrank its own ceiling under pressure, produced
+        // a progress summary, and gave up. The shrink path must be opt-in.
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_session = Some(session.clone());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.token_budget.max_turn_input_tokens = 80_000;
+            guard.config.context_window.adaptive = true;
+            // adaptive_budget_reduction stays at default (false).
+        }
+        state.max_turn_input_tokens = 80_000;
+
+        apply_per_turn_adaptation(&mut state, 72_000);
+
+        let guard = session.read().unwrap();
+        assert_eq!(
+            guard.config.token_budget.max_turn_input_tokens, 80_000,
+            "budget must be unchanged when adaptive_budget_reduction is off"
         );
     }
 
@@ -6664,6 +6692,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             let mut guard = session.write().unwrap();
             guard.config.token_budget.max_turn_input_tokens = 80_000;
             guard.config.context_window.adaptive = true;
+            guard.config.context_window.adaptive_budget_reduction = true;
             guard.turn_number = 10;
             // Previous increase was at turn 2 — well past cooldown
             guard.last_token_budget_direction = 1;
@@ -6695,6 +6724,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             let mut guard = session.write().unwrap();
             guard.config.token_budget.max_turn_input_tokens = 80_000;
             guard.config.context_window.adaptive = true;
+            guard.config.context_window.adaptive_budget_reduction = true;
             guard.turn_number = 5;
             // Previous change was also a decrease
             guard.last_token_budget_direction = -1;
@@ -6756,6 +6786,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             let mut guard = session.write().unwrap();
             guard.config.token_budget.max_turn_input_tokens = 80_000;
             guard.config.context_window.adaptive = true;
+            guard.config.context_window.adaptive_budget_reduction = true;
             guard.turn_number = 1;
         }
         state.max_turn_input_tokens = 80_000;

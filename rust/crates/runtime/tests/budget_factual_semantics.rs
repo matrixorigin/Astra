@@ -25,9 +25,7 @@
 
 use astra_config::runtime_config::ContextWindowConfig;
 use astra_core::RuntimeLimits;
-use astra_runtime::turn::budget_messaging::{
-    BUDGET_REACHED_ADVISORY, COMPACT_RESUME_DIRECTIVE,
-};
+use astra_runtime::turn::budget_messaging::{BUDGET_REACHED_ADVISORY, COMPACT_RESUME_DIRECTIVE};
 
 // ─── 1. Model-aware default budget ───────────────────────────────────────
 
