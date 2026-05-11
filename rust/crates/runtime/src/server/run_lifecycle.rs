@@ -2744,11 +2744,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     .await
                     {
                         Ok(report) => {
-                            if report.learnings_stored > 0 {
+                            let wrote_episode = report.episode_chars > 0;
+                            if wrote_episode
+                                || report.working_purged > 0
+                                || report.reflect_candidates > 0
+                            {
                                 tracing::info!(
                                     session_id = %sid,
                                     learnings = report.learnings_stored,
                                     purged = report.working_purged,
+                                    episode_chars = report.episode_chars,
+                                    reflect_candidates = report.reflect_candidates,
+                                    reflect_synthesized = report.reflect_synthesized,
                                     "session-end governance complete"
                                 );
                             }

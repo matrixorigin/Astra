@@ -212,6 +212,71 @@ pub trait MemoriaClient: Send + Sync {
     async fn delete(&self, _memory_id: &str) -> Result<(), String> {
         Ok(())
     }
+
+    // ── Cognitive verbs (Phase 3) ────────────────────────────────────
+    //
+    // These mirror the v2 `memory(action=…)` LLM surface but on the
+    // runtime side so orchestration code (session-end, turn-start,
+    // auto-focus, feedback loop) can call them without routing through
+    // the tool dispatcher. The default impls return benign no-ops so
+    // mock clients in tests don't need to care about v2 verbs they
+    // haven't opted in to.
+
+    /// Persist an episodic session summary. `overview` is the condensed
+    /// (~300-500 char) post-session narrative.
+    async fn store_episode(&self, _session_id: &str, _overview: &str) -> Result<String, String> {
+        Ok(String::new())
+    }
+
+    /// Trigger Memoria's cross-memory reflection for the given session.
+    /// The backend respects a cooldown (≥1h v1 default); callers that
+    /// want to bypass it should pass `force=true`.
+    async fn reflect_session(
+        &self,
+        _session_id: &str,
+        _force: bool,
+    ) -> Result<ReflectSummary, String> {
+        Ok(ReflectSummary::default())
+    }
+
+    /// Persist a focus hint client-side (session-scoped, TTL-bounded).
+    /// Subsequent `recall`s consult the store and add `boost_*` fields
+    /// to the request body. Memoria v1 ignores them; v2 will honor.
+    async fn focus(
+        &self,
+        _session_id: &str,
+        _focus_type: &str,
+        _value: &str,
+        _boost: Option<f64>,
+        _ttl_secs: Option<i64>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Record an explicit quality signal (useful / irrelevant /
+    /// outdated / wrong) on a previously-recalled memory. Shapes the
+    /// ranking of that memory in future recalls.
+    async fn feedback(
+        &self,
+        _memory_id: &str,
+        _signal: &str,
+        _context: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Summary returned by [`MemoriaClient::reflect_session`].
+#[derive(Debug, Clone, Default)]
+pub struct ReflectSummary {
+    /// Whether the backend actually synthesized new scene nodes (v2
+    /// reflect returns true); v1 always reports `false` here but
+    /// still triggers graph consolidation.
+    pub synthesized: bool,
+    /// Number of scene / cluster candidates produced.
+    pub candidates: u64,
+    /// Raw v1 response body for diagnostics (first 200 chars).
+    pub diagnostics: String,
 }
 
 /// A memory record from Memoria.
@@ -228,12 +293,28 @@ pub struct MemoriaMemory {
 // HTTP Client Implementation
 // ---------------------------------------------------------------------------
 
+/// A single active focus hint: boost a topic / tag / memory_id for a
+/// finite window. Shared backing for `HttpMemoriaClient::focus` and
+/// consulted during `retrieve_ext` so the recall payload picks it up.
+#[derive(Debug, Clone)]
+struct RuntimeFocusHint {
+    focus_type: String,
+    value: String,
+    boost: f64,
+    expires_at: std::time::Instant,
+}
+
 /// HTTP-based Memoria client.
 #[derive(Clone)]
 pub struct HttpMemoriaClient {
     base_url: String,
     api_key: String,
     http: reqwest::Client,
+    /// Session-scoped focus store (runtime side). Mirrors the tool-side
+    /// store in `astra_tools::memoria` so orchestration and LLM-driven
+    /// focus hints are unified at retrieval time.
+    focus_store:
+        std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, Vec<RuntimeFocusHint>>>>,
 }
 
 impl HttpMemoriaClient {
@@ -247,6 +328,9 @@ impl HttpMemoriaClient {
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            focus_store: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -254,6 +338,28 @@ impl HttpMemoriaClient {
     pub fn from_env() -> Option<Self> {
         let mem = astra_core::MemoriaSettings::from_env();
         Some(Self::new(mem.base_url, mem.master_key?))
+    }
+
+    /// Read back active focus hints for a session (side-effect:
+    /// evicts expired entries). Public so test code can introspect.
+    pub fn active_focus_hints(&self, session_id: &str) -> Vec<(String, String, f64)> {
+        let now = std::time::Instant::now();
+        let key = if session_id.is_empty() {
+            "_global"
+        } else {
+            session_id
+        };
+        let Ok(mut store) = self.focus_store.write() else {
+            return Vec::new();
+        };
+        let Some(bucket) = store.get_mut(key) else {
+            return Vec::new();
+        };
+        bucket.retain(|h| h.expires_at > now);
+        bucket
+            .iter()
+            .map(|h| (h.focus_type.clone(), h.value.clone(), h.boost))
+            .collect()
     }
 }
 
@@ -315,7 +421,34 @@ impl MemoriaClient for HttpMemoriaClient {
         if let Some(sid) = session_id {
             body["session_id"] = json!(sid);
             if filter_session {
-                body["filter_session"] = json!(true);
+                // Map to v1's session_scope primitive instead of the
+                // legacy `filter_session` flag (Memoria never honored it).
+                body["session_scope"] = json!("only");
+            }
+        }
+
+        // Attach active focus hints (client-side, session-scoped TTL).
+        // Memoria v1 currently ignores `boost_*`; v2 will honor.
+        let hints = self.active_focus_hints(session_id.unwrap_or(""));
+        if !hints.is_empty() {
+            let (mut topics, mut tags, mut mids) = (Vec::new(), Vec::new(), Vec::new());
+            for (ty, val, boost) in hints {
+                let entry = json!({"value": val, "boost": boost});
+                match ty.as_str() {
+                    "topic" => topics.push(entry),
+                    "tag" => tags.push(entry),
+                    "memory_id" => mids.push(entry),
+                    _ => {}
+                }
+            }
+            if !topics.is_empty() {
+                body["boost_topics"] = Value::Array(topics);
+            }
+            if !tags.is_empty() {
+                body["boost_tags"] = Value::Array(tags);
+            }
+            if !mids.is_empty() {
+                body["boost_memory_ids"] = Value::Array(mids);
             }
         }
 
@@ -436,6 +569,165 @@ impl MemoriaClient for HttpMemoriaClient {
             .map_err(|e| format!("Memoria delete failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("Memoria delete HTTP {}", resp.status()));
+        }
+        Ok(())
+    }
+
+    /// Persist an episodic session summary via v1 `/v1/memories` with
+    /// `memory_type=episodic`. The session_id is mandatory — episodes
+    /// without a session_id would never be cleaned up.
+    async fn store_episode(&self, session_id: &str, overview: &str) -> Result<String, String> {
+        if session_id.is_empty() {
+            return Err("store_episode requires non-empty session_id".into());
+        }
+        if overview.trim().is_empty() {
+            return Err("store_episode: empty overview".into());
+        }
+        let url = format!("{}/v1/memories", self.base_url.trim_end_matches('/'));
+        let body = json!({
+            "content": overview,
+            "memory_type": "episodic",
+            "session_id": session_id,
+            "trust_tier": "T3",
+            "source": {"agent": "session_end_orchestrator"},
+            "tags": ["astra:episode"],
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Memoria store_episode failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("Memoria store_episode HTTP {}", resp.status()));
+        }
+        let data: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Memoria store_episode parse failed: {e}"))?;
+        Ok(data
+            .get("memory_id")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_default())
+    }
+
+    async fn reflect_session(
+        &self,
+        session_id: &str,
+        force: bool,
+    ) -> Result<ReflectSummary, String> {
+        let url = format!("{}/v1/reflect", self.base_url.trim_end_matches('/'));
+        let mut body = json!({"force": force});
+        if !session_id.is_empty() {
+            body["session_id"] = json!(session_id);
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Memoria reflect failed: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!(
+                "Memoria reflect HTTP {status}: {}",
+                text.chars().take(120).collect::<String>()
+            ));
+        }
+        let data: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        Ok(ReflectSummary {
+            synthesized: data
+                .get("synthesized")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            candidates: data
+                .get("candidates")
+                .and_then(|c| c.as_array())
+                .map(|a| a.len() as u64)
+                .or_else(|| data.get("scenes_created").and_then(Value::as_u64))
+                .unwrap_or(0),
+            diagnostics: text.chars().take(200).collect(),
+        })
+    }
+
+    async fn focus(
+        &self,
+        session_id: &str,
+        focus_type: &str,
+        value: &str,
+        boost: Option<f64>,
+        ttl_secs: Option<i64>,
+    ) -> Result<(), String> {
+        if !matches!(focus_type, "topic" | "tag" | "memory_id" | "session") {
+            return Err(format!(
+                "invalid focus_type {focus_type:?}; expected topic/tag/memory_id/session"
+            ));
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("focus: empty value".into());
+        }
+        let boost = boost.unwrap_or(1.5);
+        let ttl = ttl_secs.unwrap_or(3600).max(1) as u64;
+        let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(ttl);
+        let key = if session_id.is_empty() {
+            "_global".to_string()
+        } else {
+            session_id.to_string()
+        };
+        let Ok(mut store) = self.focus_store.write() else {
+            return Err("focus store poisoned".into());
+        };
+        let bucket = store.entry(key).or_default();
+        bucket.retain(|h| !(h.focus_type == focus_type && h.value == value));
+        bucket.push(RuntimeFocusHint {
+            focus_type: focus_type.to_string(),
+            value: value.to_string(),
+            boost,
+            expires_at,
+        });
+        Ok(())
+    }
+
+    async fn feedback(
+        &self,
+        memory_id: &str,
+        signal: &str,
+        context: Option<&str>,
+    ) -> Result<(), String> {
+        if memory_id.is_empty() {
+            return Err("feedback: empty memory_id".into());
+        }
+        if !matches!(signal, "useful" | "irrelevant" | "outdated" | "wrong") {
+            return Err(format!("invalid feedback signal {signal:?}"));
+        }
+        use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+        let encoded = utf8_percent_encode(memory_id, NON_ALPHANUMERIC).to_string();
+        let url = format!(
+            "{}/v1/memories/{}/feedback",
+            self.base_url.trim_end_matches('/'),
+            encoded
+        );
+        let mut body = json!({"signal": signal});
+        if let Some(ctx) = context {
+            body["context"] = json!(ctx);
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Memoria feedback failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("Memoria feedback HTTP {}", resp.status()));
         }
         Ok(())
     }
