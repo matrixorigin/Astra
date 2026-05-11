@@ -312,6 +312,109 @@ pub(super) async fn handle_memory_domain_command(
                         Err(e) => eprintln!("{}", format!("  ✗ Unreachable: {e}").red()),
                     }
                 }
+                // ─── Inspect one memory by id ──────────────────────
+                "show" if !sub_arg.is_empty() => {
+                    let memory_id = sub_arg.trim();
+                    let mem = astra_core::MemoriaSettings::from_env();
+                    let Some(bearer) = mem.bearer_token() else {
+                        eprintln!(
+                            "  {}",
+                            "Memoria not configured (MEMORIA_MASTER_KEY missing).".red()
+                        );
+                        return Ok(());
+                    };
+                    match reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(5))
+                        .no_proxy()
+                        .build()
+                    {
+                        Ok(client) => {
+                            let url = format!("{}/v1/memories/{memory_id}", mem.base_url);
+                            match client
+                                .get(&url)
+                                .header("Authorization", bearer)
+                                .send()
+                                .await
+                            {
+                                Ok(r) if r.status().is_success() => {
+                                    let body = r.text().await.unwrap_or_default();
+                                    print_json_or_raw(&body);
+                                }
+                                Ok(r) => eprintln!(
+                                    "{}",
+                                    format!("  ✗ Not found ({}): {memory_id}", r.status()).red()
+                                ),
+                                Err(e) => {
+                                    eprintln!("{}", format!("  ✗ Memoria unreachable: {e}").red())
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("{}", format!("  ✗ Client build failed: {e}").red())
+                        }
+                    }
+                }
+                // ─── Hard-delete one memory by id ──────────────────
+                "forget" if !sub_arg.is_empty() => {
+                    // Grammar: "forget <id> [--reason TEXT]"
+                    let mut parts = sub_arg.splitn(2, "--reason");
+                    let memory_id = parts.next().unwrap_or("").trim().to_string();
+                    let reason = parts.next().map(|s| s.trim().to_string());
+                    if memory_id.is_empty() {
+                        eprintln!(
+                            "  {}",
+                            "usage: /memory forget <memory_id> [--reason TEXT]".yellow()
+                        );
+                        return Ok(());
+                    }
+                    let mem = astra_core::MemoriaSettings::from_env();
+                    let Some(bearer) = mem.bearer_token() else {
+                        eprintln!(
+                            "  {}",
+                            "Memoria not configured (MEMORIA_MASTER_KEY missing).".red()
+                        );
+                        return Ok(());
+                    };
+                    // v1 /v1/memories/purge with memory_ids=[id], reason.
+                    let url = format!("{}/v1/memories/purge", mem.base_url);
+                    let mut body = serde_json::json!({"memory_ids": [memory_id.clone()]});
+                    if let Some(r) = reason {
+                        body["reason"] = serde_json::Value::String(r);
+                    }
+                    match reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(5))
+                        .no_proxy()
+                        .build()
+                    {
+                        Ok(client) => {
+                            match client
+                                .post(&url)
+                                .header("Authorization", bearer)
+                                .json(&body)
+                                .send()
+                                .await
+                            {
+                                Ok(r) if r.status().is_success() => {
+                                    eprintln!(
+                                        "  {} Forgot memory {}",
+                                        theme::icon_ok(),
+                                        memory_id.cyan()
+                                    );
+                                }
+                                Ok(r) => eprintln!(
+                                    "{}",
+                                    format!("  ✗ Purge failed ({}): {memory_id}", r.status()).red()
+                                ),
+                                Err(e) => {
+                                    eprintln!("{}", format!("  ✗ Memoria unreachable: {e}").red())
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("{}", format!("  ✗ Client build failed: {e}").red())
+                        }
+                    }
+                }
                 // ─── Cloud: Snapshots ──────────────────────────────
                 "snapshot" => {
                     let name = if sub_arg.is_empty() {

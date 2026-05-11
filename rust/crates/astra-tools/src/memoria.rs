@@ -311,6 +311,58 @@ impl MemoriaClient {
         }
     }
 
+    /// Minimum similarity score (Memoria `final_score`) that flags a
+    /// new `remember` call as a likely duplicate. Tuned empirically:
+    /// vector+keyword hybrid scores above ~0.85 on a short phrase
+    /// match are near-synonyms in practice.
+    const CONFLICT_SIMILARITY_FLOOR: f64 = 0.85;
+
+    /// Client-side conflict pre-check for `remember`. Issues a cheap
+    /// top-3 recall with a 2-second timeout; if any existing memory
+    /// crosses [`CONFLICT_SIMILARITY_FLOOR`], returns a structured
+    /// JSON string the LLM parses as a tool result — a "redirect" that
+    /// nudges the model toward `update(memory_id=...)` instead of
+    /// writing a duplicate. Returns `None` on no conflict / fetch
+    /// failure (degrade to the normal write path).
+    async fn detect_remember_conflict(
+        &self,
+        new_content: &str,
+        session_id: Option<&str>,
+    ) -> Option<String> {
+        // A narrow conflict query: use the new content as the query.
+        // We don't want to spend 5s on a full retrieval here — the
+        // write path must stay fast when there are no conflicts.
+        let mem = astra_core::MemoriaSettings::from_env();
+        let key = mem.master_key?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .no_proxy()
+            .build()
+            .ok()?;
+        let mut body = json!({"query": new_content, "top_k": 3});
+        if let Some(sid) = session_id {
+            body["session_id"] = json!(sid);
+        }
+        let resp = client
+            .post(format!("{}/v1/memories/retrieve", mem.base_url))
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&body)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let text = resp.text().await.ok()?;
+        let parsed: Value = serde_json::from_str(&text).ok()?;
+        let arr = parsed
+            .get("memories")
+            .and_then(Value::as_array)
+            .or_else(|| parsed.as_array())?;
+
+        format_remember_conflict(arr, Self::CONFLICT_SIMILARITY_FLOOR)
+    }
+
     /// Execute a memoria operation (store, retrieve, search, purge, correct, profile).
     pub async fn call(&self, op: &str, args: &Value) -> String {
         self.call_with_timeout(op, args, Duration::from_secs(10))
@@ -327,6 +379,25 @@ impl MemoriaClient {
 
         if self.is_circuit_open() {
             return json!({"error": "Memory service unavailable (circuit open)"}).to_string();
+        }
+
+        // `remember`: run a client-side conflict pre-check so the LLM
+        // can't silently create duplicates of near-identical memories.
+        // Opt-out via `skip_conflict_check: true` — the background
+        // extractor already manifests existing memories in its prompt
+        // and sets this flag to bypass the double-check.
+        if op == "remember"
+            && !args
+                .get("skip_conflict_check")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && let Some(content) = args.get("content").and_then(Value::as_str)
+            && !content.trim().is_empty()
+        {
+            let session_id = args.get("session_id").and_then(Value::as_str);
+            if let Some(conflict) = self.detect_remember_conflict(content, session_id).await {
+                return conflict;
+            }
         }
 
         // The v2→v1 translation — including business-category expansion
@@ -828,6 +899,59 @@ impl MemoriaClient {
     }
 }
 
+/// Given the `memories` array from a Memoria retrieve response, return
+/// a conflict-redirect JSON blob if any entry crosses `floor`.
+/// Factored out so the LLM-facing shape is unit-testable without
+/// spinning up an HTTP server.
+fn format_remember_conflict(arr: &[Value], floor: f64) -> Option<String> {
+    let mut hits: Vec<(String, f64, String)> = Vec::new();
+    for entry in arr {
+        let Some(score) = entry.get("retrieval_score").and_then(Value::as_f64) else {
+            continue;
+        };
+        if score < floor {
+            continue;
+        }
+        let Some(id) = entry
+            .get("memory_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+        else {
+            continue;
+        };
+        let abstract_text = entry
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(140)
+            .collect::<String>();
+        hits.push((id, score, abstract_text));
+    }
+    if hits.is_empty() {
+        return None;
+    }
+    Some(
+        json!({
+            "status": "conflict",
+            "action_required": "update",
+            "reason": "A similar memory already exists; update it instead of writing a duplicate.",
+            "candidates": hits.iter().map(|(id, score, abs_text)| json!({
+                "memory_id": id,
+                "similarity": score,
+                "abstract": abs_text,
+            })).collect::<Vec<_>>(),
+            "retry_hint": "Call memory(action=update, memory_id=<chosen_id>, content=<new_content>) \
+                           to supersede, OR retry remember with skip_conflict_check=true if the \
+                           new memory is intentionally distinct.",
+        })
+        .to_string(),
+    )
+}
+
 /// Build a one-shot Memoria HTTP client + auth header.
 pub fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, String, String)> {
     let mem = astra_core::MemoriaSettings::from_env();
@@ -988,6 +1112,72 @@ pub async fn memoria_health() -> Result<String, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn conflict_returns_none_below_floor() {
+        let arr = vec![
+            json!({"memory_id": "a", "retrieval_score": 0.70, "content": "x"}),
+            json!({"memory_id": "b", "retrieval_score": 0.50, "content": "y"}),
+        ];
+        assert!(format_remember_conflict(&arr, 0.85).is_none());
+    }
+
+    #[test]
+    fn conflict_returns_none_on_empty() {
+        assert!(format_remember_conflict(&[], 0.85).is_none());
+    }
+
+    #[test]
+    fn conflict_surfaces_high_similarity_hit_as_update_redirect() {
+        let arr = vec![
+            json!({
+                "memory_id": "m-42",
+                "retrieval_score": 0.93,
+                "content": "Integration tests must hit a real database\nWhy: prior incident",
+            }),
+            json!({"memory_id": "low", "retrieval_score": 0.41, "content": "noise"}),
+        ];
+        let out = format_remember_conflict(&arr, 0.85).expect("conflict");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["status"], "conflict");
+        assert_eq!(parsed["action_required"], "update");
+        let candidates = parsed["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0]["memory_id"], "m-42");
+        assert_eq!(candidates[0]["similarity"].as_f64().unwrap(), 0.93);
+        // First-line abstract only.
+        assert_eq!(
+            candidates[0]["abstract"],
+            "Integration tests must hit a real database"
+        );
+    }
+
+    #[test]
+    fn conflict_skips_entries_missing_score_or_id() {
+        let arr = vec![
+            json!({"memory_id": "ok", "retrieval_score": 0.90, "content": "hit"}),
+            json!({"retrieval_score": 0.95, "content": "missing id"}),
+            json!({"memory_id": "no_score", "content": "missing score"}),
+        ];
+        let out = format_remember_conflict(&arr, 0.85).expect("conflict");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["candidates"][0]["memory_id"], "ok");
+    }
+
+    #[test]
+    fn conflict_truncates_long_abstract() {
+        let long = "x".repeat(500);
+        let arr = vec![json!({
+            "memory_id": "m",
+            "retrieval_score": 0.95,
+            "content": long,
+        })];
+        let out = format_remember_conflict(&arr, 0.85).expect("conflict");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let abstract_text = parsed["candidates"][0]["abstract"].as_str().unwrap();
+        assert!(abstract_text.chars().count() <= 140);
+    }
 
     #[test]
     fn map_business_types_to_memoria_primitives() {

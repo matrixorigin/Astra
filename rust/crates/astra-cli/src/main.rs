@@ -3623,6 +3623,55 @@ total_tokens_out: 500
     }
 
     #[test]
+    fn cli_memory_list_with_type_and_limit() {
+        let cli = Cli::try_parse_from([
+            "astra", "memory", "list", "--type", "profile", "--limit", "5",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Memory(args)) => match args.command {
+                Some(MemorySubcommand::List(list)) => {
+                    assert_eq!(list.memory_type.as_deref(), Some("profile"));
+                    assert_eq!(list.limit, 5);
+                }
+                other => panic!("unexpected memory subcommand: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_memory_show_takes_memory_id() {
+        let cli = Cli::try_parse_from(["astra", "memory", "show", "m-12345"]).unwrap();
+        match cli.command {
+            Some(Command::Memory(args)) => match args.command {
+                Some(MemorySubcommand::Show(show)) => {
+                    assert_eq!(show.memory_id, "m-12345");
+                }
+                other => panic!("unexpected memory subcommand: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_memory_forget_accepts_reason() {
+        let cli =
+            Cli::try_parse_from(["astra", "memory", "forget", "m-42", "--reason", "duplicate"])
+                .unwrap();
+        match cli.command {
+            Some(Command::Memory(args)) => match args.command {
+                Some(MemorySubcommand::Forget(forget)) => {
+                    assert_eq!(forget.memory_id, "m-42");
+                    assert_eq!(forget.reason.as_deref(), Some("duplicate"));
+                }
+                other => panic!("unexpected memory subcommand: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn cli_permissions_command_keeps_mode_arg() {
         let cli = Cli::try_parse_from(["astra", "permissions", "auto"]).unwrap();
         match cli.command {

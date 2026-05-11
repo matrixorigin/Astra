@@ -175,6 +175,55 @@ pub async fn prefetch_session_start_memories(
     }
 }
 
+/// Fetch an ambient `<memory_index>` block — a compact list of all
+/// known memories so the LLM knows what it *could* recall. Session-
+/// stable: rebuilt once per session-start and kept in the prompt
+/// prefix; only flips when the user writes a new memory.
+///
+/// Backed by the same `/v1/memories/retrieve` endpoint with an empty
+/// query (browse mode). Returns `None` when the key is empty or no
+/// memories exist for this user.
+pub async fn prefetch_memory_index(mem_url: &str, mem_key: &str, user_id: &str) -> Option<String> {
+    if mem_key.is_empty() {
+        return None;
+    }
+    const INDEX_TOP_K: u32 = 80;
+    let items = fetch_memories_structured(mem_url, mem_key, "", user_id, INDEX_TOP_K).await;
+    if items.is_empty() {
+        return None;
+    }
+    build_memory_index_block(&items)
+}
+
+/// Render a `<memory_index>` block — one line per entry, under 100
+/// chars of abstract. Returns `None` on empty input.
+fn build_memory_index_block(items: &[RankableMemory]) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut s = String::with_capacity(1024);
+    s.push_str("<memory_index>\n");
+    s.push_str(
+        "(Ambient awareness. Call `memory(action=recall, query=X)` for full content \
+        of a topic, or `memory(action=expand, memory_id=ID)` to drill into one entry.)\n",
+    );
+    for m in items {
+        let tag = if m.memory_type.is_empty() {
+            "?".to_string()
+        } else {
+            m.memory_type.clone()
+        };
+        let abstract_line = session_start_line(&m.content, 100);
+        let suffix = m.freshness_suffix();
+        s.push_str(&format!(
+            "- [{tag}] {}: {abstract_line}{suffix}\n",
+            m.memory_id
+        ));
+    }
+    s.push_str("</memory_index>");
+    Some(s)
+}
+
 /// Render the `<session_memory>` block injected into the system prompt
 /// on the first turn. Returns `None` when both lists are empty so the
 /// caller can skip injection entirely.
@@ -1287,6 +1336,67 @@ mod tests {
         assert!(out.contains("### Recent sessions"));
         assert!(out.contains("prefers Rust"));
         assert!(out.contains("auth refactor"));
+    }
+
+    #[test]
+    fn memory_index_block_none_when_empty() {
+        assert!(build_memory_index_block(&[]).is_none());
+    }
+
+    #[test]
+    fn memory_index_block_renders_entries() {
+        fn mk(id: &str, ty: &str, c: &str) -> RankableMemory {
+            RankableMemory {
+                memory_id: id.into(),
+                content: c.into(),
+                memory_type: ty.into(),
+                retrieval_score: Some(0.5),
+                ..Default::default()
+            }
+        }
+        let items = vec![
+            mk("m1", "profile", "user prefers Rust"),
+            mk("m2", "feedback", "use real DB in tests"),
+            mk("m3", "project", "merge freeze 2026-05-08"),
+        ];
+        let out = build_memory_index_block(&items).expect("non-empty");
+        assert!(out.starts_with("<memory_index>"));
+        assert!(out.ends_with("</memory_index>"));
+        assert!(out.contains("- [profile] m1: user prefers Rust"));
+        assert!(out.contains("- [feedback] m2: use real DB in tests"));
+        assert!(out.contains("- [project] m3: merge freeze 2026-05-08"));
+    }
+
+    #[test]
+    fn memory_index_block_truncates_long_content() {
+        let items = vec![RankableMemory {
+            memory_id: "big".into(),
+            content: "x".repeat(500),
+            memory_type: "semantic".into(),
+            retrieval_score: Some(0.5),
+            ..Default::default()
+        }];
+        let out = build_memory_index_block(&items).expect("non-empty");
+        // Entry line must cap at 100-char abstract + a bit of scaffold;
+        // total under ~180 chars.
+        let entry_line = out
+            .lines()
+            .find(|l| l.starts_with("- ["))
+            .expect("has entry line");
+        assert!(
+            entry_line.chars().count() <= 200,
+            "entry line too long: {} chars",
+            entry_line.chars().count()
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_memory_index_empty_key_is_noop() {
+        assert!(
+            prefetch_memory_index("http://localhost", "", "user1")
+                .await
+                .is_none()
+        );
     }
 
     #[test]

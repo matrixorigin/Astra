@@ -494,9 +494,12 @@ pub(crate) struct TaskQueryArgs {
 }
 
 #[derive(Args, Debug)]
-#[command(
-    after_help = "Examples:\n  astra memory list\n  astra memory search team bootstrap\n  astra memory search 用户偏好"
-)]
+#[command(after_help = "Examples:\n  \
+        astra memory list\n  \
+        astra memory list --type profile\n  \
+        astra memory search 用户偏好\n  \
+        astra memory show <memory_id>\n  \
+        astra memory forget <memory_id>")]
 pub(crate) struct MemoryArgs {
     #[command(subcommand)]
     pub command: Option<MemorySubcommand>,
@@ -504,10 +507,25 @@ pub(crate) struct MemoryArgs {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum MemorySubcommand {
-    /// List recent memories
-    List,
-    /// Search memories
+    /// List recent memories, newest first.
+    List(MemoryListArgs),
+    /// Semantic search across all memories.
     Search(MemorySearchArgs),
+    /// Show full content of a single memory by id.
+    Show(MemoryShowArgs),
+    /// Soft-delete a memory by id (can be restored by an admin).
+    Forget(MemoryForgetArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct MemoryListArgs {
+    /// Filter to a single memory_type (profile / semantic / procedural /
+    /// episodic / working). When omitted, all types are listed.
+    #[arg(long = "type")]
+    pub memory_type: Option<String>,
+    /// Maximum number of entries to print.
+    #[arg(long, default_value_t = 20)]
+    pub limit: u32,
 }
 
 #[derive(Args, Debug)]
@@ -515,6 +533,21 @@ pub(crate) struct MemorySearchArgs {
     /// Search query
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub query: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct MemoryShowArgs {
+    /// Memory id to inspect (UUID from `astra memory list`).
+    pub memory_id: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct MemoryForgetArgs {
+    /// Memory id to delete.
+    pub memory_id: String,
+    /// Optional reason for the audit trail.
+    #[arg(long)]
+    pub reason: Option<String>,
 }
 
 #[derive(Args, Debug)]

@@ -1269,12 +1269,38 @@ impl InProcessChatTurnBridge {
                 memory_preview = per_turn.preview;
                 memoria_prefetch_entries = per_turn.entries;
 
-                // Combine the two rendered sections. If both exist, the
-                // session-start block comes first (cold warmup, ordered
-                // by recency of relevance).
-                match (session_start.and_then(|s| s.section), per_turn.section) {
-                    (Some(start), Some(turn)) => Some(format!("{start}\n\n{turn}")),
-                    (Some(start), None) => Some(start),
+                // First-turn only: layer in a `<memory_index>` block —
+                // compact "name + abstract + age" listing of all known
+                // memories so the LLM has ambient awareness of what it
+                // could recall. Gated by env to stay off by default
+                // until we have real-traffic data on prompt budget
+                // impact; flip to on when comfortable.
+                let memory_index = if is_first_turn
+                    && std::env::var("ASTRA_MEMORY_INDEX_INJECT")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false)
+                {
+                    prefetch_memory_index(mem_url, mem_key, &user_id).await
+                } else {
+                    None
+                };
+
+                // Combine sections in order: memory index first (stable
+                // across turns — good cache citizen), then session-start
+                // warmup (also stable, first turn only), then the
+                // per-turn hybrid recall (volatile but fresh). Cache
+                // boundary sits between the index+start block and the
+                // per-turn block.
+                let session_start_section = session_start.and_then(|s| s.section);
+                let stable_part = match (memory_index, session_start_section) {
+                    (Some(idx), Some(start)) => Some(format!("{idx}\n\n{start}")),
+                    (Some(idx), None) => Some(idx),
+                    (None, Some(start)) => Some(start),
+                    (None, None) => None,
+                };
+                match (stable_part, per_turn.section) {
+                    (Some(stable), Some(turn)) => Some(format!("{stable}\n\n{turn}")),
+                    (Some(stable), None) => Some(stable),
                     (None, turn) => turn,
                 }
             } else {
@@ -3668,7 +3694,7 @@ async fn persist_bridge_stream_failure_capture(
 
 // ── Memory prefetch — delegated to turn::memory_prefetch ─────────────────────
 pub use super::memory_prefetch::{
-    MemoryPrefetchResult, SessionStartPrefetchResult, prefetch_memories,
+    MemoryPrefetchResult, SessionStartPrefetchResult, prefetch_memories, prefetch_memory_index,
     prefetch_session_start_memories,
 };
 

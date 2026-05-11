@@ -209,8 +209,30 @@ fn render_task_args(args: &TaskArgs) -> String {
 
 fn render_memory_args(args: &MemoryArgs) -> String {
     match &args.command {
-        None | Some(MemorySubcommand::List) => String::new(),
+        None => String::new(),
+        Some(MemorySubcommand::List(cmd)) => {
+            let mut parts = Vec::new();
+            if let Some(ty) = &cmd.memory_type {
+                parts.push(format!("--type {ty}"));
+            }
+            if cmd.limit != 20 {
+                parts.push(format!("--limit {}", cmd.limit));
+            }
+            if parts.is_empty() {
+                String::new()
+            } else {
+                parts.join(" ")
+            }
+        }
         Some(MemorySubcommand::Search(cmd)) => format!("search {}", join_words(&cmd.query)),
+        Some(MemorySubcommand::Show(cmd)) => format!("show {}", cmd.memory_id),
+        Some(MemorySubcommand::Forget(cmd)) => {
+            if let Some(reason) = &cmd.reason {
+                format!("forget {} --reason {}", cmd.memory_id, reason)
+            } else {
+                format!("forget {}", cmd.memory_id)
+            }
+        }
     }
 }
 
