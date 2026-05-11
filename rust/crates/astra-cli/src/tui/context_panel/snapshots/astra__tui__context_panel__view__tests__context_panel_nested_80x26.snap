@@ -4,6 +4,7 @@ expression: "render_panel(&b, 80, 26)"
 ---
 ┌ Context window (32% · low) ──────────────────────────────────────────────────┐
 │  32.5k / 100.0k tokens  (32.5%)                                              │
+│  Tab focus · Enter close · j/k scroll · Esc close                            │
 │                                                                              │
 │  ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁   ⛁ System prompt     4.0k  ( 4.0%)                     │
 │  ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛶ ⛶ ⛶ ⛶   ⛁ Tools             6.0k  ( 6.0%)                     │
@@ -26,5 +27,4 @@ expression: "render_panel(&b, 80, 26)"
 │                                                                              │
 │   Memory · /memory                                                           │
 │    └ "User prefers terse answers"   400 tokens  (rel 0.91)                   │
-│                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘

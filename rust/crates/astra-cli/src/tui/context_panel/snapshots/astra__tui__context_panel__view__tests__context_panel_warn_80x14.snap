@@ -4,6 +4,7 @@ expression: "render_panel(&b, 80, 14)"
 ---
 ┌ Context window (70% · warn) ─────────────────────────────────────────────────┐
 │  70.5k / 100.0k tokens  (70.5%)                                              │
+│  Tab focus · Enter close · j/k scroll · Esc close                            │
 │                                                                              │
 │  ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁   ⛁ System prompt     8.0k  ( 8.0%)                     │
 │  ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁   ⛁ Tools            10.0k  (10.0%)                     │
@@ -11,7 +12,6 @@ expression: "render_panel(&b, 80, 14)"
 │  ⛁ ⛁ ⛁ ⛁ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ History          50.0k  (50.0%)                     │
 │  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Current turn      1.5k  ( 1.5%)                     │
 │                        ⛶ Free space       29.5k  (29.5%)                     │
-│                                                                              │
 │                                                                              │
 │                                                                              │
 │                                                                              │

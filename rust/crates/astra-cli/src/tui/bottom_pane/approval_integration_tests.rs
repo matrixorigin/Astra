@@ -37,10 +37,12 @@ fn slash_items() -> Vec<SlashItem> {
         SlashItem {
             name: "/help",
             description: "show help",
+            subcommands: &[],
         },
         SlashItem {
             name: "/history",
             description: "browse history",
+            subcommands: &[],
         },
     ]
 }

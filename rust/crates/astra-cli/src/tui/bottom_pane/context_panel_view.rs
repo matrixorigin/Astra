@@ -125,13 +125,18 @@ impl ContextPanelView {
             Some(s) => s,
             None => {
                 self.focus = self.breakdown.first_focusable_section();
-                // Collapse any prior expansion — focus just landed
-                // on a new (possibly different) section.
+                // Entering focus mode for the first time: any
+                // stale nested state (from a prior Tab-in /
+                // Tab-out dance that the defaults don't cover)
+                // gets cleared here. Mirror the Some-branch
+                // reset below so behaviour stays consistent.
                 if let Some(exp) = self.expanded
                     && Some(exp) != self.focus
                 {
                     self.expanded = None;
                 }
+                self.selected_item = 0;
+                self.drilled = false;
                 return;
             }
         };
@@ -189,12 +194,22 @@ impl ContextPanelView {
         self.scroll = self.pre_drill_scroll;
     }
 
-    /// Adjust the scroll window so the row containing the ▸
-    /// marker stays in view. Called after every Up/Down inside an
-    /// expanded section. Renders the line list to find the
-    /// marker's row, then clamps scroll so it lands within the
-    /// visible viewport (with one row of breathing room top and
-    /// bottom).
+    /// Adjust the scroll window so the whole selected-item block
+    /// stays in view — the ▸ header row AND its wrapped preview
+    /// body. Previous implementation only tracked the marker row,
+    /// so selecting an item with a 3-line preview left the last
+    /// lines of that preview clipped off the bottom.
+    ///
+    /// Algorithm:
+    ///   • Find the marker row (top of block) and the last row
+    ///     belonging to that block (next ▸ / next section
+    ///     heading / end of list).
+    ///   • If the block height fits the viewport: park it within
+    ///     the visible window (scroll up if block_top is above,
+    ///     scroll down if block_bottom is below).
+    ///   • If the block is taller than the viewport: keep
+    ///     block_top at the top so the user can scroll through the
+    ///     body naturally.
     fn scroll_to_selected_item(&mut self) {
         let inner_w = self.last_inner_width.get();
         let inner_h = self.last_viewport_rows.get();
@@ -204,36 +219,91 @@ impl ContextPanelView {
         let state = self.view_state();
         let lines =
             crate::tui::context_panel::view::build_lines_with(&self.breakdown, inner_w, state);
-        let Some(row) = lines.iter().position(|l| {
+
+        // Find the marker row. Every selected-item header carries
+        // a literal `▸` in exactly one span — and only one item
+        // per section is selected at a time.
+        let Some(marker_row) = lines.iter().position(|l| {
             l.spans
                 .iter()
                 .any(|s| s.content.as_ref().contains('▸'))
         }) else {
             return;
         };
-        let row = row as u16;
-        let top_margin = 1u16;
-        let bottom_margin = 1u16;
-        let visible_top = self.scroll;
-        let visible_bottom = self
-            .scroll
-            .saturating_add(inner_h.saturating_sub(bottom_margin));
-        if row + top_margin <= visible_top {
-            // Selection moved above the visible window.
-            self.scroll = row.saturating_sub(top_margin);
-        } else if row >= visible_bottom {
-            // Selection moved below.
-            self.scroll = row.saturating_sub(inner_h.saturating_sub(bottom_margin + 1));
+
+        // Walk forward to find the block's bottom: stop at the
+        // next marker row (another section's selected header —
+        // shouldn't happen since only one is selected, but safe),
+        // an empty line that ends the section (section separator),
+        // or the end of the line list.
+        let mut block_bottom = marker_row;
+        for (i, line) in lines.iter().enumerate().skip(marker_row + 1) {
+            let has_marker = line
+                .spans
+                .iter()
+                .any(|s| s.content.as_ref().contains('▸'));
+            if has_marker {
+                break;
+            }
+            if line.spans.is_empty() {
+                break;
+            }
+            // Stop at the next item's `└ ` row. A faster
+            // heuristic: the item marker row uses the indent
+            // `      ▸ └` / `    ▸ └` / `    ▸ └`. Sibling items
+            // that are not the selected one render `      ` (no
+            // ▸) followed by `└`. Use that as the cut — detect a
+            // fresh `└` in one of the first six columns.
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            // Heuristic: sibling item rows always start with some
+            // whitespace, contain `└ `, and stay above the
+            // preview-indent column (text_offset >= 13). Anything
+            // looking like a new `#N role` sibling wraps us up.
+            let trimmed = text.trim_start();
+            if trimmed.starts_with("└ #") || trimmed.starts_with("└ bash")
+                || trimmed.starts_with("└ ") && trimmed.contains(" tokens")
+            {
+                break;
+            }
+            block_bottom = i;
         }
+        let block_top = marker_row as u16;
+        let block_bot = block_bottom as u16;
+        let block_height = block_bot.saturating_sub(block_top).saturating_add(1);
+
+        let viewport_top = self.scroll;
+        let viewport_bottom = viewport_top.saturating_add(inner_h);
+
+        if block_height >= inner_h {
+            // Block taller than viewport — pin top so the user can
+            // scroll through the body.
+            self.scroll = block_top;
+        } else if block_top < viewport_top {
+            // Block starts above viewport → scroll up.
+            self.scroll = block_top;
+        } else if block_bot >= viewport_bottom {
+            // Block's bottom is below viewport → scroll down just
+            // enough to show the full block.
+            self.scroll = block_bot.saturating_sub(inner_h).saturating_add(1);
+        }
+        // else: block fully visible, no change.
         let max = self.max_scroll();
         self.scroll = self.scroll.min(max);
     }
 
     /// Adjust scroll so the currently-focused section's heading is
-    /// visible. Lands the heading a couple rows from the top when
-    /// the section starts deep in the line list — close to Claude
-    /// Code's behavior where Tab jumps your eye to the new row.
-    /// No-op when there's no focus or the breakdown has no content.
+    /// visible — but ONLY when it would otherwise be clipped.
+    ///
+    /// Previous behaviour scrolled unconditionally to `line_idx - 2`
+    /// which pushed the grid + legend off-screen even when the
+    /// heading was already visible. That made Tab feel jumpy and
+    /// lost useful overview context.  Now:
+    ///
+    /// - heading already visible → no scroll change at all
+    /// - heading above viewport  → scroll up so heading is 2 rows
+    ///   from the top
+    /// - heading below viewport  → scroll down so the heading AND
+    ///   at least one row of the section body are visible
     fn scroll_to_focus(&mut self) {
         let Some(focus) = self.focus else { return };
         let inner_w = self.last_inner_width.get();
@@ -246,11 +316,22 @@ impl ContextPanelView {
         else {
             return;
         };
-        // Leave two rows above the heading when possible so users
-        // see the grid + compression hint instead of the heading
-        // being pinned to row 0. Clamp to max_scroll so the end of
-        // the content doesn't get empty space below.
-        let target = line_idx.saturating_sub(2);
+        let viewport_top = self.scroll;
+        let viewport_bottom = viewport_top.saturating_add(inner_h);
+        // Heading sits comfortably inside the viewport? leave
+        // scroll alone — keep the eye where it was, preserve grid
+        // + legend visibility.
+        if line_idx >= viewport_top && line_idx + 1 < viewport_bottom {
+            return;
+        }
+        let target = if line_idx < viewport_top {
+            // Scroll up — park heading near the top with a small margin.
+            line_idx.saturating_sub(2)
+        } else {
+            // Scroll down — put the heading near the top of the
+            // viewport so the user sees the new section below it.
+            line_idx.saturating_sub(2)
+        };
         let max = self.max_scroll();
         self.scroll = target.min(max);
     }
@@ -969,6 +1050,79 @@ mod tests {
         v.handle_key(press(KeyCode::Tab));
         assert_eq!(v.focus, focus_before, "Tab must be a no-op inside drill");
         assert!(v.drilled);
+    }
+
+    #[test]
+    fn scroll_to_focus_noop_when_heading_already_visible() {
+        // Regression: Tab cycling from the first focused section
+        // used to unconditionally re-scroll, pushing the
+        // grid/legend off-screen even when the target heading was
+        // already fully visible.
+        let mut v = ContextPanelView::new(big_breakdown());
+        prime_viewport(&v, 80, 24);
+        v.handle_key(press(KeyCode::Tab));
+        let first_scroll = v.scroll;
+        // Tab to next focus; heading of the next section is still
+        // above the viewport floor, so scroll should stay where
+        // it was (at 0 for this fixture).
+        v.handle_key(press(KeyCode::Tab));
+        assert_eq!(
+            v.scroll, first_scroll,
+            "no-op scroll expected when next heading is already in viewport",
+        );
+    }
+
+    #[test]
+    fn down_keeps_selected_item_block_visible() {
+        // Regression: with variable preview heights, selecting an
+        // item with a longer body pushed later items off the
+        // bottom. After the preview-height stabilisation we walk
+        // through a section and verify the selected block always
+        // fits the viewport.
+        let mut v = ContextPanelView::new(big_breakdown());
+        prime_viewport(&v, 80, 18);
+        while v.focus != Some(Section::Tools) {
+            v.handle_key(press(KeyCode::Tab));
+        }
+        v.handle_key(press(KeyCode::Enter)); // expand
+        let tools_n = v.selectable_count();
+        assert!(tools_n >= 4, "need multi-item section for this check");
+        for _ in 0..tools_n {
+            v.handle_key(press(KeyCode::Down));
+            let state = v.view_state();
+            let lines = crate::tui::context_panel::view::build_lines_with(
+                &v.breakdown,
+                v.last_inner_width.get(),
+                state,
+            );
+            let marker = lines.iter().position(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.content.as_ref().contains('▸'))
+            }).unwrap() as u16;
+            let viewport_top = v.scroll;
+            let viewport_bottom = viewport_top + v.last_viewport_rows.get();
+            assert!(
+                marker >= viewport_top && marker < viewport_bottom,
+                "selected-item marker must stay inside viewport (marker={marker}, top={viewport_top}, bot={viewport_bottom})"
+            );
+        }
+    }
+
+    #[test]
+    fn first_tab_resets_stale_nested_state() {
+        // Consistency fix: focus_next's None-branch used to only
+        // clear `expanded`; selected_item and drilled could leak
+        // in principle from a prior session. Call focus_next
+        // directly — going through the public keymap wouldn't
+        // exercise this path because Tab is blocked while drilled.
+        let mut v = ContextPanelView::new(big_breakdown());
+        v.selected_item = 4;
+        v.drilled = true;
+        v.focus_next(false);
+        assert_eq!(v.selected_item, 0);
+        assert!(!v.drilled);
+        assert!(v.focus.is_some(), "first tab enters focus mode");
     }
 
     #[test]

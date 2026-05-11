@@ -13,7 +13,7 @@ expression: buffer_to_string(&buf)
 
  ▼ History · conversation turns
     └ 3 turns  (3 retained · 0 compressed · 0 dropped)
-    ↑/↓ select · Enter drill · Esc back
+    ↑/↓ select · Enter drill · Tab next · Esc back
         └ #0 user   80 tokens
              Can you refactor the auth module so the session validator lives
              in its own file?
@@ -21,8 +21,6 @@ expression: buffer_to_string(&buf)
              I'll start by reading auth.rs and mapping out every caller.
 
 
-             Let me look at the module structure first, then identify what
-             to move. The validate_session function has three call sites
-             that I'll need to update.
+             Let me look at the module structure first, then identify what…
         └ #2 user   40 tokens
              Thanks — now make the helper private.

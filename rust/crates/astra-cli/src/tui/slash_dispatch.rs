@@ -1356,9 +1356,15 @@ fn collect_history_text(
             record(turn_idx, u.text(), &mut previews, &mut bodies, true);
             turn_idx = turn_idx.saturating_add(1);
         } else if let Some(a) = any.downcast_ref::<AssistantCell>() {
+            if turn_idx == 0 {
+                continue;
+            }
             let slot = turn_idx.saturating_sub(1);
             record(slot, a.source(), &mut previews, &mut bodies, false);
         } else if let Some(r) = any.downcast_ref::<ReasoningCell>() {
+            if turn_idx == 0 {
+                continue;
+            }
             let slot = turn_idx.saturating_sub(1);
             record(slot, r.text(), &mut previews, &mut bodies, false);
         }
@@ -1430,6 +1436,85 @@ mod panels_tests {
         insta::assert_snapshot!(
             "panels_cheat_sheet",
             build_panels_cheat_sheet_lines().join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod context_history_tests {
+    use super::{collect_history_text, one_line_preview};
+    use crate::tui::chat_widget::ChatWidget;
+    use crate::tui::turn_event::{SystemLevel, TurnEvent};
+
+    #[test]
+    fn one_line_preview_skips_leading_blanks_crlf_and_truncates() {
+        assert_eq!(one_line_preview("\n\n  first line  \nsecond"), "first line");
+        assert_eq!(one_line_preview("\r\nCRLF line\r\n"), "CRLF line");
+
+        let long = "a".repeat(240);
+        let preview = one_line_preview(&long);
+        assert_eq!(preview.chars().count(), 200);
+        assert!(preview.chars().all(|ch| ch == 'a'));
+    }
+
+    #[test]
+    fn collect_history_text_ignores_assistant_without_user_anchor() {
+        let mut chat = ChatWidget::new("");
+        chat.replay(vec![
+            TurnEvent::Assistant {
+                ts: None,
+                markdown: "orphan assistant should not attach to turn zero".into(),
+            },
+            TurnEvent::Thinking {
+                ts: None,
+                text: "orphan reasoning should not attach to turn zero".into(),
+                duration_ms: None,
+            },
+        ]);
+
+        let (previews, bodies) = collect_history_text(&chat);
+
+        assert!(
+            previews.is_empty() && bodies.is_empty(),
+            "assistant/reasoning cells before the first user turn must not create a fake turn 0"
+        );
+    }
+
+    #[test]
+    fn collect_history_text_skips_system_cells_and_keeps_turn_indices_aligned() {
+        let mut chat = ChatWidget::new("");
+        chat.replay(vec![
+            TurnEvent::User {
+                ts: None,
+                text: "first user".into(),
+            },
+            TurnEvent::System {
+                ts: None,
+                level: SystemLevel::Info,
+                text: "system note should not appear in context history".into(),
+            },
+            TurnEvent::Assistant {
+                ts: None,
+                markdown: "assistant answer".into(),
+            },
+            TurnEvent::User {
+                ts: None,
+                text: "second user".into(),
+            },
+        ]);
+
+        let (previews, bodies) = collect_history_text(&chat);
+
+        assert_eq!(previews.get(&0).map(String::as_str), Some("first user"));
+        assert_eq!(bodies.get(&0).map(String::as_str), Some("first user"));
+        assert_eq!(previews.get(&1).map(String::as_str), Some("second user"));
+        assert_eq!(bodies.get(&1).map(String::as_str), Some("second user"));
+        assert!(
+            previews
+                .values()
+                .chain(bodies.values())
+                .all(|text| !text.contains("system note")),
+            "system cells should not pollute turn previews or bodies"
         );
     }
 }

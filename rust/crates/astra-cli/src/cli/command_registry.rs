@@ -610,16 +610,14 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_arg_hint("[log|push|pull]"),
     CommandMeta::new(
         "/context",
-        "Context window / budget summary",
+        "Open the context panel (TUI) or dump a snapshot to disk",
         CommandGroup::Observability,
     )
-    .with_subcommands(&[
-        ("breakdown", "Per-component token breakdown for last turn"),
-        (
-            "cognition",
-            "Cognitive runtime flags (boosted/widen, recent tools, pending proposal)",
-        ),
-    ]),
+    .with_subcommands(&[(
+        "dump",
+        "Write a JSON snapshot of the live context to disk",
+    )])
+    .with_arg_hint("[dump [path]]"),
     CommandMeta::new(
         "/rewind",
         "Rewind conversation to an earlier turn",

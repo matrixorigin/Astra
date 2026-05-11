@@ -55,6 +55,12 @@ pub(crate) const GRID_ROWS: usize = 5;
 pub(crate) const GRID_COLS: usize = 10;
 pub(crate) const GRID_CELLS: usize = GRID_ROWS * GRID_COLS;
 
+/// Preview body rows rendered under each item when the section is
+/// expanded (but not drilled). Kept stable across selection so
+/// ↑/↓ is pure navigation — nothing jumps.  Drill mode renders
+/// the full body instead, capped by the wrap_text budget.
+pub(crate) const EXPANDED_PREVIEW_ROWS: usize = 3;
+
 /// View state for a single render pass.
 ///
 /// Three nested modes, picked by which fields are set:
@@ -275,9 +281,9 @@ pub(crate) fn build_lines_with(
     // user always knows which keys do what RIGHT NOW.  The hint in
     // the bottom-pane footer repeats this, but having it inline
     // keeps the info visible while the user scrolls.
-    if let Some(focused) = state.focus {
+    let hint = if let Some(focused) = state.focus {
         let selectable = section_item_count(b, focused) > 0;
-        let hint = if state.drilled {
+        if state.drilled {
             "  Esc back · j/k scroll"
         } else if state.expanded.is_some() && selectable {
             "  ↑/↓ select · Enter drill · Tab next · Esc back"
@@ -287,12 +293,14 @@ pub(crate) fn build_lines_with(
             "  Tab next · Enter/Esc collapse · j/k scroll"
         } else {
             "  Tab next · Enter expand · j/k scroll · Esc close"
-        };
-        out.push(Line::from(Span::styled(
-            hint,
-            Style::default().add_modifier(Modifier::DIM),
-        )));
-    }
+        }
+    } else {
+        "  Tab focus · Enter close · j/k scroll · Esc close"
+    };
+    out.push(Line::from(Span::styled(
+        hint,
+        Style::default().add_modifier(Modifier::DIM),
+    )));
     out.push(Line::default());
 
     // Top block: grid on the left, category legend on the right.
@@ -713,7 +721,7 @@ fn append_history_section(
         out.push(Line::from(vec![
             Span::raw("    "),
             Span::styled(
-                "↑/↓ select · Enter drill · Esc back",
+                "↑/↓ select · Enter drill · Tab next · Esc back",
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ]));
@@ -806,8 +814,13 @@ fn turn_detail_lines(
         t.preview.as_str()
     };
     if !preview_source.is_empty() {
-        let rows_budget = if selected { 6 } else { 3 };
-        let lines = wrap_text(preview_source.trim(), 64, rows_budget);
+        // Stable preview height regardless of selection. Variable
+        // heights made selection cause layout to shift underneath
+        // the user — items below the selected one disappeared off
+        // the bottom as the preview grew. Drill mode is where the
+        // full body appears; the expanded-list view keeps rows
+        // predictable so ↑/↓ feel like pure navigation.
+        let lines = wrap_text(preview_source.trim(), 64, EXPANDED_PREVIEW_ROWS);
         for line in lines {
             out.push(Line::from(vec![
                 Span::raw("             "),
@@ -826,7 +839,7 @@ fn append_tools_expanded(
     out.push(Line::from(vec![
         Span::raw("    "),
         Span::styled(
-            "↑/↓ select · Enter drill · Esc back",
+            "↑/↓ select · Enter drill · Tab next · Esc back",
             Style::default().add_modifier(Modifier::DIM),
         ),
     ]));
@@ -1122,7 +1135,7 @@ fn append_memory_section(
         out.push(Line::from(vec![
             Span::raw("    "),
             Span::styled(
-                "↑/↓ select · Enter drill · Esc back",
+                "↑/↓ select · Enter drill · Tab next · Esc back",
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ]));
@@ -1182,8 +1195,7 @@ fn append_memory_section(
         };
         out.push(Line::from(header));
         if expanded {
-            let rows_budget = if selected { 6 } else { 3 };
-            for line in wrap_text(m.preview.trim(), 66, rows_budget) {
+            for line in wrap_text(m.preview.trim(), 66, EXPANDED_PREVIEW_ROWS) {
                 out.push(Line::from(vec![
                     Span::raw("          "),
                     Span::styled(line, Style::default().add_modifier(Modifier::DIM)),
@@ -1483,7 +1495,7 @@ fn append_decisions_section(
         out.push(Line::from(vec![
             Span::raw("    "),
             Span::styled(
-                "↑/↓ select · Enter drill · Esc back",
+                "↑/↓ select · Enter drill · Tab next · Esc back",
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ]));
@@ -1519,8 +1531,7 @@ fn append_decisions_section(
         ]));
         if expanded {
             if !d.reasoning.is_empty() {
-                let rows_budget = if selected { 6 } else { 2 };
-                for line in wrap_text(&d.reasoning, 66, rows_budget) {
+                for line in wrap_text(&d.reasoning, 66, EXPANDED_PREVIEW_ROWS) {
                     out.push(Line::from(vec![
                         Span::raw("          "),
                         Span::styled(line, Style::default().add_modifier(Modifier::DIM)),
@@ -1615,7 +1626,7 @@ fn append_compaction_section(
         out.push(Line::from(vec![
             Span::raw("    "),
             Span::styled(
-                "↑/↓ select · Enter drill · Esc back",
+                "↑/↓ select · Enter drill · Tab next · Esc back",
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ]));
@@ -3024,6 +3035,54 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(text.contains("▼"), "expand marker missing: {text}");
+    }
+
+    #[test]
+    fn expanded_selectable_section_hints_include_tab_navigation() {
+        let mut t = trace(100_000, 2_000, 0, 0, 1_000, 0);
+        t.tools.tools_selected = vec![ToolSelected {
+            tool_name: "bash".into(),
+            score: 0.9,
+            tokens: 100,
+            selection_factors: Vec::new(),
+        }];
+        let b = ContextBreakdown::from_trace(&t);
+        let state = ViewState {
+            focus: Some(Section::Tools),
+            expanded: Some(Section::Tools),
+            selected_item: 0,
+            drilled: false,
+        };
+
+        let hint_lines: Vec<String> = build_lines_with(&b, 80, state)
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .filter(|text: &String| text.contains("↑/↓ select") && text.contains("Enter drill"))
+            .collect();
+
+        assert!(
+            !hint_lines.is_empty(),
+            "expanded selectable section should render keyboard hints"
+        );
+        assert!(
+            hint_lines.iter().all(|text| text.contains("Tab next")),
+            "all visible selectable-section hints should mention Tab navigation: {hint_lines:?}"
+        );
+    }
+
+    #[test]
+    fn initial_context_panel_shows_inline_tab_focus_hint() {
+        let b = ContextBreakdown::from_trace(&trace(100_000, 2_000, 8_000, 0, 0, 500));
+        let text: String = build_lines_with(&b, 80, ViewState::default())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(
+            text.contains("Tab focus"),
+            "initial no-focus panel should show the same inline Tab focus hint as the footer: {text}"
+        );
     }
 
     #[test]

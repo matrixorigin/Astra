@@ -4,6 +4,7 @@ expression: "render_panel(&b, 80, 28)"
 ---
 ┌ Context window (34% · low) ──────────────────────────────────────────────────┐
 │  34.5k / 102.4k tokens  (33.7%)                                              │
+│  Tab focus · Enter close · j/k scroll · Esc close                            │
 │                                                                              │
 │  ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁   ⛁ System prompt     6.0k  ( 5.9%)                     │
 │  ⛁ ⛁ ⛁ ⛁ ⛁ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Tools             6.3k  ( 6.2%)                     │
@@ -26,7 +27,6 @@ expression: "render_panel(&b, 80, 28)"
 │   Compaction · context trimming                                              │
 │    └ not triggered this turn                                                 │
 │    └ 32.0k → 22.0k tokens  (saved 10.0k, −31%)                               │
-│                                                                              │
 │                                                                              │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘

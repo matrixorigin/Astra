@@ -388,6 +388,7 @@ pub(crate) async fn run_tui_repl(
             .map(|m| slash_menu::SlashItem {
                 name: m.name,
                 description: m.description,
+                subcommands: m.subcommands,
             })
             .collect();
         bottom_pane.set_slash_items(slash_items);
