@@ -31,11 +31,10 @@ fn string_to_result(output: String) -> ToolResult {
 }
 
 fn outcome_to_result(outcome: crate::git_gix::ToolExecutionOutcome) -> ToolResult {
-    let is_error = outcome.output.starts_with("Error");
     ToolResult {
         output: outcome.output,
         metadata: outcome.tool_result_fields,
-        is_error,
+        is_error: outcome.is_error,
     }
 }
 
@@ -778,6 +777,19 @@ mod tests {
             .await;
         assert!(!result.is_error);
         assert!(result.output.contains("hello"));
+    }
+
+    #[test]
+    fn outcome_to_result_uses_explicit_error_flag_not_output_prefix() {
+        let outcome = crate::git_gix::ToolExecutionOutcome::error("fatal: git failed".to_string());
+
+        let result = outcome_to_result(outcome);
+
+        assert!(
+            result.is_error,
+            "non-Error-prefixed git outcome errors must stay errors"
+        );
+        assert_eq!(result.output, "fatal: git failed");
     }
 
     #[tokio::test]

@@ -1441,7 +1441,7 @@ fn comment_line_count(s: &str) -> usize {
                 // Scoped enough to not collide with plain prose or
                 // markdown bullets (those are typically `-` / `+`
                 // inside code here, not ` * `).
-                || (trimmed.starts_with("* ") && !trimmed.starts_with("* "))
+                || trimmed.starts_with("* ")
                 || trimmed == "*/"
                 // Python / TypeScript / Markdown triple-quoted
                 // docstring delimiters. One-sided match is OK for a
@@ -3164,13 +3164,34 @@ mod tests {
     #[test]
     fn comment_line_count_counts_jsdoc_opener() {
         let s = "/**\n * Hello\n */\nfunction f() {}\n";
-        // `/**` + `*/` = 2. The ` * Hello` continuation is also valid
-        // JSDoc; 3 total is acceptable.
-        let n = comment_line_count(s);
+        assert_eq!(comment_line_count(s), 3);
+    }
+
+    #[test]
+    fn str_replace_rejects_jsdoc_continuation_line_loss_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let original = "/**\n * Important details\n */\nfunction thing() {}\n";
+        std::fs::write(tmp.path().join("doc.js"), original).unwrap();
+        let args = serde_json::json!({
+            "path": "doc.js",
+            "old_str": original,
+            "new_str": "/**\n */\nfunction thing() {}\n"
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
         assert!(
-            (2..=3).contains(&n),
-            "expected 2-3 for JSDoc block; got {n}"
+            result.is_error,
+            "JSDoc continuation line loss should be rejected: {}",
+            result.output
         );
+        assert!(
+            result.output.contains("comment/doc-comment"),
+            "got: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("doc.js")).unwrap();
+        assert_eq!(content, original);
     }
 
     // ── Atomic write pipeline ────────────────────────────────────

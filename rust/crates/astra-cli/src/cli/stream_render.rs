@@ -2654,6 +2654,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 crate::edge_tools::ToolExecutionOutcome {
                                     output,
                                     tool_result_fields: None,
+                                    is_error: false,
                                 },
                                 0u64,
                             );
@@ -2685,6 +2686,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                                 "Tool blocked by hook '{hook_id}': {reason}"
                                             ),
                                             tool_result_fields: None,
+                                            is_error: true,
                                         },
                                         0u64,
                                     );
@@ -2714,6 +2716,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     crate::edge_tools::ToolExecutionOutcome {
                                         output: post.final_output,
                                         tool_result_fields: outcome.tool_result_fields,
+                                        is_error: outcome.is_error,
                                     },
                                     dur,
                                 );
@@ -6073,6 +6076,7 @@ where
                     panic_payload_summary(payload.as_ref())
                 ),
                 tool_result_fields: None,
+                is_error: true,
             },
             t0.elapsed().as_millis() as u64,
         ),

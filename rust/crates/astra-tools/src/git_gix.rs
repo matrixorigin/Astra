@@ -85,13 +85,24 @@ fn run_git_with_timeout(project_root: &Path, args: &[&str]) -> Option<std::proce
 pub struct ToolExecutionOutcome {
     pub output: String,
     pub tool_result_fields: Option<serde_json::Map<String, serde_json::Value>>,
+    pub is_error: bool,
 }
 
 impl ToolExecutionOutcome {
     pub fn text(output: String) -> Self {
+        let is_error = output.starts_with("Error");
         Self {
             output,
             tool_result_fields: None,
+            is_error,
+        }
+    }
+
+    pub fn error(output: String) -> Self {
+        Self {
+            output,
+            tool_result_fields: None,
+            is_error: true,
         }
     }
 }
@@ -2160,7 +2171,7 @@ pub fn git_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecut
     let message = match args.get("message").and_then(Value::as_str) {
         Some(m) if !m.trim().is_empty() => m.trim(),
         _ => {
-            return ToolExecutionOutcome::text(
+            return ToolExecutionOutcome::error(
                 "Error: 'message' is required and must not be empty".to_string(),
             );
         }
@@ -2168,7 +2179,7 @@ pub fn git_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecut
 
     // Validate message length (prevent absurdly long messages)
     if message.len() > 5000 {
-        return ToolExecutionOutcome::text(
+        return ToolExecutionOutcome::error(
             "Error: commit message too long (max 5000 chars)".to_string(),
         );
     }
@@ -2189,10 +2200,10 @@ pub fn git_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecut
             .output();
         match add_out {
             Err(e) => {
-                return ToolExecutionOutcome::text(format!("Error: git add failed: {e}"));
+                return ToolExecutionOutcome::error(format!("Error: git add failed: {e}"));
             }
             Ok(ref out) if !out.status.success() => {
-                return ToolExecutionOutcome::text(format!(
+                return ToolExecutionOutcome::error(format!(
                     "Error: git add -A failed: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 ));
@@ -2206,10 +2217,10 @@ pub fn git_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecut
         let add_out = cmd.output();
         match add_out {
             Err(e) => {
-                return ToolExecutionOutcome::text(format!("Error: git add failed: {e}"));
+                return ToolExecutionOutcome::error(format!("Error: git add failed: {e}"));
             }
             Ok(ref out) if !out.status.success() => {
-                return ToolExecutionOutcome::text(format!(
+                return ToolExecutionOutcome::error(format!(
                     "Error: git add failed: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 ));
@@ -2256,6 +2267,7 @@ pub fn git_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecut
             ToolExecutionOutcome {
                 output: format!("✓ Committed: {short_hash} {message}"),
                 tool_result_fields,
+                is_error: false,
             }
         }
         Ok(out) => {
@@ -2263,10 +2275,10 @@ pub fn git_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecut
             if stderr.contains("nothing to commit") {
                 ToolExecutionOutcome::text("Nothing to commit — working tree clean".to_string())
             } else {
-                ToolExecutionOutcome::text(format!("Error: git commit failed: {}", stderr.trim()))
+                ToolExecutionOutcome::error(format!("Error: git commit failed: {}", stderr.trim()))
             }
         }
-        Err(e) => ToolExecutionOutcome::text(format!("Error: git commit failed: {e}")),
+        Err(e) => ToolExecutionOutcome::error(format!("Error: git commit failed: {e}")),
     }
 }
 
@@ -2282,16 +2294,16 @@ pub fn git_revert_commit_with_metadata(project_root: &Path, args: &Value) -> Too
     let commit_ref = match args.get("commit_sha").and_then(Value::as_str) {
         Some(commit_ref) => match validate_commit_ref(commit_ref, "commit_sha") {
             Ok(commit_ref) => commit_ref,
-            Err(error) => return ToolExecutionOutcome::text(error),
+            Err(error) => return ToolExecutionOutcome::error(error),
         },
         None => {
-            return ToolExecutionOutcome::text("Error: 'commit_sha' is required".to_string());
+            return ToolExecutionOutcome::error("Error: 'commit_sha' is required".to_string());
         }
     };
     let target_commit_sha = match resolve_commit_ref(project_root, &commit_ref) {
         Some(commit_sha) => commit_sha,
         None => {
-            return ToolExecutionOutcome::text(format!("Error: unknown commit '{commit_ref}'"));
+            return ToolExecutionOutcome::error(format!("Error: unknown commit '{commit_ref}'"));
         }
     };
 
@@ -2333,6 +2345,7 @@ pub fn git_revert_commit_with_metadata(project_root: &Path, args: &Value) -> Too
                     revert_short_sha
                 ),
                 tool_result_fields,
+                is_error: false,
             }
         }
         Ok(out) => {
@@ -2347,9 +2360,9 @@ pub fn git_revert_commit_with_metadata(project_root: &Path, args: &Value) -> Too
                     message.push_str(&format!(" ({error})"));
                 }
             }
-            ToolExecutionOutcome::text(message)
+            ToolExecutionOutcome::error(message)
         }
-        Err(e) => ToolExecutionOutcome::text(format!("Error: git revert failed: {e}")),
+        Err(e) => ToolExecutionOutcome::error(format!("Error: git revert failed: {e}")),
     }
 }
 
@@ -2368,7 +2381,7 @@ pub fn git_stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecuti
     let action = match args.get("action").and_then(Value::as_str) {
         Some(a) => a,
         None => {
-            return ToolExecutionOutcome::text(
+            return ToolExecutionOutcome::error(
                 "Error: 'action' is required (push, apply, pop, list, drop)".to_string(),
             );
         }
@@ -2398,7 +2411,7 @@ pub fn git_stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecuti
         "apply" => {
             let selector = match apply_stash_selector(args) {
                 Ok(selector) => selector,
-                Err(error) => return ToolExecutionOutcome::text(error),
+                Err(error) => return ToolExecutionOutcome::error(error),
             };
             cmd.arg("stash").arg("apply").arg(selector);
         }
@@ -2414,7 +2427,7 @@ pub fn git_stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecuti
             cmd.arg("stash").arg("drop").arg(selector);
         }
         _ => {
-            return ToolExecutionOutcome::text(format!(
+            return ToolExecutionOutcome::error(format!(
                 "Error: unknown stash action '{action}'. Use: push, apply, pop, list, drop"
             ));
         }
@@ -2456,17 +2469,18 @@ pub fn git_stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecuti
                 ToolExecutionOutcome {
                     output,
                     tool_result_fields,
+                    is_error: false,
                 }
             } else {
                 let err = stderr.trim();
                 if err.contains("No local changes") || err.contains("No stash entries") {
                     ToolExecutionOutcome::text(err.to_string())
                 } else {
-                    ToolExecutionOutcome::text(format!("Error: git stash {action} failed: {err}"))
+                    ToolExecutionOutcome::error(format!("Error: git stash {action} failed: {err}"))
                 }
             }
         }
-        Err(e) => ToolExecutionOutcome::text(format!("Error: git stash failed: {e}")),
+        Err(e) => ToolExecutionOutcome::error(format!("Error: git stash failed: {e}")),
     }
 }
 
