@@ -169,7 +169,10 @@ fn bool_editor_renders_both_options_with_marker_on_current() {
     }
     // Both options must be on screen.
     assert!(text.contains("true"), "bool editor missing `true`: {text}");
-    assert!(text.contains("false"), "bool editor missing `false`: {text}");
+    assert!(
+        text.contains("false"),
+        "bool editor missing `false`: {text}"
+    );
     // The cursor/marker (›) must sit on the *current* value, which is
     // `false` by default here. A trailing space avoids matching a prefix
     // of a future label.

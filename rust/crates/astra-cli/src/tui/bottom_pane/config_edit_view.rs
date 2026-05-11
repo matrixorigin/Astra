@@ -584,50 +584,78 @@ enum InnerOutcome {
 }
 
 // ── Bool ──────────────────────────────────────────────────────────────
+//
+// Two-option picker — same visual pattern as EnumEditor so users have
+// a single mental model for "pick one of these". Space/Tab keeps the
+// "flip" shortcut from the earlier single-value editor for muscle
+// memory, but the primary UI is ↑↓ + Enter.
 
 struct BoolEditor {
     id: String,
     label: String,
-    value: bool,
+    /// 0 = false row, 1 = true row. Initialised to the current value so
+    /// the cursor opens on whichever option is live.
+    selected: usize,
 }
 
 impl BoolEditor {
     fn new(item: &SettingItem) -> Self {
+        let current = item.value_as_bool().unwrap_or(false);
         Self {
             id: item.id.clone(),
             label: item.label.clone(),
-            value: item.value_as_bool().unwrap_or(false),
+            selected: if current { 1 } else { 0 },
         }
+    }
+
+    fn current_value(&self) -> bool {
+        self.selected == 1
     }
 }
 
 impl InnerEditor for BoolEditor {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let hint = Style::default().fg(Color::DarkGray);
-        let val_style = Style::default()
+        let sel = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
-        let lines = vec![
-            Line::from(Span::styled(
-                format!("  ▶ {} ", self.label),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(vec![
-                Span::styled("  value: ", hint),
-                Span::styled(self.value.to_string(), val_style),
-                Span::styled("    (space toggles, Enter saves, Esc cancels)", hint),
-            ]),
-        ];
+        let mut lines = vec![Line::from(Span::styled(
+            format!("  ▶ {} ", self.label),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))];
+        for (i, label) in ["false", "true"].iter().enumerate() {
+            let marker = if i == self.selected { "› " } else { "  " };
+            let line = Line::from(vec![
+                Span::styled("  ", hint),
+                Span::styled(
+                    format!("{}{}", marker, label),
+                    if i == self.selected { sel } else { hint },
+                ),
+            ]);
+            lines.push(line);
+        }
+        lines.push(Line::from(Span::styled(
+            "  (↑↓ move, space toggle, Enter save, Esc cancel)",
+            hint,
+        )));
         Widget::render(Paragraph::new(lines), area, buf);
+    }
+
+    fn desired_height(&self, _width: u16) -> u16 {
+        // label + 2 options + hint = 4 rows
+        4
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> InnerOutcome {
         match key.code {
-            KeyCode::Char(' ') | KeyCode::Tab => {
-                self.value = !self.value;
+            KeyCode::Up | KeyCode::Down | KeyCode::Char(' ') | KeyCode::Tab => {
+                // All four keys swap the selection. Arrow keys match
+                // EnumEditor (the norm); space/tab preserves the old
+                // "flip" muscle memory.
+                self.selected = 1 - self.selected;
                 InnerOutcome::Pending
             }
-            KeyCode::Enter => InnerOutcome::Accept(Value::Bool(self.value)),
+            KeyCode::Enter => InnerOutcome::Accept(Value::Bool(self.current_value())),
             KeyCode::Esc => InnerOutcome::Cancel,
             _ => InnerOutcome::Pending,
         }
@@ -637,7 +665,7 @@ impl InnerEditor for BoolEditor {
         &self.id
     }
     fn hint_keys(&self) -> &'static str {
-        "space toggle · Enter save · Esc cancel"
+        "↑↓ move · space toggle · Enter save · Esc cancel"
     }
     fn kind_label(&self) -> &'static str {
         "bool"
