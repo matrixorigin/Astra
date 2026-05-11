@@ -1117,6 +1117,46 @@ pub(crate) enum ConfigCmd {
     Set(ConfigSetArgs),
     /// Show the resolved workflow-guard policy for a model
     ShowPolicy(ConfigShowPolicyArgs),
+    /// Inspect the content-addressed history of saved configs.
+    #[command(subcommand)]
+    Version(ConfigVersionCmd),
+}
+
+/// `astra config version ...` — browse, diff, and inspect saved config
+/// versions. Every `/config` save and every session startup writes an
+/// entry to the version store (`~/.astra/config/versions/`); these
+/// commands are the read-side of that store.
+#[derive(Subcommand, Debug)]
+pub(crate) enum ConfigVersionCmd {
+    /// List versions newest-first.
+    List(ConfigVersionListArgs),
+    /// Print the TOML body of a specific version.
+    Show(ConfigVersionShowArgs),
+    /// Show field-level diff between two versions.
+    Diff(ConfigVersionDiffArgs),
+    /// Print the id of the config the current process would run under.
+    Current,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConfigVersionListArgs {
+    /// Maximum number of rows to render (default: all).
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConfigVersionShowArgs {
+    /// Version id (full or a unique prefix, e.g. `cfg_a7b2`).
+    pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConfigVersionDiffArgs {
+    /// First version id (or unique prefix).
+    pub a: String,
+    /// Second version id (or unique prefix).
+    pub b: String,
 }
 
 #[derive(Args, Debug)]

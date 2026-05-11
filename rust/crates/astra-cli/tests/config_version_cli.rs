@@ -26,8 +26,8 @@
 //! machinery.
 
 use astra_config::config_version_cli::{
-    format_current, format_version_diff, format_version_list, format_version_show, resolve_prefix,
-    ResolveError,
+    ResolveError, format_current, format_version_diff, format_version_list, format_version_show,
+    resolve_prefix,
 };
 use astra_config::config_versions::{ConfigVersionStore, LocalFileStore, PutMetadata};
 use astra_config::runtime_config::RuntimeConfig;
@@ -60,7 +60,9 @@ fn list_renders_newest_first_with_id_and_source_session() {
     // At least a header + 3 rows. Header detection is loose — look
     // for the id column and the session column names.
     assert!(
-        lines.iter().any(|l| l.contains("id") && l.contains("source")),
+        lines
+            .iter()
+            .any(|l| l.contains("id") && l.contains("source")),
         "list must render a header that names the id and source columns: {out}"
     );
     // Newest session (sess_2) must appear before the oldest (sess_0).
@@ -78,10 +80,7 @@ fn list_with_limit_caps_output() {
     let out = format_version_list(&store, Some(2)).expect("format ok");
     // Count non-header, non-blank lines that carry a `cfg_` id — that's
     // how many actual rows the view rendered.
-    let rows = out
-        .lines()
-        .filter(|l| l.contains("cfg_"))
-        .count();
+    let rows = out.lines().filter(|l| l.contains("cfg_")).count();
     assert_eq!(rows, 2, "limit=2 must render 2 id rows, got:\n{out}");
 }
 

@@ -177,12 +177,20 @@ impl LocalFileStore {
                 path: path.clone(),
                 source,
             })?;
-        let line =
+        // Atomic single-syscall append. writeln! can internally issue
+        // two write calls (body + newline) which concurrent writers
+        // on the same O_APPEND file will interleave, producing
+        // `{...}{...}\n` that breaks the reader's one-row-per-line
+        // contract. Combine into one buffer so the kernel's O_APPEND
+        // semantics keep each record whole.
+        let mut line =
             serde_json::to_string(entry).map_err(|e| StoreError::CorruptIndex(e.to_string()))?;
-        writeln!(f, "{line}").map_err(|source| StoreError::Io {
-            path: path.clone(),
-            source,
-        })?;
+        line.push('\n');
+        f.write_all(line.as_bytes())
+            .map_err(|source| StoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
         Ok(())
     }
 
@@ -204,9 +212,33 @@ impl LocalFileStore {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: IndexEntry = serde_json::from_str(&line)
-                .map_err(|e| StoreError::CorruptIndex(format!("line {}: {}", i + 1, e)))?;
-            out.push(entry);
+            // Primary path: one JSON object per line.
+            if let Ok(entry) = serde_json::from_str::<IndexEntry>(&line) {
+                out.push(entry);
+                continue;
+            }
+            // Recovery path: older builds could race writeln!() across
+            // processes and produce `{...}{...}\n` on one line. Feed
+            // the line through the streaming deserializer and accept
+            // whatever valid objects come out — strict parse of a
+            // legacy row shouldn't sink a live CLI.
+            let mut de = serde_json::Deserializer::from_str(&line).into_iter::<IndexEntry>();
+            let mut any = false;
+            for item in de.by_ref() {
+                match item {
+                    Ok(entry) => {
+                        out.push(entry);
+                        any = true;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if !any {
+                return Err(StoreError::CorruptIndex(format!(
+                    "line {}: could not recover any IndexEntry",
+                    i + 1
+                )));
+            }
         }
         Ok(out)
     }

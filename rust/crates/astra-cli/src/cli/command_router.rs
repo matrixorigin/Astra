@@ -2510,6 +2510,44 @@ fn execute_config_command(cmd: ConfigCmd) -> Result<(), String> {
         ConfigCmd::Get(args) => config_get(&args.key),
         ConfigCmd::Set(args) => config_set(&args.key, &args.value),
         ConfigCmd::ShowPolicy(args) => config_show_policy(args.model.as_deref(), args.json),
+        ConfigCmd::Version(sub) => config_version_dispatch(sub),
+    }
+}
+
+/// Dispatch for `astra config version ...`. Uses the default
+/// `LocalFileStore` at `~/.astra/config/versions/`; if home dir is
+/// unresolvable we surface that as an error instead of silently using
+/// the process cwd, which would mislead users about where their
+/// versions live.
+fn config_version_dispatch(sub: ConfigVersionCmd) -> Result<(), String> {
+    use astra_config::config_version_cli::{
+        format_current, format_version_diff, format_version_list, format_version_show,
+    };
+    use astra_config::config_versions::LocalFileStore;
+
+    let store = LocalFileStore::at_default_root()
+        .ok_or_else(|| "could not locate home directory for version store".to_string())?;
+    match sub {
+        ConfigVersionCmd::List(args) => {
+            let out = format_version_list(&store, args.limit).map_err(|e| e.to_string())?;
+            print!("{out}");
+            Ok(())
+        }
+        ConfigVersionCmd::Show(args) => {
+            let out = format_version_show(&store, &args.id).map_err(|e| e.to_string())?;
+            print!("{out}");
+            Ok(())
+        }
+        ConfigVersionCmd::Diff(args) => {
+            let out = format_version_diff(&store, &args.a, &args.b).map_err(|e| e.to_string())?;
+            print!("{out}");
+            Ok(())
+        }
+        ConfigVersionCmd::Current => {
+            let id = format_current().map_err(|e| e.to_string())?;
+            println!("{id}");
+            Ok(())
+        }
     }
 }
 

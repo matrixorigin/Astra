@@ -3,6 +3,7 @@
 //! Standalone crate with zero runtime infrastructure dependencies.
 
 pub mod config_overlay;
+pub mod config_version_cli;
 pub mod config_versions;
 pub mod execution_profile;
 pub mod lock_ext;
