@@ -44,7 +44,8 @@ pub(crate) struct ContextBreakdown {
 /// Aggregate summary of the history slice the context carried into
 /// the most recent turn.  The view renders this as a labelled
 /// section so the user can see how aggressively the compactor is
-/// trimming their backlog.
+/// trimming their backlog. `turns` carries per-turn details that
+/// the expanded view surfaces.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct HistorySummary {
     pub total_turns: u32,
@@ -54,6 +55,8 @@ pub(crate) struct HistorySummary {
     pub tokens_before: u32,
     pub tokens_after: u32,
     pub compression_ratio: f64,
+    pub turns: Vec<TurnDetail>,
+    pub dropped_indices: Vec<u32>,
 }
 
 impl HistorySummary {
@@ -111,6 +114,11 @@ pub(crate) struct Category {
 pub(crate) struct ToolItem {
     pub name: String,
     pub tokens: u32,
+    pub score: f64,
+    /// Top-ranked selection factors from the tool scorer.  Each
+    /// entry is `(factor_name, weight)` — kept short so expanded
+    /// rows stay readable.
+    pub factors: Vec<(String, f64)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -118,12 +126,29 @@ pub(crate) struct MemoryItem {
     pub preview: String,
     pub tokens: u32,
     pub relevance: f64,
+    pub memory_type: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SkillItem {
     pub name: String,
     pub tokens: u32,
+    /// Optional one-line description (populated only when the
+    /// model data source carries it — e.g. selector shortlist).
+    pub description: Option<String>,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TurnDetail {
+    pub index: u32,
+    pub role: String,
+    pub tokens: u32,
+    pub has_tool_calls: bool,
+    /// `None` when this turn was retained; `Some(method)` when
+    /// compressed with that method.
+    pub compressed_from: Option<(u32, String)>,
 }
 
 /// A labelled sub-section of the system prompt (e.g. "Environment",
@@ -134,6 +159,74 @@ pub(crate) struct SkillItem {
 pub(crate) struct SectionItem {
     pub name: String,
     pub tokens: u32,
+}
+
+/// Which nested section the user currently has focused. Drives
+/// heading highlight + `Enter to expand` hint visibility. Cycles
+/// via Tab / Shift+Tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Section {
+    SystemPrompt,
+    Tools,
+    Skills,
+    Memory,
+    History,
+}
+
+impl Section {
+    pub fn all() -> &'static [Section] {
+        &[
+            Section::SystemPrompt,
+            Section::Tools,
+            Section::Skills,
+            Section::Memory,
+            Section::History,
+        ]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Section::SystemPrompt => "System prompt",
+            Section::Tools => "Tools · /tool",
+            Section::Skills => "Skills · /skills",
+            Section::Memory => "Memory · /memory",
+            Section::History => "History · conversation turns",
+        }
+    }
+
+    /// Next section in cycle order. Wraps.
+    pub fn next(self) -> Section {
+        let all = Self::all();
+        let idx = all.iter().position(|s| *s == self).unwrap_or(0);
+        all[(idx + 1) % all.len()]
+    }
+
+    /// Previous section in cycle order. Wraps.
+    pub fn prev(self) -> Section {
+        let all = Self::all();
+        let idx = all.iter().position(|s| *s == self).unwrap_or(0);
+        all[(idx + all.len() - 1) % all.len()]
+    }
+}
+
+/// Does a given [`Section`] have any data in this breakdown? Used
+/// by focus-cycling to skip sections with nothing to show.
+impl ContextBreakdown {
+    pub fn section_non_empty(&self, s: Section) -> bool {
+        match s {
+            Section::SystemPrompt => !self.system_sections.is_empty(),
+            Section::Tools => !self.tools.is_empty(),
+            Section::Skills => !self.skills.is_empty(),
+            Section::Memory => !self.memories.is_empty(),
+            Section::History => !self.history.is_empty(),
+        }
+    }
+
+    /// First section that has content, or None if nothing to drill
+    /// into.
+    pub fn first_focusable_section(&self) -> Option<Section> {
+        Section::all().iter().copied().find(|s| self.section_non_empty(*s))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +317,13 @@ impl ContextBreakdown {
             .map(|t| ToolItem {
                 name: t.tool_name.clone(),
                 tokens: t.tokens,
+                score: t.score,
+                factors: t
+                    .selection_factors
+                    .iter()
+                    .take(3)
+                    .map(|f| (f.factor_name.clone(), f.weight))
+                    .collect(),
             })
             .collect();
 
@@ -240,6 +340,8 @@ impl ContextBreakdown {
                 preview: m.content_preview.clone(),
                 tokens: m.tokens,
                 relevance: m.relevance_score,
+                memory_type: m.memory_type.clone(),
+                source: format!("{:?}", m.source),
             })
             .collect();
         memories.sort_by_key(|m| std::cmp::Reverse(m.tokens));
@@ -257,6 +359,8 @@ impl ContextBreakdown {
             .map(|s| SkillItem {
                 name: s.skill_name.clone(),
                 tokens: s.tokens,
+                description: None,
+                source: None,
             })
             .collect();
         skills.sort_by_key(|s| std::cmp::Reverse(s.tokens));
@@ -269,6 +373,12 @@ impl ContextBreakdown {
                 .map(|e: &SkillSelectorShortlistEntry| SkillItem {
                     name: e.skill_name.clone(),
                     tokens: 0,
+                    description: if e.description.is_empty() {
+                        None
+                    } else {
+                        Some(e.description.clone())
+                    },
+                    source: Some(e.source.clone()),
                 })
                 .collect();
         }
@@ -283,6 +393,31 @@ impl ContextBreakdown {
         // Rendered as a dedicated section so users can see how much
         // of their backlog survived the compactor this turn.
         let h = &trace.history;
+        let mut turns: Vec<TurnDetail> = Vec::with_capacity(
+            h.turns_retained.len() + h.turns_compressed.len(),
+        );
+        for r in &h.turns_retained {
+            turns.push(TurnDetail {
+                index: r.turn_index,
+                role: r.role.clone(),
+                tokens: r.tokens,
+                has_tool_calls: r.has_tool_calls,
+                compressed_from: None,
+            });
+        }
+        for c in &h.turns_compressed {
+            turns.push(TurnDetail {
+                index: c.turn_index,
+                role: c.role.clone(),
+                tokens: c.compressed_tokens,
+                has_tool_calls: false,
+                compressed_from: Some((c.original_tokens, format!("{:?}", c.compression_method))),
+            });
+        }
+        // Sort ascending by turn index so the expanded view reads
+        // chronologically — matches how scrollback is ordered.
+        turns.sort_by_key(|t| t.index);
+
         let history = HistorySummary {
             total_turns: h.total_turns_available,
             retained: h.turns_retained.len() as u32,
@@ -291,6 +426,8 @@ impl ContextBreakdown {
             tokens_before: h.tokens_before,
             tokens_after: h.tokens_after,
             compression_ratio: h.compression_ratio,
+            turns,
+            dropped_indices: h.turns_dropped.clone(),
         };
 
         Self {

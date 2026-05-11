@@ -43,7 +43,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
-use super::model::{Category, CategoryKind, ContextBreakdown, MemoryItem, PressureBand};
+use super::model::{
+    Category, CategoryKind, ContextBreakdown, HistorySummary, MemoryItem, PressureBand, Section,
+    SkillItem, ToolItem, TurnDetail,
+};
 
 /// Grid geometry. The grid lives in the left column of the two-pane
 /// top section. 5 rows × 10 cols = 50 glyphs — each glyph therefore
@@ -52,15 +55,44 @@ pub(crate) const GRID_ROWS: usize = 5;
 pub(crate) const GRID_COLS: usize = 10;
 pub(crate) const GRID_CELLS: usize = GRID_ROWS * GRID_COLS;
 
-/// Ratatui render shim used by `ContextPanelView` and tests.
-pub(crate) fn render(b: &ContextBreakdown, area: Rect, buf: &mut Buffer) {
-    render_with_scroll(b, area, buf, 0)
+/// View state for a single render pass. Carries the currently
+/// focused section plus whether it's expanded to its detail view.
+/// Defaults to "no focus, no expansion" which reproduces the
+/// original flat render.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ViewState {
+    pub focus: Option<Section>,
+    pub expanded: Option<Section>,
 }
 
-/// Ratatui render shim with explicit scroll offset. Callers that
-/// own scroll state (the BottomPane view wrapper) use this;
-/// stateless callers go through [`render`].
-pub(crate) fn render_with_scroll(b: &ContextBreakdown, area: Rect, buf: &mut Buffer, scroll: u16) {
+impl ViewState {
+    pub fn collapsed(focus: Option<Section>) -> Self {
+        Self {
+            focus,
+            expanded: None,
+        }
+    }
+
+    pub fn is_expanded(&self, s: Section) -> bool {
+        self.expanded == Some(s)
+    }
+}
+
+/// Ratatui render shim used by `ContextPanelView` and tests.
+pub(crate) fn render(b: &ContextBreakdown, area: Rect, buf: &mut Buffer) {
+    render_with(b, area, buf, 0, ViewState::default())
+}
+
+/// Ratatui render shim with explicit scroll offset and view state.
+/// Callers that own scroll + focus + expansion state (the BottomPane
+/// view wrapper) use this; stateless callers go through [`render`].
+pub(crate) fn render_with(
+    b: &ContextBreakdown,
+    area: Rect,
+    buf: &mut Buffer,
+    scroll: u16,
+    state: ViewState,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -84,25 +116,35 @@ pub(crate) fn render_with_scroll(b: &ContextBreakdown, area: Rect, buf: &mut Buf
     // Build the full logical line list once; the paragraph picks
     // the window based on the current scroll offset and draws it
     // with wrap disabled (lines are pre-sized for `inner.width`).
-    let lines = build_lines(b, inner.width);
+    let lines = build_lines_with(b, inner.width, state);
     Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0))
         .render(inner, buf);
 }
 
-/// Total logical line count of the breakdown at the given width.
-/// The view wrapper uses this to clamp the scroll offset so the
-/// user can't scroll past the last line.
+/// Backwards-compat alias — some callsites still use the older
+/// "scroll-only" signature.
+pub(crate) fn render_with_scroll(b: &ContextBreakdown, area: Rect, buf: &mut Buffer, scroll: u16) {
+    render_with(b, area, buf, scroll, ViewState::default())
+}
+
+/// Total logical line count of the breakdown at the given width
+/// and view state. The view wrapper uses this to clamp the scroll
+/// offset so the user can't scroll past the last line — when a
+/// section expands, the count grows and the scroll clamp moves
+/// with it.
 ///
-/// Returns `0` for the empty-breakdown placeholder render path —
-/// that variant paints a single stub row and must not participate
-/// in scrolling, so max_scroll collapses to zero for it.
+/// Returns `0` for the empty-breakdown placeholder render path.
 pub(crate) fn line_count(b: &ContextBreakdown, inner_width: u16) -> u16 {
+    line_count_with(b, inner_width, ViewState::default())
+}
+
+pub(crate) fn line_count_with(b: &ContextBreakdown, inner_width: u16, state: ViewState) -> u16 {
     if b.limit == 0 && b.categories.is_empty() {
         return 0;
     }
-    build_lines(b, inner_width).len() as u16
+    build_lines_with(b, inner_width, state).len() as u16
 }
 
 pub(crate) fn desired_height(b: &ContextBreakdown) -> u16 {
@@ -125,8 +167,21 @@ pub(crate) fn desired_height(b: &ContextBreakdown) -> u16 {
 
 // ─── Line builder ─────────────────────────────────────────────────
 
-/// Convert the breakdown into a list of rendered lines.
+/// Convert the breakdown into a list of rendered lines — collapsed
+/// view, no focus highlight. Retained for stateless callers and
+/// legacy tests. Defers to [`build_lines_with`] under the hood.
 pub(crate) fn build_lines(b: &ContextBreakdown, inner_width: u16) -> Vec<Line<'static>> {
+    build_lines_with(b, inner_width, ViewState::default())
+}
+
+/// State-aware version of [`build_lines`]. Honors the focus
+/// highlight (bold section heading when focused) and expands the
+/// currently expanded section to its full detail form.
+pub(crate) fn build_lines_with(
+    b: &ContextBreakdown,
+    inner_width: u16,
+    state: ViewState,
+) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
 
     // Header — model token counts + compression hint.
@@ -135,6 +190,18 @@ pub(crate) fn build_lines(b: &ContextBreakdown, inner_width: u16) -> Vec<Line<'s
         out.push(Line::from(Span::styled(
             "  ⚠ compression triggered on the last turn",
             Style::default().fg(Color::Yellow),
+        )));
+    }
+    if let Some(focused) = state.focus {
+        let hint = if state.expanded.is_some() {
+            "  Tab next · Esc collapse · j/k scroll"
+        } else {
+            "  Tab next · Enter expand · j/k scroll"
+        };
+        let _ = focused;
+        out.push(Line::from(Span::styled(
+            hint,
+            Style::default().add_modifier(Modifier::DIM),
         )));
     }
     out.push(Line::default());
@@ -147,33 +214,62 @@ pub(crate) fn build_lines(b: &ContextBreakdown, inner_width: u16) -> Vec<Line<'s
     out.push(Line::default());
 
     // Nested sub-sections. Only rendered when non-empty.
-    append_section(
-        &mut out,
-        "System prompt",
-        &b.system_sections,
-        |s| format!(" {}", s.name),
-        |s| s.tokens,
-    );
-    append_section(
-        &mut out,
-        "Tools · /tool",
-        &b.tools,
-        |t| format!(" {}", t.name),
-        |t| t.tokens,
-    );
-    append_skill_section(&mut out, &b.skills);
-    append_memory_section(&mut out, &b.memories);
-    append_history_section(&mut out, &b.history);
+    render_section(&mut out, b, state, Section::SystemPrompt);
+    render_section(&mut out, b, state, Section::Tools);
+    render_section(&mut out, b, state, Section::Skills);
+    render_section(&mut out, b, state, Section::Memory);
+    render_section(&mut out, b, state, Section::History);
 
     // Drop the last blank line if we pushed one — trailing blanks
     // render as empty lines at the bottom of the scroll view which
-    // feels unfinished. `append_section` always ends with a blank
-    // so the last call leaves a trailing gap.
+    // feels unfinished.
     while out.last().map(|l| l.spans.is_empty()).unwrap_or(false) {
         out.pop();
     }
 
     out
+}
+
+fn render_section(
+    out: &mut Vec<Line<'static>>,
+    b: &ContextBreakdown,
+    state: ViewState,
+    section: Section,
+) {
+    if !b.section_non_empty(section) {
+        return;
+    }
+    let focused = state.focus == Some(section);
+    let expanded = state.is_expanded(section);
+    match section {
+        Section::SystemPrompt => {
+            out.push(section_heading_for(Section::SystemPrompt, focused, expanded));
+            for s in &b.system_sections {
+                out.push(section_row(&format!(" {}", s.name), s.tokens));
+            }
+            out.push(Line::default());
+        }
+        Section::Tools => {
+            out.push(section_heading_for(Section::Tools, focused, expanded));
+            if expanded {
+                append_tools_expanded(out, &b.tools);
+            } else {
+                for t in &b.tools {
+                    out.push(section_row(&format!(" {}", t.name), t.tokens));
+                }
+            }
+            out.push(Line::default());
+        }
+        Section::Skills => {
+            append_skill_section(out, &b.skills, focused, expanded);
+        }
+        Section::Memory => {
+            append_memory_section(out, &b.memories, focused, expanded);
+        }
+        Section::History => {
+            append_history_section(out, &b.history, focused, expanded);
+        }
+    }
 }
 
 fn header_line(b: &ContextBreakdown) -> Line<'static> {
@@ -336,33 +432,17 @@ fn free_space_row(free_tokens: u32, limit: u32, label_width: usize) -> Line<'sta
 
 // ─── Sub-sections ─────────────────────────────────────────────────
 
-fn append_section<T, F, G>(
+/// Skills sub-section. Skills have a `tokens=0` fallback: when the
+/// runtime only records a selector shortlist (no per-skill token
+/// counts), we still want to list the skill names. When the
+/// section is expanded we also surface the shortlist description
+/// and source.
+fn append_skill_section(
     out: &mut Vec<Line<'static>>,
-    heading: &str,
-    items: &[T],
-    label: F,
-    tokens: G,
-) where
-    F: Fn(&T) -> String,
-    G: Fn(&T) -> u32,
-{
-    if items.is_empty() {
-        return;
-    }
-    out.push(section_heading(heading));
-    for item in items {
-        out.push(section_row(&label(item), tokens(item)));
-    }
-    out.push(Line::default());
-}
-
-/// Skills sub-section. Distinct from the generic `append_section`
-/// because skills have a `tokens=0` fallback: when the runtime only
-/// records a selector shortlist (no per-skill token counts), we
-/// still want to list the skill names so the user knows which
-/// skills the selector believed were in play — just without the
-/// trailing "N tokens" suffix.
-fn append_skill_section(out: &mut Vec<Line<'static>>, skills: &[super::model::SkillItem]) {
+    skills: &[SkillItem],
+    focused: bool,
+    expanded: bool,
+) {
     if skills.is_empty() {
         return;
     }
@@ -372,7 +452,7 @@ fn append_skill_section(out: &mut Vec<Line<'static>>, skills: &[super::model::Sk
     } else {
         "Skills · /skills"
     };
-    out.push(section_heading(heading));
+    out.push(section_heading_raw(heading, focused, expanded));
     for s in skills {
         if s.tokens == 0 {
             out.push(Line::from(vec![
@@ -382,16 +462,39 @@ fn append_skill_section(out: &mut Vec<Line<'static>>, skills: &[super::model::Sk
         } else {
             out.push(section_row(&format!(" {}", s.name), s.tokens));
         }
+        if expanded {
+            if let Some(desc) = &s.description {
+                let preview = truncate_preview(desc, 70);
+                out.push(Line::from(vec![
+                    Span::raw("        "),
+                    Span::styled(preview, Style::default().add_modifier(Modifier::DIM)),
+                ]));
+            }
+            if let Some(source) = &s.source {
+                out.push(Line::from(vec![
+                    Span::raw("        "),
+                    Span::styled(
+                        format!("source: {source}"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
     }
     out.push(Line::default());
 }
 
-fn append_history_section(out: &mut Vec<Line<'static>>, h: &super::model::HistorySummary) {
+fn append_history_section(
+    out: &mut Vec<Line<'static>>,
+    h: &HistorySummary,
+    focused: bool,
+    expanded: bool,
+) {
     if h.is_empty() {
         return;
     }
-    out.push(section_heading("History · conversation turns"));
-    // Line 1 — turn breakdown (retained / compressed / dropped).
+    out.push(section_heading_for(Section::History, focused, expanded));
+    // Collapsed view: just the aggregate counts.
     let mut turn_spans: Vec<Span<'static>> = vec![Span::raw("    └ ")];
     turn_spans.push(Span::raw(format!("{} turns", h.total_turns)));
     if h.retained > 0 || h.compressed > 0 || h.dropped > 0 {
@@ -404,14 +507,8 @@ fn append_history_section(out: &mut Vec<Line<'static>>, h: &super::model::Histor
         ));
     }
     out.push(Line::from(turn_spans));
-    // Line 2 — compression shape. Only when compression actually
-    // fired; otherwise the numbers are meaningless.
     if h.tokens_before > 0 && h.tokens_before != h.tokens_after {
-        let pct_saved = if h.tokens_before == 0 {
-            0.0
-        } else {
-            (1.0 - h.tokens_after as f64 / h.tokens_before as f64) * 100.0
-        };
+        let pct_saved = (1.0 - h.tokens_after as f64 / h.tokens_before as f64) * 100.0;
         out.push(Line::from(vec![
             Span::raw("    └ "),
             Span::raw(format!(
@@ -425,18 +522,114 @@ fn append_history_section(out: &mut Vec<Line<'static>>, h: &super::model::Histor
             ),
         ]));
     }
+    if expanded {
+        // Per-turn detail. Retained turns, then compressed, then a
+        // terse list of dropped turn indices.
+        let retained: Vec<&TurnDetail> =
+            h.turns.iter().filter(|t| t.compressed_from.is_none()).collect();
+        let compressed: Vec<&TurnDetail> =
+            h.turns.iter().filter(|t| t.compressed_from.is_some()).collect();
+        if !retained.is_empty() {
+            out.push(Line::from(vec![
+                Span::raw("    └ "),
+                Span::styled("Retained", Style::default().add_modifier(Modifier::BOLD)),
+            ]));
+            for t in retained {
+                out.push(turn_detail_line(t, false));
+            }
+        }
+        if !compressed.is_empty() {
+            out.push(Line::from(vec![
+                Span::raw("    └ "),
+                Span::styled("Compressed", Style::default().add_modifier(Modifier::BOLD)),
+            ]));
+            for t in compressed {
+                out.push(turn_detail_line(t, true));
+            }
+        }
+        if !h.dropped_indices.is_empty() {
+            let rendered_indices: Vec<String> =
+                h.dropped_indices.iter().map(|i| format!("#{i}")).collect();
+            out.push(Line::from(vec![
+                Span::raw("    └ "),
+                Span::raw(format!("Dropped: {}", rendered_indices.join(", "))),
+            ]));
+        }
+    }
     out.push(Line::default());
 }
 
-fn append_memory_section(out: &mut Vec<Line<'static>>, memories: &[MemoryItem]) {
+fn turn_detail_line(t: &TurnDetail, compressed: bool) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = vec![Span::raw("        └ ")];
+    spans.push(Span::raw(format!("#{} {}", t.index, t.role)));
+    if compressed {
+        if let Some((orig, method)) = &t.compressed_from {
+            spans.push(Span::styled(
+                format!(
+                    "   {} → {} tokens",
+                    fmt_tokens(*orig),
+                    fmt_tokens(t.tokens)
+                ),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            spans.push(Span::styled(
+                format!("  via {method}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    } else {
+        spans.push(Span::styled(
+            format!("   {} tokens", fmt_tokens(t.tokens)),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        if t.has_tool_calls {
+            spans.push(Span::styled(
+                "  [tools]".to_string(),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+    }
+    Line::from(spans)
+}
+
+fn append_tools_expanded(out: &mut Vec<Line<'static>>, tools: &[ToolItem]) {
+    for t in tools {
+        out.push(section_row(&format!(" {}", t.name), t.tokens));
+        // Score + top-ranked factors. Each on its own indented line
+        // so long factor names don't wrap weirdly.
+        let score_span = Span::styled(
+            format!("        score {:.2}", t.score),
+            Style::default().fg(Color::DarkGray),
+        );
+        out.push(Line::from(vec![score_span]));
+        for (name, weight) in t.factors.iter().take(3) {
+            out.push(Line::from(vec![
+                Span::raw("        · "),
+                Span::raw(name.clone()),
+                Span::styled(
+                    format!("   {weight:+.2}"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+    }
+}
+
+fn append_memory_section(
+    out: &mut Vec<Line<'static>>,
+    memories: &[MemoryItem],
+    focused: bool,
+    expanded: bool,
+) {
     if memories.is_empty() {
         return;
     }
-    out.push(section_heading("Memory · /memory"));
+    out.push(section_heading_for(Section::Memory, focused, expanded));
     for m in memories {
-        // Preview quoted so the row reads as "content: tokens" even
-        // when the preview itself has colons.
-        let preview = truncate_preview(&m.preview, 60);
+        // Collapsed: truncated preview. Expanded: full preview on
+        // its own line so the user can read without wrapping.
+        let preview_len = if expanded { 160 } else { 60 };
+        let preview = truncate_preview(&m.preview, preview_len);
         out.push(Line::from(vec![
             Span::raw("    └ "),
             Span::raw(format!("\"{preview}\"")),
@@ -449,15 +642,53 @@ fn append_memory_section(out: &mut Vec<Line<'static>>, memories: &[MemoryItem]) 
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
+        if expanded {
+            out.push(Line::from(vec![
+                Span::raw("        "),
+                Span::styled(
+                    format!("{} · {}", m.memory_type, m.source),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
     }
     out.push(Line::default());
 }
 
 fn section_heading(text: &str) -> Line<'static> {
-    Line::from(vec![Span::styled(
-        format!("  {text}"),
-        Style::default().add_modifier(Modifier::BOLD),
-    )])
+    section_heading_raw(text, false, false)
+}
+
+/// Render a section heading for a known [`Section`]. Adds a marker
+/// glyph so focused / expanded state is visible at a glance.
+fn section_heading_for(section: Section, focused: bool, expanded: bool) -> Line<'static> {
+    section_heading_raw(section.label(), focused, expanded)
+}
+
+fn section_heading_raw(text: &str, focused: bool, expanded: bool) -> Line<'static> {
+    // Unicode markers: ▼ when the section is expanded, ▶ when it's
+    // focused-but-collapsed (there's detail to see), and a plain
+    // space otherwise. Keeps column alignment stable across states.
+    let marker = if expanded {
+        "▼"
+    } else if focused {
+        "▶"
+    } else {
+        " "
+    };
+    let style = if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(marker.to_string(), style),
+        Span::raw(" "),
+        Span::styled(text.to_string(), style),
+    ])
 }
 
 fn section_row(label: &str, tokens: u32) -> Line<'static> {
@@ -809,6 +1040,153 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(!text.contains("Free space"), "should be hidden: {text}");
+    }
+
+    #[test]
+    fn expanded_history_section_shows_per_turn_detail() {
+        let mut t = trace(100_000, 2_000, 8_000, 0, 0, 0);
+        t.history.total_turns_available = 4;
+        t.history.turns_retained = vec![
+            TurnRetention {
+                turn_index: 0,
+                role: "user".into(),
+                tokens: 180,
+                has_tool_calls: false,
+            },
+            TurnRetention {
+                turn_index: 2,
+                role: "assistant".into(),
+                tokens: 4_200,
+                has_tool_calls: true,
+            },
+        ];
+        t.history.turns_compressed = vec![TurnCompression {
+            turn_index: 1,
+            role: "assistant".into(),
+            original_tokens: 800,
+            compressed_tokens: 120,
+            compression_method: CompressionMethod::ReactiveCompact,
+            information_lost: Vec::new(),
+        }];
+        t.history.turns_dropped = vec![3];
+        t.history.tokens_before = 5_180;
+        t.history.tokens_after = 4_500;
+        let b = ContextBreakdown::from_trace(&t);
+        let state = ViewState {
+            focus: Some(Section::History),
+            expanded: Some(Section::History),
+        };
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Per-turn detail appears only on expansion.
+        assert!(text.contains("#0 user"), "retained turn missing: {text}");
+        assert!(
+            text.contains("#2 assistant"),
+            "retained turn missing: {text}"
+        );
+        assert!(text.contains("[tools]"), "tool marker missing: {text}");
+        assert!(
+            text.contains("#1 assistant"),
+            "compressed turn missing: {text}"
+        );
+        assert!(text.contains("via"), "compression method missing: {text}");
+        assert!(
+            text.contains("Dropped: #3"),
+            "dropped turn missing: {text}"
+        );
+    }
+
+    #[test]
+    fn expanded_memory_section_shows_type_and_source() {
+        let mut t = trace(100_000, 1_000, 1_000, 500, 0, 0);
+        t.memory.memories_selected = vec![MemorySelection {
+            memory_id: "m1".into(),
+            memory_type: "semantic".into(),
+            content_preview: "short".into(),
+            relevance_score: 0.9,
+            tokens: 120,
+            source: MemorySource::Memoria,
+        }];
+        let b = ContextBreakdown::from_trace(&t);
+        let state = ViewState {
+            focus: Some(Section::Memory),
+            expanded: Some(Section::Memory),
+        };
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("semantic"), "memory type missing: {text}");
+        assert!(text.contains("Memoria"), "memory source missing: {text}");
+    }
+
+    #[test]
+    fn collapsed_history_section_omits_per_turn_detail() {
+        let mut t = trace(100_000, 2_000, 8_000, 0, 0, 0);
+        t.history.total_turns_available = 2;
+        t.history.turns_retained = vec![TurnRetention {
+            turn_index: 0,
+            role: "user".into(),
+            tokens: 100,
+            has_tool_calls: false,
+        }];
+        let b = ContextBreakdown::from_trace(&t);
+        let state = ViewState::collapsed(Some(Section::History));
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !text.contains("#0 user"),
+            "per-turn detail must stay hidden when collapsed: {text}"
+        );
+    }
+
+    #[test]
+    fn focused_section_heading_has_focus_marker() {
+        // The ▶ marker appears only on the focused section heading.
+        let mut t = trace(100_000, 2_000, 0, 0, 1_000, 0);
+        t.tools.tools_selected = vec![ToolSelected {
+            tool_name: "bash".into(),
+            score: 0.9,
+            tokens: 100,
+            selection_factors: Vec::new(),
+        }];
+        let b = ContextBreakdown::from_trace(&t);
+        let state = ViewState::collapsed(Some(Section::Tools));
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("▶"), "focus marker missing: {text}");
+    }
+
+    #[test]
+    fn expanded_section_heading_has_expand_marker() {
+        let mut t = trace(100_000, 2_000, 0, 0, 1_000, 0);
+        t.tools.tools_selected = vec![ToolSelected {
+            tool_name: "bash".into(),
+            score: 0.9,
+            tokens: 100,
+            selection_factors: Vec::new(),
+        }];
+        let b = ContextBreakdown::from_trace(&t);
+        let state = ViewState {
+            focus: Some(Section::Tools),
+            expanded: Some(Section::Tools),
+        };
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("▼"), "expand marker missing: {text}");
     }
 
     #[test]

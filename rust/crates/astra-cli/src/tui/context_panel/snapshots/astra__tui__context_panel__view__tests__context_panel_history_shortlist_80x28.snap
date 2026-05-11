@@ -11,15 +11,15 @@ expression: "render_panel(&b, 80, 28)"
 │  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Current turn       227  ( 0.2%)                     │
 │  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛶ Free space       67.9k  (66.3%)                     │
 │                                                                              │
-│  Tools · /tool                                                               │
+│   Tools · /tool                                                              │
 │    └ bash   189 tokens                                                       │
 │    └ read_file   152 tokens                                                  │
 │                                                                              │
-│  Skills · /skills (shortlist)                                                │
+│   Skills · /skills (shortlist)                                               │
 │    └ review_changes                                                          │
 │    └ verify_task                                                             │
 │                                                                              │
-│  History · conversation turns                                                │
+│   History · conversation turns                                               │
 │    └ 8 turns  (1 retained · 1 compressed · 2 dropped)                        │
 │    └ 32.0k → 22.0k tokens  (−31%)                                            │
 │                                                                              │

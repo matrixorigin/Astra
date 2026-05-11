@@ -12,19 +12,19 @@ expression: "render_panel(&b, 80, 26)"
 │  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Current turn       500  ( 0.5%)                     │
 │                        ⛶ Free space       67.5k  (67.5%)                     │
 │                                                                              │
-│  System prompt                                                               │
+│   System prompt                                                              │
 │    └ Persona   1.5k tokens                                                   │
 │    └ Environment   800 tokens                                                │
 │    └ User preferences   200 tokens                                           │
 │                                                                              │
-│  Tools · /tool                                                               │
+│   Tools · /tool                                                              │
 │    └ read_file   1.2k tokens                                                 │
 │    └ write_file   900 tokens                                                 │
 │                                                                              │
-│  Skills · /skills                                                            │
+│   Skills · /skills                                                           │
 │    └ review_changes   650 tokens                                             │
 │                                                                              │
-│  Memory · /memory                                                            │
+│   Memory · /memory                                                           │
 │    └ "User prefers terse answers"   400 tokens  (rel 0.91)                   │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
