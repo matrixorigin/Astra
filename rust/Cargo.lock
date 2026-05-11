@@ -229,6 +229,7 @@ dependencies = [
  "astra-core",
  "chrono",
  "dirs 6.0.0",
+ "fs2",
  "serde",
  "serde_json",
  "sha2",

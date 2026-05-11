@@ -29,6 +29,7 @@
 
 use crate::runtime_config::RuntimeConfig;
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
@@ -187,12 +188,15 @@ impl LocalFileStore {
                 path: path.clone(),
                 source,
             })?;
-        // Atomic single-syscall append. writeln! can internally issue
-        // two write calls (body + newline) which concurrent writers
-        // on the same O_APPEND file will interleave, producing
-        // `{...}{...}\n` that breaks the reader's one-row-per-line
-        // contract. Combine into one buffer so the kernel's O_APPEND
-        // semantics keep each record whole.
+        f.lock_exclusive().map_err(|source| StoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+
+        // Hold an advisory file lock for the complete append. `write_all`
+        // may loop internally, so O_APPEND alone cannot guarantee a
+        // one-row-per-line record when multiple CLI processes save config
+        // versions at the same time.
         let mut line =
             serde_json::to_string(entry).map_err(|e| StoreError::CorruptIndex(e.to_string()))?;
         line.push('\n');
@@ -201,6 +205,10 @@ impl LocalFileStore {
                 path: path.clone(),
                 source,
             })?;
+        f.unlock().map_err(|source| StoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
         Ok(())
     }
 

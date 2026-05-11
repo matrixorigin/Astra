@@ -473,6 +473,68 @@ fn fractional_threshold_edit_round_trips_and_marks_dirty() {
     );
 }
 
+#[test]
+fn fractional_number_editor_shows_inline_guidance_for_lone_decimal_before_enter() {
+    let mut v = make_view();
+    v.select_by_id("context_window.compression_threshold_min");
+    v.handle_key(key(KeyCode::Enter));
+
+    for _ in 0..8 {
+        v.handle_key(key(KeyCode::Backspace));
+    }
+    v.handle_key(ch('.'));
+
+    let area = Rect::new(0, 0, 90, 8);
+    let mut buf = Buffer::empty(area);
+    v.render(area, &mut buf);
+    let mut text = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            text.push_str(buf[(x, y)].symbol());
+        }
+    }
+
+    assert!(
+        text.contains("add a digit") && text.contains("0.5"),
+        "lone decimal should show friendly inline guidance before Enter, got: {text}"
+    );
+}
+
+#[test]
+fn fractional_number_editor_clears_lone_decimal_guidance_when_value_becomes_valid() {
+    let mut v = make_view();
+    v.select_by_id("context_window.compression_threshold_min");
+    v.handle_key(key(KeyCode::Enter));
+
+    for _ in 0..8 {
+        v.handle_key(key(KeyCode::Backspace));
+    }
+    for c in ".85".chars() {
+        v.handle_key(ch(c));
+    }
+
+    let area = Rect::new(0, 0, 90, 8);
+    let mut buf = Buffer::empty(area);
+    v.render(area, &mut buf);
+    let mut text = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            text.push_str(buf[(x, y)].symbol());
+        }
+    }
+
+    assert!(
+        !text.contains("add a digit"),
+        "guidance should clear once .85 is a valid number, got: {text}"
+    );
+
+    v.handle_key(key(KeyCode::Enter));
+    assert!(
+        !v.has_inner_editor(),
+        "valid fractional shorthand should still save and close the editor"
+    );
+}
+
 // ─── Esc flow ───────────────────────────────────────────────────────────
 
 #[test]

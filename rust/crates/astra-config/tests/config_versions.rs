@@ -37,6 +37,10 @@
 
 use astra_config::config_versions::{ConfigVersionStore, LocalFileStore, PutMetadata, VersionId};
 use astra_config::runtime_config::RuntimeConfig;
+use fs2::FileExt;
+use std::fs::OpenOptions;
+use std::sync::mpsc;
+use std::time::Duration;
 
 fn tmp_store() -> (tempfile::TempDir, LocalFileStore) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -256,5 +260,55 @@ fn duplicate_put_with_different_metadata_keeps_first_blob_records_second_index_r
     assert!(
         sessions.contains(&"sess_A".to_string()) && sessions.contains(&"sess_B".to_string()),
         "both index rows must be present, got {sessions:?}"
+    );
+}
+
+#[test]
+fn put_waits_for_exclusive_index_lock_before_appending() {
+    let (dir, store) = tmp_store();
+    let index_path = dir.path().join("index.jsonl");
+    let locked_index = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&index_path)
+        .expect("open lock target");
+    locked_index
+        .lock_exclusive()
+        .expect("hold exclusive index lock");
+
+    let root = dir.path().to_path_buf();
+    let (tx, rx) = mpsc::channel();
+    let (started_tx, started_rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let store = LocalFileStore::new(root);
+        let mut cfg = RuntimeConfig::default();
+        cfg.token_budget.max_turn_input_tokens += 42;
+        started_tx.send(()).expect("send started");
+        let result = store.put(&cfg, PutMetadata::default());
+        tx.send(result).expect("send result");
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("writer thread should start");
+
+    assert!(
+        rx.recv_timeout(Duration::from_millis(150)).is_err(),
+        "put must respect an existing exclusive lock on index.jsonl before appending"
+    );
+
+    locked_index.unlock().expect("release index lock");
+    let put_result = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("put should complete after lock release");
+    put_result.expect("put after lock release");
+    handle.join().expect("writer thread");
+
+    let entries = store.list().expect("index readable");
+    assert_eq!(
+        entries.len(),
+        1,
+        "the delayed append should land exactly once"
     );
 }

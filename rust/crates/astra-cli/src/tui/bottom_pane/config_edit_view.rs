@@ -761,7 +761,8 @@ impl NumberEditor {
     fn try_commit(&mut self) -> Option<Value> {
         // Accept fractions only for knobs declared as fractional. Integer
         // knobs still reject values that would silently round.
-        let parsed: Result<f64, _> = self.buffer.trim().parse();
+        let trimmed = self.buffer.trim();
+        let parsed: Result<f64, _> = trimmed.parse();
         match parsed {
             Ok(n) if n.is_finite() => {
                 if !self.allow_fraction && n.fract() != 0.0 {
@@ -783,9 +784,36 @@ impl NumberEditor {
                 }
             }
             _ => {
-                self.error = Some(format!("Not a number: {}", self.buffer));
+                self.error = Some(self.parse_error_message(trimmed));
                 None
             }
+        }
+    }
+
+    fn refresh_inline_error(&mut self) {
+        let trimmed = self.buffer.trim();
+        self.error = if Self::is_incomplete_number(trimmed) {
+            Some(Self::incomplete_number_message())
+        } else {
+            None
+        };
+    }
+
+    fn is_incomplete_number(trimmed: &str) -> bool {
+        matches!(trimmed, "." | "-" | "-.")
+    }
+
+    fn incomplete_number_message() -> String {
+        "Incomplete number: add a digit (try 0.5)".to_string()
+    }
+
+    fn parse_error_message(&self, trimmed: &str) -> String {
+        if trimmed.is_empty() {
+            "Enter a number before saving".to_string()
+        } else if Self::is_incomplete_number(trimmed) {
+            Self::incomplete_number_message()
+        } else {
+            format!("Not a number: {}", self.buffer)
         }
     }
 }
@@ -835,19 +863,19 @@ impl InnerEditor for NumberEditor {
             },
             KeyCode::Backspace => {
                 self.buffer.pop();
-                self.error = None;
+                self.refresh_inline_error();
                 InnerOutcome::Pending
             }
             KeyCode::Char(c) if c.is_ascii_digit() || c == '-' => {
                 if c != '-' || (self.min < 0.0 && self.buffer.is_empty()) {
                     self.buffer.push(c);
-                    self.error = None;
+                    self.refresh_inline_error();
                 }
                 InnerOutcome::Pending
             }
             KeyCode::Char('.') if self.allow_fraction && !self.buffer.contains('.') => {
                 self.buffer.push('.');
-                self.error = None;
+                self.refresh_inline_error();
                 InnerOutcome::Pending
             }
             _ => InnerOutcome::Pending,
