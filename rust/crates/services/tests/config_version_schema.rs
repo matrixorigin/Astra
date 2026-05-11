@@ -73,7 +73,7 @@ fn insert_params_roundtrip_preserves_every_field() {
     assert_eq!(bindings.user_id, "user_test");
     assert!(bindings.toml_body.contains("max_turn_input_tokens"));
     assert_eq!(bindings.created_at_ms, 1_778_485_059_634);
-    assert_eq!(bindings.first_seen_session.as_deref(), Some("sess_xyz"));
+    assert_eq!(bindings.first_seen_session, Some("sess_xyz"));
 }
 
 #[test]

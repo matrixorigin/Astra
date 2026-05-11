@@ -27,6 +27,11 @@ pub(crate) struct FinalizeOutcome {
 pub(crate) struct SaveRecord {
     pub new_version_id: String,
     pub source: &'static str,
+    /// Canonical TOML that landed on disk and in the version store.
+    /// Carried here so the cloud-push path in `tui/mod.rs` can hand
+    /// the full payload to `enqueue_config_version_push` without
+    /// re-reading from the store.
+    pub toml_body: String,
 }
 
 /// Resolve a completion token.
@@ -101,6 +106,7 @@ fn save_and_report(
         save: Some(SaveRecord {
             new_version_id: new_id,
             source,
+            toml_body: pretty,
         }),
     })
 }

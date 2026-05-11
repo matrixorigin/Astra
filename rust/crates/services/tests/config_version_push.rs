@@ -53,7 +53,10 @@ fn for_config_version_places_toml_body_in_content() {
         "TOML must land in content — it's the cloud-side payload"
     );
     assert_eq!(evt.user_id, row.user_id);
-    assert_eq!(evt.session_id, row.first_seen_session.clone().unwrap_or_default());
+    assert_eq!(
+        evt.session_id,
+        row.first_seen_session.clone().unwrap_or_default()
+    );
 }
 
 #[test]

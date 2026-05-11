@@ -103,3 +103,42 @@ pub fn config_versions_insert_params(row: &ConfigVersionRow) -> ConfigVersionIns
 pub fn parse_config_version_row(row: &ConfigVersionRow) -> ConfigVersionRow {
     row.clone()
 }
+
+/// Canonical `event_type` for queued config-version pushes. The
+/// ingestion worker classifies events by this tag; moving / renaming
+/// it is a breaking change since the classifier string is embedded
+/// in queued-but-not-yet-flushed events.
+pub const CONFIG_VERSION_SAVED_EVENT_TYPE: &str = "config_version_saved";
+
+/// Turn a queued `IngestionEvent` back into a typed row, iff it was
+/// produced by `IngestionEvent::for_config_version`. Returns `None`
+/// for any other event_type so the worker can cleanly decide whether
+/// to also write to the `config_versions` table.
+pub fn extract_config_version_row(
+    event: &crate::event_ingestion::IngestionEvent,
+) -> Option<ConfigVersionRow> {
+    if event.event_type != CONFIG_VERSION_SAVED_EVENT_TYPE {
+        return None;
+    }
+    let toml_body = event.content.clone().unwrap_or_default();
+    // Treat empty session_id as "no session" so the roundtrip
+    // matches what `for_config_version` put in (None → empty).
+    let first_seen_session = if event.session_id.is_empty() {
+        None
+    } else {
+        Some(event.session_id.clone())
+    };
+    // created_at on the IngestionEvent is an ISO-8601 string; we
+    // don't carry that back into ConfigVersionRow on the hot path
+    // because the SQL INSERT uses either FROM_UNIXTIME on a bound
+    // epoch-ms value OR the server's CURRENT_TIMESTAMP default.
+    // Scripts that need forensic timestamps read the DATETIME column
+    // directly on the pull side.
+    Some(ConfigVersionRow {
+        version_id: event.event_id.clone(),
+        user_id: event.user_id.clone(),
+        toml_body,
+        created_at_ms: 0,
+        first_seen_session,
+    })
+}

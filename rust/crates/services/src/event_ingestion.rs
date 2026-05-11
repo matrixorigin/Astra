@@ -143,6 +143,36 @@ impl IngestionEvent {
         Self::from_journal_event_with_redact(event, user_id, false)
     }
 
+    /// Build an `IngestionEvent` that carries a saved config version
+    /// to the cloud. The worker classifier uses the event_type tag
+    /// (see `config_version_cloud::CONFIG_VERSION_SAVED_EVENT_TYPE`)
+    /// to dual-write: agent_events row AND config_versions row.
+    ///
+    /// Event id == version id so INSERT IGNORE on the PK also
+    /// handles agent_events dedup — pushing the same config twice
+    /// records "the fact of pushing it" exactly once on both tables.
+    pub fn for_config_version(row: &crate::config_version_cloud::ConfigVersionRow) -> Self {
+        Self {
+            event_id: row.version_id.clone(),
+            session_id: row.first_seen_session.clone().unwrap_or_default(),
+            user_id: row.user_id.clone(),
+            event_type: crate::config_version_cloud::CONFIG_VERSION_SAVED_EVENT_TYPE.to_string(),
+            content: Some(row.toml_body.clone()),
+            token_usage: None,
+            llm_model_used: None,
+            skill_name: None,
+            metadata: None,
+            // Cloud side uses the server's CURRENT_TIMESTAMP default
+            // for `config_versions.created_at`; this field is carried
+            // for `agent_events.created_at` to stay consistent with
+            // other rows in the same batch.
+            created_at: chrono::Utc::now().to_rfc3339(),
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: None,
+        }
+    }
+
     /// Like [`from_journal_event`] but optionally replaces the `content` field
     /// with a deterministic privacy marker when `redact_content == true`.
     pub fn from_journal_event_with_redact(
@@ -744,6 +774,40 @@ impl EventIngestionWorker {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| format!("session close for {}: {e}", event.session_id))?;
+            }
+        }
+
+        // Step 4b: dual-write config-version events into the
+        // `config_versions` table. Any event the classifier
+        // recognises gets an INSERT IGNORE with the content-
+        // addressed PK so a duplicate push from another machine
+        // is a zero-row no-op. We reuse the same transaction so
+        // the agent_events row and the config_versions row land
+        // together.
+        for event in events {
+            if let Some(row) = crate::config_version_cloud::extract_config_version_row(event) {
+                let params = crate::config_version_cloud::config_versions_insert_params(&row);
+                sqlx::query(crate::config_version_cloud::CONFIG_VERSIONS_INSERT_SQL)
+                    .bind(params.version_id)
+                    .bind(params.user_id)
+                    .bind(params.toml_body)
+                    // Cloud side doesn't trust the client's clock
+                    // for ordering; we bind the ISO-8601 timestamp
+                    // from the event but the INSERT's FROM_UNIXTIME
+                    // expects epoch-ms. Events produced by
+                    // `for_config_version` set created_at to "now"
+                    // at enqueue time, which is the closest reliable
+                    // value we have without pushing server-side
+                    // clock assumptions onto clients.
+                    .bind(
+                        chrono::DateTime::parse_from_rfc3339(&event.created_at)
+                            .map(|dt| dt.timestamp_millis())
+                            .unwrap_or(0),
+                    )
+                    .bind(params.first_seen_session)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| format!("config_versions insert for {}: {e}", row.version_id))?;
             }
         }
 

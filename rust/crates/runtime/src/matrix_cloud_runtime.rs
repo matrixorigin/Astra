@@ -308,6 +308,24 @@ impl MatrixCloudRuntime {
         }
     }
 
+    /// Enqueue a content-addressed config-version push. The worker
+    /// dual-writes to `agent_events` (standard trail) and
+    /// `config_versions` (tenant-scoped blob + TOML body). No-op if
+    /// ingestion has been shut down. Idempotent on the server side
+    /// via INSERT IGNORE on (user_id, version_id).
+    pub fn enqueue_config_version_push(
+        &self,
+        row: &astra_services::config_version_cloud::ConfigVersionRow,
+    ) {
+        let Ok(guard) = self.ingestion.lock() else {
+            return;
+        };
+        let Some(sender) = guard.as_ref() else {
+            return;
+        };
+        sender.enqueue(IngestionEvent::for_config_version(row));
+    }
+
     /// Flush and stop the ingestion worker, then **wait** for the background
     /// worker plus tracked session/cloud sync tasks to drain before process exit.
     pub async fn shutdown_ingestion_and_wait(&self) {

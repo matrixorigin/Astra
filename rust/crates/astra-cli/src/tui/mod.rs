@@ -883,6 +883,34 @@ pub(crate) async fn run_tui_repl(
                                                     }
                                                     state.config_version_id =
                                                         Some(save.new_version_id.clone());
+
+                                                    // Step 4b: cloud push. Best-effort
+                                                    // — if matrix_runtime is None (no
+                                                    // cloud configured) or the
+                                                    // ingestion worker is gone, we
+                                                    // degrade to local-only. The
+                                                    // version will sync next time the
+                                                    // CLI runs with cloud available,
+                                                    // via the same content-addressed
+                                                    // id.
+                                                    if let Some(ref mc) =
+                                                        state.matrix_runtime
+                                                    {
+                                                        let user_id = state
+                                                            .ingestion_user_id
+                                                            .clone()
+                                                            .unwrap_or_else(|| {
+                                                                "anonymous".to_string()
+                                                            });
+                                                        let row = astra_services::config_version_cloud::ConfigVersionRow {
+                                                            version_id: save.new_version_id.clone(),
+                                                            user_id,
+                                                            toml_body: save.toml_body.clone(),
+                                                            created_at_ms: chrono::Utc::now().timestamp_millis(),
+                                                            first_seen_session: state.session_id.clone(),
+                                                        };
+                                                        mc.enqueue_config_version_push(&row);
+                                                    }
                                                 }
                                                 history_cell::system::SystemCell::response(
                                                     outcome.message,
