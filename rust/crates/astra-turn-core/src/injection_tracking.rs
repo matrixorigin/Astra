@@ -94,6 +94,29 @@ impl InjectionChannel {
         }
     }
 
+    /// Reverse of [`Self::tag`]: parse the stable tag back into its
+    /// enum variant. Returns `None` for unknown tags — callers
+    /// observing a bridge-supplied fingerprint stream should treat
+    /// unknown tags as "future variant this binary doesn't know" and
+    /// skip them rather than panic.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "recent_failing_tests" => Some(Self::RecentFailingTests),
+            "outcome_bias" => Some(Self::OutcomeBias),
+            "lessons" => Some(Self::Lessons),
+            "volatile_pending" => Some(Self::VolatilePending),
+            "memoria_insights" => Some(Self::MemoriaInsights),
+            "memoria_prefetch" => Some(Self::MemoriaPrefetch),
+            "self_awareness" => Some(Self::SelfAwareness),
+            "feedback_rules" => Some(Self::FeedbackRules),
+            "implicit_feedback" => Some(Self::ImplicitFeedback),
+            "recent_arg_hints" => Some(Self::RecentArgHints),
+            "skill_listing" => Some(Self::SkillListing),
+            "tool_round_guidance" => Some(Self::ToolRoundGuidance),
+            _ => None,
+        }
+    }
+
     /// Canonical ordering used when rendering the full report.
     ///
     /// Ordering policy: self-* signals first (failing tests, bias,

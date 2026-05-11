@@ -79,10 +79,7 @@ fn known_text_delta_still_passes_through() {
     let out = transform_run_event_for_client(ok);
     assert!(!out.is_null(), "text_delta must pass through; got null");
     let obj = out.as_object().expect("object");
-    assert_eq!(
-        obj.get("type").and_then(Value::as_str),
-        Some("text_delta")
-    );
+    assert_eq!(obj.get("type").and_then(Value::as_str), Some("text_delta"));
 }
 
 #[test]

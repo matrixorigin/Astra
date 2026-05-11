@@ -528,17 +528,80 @@ impl RunStateStore for InMemoryRunStateStore {
     }
 }
 
+/// Known client-facing event `type` values that are safe to surface
+/// on the external `/chat/turn` SSE stream. Anything outside this
+/// allowlist is dropped — it's either an internal diagnostic event
+/// (e.g. `injection_freshness`) whose stability no external
+/// consumer should depend on, or a future event that hasn't been
+/// explicitly opted into the public surface.
+///
+/// wip-7 motivation: the pre-allowlist code path pass-through'd any
+/// `{"type": ...}`-shaped event unchanged. wip-5's
+/// `injection_freshness` event carried raw channel text for
+/// observation purposes — that text leaked to any authenticated
+/// `/chat/turn` client. The wip-7 bridge emits fingerprints only,
+/// but the allowlist is the defence-in-depth so a future diagnostic
+/// event can't accidentally leak either.
+///
+/// Adding a new public event: add its `type` string here AND, if the
+/// event also arrives in `{"event_type": ..., "data": ...}` shape
+/// from the journal, add a dedicated `match` arm below so the
+/// transform shapes it consistently.
+const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
+    // Streaming assistant content.
+    "text_delta",
+    "text_done",
+    "thinking_delta",
+    "thinking_done",
+    "reasoning_delta",
+    "reasoning_done",
+    "reasoning_message_content",
+    // Tool-call lifecycle.
+    "tool_call",
+    "tool_call_start",
+    "tool_call_end",
+    "tool_request",
+    "approval_required",
+    "approval_batch_required",
+    // Run lifecycle + framing.
+    "run_started",
+    "run_finished",
+    "run_paused",
+    "run_resumed",
+    "context_meta",
+    "session_info",
+    "turn_complete",
+    "turn_done",
+    "usage",
+    "explain",
+    "error",
+    "ping",
+    // Plan / delegation surface (public admin features).
+    "plan_created",
+    "plan_step_start",
+    "plan_step_done",
+    "plan_revised",
+    "agent_delegated",
+    "agent_spawned",
+    "agent_progress",
+    "agent_completed",
+];
+
 pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::Value {
+    // Already-client-ready shape (`{"type": ..., ...}`): allowlist the
+    // `type` value. Drop anything not explicitly safe for external
+    // consumption.
     if event
         .get("event_type")
         .and_then(serde_json::Value::as_str)
         .is_none()
-        && event
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .is_some()
+        && let Some(client_type) = event.get("type").and_then(serde_json::Value::as_str)
     {
-        return event;
+        if EXTERNAL_CLIENT_ALLOWLIST.contains(&client_type) {
+            return event;
+        }
+        // Unknown / internal event — drop.
+        return serde_json::Value::Null;
     }
 
     let event_type = event
@@ -612,6 +675,42 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             "message": data.get("error").cloned().unwrap_or(serde_json::Value::String("Unknown error".to_string())),
             "code": "RUN_ERROR",
         }),
+        // Turn-completion events carry the authoritative assistant
+        // text for client reconciliation (the streaming deltas may be
+        // stale if the server recovered mid-turn). Pass through with
+        // the full data payload merged into the client-shaped event.
+        "turn_complete" | "turn_done" => {
+            let mut out = serde_json::json!({ "type": event_type });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
+        "run_paused" => {
+            // Pause/resume lifecycle events had been falling through
+            // the `_` catch-all in pre-wip-7 code, which relied on
+            // passthrough. wip-7's allowlist drops the catch-all, so
+            // pause/resume need explicit arms — `run_handlers` also
+            // injects `run_id` for these.
+            let mut out = serde_json::json!({ "type": "run_paused" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
+        "run_resumed" => {
+            let mut out = serde_json::json!({ "type": "run_resumed" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
         "plan_created" => serde_json::json!({
             "type": "plan_created",
             "plan": data.get("plan").cloned().unwrap_or(serde_json::json!({})),
@@ -663,13 +762,11 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         }
         "keepalive" => serde_json::json!({ "type": "ping" }),
         _ => {
-            let mut out = serde_json::json!({ "type": event_type });
-            if let Some(obj) = out.as_object_mut() {
-                for (k, v) in &data {
-                    obj.insert(k.clone(), v.clone());
-                }
-            }
-            out
+            // wip-7 allowlist: unknown internal event_types are
+            // dropped. Adding a new event type means adding it
+            // explicitly above (and, for client-facing events,
+            // adding its `type` to `EXTERNAL_CLIENT_ALLOWLIST`).
+            serde_json::Value::Null
         }
     }
 }
@@ -916,26 +1013,38 @@ mod tests {
     }
 
     #[test]
-    fn unknown_event_type_passthrough() {
+    fn unknown_event_type_dropped_by_allowlist() {
+        // wip-7: the transform is an allowlist, not a passthrough —
+        // unknown `event_type` values return `Value::Null` so the
+        // caller in `run_handlers` can skip them entirely. This
+        // blocks future internal events from accidentally leaking to
+        // external API clients.
         let out = transform_run_event_for_client(make_event("custom_event", json!({})));
-        assert_eq!(out["type"], "custom_event");
+        assert!(
+            out.is_null(),
+            "unknown event_type must be dropped by the allowlist, got: {out}"
+        );
     }
 
     #[test]
-    fn unknown_event_type_preserves_data_fields() {
+    fn unknown_event_type_with_data_also_dropped() {
+        // Even when an unknown event carries structured data we'd
+        // want on a passthrough, the allowlist still drops it — the
+        // point is that internal events must be explicitly opted in.
         let out = transform_run_event_for_client(make_event(
             "team_prepare",
             json!({"delegation_id": "d1", "phase": "prepare"}),
         ));
-        assert_eq!(out["type"], "team_prepare");
-        assert_eq!(out["delegation_id"], "d1");
-        assert_eq!(out["phase"], "prepare");
+        assert!(out.is_null(), "unknown event_type must be dropped");
     }
 
     #[test]
-    fn missing_event_type() {
+    fn missing_event_type_and_no_type_is_dropped() {
+        // No `event_type` AND no `type` on the wire: treat as malformed
+        // / future schema and drop. Pre-wip-7 this returned an empty
+        // `type:""` synthetic event; wip-7 drops it per allowlist.
         let out = transform_run_event_for_client(json!({"data": {}}));
-        assert_eq!(out["type"], "");
+        assert!(out.is_null(), "malformed event must be dropped");
     }
 
     #[test]
@@ -946,8 +1055,32 @@ mod tests {
     }
 
     #[test]
-    fn already_shaped_client_event_passthrough() {
-        let event = json!({"type": "reasoning_delta", "content": "thinking", "index": 7});
+    fn already_shaped_client_event_not_in_allowlist_is_dropped() {
+        // wip-7: already-shaped `{"type": ...}` events go through the
+        // external-client allowlist. `injection_freshness` is the
+        // motivating case — it's the internal-diagnostic side-channel
+        // the bridge emits for the CLI's observability hooks. External
+        // API callers should NEVER see it, even when the bridge emits
+        // the fingerprint-only wire shape.
+        let event = json!({
+            "type": "injection_freshness",
+            "channels": [
+                { "tag": "self_awareness", "hash": 0u64, "bytes": 0u64, "is_empty": true }
+            ]
+        });
+        let out = transform_run_event_for_client(event);
+        assert!(
+            out.is_null(),
+            "client-shaped internal event must be dropped by allowlist, got: {out}"
+        );
+    }
+
+    #[test]
+    fn already_shaped_client_event_in_allowlist_passes_through() {
+        // Allowlisted types pass through unchanged so indexing /
+        // downstream decoration (e.g. `run_id` injection in
+        // `run_handlers`) still works.
+        let event = json!({"type": "text_delta", "content": "hello", "index": 3});
         let out = transform_run_event_for_client(event.clone());
         assert_eq!(out, event);
     }

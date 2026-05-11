@@ -1879,34 +1879,100 @@ impl InProcessChatTurnBridge {
                         skill_injections,
                         memory_injections,
                     );
-                    // Emit per-turn injection-channel texts so the CLI's
-                    // observability layer can fingerprint every live
-                    // channel (wip-5). Bridge echoes the CLI-owned
-                    // channels (self_awareness / memoria_insights /
-                    // recent_arg_hints / skill_listing) for symmetry so
-                    // the single post-turn `observe_bridge_injections`
-                    // call has one canonical source. Bridge-generated
-                    // channels (feedback_rules / implicit_feedback /
-                    // memoria_prefetch / tool_round_guidance / volatile)
-                    // are only visible here.
-                    let volatile_joined = env_volatile.as_deref().unwrap_or("").to_string();
-                    let memoria_prefetch_str = memoria_prefetch_section.as_deref().unwrap_or("");
+                    // wip-7: emit per-channel fingerprints ONLY — no raw
+                    // text crosses the HTTP boundary. Raw channel content
+                    // (learned feedback rules, memoria recall digests,
+                    // self-awareness summaries, user-correction excerpts)
+                    // is sensitive runtime state that leaked via
+                    // `transform_run_event_for_client`'s pass-through in
+                    // wip-5. Fingerprints carry opaque hash + byte length
+                    // + empty-flag, enough for `ObservabilitySession` to
+                    // detect content change but useless to an external
+                    // API consumer.
+                    //
+                    // wip-7 fix #2 (volatile gating): the fingerprint
+                    // reflects *what the model actually sees* — when
+                    // `CacheCapability::should_inject_volatile_on_round`
+                    // returns false, the whole volatile lane is dropped
+                    // downstream and we must emit empty fingerprints so
+                    // the freshness report doesn't claim the channel is
+                    // live. `effective_dynamic_sections` is the
+                    // post-gate section list; if it's empty while the
+                    // pre-gate list had entries, gating dropped them.
+                    //
+                    // wip-7 fix #3 (memoria_prefetch provenance): the
+                    // raw `memoria_prefetch_section` string is the
+                    // pre-pipeline hint. The pipeline's Memory binder
+                    // ranks / dedups / budgets the typed
+                    // `memoria_prefetch_entries` list and emits the
+                    // final prompt bytes. Fingerprinting the typed list
+                    // (stable concat of per-entry content) tracks the
+                    // actual injection — not the unprocessed hint.
+                    let volatile_injected =
+                        cache_cap.should_inject_volatile_on_round(round_index);
+                    let fp = |content: &str| {
+                        astra_turn_core::injection_tracking::InjectionFingerprint::from_content(
+                            content,
+                        )
+                    };
+                    let bridge_channel = |tag: &str, content: &str| {
+                        // Gated-out content → empty fingerprint, tracking
+                        // the model's actual view of the lane (fix #2).
+                        let effective = if volatile_injected { content } else { "" };
+                        let fpv = fp(effective);
+                        json!({
+                            "tag": tag,
+                            "hash": fpv.hash,
+                            "bytes": effective.len() as u64,
+                            "is_empty": fpv.is_empty,
+                        })
+                    };
+                    // Memoria prefetch: fingerprint the typed-entry list
+                    // (post-retrieval, pre-pipeline-binder). Canonical
+                    // serialization = concatenation of per-entry content
+                    // with a stable separator so identical retrievals
+                    // across turns produce identical hashes.
+                    let memoria_prefetch_canonical = if memoria_prefetch_entries.is_empty() {
+                        // No typed entries → fall back to the raw section
+                        // (legacy path when the pipeline memory binder is
+                        // off). Still rendered post-gate.
+                        memoria_prefetch_section.as_deref().unwrap_or("").to_string()
+                    } else {
+                        memoria_prefetch_entries
+                            .iter()
+                            .map(|e| e.content.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n---\n")
+                    };
+                    let channels_payload = json!([
+                        // CLI-owned channels: the bridge echoes them for
+                        // symmetry, but the CLI fingerprints its own
+                        // source-of-truth texts post-turn and those
+                        // authoritative fingerprints win. Bytes here
+                        // reflect the bridge-side view of the same
+                        // strings in edge_profile.
+                        bridge_channel("self_awareness", &self_awareness_hint),
+                        bridge_channel("memoria_insights", &memoria_insights_hint),
+                        bridge_channel("recent_arg_hints", &recent_arg_hints_hint),
+                        bridge_channel("skill_listing", &skill_listing_hint),
+                        // lessons is CLI-owned and has no bridge source —
+                        // emit an empty placeholder so the CLI observer
+                        // (which only reads bridge fingerprints for
+                        // bridge-internal channels) doesn't rely on it.
+                        bridge_channel("lessons", ""),
+                        // Bridge-internal channels: only visible here.
+                        bridge_channel("memoria_prefetch", &memoria_prefetch_canonical),
+                        bridge_channel("feedback_rules", &feedback_rules_hint),
+                        bridge_channel("implicit_feedback", &implicit_feedback_hint),
+                        bridge_channel("tool_round_guidance", &tool_round_guidance),
+                        bridge_channel(
+                            "volatile_pending",
+                            env_volatile.as_deref().unwrap_or(""),
+                        ),
+                    ]);
                     yield render_sse(&json!({
                         "type": "injection_freshness",
-                        "texts": {
-                            "self_awareness": self_awareness_hint,
-                            "memoria_insights": memoria_insights_hint,
-                            "recent_arg_hints": recent_arg_hints_hint,
-                            "skill_listing": skill_listing_hint,
-                            // CLI owns lessons — bridge leaves empty so the
-                            // CLI post-turn merge can supply the live value.
-                            "lessons": "",
-                            "memoria_prefetch": memoria_prefetch_str,
-                            "feedback_rules": feedback_rules_hint,
-                            "implicit_feedback": implicit_feedback_hint,
-                            "tool_round_guidance": tool_round_guidance,
-                            "volatile": volatile_joined,
-                        }
+                        "channels": channels_payload,
                     }));
                     yield render_sse(&json!({
                         "type": "context_meta",

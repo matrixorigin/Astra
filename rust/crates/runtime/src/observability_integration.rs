@@ -217,16 +217,28 @@ pub struct QueryBehavior {
     pub correction_detected: bool,
 }
 
-/// Raw per-turn text for every caller-supplied
-/// [`astra_turn_core::injection_tracking::InjectionChannel`]. Built by
-/// the bridge / CLI and passed to
-/// [`ObservabilitySession::observe_bridge_injections`] so the
-/// freshness tracker fingerprints every live channel, not just the 4
-/// legacy ones.
+/// Raw per-turn text for the CLI-owned subset of
+/// [`astra_turn_core::injection_tracking::InjectionChannel`] variants.
+/// The CLI has the authoritative source for these channels (either
+/// wrote them into `edge_profile` or can re-read them from the
+/// executor) so it fingerprints them client-side with a full preview
+/// — wip-7 keeps raw channel text off the HTTP wire.
 ///
-/// Empty `""` for a field means "this channel is tracked this turn but
-/// rendered nothing" — the distinction between `Empty` (known-silent)
-/// and `Untracked` (never-observed) depends on being explicit here.
+/// Bridge-internal channels (`memoria_prefetch`, `feedback_rules`,
+/// `implicit_feedback`, `tool_round_guidance`, `volatile_pending`)
+/// are not in this struct — the CLI receives opaque fingerprints for
+/// those via [`astra_turn_core::chat_turn_sse_dispatch::BridgeInjectionFingerprints`]
+/// and observes them with an empty preview (introspect still shows
+/// tag + hash + bytes).
+///
+/// Empty `""` for a field means "CLI is tracking this channel this
+/// turn but the content is empty" — the distinction between `Empty`
+/// (known-silent) and `Untracked` (never-observed) depends on being
+/// explicit here. If the CLI doesn't have the text for a channel
+/// (e.g. it's not easily retrievable post-turn), leave it `""` and
+/// pair with a bridge fingerprint — the bridge fingerprint carries
+/// the authoritative hash/bytes while the CLI-side preview stays
+/// empty for that channel.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BridgeInjectionTexts<'a> {
     pub lessons: &'a str,
@@ -391,23 +403,42 @@ impl ObservabilitySession {
     }
 
     /// Observe every tracked prompt-injection channel for the current
-    /// turn. Idempotent per fingerprint — calling this multiple times
-    /// in the same turn with identical content only bumps the
+    /// turn with a hybrid input: raw CLI-owned text (for channels the
+    /// CLI authoritatively writes into `edge_profile`, so introspect
+    /// can render a preview) + bridge-supplied fingerprints (for
+    /// bridge-internal channels whose raw text stays off the HTTP
+    /// wire per the wip-7 contract).
+    ///
+    /// Idempotent per fingerprint — calling this multiple times in
+    /// the same turn with identical content only bumps the
     /// `last_seen_round` of the current run. A content change opens a
-    /// new run so the freshness report reports `rounds_alive=0` and
+    /// new run so the freshness report resets `rounds_alive` to 0 and
     /// clears a stale status.
     ///
     /// The self-model channels (`RecentFailingTests`, `OutcomeBias`)
-    /// are read off this session's own state. Everything else comes
-    /// from the caller because only the bridge / CLI sees what actually
-    /// landed in `edge_profile` / `dynamic_sections` this turn.
+    /// are derived from this session's own state. Everything else
+    /// comes from the caller because only the bridge / CLI sees what
+    /// actually landed in `edge_profile` / `dynamic_sections` this
+    /// turn.
+    ///
+    /// wip-7 fix #4 (missing event): if `bridge_fingerprints` is
+    /// `None`, the bridge did not emit the `injection_freshness`
+    /// event this turn — the observation pipe is broken. Skip the
+    /// bridge-internal channels entirely so their history stays
+    /// `Untracked` rather than being defaulted to `Empty` (which
+    /// would mask the broken pipe).
     ///
     /// Call site: CLI's post-turn observation hook in
     /// `cli_loop_host::execute_turn` — fires AFTER the bridge's SSE
-    /// stream has emitted `injection_freshness` so every live channel
-    /// gets fingerprinted with the exact string the model actually
-    /// consumed this turn.
-    pub fn observe_bridge_injections(&mut self, texts: BridgeInjectionTexts<'_>) {
+    /// stream has drained so every live channel gets fingerprinted
+    /// against the exact bytes the model consumed this turn.
+    pub fn observe_bridge_injections_partial(
+        &mut self,
+        self_observed: BridgeInjectionTexts<'_>,
+        bridge_fingerprints: Option<
+            &astra_turn_core::chat_turn_sse_dispatch::BridgeInjectionFingerprints,
+        >,
+    ) {
         use astra_turn_core::injection_tracking::{InjectionChannel, InjectionFingerprint};
         let round = self.turn_number;
 
@@ -430,8 +461,9 @@ impl ObservabilitySession {
             InjectionFingerprint::from_content(&bias_text),
         );
 
-        // Caller-supplied channels. Order matches
-        // `InjectionChannel::all()` ordering for stable introspect output.
+        // CLI-owned channels: fingerprint from the raw text the CLI
+        // already has. Preview is populated so introspect can show
+        // the first 80 chars of the actual injection.
         let BridgeInjectionTexts {
             lessons,
             volatile,
@@ -443,27 +475,114 @@ impl ObservabilitySession {
             recent_arg_hints,
             skill_listing,
             tool_round_guidance,
-        } = texts;
+        } = self_observed;
 
-        let pairs = [
+        // Track which tags the CLI supplied raw text for (even if the
+        // text is empty — `""` still counts as "observed as empty").
+        // Tags listed here will NOT be overwritten by bridge
+        // fingerprints below: CLI is authoritative for its own
+        // channels. Tags not listed fall through to bridge-fingerprint
+        // observation so the wire-derived hash/bytes still register.
+        let cli_owned: &[(InjectionChannel, &str)] = &[
             (InjectionChannel::Lessons, lessons),
-            (InjectionChannel::VolatilePending, volatile),
-            (InjectionChannel::MemoriaInsights, memoria_insights),
-            (InjectionChannel::MemoriaPrefetch, memoria_prefetch),
             (InjectionChannel::SelfAwareness, self_awareness),
-            (InjectionChannel::FeedbackRules, feedback_rules),
-            (InjectionChannel::ImplicitFeedback, implicit_feedback),
+        ];
+        // CLI-owned pairs that may or may not carry text this turn —
+        // if the CLI doesn't have an easy source in the post-turn
+        // hook, it passes `""` and relies on the bridge fingerprint
+        // (below) for the hash/bytes. Tracked here so we know not to
+        // double-observe.
+        let cli_passthrough: &[(InjectionChannel, &str)] = &[
+            (InjectionChannel::MemoriaInsights, memoria_insights),
             (InjectionChannel::RecentArgHints, recent_arg_hints),
             (InjectionChannel::SkillListing, skill_listing),
-            (InjectionChannel::ToolRoundGuidance, tool_round_guidance),
         ];
-        for (channel, text) in pairs {
+
+        for (channel, text) in cli_owned {
             self.injection_history.observe(
                 round,
-                channel,
+                *channel,
                 InjectionFingerprint::from_content(text),
             );
         }
+        // CLI-passthrough: if CLI actually has the text (non-empty),
+        // prefer that — the preview is more useful than the bridge's
+        // empty-preview fingerprint. If CLI has nothing, fall through
+        // to bridge fingerprint below.
+        let mut observed_tags: std::collections::HashSet<&'static str> =
+            cli_owned.iter().map(|(c, _)| c.tag()).collect();
+        for (channel, text) in cli_passthrough {
+            if !text.is_empty() {
+                self.injection_history.observe(
+                    round,
+                    *channel,
+                    InjectionFingerprint::from_content(text),
+                );
+                observed_tags.insert(channel.tag());
+            }
+        }
+        // If CLI provided text for bridge-internal channels (legacy
+        // call sites), honour it so they still get observed — but
+        // wip-7 contract: CLI should NOT have raw text for
+        // bridge-internal channels, these are expected to be `""`.
+        let cli_bridge_echo: &[(InjectionChannel, &str)] = &[
+            (InjectionChannel::VolatilePending, volatile),
+            (InjectionChannel::MemoriaPrefetch, memoria_prefetch),
+            (InjectionChannel::FeedbackRules, feedback_rules),
+            (InjectionChannel::ImplicitFeedback, implicit_feedback),
+            (InjectionChannel::ToolRoundGuidance, tool_round_guidance),
+        ];
+        for (channel, text) in cli_bridge_echo {
+            if !text.is_empty() {
+                self.injection_history.observe(
+                    round,
+                    *channel,
+                    InjectionFingerprint::from_content(text),
+                );
+                observed_tags.insert(channel.tag());
+            }
+        }
+
+        // wip-7 fix #4: missing event → skip bridge-internal channels.
+        // DO NOT synthesize an empty bundle — that would mark every
+        // bridge channel as `Empty` in the freshness report and
+        // silently mask the fact that the observation pipe failed.
+        if let Some(fps) = bridge_fingerprints {
+            for entry in &fps.channels {
+                if observed_tags.contains(entry.tag.as_str()) {
+                    // CLI already observed this channel with raw
+                    // text — skip the wire fingerprint to avoid
+                    // double-observation. First observation wins.
+                    continue;
+                }
+                let Some(channel) = InjectionChannel::from_tag(&entry.tag) else {
+                    continue;
+                };
+                self.injection_history.observe(
+                    round,
+                    channel,
+                    InjectionFingerprint {
+                        hash: entry.hash,
+                        preview: String::new(),
+                        is_empty: entry.is_empty,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Backwards-compat wrapper used by `ObservabilitySession` unit
+    /// tests that pre-date wip-7's fingerprint split. Forwards to
+    /// [`Self::observe_bridge_injections_partial`] with no bridge
+    /// fingerprints — every channel's fingerprint is derived from the
+    /// caller-supplied raw text, which is the shape existing tests
+    /// expect. Production call sites must use
+    /// [`Self::observe_bridge_injections_partial`] with the wire
+    /// fingerprints so bridge-internal channels get tracked via their
+    /// (post-gate) opaque fingerprints.
+    #[cfg(test)]
+    pub fn observe_bridge_injections(&mut self, texts: BridgeInjectionTexts<'_>) {
+        self.observe_bridge_injections_partial(texts, None);
     }
 
     /// Publish the four SelfModel inputs that were previously hard-coded to
