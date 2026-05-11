@@ -145,6 +145,75 @@ fn bool_edit_round_trips_and_marks_dirty() {
     );
 }
 
+// ─── bool picker: two options visible, arrow-navigable ──────────────────
+
+/// Reference CLI shows bools as a two-line picker (`› true` / `  false`)
+/// with ↑↓ to move and Enter to confirm. That's the muscle memory we're
+/// importing — a single "value: X, press space to flip" line is less
+/// discoverable and mis-matches Enum's UX in the same panel.
+#[test]
+fn bool_editor_renders_both_options_with_marker_on_current() {
+    let mut v = make_view();
+    v.select_by_id("context_window.adaptive_budget_reduction"); // default false
+    v.handle_key(key(KeyCode::Enter));
+    let width = 80u16;
+    let h = 10u16;
+    let area = Rect::new(0, 0, width, h);
+    let mut buf = Buffer::empty(area);
+    v.render(area, &mut buf);
+    let mut text = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            text.push_str(buf[(x, y)].symbol());
+        }
+    }
+    // Both options must be on screen.
+    assert!(text.contains("true"), "bool editor missing `true`: {text}");
+    assert!(text.contains("false"), "bool editor missing `false`: {text}");
+    // The cursor/marker (›) must sit on the *current* value, which is
+    // `false` by default here. A trailing space avoids matching a prefix
+    // of a future label.
+    let marker_on_false = text.contains("› false") || text.contains("›false");
+    assert!(
+        marker_on_false,
+        "cursor must start on the current value (false), got: {text}"
+    );
+}
+
+#[test]
+fn bool_editor_arrow_key_moves_selection_between_options() {
+    let mut v = make_view();
+    v.select_by_id("context_window.adaptive_budget_reduction"); // current false
+    v.handle_key(key(KeyCode::Enter));
+    // ↓ moves from false to true.
+    v.handle_key(key(KeyCode::Down));
+    v.handle_key(key(KeyCode::Enter)); // accept
+    assert!(!v.has_inner_editor());
+    assert!(
+        v.working_config_for_test()
+            .context_window
+            .adaptive_budget_reduction,
+        "Down + Enter must commit the other option (true)"
+    );
+}
+
+#[test]
+fn bool_editor_space_still_toggles_for_muscle_memory() {
+    // Space has been "flip" forever; keep it working so users who
+    // trained on the old editor aren't stranded.
+    let mut v = make_view();
+    v.select_by_id("context_window.adaptive_budget_reduction"); // current false
+    v.handle_key(key(KeyCode::Enter));
+    v.handle_key(ch(' '));
+    v.handle_key(key(KeyCode::Enter));
+    assert!(
+        v.working_config_for_test()
+            .context_window
+            .adaptive_budget_reduction,
+        "space still toggles"
+    );
+}
+
 #[test]
 fn number_edit_round_trips_and_marks_dirty() {
     let mut v = make_view();
