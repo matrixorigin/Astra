@@ -205,10 +205,14 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("WebFetchTool", RO, WB.union(AL)),
     tool("web_search", RO, WB),
     tool("WebSearchTool", RO, WB.union(AL)),
-    // ── Memory / retrieval (read-only but not compactable) ───────────
-    tool("memory_search", RO, ME),
-    tool("memory_retrieve", RO, ME),
-    tool("memory_profile", RO, ME),
+    // ── Memory (action-aware) ────────────────────────────────────────
+    //
+    // Single consolidated entry. The `action` arg determines read vs write.
+    // Base classification is Mutating + NonIdempotent (conservative default
+    // when args are unavailable). Callers that have args use
+    // `Registry::category_for(name, args)` / `idempotency_for(name, args)`
+    // to get the precise classification per action.
+    tool("memory", MU, ME),
     // ── MatrixOne read-only ──────────────────────────────────────────
     tool("mo_query", RO, MO),
     // ── Agent info / reflection (read-only) ──────────────────────────
@@ -260,10 +264,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("rollback_session_state", MU, OR),
     // ── Mutating — GitHub writes ─────────────────────────────────────
     tool("github_create_issue", MU, A),
-    // ── Mutating — memory writes ─────────────────────────────────────
-    tool("memory_store", MU, ME),
-    tool("memory_correct", MU, ME),
-    tool("memory_purge", MU, ME),
+    // (memory entries consolidated above into a single action-aware row)
     // ── Mutating — MatrixOne writes ──────────────────────────────────
     tool("mo_snapshot", MU, MO),
     tool("mo_branch", MU, MO),
@@ -334,6 +335,43 @@ impl ToolRegistry {
         self.get(name)
             .map(|m| m.idempotency)
             .unwrap_or(ToolIdempotency::NonIdempotent)
+    }
+
+    // ── Action-aware queries (for consolidated tools like `memory`) ──
+    //
+    // Most tools classify on name alone. A few — currently only `memory` —
+    // carry an `action` field whose value changes read/write semantics.
+    // These helpers consult `args["action"]` and return the precise answer;
+    // for name-only tools they fall back to the table row.
+
+    pub fn idempotency_for(&self, name: &str, args: Option<&serde_json::Value>) -> ToolIdempotency {
+        astra_turn_types::classify_tool_idempotency(name, args)
+    }
+
+    /// Returns the effective `ToolCategory` after inspecting `args` for
+    /// consolidated tools. Currently only `memory` has per-action behaviour.
+    pub fn category_for(&self, name: &str, args: Option<&serde_json::Value>) -> ToolCategory {
+        if name == "memory" {
+            return match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
+                Some("retrieve") | Some("search") | Some("profile") | Some("feedback") => {
+                    ToolCategory::ReadOnly
+                }
+                _ => ToolCategory::Mutating,
+            };
+        }
+        self.category(name)
+    }
+
+    pub fn is_read_only_for(&self, name: &str, args: Option<&serde_json::Value>) -> bool {
+        self.category_for(name, args).is_read_only()
+    }
+
+    pub fn is_mutating_for(&self, name: &str, args: Option<&serde_json::Value>) -> bool {
+        self.category_for(name, args).is_mutating()
+    }
+
+    pub fn is_parallelizable_for(&self, name: &str, args: Option<&serde_json::Value>) -> bool {
+        self.category_for(name, args).is_parallelizable()
     }
 
     // ── Derived queries (replace all hardcoded lists) ────────────────
@@ -413,7 +451,9 @@ impl ToolRegistry {
         if name.starts_with("github_") {
             return ToolDisplayCategory::Github;
         }
-        if name.starts_with("memoria_") || name.starts_with("memory_") {
+        // MCP-prefixed Memoria tools keep the Memory display slot even when
+        // they don't land in TOOL_TABLE (e.g. dynamic plugin schemas).
+        if name.starts_with("memoria_") {
             return ToolDisplayCategory::Memory;
         }
         let flags = self.flags(name);
@@ -754,19 +794,36 @@ mod tests {
     }
 
     #[test]
-    fn memory_read_tools_are_read_only_but_not_compactable() {
+    fn memory_tool_is_conservative_by_name_and_action_aware_with_args() {
+        use serde_json::json;
         let r = registry();
-        assert!(r.is_read_only("memory_search"));
-        assert!(!r.is_compactable("memory_search"));
-        assert!(r.is_read_only("memory_retrieve"));
-        assert!(!r.is_compactable("memory_retrieve"));
-    }
+        // Name-only query: conservative Mutating (used when args aren't
+        // available, e.g. static schema audits).
+        assert_eq!(r.category("memory"), ToolCategory::Mutating);
+        assert!(!r.is_read_only("memory"));
+        assert!(!r.is_compactable("memory"));
 
-    #[test]
-    fn memory_write_tools_are_mutating() {
-        let r = registry();
-        for name in ["memory_store", "memory_correct", "memory_purge"] {
-            assert_eq!(r.category(name), ToolCategory::Mutating, "{name}");
+        // Action-aware: retrieve/search/profile/feedback are ReadOnly.
+        for action in ["retrieve", "search", "profile", "feedback"] {
+            let args = json!({"action": action});
+            assert!(
+                r.is_read_only_for("memory", Some(&args)),
+                "memory(action={action}) should be read-only"
+            );
+            assert!(
+                !r.is_mutating_for("memory", Some(&args)),
+                "memory(action={action}) should NOT be mutating"
+            );
+        }
+
+        // Mutating actions stay Mutating.
+        for action in ["store", "purge", "correct"] {
+            let args = json!({"action": action});
+            assert!(
+                r.is_mutating_for("memory", Some(&args)),
+                "memory(action={action}) should be mutating"
+            );
+            assert!(!r.is_read_only_for("memory", Some(&args)));
         }
     }
 
@@ -873,7 +930,7 @@ mod tests {
         assert!(!headless.contains(&"ReadFileTool"));
         assert!(!headless.contains(&"web_fetch"));
         assert!(!headless.contains(&"web_search"));
-        assert!(!headless.contains(&"memory_search"));
+        assert!(!headless.contains(&"memory"));
     }
 
     #[test]
@@ -974,8 +1031,6 @@ mod tests {
             "WebFetchTool",
             "web_search",
             "WebSearchTool",
-            "memory_search",
-            "memory_retrieve",
             "get_file_contents",
             "search_code",
             "list_files",
@@ -991,6 +1046,13 @@ mod tests {
         ] {
             assert!(r.is_parallelizable(name), "{name} should be parallelizable");
         }
+
+        // `memory` is parallelizable iff the action is read-only.
+        use serde_json::json;
+        assert!(r.is_parallelizable_for("memory", Some(&json!({"action": "retrieve"}))));
+        assert!(r.is_parallelizable_for("memory", Some(&json!({"action": "search"}))));
+        assert!(!r.is_parallelizable_for("memory", Some(&json!({"action": "store"}))));
+        assert!(!r.is_parallelizable_for("memory", Some(&json!({"action": "purge"}))));
     }
 
     // ── Complex cross-system scenario tests ────────────────────────────
@@ -1072,7 +1134,6 @@ mod tests {
             ("bash", false),
             ("find_definition", true),
             ("delete_file", false),
-            ("memory_retrieve", true),
         ];
         for (name, expect_parallel) in batch {
             assert_eq!(
@@ -1081,6 +1142,11 @@ mod tests {
                 "{name}: expected parallelizable={expect_parallel}"
             );
         }
+
+        // `memory` must be partitioned by action, not by name.
+        use serde_json::json;
+        assert!(r.is_parallelizable_for("memory", Some(&json!({"action": "retrieve"}))));
+        assert!(!r.is_parallelizable_for("memory", Some(&json!({"action": "store"}))));
     }
 
     /// Stall detector scenario: 5 rounds of pure exploration tools should
@@ -1135,7 +1201,7 @@ mod tests {
         // Headless set excludes web (needs network), memory (needs server),
         // MatrixOne (needs DB), orchestration (agent-internal), aliases
         assert!(!headless.contains(&"web_fetch"));
-        assert!(!headless.contains(&"memory_search"));
+        assert!(!headless.contains(&"memory"));
         assert!(!headless.contains(&"mo_query"));
         assert!(!headless.contains(&"context_analysis"));
         assert!(!headless.contains(&"ReadFileTool"));
@@ -1673,8 +1739,6 @@ mod tests {
             "github_get_issue",
             "github_ci_status",
             "github_repo_stats",
-            "memory_search",
-            "memory_profile",
             "web_fetch",
             "get_agent_info",
         ] {
@@ -1682,6 +1746,15 @@ mod tests {
                 r.idempotency(name),
                 ToolIdempotency::PureRead,
                 "{name} should be PureRead"
+            );
+        }
+        // `memory` is action-sensitive: validated via idempotency_for with args.
+        use serde_json::json;
+        for action in ["retrieve", "search", "profile", "feedback"] {
+            assert_eq!(
+                r.idempotency_for("memory", Some(&json!({"action": action}))),
+                ToolIdempotency::PureRead,
+                "memory(action={action}) should be PureRead"
             );
         }
     }
@@ -1718,9 +1791,6 @@ mod tests {
             "bash",
             "str_replace",
             "github_create_issue",
-            "memory_store",
-            "memory_purge",
-            "memory_correct",
             "delete_file",
             "multi_edit",
             "edit_file",
@@ -1808,7 +1878,7 @@ mod tests {
     fn scenario_retry_policy_derivation() {
         let r = registry();
 
-        let pure_reads = ["read_file", "grep", "git_status", "memory_search"];
+        let pure_reads = ["read_file", "grep", "git_status"];
         for name in pure_reads {
             let idem = r.idempotency(name);
             assert!(
@@ -1860,8 +1930,6 @@ mod tests {
             "github_get_issue",
             "github_ci_status",
             "github_repo_stats",
-            "memory_search",
-            "memory_profile",
             "web_fetch",
             "get_agent_info",
         ];
@@ -1879,14 +1947,7 @@ mod tests {
             "step_protocol compat: write_file should be IdempotentWrite"
         );
 
-        let old_non_idempotent = [
-            "bash",
-            "str_replace",
-            "github_create_issue",
-            "memory_store",
-            "memory_purge",
-            "memory_correct",
-        ];
+        let old_non_idempotent = ["bash", "str_replace", "github_create_issue"];
         for name in old_non_idempotent {
             assert_eq!(
                 r.idempotency(name),
@@ -1894,6 +1955,17 @@ mod tests {
                 "step_protocol compat: {name} should be NonIdempotent"
             );
         }
+
+        // `memory` replaces the six legacy memory_* entries — action-aware.
+        use serde_json::json;
+        assert_eq!(
+            r.idempotency_for("memory", Some(&json!({"action": "search"}))),
+            ToolIdempotency::PureRead,
+        );
+        assert_eq!(
+            r.idempotency_for("memory", Some(&json!({"action": "store"}))),
+            ToolIdempotency::NonIdempotent,
+        );
     }
 
     /// Every tool in TOOL_TABLE must agree with the canonical
@@ -1903,7 +1975,7 @@ mod tests {
         for meta in TOOL_TABLE {
             assert_eq!(
                 meta.idempotency,
-                classify_tool_idempotency(meta.name),
+                classify_tool_idempotency(meta.name, None),
                 "TOOL_TABLE idempotency for {} disagrees with shared classify_tool_idempotency",
                 meta.name,
             );
@@ -2057,22 +2129,10 @@ mod tests {
     }
 
     #[test]
-    fn display_category_memory_tools() {
+    fn display_category_memory_tool() {
         let r = registry();
-        for name in [
-            "memory_search",
-            "memory_retrieve",
-            "memory_profile",
-            "memory_store",
-            "memory_correct",
-            "memory_purge",
-        ] {
-            assert_eq!(
-                r.display_category(name),
-                ToolDisplayCategory::Memory,
-                "{name} should be Memory category"
-            );
-        }
+        // All memory actions share the consolidated `memory` tool.
+        assert_eq!(r.display_category("memory"), ToolDisplayCategory::Memory,);
     }
 
     #[test]

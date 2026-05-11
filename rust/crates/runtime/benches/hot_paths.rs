@@ -76,7 +76,7 @@ fn bench_pre_filter_dynamic(c: &mut Criterion) {
         ("git_local", "show me the last 5 commits"),
         ("analytical_cn", "分析一下之前的决策"),
         ("vague_0sig", "我关注matrixorigin"),
-        ("memory_store", "记住我喜欢用 Rust"),
+        ("memory_action_store", "记住我喜欢用 Rust"),
         ("code_write", "create a new file called main.rs"),
     ];
 

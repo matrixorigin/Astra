@@ -1212,8 +1212,11 @@ impl ToolRetryPolicy {
 }
 
 /// Get tool-level retry policy based on idempotency classification.
-pub fn tool_retry_policy(tool_name: &str) -> ToolRetryPolicy {
-    match classify_tool_idempotency(tool_name) {
+///
+/// `args` is optional because most tools dispatch on name alone; action-sensitive
+/// tools (e.g. `memory`) inspect `args["action"]` to distinguish read vs write.
+pub fn tool_retry_policy(tool_name: &str, args: Option<&serde_json::Value>) -> ToolRetryPolicy {
+    match classify_tool_idempotency(tool_name, args) {
         // Pure reads: retry aggressively (no side effects)
         ToolIdempotency::PureRead => ToolRetryPolicy {
             max_attempts: 3,
@@ -2072,7 +2075,7 @@ mod tests {
     #[test]
     fn idempotency_key_context_memory_snapshot() {
         let args = serde_json::json!({});
-        let key = IdempotencyKey::semantic("memory_search", &args).with_context(ContextSignature {
+        let key = IdempotencyKey::semantic("memory", &args).with_context(ContextSignature {
             workspace_version: None,
             memory_snapshot_id: Some("snap-20250101".into()),
         });
@@ -2141,36 +2144,50 @@ mod tests {
             "github_list_prs",
             "github_ci_status",
             "mo_query",
-            "memory_search",
         ] {
             assert_eq!(
-                classify_tool_idempotency(tool),
+                classify_tool_idempotency(tool, None),
                 ToolIdempotency::PureRead,
                 "Expected PureRead for {tool}"
             );
         }
+        // memory is action-sensitive; see dedicated test below.
+    }
+
+    #[test]
+    fn tool_classification_memory_actions() {
+        use serde_json::json;
+        assert_eq!(
+            classify_tool_idempotency("memory", Some(&json!({"action": "retrieve"}))),
+            ToolIdempotency::PureRead,
+        );
+        assert_eq!(
+            classify_tool_idempotency("memory", Some(&json!({"action": "search"}))),
+            ToolIdempotency::PureRead,
+        );
+        assert_eq!(
+            classify_tool_idempotency("memory", Some(&json!({"action": "store"}))),
+            ToolIdempotency::NonIdempotent,
+        );
+        assert_eq!(
+            classify_tool_idempotency("memory", Some(&json!({"action": "purge"}))),
+            ToolIdempotency::NonIdempotent,
+        );
     }
 
     #[test]
     fn tool_classification_idempotent_write() {
         assert_eq!(
-            classify_tool_idempotency("write_file"),
+            classify_tool_idempotency("write_file", None),
             ToolIdempotency::IdempotentWrite
         );
     }
 
     #[test]
     fn tool_classification_non_idempotent() {
-        for tool in [
-            "bash",
-            "str_replace",
-            "github_create_issue",
-            "memory_store",
-            "memory_purge",
-            "mo_snapshot",
-        ] {
+        for tool in ["bash", "str_replace", "github_create_issue", "mo_snapshot"] {
             assert_eq!(
-                classify_tool_idempotency(tool),
+                classify_tool_idempotency(tool, None),
                 ToolIdempotency::NonIdempotent,
                 "Expected NonIdempotent for {tool}"
             );
@@ -2180,7 +2197,7 @@ mod tests {
     #[test]
     fn unknown_tool_defaults_to_non_idempotent() {
         assert_eq!(
-            classify_tool_idempotency("some_future_tool"),
+            classify_tool_idempotency("some_future_tool", None),
             ToolIdempotency::NonIdempotent
         );
     }
@@ -2230,21 +2247,21 @@ mod tests {
 
     #[test]
     fn tool_retry_policy_pure_read() {
-        let policy = tool_retry_policy("grep");
+        let policy = tool_retry_policy("grep", None);
         assert_eq!(policy.max_attempts, 3);
         assert_eq!(policy.backoff_base_ms, 200);
     }
 
     #[test]
     fn tool_retry_policy_idempotent_write() {
-        let policy = tool_retry_policy("write_file");
+        let policy = tool_retry_policy("write_file", None);
         assert_eq!(policy.max_attempts, 2);
         assert_eq!(policy.backoff_base_ms, 500);
     }
 
     #[test]
     fn tool_retry_policy_non_idempotent() {
-        let policy = tool_retry_policy("bash");
+        let policy = tool_retry_policy("bash", None);
         assert_eq!(policy.max_attempts, 1);
     }
 

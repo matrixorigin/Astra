@@ -4135,11 +4135,11 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
         MockToolScenario {
             name: "memory_store",
             message: "记住我喜欢 Rust".to_string(),
-            edge_tools: vec!["memory_store"],
+            edge_tools: vec!["memory"],
             steps: vec![MockToolScenarioStep {
                 request_id: "tc-matrix-mstore",
-                tool_name: "memory_store",
-                args: json!({"content": "User likes Rust"}),
+                tool_name: "memory",
+                args: json!({"action": "store", "content": "User likes Rust"}),
                 result_output: "memory stored",
                 requires_approval: false,
             }],
@@ -4149,11 +4149,11 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
         MockToolScenario {
             name: "memory_search",
             message: "我之前说过我喜欢什么语言?".to_string(),
-            edge_tools: vec!["memory_search"],
+            edge_tools: vec!["memory"],
             steps: vec![MockToolScenarioStep {
                 request_id: "tc-matrix-msearch",
-                tool_name: "memory_search",
-                args: json!({"query": "preferred language"}),
+                tool_name: "memory",
+                args: json!({"action": "search", "query": "preferred language"}),
                 result_output: "User likes Rust",
                 requires_approval: false,
             }],
@@ -4224,20 +4224,20 @@ async fn mock_llm_memory_followup_preserves_session_local_and_cloud_state() {
                     {
                         "tool_calls": [tool_call(
                             "tc-memory-store",
-                            "memory_store",
-                            json!({"content": "User likes Rust"})
+                            "memory",
+                            json!({"action": "store", "content": "User likes Rust"})
                         )]
                     },
                     { "full_text": "我记住了你的偏好。" }
                 ],
-                "edge_tools": [tool_schema("memory_store")]
+                "edge_tools": [tool_schema("memory")]
             }
         }),
         "memory_store_turn",
         &[MockToolScenarioStep {
             request_id: "tc-memory-store",
-            tool_name: "memory_store",
-            args: json!({"content": "User likes Rust"}),
+            tool_name: "memory",
+            args: json!({"action": "store", "content": "User likes Rust"}),
             result_output: "memory stored",
             requires_approval: false,
         }],
@@ -4259,20 +4259,20 @@ async fn mock_llm_memory_followup_preserves_session_local_and_cloud_state() {
                     {
                         "tool_calls": [tool_call(
                             "tc-memory-search",
-                            "memory_search",
-                            json!({"query": "latest remembered preference"})
+                            "memory",
+                            json!({"action": "search", "query": "latest remembered preference"})
                         )]
                     },
                     { "full_text": "你刚才让我记住你喜欢 Rust。" }
                 ],
-                "edge_tools": [tool_schema("memory_search")]
+                "edge_tools": [tool_schema("memory")]
             }
         }),
         "memory_search_turn",
         &[MockToolScenarioStep {
             request_id: "tc-memory-search",
-            tool_name: "memory_search",
-            args: json!({"query": "latest remembered preference"}),
+            tool_name: "memory",
+            args: json!({"action": "search", "query": "latest remembered preference"}),
             result_output: "User likes Rust",
             requires_approval: false,
         }],
@@ -4316,21 +4316,13 @@ async fn mock_llm_memory_followup_preserves_session_local_and_cloud_state() {
         .skill_selection
         .as_ref()
         .expect("store turn skill selection");
-    assert!(
-        store_skill
-            .selected_skills
-            .contains(&"memory_store".to_string())
-    );
+    assert!(store_skill.selected_skills.contains(&"memory".to_string()));
     assert!(store_skill.user_query.contains("记住我喜欢 Rust"));
     let search_skill = hook_plans[1]
         .skill_selection
         .as_ref()
         .expect("search turn skill selection");
-    assert!(
-        search_skill
-            .selected_skills
-            .contains(&"memory_search".to_string())
-    );
+    assert!(search_skill.selected_skills.contains(&"memory".to_string()));
     assert!(search_skill.user_query.contains("我刚才让你记住了什么?"));
     drop(hook_plans);
 
@@ -4345,13 +4337,13 @@ async fn mock_llm_memory_followup_preserves_session_local_and_cloud_state() {
         .as_ref()
         .and_then(|meta| meta.get("tool_name"))
         .and_then(Value::as_str);
-    assert_eq!(first_tool_name, Some("memory_store"));
+    assert_eq!(first_tool_name, Some("memory"));
     let second_tool_name = tool_plans[1].events[0]
         .metadata
         .as_ref()
         .and_then(|meta| meta.get("tool_name"))
         .and_then(Value::as_str);
-    assert_eq!(second_tool_name, Some("memory_search"));
+    assert_eq!(second_tool_name, Some("memory"));
 }
 
 #[tokio::test]

@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn code_and_memory_stack() {
-        let h = domain_hints_from_boost_terms(&["read_file".into(), "memory_store".into()]);
+        let h = domain_hints_from_boost_terms(&["read_file".into(), "memory".into()]);
         assert!(h.contains(&DomainHint::Code));
         assert!(h.contains(&DomainHint::Memory));
     }

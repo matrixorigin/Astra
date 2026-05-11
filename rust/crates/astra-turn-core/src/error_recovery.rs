@@ -109,14 +109,7 @@ const TOOL_GROUPS: &[&[&str]] = &[
     &["read_file", "grep", "glob", "list_dir"],
     // File writing tools
     &["write_file", "str_replace", "multi_edit"],
-    // Memory tools
-    &[
-        "memory_store",
-        "memory_search",
-        "memory_correct",
-        "memory_purge",
-        "memory_profile",
-    ],
+    // Memory tool is single-row and action-aware; no peer alternatives.
     // MatrixOne tools
     &["mo_query", "mo_snapshot", "mo_branch"],
 ];
@@ -613,12 +606,6 @@ mod tests {
     fn suggest_github_alternatives() {
         let alts = suggest_alternatives("github_list_prs", &[]);
         assert!(alts.contains(&"github_get_pr".to_string()));
-    }
-
-    #[test]
-    fn suggest_memory_alternatives() {
-        let alts = suggest_alternatives("memory_store", &[]);
-        assert!(alts.contains(&"memory_search".to_string()));
     }
 
     #[test]

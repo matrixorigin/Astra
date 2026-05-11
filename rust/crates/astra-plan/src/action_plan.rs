@@ -318,7 +318,7 @@ impl ActionAuditEntry {
         Self {
             action_index: action.index(),
             tool: action.tool().to_string(),
-            idempotency: classify_tool_idempotency(action.tool()),
+            idempotency: classify_tool_idempotency(action.tool(), Some(action.args())),
             args_hash: canonical_sha256_hex(action.args()),
             result_hash: canonical_sha256_hex(result_value),
             success,

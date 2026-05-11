@@ -875,7 +875,7 @@ impl<'a> CliSseStreamHost<'a> {
                 .map(str::trim)
                 .is_some_and(astra_turn_core::cloud_approval_policy::bash_command_is_read_only);
         }
-        is_tool_concurrency_safe(tool)
+        is_tool_concurrency_safe(tool, Some(args))
             || matches!(
                 tool,
                 "write_file"
@@ -2574,7 +2574,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // Classify by concurrency safety.
         let conc_flags: Vec<bool> = requests
             .iter()
-            .map(|req| is_tool_concurrency_safe(&req.tool))
+            .map(|req| is_tool_concurrency_safe(&req.tool, Some(&req.args)))
             .collect();
         let conc_count = conc_flags.iter().filter(|&&f| f).count();
 
@@ -3709,8 +3709,20 @@ impl StreamRenderState {
                             truncate_line(query, path_budget(20))
                         )
                     }
-                    "purge" => "Purging memory".to_string(),
-                    "correct" => "Correcting memory".to_string(),
+                    "purge" => match args.get("topic").and_then(Value::as_str) {
+                        Some(topic) => format!(
+                            "Purging memory: \"{}\"",
+                            truncate_line(topic, path_budget(18))
+                        ),
+                        None => "Purging memory".to_string(),
+                    },
+                    "correct" => match args.get("memory_id").and_then(Value::as_str) {
+                        Some(memory_id) => format!(
+                            "Correcting memory: {}",
+                            truncate_line(memory_id, path_budget(20))
+                        ),
+                        None => "Correcting memory".to_string(),
+                    },
                     "profile" => "Checking profile".to_string(),
                     "feedback" => "Memory feedback".to_string(),
                     _ => format!("Memory: {action}"),
@@ -4511,43 +4523,6 @@ impl StreamRenderState {
                     ),
                 }
             }
-            // Memory tools with natural verbs
-            "memory_retrieve" => {
-                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                format!("Recalling: \"{}\"", truncate_line(query, path_budget(13)))
-            }
-            "memory_store" => {
-                let content = args.get("content").and_then(Value::as_str).unwrap_or("");
-                format!("Storing: \"{}\"", truncate_line(content, path_budget(11)))
-            }
-            "memory_search" => {
-                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                format!(
-                    "Searching memory: \"{}\"",
-                    truncate_line(query, path_budget(20))
-                )
-            }
-            "memory_purge" => {
-                let topic = args.get("topic").and_then(Value::as_str);
-                match topic {
-                    Some(topic) => format!(
-                        "Purging memory: \"{}\"",
-                        truncate_line(topic, path_budget(18))
-                    ),
-                    None => "Purging memory".to_string(),
-                }
-            }
-            "memory_correct" => {
-                let memory_id = args.get("memory_id").and_then(Value::as_str);
-                match memory_id {
-                    Some(memory_id) => format!(
-                        "Correcting memory: {}",
-                        truncate_line(memory_id, path_budget(20))
-                    ),
-                    None => "Correcting memory".to_string(),
-                }
-            }
-            "memory_profile" => "Checking profile".to_string(),
             // Skill tool — show specific skill name or discover query
             "skill" => {
                 let action = args.get("action").and_then(Value::as_str).unwrap_or("run");
@@ -5197,22 +5172,28 @@ impl StreamRenderState {
                     _ => None,
                 }
             }
-            "memory_retrieve" | "memory_search" => args
-                .get("query")
-                .and_then(Value::as_str)
-                .map(|q| truncate_line(q, 50)),
-            "memory_store" => args
-                .get("content")
-                .and_then(Value::as_str)
-                .map(|c| truncate_line(c, 50)),
-            "memory_purge" => args
-                .get("topic")
-                .and_then(Value::as_str)
-                .map(|topic| truncate_line(topic, 40)),
-            "memory_correct" => args
-                .get("memory_id")
-                .and_then(Value::as_str)
-                .map(|memory_id| truncate_line(memory_id, 40)),
+            "memory" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                match action {
+                    "retrieve" | "search" => args
+                        .get("query")
+                        .and_then(Value::as_str)
+                        .map(|q| truncate_line(q, 50)),
+                    "store" => args
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(|c| truncate_line(c, 50)),
+                    "purge" => args
+                        .get("topic")
+                        .and_then(Value::as_str)
+                        .map(|topic| truncate_line(topic, 40)),
+                    "correct" => args
+                        .get("memory_id")
+                        .and_then(Value::as_str)
+                        .map(|memory_id| truncate_line(memory_id, 40)),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -6240,7 +6221,6 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "web_fetch" => format!("Fetching: {preview}"),
         "web_search" => format!("Searching web: \"{preview}\""),
         "github" => format!("GitHub: {preview}"),
-        "memory" => format!("Memory: {preview}"),
         "session" => format!("Session: {preview}"),
         "mo" => format!("MO: {preview}"),
         "agent" => format!("Agent: {preview}"),
@@ -6295,12 +6275,17 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "mo_query" => format!("MatrixOne query: \"{preview}\""),
         "mo_snapshot" => format!("MatrixOne snapshot: {preview}"),
         "mo_branch" => format!("MatrixOne branch: {preview}"),
-        "memory_retrieve" => format!("Recalling: \"{preview}\""),
-        "memory_store" => format!("Storing: \"{preview}\""),
-        "memory_search" => format!("Searching memory: \"{preview}\""),
-        "memory_purge" => format!("Purging memory: \"{preview}\""),
-        "memory_correct" => format!("Correcting memory: {preview}"),
-        "memory_profile" => "Checking profile".to_string(),
+        // `memory` is action-aware; when we only have the preview string (not the
+        // parsed args), surface it generically. Callers that have the full args
+        // object should use the richer `format_tool_description_with_output`
+        // path which dispatches on `action`.
+        "memory" => {
+            if preview.is_empty() {
+                "Memory".to_string()
+            } else {
+                format!("Memory: {preview}")
+            }
+        }
         "skill" => format!("Running skill: {preview}"),
         "discover_skills" => format!("Discovering skills: \"{preview}\""),
         other if other.starts_with("mcp_") => {
@@ -7349,14 +7334,15 @@ mod tests {
     fn format_memory_maintenance_descriptions() {
         let r = StreamRenderState::new();
         let purge = r.format_tool_description(
-            "memory_purge",
-            &serde_json::json!({"topic": "renderer drift"}),
+            "memory",
+            &serde_json::json!({"action": "purge", "topic": "renderer drift"}),
         );
         let correct = r.format_tool_description(
-            "memory_correct",
-            &serde_json::json!({"memory_id": "mem-123"}),
+            "memory",
+            &serde_json::json!({"action": "correct", "memory_id": "mem-123"}),
         );
-        let profile = r.format_tool_description("memory_profile", &serde_json::json!({}));
+        let profile =
+            r.format_tool_description("memory", &serde_json::json!({"action": "profile"}));
 
         assert_eq!(purge, "Purging memory: \"renderer drift\"");
         assert_eq!(correct, "Correcting memory: mem-123");
@@ -7364,19 +7350,13 @@ mod tests {
     }
 
     #[test]
-    fn format_memory_maintenance_preview_display_names() {
+    fn format_memory_preview_display_names() {
+        // Preview-only path can't know the action; it surfaces the raw preview.
         assert_eq!(
-            format_tool_display_from_preview("memory_purge", Some("renderer drift")),
-            "Purging memory: \"renderer drift\""
+            format_tool_display_from_preview("memory", Some("action=purge topic=...")),
+            "Memory: action=purge topic=..."
         );
-        assert_eq!(
-            format_tool_display_from_preview("memory_correct", Some("mem-123")),
-            "Correcting memory: mem-123"
-        );
-        assert_eq!(
-            format_tool_display_from_preview("memory_profile", None),
-            "Checking profile"
-        );
+        assert_eq!(format_tool_display_from_preview("memory", None), "Memory");
     }
 
     #[test]

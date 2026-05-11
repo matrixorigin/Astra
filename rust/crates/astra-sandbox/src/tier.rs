@@ -30,9 +30,9 @@ pub enum ToolTier {
 pub fn classify_tool(name: &str) -> ToolTier {
     match name {
         // ── Tier 0: In-process (no subprocess needed) ────────────────
-        "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
-        | "memory_correct" | "memory_profile" | "memory_feedback" | "web_search" | "web_fetch"
-        | "read_file" | "list_dir" | "delegate" => ToolTier::InProcess,
+        "memory" | "web_search" | "web_fetch" | "read_file" | "list_dir" | "delegate" => {
+            ToolTier::InProcess
+        }
 
         // ── Tier 1: Sandboxed subprocess ─────────────────────────────
         "grep" | "glob" | "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame" => {

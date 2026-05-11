@@ -172,12 +172,18 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
                 .unwrap_or(".");
             Some(format!("{}:{}", tool_name, normalize_path(file)))
         }
-        // Memory tools: key on query
-        "memory_search" => {
-            let query = arg_str(args, "query").unwrap_or("");
-            Some(format!("memory_search:{}", query.to_lowercase()))
+        // Memory tool is action-aware; dedup keys depend on the action.
+        "memory" => {
+            let action = arg_str(args, "action").unwrap_or("");
+            match action {
+                "search" | "retrieve" => {
+                    let query = arg_str(args, "query").unwrap_or("");
+                    Some(format!("memory_{action}:{}", query.to_lowercase()))
+                }
+                "profile" => Some("memory_profile".to_string()),
+                _ => None,
+            }
         }
-        "memory_profile" => Some("memory_profile".to_string()),
         _ => None,
     }
 }

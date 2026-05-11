@@ -529,7 +529,7 @@ fn tool_error_recovery_section() -> &'static str {
      - Fix: ask the user to re-authenticate, or try a path you have access to.\n\
      \n\
      ### Non-errors (do not treat as failures)\n\
-     - `memory_retrieve` returns empty → normal for new users/topics; proceed without memory.\n\
+     - a memory read returns empty → normal for new users/topics; proceed without memory.\n\
      - `grep` / `glob` returns zero matches → valid answer; report it, don't keep searching blindly.\n\
      \n\
      ### Unknown tool name\n\
@@ -1752,7 +1752,7 @@ mod tests {
     }
 
     // Tests for `## Self-Model\nTools: ...` list, `## Memory Rules` /
-    // `<types>` taxonomy, and `GitHub data` / `memory_store` guidance
+    // `<types>` taxonomy, and `GitHub data` / `memory` guidance
     // were deleted: those Markdown sections were emitted by
     // `self_model_section` / `tool_conditional_section`, which are now
     // no-ops (commit a1187f76 — the tools array schema already carries
@@ -1911,7 +1911,7 @@ mod tests {
         assert!(p.contains("Unknown tool name"));
         // Key anti-patterns preserved
         assert!(p.contains("Anti-pattern"));
-        assert!(p.contains("memory_retrieve"));
+        assert!(p.contains("memory read returns empty"));
     }
 
     #[test]

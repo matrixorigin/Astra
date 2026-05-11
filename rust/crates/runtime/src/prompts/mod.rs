@@ -156,8 +156,8 @@ mod tests {
     fn no_memory_tools_omits_memory_section() {
         let p = build_main_system_prompt(&["bash", "read_file"], "", 1.0, None);
         assert!(
-            !p.contains("memory_store"),
-            "should NOT mention memory_store when no memory tools selected"
+            !p.contains("`memory(action="),
+            "should NOT mention the memory tool when no memory tools selected"
         );
         assert!(
             !p.contains("Memory rules"),
@@ -171,7 +171,7 @@ mod tests {
     /// When no GitHub tools are selected, GitHub-specific rules must be omitted.
     #[test]
     fn no_github_tools_omits_github_rules() {
-        let p = build_main_system_prompt(&["bash", "memory_store"], "", 1.0, None);
+        let p = build_main_system_prompt(&["bash", "memory"], "", 1.0, None);
         assert!(
             !p.contains("github_list_prs"),
             "should NOT mention github_list_prs when no GitHub tools selected"
@@ -201,13 +201,7 @@ mod tests {
     #[test]
     fn compressed_prompt_under_token_budget() {
         let p = build_main_system_prompt(
-            &[
-                "read_file",
-                "bash",
-                "memory_store",
-                "github_list_prs",
-                "git_diff",
-            ],
+            &["read_file", "bash", "memory", "github_list_prs", "git_diff"],
             "",
             1.0,
             None,

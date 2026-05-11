@@ -65,12 +65,7 @@ fn friendly_tool_name(tool_name: &str) -> &str {
         "mo_query" => "MatrixOne query",
         "mo_snapshot" => "MatrixOne snapshot",
         "mo_branch" => "MatrixOne branch",
-        "memory_retrieve" => "Recalling",
-        "memory_store" => "Storing",
-        "memory_search" => "Searching memory",
-        "memory_purge" => "Purging memory",
-        "memory_correct" => "Correcting memory",
-        "memory_profile" => "Checking profile",
+        "memory" => "Memory",
         "find_definition" => "Finding definition",
         "find_references" => "Finding references",
         "symbol_search" => "Searching symbols",
@@ -365,12 +360,7 @@ mod tests {
         assert_eq!(friendly_tool_name("mo_query"), "MatrixOne query");
         assert_eq!(friendly_tool_name("mo_snapshot"), "MatrixOne snapshot");
         assert_eq!(friendly_tool_name("mo_branch"), "MatrixOne branch");
-        assert_eq!(friendly_tool_name("memory_retrieve"), "Recalling");
-        assert_eq!(friendly_tool_name("memory_store"), "Storing");
-        assert_eq!(friendly_tool_name("memory_search"), "Searching memory");
-        assert_eq!(friendly_tool_name("memory_purge"), "Purging memory");
-        assert_eq!(friendly_tool_name("memory_correct"), "Correcting memory");
-        assert_eq!(friendly_tool_name("memory_profile"), "Checking profile");
+        assert_eq!(friendly_tool_name("memory"), "Memory");
         assert_eq!(friendly_tool_name("find_definition"), "Finding definition");
         assert_eq!(friendly_tool_name("find_references"), "Finding references");
         assert_eq!(friendly_tool_name("symbol_search"), "Searching symbols");

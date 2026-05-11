@@ -224,7 +224,7 @@ const TYPES_SECTION: &str = "\
 ### Storage rules
 - Do NOT ask whether to store — just store, then confirm.
 - Do NOT explore codebase for interest expressions.
-- Before storing, check if a similar memory exists. Use memory_correct to update instead of duplicating.
+- Before storing, check if a similar memory exists. Use `memory(action=correct)` to update instead of duplicating.
 - Negative preferences (\"不喜欢\", \"don't want\", \"stop using\") → store and respect in future decisions.
 - If a memory seems outdated, correct it rather than storing a new one.
 - '## User Memories' (when present) = user context — check it BEFORE calling any tool.\n";
@@ -503,7 +503,7 @@ mod tests {
     #[test]
     fn full_mode_has_deduplication_rule() {
         let prompt = build_memory_prompt(MemoryPromptMode::Full);
-        assert!(prompt.contains("memory_correct"));
+        assert!(prompt.contains("memory(action=correct)"));
     }
 
     #[test]

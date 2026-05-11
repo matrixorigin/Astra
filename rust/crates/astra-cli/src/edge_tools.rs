@@ -1966,12 +1966,6 @@ impl ToolExecutor {
                     }
                     self.memoria_call(op, &clean_args).await
                 }
-                "memory_retrieve" => self.memoria_call("retrieve", args).await,
-                "memory_store" => self.memoria_call("store", args).await,
-                "memory_search" => self.memoria_call("search", args).await,
-                "memory_purge" => self.memoria_call("purge", args).await,
-                "memory_correct" => self.memoria_call("correct", args).await,
-                "memory_profile" => self.memoria_call("profile", args).await,
                 "adjust_config" => self.adjust_config(args),
                 "prioritize_tool" => self.prioritize_tool(args),
                 "deprioritize_tool" => self.deprioritize_tool(args),

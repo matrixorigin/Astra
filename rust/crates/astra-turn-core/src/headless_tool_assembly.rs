@@ -929,9 +929,7 @@ mod tests {
             "mo_query",
             "mo_snapshot",
             "mo_branch",
-            "memory_store",
-            "memory_purge",
-            "memory_correct",
+            "memory", // action-aware; conservatively classified as Mutating
         ];
         for &tool in READ_ONLY_TOOLS.iter() {
             assert!(

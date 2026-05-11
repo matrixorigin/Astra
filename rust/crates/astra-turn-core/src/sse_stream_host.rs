@@ -114,7 +114,15 @@ pub struct ToolBatchRequest {
 /// making them safe to execute in parallel via `futures::future::join_all`.
 /// This includes both sync tools (fast local I/O) and async tools (network I/O
 /// that benefits most from parallel execution).
-pub fn is_tool_concurrency_safe(tool: &str) -> bool {
+pub fn is_tool_concurrency_safe(tool: &str, args: Option<&serde_json::Value>) -> bool {
+    // `memory` is action-aware: retrieve/search/profile/feedback are safe;
+    // store/purge/correct are not. Without args we're conservative.
+    if tool == "memory" {
+        return matches!(
+            args.and_then(|a| a.get("action")).and_then(|v| v.as_str()),
+            Some("retrieve") | Some("search") | Some("profile") | Some("feedback")
+        );
+    }
     matches!(
         tool,
         // ── Local read-only (sync) ───────────────────────────────────
@@ -156,10 +164,6 @@ pub fn is_tool_concurrency_safe(tool: &str) -> bool {
             | "github_list_issues"
             | "github_get_issue"
             | "github_repo_stats"
-            // ── Memoria read-only (async) ────────────────────────────
-            | "memory_retrieve"
-            | "memory_search"
-            | "memory_profile"
     )
 }
 

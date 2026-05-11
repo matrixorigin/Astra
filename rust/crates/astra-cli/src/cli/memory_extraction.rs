@@ -5,8 +5,8 @@
 //! references) via Memoria. Inspired by Claude Code's `extractMemories`.
 //!
 //! Key invariants:
-//! - **Mutual exclusion**: if the main model already called `memory_store`
-//!   this turn, extraction is skipped (no double-writes).
+//! - **Mutual exclusion**: if the main model already invoked the `memory`
+//!   tool this turn, extraction is skipped (no double-writes).
 //! - **Fire-and-forget**: never blocks the next user input.
 //! - **Single in-flight**: at most one extraction runs at a time.
 //! - **Quality gate**: extracted content must pass `is_high_quality_lesson`.
@@ -102,9 +102,17 @@ pub fn parse_extraction_response(response: &str) -> Vec<ExtractedMemory> {
         .collect()
 }
 
-/// Check if the main model already wrote to memory this turn.
+/// Check if the main model already touched memory this turn.
+///
+/// The `memory` tool is action-aware (retrieve / store / purge / …) but by
+/// the time we reach here we only carry tool *names*, not args. Per-action
+/// information would need to thread through `recent_tools` serialization
+/// (invasive); for now we use the conservative rule: if the main model
+/// invoked `memory` at all, skip background extraction this turn. Cost:
+/// occasional missed extractions after read-only retrieves. Benefit: zero
+/// risk of double-writing the same memory on a store-heavy turn.
 pub fn main_model_wrote_memory(tools_used: &[String]) -> bool {
-    tools_used.iter().any(|t| t == "memory_store")
+    tools_used.iter().any(|t| t == "memory")
 }
 
 /// Actual cache usage reported by the provider, when available.
@@ -765,15 +773,12 @@ mod tests {
     // ── main_model_wrote_memory ──
 
     #[test]
-    fn detects_memory_store_in_tools() {
-        assert!(main_model_wrote_memory(&[
-            "bash".into(),
-            "memory_store".into()
-        ]));
+    fn detects_memory_use_in_tools() {
+        assert!(main_model_wrote_memory(&["bash".into(), "memory".into()]));
     }
 
     #[test]
-    fn no_memory_store() {
+    fn no_memory_use() {
         assert!(!main_model_wrote_memory(&[
             "bash".into(),
             "read_file".into()
@@ -849,7 +854,7 @@ mod tests {
             model_name: "m".into(),
             provider: "openai".into(),
         };
-        let tools = vec!["memory_store".into()];
+        let tools = vec!["memory".into()];
         let outcome = ext.maybe_extract(ctx(1, Some(&params), &tools));
         assert_eq!(outcome.tag(), "skipped_main_wrote");
     }

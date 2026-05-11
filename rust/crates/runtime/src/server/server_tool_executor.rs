@@ -1280,26 +1280,6 @@ impl ServerToolExecutor {
                     astra_tools::ToolResult::text(output)
                 }
             }
-            // Legacy aliases
-            "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
-            | "memory_correct" | "memory_profile" => {
-                let op = name.strip_prefix("memory_").unwrap_or(name);
-                let mut isolated_args = args.clone();
-                if let Some(obj) = isolated_args.as_object_mut() {
-                    obj.remove("action"); // defensive: strip if present
-                    obj.insert(
-                        "session_id".to_string(),
-                        Value::String(self.user_id.clone()),
-                    );
-                    obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
-                }
-                let output = self.memoria_client.call(op, &isolated_args).await;
-                if output.starts_with("Error") {
-                    astra_tools::ToolResult::error(output)
-                } else {
-                    astra_tools::ToolResult::text(output)
-                }
-            }
             // ── Tool search (first-class activation primitive) ─────────
             //
             // Lets the LLM look up schemas for deferred tools listed in
@@ -4802,7 +4782,7 @@ esac
         // We can't actually call Memoria, but we can verify the execute path
         // doesn't panic and returns a reasonable error (no MEMORIA_BASE_URL set).
         let result = exec
-            .execute("memory_store", &json!({"content": "test"}))
+            .execute("memory", &json!({"action": "store", "content": "test"}))
             .await;
         // Should attempt the call (may fail due to no server, but shouldn't crash)
         assert!(!result.is_empty());

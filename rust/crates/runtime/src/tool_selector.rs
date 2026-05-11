@@ -1002,8 +1002,8 @@ mod tests {
 
     #[test]
     fn parse_json_array() {
-        let names = parse_tool_names_from_llm(r#"["github", "memory_search"]"#);
-        assert_eq!(names, vec!["github", "memory_search"]);
+        let names = parse_tool_names_from_llm(r#"["github", "memory"]"#);
+        assert_eq!(names, vec!["github", "memory"]);
     }
 
     #[test]
@@ -1117,12 +1117,11 @@ mod tests {
 
     #[test]
     fn memory_query_has_memory_tools_available() {
-        // The full memory toolset (memory_store, memory_retrieve, memory_purge,
-        // memory_correct) is now pinned — always included in the static tool
-        // prefix — so a memory-query doesn't need to "activate" them via
-        // dynamic ranking. This test asserts the pinning contract instead:
-        // every turn, regardless of query, the pinned prefix carries the
-        // memory tools.
+        // The consolidated `memory` tool (action-aware: store/retrieve/purge/
+        // correct/…) is pinned — always included in the static tool prefix —
+        // so a memory-query doesn't need to "activate" it via dynamic ranking.
+        // This test asserts the pinning contract: every turn, regardless of
+        // query, the pinned prefix carries the memory tool.
         let pinned_memory: Vec<&str> = TOOL_CATALOG
             .iter()
             .filter(|t| t.pinned && t.intents.contains(&IntentType::Memory))

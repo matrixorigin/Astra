@@ -456,24 +456,29 @@ fn fmt_mo_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
 }
 
 fn fmt_memory_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
-    match name {
-        "memory_retrieve" | "memory_search" => obj
+    // `memory` is the single consolidated tool; the `action` field selects
+    // retrieve / search / store / purge / correct / profile / feedback.
+    if name != "memory" {
+        return None;
+    }
+    let action = obj.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    match action {
+        "retrieve" | "search" => obj
             .get("query")
             .and_then(|v| v.as_str())
             .map(|q| truncate_str(q, 50)),
-        "memory_store" => obj
+        "store" => obj
             .get("content")
             .and_then(|v| v.as_str())
             .map(|content| truncate_str(content, 50)),
-        "memory_purge" => obj
+        "purge" => obj
             .get("topic")
             .and_then(|v| v.as_str())
             .map(|topic| truncate_str(topic, 40)),
-        "memory_correct" => obj
+        "correct" => obj
             .get("memory_id")
             .and_then(|v| v.as_str())
             .map(|memory_id| truncate_str(memory_id, 40)),
-        "memory_profile" => None,
         _ => None,
     }
 }
@@ -1317,19 +1322,28 @@ mod tests {
 
     #[test]
     fn tool_call_detail_memory_shows_query() {
-        let detail = tool_call_detail("memory_search", &json!({"query": "memoria repo"}));
+        let detail = tool_call_detail(
+            "memory",
+            &json!({"action": "search", "query": "memoria repo"}),
+        );
         assert_eq!(detail.as_deref(), Some("memoria repo"));
     }
 
     #[test]
     fn tool_call_detail_memory_purge_shows_topic() {
-        let detail = tool_call_detail("memory_purge", &json!({"topic": "renderer drift"}));
+        let detail = tool_call_detail(
+            "memory",
+            &json!({"action": "purge", "topic": "renderer drift"}),
+        );
         assert_eq!(detail.as_deref(), Some("renderer drift"));
     }
 
     #[test]
     fn tool_call_detail_memory_correct_shows_id() {
-        let detail = tool_call_detail("memory_correct", &json!({"memory_id": "mem-123"}));
+        let detail = tool_call_detail(
+            "memory",
+            &json!({"action": "correct", "memory_id": "mem-123"}),
+        );
         assert_eq!(detail.as_deref(), Some("mem-123"));
     }
 

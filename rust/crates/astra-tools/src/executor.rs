@@ -523,14 +523,6 @@ impl DefaultToolExecutor {
                      Use ServerToolExecutor or CliToolExecutor instead of DefaultToolExecutor."
                 ))
             }
-            // Legacy aliases
-            "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
-            | "memory_correct" | "memory_profile" | "memory_feedback" => {
-                ToolResult::error(format!(
-                    "Error: Memory tool '{name}' requires a configured memoria endpoint. \
-                     Use ServerToolExecutor or CliToolExecutor instead of DefaultToolExecutor."
-                ))
-            }
 
             // ── run_script (programmatic tool calling via Python + UDS RPC) ──
             "run_script" => {
@@ -1368,7 +1360,10 @@ mod tests {
     async fn dispatch_memory_without_endpoint() {
         let (_tmp, exec) = test_executor();
         let result = exec
-            .execute("memory_store", &serde_json::json!({"content": "test"}))
+            .execute(
+                "memory",
+                &serde_json::json!({"action": "store", "content": "test"}),
+            )
             .await;
         assert!(result.is_error);
         assert!(
