@@ -1220,6 +1220,13 @@ impl InProcessChatTurnBridge {
             // `## User Memories`). When present, the CLI digest is
             // authoritative. See `bridge_should_run_memoria_prefetch`.
             let mut memoria_prefetch_entries = Vec::new();
+            // First-turn-only cold warmup: pull user profile + recent
+            // episodes so cross-session continuity is baked into the
+            // system prompt before the model starts reasoning. Bundled
+            // with the per-turn recall into a single `<session_memory>`
+            // block to keep the cache prefix stable across turns — the
+            // block only changes between session boundaries.
+            let is_first_turn = trace_turn <= 1;
             let memoria_prefetch_section = if !bridge_should_run_memoria_prefetch(&edge_profile) {
                 None
             } else if let (Some(mem_url), Some(mem_key)) = (
@@ -1236,12 +1243,40 @@ impl InProcessChatTurnBridge {
                     .get("retrieval_top_k")
                     .and_then(Value::as_u64)
                     .unwrap_or(5) as u32;
-                let result = prefetch_memories(mem_url, mem_key, user_msg, &user_id, top_k).await;
-                memory_fetch_ms = result.fetch_ms;
-                memory_items = result.items;
-                memory_preview = result.preview;
-                memoria_prefetch_entries = result.entries;
-                result.section
+
+                // Per-turn hybrid recall runs every turn. Session-start
+                // (profile + episodes) runs only on turn 1.
+                let (per_turn, session_start) = tokio::join!(
+                    prefetch_memories(mem_url, mem_key, user_msg, &user_id, top_k),
+                    async {
+                        if is_first_turn {
+                            Some(
+                                prefetch_session_start_memories(mem_url, mem_key, &user_id)
+                                    .await,
+                            )
+                        } else {
+                            None
+                        }
+                    }
+                );
+
+                memory_fetch_ms = per_turn.fetch_ms
+                    + session_start
+                        .as_ref()
+                        .map(|s| s.fetch_ms)
+                        .unwrap_or(0);
+                memory_items = per_turn.items;
+                memory_preview = per_turn.preview;
+                memoria_prefetch_entries = per_turn.entries;
+
+                // Combine the two rendered sections. If both exist, the
+                // session-start block comes first (cold warmup, ordered
+                // by recency of relevance).
+                match (session_start.and_then(|s| s.section), per_turn.section) {
+                    (Some(start), Some(turn)) => Some(format!("{start}\n\n{turn}")),
+                    (Some(start), None) => Some(start),
+                    (None, turn) => turn,
+                }
             } else {
                 None
             };
@@ -3632,7 +3667,10 @@ async fn persist_bridge_stream_failure_capture(
 }
 
 // ── Memory prefetch — delegated to turn::memory_prefetch ─────────────────────
-pub use super::memory_prefetch::{MemoryPrefetchResult, prefetch_memories};
+pub use super::memory_prefetch::{
+    MemoryPrefetchResult, SessionStartPrefetchResult, prefetch_memories,
+    prefetch_session_start_memories,
+};
 
 /// Test-accessible wrapper around private schema pruning — used by integration
 /// tests that need to verify progressive schema detail levels.

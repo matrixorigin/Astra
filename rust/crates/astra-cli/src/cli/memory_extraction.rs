@@ -102,17 +102,91 @@ pub fn parse_extraction_response(response: &str) -> Vec<ExtractedMemory> {
         .collect()
 }
 
-/// Check if the main model already touched memory this turn.
+/// Check if the main model already **wrote** to memory this turn.
 ///
-/// The `memory` tool is action-aware (retrieve / store / purge / …) but by
-/// the time we reach here we only carry tool *names*, not args. Per-action
-/// information would need to thread through `recent_tools` serialization
-/// (invasive); for now we use the conservative rule: if the main model
-/// invoked `memory` at all, skip background extraction this turn. Cost:
-/// occasional missed extractions after read-only retrieves. Benefit: zero
-/// risk of double-writing the same memory on a store-heavy turn.
+/// Write actions (`remember`, `forget`, `update`, `focus`, `reflect`,
+/// `feedback`) mean the agent is actively shaping durable state — the
+/// background extractor should stand down to avoid racing or
+/// double-writing. Read actions (`recall`, `expand`, `profile`) do not
+/// block extraction.
+///
+/// `actions` should list every `memory(action=…)` call made this turn,
+/// populated at the call site that has access to tool-call args.
+/// When the slice is empty the function treats the turn as
+/// "wrote nothing" — the conservative legacy name-only skip is
+/// handled by the caller via the secondary `tools_used` check
+/// (see [`MemoryExtractor::maybe_extract`]).
+pub fn main_model_wrote_memory_actions(actions: &[String]) -> bool {
+    actions.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "remember" | "forget" | "update" | "focus" | "reflect" | "feedback"
+        )
+    })
+}
+
+/// Legacy name-only check. Kept for callers that don't yet have
+/// per-action visibility (e.g. restored sessions where we only
+/// rehydrate tool names). Treats any `memory` call as a write —
+/// conservative but correctness-safe.
 pub fn main_model_wrote_memory(tools_used: &[String]) -> bool {
     tools_used.iter().any(|t| t == "memory")
+}
+
+/// Extract the `action` field from every `memory(action=…)` tool call
+/// in a list of journal records. Returns actions in call order.
+///
+/// We scan `args_preview` (the already-truncated JSON-ish blob the
+/// journal stores) with a small, forgiving pattern: the preview is
+/// capped at ~80 chars but the `"action":"…"` entry sits at the front
+/// of the object in all dispatch paths, so it survives truncation.
+pub fn extract_memory_actions(
+    records: &[astra_services::session_journal::ToolCallRecord],
+) -> Vec<String> {
+    records
+        .iter()
+        .filter(|r| r.name == "memory")
+        .filter_map(|r| {
+            r.args_preview
+                .as_deref()
+                .and_then(parse_action_from_preview)
+        })
+        .collect()
+}
+
+/// Best-effort extraction of the `"action"` value from a truncated
+/// JSON-ish preview string. Accepts both double-quoted and single-
+/// quoted variants since different dispatch paths use slightly
+/// different preview formatters. Returns `None` when the field is
+/// absent or malformed.
+fn parse_action_from_preview(preview: &str) -> Option<String> {
+    for marker in [
+        "\"action\":\"",
+        "\"action\": \"",
+        "'action':'",
+        "'action': '",
+    ] {
+        if let Some(idx) = preview.find(marker) {
+            let rest = &preview[idx + marker.len()..];
+            let end = rest.find(['"', '\''])?;
+            let action = &rest[..end];
+            if !action.is_empty() {
+                return Some(action.to_string());
+            }
+        }
+    }
+    // Key=value fallback used by some test fixtures.
+    if let Some(idx) = preview.find("action=") {
+        let rest = &preview[idx + "action=".len()..];
+        let action: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if !action.is_empty() {
+            return Some(action);
+        }
+    }
+    None
 }
 
 /// Actual cache usage reported by the provider, when available.
@@ -245,7 +319,16 @@ pub struct ExtractionContext<'a> {
     pub selector_params: Option<&'a LlmConnParams>,
     pub user_message: &'a str,
     pub assistant_response: &'a str,
+    /// Tool *names* the main model invoked this turn (names only; no args).
+    /// Used for the legacy name-only skip heuristic when
+    /// `recent_memory_actions` is empty.
     pub tools_used: &'a [String],
+    /// `memory(action=…)` action strings observed on this turn, in
+    /// call order. When non-empty, the orchestrator uses these to
+    /// decide skip-on-write precisely (only actual write actions
+    /// block extraction). Empty means "no per-action info available";
+    /// the caller falls back to the conservative name-only heuristic.
+    pub recent_memory_actions: &'a [String],
     pub session_id: Option<&'a str>,
     pub existing_manifest: &'a str,
     /// Fork prefix captured from the parent turn. When available AND the
@@ -306,7 +389,16 @@ impl MemoryExtractor {
             );
             return ExtractionOutcome::SkippedBusy { prior_turn: prior };
         }
-        if main_model_wrote_memory(ctx.tools_used) {
+        // Skip extraction when the main model already *wrote* to memory
+        // this turn. Prefer the precise per-action signal when we have
+        // it; fall back to the conservative name-only heuristic only
+        // when actions weren't threaded through (legacy code paths).
+        let skip = if !ctx.recent_memory_actions.is_empty() {
+            main_model_wrote_memory_actions(ctx.recent_memory_actions)
+        } else {
+            main_model_wrote_memory(ctx.tools_used)
+        };
+        if skip {
             self.last_processed_turn = ctx.turn;
             return ExtractionOutcome::SkippedMainWrote;
         }
@@ -839,6 +931,28 @@ mod tests {
             user_message: "msg",
             assistant_response: "resp",
             tools_used: tools,
+            recent_memory_actions: &[],
+            session_id: None,
+            existing_manifest: "",
+            fork_prefix: None,
+        }
+    }
+
+    /// Variant that also carries `recent_memory_actions` so tests can
+    /// verify the action-aware skip path.
+    fn ctx_with_actions<'a>(
+        turn: u32,
+        params: Option<&'a LlmConnParams>,
+        tools: &'a [String],
+        actions: &'a [String],
+    ) -> ExtractionContext<'a> {
+        ExtractionContext {
+            turn,
+            selector_params: params,
+            user_message: "msg",
+            assistant_response: "resp",
+            tools_used: tools,
+            recent_memory_actions: actions,
             session_id: None,
             existing_manifest: "",
             fork_prefix: None,
@@ -857,6 +971,131 @@ mod tests {
         let tools = vec!["memory".into()];
         let outcome = ext.maybe_extract(ctx(1, Some(&params), &tools));
         assert_eq!(outcome.tag(), "skipped_main_wrote");
+    }
+
+    #[tokio::test]
+    async fn extractor_does_not_skip_when_only_memory_reads() {
+        // With per-action visibility, read-only `recall` / `expand` /
+        // `profile` calls no longer block extraction — only actual
+        // writes do.
+        let mut ext = MemoryExtractor::new();
+        let params = LlmConnParams {
+            base_url: "http://x".into(),
+            api_key: "k".into(),
+            model_name: "m".into(),
+            provider: "openai".into(),
+        };
+        let tools = vec!["memory".into(), "memory".into()];
+        let actions = vec!["recall".into(), "expand".into()];
+        let outcome = ext.maybe_extract(ctx_with_actions(1, Some(&params), &tools, &actions));
+        // The background worker may spawn; we just need to confirm the
+        // write-gate didn't pre-empt it.
+        assert_ne!(
+            outcome.tag(),
+            "skipped_main_wrote",
+            "read-only memory actions must not block extraction"
+        );
+    }
+
+    #[test]
+    fn extractor_skips_when_action_is_write() {
+        let mut ext = MemoryExtractor::new();
+        let params = LlmConnParams {
+            base_url: "http://x".into(),
+            api_key: "k".into(),
+            model_name: "m".into(),
+            provider: "openai".into(),
+        };
+        let tools = vec!["memory".into()];
+        // A single `remember` should trigger the skip.
+        let actions = vec!["remember".into()];
+        let outcome = ext.maybe_extract(ctx_with_actions(1, Some(&params), &tools, &actions));
+        assert_eq!(outcome.tag(), "skipped_main_wrote");
+    }
+
+    #[test]
+    fn extract_memory_actions_reads_double_quoted_action() {
+        let rec = |name: &str, preview: &str| astra_services::session_journal::ToolCallRecord {
+            name: name.into(),
+            ok: true,
+            args_preview: Some(preview.into()),
+            ..Default::default()
+        };
+        let records = vec![
+            rec("memory", r#"{"action":"recall","query":"auth"}"#),
+            rec("bash", r#"{"command":"ls"}"#),
+            rec("memory", r#"{"action":"remember","content":"prefer …"#),
+        ];
+        assert_eq!(
+            extract_memory_actions(&records),
+            vec!["recall".to_string(), "remember".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_memory_actions_survives_truncation() {
+        // Even if the preview is cut mid-content, the `"action":"…"`
+        // prefix sits at the front and remains recoverable.
+        let rec = astra_services::session_journal::ToolCallRecord {
+            name: "memory".into(),
+            ok: true,
+            args_preview: Some(r#"{"action":"forget","memory_id":"m1…"#.into()),
+            ..Default::default()
+        };
+        assert_eq!(extract_memory_actions(&[rec]), vec!["forget".to_string()]);
+    }
+
+    #[test]
+    fn extract_memory_actions_handles_key_value_style() {
+        let rec = astra_services::session_journal::ToolCallRecord {
+            name: "memory".into(),
+            ok: true,
+            args_preview: Some("action=recall query=auth".into()),
+            ..Default::default()
+        };
+        assert_eq!(extract_memory_actions(&[rec]), vec!["recall".to_string()]);
+    }
+
+    #[test]
+    fn extract_memory_actions_ignores_other_tools() {
+        let records = vec![astra_services::session_journal::ToolCallRecord {
+            name: "bash".into(),
+            args_preview: Some(r#"{"action":"not_memory"}"#.into()),
+            ..Default::default()
+        }];
+        assert!(extract_memory_actions(&records).is_empty());
+    }
+
+    #[test]
+    fn extract_memory_actions_returns_empty_when_args_missing() {
+        let records = vec![astra_services::session_journal::ToolCallRecord {
+            name: "memory".into(),
+            args_preview: None,
+            ..Default::default()
+        }];
+        assert!(extract_memory_actions(&records).is_empty());
+    }
+
+    #[test]
+    fn main_model_wrote_memory_actions_classifies_v2_verbs() {
+        // Writes
+        for w in [
+            "remember", "forget", "update", "focus", "reflect", "feedback",
+        ] {
+            assert!(
+                main_model_wrote_memory_actions(&[w.to_string()]),
+                "{w} should count as a write"
+            );
+        }
+        // Reads
+        for r in ["recall", "expand", "profile"] {
+            assert!(
+                !main_model_wrote_memory_actions(&[r.to_string()]),
+                "{r} should NOT count as a write"
+            );
+        }
+        // Empty list → not a write
+        assert!(!main_model_wrote_memory_actions(&[]));
     }
 
     #[test]
@@ -1351,6 +1590,7 @@ mod tests {
             user_message: "hello",
             assistant_response: "world",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: None,
@@ -1386,6 +1626,7 @@ mod tests {
             user_message: "I prefer Rust",
             assistant_response: "Noted",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: None,
@@ -1423,6 +1664,7 @@ mod tests {
             user_message: "I prefer Rust",
             assistant_response: "Noted",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: None,
@@ -1457,6 +1699,7 @@ mod tests {
             user_message: "keep it concise",
             assistant_response: "ok",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: None,
@@ -1644,6 +1887,7 @@ mod tests {
             user_message: "set dark mode",
             assistant_response: "done",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: Some(prefix),
@@ -1689,6 +1933,7 @@ mod tests {
             user_message: "be verbose",
             assistant_response: "ok",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: None,
@@ -1796,6 +2041,7 @@ mod tests {
             user_message: "test",
             assistant_response: "ok",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: Some(prefix),
@@ -1925,6 +2171,7 @@ mod tests {
             user_message: "be concise",
             assistant_response: "ok",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: Some(prefix),
@@ -1962,6 +2209,7 @@ mod tests {
             user_message: "test",
             assistant_response: "ok",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: Some(prefix),
@@ -2003,6 +2251,7 @@ mod tests {
             user_message: "deadline is friday",
             assistant_response: "noted",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: None,

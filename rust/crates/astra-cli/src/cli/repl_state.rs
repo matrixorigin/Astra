@@ -137,6 +137,12 @@ pub(crate) struct ReplState {
     pub journal: Option<session_journal::JournalWriter>,
     /// Tools used in the last turn — fed into selection for recency boost.
     pub recent_tools: Vec<String>,
+    /// `memory(action=…)` action strings observed on this turn, in
+    /// call order. Emptied at the start of each turn and populated as
+    /// tool calls run. Used by the extraction gate to precisely skip
+    /// only when an actual write action fired — read actions
+    /// (`recall` / `expand` / `profile`) do not block extraction.
+    pub recent_memory_actions: Vec<String>,
     /// Session-persistent permission manager — "always"/"skip" survives across turns.
     pub perm_manager: PermissionManager,
     /// User ID for event ingestion attribution.
@@ -431,6 +437,7 @@ impl Default for ReplState {
             context_budget: prompts::ContextBudget::default(),
             journal: None,
             recent_tools: Vec::new(),
+            recent_memory_actions: Vec::new(),
             perm_manager: PermissionManager::with_project(
                 std::env::var("ASTRA_CLI_AUTO_APPROVE")
                     .map(|v| v == "1")

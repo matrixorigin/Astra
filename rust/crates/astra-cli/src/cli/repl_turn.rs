@@ -1718,6 +1718,7 @@ async fn apply_turn_success_async(
 
     // Background memory extraction: analyze this turn for durable memories.
     let tools_used: Vec<String> = state.recent_tools.to_vec();
+    let recent_memory_actions: Vec<String> = state.recent_memory_actions.to_vec();
     let extraction_turn = state.turn;
 
     // Resolve fork prefix for extraction cache sharing: look up the
@@ -1742,6 +1743,7 @@ async fn apply_turn_success_async(
                 user_message: line,
                 assistant_response: state.last_response.as_deref().unwrap_or(""),
                 tools_used: &tools_used,
+                recent_memory_actions: &recent_memory_actions,
                 session_id: state.session_id.as_deref(),
                 existing_manifest: "",
                 fork_prefix,
@@ -1864,6 +1866,8 @@ fn apply_turn_success_sync(
         build_history_text(&result.full_text, &result.tool_call_records),
     ));
     state.recent_tools = result.tools_used.clone();
+    state.recent_memory_actions =
+        super::memory_extraction::extract_memory_actions(&result.tool_call_records);
 
     // Persist tool health for cross-session error budgets
     if !result.tool_health_export.is_empty() {

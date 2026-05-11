@@ -90,6 +90,136 @@ pub async fn prefetch_memories(
     }
 }
 
+/// Result of a session-start prefetch — gathers `profile` + recent
+/// `episodic` memories so the first turn of a session has
+/// cross-session continuity baked into the system prompt.
+///
+/// The three buckets mirror `MemoryOrchestrator::SessionStartMemories`
+/// but stay in the prefetch module so we don't drag the orchestrator
+/// dependency into `bridge_inprocess`.
+#[derive(Debug, Default)]
+pub struct SessionStartPrefetchResult {
+    /// Rendered `<session_memory>` block. `None` when nothing to inject.
+    pub section: Option<String>,
+    /// Ground-truth profile memories (`memory_type=profile`).
+    pub profile: Vec<RankableMemory>,
+    /// Most recent cross-session episodes (`memory_type=episodic`).
+    pub recent_episodes: Vec<RankableMemory>,
+    /// How long the prefetch took.
+    pub fetch_ms: i64,
+}
+
+/// Prefetch session-start memories: profile + recent episodes. Intended
+/// to run **only on the first turn** of a session — the caller decides
+/// based on `turn_number`. On non-first turns we rely on
+/// `prefetch_memories` (hybrid per-turn recall) to surface relevant
+/// memory.
+///
+/// Both fetches run in parallel; any fetch failure is treated as "no
+/// memory" so a degraded Memoria never blocks the turn.
+pub async fn prefetch_session_start_memories(
+    mem_url: &str,
+    mem_key: &str,
+    user_id: &str,
+) -> SessionStartPrefetchResult {
+    if mem_key.is_empty() {
+        return SessionStartPrefetchResult::default();
+    }
+    let started = Instant::now();
+
+    // Two queries in parallel:
+    //   1. `profile` — broad query to surface user-identity memories.
+    //      Filtered client-side on `memory_type == "profile"`.
+    //   2. `episodic` — query biased toward recent session summaries.
+    //      Filtered on `memory_type == "episodic"`.
+    const PROFILE_TOP_K: u32 = 5;
+    const EPISODE_TOP_K: u32 = 6;
+    let (profile_raw, episode_raw) = tokio::join!(
+        fetch_memories_structured(
+            mem_url,
+            mem_key,
+            "user profile preferences role",
+            user_id,
+            PROFILE_TOP_K,
+        ),
+        fetch_memories_structured(
+            mem_url,
+            mem_key,
+            "recent session episode summary",
+            user_id,
+            EPISODE_TOP_K,
+        )
+    );
+
+    let mut profile: Vec<RankableMemory> = profile_raw
+        .into_iter()
+        .filter(|m| m.memory_type == "profile")
+        .collect();
+    let mut recent_episodes: Vec<RankableMemory> = episode_raw
+        .into_iter()
+        .filter(|m| m.memory_type == "episodic")
+        .collect();
+
+    // Sort each bucket by server-side retrieval score and cap.
+    astra_turn_types::sort_by_retrieval_score(&mut profile);
+    astra_turn_types::sort_by_retrieval_score(&mut recent_episodes);
+    profile.truncate(3);
+    recent_episodes.truncate(3);
+
+    let section = build_session_start_block(&profile, &recent_episodes);
+    SessionStartPrefetchResult {
+        section,
+        profile,
+        recent_episodes,
+        fetch_ms: started.elapsed().as_millis() as i64,
+    }
+}
+
+/// Render the `<session_memory>` block injected into the system prompt
+/// on the first turn. Returns `None` when both lists are empty so the
+/// caller can skip injection entirely.
+fn build_session_start_block(
+    profile: &[RankableMemory],
+    episodes: &[RankableMemory],
+) -> Option<String> {
+    if profile.is_empty() && episodes.is_empty() {
+        return None;
+    }
+    let mut s = String::with_capacity(512);
+    s.push_str("<session_memory>\n");
+    if !profile.is_empty() {
+        s.push_str("### User profile\n");
+        for m in profile {
+            s.push_str("- ");
+            s.push_str(&session_start_line(&m.content, 160));
+            s.push('\n');
+        }
+    }
+    if !episodes.is_empty() {
+        s.push_str("### Recent sessions\n");
+        for m in episodes {
+            s.push_str("- ");
+            s.push_str(&session_start_line(&m.content, 200));
+            s.push('\n');
+        }
+    }
+    s.push_str("</session_memory>");
+    Some(s)
+}
+
+/// Compact one memory entry to its first meaningful line, capped.
+fn session_start_line(raw: &str, budget: usize) -> String {
+    let first = raw.lines().find(|l| !l.trim().is_empty()).unwrap_or(raw);
+    let normalized: String = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= budget {
+        normalized
+    } else {
+        let mut out: String = normalized.chars().take(budget.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
 /// Flatten a retrieved entry to its compact view:
 /// `[@ns/status] <abstract>`. Drops any overview/detail layers so the
 /// volatile system-prompt lane stays within budget.
@@ -1093,6 +1223,54 @@ mod tests {
         let result = prefetch_memories("http://localhost", "key", "   ", "user1", 5).await;
         assert!(result.section.is_none());
         assert_eq!(result.items, 0);
+    }
+
+    #[tokio::test]
+    async fn prefetch_session_start_empty_key_is_noop() {
+        let result = prefetch_session_start_memories("http://localhost", "", "user1").await;
+        assert!(result.section.is_none());
+        assert!(result.profile.is_empty());
+        assert!(result.recent_episodes.is_empty());
+    }
+
+    #[test]
+    fn session_start_block_none_when_empty() {
+        let out = build_session_start_block(&[], &[]);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn session_start_block_emits_both_sections_when_populated() {
+        fn mem(id: &str, ty: &str, c: &str) -> RankableMemory {
+            RankableMemory {
+                memory_id: id.into(),
+                memory_type: ty.into(),
+                content: c.into(),
+                retrieval_score: Some(0.8),
+                trust_tier: None,
+            }
+        }
+        let profile = vec![mem("p1", "profile", "[user] prefers Rust")];
+        let episodes = vec![mem(
+            "e1",
+            "episodic",
+            "[episode] turn=5, finished auth refactor",
+        )];
+        let out = build_session_start_block(&profile, &episodes).expect("non-empty");
+        assert!(out.starts_with("<session_memory>"));
+        assert!(out.ends_with("</session_memory>"));
+        assert!(out.contains("### User profile"));
+        assert!(out.contains("### Recent sessions"));
+        assert!(out.contains("prefers Rust"));
+        assert!(out.contains("auth refactor"));
+    }
+
+    #[test]
+    fn session_start_line_respects_budget_with_ellipsis() {
+        let long = "a".repeat(500);
+        let out = session_start_line(&long, 120);
+        assert!(out.chars().count() <= 120);
+        assert!(out.ends_with('…'));
     }
 
     #[test]
