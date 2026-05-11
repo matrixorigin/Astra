@@ -71,6 +71,7 @@ impl SessionStartMemories {
             for m in &self.profile {
                 s.push_str("- ");
                 s.push_str(compact_line(&m.content, 160).as_str());
+                s.push_str(&m.freshness_suffix());
                 s.push('\n');
             }
         }
@@ -79,6 +80,7 @@ impl SessionStartMemories {
             for m in &self.recent_episodes {
                 s.push_str("- ");
                 s.push_str(compact_line(&m.content, 200).as_str());
+                s.push_str(&m.freshness_suffix());
                 s.push('\n');
             }
         }
@@ -87,6 +89,7 @@ impl SessionStartMemories {
             for m in &self.relevant {
                 s.push_str("- ");
                 s.push_str(compact_line(&m.content, 160).as_str());
+                s.push_str(&m.freshness_suffix());
                 s.push('\n');
             }
         }
@@ -162,6 +165,13 @@ pub struct MemoryOrchestrator {
     /// entries are evicted on observation so a long-lived orchestrator
     /// doesn't leak memory.
     recall_ledger: std::sync::RwLock<std::collections::HashMap<String, RecallLedgerEntry>>,
+    /// "Already surfaced to the LLM this session" — dedup set of
+    /// memory_ids that have appeared in a `<session_memory>` block
+    /// or a recall result. `filter_already_seen` applies this to
+    /// trim repeat hits from per-turn recall so the LLM doesn't see
+    /// the same abstract five turns in a row.
+    seen_memory_ids:
+        std::sync::RwLock<std::collections::HashMap<String, std::collections::HashSet<String>>>,
 }
 
 impl MemoryOrchestrator {
@@ -171,6 +181,54 @@ impl MemoryOrchestrator {
             prefetch_top_k: 5,
             max_episodes: 3,
             recall_ledger: std::sync::RwLock::new(std::collections::HashMap::new()),
+            seen_memory_ids: std::sync::RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Mark a set of memory_ids as already surfaced to the LLM in this
+    /// session so future recalls can filter them out. Callers invoke
+    /// this after injecting a memory block into the prompt.
+    pub fn mark_surfaced(&self, session_id: &str, memory_ids: &[String]) {
+        if memory_ids.is_empty() {
+            return;
+        }
+        let Ok(mut g) = self.seen_memory_ids.write() else {
+            return;
+        };
+        let bucket = g.entry(session_id.to_string()).or_default();
+        for id in memory_ids {
+            if !id.is_empty() {
+                bucket.insert(id.clone());
+            }
+        }
+    }
+
+    /// Filter a candidate memory list down to ones not yet surfaced
+    /// this session. Returns a new Vec in the same order, minus
+    /// already-seen memory_ids. Read-only; does not mark anything.
+    pub fn filter_already_surfaced(
+        &self,
+        session_id: &str,
+        memories: Vec<MemoriaMemory>,
+    ) -> Vec<MemoriaMemory> {
+        let Ok(g) = self.seen_memory_ids.read() else {
+            return memories;
+        };
+        let Some(seen) = g.get(session_id) else {
+            return memories;
+        };
+        memories
+            .into_iter()
+            .filter(|m| !seen.contains(&m.memory_id))
+            .collect()
+    }
+
+    /// Clear the "already surfaced" set for a session. Intended for
+    /// session-end cleanup so long-lived orchestrator processes don't
+    /// keep per-session state indefinitely.
+    pub fn reset_session_surface(&self, session_id: &str) {
+        if let Ok(mut g) = self.seen_memory_ids.write() {
+            g.remove(session_id);
         }
     }
 
@@ -182,6 +240,80 @@ impl MemoryOrchestrator {
     pub fn with_max_episodes(mut self, max: usize) -> Self {
         self.max_episodes = max.max(1);
         self
+    }
+
+    /// Build a compact `<memory_index>` block — one line per known
+    /// memory (`- [type] memory_id: one-line abstract`). Intended for
+    /// always-injection into the session-stable prompt lane so the LLM
+    /// has ambient awareness of what it *could* recall, without the
+    /// token cost of the full content.
+    ///
+    /// `limit` caps the index size (default 80 entries ≈ ~1200 tokens).
+    /// Returns `None` when nothing to index.
+    pub async fn build_memory_index(&self, user_id: Option<&str>, limit: usize) -> Option<String> {
+        // We reuse `retrieve` with a broad query — Memoria's ranker
+        // surfaces the "most alive" memories first (recency +
+        // importance + access count). We then strip to the compact
+        // abstract + id form.
+        //
+        // Bailing on empty query is fine: `retrieve` treats it as
+        // "browse mode" and returns the most-recently-written items.
+        let all = self.client.retrieve("", user_id, limit.max(1)).await.ok()?;
+        if all.is_empty() {
+            return None;
+        }
+        let mut s = String::with_capacity(512);
+        s.push_str("<memory_index>\n");
+        s.push_str(
+            "(Ambient awareness — compact list of what you could recall. \
+            Call `memory(action=recall, query=X)` to pull the full content of a specific \
+            topic, or `memory(action=expand, memory_id=ID)` to drill into one entry.)\n",
+        );
+        for m in all.iter().take(limit) {
+            let abstract_line = compact_line(&m.content, 100);
+            let tag = if m.memory_type.is_empty() {
+                "?".to_string()
+            } else {
+                m.memory_type.clone()
+            };
+            let suffix = m.freshness_suffix();
+            s.push_str(&format!(
+                "- [{tag}] {}: {abstract_line}{suffix}\n",
+                m.memory_id
+            ));
+        }
+        s.push_str("</memory_index>");
+        Some(s)
+    }
+
+    /// Detect potentially conflicting memories before persisting a new
+    /// one. Returns the set of similar existing memories (by
+    /// retrieval-score rank) whose content overlaps `new_content`
+    /// enough that the caller should probably `update` rather than
+    /// `remember`.
+    ///
+    /// Cheap: one top-k recall. The caller decides policy — either
+    /// ask the LLM ("update or create?") or hand the ids to a
+    /// downstream `update` call.
+    pub async fn detect_conflicts(
+        &self,
+        new_content: &str,
+        session_id: Option<&str>,
+        similarity_floor: f64,
+    ) -> Vec<MemoriaMemory> {
+        if new_content.trim().is_empty() {
+            return Vec::new();
+        }
+        let candidates = match self.client.retrieve(new_content, session_id, 5).await {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        // Keep entries above the similarity floor (server-side `final_score`
+        // is already hybrid + tier-weighted; we trust it).
+        candidates
+            .into_iter()
+            .filter(|m| m.retrieval_score.unwrap_or(0.0) >= similarity_floor)
+            .collect()
     }
 
     /// Pre-warm: on session start, gather profile + recent episodes +
@@ -445,6 +577,7 @@ mod tests {
             memory_type: ty.into(),
             content: content.into(),
             retrieval_score: Some(0.8),
+            ..Default::default()
         }
     }
 
@@ -571,13 +704,21 @@ mod tests {
 
     struct FeedbackCapturingClient {
         feedback_calls: Mutex<Vec<(String, String, Option<String>)>>,
+        /// Optional canned retrieve response used by index / conflict tests.
+        retrieve_response: Mutex<Vec<MemoriaMemory>>,
     }
 
     impl FeedbackCapturingClient {
         fn new() -> Self {
             Self {
                 feedback_calls: Mutex::new(Vec::new()),
+                retrieve_response: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_retrieve_response(self, memories: Vec<MemoriaMemory>) -> Self {
+            *self.retrieve_response.lock().unwrap() = memories;
+            self
         }
     }
 
@@ -590,7 +731,7 @@ mod tests {
             _k: usize,
             _fs: bool,
         ) -> Result<Vec<MemoriaMemory>, String> {
-            Ok(vec![])
+            Ok(self.retrieve_response.lock().unwrap().clone())
         }
         async fn store(
             &self,
@@ -679,6 +820,168 @@ mod tests {
                 outcome
             );
         }
+    }
+
+    // ── "Already surfaced" dedup ───────────────────────────────────
+
+    #[test]
+    fn mark_surfaced_then_filter_removes_those_ids() {
+        let client = std::sync::Arc::new(FeedbackCapturingClient::new());
+        let orch = MemoryOrchestrator::new(client);
+        orch.mark_surfaced("sess", &["a".into(), "b".into()]);
+        let candidates = vec![
+            memory("a", "semantic", "alpha"),
+            memory("b", "semantic", "beta"),
+            memory("c", "semantic", "gamma"),
+        ];
+        let filtered = orch.filter_already_surfaced("sess", candidates);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].memory_id, "c");
+    }
+
+    #[test]
+    fn filter_passes_everything_when_nothing_seen() {
+        let client = std::sync::Arc::new(FeedbackCapturingClient::new());
+        let orch = MemoryOrchestrator::new(client);
+        let candidates = vec![memory("a", "semantic", "x")];
+        assert_eq!(orch.filter_already_surfaced("sess", candidates).len(), 1);
+    }
+
+    #[test]
+    fn reset_session_surface_clears_dedup_set() {
+        let client = std::sync::Arc::new(FeedbackCapturingClient::new());
+        let orch = MemoryOrchestrator::new(client);
+        orch.mark_surfaced("sess", &["a".into()]);
+        orch.reset_session_surface("sess");
+        let filtered = orch.filter_already_surfaced("sess", vec![memory("a", "semantic", "x")]);
+        assert_eq!(filtered.len(), 1, "after reset, ids flow through again");
+    }
+
+    #[test]
+    fn mark_surfaced_is_per_session() {
+        let client = std::sync::Arc::new(FeedbackCapturingClient::new());
+        let orch = MemoryOrchestrator::new(client);
+        orch.mark_surfaced("sess1", &["a".into()]);
+        let kept = orch.filter_already_surfaced("sess2", vec![memory("a", "semantic", "x")]);
+        assert_eq!(kept.len(), 1, "session boundaries isolate the dedup set");
+    }
+
+    // ── Prompt block carries freshness suffix for old memories ─────
+
+    #[test]
+    fn session_start_block_renders_freshness_for_stale_memory() {
+        let mut m = memory("m1", "profile", "user is a data scientist");
+        // 10 days ago, T1 tier (365-day half-life) → "10 days ago", no verify.
+        let ts = chrono::Utc::now() - chrono::Duration::days(10);
+        m.observed_at = Some(ts.to_rfc3339());
+        m.trust_tier = Some("T1".into());
+        let bundle = SessionStartMemories {
+            profile: vec![m],
+            ..Default::default()
+        };
+        let block = bundle.to_prompt_block().expect("non-empty");
+        assert!(
+            block.contains("10 days ago"),
+            "freshness label missing: {block}"
+        );
+        assert!(!block.contains("verify first"));
+    }
+
+    #[test]
+    fn session_start_block_marks_verify_first_past_half_life() {
+        let mut m = memory("m1", "episodic", "[episode] last session fix");
+        // 120 days ago, default T3 tier (60-day half-life) → verify.
+        let ts = chrono::Utc::now() - chrono::Duration::days(120);
+        m.observed_at = Some(ts.to_rfc3339());
+        // No trust_tier → defaults to T3 treatment in the formatter.
+        let bundle = SessionStartMemories {
+            recent_episodes: vec![m],
+            ..Default::default()
+        };
+        let block = bundle.to_prompt_block().expect("non-empty");
+        assert!(block.contains("120 days ago"), "age label missing: {block}");
+        assert!(
+            block.contains("verify first"),
+            "verify-first hint missing past half-life: {block}"
+        );
+    }
+
+    // ── Memory index ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn memory_index_returns_none_on_empty_store() {
+        let client = std::sync::Arc::new(FeedbackCapturingClient::new());
+        let orch = MemoryOrchestrator::new(client);
+        assert!(orch.build_memory_index(Some("u1"), 50).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_index_renders_one_line_per_entry() {
+        let mems = vec![
+            memory("m1", "profile", "user prefers Rust"),
+            memory("m2", "feedback", "use real DB in tests"),
+            memory("m3", "project", "merge freeze 2026-05-08"),
+        ];
+        let client =
+            std::sync::Arc::new(FeedbackCapturingClient::new().with_retrieve_response(mems));
+        let orch = MemoryOrchestrator::new(client);
+        let idx = orch
+            .build_memory_index(Some("u1"), 50)
+            .await
+            .expect("non-empty");
+        assert!(idx.starts_with("<memory_index>"));
+        assert!(idx.ends_with("</memory_index>"));
+        assert!(idx.contains("- [profile] m1: user prefers Rust"));
+        assert!(idx.contains("- [feedback] m2: use real DB in tests"));
+        assert!(idx.contains("- [project] m3: merge freeze 2026-05-08"));
+    }
+
+    #[tokio::test]
+    async fn memory_index_respects_limit() {
+        let mems = (0..10)
+            .map(|i| memory(&format!("m{i}"), "semantic", "x"))
+            .collect();
+        let client =
+            std::sync::Arc::new(FeedbackCapturingClient::new().with_retrieve_response(mems));
+        let orch = MemoryOrchestrator::new(client);
+        let idx = orch
+            .build_memory_index(Some("u1"), 3)
+            .await
+            .expect("non-empty");
+        let lines = idx.lines().filter(|l| l.starts_with("- [")).count();
+        assert_eq!(lines, 3);
+    }
+
+    // ── Conflict detection ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn detect_conflicts_returns_high_similarity_matches() {
+        let candidate_a = {
+            let mut m = memory("a", "feedback", "use real DB in tests");
+            m.retrieval_score = Some(0.92);
+            m
+        };
+        let candidate_b = {
+            let mut m = memory("b", "feedback", "prefer pnpm over npm");
+            m.retrieval_score = Some(0.41);
+            m
+        };
+        let client = std::sync::Arc::new(
+            FeedbackCapturingClient::new().with_retrieve_response(vec![candidate_a, candidate_b]),
+        );
+        let orch = MemoryOrchestrator::new(client);
+        let hits = orch
+            .detect_conflicts("always use a real database in tests", None, 0.85)
+            .await;
+        assert_eq!(hits.len(), 1, "only the high-similarity hit should surface");
+        assert_eq!(hits[0].memory_id, "a");
+    }
+
+    #[tokio::test]
+    async fn detect_conflicts_empty_new_content_returns_nothing() {
+        let client = std::sync::Arc::new(FeedbackCapturingClient::new());
+        let orch = MemoryOrchestrator::new(client);
+        assert!(orch.detect_conflicts("   ", None, 0.8).await.is_empty());
     }
 
     #[tokio::test]

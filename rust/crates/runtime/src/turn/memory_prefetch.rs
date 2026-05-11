@@ -192,6 +192,7 @@ fn build_session_start_block(
         for m in profile {
             s.push_str("- ");
             s.push_str(&session_start_line(&m.content, 160));
+            s.push_str(&m.freshness_suffix());
             s.push('\n');
         }
     }
@@ -200,6 +201,7 @@ fn build_session_start_block(
         for m in episodes {
             s.push_str("- ");
             s.push_str(&session_start_line(&m.content, 200));
+            s.push_str(&m.freshness_suffix());
             s.push('\n');
         }
     }
@@ -615,12 +617,27 @@ fn parse_rankable(value: serde_json::Value) -> Option<RankableMemory> {
         .get("trust_tier")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    let observed_at = value
+        .get("observed_at")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let updated_at = value
+        .get("updated_at")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let session_id = value
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     Some(RankableMemory {
         memory_id,
         content,
         memory_type,
         retrieval_score,
         trust_tier,
+        observed_at,
+        updated_at,
+        session_id,
     })
 }
 
@@ -776,6 +793,7 @@ mod tests {
                 memory_type: "semantic".into(),
                 retrieval_score: Some(0.9),
                 trust_tier: Some("T1".into()),
+                ..Default::default()
             },
             RankableMemory {
                 memory_id: "full-only".into(),
@@ -783,6 +801,7 @@ mod tests {
                 memory_type: "semantic".into(),
                 retrieval_score: Some(0.7),
                 trust_tier: Some("T2".into()),
+                ..Default::default()
             },
         ];
         let entity = vec![
@@ -793,6 +812,7 @@ mod tests {
                 memory_type: "semantic".into(),
                 retrieval_score: Some(0.6),
                 trust_tier: Some("T1".into()),
+                ..Default::default()
             },
             RankableMemory {
                 memory_id: "entity-only".into(),
@@ -800,6 +820,7 @@ mod tests {
                 memory_type: "episodic".into(),
                 retrieval_score: Some(0.8),
                 trust_tier: Some("T3".into()),
+                ..Default::default()
             },
         ];
         let merged = merge_structured_results(full, entity);
@@ -857,6 +878,7 @@ mod tests {
             memory_type: "profile".into(),
             retrieval_score: Some(0.65),
             trust_tier: Some("T1".into()),
+            ..Default::default()
         }];
         let entity = vec![RankableMemory {
             memory_id: "higher-score".into(),
@@ -864,6 +886,7 @@ mod tests {
             memory_type: "episodic".into(),
             retrieval_score: Some(0.82),
             trust_tier: Some("T3".into()),
+            ..Default::default()
         }];
         let mut merged = merge_structured_results(full, entity);
         astra_turn_types::sort_by_retrieval_score(&mut merged);
@@ -1248,6 +1271,7 @@ mod tests {
                 content: c.into(),
                 retrieval_score: Some(0.8),
                 trust_tier: None,
+                ..Default::default()
             }
         }
         let profile = vec![mem("p1", "profile", "[user] prefers Rust")];

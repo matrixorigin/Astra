@@ -32,11 +32,27 @@ Types:
 - project: deadlines, decisions, incidents (\"merge freeze May 8\", \"auth rewrite for compliance\")
 - ref: external system pointers (\"bugs in Linear project INGEST\", \"dashboard at grafana.internal/d/api-latency\")
 
+Body structure for feedback and project types (REQUIRED — without these a future reader
+can't judge edge cases and the memory degrades into a slogan):
+  Lead with the rule or fact, then two lines:
+    **Why:** the reason the user gave — often a past incident or strong preference
+    **How to apply:** when/where the guidance should kick in
+
+  Good: \"Integration tests must hit a real database, not mocks.\\n**Why:** prior incident \
+where mock/prod divergence masked a broken migration.\\n**How to apply:** when touching \
+tests in services/**/tests/.\"
+  Bad: \"Use real DBs in tests.\"  (missing the why; future-you can't judge exceptions.)
+
 Do NOT extract:
 - Code patterns or architecture (derivable from the codebase)
 - Git history or file paths
 - Ephemeral debug context or temporary state
 - Things the user did NOT say (don't infer preferences from tool usage)
+
+These exclusions apply EVEN when the user explicitly asks you to save. If the user asks
+you to \"save this week's PR list\" or \"remember what I did today\", do NOT store the raw
+list — store only the one surprising / non-obvious part (e.g. \"user is reviewing PRs on \
+weekends this month — flag as pattern, not policy\"). Activity logs are noise.
 
 Return [] if nothing is worth remembering. Be selective — false negatives are better than noise.";
 

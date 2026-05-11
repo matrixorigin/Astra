@@ -280,13 +280,81 @@ pub struct ReflectSummary {
 }
 
 /// A memory record from Memoria.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Carries the freshness-critical fields (`observed_at`, `updated_at`,
+/// `trust_tier`) so the caller can render an LLM-visible staleness
+/// caveat without a second round-trip. See [`MemoriaMemory::freshness_suffix`]
+/// for the canonical formatter.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MemoriaMemory {
     pub memory_id: String,
     pub content: String,
     pub memory_type: String,
     #[serde(default)]
     pub retrieval_score: Option<f64>,
+    /// RFC3339 timestamp of when the memory was first observed (i.e.
+    /// the fact was stated). Decay half-life is measured from this.
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    /// RFC3339 timestamp of the most recent update (e.g. via `update`).
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// Trust tier string (`T1`-`T4`) — drives default half-life.
+    #[serde(default)]
+    pub trust_tier: Option<String>,
+    /// Session id tag, if the memory was scoped to one at write time.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+impl MemoriaMemory {
+    /// Days elapsed since `observed_at` (or `updated_at` as fallback).
+    /// `None` when neither timestamp is available.
+    pub fn age_days(&self) -> Option<i64> {
+        let ts = self.observed_at.as_deref().or(self.updated_at.as_deref())?;
+        let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+        let age = chrono::Utc::now() - dt.with_timezone(&chrono::Utc);
+        Some(age.num_days().max(0))
+    }
+
+    /// Human-readable age label (`today`, `yesterday`, `3 days ago`).
+    /// Returns `None` when timestamp info is missing.
+    pub fn age_label(&self) -> Option<String> {
+        match self.age_days()? {
+            0 => Some("today".into()),
+            1 => Some("yesterday".into()),
+            n => Some(format!("{n} days ago")),
+        }
+    }
+
+    /// Append-friendly freshness marker for compact memory renderings.
+    /// Empty for fresh memories (≤ 1 day); otherwise a space-prefixed
+    /// ` (N days ago)` or, past the stale threshold, a
+    /// ` (N days ago — verify first)` hint that tells the LLM to
+    /// re-check before citing.
+    pub fn freshness_suffix(&self) -> String {
+        let Some(days) = self.age_days() else {
+            return String::new();
+        };
+        if days <= 1 {
+            return String::new();
+        }
+        // "Verify first" threshold: default half-life boundary for the
+        // trust tier the memory carries (or T3 default = 60 days when
+        // the tier is unknown). Past this, the point-in-time observation
+        // is likely stale and the LLM should re-check.
+        let half_life = match self.trust_tier.as_deref() {
+            Some("T1") => 365,
+            Some("T2") => 180,
+            Some("T4") => 30,
+            _ => 60, // T3 default
+        };
+        if days >= half_life {
+            format!(" ({days} days ago — verify first)")
+        } else {
+            format!(" ({days} days ago)")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1508,6 +1576,7 @@ mod tests {
             content: "User prefers Rust".to_string(),
             memory_type: "working".to_string(),
             retrieval_score: Some(0.9),
+            ..Default::default()
         }];
         let ctx = build_memory_context(&memories, 1000);
         assert!(ctx.contains("User prefers Rust"));
@@ -1522,12 +1591,14 @@ mod tests {
                 content: "A".repeat(100),
                 memory_type: "working".to_string(),
                 retrieval_score: None,
+                ..Default::default()
             },
             MemoriaMemory {
                 memory_id: "m2".to_string(),
                 content: "B".repeat(100),
                 memory_type: "working".to_string(),
                 retrieval_score: None,
+                ..Default::default()
             },
         ];
         // With very small token limit, should only include first
@@ -1616,6 +1687,7 @@ mod tests {
             content: "Working on auth module".to_string(),
             memory_type: "working".to_string(),
             retrieval_score: Some(0.8),
+            ..Default::default()
         }]);
         let params = MemoriaCompactParams {
             budget_chars: 10000,
@@ -1716,6 +1788,7 @@ mod tests {
             content: "Working on auth module".to_string(),
             memory_type: "working".to_string(),
             retrieval_score: Some(0.8),
+            ..Default::default()
         }]);
         let params = MemoriaCompactParams {
             budget_chars: 10000,
@@ -2298,6 +2371,7 @@ mod tests {
             content: "Working on auth module".to_string(),
             memory_type: "working".to_string(),
             retrieval_score: Some(0.8),
+            ..Default::default()
         }]);
         let params = MemoriaCompactParams {
             budget_chars: 10000,
@@ -2454,6 +2528,7 @@ mod tests {
             content: "Working on auth module".to_string(),
             memory_type: "working".to_string(),
             retrieval_score: Some(0.8),
+            ..Default::default()
         }]);
         let params = MemoriaCompactParams {
             budget_chars: 10000,
