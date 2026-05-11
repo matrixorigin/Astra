@@ -201,6 +201,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "tokio-util",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -229,6 +230,7 @@ dependencies = [
  "dirs 6.0.0",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "toml 1.1.2+spec-1.1.0",
 ]
 

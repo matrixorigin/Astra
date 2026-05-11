@@ -978,6 +978,36 @@ async fn main() {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
     diagnostic_log::init_cli_observability(&cli);
+    // `--settings <JSON-or-path>` must install its overlay BEFORE any
+    // code calls `RuntimeConfig::load()` — the first such call below is
+    // the safety-config apply. parse_settings_source handles inline JSON
+    // vs. filesystem path; apply_settings_json parses the JSON into a
+    // RuntimeConfig (all fields default) that `load()` will then merge
+    // with non-default-wins semantics. Malformed input aborts with a
+    // clear message instead of silently dropping the flag.
+    if let Some(raw) = cli.settings.as_deref() {
+        match astra_config::config_overlay::parse_settings_source(raw) {
+            Ok(json) => match astra_config::config_overlay::apply_settings_json(
+                astra_config::runtime_config::RuntimeConfig::default(),
+                &json,
+            ) {
+                Ok(overlay) => {
+                    astra_config::runtime_config::set_cli_overlay(Some(overlay));
+                }
+                Err(err) => {
+                    eprintln!(
+                        "{}",
+                        format!("Error: --settings JSON is invalid: {err}").red()
+                    );
+                    std::process::exit(2);
+                }
+            },
+            Err(err) => {
+                eprintln!("{}", format!("Error: --settings: {err}").red());
+                std::process::exit(2);
+            }
+        }
+    }
     // Apply safety.trust_mode from runtime config to the global guard.
     // Defaults to Strict — users must explicitly opt in via
     // `~/.astra/config/runtime.toml` [safety] trust_mode = "trusted".
@@ -1035,6 +1065,7 @@ async fn main() {
         add_dir,
         verbose,
         mcp_config,
+        settings: _settings_already_applied,
         session_id: cli_session_id,
         session_name,
         bare,
@@ -1179,6 +1210,16 @@ async fn main() {
     // Resolve model: --model flag > config default_model > None
     let resolved_model =
         cli_model.or_else(|| command_router::read_config_default_model().ok().flatten());
+
+    // Export the resolved model so slash commands (/config, /self budget)
+    // can surface the model-aware effective budget without threading the
+    // value through every handler. Scope is this process only; the REPL
+    // would set this once at startup.
+    if let Some(ref m) = resolved_model {
+        unsafe {
+            std::env::set_var("ASTRA_CLI_ACTIVE_MODEL", m);
+        }
+    }
 
     let use_tui = enable_tui
         && std::io::stdin().is_terminal()

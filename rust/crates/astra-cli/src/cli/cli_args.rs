@@ -76,6 +76,18 @@ pub(crate) struct Cli {
     /// Load MCP server config from JSON file(s) or inline JSON strings
     #[arg(long = "mcp-config", num_args = 1..)]
     pub mcp_config: Vec<String>,
+    /// Overlay runtime settings from a JSON string or file path.
+    ///
+    /// Partial overlay: the JSON needs to mention only the fields you
+    /// want to change; everything else keeps the value from config file
+    /// + env + defaults. Inline vs. file is decided by a leading `{`.
+    ///
+    /// Examples:
+    ///   astra -p 'fix tests' --model sonnet-4-6 \
+    ///     --settings '{"token_budget":{"max_turn_input_tokens":500000}}'
+    ///   astra --settings overrides.json
+    #[arg(long = "settings", value_name = "JSON-OR-PATH")]
+    pub settings: Option<String>,
     /// Use a specific session ID (must be a valid UUID)
     #[arg(long = "session-id")]
     pub session_id: Option<String>,

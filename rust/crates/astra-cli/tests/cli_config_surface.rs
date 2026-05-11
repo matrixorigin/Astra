@@ -28,7 +28,7 @@
 //!    The rendering / keystroke handling is thin glue over these.
 
 use astra_config::config_overlay::{
-    SettingItem, SettingKind, apply_edit, apply_settings_json, build_settings_catalog,
+    SettingKind, apply_edit, apply_settings_json, build_settings_catalog,
     effective_budget_for_model, filter_settings, parse_settings_source,
 };
 use astra_config::runtime_config::RuntimeConfig;
@@ -154,7 +154,7 @@ fn catalog_includes_knobs_that_motivated_this_refactor() {
         "memory.retrieval_top_k",
     ] {
         assert!(
-            ids.iter().any(|id| *id == required),
+            ids.contains(&required),
             "catalog must expose `{required}`, found: {ids:?}"
         );
     }
@@ -199,7 +199,10 @@ fn filter_settings_matches_on_id_or_label() {
         "search for `budget` must surface the main budget knob"
     );
     let none = filter_settings(&items, "surely-not-in-any-key-or-label-at-all");
-    assert!(none.is_empty(), "no matches must return empty, got {none:?}");
+    assert!(
+        none.is_empty(),
+        "no matches must return empty, got {none:?}"
+    );
 }
 
 #[test]

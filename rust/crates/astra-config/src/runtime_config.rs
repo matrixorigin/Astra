@@ -1297,6 +1297,38 @@ fn merge_if_non_default<T: PartialEq>(slot: &mut T, incoming: T, default: T) {
     }
 }
 
+// ─── CLI `--settings` overlay ────────────────────────────────────────────────
+
+/// Process-wide overlay installed by the CLI front door from `--settings`.
+/// `RuntimeConfig::load()` reads this after env overrides and merges it with
+/// non-default-wins semantics, so a `--settings` override beats both env and
+/// on-disk config for one invocation. `None` = no overlay, normal load.
+///
+/// Stored as the already-parsed `RuntimeConfig` rather than raw JSON so the
+/// CLI boundary is the only place that can fail on malformed input — every
+/// `load()` call thereafter is infallible.
+static CLI_OVERLAY: std::sync::OnceLock<std::sync::RwLock<Option<RuntimeConfig>>> =
+    std::sync::OnceLock::new();
+
+fn cli_overlay_cell() -> &'static std::sync::RwLock<Option<RuntimeConfig>> {
+    CLI_OVERLAY.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Install a process-wide config overlay. Subsequent `RuntimeConfig::load()`
+/// calls merge `overlay` on top of the resolved config. Pass `None` to clear.
+///
+/// Intended for CLI `--settings`: call once at startup after arg parsing.
+/// Safe to call multiple times; the last call wins.
+pub fn set_cli_overlay(overlay: Option<RuntimeConfig>) {
+    if let Ok(mut slot) = cli_overlay_cell().write() {
+        *slot = overlay;
+    }
+}
+
+fn cli_overlay_snapshot() -> Option<RuntimeConfig> {
+    cli_overlay_cell().read().ok().and_then(|s| s.clone())
+}
+
 // ─── Configuration Loading ───────────────────────────────────────────────────
 
 impl RuntimeConfig {
@@ -1307,6 +1339,7 @@ impl RuntimeConfig {
     /// 2. ~/.astra/config/runtime.toml
     /// 3. .astra/config/runtime.toml
     /// 4. Environment variables
+    /// 5. CLI `--settings` overlay (see [`set_cli_overlay`])
     pub fn load() -> Self {
         let mut config = Self::default();
 
@@ -1330,6 +1363,13 @@ impl RuntimeConfig {
 
         // Environment overrides
         config.apply_env_overrides();
+
+        // CLI --settings overlay (process-wide, highest precedence).
+        // Applied after env so an operator who wants to undo an env-set
+        // knob for one invocation can do so without unsetting the env.
+        if let Some(overlay) = cli_overlay_snapshot() {
+            config = config.merge(overlay);
+        }
 
         // Apply strategy presets
         if config.compression.strategy != CompressionStrategy::Custom {
