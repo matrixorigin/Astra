@@ -77,6 +77,131 @@ pub use astra_turn_core::section_types::{CacheScope, PromptSection, PromptTokenB
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str =
     "\n<!-- astra:system-prompt:dynamic-boundary -->\n";
 
+/// Escape XML metacharacters for embedding inside element text content
+/// of `<deferred_tools>` / `<available_skills>` blocks.
+///
+/// Without this, a description like `</description><name>bash</name>`
+/// could inject a fake entry into the system prompt — prompt-injection
+/// vector.
+///
+/// Zero-alloc fast path: if the input contains none of `<`, `>`, `&`,
+/// the borrowed input is returned unchanged. The vast majority of tool
+/// and skill descriptions fall into this fast path.
+///
+/// Scope: element-text content only. If content is ever moved into
+/// attribute values, additionally escape `"` and `'`.
+fn xml_escape_text(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains(['<', '>', '&']) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    for ch in s.chars() {
+        match ch {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Render the `<deferred_tools>` section of the system prompt.
+///
+/// The deferred block tells the LLM which tools exist outside the pinned
+/// `tools[]` array — without paying their full schema cost every turn.
+/// The model activates one by calling `tool_search(query="select:NAME")`
+/// which returns the schema as a tool_result.
+///
+/// Returns `None` when the surface has no deferred entries (no point
+/// emitting an empty block). The returned section carries
+/// [`CacheScope::Session`] so it joins the cached session prefix.
+///
+/// The rendered format mirrors the shape used by `<available_skills>`:
+///
+/// ```text
+/// <deferred_tools>
+///   <tool>
+///     <name>mcp__weather</name>
+///     <description>Get weather for a city</description>
+///   </tool>
+///   ...
+/// </deferred_tools>
+/// ```
+///
+/// Followed by a single nudge line so weak models know how to pull a
+/// schema in when they need one.
+/// Render the `<available_skills>` section of the system prompt.
+///
+/// Mirrors [`build_deferred_tools_section`] for skills: name + description
+/// per entry, wrapped in `<available_skills>…</available_skills>`, plus a
+/// short nudge so the model calls the `skill` tool instead of guessing.
+///
+/// Returns `None` when there are no skills (don't emit a ghost block).
+/// The section is [`CacheScope::Session`] so the listing joins the cached
+/// prefix — adding a skill causes one flip and then stability.
+///
+/// Sorts internally by skill name so a provider that emits skills in
+/// unpredictable order still produces byte-stable output across sessions.
+pub fn build_skill_listing_section(
+    skills: &[astra_skills::traits::SkillToolInfo],
+) -> Option<PromptSection> {
+    if skills.is_empty() {
+        return None;
+    }
+
+    // Sort for cache stability — provider iteration order is not a contract.
+    let mut sorted: Vec<&astra_skills::traits::SkillToolInfo> = skills.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut body = String::with_capacity(skills.len() * 120 + 256);
+    body.push_str("<available_skills>\n");
+    for s in &sorted {
+        body.push_str("  <skill>\n    <name>");
+        body.push_str(&xml_escape_text(&s.name));
+        body.push_str("</name>\n    <description>");
+        body.push_str(&xml_escape_text(&s.description));
+        body.push_str("</description>\n  </skill>\n");
+    }
+    body.push_str("</available_skills>\n\n");
+    body.push_str(
+        "When a user request matches a skill above, call the `skill` tool \
+         with that skill's name FIRST (before any other tool). On seeing \
+         `<skill-loaded name=\"...\"/>` in a tool result, follow that skill's \
+         instructions — do not re-invoke it.",
+    );
+
+    Some(PromptSection::stable(body, CacheScope::Session))
+}
+
+pub fn build_deferred_tools_section(
+    surface: &crate::tool_registry::surface::ToolSurface,
+) -> Option<PromptSection> {
+    let entries = surface.deferred();
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut body = String::with_capacity(entries.len() * 80 + 256);
+    body.push_str("<deferred_tools>\n");
+    for entry in entries {
+        body.push_str("  <tool>\n    <name>");
+        body.push_str(&xml_escape_text(&entry.name));
+        body.push_str("</name>\n    <description>");
+        body.push_str(&xml_escape_text(&entry.short_desc));
+        body.push_str("</description>\n  </tool>\n");
+    }
+    body.push_str("</deferred_tools>\n\n");
+    body.push_str(
+        "If a tool in `<deferred_tools>` fits your next step, call \
+         `tool_search(query=\"select:NAME\")` first — the tool_result will contain the \
+         full schema so you can invoke it on the next turn. Never guess at a tool that is \
+         not in `tools[]` without doing this.",
+    );
+
+    Some(PromptSection::stable(body, CacheScope::Session))
+}
+
 /// Builder that enforces the **static-before-dynamic** invariant at the API
 /// level, so callers cannot silently push a volatile section into the cached
 /// prefix (the class of regression fixed by commit `b64223c9`).

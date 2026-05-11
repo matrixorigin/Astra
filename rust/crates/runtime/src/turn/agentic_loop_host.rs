@@ -4098,66 +4098,37 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn skill_listing_system_message_format() {
-        use crate::skills::manifest::SkillSourceKind;
-        use crate::turn::skill_tool::{SkillToolInfo, skill_listing_system_message};
+    fn skill_listing_section_format() {
+        use crate::prompts::build_skill_listing_section;
+        use crate::turn::skill_tool::SkillToolInfo;
 
         let skills = vec![
             SkillToolInfo {
                 name: "review".into(),
                 description: "Code review".into(),
-                when_to_use: None,
-                source: SkillSourceKind::Bundled,
-                aliases: vec![],
-                category: None,
-                tags: vec![],
-                triggers: vec![],
+                ..Default::default()
             },
             SkillToolInfo {
                 name: "debug".into(),
                 description: "Debug issues".into(),
-                when_to_use: None,
-                source: SkillSourceKind::Bundled,
-                aliases: vec![],
-                category: None,
-                tags: vec![],
-                triggers: vec![],
+                ..Default::default()
             },
         ];
 
-        let msg = skill_listing_system_message(&skills, None, None, false);
-        let content = msg["content"].as_str().unwrap();
-
-        // Must contain skill names in XML format
-        assert!(
-            content.contains("<name>review</name>"),
-            "missing review skill"
-        );
-        assert!(
-            content.contains("<name>debug</name>"),
-            "missing debug skill"
-        );
-        assert!(
-            content.contains("<available_skills>"),
-            "missing opening tag"
-        );
-        assert!(
-            content.contains("</available_skills>"),
-            "missing closing tag"
-        );
-        // Must be a system message
-        assert_eq!(msg["role"], "system");
+        let section = build_skill_listing_section(&skills).expect("non-empty");
+        assert!(section.text.contains("<name>review</name>"));
+        assert!(section.text.contains("<name>debug</name>"));
+        assert!(section.text.contains("<available_skills>"));
+        assert!(section.text.contains("</available_skills>"));
     }
 
     #[test]
-    fn skill_listing_empty_skills_produces_no_message() {
-        use crate::turn::skill_tool::skill_listing_system_message;
-        // With empty skills, the function still returns a message but with no skill entries
-        let msg = skill_listing_system_message(&[], None, None, false);
-        let content = msg["content"].as_str().unwrap();
-        // Should have the wrapper but no <skill> entries
-        assert!(content.contains("<available_skills>"));
-        assert!(!content.contains("<name>"));
+    fn skill_listing_empty_skills_produces_no_section() {
+        use crate::prompts::build_skill_listing_section;
+        assert!(
+            build_skill_listing_section(&[]).is_none(),
+            "empty skill list must produce no section"
+        );
     }
 
     #[tokio::test]
@@ -4187,64 +4158,51 @@ pub(crate) mod tests {
 
     #[test]
     fn skill_listing_refresh_updates_field() {
-        use crate::skills::manifest::SkillSourceKind;
-        use crate::turn::skill_tool::{SkillToolInfo, skill_listing_system_message};
+        use crate::prompts::build_skill_listing_section;
+        use crate::turn::skill_tool::SkillToolInfo;
 
         let mut state = make_state();
-
-        // Initial: no listing
         assert!(state.skills.listing_message.is_none());
 
-        // Simulate first refresh with 1 skill
         let skills_v1 = vec![SkillToolInfo {
             name: "review".into(),
             description: "v1".into(),
-            when_to_use: None,
-            source: SkillSourceKind::Bundled,
-            aliases: vec![],
-            category: None,
-            tags: vec![],
-            triggers: vec![],
+            ..Default::default()
         }];
-        state.skills.listing_message =
-            Some(skill_listing_system_message(&skills_v1, None, None, false));
-        let v1_content = state.skills.listing_message.as_ref().unwrap()["content"]
+        let section_v1 = build_skill_listing_section(&skills_v1).unwrap();
+        state.skills.listing_message = Some(json!({
+            "role": "system",
+            "content": section_v1.text,
+        }));
+        let v1 = state.skills.listing_message.as_ref().unwrap()["content"]
             .as_str()
             .unwrap()
             .to_string();
-        assert!(v1_content.contains("review"));
+        assert!(v1.contains("review"));
 
-        // Simulate second refresh with 2 skills (hot-reload added one)
         let skills_v2 = vec![
             SkillToolInfo {
                 name: "review".into(),
                 description: "v2".into(),
-                when_to_use: None,
-                source: SkillSourceKind::Bundled,
-                aliases: vec![],
-                category: None,
-                tags: vec![],
-                triggers: vec![],
+                ..Default::default()
             },
             SkillToolInfo {
                 name: "debug".into(),
                 description: "new".into(),
-                when_to_use: None,
-                source: SkillSourceKind::Bundled,
-                aliases: vec![],
-                category: None,
-                tags: vec![],
-                triggers: vec![],
+                ..Default::default()
             },
         ];
-        state.skills.listing_message =
-            Some(skill_listing_system_message(&skills_v2, None, None, false));
-        let v2_content = state.skills.listing_message.as_ref().unwrap()["content"]
+        let section_v2 = build_skill_listing_section(&skills_v2).unwrap();
+        state.skills.listing_message = Some(json!({
+            "role": "system",
+            "content": section_v2.text,
+        }));
+        let v2 = state.skills.listing_message.as_ref().unwrap()["content"]
             .as_str()
             .unwrap()
             .to_string();
         assert!(
-            v2_content.contains("debug"),
+            v2.contains("debug"),
             "new skill should appear after refresh"
         );
     }

@@ -1,0 +1,188 @@
+//! Tool surface — T1 pinned + T2 deferred model.
+//!
+//! See `memory/project_tool_surface_rewrite.md` and the plan file for the
+//! architectural story. Short version:
+//!
+//! - **T1 pinned** = a small, stable set of tool schemas that go into the
+//!   LLM `tools[]` array on every turn. Byte-stable across a session so the
+//!   Anthropic/Bedrock prompt cache can hit the whole prefix.
+//! - **T2 deferred** = every other known tool, listed as `name + short_desc`
+//!   in a system-reminder block. The model activates one by calling
+//!   `tool_search(query="select:NAME")` which returns the full schema via a
+//!   tool_result — the tool is never added to `tools[]`.
+//!
+//! The default T1 set is the 11-member coding core (see `DEFAULT_PINNED`).
+//! Users override via `runtime.tool_surface.pinned_tools` in TOML. A name
+//! prefixed with `-` removes a default (e.g. `"-grep"`).
+//!
+//! Implementation is complete and wired into production. See
+//! `memory/project_tool_surface_rewrite.md` for the architectural story.
+
+use astra_config::ToolSurfaceConfig;
+use serde::Serialize;
+use serde_json::Value;
+
+/// Default T1 pinned tools — the coding golden path + astra intrinsics +
+/// activation primitives. ~11 entries.
+///
+/// Rationale for each inclusion:
+/// - `bash`, `read_file`, `write_file`, `str_replace` — the coding four.
+/// - `grep`, `glob`, `list_dir` — file discovery, used in 80%+ of turns.
+/// - `memory` — astra's intrinsic memory capability (cf. TOOL_CATALOG
+///   comment at tool_registry_meta:408 — "memory is pinned, intrinsic
+///   store/retrieve capability"). Deferring it would force a
+///   round-trip for every memory op.
+/// - `skill`, `tool_search` — the two activation primitives. Needed to
+///   reach anything in the deferred list.
+/// - `introspect` — runtime diagnostics. Cheap schema, high value when
+///   the model needs to self-check pressure/cache/tool health.
+///
+/// Explicitly deferred: `github`, `git`, `mo`, `agent`, `web_fetch`,
+/// `lsp`, `task`, `notify`, `ask_user`, `session`, `symbols`,
+/// `powershell`, `run_script`. Users pin via config as needed.
+pub const DEFAULT_PINNED: &[&str] = &[
+    "bash",
+    "glob",
+    "grep",
+    "introspect",
+    "list_dir",
+    "memory",
+    "read_file",
+    "skill",
+    "str_replace",
+    "tool_search",
+    "write_file",
+];
+
+/// One entry in the deferred manifest.
+///
+/// Deliberately minimal: `name + short_desc`. No parameters, no schema — the
+/// whole point of the deferred layer is that schema lives only in the
+/// catalog until the model explicitly pulls it with `tool_search`.
+#[derive(Clone, Debug, Serialize)]
+pub struct DeferredEntry {
+    pub name: String,
+    pub short_desc: String,
+}
+
+/// The resolved tool surface for a session.
+pub struct ToolSurface {
+    pinned: Vec<Value>,
+    deferred: Vec<DeferredEntry>,
+}
+
+impl ToolSurface {
+    /// Build a `ToolSurface` from a catalog snapshot, user config, and
+    /// plugin schemas registered this session.
+    ///
+    /// Algorithm:
+    /// 1. Start from [`DEFAULT_PINNED`].
+    /// 2. Apply `cfg.pinned_tools`: a bare name adds, a `-name` removes.
+    ///    Unknown names are silently ignored.
+    /// 3. Partition the union of catalog + plugins: names in the resolved
+    ///    pinned set → `pinned_schemas`; everything else → `deferred`.
+    /// 4. Sort both alphabetically for byte-stability.
+    pub fn build(
+        catalog_schemas: Vec<Value>,
+        cfg: &ToolSurfaceConfig,
+        plugin_schemas: &[Value],
+    ) -> Self {
+        // Fold all known schemas into a single (name → schema) map. Plugin
+        // schemas override catalog entries with the same name — plugins
+        // are user-registered and authoritative for their own tool.
+        let mut by_name: std::collections::BTreeMap<String, Value> =
+            std::collections::BTreeMap::new();
+        for schema in catalog_schemas
+            .into_iter()
+            .chain(plugin_schemas.iter().cloned())
+        {
+            if let Some(name) = schema_name(&schema) {
+                by_name.insert(name, schema);
+            }
+        }
+
+        // Resolve the pinned name set: defaults + additive overrides, minus
+        // any `-name` removals. Unknown names (no schema in `by_name`) are
+        // silently dropped per the config contract.
+        let mut pinned_names: std::collections::BTreeSet<String> =
+            DEFAULT_PINNED.iter().map(|s| (*s).to_string()).collect();
+        for entry in &cfg.pinned_tools {
+            let trimmed = entry.trim();
+            // Empty / whitespace-only / bare "-" / double-prefixed "--" are
+            // user-config noise — silently skip. The fence against "-- foo"
+            // becoming "-foo" (which tries to remove a tool named "-foo")
+            // is also a bug prevention.
+            if trimmed.is_empty() || trimmed == "-" || trimmed.starts_with("--") {
+                continue;
+            }
+            if let Some(name) = trimmed.strip_prefix('-') {
+                pinned_names.remove(name);
+            } else if by_name.contains_key(trimmed) {
+                pinned_names.insert(trimmed.to_string());
+            }
+        }
+
+        // Partition. BTreeMap iteration is already alphabetical, so the
+        // resulting vectors come out sorted for free.
+        let mut pinned: Vec<Value> = Vec::new();
+        let mut deferred: Vec<DeferredEntry> = Vec::new();
+        for (name, schema) in by_name {
+            if pinned_names.contains(&name) {
+                pinned.push(schema);
+            } else {
+                let short_desc = short_description(&schema);
+                deferred.push(DeferredEntry { name, short_desc });
+            }
+        }
+
+        Self { pinned, deferred }
+    }
+
+    /// The byte-stable T1 schemas to feed into `tools[]`.
+    ///
+    /// Returned by value so callers can annotate `cache_control` without
+    /// mutating the surface.
+    pub fn pinned_schemas(&self) -> Vec<Value> {
+        self.pinned.clone()
+    }
+
+    /// The deferred manifest — one `name + short_desc` entry per non-pinned
+    /// tool, ready to render into the system-reminder block.
+    pub fn deferred(&self) -> &[DeferredEntry] {
+        &self.deferred
+    }
+}
+
+fn schema_name(schema: &Value) -> Option<String> {
+    schema
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .map(String::from)
+}
+
+/// Truncate the schema description to ≤120 chars at a UTF-8 char boundary.
+///
+/// 120 chars is enough for one-line relevance cues — the full description
+/// comes back later via `tool_search(select:…)` when the model actually
+/// pulls the schema.
+fn short_description(schema: &Value) -> String {
+    let raw = schema
+        .get("function")
+        .and_then(|f| f.get("description"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    const MAX: usize = 120;
+    if raw.chars().count() <= MAX {
+        return raw.to_string();
+    }
+    let mut out = String::new();
+    for (i, ch) in raw.chars().enumerate() {
+        if i + 1 >= MAX {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}

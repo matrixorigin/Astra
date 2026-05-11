@@ -772,16 +772,42 @@ pub fn resolve_schemas(
 
 /// Pressure-aware variant of [`resolve_schemas`].
 ///
+/// **Post-Phase-6 behavior:** produces a byte-stable `tools[]` from the
+/// [`ToolSurface`] rather than the selector's per-turn ranked output.
+/// Every turn in a session returns the same schemas — the `<functions>`
+/// block is static. Plugins stay in the deferred
+/// listing; user pins them via `runtime.tool_surface.pinned_tools`.
+///
+/// `selected_names` is retained as observability input — the selector
+/// still runs and records what it *would* have picked, but its output
+/// no longer mutates `tools[]`.
+///
 /// At increasing pressure levels, schemas are progressively pruned:
-/// - `>= 0.3`: Truncate descriptions + remove param descriptions (saves ~40%)
-/// - `>= 0.6`: Remove descriptions entirely (saves ~60%)
-/// - `>= 0.8`: Also skip deferrable pinned tools + strip optional params (saves ~70%)
+/// - `>= 0.3`: Truncate descriptions + remove param descriptions (~40%)
+/// - `>= 0.6`: Remove descriptions entirely (~60%)
+/// - `>= 0.8`: Also skip deferrable pinned tools + strip optional params (~70%)
 pub fn resolve_schemas_with_pressure(
     registry: &ToolRegistry,
     selected_names: &[String],
     budget_pressure: f64,
 ) -> (Vec<Value>, tool_registry::SelectionReport) {
-    // Determine pruning level based on pressure
+    resolve_schemas_with_surface(
+        registry,
+        selected_names,
+        budget_pressure,
+        &astra_config::ToolSurfaceConfig::default(),
+    )
+}
+
+/// Surface-aware resolver used by production call sites that have a
+/// loaded [`ToolSurfaceConfig`] in scope. Prefer this entry point when
+/// the user's pinned-tools override needs to take effect.
+pub fn resolve_schemas_with_surface(
+    registry: &ToolRegistry,
+    selected_names: &[String],
+    budget_pressure: f64,
+    cfg: &astra_config::ToolSurfaceConfig,
+) -> (Vec<Value>, tool_registry::SelectionReport) {
     let prune_level = if budget_pressure >= 0.8 {
         PruneLevel::Aggressive
     } else if budget_pressure >= 0.6 {
@@ -792,37 +818,37 @@ pub fn resolve_schemas_with_pressure(
         PruneLevel::None
     };
 
-    let mut schemas = Vec::new();
-    let mut names = Vec::new();
-    let pinned_names: std::collections::HashSet<&str> = TOOL_CATALOG
+    // Build the surface from the registry's full catalog. Plugins live
+    // in `all_schemas` post-register but NOT in `plugin_tool_names`
+    // (Phase-5 rule); `ToolSurface::build` partitions everything that
+    // isn't pinned into the deferred listing.
+    let surface = crate::tool_registry::surface::ToolSurface::build(
+        registry.all_schemas().to_vec(),
+        cfg,
+        &[],
+    );
+
+    let schemas: Vec<Value> = surface
+        .pinned_schemas()
+        .into_iter()
+        .map(|s| prune_schema(s, prune_level))
+        .collect();
+    let names: Vec<String> = schemas
         .iter()
-        .filter(|t| t.pinned)
-        .map(|t| t.name)
+        .filter_map(|s| {
+            s.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
         .collect();
 
-    // Use pre-resolved pinned schemas (cached at registry construction)
-    for (name, schema) in registry.pinned_schemas() {
-        schemas.push(prune_schema(schema.clone(), prune_level));
-        names.push(name.clone());
-    }
+    // `selected_names` is preserved for the report so observability
+    // still sees what the selector wanted, but it no longer mutates
+    // the actual `tools[]`.
+    let _ = selected_names;
 
-    // Add dynamic tools via O(1) index lookup (replaces linear search)
-    for name in selected_names {
-        if names.contains(name) {
-            continue; // already included as pinned
-        }
-        if let Some(schema) = registry.schema_by_name(name) {
-            schemas.push(prune_schema(schema.clone(), prune_level));
-            names.push(name.clone());
-        }
-    }
-
-    let budget_used: u32 = names
-        .iter()
-        .filter(|n| !pinned_names.contains(n.as_str()))
-        .map(|n| registry.token_cost(n))
-        .sum();
-
+    let budget_used: u32 = names.iter().map(|n| registry.token_cost(n)).sum();
     let report = tool_registry::SelectionReport {
         tools_selected: names,
         selected_count: schemas.len() as u32,
@@ -1116,6 +1142,11 @@ mod tests {
 
     #[test]
     fn resolve_schemas_always_includes_pinned() {
+        // Post-Phase-6: `tools[]` is sourced from ToolSurface's default
+        // pinned set, independent of `selected_names`. The selector's
+        // choice is preserved in the report for observability but does
+        // NOT mutate the schemas: static tools[], model reaches
+        // non-pinned tools via tool_search.
         let registry = mock_registry();
         let (schemas, report) = resolve_schemas(&registry, &["github".into()]);
 
@@ -1125,24 +1156,35 @@ mod tests {
             names.contains(&"read_file".to_string()),
             "must include read_file"
         );
+        // github is NOT in tools[] — it's deferred by default. User pins
+        // via `runtime.tool_surface.pinned_tools = ["github"]` if desired.
         assert!(
-            names.contains(&"github".to_string()),
-            "must include requested tool"
+            !names.contains(&"github".to_string()),
+            "github must not be in tools[] post-Phase-6; it's deferred"
         );
         assert_eq!(schemas.len(), report.selected_count as usize);
     }
 
     #[test]
-    fn resolve_schemas_deduplicates_pinned() {
+    fn resolve_schemas_produces_byte_stable_output_across_calls() {
+        // Cache invariant: identical calls produce identical bytes.
         let registry = mock_registry();
-        // Request bash (which is pinned) — should not appear twice
-        let (_, report) = resolve_schemas(&registry, &["bash".into(), "github".into()]);
-        let bash_count = report
-            .tools_selected
-            .iter()
-            .filter(|n| *n == "bash")
-            .count();
-        assert_eq!(bash_count, 1, "bash should appear exactly once");
+        let (schemas_a, _) = resolve_schemas(&registry, &["bash".into(), "github".into()]);
+        let (schemas_b, _) = resolve_schemas(&registry, &["read_file".into()]);
+        let (schemas_c, _) = resolve_schemas(&registry, &[]);
+
+        let bytes_a = serde_json::to_vec(&schemas_a).unwrap();
+        let bytes_b = serde_json::to_vec(&schemas_b).unwrap();
+        let bytes_c = serde_json::to_vec(&schemas_c).unwrap();
+        // Regardless of what the selector requested, tools[] is byte-stable.
+        assert_eq!(
+            bytes_a, bytes_b,
+            "tools[] must not depend on selector output"
+        );
+        assert_eq!(
+            bytes_a, bytes_c,
+            "tools[] must not depend on selector output"
+        );
     }
 
     // ── FallbackSelector ──

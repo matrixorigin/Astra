@@ -127,7 +127,7 @@ pub struct AgentContext {
 }
 
 /// Session-level context. Set at session start, stable within session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionContext {
     pub session_id: String,
     pub run_id: String,
@@ -138,6 +138,12 @@ pub struct SessionContext {
     pub project_context: String,
     pub edge_profile: EdgeProfile,
     pub self_model: Option<String>,
+    /// Pre-rendered `<deferred_tools>` system block. Session-scoped so it
+    /// joins the cached prefix. Empty when no tools are deferred.
+    pub deferred_tools_block: String,
+    /// Pre-rendered `<available_skills>` system block. Session-scoped.
+    /// Empty when no skills are loaded.
+    pub skill_listing_block: String,
 }
 
 /// Edge profile — workspace and runtime environment info.

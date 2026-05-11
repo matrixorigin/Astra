@@ -1201,22 +1201,10 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             }
         }
         if any_newly_activated && let Some(resolver) = &state.skills.resolver {
-            let full = resolver.available_skills();
-            if !full.is_empty() {
-                let (visible, open_skill_name, _telemetry) =
-                    crate::turn::skill_tool::visible_skills_for_host_turn(
-                        &full,
-                        state.message.as_str(),
-                        &state.skills.quality_tracker,
-                        &state.skills.pinned,
-                        &state.skills.discovered,
-                        &state.skills.invoked,
-                        &state.skills.search,
-                    );
-                host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
-                    &visible,
-                    open_skill_name,
-                ));
+            // Phase-9: byte-stable schema — no enum, skill list is surfaced
+            // via <available_skills> in session-cached prompt prefix.
+            if !resolver.available_skills().is_empty() {
+                host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
             }
         }
     }

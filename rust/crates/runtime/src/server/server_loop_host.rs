@@ -646,6 +646,13 @@ pub struct ServerAgenticLoopHost {
     edge_tools: Vec<Value>,
     edge_profile: Map<String, Value>,
     valid_tools: HashSet<String>,
+    /// Names the validator should admit beyond the static catalog.
+    ///
+    /// Covers runtime-injected tools (`skill`, `spawn_agent`, `web_search`,
+    /// etc.) plus plugin/MCP tool names. Populated by the host's init
+    /// path before the first `sync_valid_tools_to_visible` call; stable
+    /// for the rest of the session.
+    admissible_extras: Vec<String>,
     selection_confidence: f64,
     /// `true` when tools were auto-populated from astra-tools (no CLI connected).
     server_side_tools: bool,
@@ -959,6 +966,7 @@ impl ServerAgenticLoopHostBuilder {
             edge_tools,
             edge_profile: self.edge_profile,
             valid_tools,
+            admissible_extras: Vec::new(),
             selection_confidence: self.selection_confidence,
             server_side_tools,
             interactive_client: self.interactive_client,
@@ -1785,15 +1793,24 @@ impl ServerAgenticLoopHost {
     }
 
     fn sync_valid_tools_to_visible(&mut self, visible_tools: &[Value]) {
-        self.valid_tools = visible_tools
-            .iter()
-            .filter_map(|tool| {
-                tool.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    .map(String::from)
-            })
-            .collect();
+        // Post-Phase-4/6: the validator's admitted set is the union of
+        // currently-visible names, every name in the static catalog, AND
+        // the session's runtime-injected + plugin names. Without the
+        // `admissible_extras` piece, calling an MCP tool after
+        // `tool_search(select:mcp__X)` would be rejected as unknown
+        // even though the executor can dispatch it.
+        self.valid_tools =
+            crate::turn::headless_tool_pipeline::admissible_tool_names_from_visible_and_extras(
+                visible_tools,
+                &self.admissible_extras,
+            );
+    }
+
+    /// Set the extras list (runtime-injected names + plugin names) so
+    /// the validator admits them after deferred activation. Should be
+    /// called once at session start, before the first tool round.
+    pub fn set_admissible_extras(&mut self, extras: Vec<String>) {
+        self.admissible_extras = extras;
     }
 
     /// Compute the tool schemas visible for the current turn after applying

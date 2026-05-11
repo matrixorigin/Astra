@@ -45,7 +45,7 @@ use agentic_sse_loop::{
     resolved_tool_metrics,
 };
 use cli_loop_host::CliAgenticLoopHost;
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// Map `ToolSelectionConfig` (from `astra-config`) to `BreakerConfig` (from
 /// `astra-turn-core`).
@@ -304,7 +304,10 @@ pub(crate) async fn stream_chat_sse(
     let mut messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message);
 
     // ─── Context pre-fetch (disabled) ─────────────────────────────────────
-    let all_schemas = if p.plan_only_chat {
+    // Returns (all_schemas, mcp_plugin_schemas) so the edge executor can
+    // install MCP tools for `tool_search(select:)` resolution while the
+    // registry gets the combined list.
+    let all_schemas: (Vec<Value>, Vec<Value>) = if p.plan_only_chat {
         messages.insert(
             0,
             json!({
@@ -312,7 +315,7 @@ pub(crate) async fn stream_chat_sse(
                 "content": CHAT_PLAN_ONLY_SYSTEM,
             }),
         );
-        Vec::new()
+        (Vec::new(), Vec::new())
     } else {
         // Refresh any MCP servers that received tool-list-changed notifications
         if let Some(ref mgr) = p.mcp_manager {
@@ -322,13 +325,26 @@ pub(crate) async fn stream_chat_sse(
             m.consume_resource_changes();
         }
         let mut schemas = edge_tools::all_tool_schemas();
-        // Inject MCP tool schemas from connected servers
-        if let Some(ref mgr) = p.mcp_manager {
+        // Inject MCP tool schemas from connected servers.
+        // Tracked separately from the static catalog so the edge
+        // `ToolExecutor` can install them via `set_plugin_schemas` for
+        // `tool_search(select:mcp__X)` resolution.
+        let mcp_schemas = if let Some(ref mgr) = p.mcp_manager {
             let m = mgr.read().await;
-            schemas.extend(m.all_tool_schemas());
-        }
-        schemas
+            m.all_tool_schemas()
+        } else {
+            Vec::new()
+        };
+        schemas.extend(mcp_schemas.iter().cloned());
+        (schemas, mcp_schemas)
     };
+    let mcp_plugin_schemas = all_schemas.1.clone();
+    let all_schemas = all_schemas.0;
+    // Install MCP schemas on the edge executor so `tool_search(select:NAME)`
+    // can resolve plugin tools for deferred activation. Without this, the
+    // LLM sees MCP tools in `<deferred_tools>` but cannot pull their
+    // schemas.
+    executor.set_plugin_schemas(mcp_plugin_schemas);
     let mut registry = ToolRegistry::new(all_schemas.clone());
     // G3: when a DynamicAgentSpawner is wired, force-pin spawn_agent's
     // schema so the tfidf selector always surfaces it. Without this,

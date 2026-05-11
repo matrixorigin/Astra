@@ -37,6 +37,7 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "mo",
     "agent",
     "introspect",
+    "tool_search",
     "lsp",
     "web_fetch",
     "web_search",
@@ -615,6 +616,35 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "subtopic": {"type": "string", "enum": ["session","cache","recent","volatile","stall","noise","all"], "description": "Which diagnostic to run (default: session). `noise`: per-channel freshness of runtime-injected prompt signals — flags channels re-rendered unchanged for many turns."},
                         "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Output detail level for the session topic (default: auto from budget). Ignored for other subtopics."}
                     }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "tool_search",
+                "description":
+                    "Search and activate deferred tools. Pass `query` to find tools by \
+                     keyword, OR pass `query=\"select:NAME\"` (or `select:NAME1,NAME2`) to \
+                     retrieve the full schema for one or more deferred tools listed in \
+                     `<deferred_tools>`. After calling with `select:`, you may invoke the \
+                     selected tool(s) directly on the next turn — runtime accepts calls \
+                     for any dispatchable name, not just names currently in `tools[]`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description":
+                                "Keyword query, or `select:NAME` / `select:NAME1,NAME2` for \
+                                 direct activation."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum results for keyword mode (default 5, max 20)."
+                        }
+                    },
+                    "required": ["query"]
                 }
             }
         }),

@@ -985,6 +985,11 @@ pub struct ServerToolExecutor {
     /// plan-mode state write through this so the next turn's system prompt
     /// reflects current state instead of the loop-start snapshot.
     plan_resume_hint_handle: Option<Arc<std::sync::RwLock<Option<String>>>>,
+    /// Plugin-registered tool schemas (e.g. MCP servers). Joined with the
+    /// server-side allowlist when `tool_search(select:NAME)` runs so
+    /// deferred activation reaches plugin tools. Populated by the server
+    /// loop host once MCP servers have been refreshed.
+    plugin_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
 }
 
 /// Snapshot used by the plan-mode write guard and the system-prompt
@@ -1062,6 +1067,16 @@ impl ServerToolExecutor {
             plan_repo: None,
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
+            plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Install plugin-registered schemas (MCP, etc.) so
+    /// `tool_search(select:NAME)` can resolve them for deferred activation.
+    /// Called by the server loop host after MCP manager refresh.
+    pub fn set_plugin_schemas(&self, schemas: Vec<Value>) {
+        if let Ok(mut guard) = self.plugin_schemas.write() {
+            *guard = schemas;
         }
     }
 
@@ -1276,6 +1291,20 @@ impl ServerToolExecutor {
                     astra_tools::ToolResult::text(output)
                 }
             }
+            // ── Tool search (first-class activation primitive) ─────────
+            //
+            // Lets the LLM look up schemas for deferred tools listed in
+            // `<deferred_tools>` via `tool_search(query="select:NAME")`.
+            // Schema pool = static server allowlist + plugin schemas
+            // installed via `set_plugin_schemas`. Without the union,
+            // MCP/skill-backed tools would never resolve.
+            "tool_search" => {
+                let mut pool = astra_tools::schemas::server_executor_tool_schemas();
+                if let Ok(guard) = self.plugin_schemas.read() {
+                    pool.extend(guard.iter().cloned());
+                }
+                tool_result_from_output(astra_tools::tool_search::tool_search(&pool, args))
+            }
             // ── Web search (standalone function) ───────────────────────
             "web_search" => {
                 let output = astra_tools::web_search::web_search(args);
@@ -1328,11 +1357,7 @@ impl ServerToolExecutor {
                     "rollback_edits" => tool_result_from_output(self.rollback_file_edits(args)),
                     "ask_user" => self.server_ask_user(args).await,
                     "sleep" => self.default_executor.execute("sleep", args).await,
-                    "tool_search" => tool_result_from_output(astra_tools::tool_search::tool_search(
-                        &astra_tools::schemas::server_executor_tool_schemas(),
-                        args,
-                    )),
-                    "" => tool_result_from_output("Missing required parameter: action. Use: config, prioritize, deprioritize, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep, tool_search".to_string()),
+                    "" => tool_result_from_output("Missing required parameter: action. Use: config, prioritize, deprioritize, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep".to_string()),
                     other => tool_result_from_output(format!("Unknown session action: '{other}'")),
                 }
             }
@@ -3835,6 +3860,56 @@ esac
     }
 
     // ── Path traversal security ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn server_tool_search_finds_catalog_tool() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:github"}))
+            .await;
+        assert!(
+            !result.is_error,
+            "tool_search must succeed for select:github"
+        );
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "select:github must resolve on server path; got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_resolves_plugin_after_install() {
+        let (exec, _dir) = test_executor();
+        let plugin = json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expr": {"type": "string"}},
+                    "required": ["expr"]
+                }
+            }
+        });
+        exec.set_plugin_schemas(vec![plugin]);
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "plugin must resolve after set_plugin_schemas on server path; got: {}",
+            result.output
+        );
+        assert_eq!(
+            parsed["matches"][0]["name"].as_str(),
+            Some("mcp__calculator")
+        );
+    }
 
     #[tokio::test]
     async fn ask_user_returns_structured_response_from_gate() {

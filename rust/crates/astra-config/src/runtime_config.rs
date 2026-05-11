@@ -75,6 +75,12 @@ pub struct RuntimeConfig {
     /// opt in explicitly.
     #[serde(default)]
     pub fork_prefix: ForkPrefixConfig,
+
+    /// Tool surface configuration — which tools are pinned into the
+    /// LLM `tools[]` array vs. exposed through the deferred
+    /// system-reminder listing. See [`ToolSurfaceConfig`].
+    #[serde(default)]
+    pub tool_surface: ToolSurfaceConfig,
 }
 
 // ─── Fork-Prefix Configuration ───────────────────────────────────────────────
@@ -233,8 +239,41 @@ impl Default for RuntimeConfig {
             adaptive_tuning: AdaptiveTuningConfig::default(),
             safety: SafetyConfig::default(),
             fork_prefix: ForkPrefixConfig::default(),
+            tool_surface: ToolSurfaceConfig::default(),
         }
     }
+}
+
+// ─── Tool Surface Configuration ──────────────────────────────────────────────
+
+/// User-editable tool surfacing policy.
+///
+/// The runtime exposes tools to the LLM in two tiers:
+///
+/// - **Pinned** — schemas live in the request `tools[]` array on every turn.
+///   Small set, byte-stable across a session so the Anthropic prompt cache
+///   hits. Default = 11 coding-core tools (see runtime `DEFAULT_PINNED`).
+/// - **Deferred** — every other tool appears as `name + short_desc` in a
+///   system-reminder block. The model calls `tool_search(query="select:X")`
+///   to pull a schema into context when it needs X.
+///
+/// Entries in `pinned_tools`:
+/// - A plain name (e.g. `"github"`) *adds* that tool to the pinned set.
+/// - A name prefixed with `-` (e.g. `"-grep"`) *removes* a default from the
+///   pinned set (it lands in deferred instead).
+/// - Unknown names are silently ignored.
+///
+/// Example `runtime.toml`:
+/// ```toml
+/// [tool_surface]
+/// pinned_tools = ["github", "memory", "-grep"]
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolSurfaceConfig {
+    /// Tools to pin into the LLM `tools[]` array. Additive over defaults;
+    /// `"-name"` removes a default.
+    #[serde(default)]
+    pub pinned_tools: Vec<String>,
 }
 
 // ─── Compression Configuration ───────────────────────────────────────────────
@@ -1335,6 +1374,20 @@ impl RuntimeConfig {
     /// Load configuration from default paths.
     ///
     /// Loads in order (later overrides earlier):
+    /// Return a process-wide cached `RuntimeConfig`.
+    ///
+    /// Use this for hot-path reads (per turn / per tool call). `load()`
+    /// does sync filesystem I/O and TOML parsing — cheap once, wasteful
+    /// repeated. Config is effectively static for the process lifetime;
+    /// a restart picks up file edits.
+    ///
+    /// Use `load()` only at session/process boundary or in tests that
+    /// deliberately want a fresh parse.
+    pub fn cached() -> &'static Self {
+        static CACHED: std::sync::OnceLock<RuntimeConfig> = std::sync::OnceLock::new();
+        CACHED.get_or_init(Self::load)
+    }
+
     /// 1. Built-in defaults
     /// 2. ~/.astra/config/runtime.toml
     /// 3. .astra/config/runtime.toml
@@ -1346,19 +1399,35 @@ impl RuntimeConfig {
         // User-level config
         if let Some(home) = dirs::home_dir() {
             let user_config = home.join(".astra/config/runtime.toml");
-            if let Ok(content) = std::fs::read_to_string(&user_config)
-                && let Ok(user) = toml::from_str::<RuntimeConfig>(&content)
-            {
-                config = config.merge(user);
+            if let Ok(content) = std::fs::read_to_string(&user_config) {
+                match toml::from_str::<RuntimeConfig>(&content) {
+                    Ok(user) => config = config.merge(user),
+                    Err(err) => {
+                        // Malformed TOML silently falling back to defaults
+                        // was the #1 footgun in the P1 review — now logged.
+                        tracing::warn!(
+                            path = %user_config.display(),
+                            error = %err,
+                            "invalid runtime.toml at user config path; falling back to defaults"
+                        );
+                    }
+                }
             }
         }
 
         // Project-level config
         let project_config = PathBuf::from(".astra/config/runtime.toml");
-        if let Ok(content) = std::fs::read_to_string(&project_config)
-            && let Ok(project) = toml::from_str::<RuntimeConfig>(&content)
-        {
-            config = config.merge(project);
+        if let Ok(content) = std::fs::read_to_string(&project_config) {
+            match toml::from_str::<RuntimeConfig>(&content) {
+                Ok(project) => config = config.merge(project),
+                Err(err) => {
+                    tracing::warn!(
+                        path = %project_config.display(),
+                        error = %err,
+                        "invalid runtime.toml at project config path; falling back to defaults"
+                    );
+                }
+            }
         }
 
         // Environment overrides
@@ -1415,6 +1484,7 @@ impl RuntimeConfig {
             adaptive_tuning,
             safety,
             fork_prefix,
+            tool_surface,
         } = other;
 
         merge_if_non_default(&mut self.version, version, default_config_version());
@@ -1872,6 +1942,15 @@ impl RuntimeConfig {
             self.fork_prefix = fork_prefix;
         }
 
+        // ToolSurfaceConfig: whole-struct replacement when `other` is
+        // non-empty. `pinned_tools` is a user-expressed override list —
+        // additive merge would let a project config silently inherit a
+        // user's pins, which is surprising. Treat it atomically: if the
+        // project (or env) file sets it, it wins outright.
+        if !tool_surface.pinned_tools.is_empty() {
+            self.tool_surface = tool_surface;
+        }
+
         self
     }
 
@@ -2157,6 +2236,7 @@ mod tests {
             },
             safety: SafetyConfig::default(),
             fork_prefix: ForkPrefixConfig::default(),
+            tool_surface: ToolSurfaceConfig::default(),
         });
 
         assert_eq!(merged.version, "2.0");

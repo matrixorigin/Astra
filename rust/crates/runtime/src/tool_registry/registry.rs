@@ -667,31 +667,34 @@ impl ToolRegistry {
         TOOL_CATALOG.iter().filter(|t| !t.pinned).count()
     }
 
-    /// Register plugin tools from a PluginRegistry, merging their schemas
-    /// into the active tool set. Rebuilds internal indexes.
+    /// Register plugin tools from a PluginRegistry.
     ///
-    /// This is the bridge between dynamic skill/plugin registration and
-    /// the production tool selection pipeline.
+    /// Post-Phase-5 contract:
+    /// plugin schemas become **lookup-able** (the executor can dispatch
+    /// them, `tool_search(select:NAME)` can return them), but they do
+    /// NOT join the selector's dynamic-candidate list. Plugins default
+    /// to the deferred listing; the user must explicitly pin them via
+    /// `runtime.tool_surface.pinned_tools` to put them in `tools[]`.
+    ///
+    /// This keeps the Anthropic prompt-cache prefix byte-stable across
+    /// plugin registration — previously a single `register_plugins`
+    /// call pushed the plugin into `plugin_tool_names`, which
+    /// `budget_select_measured` then stuffed into every turn's `tools[]`,
+    /// silently busting the cache boundary for the rest of the session.
     pub fn register_plugins(&mut self, plugins: &super::plugin::PluginRegistry) {
         let plugin_schemas = plugins.schemas();
         if plugin_schemas.is_empty() {
             return;
         }
-        // Track plugin tool names for inclusion in selection
-        for schema in &plugin_schemas {
-            if let Some(name) = schema
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-            {
-                self.plugin_tool_names.push(name.to_string());
-            }
-        }
+        // Plugins are looked up by name (for executor dispatch and
+        // `tool_search(select:NAME)`) but intentionally NOT added to
+        // `plugin_tool_names` — that field drives `budget_select_measured`,
+        // which puts names into `tools[]`. Plugins live in the deferred
+        // listing instead.
         self.all_schemas.extend(plugin_schemas);
         // Rebuild indexes to include the new schemas
         self.measured_costs = Self::measure_all_schemas(&self.all_schemas);
         self.schema_index = Self::build_schema_index(&self.all_schemas);
-        // Pinned schemas don't change (plugins are never pinned in catalog)
     }
 
     /// Inject a single tool schema dynamically (e.g. the `skill` or `delegate` tool).

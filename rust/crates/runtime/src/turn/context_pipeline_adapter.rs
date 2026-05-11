@@ -154,23 +154,20 @@ pub(crate) fn build_external_sources(
                     as std::sync::Arc<dyn astra_turn_core::spill_backend::SpillBackend>
             });
 
-    // Skill listing — per-turn ranked shortlist of available skills, based
-    // on the current user message. Previously injected post-pipeline as a
-    // `role: system` message and folded into `body.system[]` via
-    // `consolidate_system_messages`. Routing it through the pipeline's
-    // volatile lane keeps the same cache behaviour (it lands in
-    // RuntimeVolatile / None scope) but makes the pipeline the single
-    // owner of system-block content — simpler to reason about where each
-    // byte of the system prompt comes from.
+    // Phase-9: skill listing moved from volatile to session-stable.
+    // `state.skills.listing_message` now holds the `<available_skills>`
+    // block produced by `build_skill_listing_section` (CacheScope::Session).
+    // We push it into `extra_stable_sections` so it rides the cached
+    // prefix. No per-turn reranking.
     let skill_listing_extra = state.skills.listing_message.as_ref().and_then(|listing| {
         listing
             .get("content")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(|s| {
-                crate::prompts::PromptSection::dynamic(
+                crate::prompts::PromptSection::stable(
                     s.to_string(),
-                    crate::prompts::PromptTokenBucket::Environment,
+                    crate::prompts::CacheScope::Session,
                 )
             })
     });
@@ -193,6 +190,13 @@ pub(crate) fn build_external_sources(
         ));
     }
 
+    // Phase-9: promote skill listing into the stable lane so it joins the
+    // session-cached prefix.
+    let mut extra_stable_sections = extra_stable_sections;
+    if let Some(section) = skill_listing_extra {
+        extra_stable_sections.push(section);
+    }
+
     ExternalSources {
         memory_entries,
         spill_dir: None,
@@ -202,16 +206,12 @@ pub(crate) fn build_external_sources(
         system_override,
         plan_context,
         tool_guidance,
-        // Adapter path (ServerAgenticLoopHost) puts environment_static
-        // here so it lands in the cached Session prefix.
+        // Stable lane: environment_static + skill listing (Session scope).
         extra_stable_sections,
-        // Volatile lane: environment_volatile (git state), skill
-        // listing. None-scope so churn doesn't invalidate the cached
-        // prefix.
-        extra_dynamic_sections: {
-            extra_dynamic_sections.extend(skill_listing_extra);
-            extra_dynamic_sections
-        },
+        // Volatile lane: environment_volatile (git state). None-scope so
+        // churn doesn't invalidate the cached prefix. Skill listing used
+        // to ride this lane too; moved to stable in Phase-9.
+        extra_dynamic_sections,
     }
 }
 
@@ -363,6 +363,8 @@ pub(crate) fn build_session_context(
             ..Default::default()
         },
         self_model: None,
+        deferred_tools_block: String::new(),
+        skill_listing_block: String::new(),
     }
 }
 

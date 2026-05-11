@@ -404,22 +404,14 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     }
 
     if let Some(resolver) = &state.skills.resolver {
-        let full = resolver.available_skills();
-        if !full.is_empty() {
-            let (visible, open_skill_name, _telemetry) =
-                crate::turn::skill_tool::visible_skills_for_host_turn(
-                    &full,
-                    state.message.as_str(),
-                    &state.skills.quality_tracker,
-                    &state.skills.pinned,
-                    &state.skills.discovered,
-                    &state.skills.invoked,
-                    &state.skills.search,
-                );
-            host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
-                &visible,
-                open_skill_name,
-            ));
+        // Phase-9: `skill_tool_schema_v2` is a byte-stable constant — it
+        // takes no skill list and advertises `skill_name` as an open
+        // string. The catalog is surfaced via `<available_skills>` in the
+        // session-cached prompt prefix (see `build_skill_listing_section`),
+        // so adding/removing a skill no longer perturbs the tool schema
+        // bytes.
+        if !resolver.available_skills().is_empty() {
+            host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
         }
     }
 
@@ -789,37 +781,38 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
 
     if let Some(resolver) = &state.skills.resolver {
+        // Phase-9: skill listing moves from per-turn volatile to
+        // session-stable. The full skill catalog is rendered via
+        // `build_skill_listing_section` (CacheScope::Session) and hosted
+        // inside the ProjectContext binding. No per-turn reranking:
+        // the model reads the list and picks.
+        //
+        // We still populate `listing_message` as a rendered `role: system`
+        // value for downstream adapters (introspect tooling, tests) so
+        // they don't need to know about the cache-scope plumbing.
         let full = resolver.available_skills();
         state.skills.listing_message = if full.is_empty() {
             None
         } else {
-            let (visible, open_skill_name, telemetry) =
-                crate::turn::skill_tool::visible_skills_for_host_turn(
-                    &full,
-                    state.message.as_str(),
-                    &state.skills.quality_tracker,
-                    &state.skills.pinned,
-                    &state.skills.discovered,
-                    &state.skills.invoked,
-                    &state.skills.search,
-                );
-            let shortlist = crate::turn::skill_tool::build_skill_selector_shortlist_trace(
-                &visible,
-                open_skill_name,
-                telemetry,
-            );
+            // Telemetry: record the shortlist once per session for
+            // observability. Marks every skill visible (no ranking).
             if state.telemetry.initial_skill_selector_shortlist.is_none() {
+                let shortlist = crate::turn::skill_tool::build_skill_selector_shortlist_trace(
+                    &full,
+                    /* open_skill_name */ true,
+                    Default::default(),
+                );
                 if let Some(ref collector) = state.telemetry.turn_trace_collector {
                     collector.record_skill_selector(shortlist.clone());
                 }
                 state.telemetry.initial_skill_selector_shortlist = Some(shortlist);
             }
-            Some(crate::turn::skill_tool::skill_listing_system_message(
-                &visible,
-                Some(&state.skills.quality_tracker),
-                Some(&state.skills.pinned),
-                open_skill_name,
-            ))
+            crate::prompts::build_skill_listing_section(&full).map(|section| {
+                serde_json::json!({
+                    "role": "system",
+                    "content": section.text,
+                })
+            })
         };
     }
 

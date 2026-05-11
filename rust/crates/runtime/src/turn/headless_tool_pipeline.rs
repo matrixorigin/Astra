@@ -19,6 +19,80 @@ mod execute;
 mod policy;
 mod record;
 
+/// Compute the set of tool names the validator should admit.
+///
+/// Pre-phase-4 the validator gated strictly on `visible` (the names in the
+/// LLM request's `tools[]` array). That blocks the deferred-activation flow:
+/// the model calls `tool_search(select:WebFetch)`, learns the schema, and on
+/// the next turn tries to call `WebFetch` — which is not in `tools[]`
+/// because the whole point of deferred is to keep `tools[]` byte-stable.
+///
+/// New rule: admit anything in `visible` **or** in the full catalog. The
+/// executor already dispatches by name; if a name is dispatchable, a legit
+/// tool call with that name should proceed regardless of `tools[]` contents.
+/// Hallucinated names (neither visible nor cataloged) stay rejected.
+pub fn admissible_tool_names(
+    visible: &HashSet<String>,
+    full_catalog: &HashSet<String>,
+) -> HashSet<String> {
+    let mut out = HashSet::with_capacity(visible.len() + full_catalog.len());
+    out.extend(visible.iter().cloned());
+    out.extend(full_catalog.iter().cloned());
+    out
+}
+
+/// Production-facing wrapper: the validator caller typically has the
+/// turn's visible tool schemas (slice of JSON values) and needs the final
+/// admitted name set. Folds in the static `TOOL_CATALOG` so every
+/// dispatchable name is accepted, not just visible ones.
+///
+/// Wire this at `server_loop_host::sync_valid_tools_to_visible` (and any
+/// equivalent CLI-side path). The deferred-activation flow depends on it.
+pub fn admissible_tool_names_from_visible(
+    visible_schemas: &[serde_json::Value],
+) -> HashSet<String> {
+    admissible_tool_names_from_visible_and_extras(visible_schemas, &[])
+}
+
+/// Like [`admissible_tool_names_from_visible`] but also admits names from
+/// an `extras` list — used to surface runtime-injected schemas (`skill`,
+/// `spawn_agent`, `web_search`, `task`, `notify`, `ask_user`) and
+/// plugin-registered MCP tools that don't live in the static
+/// `TOOL_CATALOG`. Without this escape hatch the validator would reject
+/// tool calls for names the executor can dispatch.
+pub fn admissible_tool_names_from_visible_and_extras(
+    visible_schemas: &[serde_json::Value],
+    extras: &[String],
+) -> HashSet<String> {
+    let visible: HashSet<String> = visible_schemas
+        .iter()
+        .filter_map(|s| {
+            s.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .map(String::from)
+        })
+        .collect();
+    let catalog: HashSet<String> = catalog_names_static().iter().cloned().collect();
+    let mut out = admissible_tool_names(&visible, &catalog);
+    out.extend(extras.iter().cloned());
+    out
+}
+
+/// Cached `TOOL_CATALOG` names as owned Strings. Built once per process
+/// so `admissible_tool_names_from_visible` doesn't re-allocate 19+ Strings
+/// per tool round.
+fn catalog_names_static() -> &'static [String] {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<String>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        astra_turn_core::tool_registry_meta::TOOL_CATALOG
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect()
+    })
+}
+
 pub(crate) struct HeadlessResolvedExecution {
     id: String,
     name: String,
@@ -1223,6 +1297,92 @@ mod tests {
         assert_eq!(h.total_failures, 1);
         assert_eq!(h.consecutive_failures, 1);
         assert!(!h.deprioritized, "1 failure should not deprioritize yet");
+    }
+
+    /// P0-T contract: the real validator must admit a deferred catalog
+    /// tool even when it's NOT in `valid_tool_names` from visible. This
+    /// simulates turn N+1 of the activation flow — where `github` was
+    /// just selected via `tool_search(select:github)` and the model is
+    /// invoking it, but visible tools[] still reflects the pinned slice.
+    #[tokio::test]
+    async fn validator_admits_deferred_catalog_tool_via_extras() {
+        let mut harness = PipelineHarness::new();
+        push_unknown_server_tool_call(&mut harness, "github");
+        begin_recorded_turn(&mut harness, 1);
+
+        // Build valid_tool_names the way production does: union of
+        // visible + catalog via the public helper. 'grep' is visible,
+        // 'github' is NOT visible but IS in TOOL_CATALOG → must be
+        // admitted.
+        let visible = vec![json!({"type": "function", "function": {"name": "grep"}})];
+        harness.valid_tool_names = super::admissible_tool_names_from_visible(&visible);
+        assert!(
+            harness.valid_tool_names.contains("github"),
+            "precondition: admissible set must include github"
+        );
+
+        let mut pipeline = harness.pipeline();
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+
+        // Before this fix: ShortCircuit (rejected as unknown).
+        // After: ValidatedExecution because the helper union includes
+        // 'github' from the catalog.
+        match result {
+            HeadlessPipelineStage::ShortCircuit => {
+                panic!("validator rejected deferred github — deferred activation flow is broken")
+            }
+            HeadlessPipelineStage::Continue(_) => {
+                // ok — admitted for execution.
+            }
+            HeadlessPipelineStage::AbortRound => {
+                panic!("validator aborted round on deferred github — unexpected")
+            }
+        }
+    }
+
+    /// Symmetric: a truly hallucinated name must still short-circuit.
+    #[tokio::test]
+    async fn validator_rejects_hallucinated_tool_even_with_admissible_helper() {
+        let mut harness = PipelineHarness::new();
+        push_unknown_server_tool_call(&mut harness, "definitely_made_up");
+        begin_recorded_turn(&mut harness, 1);
+
+        let visible = vec![json!({"type": "function", "function": {"name": "grep"}})];
+        harness.valid_tool_names = super::admissible_tool_names_from_visible(&visible);
+        assert!(
+            !harness.valid_tool_names.contains("definitely_made_up"),
+            "precondition: hallucinated name must NOT be admissible"
+        );
+
+        let mut pipeline = harness.pipeline();
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(
+            matches!(result, HeadlessPipelineStage::ShortCircuit),
+            "hallucinated tool must short-circuit; deferred-admission helper must not be a hole"
+        );
+    }
+
+    /// Extras path: plugin/runtime-injected names reach admissible via
+    /// `admissible_tool_names_from_visible_and_extras` and must be
+    /// admitted by the real validator.
+    #[tokio::test]
+    async fn validator_admits_plugin_name_via_extras() {
+        let mut harness = PipelineHarness::new();
+        push_unknown_server_tool_call(&mut harness, "mcp__weather");
+        begin_recorded_turn(&mut harness, 1);
+
+        let visible = vec![json!({"type": "function", "function": {"name": "grep"}})];
+        let extras = vec!["mcp__weather".to_string()];
+        harness.valid_tool_names =
+            super::admissible_tool_names_from_visible_and_extras(&visible, &extras);
+        assert!(harness.valid_tool_names.contains("mcp__weather"));
+
+        let mut pipeline = harness.pipeline();
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(
+            !matches!(result, HeadlessPipelineStage::ShortCircuit),
+            "plugin-registered tool must be admitted via extras"
+        );
     }
 
     #[tokio::test]

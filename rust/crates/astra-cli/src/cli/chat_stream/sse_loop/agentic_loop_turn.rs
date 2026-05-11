@@ -538,10 +538,16 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         );
 
         let conf = sel_result.confidence;
-        let (schemas, report) = tool_selector::resolve_schemas_with_pressure(
+        // Phase-8: honour `runtime.tool_surface.pinned_tools` from the user's
+        // TOML so `tools[]` reflects their config rather than baked defaults.
+        let surface_cfg = astra_config::runtime_config::RuntimeConfig::cached()
+            .tool_surface
+            .clone();
+        let (schemas, report) = tool_selector::resolve_schemas_with_surface(
             ctx.registry,
             &sel_result.tool_names,
             budget_pressure,
+            &surface_cfg,
         );
         (
             schemas,
@@ -581,10 +587,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             sel_result.selector_tokens_out,
         );
         let conf = sel_result.confidence;
-        let (mut selected, mut report) = tool_selector::resolve_schemas_with_pressure(
+        let surface_cfg = astra_config::runtime_config::RuntimeConfig::cached()
+            .tool_surface
+            .clone();
+        let (mut selected, mut report) = tool_selector::resolve_schemas_with_surface(
             ctx.registry,
             &sel_result.tool_names,
             budget_pressure,
+            &surface_cfg,
         );
         pin_invoked_tool_schemas(
             &mut selected,

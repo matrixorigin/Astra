@@ -95,6 +95,8 @@ impl MockLoopState {
                 ..Default::default()
             },
             self_model: None,
+            deferred_tools_block: String::new(),
+            skill_listing_block: String::new(),
         }
     }
 

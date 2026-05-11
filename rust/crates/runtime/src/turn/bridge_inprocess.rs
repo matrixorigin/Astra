@@ -68,6 +68,26 @@ use astra_turn_core::tool_schema_prune::prune_tool_schemas;
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 const ROOT_TURN_JOURNAL_HEADER: &str = "x-mo-root-turn-journal";
 
+/// Build a prompt section for the CLI-injected skill listing.
+///
+/// Returns `None` when the CLI didn't include a listing (no skills loaded
+/// this session). Returns a `CacheScope::Session` section otherwise, so
+/// the Anthropic prompt cache hits the full block. This was previously a
+/// `CacheScope::None` volatile section, which meant CLI users paid the
+/// ~2.5KB skill listing cost every turn.
+pub fn skill_listing_section_for_edge_profile(
+    raw: Option<&str>,
+) -> Option<crate::prompts::PromptSection> {
+    let text = raw?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(crate::prompts::PromptSection::stable(
+        text.to_string(),
+        crate::prompts::CacheScope::Session,
+    ))
+}
+
 /// Decide whether the bridge should run its own `prefetch_memories` call.
 ///
 /// Returns `false` (= skip) when the CLI has already injected
@@ -1278,16 +1298,19 @@ impl InProcessChatTurnBridge {
                 .unwrap_or_default();
 
             // ── Skill listing (injected by CLI via edge_profile) ──
-            // Previously injected as a leading role:system message (broke
-            // prefix cache on every turn because the skill selector re-ranks).
-            // Now routed through the volatile lane alongside other per-turn
-            // dynamic sections.
-            let skill_listing_hint = edge_profile
+            // Phase-9 fix: route to the session-stable lane so the
+            // Anthropic prompt cache hits the listing block. Previously
+            // this string went into `dynamic_sections` (volatile) which
+            // made CLI users' turn-to-turn cache miss the entire listing
+            // every round — the very regression the skill rewrite was
+            // meant to eliminate.
+            let skill_listing_hint_text = edge_profile
                 .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_SKILL_LISTING_TEXT)
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-                .map(|text| format!("\n\n{text}"))
-                .unwrap_or_default();
+                .map(String::from);
+            let skill_listing_section =
+                skill_listing_section_for_edge_profile(skill_listing_hint_text.as_deref());
 
             // Memory storage decisions are now fully LLM-driven via system
             // prompt rules. detect_store_signal keyword matching was removed.
@@ -1491,13 +1514,10 @@ impl InProcessChatTurnBridge {
                     ),
                 );
             }
-            if !skill_listing_hint.is_empty() {
-                dynamic_sections.push(
-                    prompts::PromptSection::dynamic(
-                        skill_listing_hint.clone(),
-                        prompts::PromptTokenBucket::Environment,
-                    ),
-                );
+            if let Some(section) = skill_listing_section.clone() {
+                // Session-scope: joins the cached prefix. Cache flips
+                // once when skill catalog changes, then stabilizes.
+                stable_sections.push(section);
             }
             if !tool_round_guidance.is_empty() {
                 dynamic_sections.push(
@@ -1543,6 +1563,28 @@ impl InProcessChatTurnBridge {
                 round_index,
                 &dynamic_sections,
             );
+            // Phase-6/8: compute the session-stable `<deferred_tools>` and
+            // `<available_skills>` blocks from the current surface so the
+            // LLM can discover non-pinned capabilities via
+            // `tool_search(select:NAME)`. Both blocks live in
+            // `CacheScope::Session` inside `bind_project_context`, so a
+            // change flips the cache once then stabilizes.
+            //
+            // `ToolSurfaceConfig` honours the user's `runtime.tool_surface`
+            // TOML: pinned_tools additive over defaults; `-name` removes a
+            // default. Loaded via the same `RuntimeConfig::load()` path as
+            // `tool_selection` above (line 1451) for consistency.
+            let surface_cfg = astra_config::runtime_config::RuntimeConfig::cached()
+                .tool_surface
+                .clone();
+            let deferred_block_str = {
+                use crate::tool_registry::surface::ToolSurface;
+                let surface = ToolSurface::build(edge_tools.clone(), &surface_cfg, &[]);
+                crate::prompts::build_deferred_tools_section(&surface)
+                    .map(|s| s.text)
+                    .unwrap_or_default()
+            };
+            let skill_block_str = String::new();
             let pipeline_outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome(
                 &tool_names,
                 &edge_tools,
@@ -1558,6 +1600,8 @@ impl InProcessChatTurnBridge {
                 edge_profile.get("cwd").and_then(Value::as_str),
                 edge_profile.get("git_branch").and_then(Value::as_str),
                 project_context,
+                &deferred_block_str,
+                &skill_block_str,
             );
             let system_msg = pipeline_outcome.primary_system;
             let dynamic_msg = pipeline_outcome.dynamic_system;
@@ -1954,7 +1998,10 @@ impl InProcessChatTurnBridge {
                         bridge_channel("self_awareness", &self_awareness_hint),
                         bridge_channel("memoria_insights", &memoria_insights_hint),
                         bridge_channel("recent_arg_hints", &recent_arg_hints_hint),
-                        bridge_channel("skill_listing", &skill_listing_hint),
+                        bridge_channel(
+                            "skill_listing",
+                            skill_listing_hint_text.as_deref().unwrap_or(""),
+                        ),
                         // lessons is CLI-owned and has no bridge source —
                         // emit an empty placeholder so the CLI observer
                         // (which only reads bridge fingerprints for

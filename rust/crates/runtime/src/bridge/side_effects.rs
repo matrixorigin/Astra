@@ -758,25 +758,22 @@ mod inprocess_hook_contract_tests {
     }
 
     fn build_hook_payload_with_derived_skill_metric() -> Value {
+        let section = crate::prompts::build_skill_listing_section(&[
+            crate::turn::skill_tool::SkillToolInfo {
+                name: "inspect".into(),
+                description: "inspect cluster".into(),
+                ..Default::default()
+            },
+            crate::turn::skill_tool::SkillToolInfo {
+                name: "deploy".into(),
+                description: "deploy service".into(),
+                aliases: vec!["ship-it".into()],
+                ..Default::default()
+            },
+        ])
+        .expect("skill listing section");
         let messages = vec![
-            crate::turn::skill_tool::skill_listing_system_message(
-                &[
-                    crate::turn::skill_tool::SkillToolInfo {
-                        name: "inspect".into(),
-                        description: "inspect cluster".into(),
-                        ..Default::default()
-                    },
-                    crate::turn::skill_tool::SkillToolInfo {
-                        name: "deploy".into(),
-                        description: "deploy service".into(),
-                        aliases: vec!["ship-it".into()],
-                        ..Default::default()
-                    },
-                ],
-                None,
-                None,
-                true,
-            ),
+            json!({"role": "system", "content": section.text}),
             json!({"role": "user", "content": "deploy the service"}),
         ];
         let tool_results: Vec<Value> = vec![json!({

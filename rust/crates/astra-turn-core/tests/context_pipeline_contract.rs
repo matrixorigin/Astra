@@ -48,6 +48,8 @@ fn build_sources() -> (
                 ..Default::default()
             },
             self_model: Some("Senior Rust agent.".into()),
+            deferred_tools_block: String::new(),
+            skill_listing_block: String::new(),
         },
         TurnState {
             messages: vec![serde_json::json!({"role": "user", "content": "hello"})],

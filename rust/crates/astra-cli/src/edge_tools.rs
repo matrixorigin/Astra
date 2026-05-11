@@ -544,6 +544,11 @@ pub struct ToolExecutor {
     self_mod_mutation_counter: std::sync::Mutex<(u32, u32)>,
     /// Shared tool executor for delegating unknown tools to astra-tools.
     default_executor: astra_tools::executor::DefaultToolExecutor,
+    /// Plugin-registered tool schemas (e.g. MCP servers). Joined with the
+    /// static catalog when `tool_search(select:X)` runs, so deferred
+    /// activation can reach plugin tools. Populated by the REPL after
+    /// `PluginRegistry::register` loads the user's skill manifests.
+    plugin_schemas: std::sync::RwLock<Vec<Value>>,
 }
 
 impl ToolExecutor {
@@ -568,6 +573,7 @@ impl ToolExecutor {
             )
             .build()
             .unwrap_or_else(|_| Client::new()),
+            plugin_schemas: std::sync::RwLock::new(Vec::new()),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
             preferred_repos: std::sync::Mutex::new(preferred_repos),
             budget_pressure: std::sync::Mutex::new(0.0),
@@ -634,6 +640,15 @@ impl ToolExecutor {
     pub fn with_spawn_context(mut self, ctx: agent_spawning::SpawnAgentContext) -> Self {
         self.spawn_context = Some(ctx);
         self
+    }
+
+    /// Install plugin-registered schemas so `tool_search(select:NAME)`
+    /// can resolve MCP / skill-backed tools. Called once at REPL start
+    /// after `PluginRegistry::register` loads manifests.
+    pub fn set_plugin_schemas(&self, schemas: Vec<Value>) {
+        if let Ok(mut guard) = self.plugin_schemas.write() {
+            *guard = schemas;
+        }
     }
 
     /// Set the shared context cache for cross-agent knowledge sharing.
@@ -1788,6 +1803,12 @@ impl ToolExecutor {
                 "bash" => self.bash(args),
                 #[cfg(windows)]
                 "powershell" => self.powershell(args),
+                // Activation primitive for the deferred tool layer.
+                // MUST use the CLI-side full catalog (`all_tool_schemas()`)
+                // so `select:NAME` can reach every cataloged tool — not
+                // just the 14 in `default_executor_tool_schemas()` that
+                // the fallback `default_executor.execute()` would hit.
+                "tool_search" => self.tool_search(args),
                 "read_file" => self.read_file(args),
                 "write_file" => {
                     // delete=true routes to delete_file handler
@@ -2050,11 +2071,10 @@ impl ToolExecutor {
                         "rollback_edits" => self.rollback_file_edits(args),
                         "ask_user" => self.ask_user(args),
                         "sleep" => self.sleep_tool(args).await,
-                        "tool_search" => self.tool_search(args),
                         "timeline" => self.render_session_timeline(args),
                         "summary" => self.render_session_summary(),
                         "history" => self.render_session_history(args),
-                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, tool_search, timeline, summary, history".to_string(),
+                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, timeline, summary, history".to_string(),
                         other => format!("Unknown session action: '{other}'"),
                     }
                 }
@@ -2627,6 +2647,112 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         (dir, executor)
+    }
+
+    // ── tool_search dispatch: CLI must route to the full catalog ───────
+    //
+    // Before this fix: `execute()` had no `"tool_search"` arm, so
+    // `default_executor.execute("tool_search")` was called. That uses
+    // `default_executor_tool_schemas()` — a 14-tool subset without
+    // github, memory, session, agent, lsp, symbols. CLI users hitting
+    // `tool_search(select:github)` got `missing:["github"]` and the
+    // entire deferred-activation flow was dead on CLI.
+
+    #[tokio::test]
+    async fn tool_search_select_github_returns_schema_on_cli_path() {
+        let executor = test_executor();
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:github"}),
+            )
+            .await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("tool_search must return valid JSON");
+        let missing = parsed["missing"].as_array().expect("missing field");
+        assert!(
+            missing.is_empty(),
+            "CLI tool_search(select:github) must resolve, not return missing; got: {out}"
+        );
+        let matches = parsed["matches"].as_array().expect("matches field");
+        assert_eq!(matches.len(), 1, "exactly one match; got: {out}");
+        assert_eq!(matches[0]["name"].as_str(), Some("github"));
+        assert!(
+            matches[0].get("parameters").is_some(),
+            "must include full parameters for activation"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_search_select_memory_returns_schema_on_cli_path() {
+        // memory is in DEFAULT_PINNED but deferred activation must still
+        // return its schema on demand. Tests that the CLI dispatch pool
+        // covers all pinned catalog tools.
+        let executor = test_executor();
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:memory"}),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed["missing"].as_array().unwrap().is_empty());
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("memory"));
+    }
+
+    #[tokio::test]
+    async fn tool_search_select_finds_plugin_schema_once_installed() {
+        // MCP / skill-backed plugins are installed via `set_plugin_schemas`
+        // at REPL startup. After install, `tool_search(select:mcp__X)`
+        // must resolve — that's the whole deferred activation contract
+        // for plugin tools.
+        let executor = test_executor();
+        let plugin = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__weather",
+                "description": "Get weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        });
+        executor.set_plugin_schemas(vec![plugin]);
+
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:mcp__weather"}),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "plugin must resolve after set_plugin_schemas; got: {out}"
+        );
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("mcp__weather"));
+        assert!(parsed["matches"][0].get("parameters").is_some());
+    }
+
+    #[tokio::test]
+    async fn tool_search_select_web_fetch_returns_schema_on_cli_path() {
+        // web_fetch is DEFERRED (not in DEFAULT_PINNED). The whole point
+        // of this test is to exercise the deferred activation flow.
+        let executor = test_executor();
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:web_fetch"}),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "select:web_fetch must resolve on CLI; got: {out}"
+        );
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("web_fetch"));
     }
 
     // ── introspect tool: first-turn behavior (regression guard) ────────
