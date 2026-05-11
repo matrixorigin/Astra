@@ -89,6 +89,29 @@ pub struct ToolExecutionOutcome {
 }
 
 impl ToolExecutionOutcome {
+    /// Construct a successful outcome. `is_error` is ALWAYS `false`.
+    ///
+    /// Use this for any non-error output, even strings that happen to start
+    /// with "Error" (e.g. `"Error code 0 (no change)"`, diff hunks quoting
+    /// compiler errors, log lines, etc.). For error outcomes use [`Self::error`].
+    pub fn ok(output: String) -> Self {
+        Self {
+            output,
+            tool_result_fields: None,
+            is_error: false,
+        }
+    }
+
+    /// DEPRECATED constructor retained for legacy call sites that still rely on
+    /// the "output starts with `Error`" heuristic to infer failure.
+    ///
+    /// **Do not use in new code.** Prefer [`Self::ok`] / [`Self::error`] so the
+    /// error flag is explicit at the call site. A successful output that
+    /// happens to start with the literal text `"Error"` would be misclassified
+    /// here — which is exactly the bug commit 454f9f47 set out to eliminate.
+    #[deprecated(
+        note = "prefer ToolExecutionOutcome::ok / ::error; prefix-inference misclassifies success strings that begin with 'Error'"
+    )]
     pub fn text(output: String) -> Self {
         let is_error = output.starts_with("Error");
         Self {
@@ -2273,7 +2296,7 @@ pub fn git_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecut
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if stderr.contains("nothing to commit") {
-                ToolExecutionOutcome::text("Nothing to commit — working tree clean".to_string())
+                ToolExecutionOutcome::ok("Nothing to commit — working tree clean".to_string())
             } else {
                 ToolExecutionOutcome::error(format!("Error: git commit failed: {}", stderr.trim()))
             }
@@ -2474,7 +2497,9 @@ pub fn git_stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecuti
             } else {
                 let err = stderr.trim();
                 if err.contains("No local changes") || err.contains("No stash entries") {
-                    ToolExecutionOutcome::text(err.to_string())
+                    // `err.to_string()` may or may not begin with "Error"; pass through
+                    // the gix error verbatim and flag as failure explicitly.
+                    ToolExecutionOutcome::error(err.to_string())
                 } else {
                     ToolExecutionOutcome::error(format!("Error: git stash {action} failed: {err}"))
                 }

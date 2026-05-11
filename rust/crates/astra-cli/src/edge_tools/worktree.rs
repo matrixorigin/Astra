@@ -844,7 +844,11 @@ impl ToolExecutor {
                     .and_then(Value::as_str)
                     .map(|path| self.normalize_worktree_path(Path::new(path)));
                 let mut output = super::git_gix::worktree_remove(&self.project_root, args);
-                if !output.starts_with("Error:")
+                // `worktree_remove` returns an "Error:" prefixed string on failure and a
+                // plain success string otherwise. Capture the failure flag BEFORE we
+                // append session-restore text (which would break prefix inference).
+                let is_error = output.starts_with("Error:");
+                if !is_error
                     && let Some(worktree_path) = normalized_path.as_ref()
                 {
                     self.remove_git_worktree_rollback(worktree_path);
@@ -854,7 +858,6 @@ impl ToolExecutor {
                         output.push_str(&format!("\n  Session restored to {original_root}"));
                     }
                 }
-                let is_error = output.starts_with("Error");
                 super::ToolExecutionOutcome {
                     output,
                     tool_result_fields: None,

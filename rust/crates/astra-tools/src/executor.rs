@@ -792,6 +792,26 @@ mod tests {
         assert_eq!(result.output, "fatal: git failed");
     }
 
+    #[test]
+    fn ok_outcome_with_error_prefixed_output_is_not_misclassified() {
+        // Regression: a successful tool result whose output happens to begin
+        // with the literal text "Error" (e.g. log lines, diff hunks quoting a
+        // compiler error, or a benign status like "Error code 0 (no change)")
+        // MUST NOT be flagged as a failure. The error bit is load-bearing for
+        // retry logic, hallucination detection, and UI badging.
+        let outcome = crate::git_gix::ToolExecutionOutcome::ok(
+            "Error code 0 (no change)\nAll fine.".to_string(),
+        );
+
+        let result = outcome_to_result(outcome);
+
+        assert!(
+            !result.is_error,
+            "ok() outcomes must stay successful even when output starts with 'Error'"
+        );
+        assert!(result.output.starts_with("Error code 0"));
+    }
+
     #[tokio::test]
     async fn dispatch_bash_reuses_identical_readonly_result() {
         // Cache-safe command: `pwd` — pure readonly, output depends
