@@ -79,12 +79,11 @@ type ServerSkillResolverBundle = (
 
 /// Build a user-scoped skill registry + resolver for server-side web runs.
 ///
-/// This path intentionally does **not** mount `LocalSkillProvider::standard()`.
-/// Local filesystem skills belong to CLI-only execution until they are imported
-/// into `skills_registry`. Web/runtime turns must resolve skills through the
-/// database provider so visibility is enforceable by `(created_by = user OR
-/// is_public = 1)` and a cloud session cannot accidentally see skills from the
-/// server operator's home directory.
+/// The visible catalog is assembled by `skills::catalog` and contains exactly:
+/// API-server HOME skills (`~/.astra/skills`, `~/.claude/skills`) plus database
+/// skills visible to the authenticated user. Request `allow_skills` is a
+/// selector/execution filter over that catalog, not a switch that enables the
+/// catalog.
 fn build_server_skill_resolver(
     skill_service: Option<Arc<dyn SkillService>>,
     user_id: &str,
@@ -92,38 +91,15 @@ fn build_server_skill_resolver(
 ) -> ServerSkillResolverBundle {
     use crate::turn::skill_tool::SkillResolver as _;
 
-    let Some(allow_skills) = allow_skills else {
-        return (None, None);
-    };
-    if allow_skills.is_empty() {
+    if matches!(allow_skills, Some(allow_skills) if allow_skills.is_empty()) {
         return (None, None);
     }
-    let Some(service) = skill_service else {
+    let Some(registry) =
+        crate::skills::catalog::build_server_visible_skill_registry(skill_service, user_id)
+    else {
         return (None, None);
     };
 
-    let mut registry = crate::skills::UnifiedSkillRegistry::new();
-    registry.add_provider(Box::new(crate::skills::DatabaseSkillProvider::new(
-        service,
-        user_id.to_string(),
-    )));
-    let registry = Arc::new(registry);
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let r = Arc::clone(&registry);
-        match handle.runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::MultiThread => {
-                let _ = tokio::task::block_in_place(|| handle.block_on(r.discover_all()));
-            }
-            _ => {
-                let _ = std::thread::scope(|s| {
-                    s.spawn(|| handle.block_on(r.discover_all())).join().ok()
-                });
-            }
-        }
-    }
-    if registry.is_empty() {
-        return (None, None);
-    }
     let resolver_impl = Arc::new(crate::skills::UnifiedSkillResolver::new(Arc::clone(
         &registry,
     )));
@@ -5294,6 +5270,35 @@ mod tests {
         }
 
         let svc = test_service().with_skill_service(Arc::new(MockSkillService));
+
+        let default_request = test_request("hello");
+        let default_state = svc.build_initial_state(
+            "test-user",
+            &default_request,
+            "session-1",
+            "run-1",
+            None,
+            None,
+        );
+        let default_resolver = default_state
+            .skills
+            .resolver
+            .as_ref()
+            .expect("default server resolver should include visible catalog");
+        let default_names: Vec<String> = default_resolver
+            .available_skills()
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+        assert!(
+            default_names.iter().any(|name| name == "remote-db"),
+            "expected database skill without request allow_skills filter: {default_names:?}"
+        );
+        assert!(
+            default_state.skills.registry_for_activation.is_some(),
+            "unfiltered server catalog should be available for conditional activation"
+        );
+
         let mut request = test_request("hello");
         request.allow_skills = Some(vec!["remote-db".to_string()]);
         let state =

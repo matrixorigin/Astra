@@ -1,9 +1,8 @@
 //! Local filesystem skill provider — discovers and loads skills from SKILL.md files.
 //!
-//! Scans standard directories (`.astra/skills/`, `.claude/skills/`, `skills/`,
-//! `~/.astra/skills/`, `~/.claude/skills/`) for skill directories containing a
-//! `SKILL.md` file. Claude Code skills are discovered automatically since both
-//! tools follow the Agent Skills open standard.
+//! Scans filesystem directories for skill directories containing a `SKILL.md`
+//! file. Claude Code skills are discovered automatically since both tools follow
+//! the Agent Skills open standard.
 
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -19,10 +18,26 @@ pub struct LocalSkillProvider {
 }
 
 impl LocalSkillProvider {
-    /// Create with standard search paths (`.astra/skills/`, `skills/`, `~/.astra/skills/`).
+    /// Create with standard CLI search paths.
+    ///
+    /// This includes project walk-up paths (`.astra/skills/`, `.claude/skills/`,
+    /// and `skills/`) plus user-level HOME paths. Use this for standalone CLI
+    /// execution, where project-local skills are part of the local workspace.
     pub fn standard() -> Self {
         Self {
             search_paths: loader::skill_search_paths(),
+        }
+    }
+
+    /// Create with only user-level HOME search paths.
+    ///
+    /// This is the provider API servers should use for their deployment-local
+    /// catalog. It deliberately does not walk the current working directory, so
+    /// a server launched from a repository cannot accidentally expose that
+    /// repository's project-local skills to every web user.
+    pub fn home_global() -> Self {
+        Self {
+            search_paths: loader::home_skill_search_paths(),
         }
     }
 

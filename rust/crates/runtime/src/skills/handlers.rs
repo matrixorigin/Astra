@@ -44,10 +44,13 @@ pub async fn list_skills_handler(
     headers: HeaderMap,
 ) -> Result<Json<SkillListRecord>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let result = state
-        .skill_service
-        .list_skills(user.user_id, query.limit, query.offset)
-        .await?;
+    let result = crate::skills::catalog::list_server_visible_skills(
+        state.skill_service.clone(),
+        &user.user_id,
+        query.limit,
+        query.offset,
+    )
+    .await?;
     Ok(Json(result))
 }
 

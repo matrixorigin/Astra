@@ -5024,6 +5024,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("stream should succeed");
@@ -5061,6 +5062,7 @@ mod tests {
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
+            None,
         )
         .await
         .expect("stream should succeed");

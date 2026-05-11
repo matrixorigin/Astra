@@ -210,7 +210,7 @@ Web UI MVP items:
 5. Stop button wired to run/session cancellation endpoint.
 6. Device revoke UI in settings/device list.
 7. Archived chats section plus read-only archived sessions and inline-confirmed permanent delete/clear-archive actions for chat lifecycle cleanup.
-8. Composer Skills picker: paginated/searchable skill selection for large skill catalogs; selected skills are sent as `allow_skills` and mirrored into `context.edge_profile.active_skills` for the runtime turn. The picker and runtime resolver read only database skills visible to the current user (`created_by = current_user OR is_public = 1`); CLI-local filesystem skills remain CLI-only until imported. Runtime does not enumerate the full skill catalog unless `allow_skills` is non-empty.
+8. Composer Skills picker: paginated/searchable skill selection for large skill catalogs; selected skills are sent as `allow_skills` and mirrored into `context.edge_profile.active_skills` for the runtime turn. The picker and runtime resolver read the same server-visible catalog: API-server HOME skills (`~/.astra/skills`, `~/.claude/skills`) plus database skills visible to the current user (`created_by = current_user OR is_public = 1`). CLI project-local filesystem skills remain CLI-only until imported. Runtime builds this resolver by default; `allow_skills` only filters it, and the LLM sees pinned/active skills plus the shared selector shortlist rather than the full catalog.
 
 Incremental v1 UI additions:
 

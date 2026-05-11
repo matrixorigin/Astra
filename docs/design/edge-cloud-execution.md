@@ -47,11 +47,11 @@ No single execution location works for everything. The agentic loop must be **sp
 
 Three related paths:
 
-1. **Model-facing index** — During `/chat/turn`, the **cloud** assembles context (including a **skill index** slice) from data in MatrixOne and related services. The edge sends messages + tool results; it does not hold the full server-side catalog in memory.
+1. **Model-facing index** — During `/chat/turn`, the **cloud** assembles context (including a **skill index** slice) from the server-visible catalog: API-server HOME skills plus user-visible MatrixOne skills. The edge sends messages + tool results; it does not hold the full server-side catalog in memory.
 
-2. **Edge `UnifiedSkillRegistry`** — The interactive CLI (`repl_runtime.rs`) registers **`LocalSkillProvider`** and **`BundledSkillProvider`**, runs **`discover_all()`**, and may add MCP skills. A **`DatabaseSkillProvider`** adapter exists but is **not** part of this default wiring; edge execution of `skill` therefore targets **filesystem/bundled/MCP** definitions unless extended.
+2. **Edge `UnifiedSkillRegistry`** — The interactive standalone CLI (`repl_runtime.rs`) registers **`LocalSkillProvider::standard()`** and **`BundledSkillProvider`**, runs **`discover_all()`**, and may add MCP skills. This includes project-local cwd walk-up skills that are intentionally not visible to Web unless published. Server-backed CLI/Web turns should instead use the API server catalog boundary.
 
-3. **HTTP catalog** — `GET /skills` (via `ThinClient`) supports slash commands, marketplace version checks, and registration flows. That is **on-demand** over the network, separate from the registry’s **`discover_all()`** cache refresh (e.g. after installing a skill).
+3. **HTTP catalog** — `GET /skills` (via `ThinClient`) supports slash commands, marketplace version checks, registration flows, and the Web composer picker. It returns the same server-visible catalog used by runtime selection: `~/.astra/skills`, `~/.claude/skills`, and `skills_registry` rows where `created_by = user OR is_public = 1`.
 
 For sync-oriented diagrams and resume/checkpoint behavior, see [`rust/docs/edge-cloud-sync-architecture.md`](../../rust/docs/edge-cloud-sync-architecture.md) §8.5.
 

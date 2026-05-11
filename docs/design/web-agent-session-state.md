@@ -2672,16 +2672,22 @@ Publish flow:
 
 Runtime visibility contract:
 
-- CLI-local filesystem skills are only discovered by local CLI flows. They are
-  not mounted in the web/runtime resolver unless they have been imported into
-  `skills_registry`.
-- Web/runtime skill catalog queries return active rows where
-  `created_by = current_user OR is_public = 1`. The same predicate is used by
-  HTTP list/detail/version endpoints and the runtime `allow_skills` resolver.
-- Runtime turns do not enumerate the full database skill catalog by default.
-  The server constructs a skill resolver only when the request carries an
-  explicit non-empty `allow_skills` list, keeping ordinary turns from scanning
-  large personal catalogs.
+- Standalone CLI discovers project-local filesystem skills from cwd walk-up
+  paths (`.astra/skills`, `.claude/skills`, and `skills/`). These project-local
+  skills are CLI-only unless imported into `skills_registry`.
+- API-server local skills are discovered independently by the server from the
+  server process HOME only: `~/.astra/skills` and `~/.claude/skills`. They have
+  no per-user ACL and are treated as deployment-level public skills for both Web
+  and server-backed CLI sessions.
+- Web/runtime skill catalog queries use the union:
+  `api_server_home_skills ∪ skills_registry(created_by = current_user) ∪
+  skills_registry(is_public = 1)`. The DB predicate is reused by HTTP
+  list/detail/version endpoints and the runtime resolver.
+- Runtime turns build the resolver by default from that visible catalog.
+  `allow_skills` is only a request-scoped filter over the visible catalog. The
+  LLM still receives only pinned/active skills plus the shared
+  `visible_skills_for_host_turn(...)` selector shortlist; full `SKILL.md`
+  content is injected only after the model calls the `skill` tool.
 - If a user-owned and public skill share a logical name, "latest by name"
   resolution prefers the user-owned row before comparing `created_at`. This
   prevents a newly published public skill from shadowing a user's private skill.
@@ -3542,7 +3548,8 @@ Exit criteria:
 - Add `skill_installations.scope`, active skill session state, and
   `user_skill_evaluations`.
 - Build skill CRUD/version/activate/install APIs.
-- Integrate personal skills into skill selector and context manifest.
+- Integrate personal skills and API-server HOME skills into the shared skill
+  selector and context manifest surface.
 - Add privacy/ownership checks and tests.
 
 Exit criteria:
