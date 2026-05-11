@@ -12,9 +12,7 @@
 //!   * Duplicate puts (same id + same body) are no-ops on the blob
 //!     but still record a metadata row, same as `put`.
 
-use astra_config::config_versions::{
-    ConfigVersionStore, LocalFileStore, PutMetadata, VersionId,
-};
+use astra_config::config_versions::{ConfigVersionStore, LocalFileStore, PutMetadata, VersionId};
 
 #[test]
 fn put_raw_toml_preserves_cloud_bytes() {

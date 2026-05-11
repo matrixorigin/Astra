@@ -65,6 +65,16 @@ impl VersionId {
     pub fn from_str_for_test(raw: &str) -> Self {
         VersionId(raw.to_string())
     }
+
+    /// Wrap an already-hashed id that arrived from an external source
+    /// (cloud pull, session journal event). The caller is responsible
+    /// for paying attention to whatever round-trip integrity check is
+    /// appropriate — `LocalFileStore::put_raw_toml` verifies the body
+    /// hashes back to this id on write. No format validation here:
+    /// content-addressed ids are opaque strings once produced.
+    pub fn from_wire_string(raw: String) -> Self {
+        VersionId(raw)
+    }
 }
 
 impl std::fmt::Display for VersionId {
@@ -241,6 +251,56 @@ impl LocalFileStore {
             }
         }
         Ok(out)
+    }
+}
+
+impl LocalFileStore {
+    /// Write a raw TOML blob under an externally-supplied version id.
+    ///
+    /// Used by the pull path (`astra config sync pull`) so
+    /// cloud-fetched bytes land byte-identical in the local store —
+    /// round-tripping through `RuntimeConfig` via `put` would
+    /// re-serialize with `to_string_pretty`, which can reorder
+    /// tables and change the content hash.
+    ///
+    /// Rejects `(id, body)` pairs whose hash does not match. This
+    /// is the content-addressed invariant the rest of the crate
+    /// relies on; we refuse to silently break it.
+    pub fn put_raw_toml(
+        &self,
+        id: &VersionId,
+        body: &str,
+        meta: PutMetadata,
+    ) -> Result<(), StoreError> {
+        let computed = VersionId::from_toml_bytes(body.as_bytes());
+        if &computed != id {
+            return Err(StoreError::CorruptIndex(format!(
+                "id/body hash mismatch: caller says {}, body hashes to {}",
+                id.as_str(),
+                computed.as_str()
+            )));
+        }
+        self.ensure_root()?;
+        let blob = self.blob_path(id);
+        if !blob.exists() {
+            let mut f = fs::File::create(&blob).map_err(|source| StoreError::Io {
+                path: blob.clone(),
+                source,
+            })?;
+            f.write_all(body.as_bytes())
+                .map_err(|source| StoreError::Io {
+                    path: blob.clone(),
+                    source,
+                })?;
+        }
+        let entry = IndexEntry {
+            id: id.clone(),
+            created_at: Some(Utc::now()),
+            source_session: meta.source_session,
+            parent: meta.parent,
+        };
+        self.append_index(&entry)?;
+        Ok(())
     }
 }
 

@@ -474,6 +474,7 @@ dependencies = [
 name = "astra-services"
 version = "0.1.0"
 dependencies = [
+ "astra-config",
  "astra-core",
  "astra-logging",
  "astra-turn-types",

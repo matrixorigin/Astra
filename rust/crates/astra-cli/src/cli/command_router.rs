@@ -1528,7 +1528,7 @@ pub(super) async fn execute_cli_command(
 
         // ── Config management ───────────────────────────────────────────
         Some(Command::Config(cfg_cmd)) => {
-            execute_config_command(cfg_cmd)?;
+            execute_config_command(cfg_cmd).await?;
             Ok(ExitCode::Success)
         }
     }
@@ -2504,13 +2504,13 @@ const KNOWN_SETTINGS: &[(&str, &str)] = &[
     ),
 ];
 
-fn execute_config_command(cmd: ConfigCmd) -> Result<(), String> {
+async fn execute_config_command(cmd: ConfigCmd) -> Result<(), String> {
     match cmd {
         ConfigCmd::List => config_list(),
         ConfigCmd::Get(args) => config_get(&args.key),
         ConfigCmd::Set(args) => config_set(&args.key, &args.value),
         ConfigCmd::ShowPolicy(args) => config_show_policy(args.model.as_deref(), args.json),
-        ConfigCmd::Version(sub) => config_version_dispatch(sub),
+        ConfigCmd::Version(sub) => config_version_dispatch(sub).await,
     }
 }
 
@@ -2519,7 +2519,7 @@ fn execute_config_command(cmd: ConfigCmd) -> Result<(), String> {
 /// unresolvable we surface that as an error instead of silently using
 /// the process cwd, which would mislead users about where their
 /// versions live.
-fn config_version_dispatch(sub: ConfigVersionCmd) -> Result<(), String> {
+async fn config_version_dispatch(sub: ConfigVersionCmd) -> Result<(), String> {
     use astra_config::config_version_cli::{
         format_current, format_version_diff, format_version_list, format_version_show,
     };
@@ -2548,7 +2548,46 @@ fn config_version_dispatch(sub: ConfigVersionCmd) -> Result<(), String> {
             println!("{id}");
             Ok(())
         }
+        ConfigVersionCmd::Pull(args) => config_version_pull(args.limit, &store).await,
     }
+}
+
+/// Fetch every cloud-mirrored config version for the current user
+/// and write blobs into the local version store. No-op when the
+/// cloud isn't configured (MATRIXONE_* unset / unreachable) —
+/// returns a clear error instead of hanging on a dead connection.
+async fn config_version_pull(
+    limit: i64,
+    local: &astra_config::config_versions::LocalFileStore,
+) -> Result<(), String> {
+    let settings = astra_runtime::matrix_settings_from_env()
+        .map_err(|e| format!("cloud not configured: {e} (set MATRIXONE_PASSWORD)"))?;
+    // Make sure the table exists — CLI clients against a fresh DB
+    // might arrive before the server's ensure_core_schema has ever
+    // run. ensure_core_schema connects once to bootstrap + applies
+    // the DDL; idempotent on re-runs.
+    astra_services::storage::ensure_core_schema(&settings, "mo_catalog")
+        .await
+        .map_err(|e| format!("schema sync failed: {e}"))?;
+    let pool = astra_core::SharedPool::new(&settings)
+        .await
+        .map_err(|e| format!("cloud connect failed: {e}"))?;
+    let user_id = astra_core::cli_user_id();
+    let outcome = astra_services::config_version_cloud::pull_all_into_local_store(
+        pool.get(),
+        &user_id,
+        local,
+        limit,
+    )
+    .await
+    .map_err(|e| format!("pull failed: {e}"))?;
+    println!(
+        "Pulled {fetched} versions from cloud ({written} new, {skipped} skipped).",
+        fetched = outcome.fetched,
+        written = outcome.written,
+        skipped = outcome.skipped_hash_mismatch
+    );
+    Ok(())
 }
 
 fn config_show_policy(model: Option<&str>, json: bool) -> Result<(), String> {

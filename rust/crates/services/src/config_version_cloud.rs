@@ -110,6 +110,84 @@ pub fn parse_config_version_row(row: &ConfigVersionRow) -> ConfigVersionRow {
 /// in queued-but-not-yet-flushed events.
 pub const CONFIG_VERSION_SAVED_EVENT_TYPE: &str = "config_version_saved";
 
+/// Outcome of a `pull_all` cycle — how many rows we fetched vs. how
+/// many actually landed (mismatch typically means the local store
+/// already had them; we dedup on blob presence).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullOutcome {
+    pub fetched: usize,
+    pub written: usize,
+    pub skipped_hash_mismatch: usize,
+}
+
+/// Fetch every config version for `user_id` from the cloud and write
+/// the blobs into `local`, deduping by content hash.
+///
+/// Uses a generous default limit (the full history) — the data volume
+/// is trivial (KBs per version, tens to hundreds of rows across a
+/// user's entire usage lifetime). `limit` is tunable so future callers
+/// can ask for "just the N most recent" without a schema change.
+///
+/// Rows whose TOML body does not hash to their advertised version_id
+/// are counted in `skipped_hash_mismatch` rather than propagated —
+/// one poisoned row must not sink the whole pull.
+pub async fn pull_all_into_local_store(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    local: &astra_config::config_versions::LocalFileStore,
+    limit: i64,
+) -> Result<PullOutcome, sqlx::Error> {
+    use sqlx::Row;
+
+    let rows = sqlx::query(CONFIG_VERSIONS_LIST_SQL)
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+    let fetched = rows.len();
+    let mut written = 0usize;
+    let mut skipped = 0usize;
+
+    for row in rows {
+        let version_id: String = row.try_get("version_id").unwrap_or_default();
+        let toml_body: String = row.try_get("toml_body").unwrap_or_default();
+        let first_seen_session: Option<String> = row.try_get("first_seen_session").ok();
+        if version_id.is_empty() || toml_body.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        let vid = astra_config::config_versions::VersionId::from_wire_string(version_id.clone());
+        let meta = astra_config::config_versions::PutMetadata {
+            source_session: first_seen_session,
+            parent: None,
+        };
+        match local.put_raw_toml(&vid, &toml_body, meta) {
+            Ok(()) => written += 1,
+            Err(astra_config::config_versions::StoreError::CorruptIndex(_)) => {
+                // Hash mismatch — skip and move on. A future
+                // `astra config sync doctor` command could flag these.
+                skipped += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "astra_services::config_version_cloud",
+                    version_id = %version_id,
+                    error = %e,
+                    "pull: failed to write version locally; skipping"
+                );
+                skipped += 1;
+            }
+        }
+    }
+
+    Ok(PullOutcome {
+        fetched,
+        written,
+        skipped_hash_mismatch: skipped,
+    })
+}
+
 /// Turn a queued `IngestionEvent` back into a typed row, iff it was
 /// produced by `IngestionEvent::for_config_version`. Returns `None`
 /// for any other event_type so the worker can cleanly decide whether

@@ -1136,6 +1136,15 @@ pub(crate) enum ConfigVersionCmd {
     Diff(ConfigVersionDiffArgs),
     /// Print the id of the config the current process would run under.
     Current,
+    /// Pull cloud-mirrored versions into the local store.
+    Pull(ConfigVersionPullArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConfigVersionPullArgs {
+    /// Maximum number of versions to pull (default: 500).
+    #[arg(long, default_value_t = 500)]
+    pub limit: i64,
 }
 
 #[derive(Args, Debug)]

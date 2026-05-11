@@ -1654,9 +1654,17 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
     run_migration(
         pool,
         11,
-        "add config_version_id pointer to agent_sessions",
+        "add config_version_id pointer column to agent_sessions",
         "ALTER TABLE agent_sessions \
-         ADD COLUMN config_version_id VARCHAR(24) DEFAULT NULL, \
+         ADD COLUMN config_version_id VARCHAR(24) DEFAULT NULL",
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        12,
+        "add config_version_id index on agent_sessions",
+        "ALTER TABLE agent_sessions \
          ADD INDEX idx_agent_sessions_config_version (config_version_id)",
     )
     .await?;
