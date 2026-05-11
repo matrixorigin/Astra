@@ -1211,15 +1211,9 @@ async fn main() {
     let resolved_model =
         cli_model.or_else(|| command_router::read_config_default_model().ok().flatten());
 
-    // Export the resolved model so slash commands (/config, /self budget)
-    // can surface the model-aware effective budget without threading the
-    // value through every handler. Scope is this process only; the REPL
-    // would set this once at startup.
-    if let Some(ref m) = resolved_model {
-        unsafe {
-            std::env::set_var("ASTRA_CLI_ACTIVE_MODEL", m);
-        }
-    }
+    // Make the resolved model available to slash commands that print
+    // model-aware diagnostics without mutating the process environment.
+    slash_config::set_active_model_for_display(resolved_model.clone());
 
     let use_tui = enable_tui
         && std::io::stdin().is_terminal()

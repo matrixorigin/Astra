@@ -48,6 +48,15 @@ pub enum OverlayError {
         expected: String,
         got: String,
     },
+    #[error("invalid range for {path}: {value} is not in [{min}, {max}]")]
+    InvalidRange {
+        path: String,
+        value: f64,
+        min: f64,
+        max: f64,
+    },
+    #[error("invalid config invariant: {0}")]
+    InvalidInvariant(String),
 }
 
 /// Interpret a `--settings` argument.
@@ -110,8 +119,14 @@ pub fn effective_budget_for_model(config: &RuntimeConfig, model: Option<&str>) -
 #[derive(Debug, Clone, PartialEq)]
 pub enum SettingKind {
     Bool,
-    Number { min: i64, max: i64 },
-    Enum { options: Vec<String> },
+    Number {
+        min: f64,
+        max: f64,
+        allow_fraction: bool,
+    },
+    Enum {
+        options: Vec<String>,
+    },
 }
 
 /// One row in the `/config edit` list.
@@ -147,8 +162,9 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             id: "token_budget.max_turn_input_tokens".to_string(),
             label: "Max turn input tokens".to_string(),
             kind: SettingKind::Number {
-                min: 8_000,
-                max: 2_000_000,
+                min: 8_000.0,
+                max: 2_000_000.0,
+                allow_fraction: false,
             },
             value: Value::from(config.token_budget.max_turn_input_tokens),
         },
@@ -156,8 +172,9 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             id: "token_budget.system_prompt_reserve".to_string(),
             label: "System prompt reserve tokens".to_string(),
             kind: SettingKind::Number {
-                min: 500,
-                max: 32_000,
+                min: 500.0,
+                max: 32_000.0,
+                allow_fraction: false,
             },
             value: Value::from(config.token_budget.system_prompt_reserve),
         },
@@ -165,8 +182,9 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             id: "token_budget.tools_reserve".to_string(),
             label: "Tools reserve tokens".to_string(),
             kind: SettingKind::Number {
-                min: 1_000,
-                max: 64_000,
+                min: 1_000.0,
+                max: 64_000.0,
+                allow_fraction: false,
             },
             value: Value::from(config.token_budget.tools_reserve),
         },
@@ -192,26 +210,42 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
         SettingItem {
             id: "context_window.compression_threshold_min".to_string(),
             label: "Compression threshold (min)".to_string(),
-            kind: SettingKind::Number { min: 0, max: 1 },
+            kind: SettingKind::Number {
+                min: 0.0,
+                max: 1.0,
+                allow_fraction: true,
+            },
             value: Value::from(config.context_window.compression_threshold_min),
         },
         SettingItem {
             id: "context_window.compression_threshold_max".to_string(),
             label: "Compression threshold (max)".to_string(),
-            kind: SettingKind::Number { min: 0, max: 1 },
+            kind: SettingKind::Number {
+                min: 0.0,
+                max: 1.0,
+                allow_fraction: true,
+            },
             value: Value::from(config.context_window.compression_threshold_max),
         },
         // ── Compression pipeline ──
         SettingItem {
             id: "compression.compression_threshold".to_string(),
             label: "Compression trigger fraction".to_string(),
-            kind: SettingKind::Number { min: 0, max: 1 },
+            kind: SettingKind::Number {
+                min: 0.0,
+                max: 1.0,
+                allow_fraction: true,
+            },
             value: Value::from(config.compression.compression_threshold),
         },
         SettingItem {
             id: "compression.preserve_recent_turns".to_string(),
             label: "Preserve recent turns".to_string(),
-            kind: SettingKind::Number { min: 1, max: 50 },
+            kind: SettingKind::Number {
+                min: 1.0,
+                max: 50.0,
+                allow_fraction: false,
+            },
             value: Value::from(config.compression.preserve_recent_turns),
         },
         SettingItem {
@@ -224,14 +258,22 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
         SettingItem {
             id: "memory.retrieval_top_k".to_string(),
             label: "Memory retrieval top-k".to_string(),
-            kind: SettingKind::Number { min: 1, max: 50 },
+            kind: SettingKind::Number {
+                min: 1.0,
+                max: 50.0,
+                allow_fraction: false,
+            },
             value: Value::from(config.memory.retrieval_top_k),
         },
         // ── Tool selection ──
         SettingItem {
             id: "tool_selection.max_tools".to_string(),
             label: "Max tools surfaced to the model".to_string(),
-            kind: SettingKind::Number { min: 1, max: 200 },
+            kind: SettingKind::Number {
+                min: 1.0,
+                max: 200.0,
+                allow_fraction: false,
+            },
             value: Value::from(config.tool_selection.max_tools),
         },
         SettingItem {
@@ -317,6 +359,25 @@ pub fn apply_edit(
             got: describe(v),
         })
     }
+    fn ensure_range(value: f64, min: f64, max: f64, path: &str) -> Result<(), OverlayError> {
+        if !value.is_finite() || value < min || value > max {
+            return Err(OverlayError::InvalidRange {
+                path: path.to_string(),
+                value,
+                min,
+                max,
+            });
+        }
+        Ok(())
+    }
+    fn ensure_threshold_order(min: f64, max: f64) -> Result<(), OverlayError> {
+        if min > max {
+            return Err(OverlayError::InvalidInvariant(format!(
+                "context_window.compression_threshold_min ({min}) must be <= context_window.compression_threshold_max ({max})"
+            )));
+        }
+        Ok(())
+    }
     fn describe(v: &Value) -> String {
         match v {
             Value::Null => "null".into(),
@@ -330,13 +391,19 @@ pub fn apply_edit(
 
     match id {
         "token_budget.max_turn_input_tokens" => {
-            config.token_budget.max_turn_input_tokens = as_u32(&new_value, id)?;
+            let n = as_u32(&new_value, id)?;
+            ensure_range(n as f64, 8_000.0, 2_000_000.0, id)?;
+            config.token_budget.max_turn_input_tokens = n;
         }
         "token_budget.system_prompt_reserve" => {
-            config.token_budget.system_prompt_reserve = as_u32(&new_value, id)?;
+            let n = as_u32(&new_value, id)?;
+            ensure_range(n as f64, 500.0, 32_000.0, id)?;
+            config.token_budget.system_prompt_reserve = n;
         }
         "token_budget.tools_reserve" => {
-            config.token_budget.tools_reserve = as_u32(&new_value, id)?;
+            let n = as_u32(&new_value, id)?;
+            ensure_range(n as f64, 1_000.0, 64_000.0, id)?;
+            config.token_budget.tools_reserve = n;
         }
         "context_window.adaptive" => {
             config.context_window.adaptive = as_bool(&new_value, id)?;
@@ -348,25 +415,39 @@ pub fn apply_edit(
             config.context_window.dynamic_compression = as_bool(&new_value, id)?;
         }
         "context_window.compression_threshold_min" => {
-            config.context_window.compression_threshold_min = as_f64(&new_value, id)?;
+            let n = as_f64(&new_value, id)?;
+            ensure_range(n, 0.0, 1.0, id)?;
+            ensure_threshold_order(n, config.context_window.compression_threshold_max)?;
+            config.context_window.compression_threshold_min = n;
         }
         "context_window.compression_threshold_max" => {
-            config.context_window.compression_threshold_max = as_f64(&new_value, id)?;
+            let n = as_f64(&new_value, id)?;
+            ensure_range(n, 0.0, 1.0, id)?;
+            ensure_threshold_order(config.context_window.compression_threshold_min, n)?;
+            config.context_window.compression_threshold_max = n;
         }
         "compression.compression_threshold" => {
-            config.compression.compression_threshold = as_f64(&new_value, id)?;
+            let n = as_f64(&new_value, id)?;
+            ensure_range(n, 0.0, 1.0, id)?;
+            config.compression.compression_threshold = n;
         }
         "compression.preserve_recent_turns" => {
-            config.compression.preserve_recent_turns = as_u32(&new_value, id)?;
+            let n = as_u32(&new_value, id)?;
+            ensure_range(n as f64, 1.0, 50.0, id)?;
+            config.compression.preserve_recent_turns = n;
         }
         "compression.preserve_tool_calls" => {
             config.compression.preserve_tool_calls = as_bool(&new_value, id)?;
         }
         "memory.retrieval_top_k" => {
-            config.memory.retrieval_top_k = as_u32(&new_value, id)?;
+            let n = as_u32(&new_value, id)?;
+            ensure_range(n as f64, 1.0, 50.0, id)?;
+            config.memory.retrieval_top_k = n;
         }
         "tool_selection.max_tools" => {
-            config.tool_selection.max_tools = as_u32(&new_value, id)?;
+            let n = as_u32(&new_value, id)?;
+            ensure_range(n as f64, 1.0, 200.0, id)?;
+            config.tool_selection.max_tools = n;
         }
         "tool_selection.prefer_recent_tools" => {
             config.tool_selection.prefer_recent_tools = as_bool(&new_value, id)?;

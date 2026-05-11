@@ -105,6 +105,31 @@ fn typing_a_letter_filters_the_list_to_matching_ids_or_labels() {
     );
 }
 
+#[test]
+fn backspace_preserves_selected_item_when_still_visible() {
+    let mut v = make_view();
+    for c in "compression_threshold".chars() {
+        v.handle_key(ch(c));
+    }
+    assert!(
+        v.visible_ids().len() >= 2,
+        "precondition: threshold filter should expose multiple related settings"
+    );
+
+    v.handle_key(key(KeyCode::Down));
+    let selected_before = v
+        .selected_id_for_test()
+        .expect("selection should point at a visible row");
+
+    v.handle_key(key(KeyCode::Backspace));
+
+    assert_eq!(
+        v.selected_id_for_test().as_deref(),
+        Some(selected_before.as_str()),
+        "Backspace should keep the highlighted setting stable when it remains visible"
+    );
+}
+
 // ─── dispatch by kind ───────────────────────────────────────────────────
 
 #[test]
@@ -343,6 +368,22 @@ fn save_prompt_preview_any_key_returns_to_prompt() {
 }
 
 #[test]
+fn save_prompt_esc_returns_to_edit_without_completing() {
+    let mut v = make_view();
+    enter_dirty_state(&mut v);
+
+    v.handle_key(key(KeyCode::Esc));
+
+    assert!(
+        !v.save_prompt_open_for_test(),
+        "Esc from the save prompt should close only the prompt"
+    );
+    assert_eq!(v.pending_action(), ConfigEditAction::None);
+    assert!(v.is_dirty(), "unsaved edits must remain available");
+    assert!(!v.is_complete(), "view should return to editing");
+}
+
+#[test]
 fn save_prompt_numeric_shortcuts_still_work_for_muscle_memory() {
     // The old 1/2/d/Esc shortcuts keep working so existing docs and
     // quick-path users aren't stranded by the new arrow UX.
@@ -400,6 +441,35 @@ fn number_edit_round_trips_and_marks_dirty() {
             .token_budget
             .max_turn_input_tokens,
         750_000
+    );
+}
+
+#[test]
+fn fractional_threshold_edit_round_trips_and_marks_dirty() {
+    let mut v = make_view();
+    v.select_by_id("context_window.compression_threshold_min");
+    v.handle_key(key(KeyCode::Enter));
+
+    for _ in 0..8 {
+        v.handle_key(key(KeyCode::Backspace));
+    }
+    for c in "0.85".chars() {
+        v.handle_key(ch(c));
+    }
+    v.handle_key(key(KeyCode::Enter));
+
+    assert!(
+        !v.has_inner_editor(),
+        "valid fractional threshold should close the number editor"
+    );
+    assert!(v.is_dirty());
+    let actual = v
+        .working_config_for_test()
+        .context_window
+        .compression_threshold_min;
+    assert!(
+        (actual - 0.85).abs() < f64::EPSILON,
+        "fractional threshold should round-trip, got {actual}"
     );
 }
 

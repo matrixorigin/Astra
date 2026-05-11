@@ -291,6 +291,7 @@ pub(super) async fn handle_slash_command(
             }
 
             state.model = Some(arg.to_string());
+            slash_config::set_active_model_for_display(Some(arg.to_string()));
             let base_model = astra_turn_core::thinking_config::resolve_model_thinking(arg).0;
             state.cached_pricing = slash_stats::fallback_pricing(base_model);
             state.context_budget = prompts::ContextBudget::from_runtime_config(

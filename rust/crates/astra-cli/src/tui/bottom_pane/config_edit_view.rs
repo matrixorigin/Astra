@@ -138,6 +138,11 @@ impl ConfigEditView {
     }
 
     #[cfg(test)]
+    pub(crate) fn selected_id_for_test(&self) -> Option<String> {
+        self.current_item().map(|i| i.id)
+    }
+
+    #[cfg(test)]
     pub(crate) fn select_by_id(&mut self, id: &str) {
         let catalog = build_settings_catalog(&self.working);
         let target = catalog.iter().position(|i| i.id == id);
@@ -195,19 +200,6 @@ impl ConfigEditView {
         self.inner = Some(editor);
     }
 
-    fn apply_inner_result(&mut self, item_id: String, value: Value) {
-        match apply_edit(self.working.clone(), &item_id, value) {
-            Ok(next) => self.working = next,
-            Err(_e) => {
-                // The per-kind editor's validator should have caught
-                // this; if apply_edit still rejects (type coercion
-                // quirk, e.g. Number out of u32 range), we drop the
-                // edit silently. A future refinement could surface a
-                // toast via the save-prompt footer area.
-            }
-        }
-    }
-
     fn handle_outer_key(&mut self, key: KeyEvent) {
         let filtered = self.filtered_catalog();
         let len = filtered.len().max(1);
@@ -237,8 +229,12 @@ impl ConfigEditView {
                 }
             }
             KeyCode::Backspace => {
+                let previous_id = self.current_item().map(|i| i.id);
                 self.filter.pop();
-                self.selected = 0;
+                let filtered = self.filtered_catalog();
+                self.selected = previous_id
+                    .and_then(|id| filtered.iter().position(|item| item.id == id))
+                    .unwrap_or(0);
             }
             KeyCode::Char(c) => {
                 self.filter.push(c);
@@ -375,8 +371,15 @@ impl BottomPaneView for ConfigEditView {
                 }
                 InnerOutcome::Accept(value) => {
                     let id = inner.item_id().to_string();
-                    self.inner = None;
-                    self.apply_inner_result(id, value);
+                    match apply_edit(self.working.clone(), &id, value) {
+                        Ok(next) => {
+                            self.working = next;
+                            self.inner = None;
+                        }
+                        Err(err) => {
+                            inner.set_error(err.to_string());
+                        }
+                    }
                 }
             }
             return;
@@ -538,7 +541,7 @@ impl ConfigEditView {
         ];
         let kind_desc = match &item.kind {
             SettingKind::Bool => "bool".to_string(),
-            SettingKind::Number { min, max } => format!("number  range {min}..={max}"),
+            SettingKind::Number { min, max, .. } => format!("number  range {min}..={max}"),
             SettingKind::Enum { options } => {
                 let shown: String = options
                     .iter()
@@ -614,6 +617,7 @@ trait InnerEditor: Send {
     fn item_id(&self) -> &str;
     fn hint_keys(&self) -> &'static str;
     fn kind_label(&self) -> &'static str;
+    fn set_error(&mut self, _message: String) {}
 }
 
 enum InnerOutcome {
@@ -718,15 +722,20 @@ struct NumberEditor {
     label: String,
     buffer: String,
     error: Option<String>,
-    min: i64,
-    max: i64,
+    min: f64,
+    max: f64,
+    allow_fraction: bool,
 }
 
 impl NumberEditor {
     fn new(item: &SettingItem) -> Self {
-        let (min, max) = match &item.kind {
-            SettingKind::Number { min, max } => (*min, *max),
-            _ => (i64::MIN, i64::MAX),
+        let (min, max, allow_fraction) = match &item.kind {
+            SettingKind::Number {
+                min,
+                max,
+                allow_fraction,
+            } => (*min, *max, *allow_fraction),
+            _ => (i64::MIN as f64, i64::MAX as f64, false),
         };
         let buffer = item
             .value_as_number()
@@ -745,21 +754,21 @@ impl NumberEditor {
             error: None,
             min,
             max,
+            allow_fraction,
         }
     }
 
     fn try_commit(&mut self) -> Option<Value> {
-        // Accept integer or integer-valued float; reject anything that
-        // would silently round. Range check against declared min/max.
+        // Accept fractions only for knobs declared as fractional. Integer
+        // knobs still reject values that would silently round.
         let parsed: Result<f64, _> = self.buffer.trim().parse();
         match parsed {
             Ok(n) if n.is_finite() => {
-                if n.fract() != 0.0 {
+                if !self.allow_fraction && n.fract() != 0.0 {
                     self.error = Some(format!("Fractional values not allowed: {}", self.buffer));
                     return None;
                 }
-                let as_i64 = n as i64;
-                if as_i64 < self.min || as_i64 > self.max {
+                if n < self.min || n > self.max {
                     self.error = Some(format!(
                         "Out of range: {} not in [{}, {}]",
                         self.buffer, self.min, self.max
@@ -767,7 +776,11 @@ impl NumberEditor {
                     return None;
                 }
                 self.error = None;
-                Some(Value::from(as_i64 as u64))
+                if self.allow_fraction {
+                    Some(Value::from(n))
+                } else {
+                    Some(Value::from(n as i64))
+                }
             }
             _ => {
                 self.error = Some(format!("Not a number: {}", self.buffer));
@@ -826,7 +839,14 @@ impl InnerEditor for NumberEditor {
                 InnerOutcome::Pending
             }
             KeyCode::Char(c) if c.is_ascii_digit() || c == '-' => {
-                self.buffer.push(c);
+                if c != '-' || (self.min < 0.0 && self.buffer.is_empty()) {
+                    self.buffer.push(c);
+                    self.error = None;
+                }
+                InnerOutcome::Pending
+            }
+            KeyCode::Char('.') if self.allow_fraction && !self.buffer.contains('.') => {
+                self.buffer.push('.');
                 self.error = None;
                 InnerOutcome::Pending
             }
@@ -838,10 +858,17 @@ impl InnerEditor for NumberEditor {
         &self.id
     }
     fn hint_keys(&self) -> &'static str {
-        "digits to edit · Backspace erase · Enter save · Esc cancel"
+        if self.allow_fraction {
+            "digits/decimal to edit · Backspace erase · Enter save · Esc cancel"
+        } else {
+            "digits to edit · Backspace erase · Enter save · Esc cancel"
+        }
     }
     fn kind_label(&self) -> &'static str {
         "number"
+    }
+    fn set_error(&mut self, message: String) {
+        self.error = Some(message);
     }
 }
 

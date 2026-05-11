@@ -106,6 +106,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             if !args.is_empty() {
                 // /model <name> — set directly
                 ctx.state.model = Some(args.to_string());
+                crate::slash_config::set_active_model_for_display(Some(args.to_string()));
                 ctx.bottom_pane.footer.model = Some(args.to_string());
                 ctx.show_response(format!("Set model to {args}"));
                 return SlashResult::Handled;
@@ -879,6 +880,7 @@ pub(crate) fn handle_view_result(
 
     // Model name → apply
     state.model = Some(name.to_string());
+    crate::slash_config::set_active_model_for_display(Some(name.to_string()));
     bottom_pane.footer.model = Some(name.to_string());
     chat_widget.commit_system(SystemCell::response(format!("Set model to {name}")));
 }

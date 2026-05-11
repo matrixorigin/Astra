@@ -180,11 +180,57 @@ fn catalog_items_carry_kind_matching_their_concrete_type() {
         .expect("must be present");
     match &budget.kind {
         SettingKind::Number { min, .. } => assert!(
-            *min >= 1000,
+            *min >= 1000.0,
             "budget lower bound must not allow values so small the turn cannot run"
         ),
         other => panic!("budget knob should be Number, got {other:?}"),
     }
+}
+
+#[test]
+fn fractional_threshold_knobs_accept_decimal_edits() {
+    let config = RuntimeConfig::default();
+    let updated = apply_edit(
+        config,
+        "context_window.compression_threshold_min",
+        serde_json::json!(0.85),
+    )
+    .expect("fractional threshold edit must succeed");
+
+    assert!((updated.context_window.compression_threshold_min - 0.85).abs() < f64::EPSILON);
+}
+
+#[test]
+fn apply_edit_rejects_fractional_threshold_outside_range() {
+    let config = RuntimeConfig::default();
+    let err = apply_edit(
+        config,
+        "compression.compression_threshold",
+        serde_json::json!(1.25),
+    )
+    .expect_err("thresholds are fractions and must stay within [0.0, 1.0]");
+
+    assert!(
+        err.to_string().to_lowercase().contains("range"),
+        "range violation should be explicit: {err}"
+    );
+}
+
+#[test]
+fn apply_edit_rejects_compression_threshold_min_above_max() {
+    let config = RuntimeConfig::default();
+    let err = apply_edit(
+        config,
+        "context_window.compression_threshold_min",
+        serde_json::json!(0.99),
+    )
+    .expect_err("min threshold must not exceed max threshold");
+
+    assert!(
+        err.to_string().to_lowercase().contains("min")
+            && err.to_string().to_lowercase().contains("max"),
+        "cross-field invariant should be clear: {err}"
+    );
 }
 
 #[test]
