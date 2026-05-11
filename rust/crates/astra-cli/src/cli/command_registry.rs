@@ -128,7 +128,6 @@ impl CommandMeta {
 const MODEL_SUBCOMMANDS: &[(&str, &str)] = &[
     ("info", "Show details for the current model"),
     ("list", "Open the picker to choose a model"),
-    ("set", "Switch model: /model set <name>"),
     ("clear", "Reset to the API default model"),
 ];
 
@@ -224,18 +223,18 @@ const MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
     ("search", "Search memories (needs query)"),
 ];
 
+// Subcommands surfaced by the `/session ` popup.  Kept tight so
+// completion shows only the high-value entry points; rarer
+// diagnostic forms (cleanup / drift / errors / trace / verify /
+// adaptive / switch) still work via the line-mode fallback but
+// aren't advertised — most users reach them through dedicated
+// slash commands or the /diag tooling instead.
 const SESSION_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("analyze", "Deep session diagnostics"),
-    ("cleanup", "Clean stale sessions"),
-    ("context", "Show context assembly trace"),
-    ("drift", "Inspect session drift signals"),
-    ("errors", "Session errors"),
-    ("export", "Export session"),
-    ("fork", "Fork session"),
-    ("history", "Session conversation history"),
-    ("list", "List journals"),
-    ("trace", "Toggle per-session full LLM capture"),
-    ("verify", "Verify session integrity"),
+    ("analyze", "Counter-only diagnostics for a session"),
+    ("export", "Write a markdown transcript to disk"),
+    ("fork", "Branch a parallel session from a parent"),
+    ("history", "Scroll a session's conversation history"),
+    ("list", "Pick a session to resume"),
 ];
 
 const DIFF_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -350,7 +349,7 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Core,
     )
     .with_subcommands(MODEL_SUBCOMMANDS)
-    .with_arg_hint("[info | list | set <name> | clear | <name>]"),
+    .with_arg_hint("[info | list | clear | <name>]"),
     CommandMeta::new("/clear", "Start a new session", CommandGroup::Core),
     CommandMeta::new("/undo", "Undo last turn(s): /undo [N]", CommandGroup::Core)
         .with_arg_hint("[N]"),
@@ -438,7 +437,7 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::SessionPlan,
     )
     .with_subcommands(SESSION_SUBCOMMANDS)
-    .with_arg_hint("[list | history | context | fork | analyze | export | …]"),
+    .with_arg_hint("[list | history | fork | analyze | export]"),
     CommandMeta::new(
         "/session history",
         "Session journal-style history",
@@ -1013,9 +1012,11 @@ mod tests {
         let subs = subcommand_completions("/session");
         assert!(subs.is_some());
         let subs = subs.unwrap();
-        assert!(subs.iter().any(|(tok, _)| *tok == "context"));
-        assert!(subs.iter().any(|(tok, _)| *tok == "drift"));
-        assert!(subs.iter().any(|(tok, _)| *tok == "trace"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "list"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "history"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "fork"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "analyze"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "export"));
     }
 
     #[test]
@@ -1059,7 +1060,7 @@ mod tests {
         // Commands with arg_hint defined in registry
         assert_eq!(
             get_arg_hint("/model"),
-            Some("[info | list | set <name> | clear | <name>]")
+            Some("[info | list | clear | <name>]")
         );
         assert_eq!(get_arg_hint("/undo"), Some("[N]"));
         assert_eq!(get_arg_hint("/resume"), Some("[session_id]"));

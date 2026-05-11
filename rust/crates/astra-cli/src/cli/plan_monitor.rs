@@ -677,6 +677,9 @@ fn display_plan_updates_live(
                         eprintln!("    {line}");
                         continue;
                     }
+                    // Plan monitor runs headless (no TUI cells) — the
+                    // progress ticks have no visual home here. Drop.
+                    StreamEvent::ToolOutput { .. } => continue,
                 }
             }
             PlanUpdate::ApprovalNeeded {

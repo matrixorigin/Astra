@@ -74,6 +74,9 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
             output_summary,
             output,
         }),
+        TuiAppEvent::ToolOutput { name, lines, bytes } => {
+            Some(AppEvent::ToolOutput { name, lines, bytes })
+        }
         TuiAppEvent::TurnComplete => Some(AppEvent::TurnComplete(Box::new(ctx.into_stats()))),
         TuiAppEvent::TurnError(msg) => Some(AppEvent::TurnError(msg)),
         // Bottom-pane-only events — ChatWidget doesn't care.

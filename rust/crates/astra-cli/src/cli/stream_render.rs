@@ -329,6 +329,75 @@ struct TurnRollbackFired {
 const EXECUTION_BOUNDARY_KIND_TOOL_BATCH: &str = "tool_batch";
 const EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK: &str = "turn_rollback";
 
+/// RAII guard: installs a `ToolProgressSink` on the edge
+/// `ToolExecutor`, spawns a ticker task that polls the sink every
+/// ~200ms and emits `StreamEvent::ToolOutput`, and on drop aborts
+/// the ticker + clears the sink. Scoped to a single `execute_tool`
+/// call so back-to-back bash invocations each get a fresh sink
+/// (counters restart from zero).
+struct BashProgressGuard {
+    executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
+    ticker: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl BashProgressGuard {
+    fn install(
+        executor: &std::sync::Arc<crate::edge_tools::ToolExecutor>,
+        tool_name: &str,
+        stream_event_tx: Option<&super::chat_stream::StreamEventTx>,
+    ) -> Self {
+        let sink = std::sync::Arc::new(super::chat_stream::ToolProgressSink::new());
+        executor.set_bash_progress_sink(Some(sink.clone()));
+
+        // Spawn the ticker only when there's an observer listening —
+        // otherwise we'd do ~5 sink reads/sec for nothing.
+        let ticker = stream_event_tx.cloned().map(|tx| {
+            let sink = sink.clone();
+            let name = tool_name.to_string();
+            tokio::spawn(async move {
+                let mut last = (0u64, 0u64);
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+                // Skip the first tick — it fires immediately and
+                // would emit a 0/0 snapshot before the tool has
+                // written anything.
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let (lines, bytes) = sink.snapshot();
+                    if (lines, bytes) == last {
+                        continue;
+                    }
+                    last = (lines, bytes);
+                    if tx
+                        .send(super::chat_stream::StreamEvent::ToolOutput {
+                            name: name.clone(),
+                            lines,
+                            bytes,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        });
+
+        Self {
+            executor: executor.clone(),
+            ticker,
+        }
+    }
+}
+
+impl Drop for BashProgressGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.ticker.take() {
+            h.abort();
+        }
+        self.executor.set_bash_progress_sink(None);
+    }
+}
+
 impl<'a> CliSseStreamHost<'a> {
     fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize, render_md: bool) -> Self {
         Self::from_edge_ctx_with_auth(ctx, term_width, render_md, None)
@@ -1708,6 +1777,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 description: tool_description.clone(),
             });
         }
+
+        // Install a bash progress sink + 200ms ticker for the TUI's
+        // live "streaming · N lines · K KB" counter. Bash is the
+        // only tool that streams stdout incrementally today — other
+        // tools are atomic and never emit progress. Cleanup (abort
+        // ticker, clear sink) happens unconditionally at the bottom
+        // of `execute_tool` via `_progress_guard`.
+        let _progress_guard = (tool == "bash").then(|| {
+            BashProgressGuard::install(&self.executor, tool, self.stream_event_tx.as_ref())
+        });
 
         // Clear text that was rendered or buffered BEFORE the first tool call
         // (intermediate draft). After first tool, keep buffering new text.

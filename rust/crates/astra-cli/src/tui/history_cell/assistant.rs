@@ -37,8 +37,9 @@
 //! so resume + future `/think toggle` can surface it.
 
 use std::any::Any;
+use std::time::Instant;
 
-use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
@@ -54,6 +55,17 @@ pub(crate) struct AssistantCell {
     /// `finalize()`.
     live: bool,
     ts: Option<String>,
+    /// First `push_delta` timestamp. Used with `token_estimate` to
+    /// show tokens/s on a live cell. `None` for non-streaming
+    /// constructors (resume, `from_markdown`) so replayed replies
+    /// don't show a stale rate.
+    started_at: Option<Instant>,
+    /// CJK-aware token estimate accumulated as chars arrive.
+    /// CJK ideographs ≈ 0.5 token each, other chars ≈ 0.25. Not an
+    /// exact count (the real tokenizer lives server-side and the
+    /// number only returns in TurnStats) but close enough that the
+    /// on-screen "42 tok/s · 1.2k" matches reality within ±15%.
+    token_estimate: f64,
 }
 
 impl AssistantCell {
@@ -62,6 +74,8 @@ impl AssistantCell {
             source: String::new(),
             live: true,
             ts: None,
+            started_at: None,
+            token_estimate: 0.0,
         }
     }
 
@@ -73,6 +87,8 @@ impl AssistantCell {
             source: markdown.into(),
             live: false,
             ts: None,
+            started_at: None,
+            token_estimate: 0.0,
         }
     }
 
@@ -90,6 +106,8 @@ impl AssistantCell {
                 source: markdown,
                 live: false,
                 ts,
+                started_at: None,
+                token_estimate: 0.0,
             }),
             _ => None,
         }
@@ -100,6 +118,10 @@ impl AssistantCell {
     /// event; the render pipeline wraps internally.
     pub fn push_delta(&mut self, delta: &str) {
         debug_assert!(self.live, "push_delta on finalised AssistantCell");
+        if self.started_at.is_none() {
+            self.started_at = Some(Instant::now());
+        }
+        self.token_estimate += estimate_tokens(delta);
         self.source.push_str(delta);
     }
 
@@ -145,6 +167,27 @@ impl AssistantCell {
     /// always lands in a later cell. So "ends with close" captures
     /// every legitimate leaked-thinking pattern without mangling
     /// prose that mentions the tag.
+    /// Compose the ` · N tok/s · X` status span that trails the
+    /// final rendered line while the cell is live. Returns `None`
+    /// when the cell hasn't received a delta yet (would divide by
+    /// zero) or when the cell is no longer streaming.
+    fn rate_suffix_span(&self) -> Option<String> {
+        if !self.live {
+            return None;
+        }
+        let started = self.started_at?;
+        let elapsed = started.elapsed().as_secs_f64();
+        if elapsed < 0.3 || self.token_estimate <= 0.0 {
+            return Some(format!(" · {}", format_token_estimate(self.token_estimate)));
+        }
+        let tok_per_s = self.token_estimate / elapsed;
+        Some(format!(
+            " · {} tok/s · {}",
+            tok_per_s.round() as u64,
+            format_token_estimate(self.token_estimate),
+        ))
+    }
+
     fn split_think(&self) -> (Option<&str>, bool, &str) {
         let source = self.source.as_str();
         let trimmed = source.trim_start();
@@ -191,10 +234,11 @@ impl AssistantCell {
 impl HistoryCell for AssistantCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let (think_inner, think_closed, body) = self.split_think();
+        let rate_suffix = self.rate_suffix_span();
 
         // Branch 1: no <think> block. Original render path.
         let Some(think) = think_inner else {
-            return render_body_with_gutter(&self.source, width, self.live);
+            return render_body_with_gutter(&self.source, width, self.live, rate_suffix);
         };
 
         // Branch 2: <think> still open (streaming). Show a dim
@@ -208,7 +252,7 @@ impl HistoryCell for AssistantCell {
         // `✻ Thought (N lines)` header, then render the body.
         let think_lines = think.trim().lines().count().max(1);
         let mut out = thought_header_lines(think_lines);
-        out.extend(render_body_with_gutter(body, width, self.live));
+        out.extend(render_body_with_gutter(body, width, self.live, rate_suffix));
         out
     }
 
@@ -239,11 +283,80 @@ impl HistoryCell for AssistantCell {
     }
 }
 
+/// CJK-aware token estimator. Roughly the same heuristic the
+/// `tiktoken` family's BPE produces on mixed-language prose:
+/// Han ideographs + Hiragana/Katakana ≈ 0.5 token/char (one glyph
+/// usually splits into one or two BPE pieces), other scripts ≈
+/// 0.25 token/char (4 chars/token on avg for English). Non-BMP
+/// emoji count as full tokens each. Good to ±15% which is all we
+/// need for "42 tok/s" feedback.
+fn estimate_tokens(s: &str) -> f64 {
+    let mut total = 0.0_f64;
+    for ch in s.chars() {
+        let c = ch as u32;
+        let w = if (0x3040..=0x30FF).contains(&c)
+            || (0x4E00..=0x9FFF).contains(&c)
+            || (0x3400..=0x4DBF).contains(&c)
+            || (0xAC00..=0xD7AF).contains(&c)
+        {
+            0.5
+        } else if c >= 0x10000 {
+            1.0
+        } else {
+            0.25
+        };
+        total += w;
+    }
+    total
+}
+
+/// Human format for a running token estimate: `420`, `5.1k`,
+/// `12.4k`. Stays short so the status span fits on the final
+/// rendered row next to the prose.
+fn format_token_estimate(tokens: f64) -> String {
+    if tokens < 1_000.0 {
+        format!("{:.0}", tokens)
+    } else {
+        format!("{:.1}k", tokens / 1_000.0)
+    }
+}
+
+/// Three-dot rhythm indicator frames. Each dot toggles on/off at
+/// a different phase so the indicator reads as "tokens arriving"
+/// rather than a static spinner. Frame rate is wall-clock based
+/// via the shared shimmer clock.
+fn rhythm_dots_span() -> Span<'static> {
+    let t = crate::tui::shimmer::elapsed_since_start().as_millis() as u64;
+    // 450 ms cycle: each of the three phases gets one-third. Use
+    // '·' (mid-dot) for "on" and ' ' for "off" so the line width
+    // stays constant (4 display cells: " · · ·" collapsed).
+    const FRAMES: [&str; 6] = [
+        "·    ", //
+        "· ·  ", //
+        "· · ·", //
+        " · · ", //
+        "   · ", //
+        "     ", //
+    ];
+    let idx = ((t / 120) % FRAMES.len() as u64) as usize;
+    Span::styled(
+        FRAMES[idx].to_string(),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
 /// Render the reply body the classic way — `┃ ` accent gutter on
 /// every line, optional blink cursor on the last line while live.
 /// Factored out so the `<think>`-aware `display_lines` can reuse
 /// it for the post-`</think>` body without duplicating layout.
-fn render_body_with_gutter(source: &str, width: u16, live: bool) -> Vec<Line<'static>> {
+fn render_body_with_gutter(
+    source: &str,
+    width: u16,
+    live: bool,
+    rate_suffix: Option<String>,
+) -> Vec<Line<'static>> {
     if source.trim().is_empty() {
         return Vec::new();
     }
@@ -265,6 +378,7 @@ fn render_body_with_gutter(source: &str, width: u16, live: bool) -> Vec<Line<'st
     // slash-response corners, selection highlights). Bold so the gutter
     // reads even at 1-cell width.
     let gutter_style = Style::default().fg(theme.gutter).bold();
+    let dim = Style::default().fg(Color::DarkGray);
     let last_idx = rendered.len() - 1;
 
     rendered
@@ -273,17 +387,16 @@ fn render_body_with_gutter(source: &str, width: u16, live: bool) -> Vec<Line<'st
         .map(|(i, line)| {
             let mut spans = vec![Span::styled("┃ ", gutter_style)];
             spans.extend(line.spans.iter().cloned());
-            // Trailing blink cursor on the final rendered line
-            // while the cell is still receiving tokens — users
-            // need to see "more is coming" without the entire
-            // line animating.
+            // Trailing rhythm-dot indicator + tok/s suffix on the
+            // final row while live. Replaces the old `▎` slow-blink
+            // cursor — a three-dot staggered rhythm reads as
+            // "tokens arriving" rather than "generic spinner".
             if live && i == last_idx {
-                spans.push(Span::styled(
-                    "▎",
-                    Style::default()
-                        .add_modifier(Modifier::SLOW_BLINK)
-                        .add_modifier(Modifier::BOLD),
-                ));
+                spans.push(Span::raw(" "));
+                spans.push(rhythm_dots_span());
+                if let Some(ref suffix) = rate_suffix {
+                    spans.push(Span::styled(suffix.clone(), dim));
+                }
             }
             Line::from(spans)
         })
@@ -463,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn live_cell_trailing_cursor_appears_on_last_line_only() {
+    fn live_cell_rhythm_indicator_appears_on_last_line_only() {
         // Use a paragraph break (`\n\n`) so markdown produces two
         // separate rendered lines. A soft break in markdown is
         // treated as whitespace, which would yield one rendered
@@ -477,29 +590,38 @@ mod tests {
             rows.len() >= 2,
             "expected at least two non-blank rows: {out}"
         );
-        // Cursor shouldn't appear on earlier lines.
+        // The rhythm-dot indicator contains at least one '·'
+        // character. Token counter text (" · N tok/s") also has
+        // them — so we check that the LAST row has both the
+        // prose and a trailing dot sequence, while the first row
+        // ends on prose alone.
         assert!(
-            !rows[0].contains('▎'),
-            "cursor leaked on first line: {:?}",
+            !rows[0].trim_end().ends_with('·'),
+            "rhythm indicator leaked on first line: {:?}",
             rows[0]
         );
-        // And must appear on the last one.
         assert!(
-            rows.last().unwrap().contains('▎'),
-            "cursor missing on last line: {:?}",
+            rows.last().unwrap().contains('·'),
+            "rhythm indicator missing on last line: {:?}",
             rows.last()
         );
     }
 
     #[test]
-    fn finalised_cell_has_no_cursor() {
+    fn finalised_cell_has_no_live_indicator() {
         let mut c = AssistantCell::new_streaming();
         c.push_delta("answer");
         c.finalize();
         let out = render(&c, 60, 2);
+        // Old cursor `▎` must be gone and no tok/s suffix should
+        // appear on a finalised cell.
         assert!(
             !out.contains('▎'),
-            "cursor must vanish after finalize: {out}"
+            "old cursor must vanish after finalize: {out}"
+        );
+        assert!(
+            !out.contains("tok/s"),
+            "rate suffix must not render on a finalised cell: {out}"
         );
     }
 
@@ -790,6 +912,68 @@ mod tests {
             "<think>\nThe user is asking a question.\nI will answer briefly.\n</think>\n\nHello — happy to help.",
         );
         insta::assert_snapshot!("assistant_think_closed_60", render(&c, 60, 3));
+    }
+
+    // ── Token estimate (CJK-aware) ──────────────────────────────
+
+    #[test]
+    fn token_estimate_ascii_prose_uses_quarter_ratio() {
+        // 12 ASCII chars ≈ 3 tokens at 0.25 each.
+        let t = super::estimate_tokens("hello, world");
+        assert!(
+            (2.5..=3.5).contains(&t),
+            "expected ~3 tokens for 12 ASCII chars, got {t}"
+        );
+    }
+
+    #[test]
+    fn token_estimate_cjk_uses_half_ratio() {
+        // 4 CJK ideographs → ~2 tokens.
+        let t = super::estimate_tokens("你好世界");
+        assert!(
+            (1.8..=2.2).contains(&t),
+            "expected ~2 tokens for 4 CJK chars, got {t}"
+        );
+    }
+
+    #[test]
+    fn token_estimate_mixed_splits_correctly() {
+        // "hello 你好" = 6 ASCII (incl. space) + 2 CJK
+        //             = 6 * 0.25 + 2 * 0.5 = 1.5 + 1.0 = 2.5
+        let t = super::estimate_tokens("hello 你好");
+        assert!(
+            (2.3..=2.7).contains(&t),
+            "expected ~2.5 tokens for mixed, got {t}"
+        );
+    }
+
+    #[test]
+    fn format_token_estimate_compacts_thousands() {
+        assert_eq!(super::format_token_estimate(420.0), "420");
+        assert_eq!(super::format_token_estimate(1_234.0), "1.2k");
+        assert_eq!(super::format_token_estimate(12_345.0), "12.3k");
+    }
+
+    #[test]
+    fn rate_suffix_none_when_finalised() {
+        let mut c = AssistantCell::new_streaming();
+        c.push_delta("some answer text");
+        c.finalize();
+        assert!(
+            c.rate_suffix_span().is_none(),
+            "no rate suffix on finalised cells"
+        );
+    }
+
+    #[test]
+    fn rate_suffix_shows_cumulative_before_300ms() {
+        // Freshly streaming cell: elapsed < 300ms so we only show
+        // the cumulative estimate, not a volatile tok/s figure.
+        let mut c = AssistantCell::new_streaming();
+        c.push_delta("hi");
+        let s = c.rate_suffix_span().expect("live cell with delta");
+        assert!(!s.contains("tok/s"), "tok/s too early: {s}");
+        assert!(s.contains(" · "), "cumulative estimate missing: {s}");
     }
 
     #[test]

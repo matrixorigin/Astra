@@ -59,6 +59,14 @@ fn event_to_json(event: &StreamEvent) -> String {
         StreamEvent::StatusLine(text) => {
             serde_json::json!({"type": "status", "text": text})
         }
+        StreamEvent::ToolOutput { name, lines, bytes } => {
+            serde_json::json!({
+                "type": "tool_output",
+                "name": name,
+                "lines": lines,
+                "bytes": bytes,
+            })
+        }
     };
     serde_json::to_string(&value).unwrap_or_default()
 }

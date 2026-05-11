@@ -9,7 +9,7 @@ use super::terminal_palette::{default_bg, default_fg};
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
-fn elapsed_since_start() -> Duration {
+pub(crate) fn elapsed_since_start() -> Duration {
     let start = PROCESS_START.get_or_init(Instant::now);
     start.elapsed()
 }

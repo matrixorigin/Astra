@@ -103,17 +103,17 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Model ───────────────────────────────────────────────────
         //
-        // Supported forms:
+        // Forms:
         //   /model                   → open the picker (legacy default)
-        //   /model list              → same as above (explicit alias)
+        //   /model list              → explicit alias for the picker
         //   /model info              → details panel for current model
-        //   /model set <name>        → switch to <name>
         //   /model clear             → reset to API default
-        //   /model <name>            → shorthand for `/model set <name>`
+        //   /model <name>            → direct switch to <name>
         //
-        // Anything we don't recognise falls back to the legacy
-        // line-mode printer so users don't hit a wall when they
-        // type something the registry doesn't cover yet.
+        // There is intentionally no `/model set <name>` — the
+        // direct-name form is already the shortest path, and
+        // having `set` as a second way to express the same thing
+        // just clutters the subcommand popup.
         "/model" => {
             let trimmed = args.trim();
             if trimmed.is_empty() || trimmed == "list" {
@@ -122,18 +122,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             let (sub, rest) = split_sub(trimmed);
             match sub {
                 "info" => handle_model_info(ctx, rest).await,
-                "set" => {
-                    if rest.is_empty() {
-                        ctx.show_error("/model set needs a model name".into());
-                        return SlashResult::Handled;
-                    }
-                    handle_model_set(ctx, rest);
-                    SlashResult::Handled
-                }
                 "clear" => handle_model_clear(ctx).await,
-                // Registered-but-unhandled subs would print an error;
-                // anything else is treated as `/model <name>` shorthand
-                // (preserves the pre-refactor one-liner path).
+                // Everything else is the `/model <name>` shorthand.
                 _ => {
                     handle_model_set(ctx, trimmed);
                     SlashResult::Handled
@@ -567,13 +557,19 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Session ─────────────────────────────────────────────────
         //
-        // Forms:
-        //   /session                 → open the session hub (current session overview)
+        // Five subcommands + the default hub cover the overwhelming
+        // majority of interactive usage.  Diagnostic subs (cleanup /
+        // drift / errors / trace / verify / adaptive / switch) used
+        // to live here too, but they duplicate functionality that
+        // already exists elsewhere (diag tooling, /resume for
+        // switch) and their output is text-only, so they fall
+        // through to the line-mode printer instead.
+        //
+        //   /session                 → session hub (current overview)
         //   /session list            → session picker
-        //   /session history [id]    → conversation history for id (defaults to current)
-        //   /session context [id]    → /context panel for id (defaults to current)
+        //   /session history [id]    → conversation history
         //   /session fork            → interactive fork flow
-        //   /session analyze [id]    → diagnostics report
+        //   /session analyze [id]    → counter-only diagnostics
         //   /session export [id]     → write markdown, echo path
         //   everything else          → line-mode fallback
         "/session" => {
@@ -585,7 +581,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             match sub {
                 "list" => handle_session_list_view(ctx),
                 "history" => handle_session_history_view(ctx, rest),
-                "context" => handle_session_context_view(ctx, rest),
                 "fork" => handle_session_fork_view(ctx),
                 "analyze" | "diag" => handle_session_analyze_view(ctx, rest),
                 "export" => handle_session_export_view(ctx, rest),
@@ -1306,18 +1301,40 @@ fn split_sub(text: &str) -> (&str, &str) {
 
 // ── /model subcommand helpers ───────────────────────────────────
 
+/// Sentinel prefix emitted by the model-name picker.  The outer
+/// loop (in `tui/mod.rs`) strips the prefix and decides whether to
+/// commit immediately or push a second picker for the model's
+/// thinking modes.  Kept public(crate) so the mod.rs arm can
+/// strip it symmetrically with the other sentinels.
+pub(crate) const MODEL_PICK_SENTINEL: &str = "__model_pick__\n";
+
+/// Sentinel prefix for the thinking-mode picker. Payload format is
+/// `__model_thinking__\n<base_model>\n<thinking_label>`.  The
+/// handler composes `base + thinking_suffix_for(label)` and sets
+/// `state.model`.
+pub(crate) const MODEL_THINKING_SENTINEL: &str = "__model_thinking__\n";
+
 /// `/model` with no args (or `list`) — fetch the catalog and push
-/// the picker.  Shared between the legacy default and the explicit
-/// `list` form so both behave identically.
+/// the picker.  The picker emits `MODEL_PICK_SENTINEL + <name>`; the
+/// outer loop then checks the model's `thinking_capability` and
+/// either commits or pushes a thinking-mode picker.
 async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
     let token = crate::repl_runtime::current_access_token(ctx.profile);
     match crate::slash_router::fetch_model_list(ctx.api, token.as_deref()).await {
         Ok(models) => {
-            let current = ctx.state.model.clone().unwrap_or_default();
+            // Strip any `-thinking:*` suffix from the cached model
+            // when highlighting the current row — the picker shows
+            // base names only, and the suffix is re-applied by the
+            // thinking stage.
+            let current_raw = ctx.state.model.clone().unwrap_or_default();
+            let current_base = current_raw
+                .split_once("-thinking:")
+                .map(|(b, _)| b.to_string())
+                .unwrap_or(current_raw);
             let items: Vec<SelectionItem> = models
                 .into_iter()
                 .map(|m| {
-                    let is_current = m == current;
+                    let is_current = m == current_base;
                     SelectionItem {
                         name: m,
                         description: None,
@@ -1328,7 +1345,8 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
             if items.is_empty() {
                 ctx.show_info("No models available".into());
             } else {
-                let view = ListSelectionView::new(items, Some("Select model:".into()));
+                let view = ListSelectionView::new(items, Some("Select model:".into()))
+                    .with_result_prefix(MODEL_PICK_SENTINEL);
                 ctx.bottom_pane.push_view(Box::new(view));
             }
         }
@@ -1538,7 +1556,7 @@ fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
         "/session history",
         "scroll this session's transcript".into(),
     ));
-    pairs.push(("/session context", "context panel for this session".into()));
+    pairs.push(("/context", "context panel for this session".into()));
     pairs.push(("/session fork", "branch a parallel session".into()));
     pairs.push(("/session analyze", "run session diagnostics".into()));
     pairs.push(("/session export", "write markdown transcript".into()));
@@ -1581,33 +1599,6 @@ fn handle_session_history_view(ctx: &mut DispatchContext<'_>, arg: &str) -> Slas
     }
     push_history_info(ctx, &sid, &events);
     SlashResult::Handled
-}
-
-/// `/session context [id]` — with no id, opens the `/context` TUI
-/// panel for the current session (via reopen).  With an explicit
-/// id, falls back to the line-mode printer since rebuilding the
-/// TUI panel from a disk journal needs more plumbing than fits in
-/// this dispatch.
-fn handle_session_context_view(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
-    if arg.is_empty() {
-        // Reopen `/context` as a next-turn action. Cleaner than
-        // re-entering `dispatch` recursively (which would be
-        // awkward because this fn isn't async).
-        use crate::tui::bottom_pane::info_view::InfoView;
-        ctx.bottom_pane.push_view(Box::new(
-            InfoView::from_plain(
-                "Session context",
-                vec![
-                    "  (no id) — open the live /context panel instead.".into(),
-                    "  /context                 current session".into(),
-                    "  /session context <id>    print context trace for a saved session".into(),
-                ],
-            )
-            .with_reopen("/context"),
-        ));
-        return SlashResult::Handled;
-    }
-    SlashResult::Fallback
 }
 
 /// `/session fork` — interactive parent picker.  On Enter the

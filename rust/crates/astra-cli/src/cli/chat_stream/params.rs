@@ -1,10 +1,47 @@
 use astra_runtime::{pipeline::persistence::ToolHealthEntry, tool_selector::ToolSelector};
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 use crate::{ExplainMode, permission_manager::PermissionManager};
+
+/// Atomic counter pair published by streaming tools (currently
+/// bash) while they run. Consumers read `lines` / `bytes` on a
+/// polling cadence (~200ms) and emit [`StreamEvent::ToolOutput`]
+/// ticks so the TUI can render a real "N lines · K KB" status on
+/// long-running tool cells. Non-streaming tools leave the sink
+/// unset and the TUI falls back to an indeterminate animation.
+#[derive(Debug, Default)]
+pub struct ToolProgressSink {
+    pub lines: AtomicU64,
+    pub bytes: AtomicU64,
+}
+
+impl ToolProgressSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a chunk observed on the tool's stdout/stderr. We
+    /// count both '\n' newlines (coarse but cheap — partial lines
+    /// that never terminate won't show up until a newline arrives,
+    /// which matches how shells usually flush).
+    pub fn record_chunk(&self, chunk: &[u8]) {
+        let newlines = chunk.iter().filter(|b| **b == b'\n').count() as u64;
+        if newlines > 0 {
+            self.lines.fetch_add(newlines, Ordering::Relaxed);
+        }
+        self.bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> (u64, u64) {
+        (
+            self.lines.load(Ordering::Relaxed),
+            self.bytes.load(Ordering::Relaxed),
+        )
+    }
+}
 
 // ─── Stream Event (fine-grained observer channel) ────────────────────────────
 
@@ -32,6 +69,16 @@ pub enum StreamEvent {
         duration_ms: u64,
         output_summary: Option<String>,
         output: Option<String>,
+    },
+    /// Mid-flight progress signal for a running tool. Emitted at a
+    /// coarse cadence (~200ms) while the tool produces output so the
+    /// TUI can show real bytes/lines counters instead of a fake
+    /// progress bar. `name` identifies the tool so the TUI can route
+    /// to the right cell when multiple tools run serially.
+    ToolOutput {
+        name: String,
+        lines: u64,
+        bytes: u64,
     },
     /// Waiting for first SSE frame (TTFT gap).
     WaitingForModel,

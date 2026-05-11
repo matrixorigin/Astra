@@ -57,6 +57,9 @@ fn map_stream_event(event: StreamEvent) -> TuiAppEvent {
             output_summary,
             output,
         },
+        StreamEvent::ToolOutput { name, lines, bytes } => {
+            TuiAppEvent::ToolOutput { name, lines, bytes }
+        }
         StreamEvent::WaitingForModel => TuiAppEvent::WaitingForModel,
         StreamEvent::ModelResponding => TuiAppEvent::ModelResponding,
         StreamEvent::StatusLine(text) => TuiAppEvent::StatusLine(text),

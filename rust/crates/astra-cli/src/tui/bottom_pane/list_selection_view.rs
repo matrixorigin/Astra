@@ -23,6 +23,12 @@ pub(crate) struct ListSelectionView {
     filter: String,
     completed: bool,
     accepted_name: Option<String>,
+    /// Optional prefix prepended to the emitted result string so
+    /// the outer loop can tell two instances of this picker apart
+    /// (e.g. model selection vs thinking-mode selection) without
+    /// a custom view subclass per use case. Consumers strip the
+    /// prefix with `strip_prefix` to dispatch.
+    result_prefix: String,
 }
 
 impl ListSelectionView {
@@ -36,7 +42,17 @@ impl ListSelectionView {
             filter: String::new(),
             completed: false,
             accepted_name: None,
+            result_prefix: String::new(),
         }
+    }
+
+    /// Stamp a sentinel prefix on the emitted result.  The sentinel
+    /// lets the outer loop route a generic picker to a specific
+    /// handler (model selection, thinking-mode selection, …)
+    /// without per-use subclasses.
+    pub fn with_result_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.result_prefix = prefix.into();
+        self
     }
 
     pub fn accepted_name(&self) -> Option<&str> {
@@ -213,8 +229,15 @@ impl BottomPaneView for ListSelectionView {
 
     fn completion(&self) -> Option<ViewCompletion> {
         if self.completed {
+            let result = self.accepted_name.clone().map(|name| {
+                if self.result_prefix.is_empty() {
+                    name
+                } else {
+                    format!("{}{}", self.result_prefix, name)
+                }
+            });
             Some(ViewCompletion {
-                result: self.accepted_name.clone(),
+                result,
                 reopen: None,
             })
         } else {
