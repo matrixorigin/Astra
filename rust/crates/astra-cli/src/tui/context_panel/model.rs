@@ -44,6 +44,51 @@ pub(crate) struct ContextBreakdown {
     pub prompt_signals: Vec<SignalItem>,
     pub session_summary: Option<SessionSummary>,
     pub decisions: Vec<DecisionItem>,
+    pub compaction: CompactionSummary,
+}
+
+/// Compaction stats sourced from two places:
+///   • `ContextAssemblyTrace.history` — last turn's compression
+///     method + pre/post tokens + information_lost.
+///   • `ObservabilitySession.compressed_turns` — every turn this
+///     session that fired compaction, for the big-picture story.
+/// Collapsed view shows aggregate counts; expansion walks per-event
+/// detail; drill shows full `information_lost` + summary text.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct CompactionSummary {
+    /// `true` when the most recent turn triggered compaction.
+    pub triggered_this_turn: bool,
+    /// All turns in the session that fired compaction.  Includes
+    /// older events beyond just this turn.
+    pub compressed_turns: Vec<u32>,
+    /// Per-event detail (from the latest trace's turns_compressed).
+    pub events: Vec<CompactionEventItem>,
+    /// Aggregate token shape (last turn only).
+    pub tokens_before: u32,
+    pub tokens_after: u32,
+}
+
+impl CompactionSummary {
+    pub fn is_empty(&self) -> bool {
+        !self.triggered_this_turn
+            && self.compressed_turns.is_empty()
+            && self.events.is_empty()
+    }
+
+    pub fn tokens_saved(&self) -> u32 {
+        self.tokens_before.saturating_sub(self.tokens_after)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CompactionEventItem {
+    pub turn_index: u32,
+    pub role: String,
+    pub method: String,
+    pub original_tokens: u32,
+    pub compressed_tokens: u32,
+    /// Human-readable bullets describing what was lost.
+    pub information_lost: Vec<String>,
 }
 
 /// Extra detail for the Memory section.  Populated directly from
@@ -286,6 +331,7 @@ pub(crate) enum Section {
     Skills,
     Memory,
     History,
+    Compaction,
     Decisions,
 }
 
@@ -299,6 +345,7 @@ impl Section {
             Section::Skills,
             Section::Memory,
             Section::History,
+            Section::Compaction,
             Section::Decisions,
         ]
     }
@@ -312,6 +359,7 @@ impl Section {
             Section::Skills => "Skills · /skills",
             Section::Memory => "Memory · /memory",
             Section::History => "History · conversation turns",
+            Section::Compaction => "Compaction · context trimming",
             Section::Decisions => "Decisions · why did it pick this",
         }
     }
@@ -343,6 +391,7 @@ impl ContextBreakdown {
             Section::Skills => !self.skills.is_empty(),
             Section::Memory => !self.memories.is_empty() || !self.memory_focus.is_empty(),
             Section::History => !self.history.is_empty(),
+            Section::Compaction => !self.compaction.is_empty(),
             Section::Decisions => !self.decisions.is_empty(),
         }
     }
@@ -406,6 +455,29 @@ pub(crate) struct ContextSnapshot<'a> {
     /// Session + budget state the trace doesn't carry. Populated
     /// by the `/context` dispatch from `ReplState`.
     pub session: Option<SessionSummary>,
+    /// User-activated system skills (from `/skill` or auto-detect).
+    /// These feed the prompt via `edge_profile.active_skills` but
+    /// the trace may not capture them in `skills_injected` when
+    /// the system-prompt breakdown wasn't recorded this turn.
+    /// Surfaced as a Skills-section fallback so users always see
+    /// what skills are loaded.  Read-only display — no prompt
+    /// cache impact.
+    pub active_skills: Vec<ActiveSkill>,
+    /// Every turn in this session that fired compaction.  Sourced
+    /// from `ObservabilitySession.compressed_turns` — the current
+    /// trace only knows about the LAST turn's compaction events,
+    /// so this list is what makes the Compaction section show a
+    /// session-level timeline.
+    pub compressed_turns: Vec<u32>,
+}
+
+/// One loaded system skill surfaced by the snapshot.  Decoupled
+/// from `astra-prompts::SystemSkill` so the context-panel module
+/// doesn't need to import that crate.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ActiveSkill {
+    pub name: String,
+    pub description: String,
 }
 
 impl ContextBreakdown {
@@ -427,6 +499,7 @@ impl ContextBreakdown {
             prompt_signals: Vec::new(),
             session_summary: None,
             decisions: Vec::new(),
+            compaction: CompactionSummary::default(),
         }
     }
 
@@ -547,6 +620,28 @@ impl ContextBreakdown {
                 })
                 .collect();
         }
+        // Last-resort fallback: the trace is silent but the CLI
+        // state knows which system skills are currently loaded
+        // via `/skill` (or auto-detect).  Surface them so users
+        // see *some* signal about what skills shape their turn.
+        // Tokens=0 because the per-skill cost lives inside the
+        // system-prompt total, not in a dedicated line item.
+        if skills.is_empty() && !snap.active_skills.is_empty() {
+            skills = snap
+                .active_skills
+                .iter()
+                .map(|s| SkillItem {
+                    name: s.name.clone(),
+                    tokens: 0,
+                    description: if s.description.is_empty() {
+                        None
+                    } else {
+                        Some(s.description.clone())
+                    },
+                    source: Some("loaded".to_string()),
+                })
+                .collect();
+        }
 
         // System-prompt sub-rows: the trace doesn't currently split
         // the system prompt into named sections, so we synthesize a
@@ -617,6 +712,7 @@ impl ContextBreakdown {
         let prompt_signals = build_prompt_signals(trace);
         let decisions = build_decisions(trace);
         let session_summary = snap.session.clone();
+        let compaction = build_compaction_summary(trace, snap);
 
         Self {
             total_used: budget.total_used,
@@ -634,6 +730,7 @@ impl ContextBreakdown {
             prompt_signals,
             session_summary,
             decisions,
+            compaction,
         }
     }
 
@@ -654,6 +751,32 @@ impl ContextBreakdown {
         } else {
             self.total_used as f64 / self.limit as f64 * 100.0
         }
+    }
+}
+
+fn build_compaction_summary(
+    trace: &ContextAssemblyTrace,
+    snap: &ContextSnapshot<'_>,
+) -> CompactionSummary {
+    let h = &trace.history;
+    let events: Vec<CompactionEventItem> = h
+        .turns_compressed
+        .iter()
+        .map(|c| CompactionEventItem {
+            turn_index: c.turn_index,
+            role: c.role.clone(),
+            method: format!("{:?}", c.compression_method),
+            original_tokens: c.original_tokens,
+            compressed_tokens: c.compressed_tokens,
+            information_lost: c.information_lost.clone(),
+        })
+        .collect();
+    CompactionSummary {
+        triggered_this_turn: trace.token_budget.compression_triggered,
+        compressed_turns: snap.compressed_turns.clone(),
+        events,
+        tokens_before: h.tokens_before,
+        tokens_after: h.tokens_after,
     }
 }
 

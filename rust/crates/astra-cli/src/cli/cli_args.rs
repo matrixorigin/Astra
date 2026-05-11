@@ -204,9 +204,34 @@ pub(crate) enum Command {
     Agent(AgentArgs),
     /// Inspect inter-agent messaging state
     Messaging(MessagingArgs),
+    /// Dump the `/context` snapshot for a persisted session
+    #[command(subcommand)]
+    Context(ContextCmd),
     /// Direct message: astra "your question here"
     #[command(external_subcommand)]
     Message(Vec<String>),
+}
+
+/// Subcommands for the standalone `astra context` group.  Mirrors
+/// the TUI's `/context` slash command but works without a running
+/// REPL — useful for forensic replay from a persisted session.
+#[derive(Subcommand, Debug)]
+pub(crate) enum ContextCmd {
+    /// Write a full JSON snapshot of the session's latest context
+    /// to disk.  The session's journal must exist under
+    /// `~/.astra/sessions/<id>.jsonl`.
+    Dump(ContextDumpArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct ContextDumpArgs {
+    /// Session id (full UUID, or any prefix that uniquely matches).
+    #[arg(short = 's', long)]
+    pub session: String,
+    /// Optional explicit output path.  When omitted, writes to
+    /// `~/.astra/context-dumps/<session>-<turn>-<ts>.json`.
+    #[arg(short = 'o', long)]
+    pub output: Option<String>,
 }
 
 /// Headless plan commands (no interactive `plan>` prompt).

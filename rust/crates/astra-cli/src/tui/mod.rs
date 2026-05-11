@@ -254,6 +254,44 @@ fn detect_git_branch() -> Option<String> {
     Some(name.shorten().to_string())
 }
 
+/// Walk the chat widget's committed history and emit role/text
+/// pairs for the `/context dump` JSON file.  Kept here (rather
+/// than in `cli::context_dump`) because `history_cell` is a
+/// private TUI module — only this crate's TUI layer should
+/// downcast cells to concrete types.
+pub(crate) fn collect_chat_turns_for_dump(
+    chat: &chat_widget::ChatWidget,
+) -> Vec<crate::context_dump::ChatTurnDump> {
+    use crate::context_dump::ChatTurnDump;
+    use history_cell::{
+        assistant::AssistantCell, reasoning::ReasoningCell, system::SystemCell, user::UserCell,
+    };
+    let mut out = Vec::new();
+    for cell in chat.history() {
+        let any = cell.as_any_ref();
+        if let Some(u) = any.downcast_ref::<UserCell>() {
+            out.push(ChatTurnDump {
+                role: "user".into(),
+                text: u.text().to_string(),
+            });
+        } else if let Some(a) = any.downcast_ref::<AssistantCell>() {
+            out.push(ChatTurnDump {
+                role: "assistant".into(),
+                text: a.source().to_string(),
+            });
+        } else if let Some(r) = any.downcast_ref::<ReasoningCell>() {
+            out.push(ChatTurnDump {
+                role: "reasoning".into(),
+                text: r.text().to_string(),
+            });
+        } else if any.downcast_ref::<SystemCell>().is_some() {
+            // System cells are UI chrome — skip to keep the dump
+            // focused on what the LLM actually consumed.
+        }
+    }
+    out
+}
+
 /// Check if the terminal supports TUI mode.
 pub(crate) fn can_run_tui() -> bool {
     use std::io::IsTerminal;

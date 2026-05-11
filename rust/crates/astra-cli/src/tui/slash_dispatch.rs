@@ -299,12 +299,21 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         // (`breakdown`, `explain`, `cognition`) fall through to the
         // existing rustyline-style printer via Fallback.
         "/context" => {
+            // `/context dump [path]` writes a JSON snapshot of the
+            // current breakdown + trace + chat history to disk.
+            // Handled inline so the output path lands as a
+            // SystemCell in scrollback.  Any other argument falls
+            // through to the line-mode printer.
+            let args_trim = args.trim();
+            if let Some(rest) = args_trim.strip_prefix("dump") {
+                return handle_context_dump(rest.trim(), ctx);
+            }
             if !args.is_empty() {
                 return SlashResult::Fallback;
             }
             use crate::tui::bottom_pane::context_panel_view::ContextPanelView;
             use crate::tui::context_panel::{ContextBreakdown, ContextSnapshot};
-            use crate::tui::context_panel::model::SessionSummary;
+            use crate::tui::context_panel::model::{ActiveSkill, SessionSummary};
 
             // Collect human-readable previews the trace doesn't
             // carry: per-turn transcript snippets (from the chat
@@ -319,6 +328,19 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
             snap.git_branch = detect_git_branch();
             snap.user_rules_path = find_user_rules_path();
+
+            // Loaded system skills.  Surfaced as a Skills-section
+            // fallback when the trace is silent (common for CLI
+            // sessions where edge_profile.active_skills isn't set).
+            snap.active_skills = ctx
+                .state
+                .active_system_skills
+                .iter()
+                .map(|s| ActiveSkill {
+                    name: s.name.clone(),
+                    description: s.description.clone(),
+                })
+                .collect();
 
             // Build the Session / Budget summary from ReplState.
             // All fields are cheap reads — no I/O, no extra locks.
@@ -351,6 +373,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             let breakdown = match ctx.state.observability_session.as_ref() {
                 Some(session) => {
                     let guard = session.read().unwrap_or_else(|e| e.into_inner());
+                    // Pull session-level compaction history into the
+                    // snapshot so the Compaction section can show all
+                    // past events, not just the last-turn trace.
+                    snap.compressed_turns = guard.compressed_turns.clone();
                     match guard.context_traces.last() {
                         // Use the full assembly trace so the panel
                         // can render the nested tool / memory /
@@ -1344,6 +1370,36 @@ fn one_line_preview(text: &str) -> String {
         .chars()
         .take(200)
         .collect()
+}
+
+/// `/context dump [path]` — write a full JSON snapshot of the
+/// context-panel state (trace + chat history + environment) to
+/// disk for sharing or forensic replay.  When `path` is empty,
+/// writes to `~/.astra/context-dumps/<session>-<turn>-<ts>.json`.
+///
+/// Kept inline so the user sees the output path as a normal
+/// scrollback cell instead of tearing down the TUI like the
+/// fallback printer would.
+fn handle_context_dump(arg: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
+    use crate::tui::history_cell::system::SystemCell;
+    let chat_history = crate::tui::collect_chat_turns_for_dump(ctx.chat_widget);
+    let path = match crate::context_dump::write_dump_for_repl(
+        ctx.state,
+        chat_history,
+        if arg.is_empty() { None } else { Some(arg) },
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            ctx.chat_widget
+                .commit_system(SystemCell::error(format!("/context dump failed: {e}")));
+            return SlashResult::Handled;
+        }
+    };
+    ctx.chat_widget.commit_system(SystemCell::info(format!(
+        "Context snapshot written to {}",
+        path.display()
+    )));
+    SlashResult::Handled
 }
 
 #[cfg(test)]

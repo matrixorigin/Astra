@@ -537,6 +537,94 @@ fn decisions_populated_from_explanations() {
 
 // ─── Session summary ───────────────────────────────────────────────
 
+// ─── ActiveSkill fallback + Compaction section ──────────────────
+
+#[test]
+fn skills_fall_back_to_active_system_skills_when_trace_silent() {
+    use super::model::{ActiveSkill, ContextSnapshot};
+    let t = trace(100_000, 1_000, 0, 0, 0, 0);
+    let mut snap = ContextSnapshot::default();
+    snap.active_skills = vec![
+        ActiveSkill {
+            name: "concise".into(),
+            description: "Keep replies short".into(),
+        },
+        ActiveSkill {
+            name: "markdown".into(),
+            description: "Output markdown".into(),
+        },
+    ];
+    let b = ContextBreakdown::from_trace_with(&t, &snap);
+    let names: Vec<&str> = b.skills.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["concise", "markdown"]);
+    assert!(
+        b.skills.iter().all(|s| s.tokens == 0),
+        "ActiveSkill fallback carries no token counts"
+    );
+}
+
+#[test]
+fn active_system_skills_do_not_override_trace_injected_skills() {
+    use super::model::{ActiveSkill, ContextSnapshot};
+    let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
+    t.system_prompt = SystemPromptBreakdown {
+        skills_injected: vec![SkillInjection {
+            skill_name: "real_from_trace".into(),
+            skill_version: None,
+            tokens: 200,
+            selection_reason: String::new(),
+        }],
+        ..SystemPromptBreakdown::default()
+    };
+    let mut snap = ContextSnapshot::default();
+    snap.active_skills = vec![ActiveSkill {
+        name: "fallback_ignored".into(),
+        description: String::new(),
+    }];
+    let b = ContextBreakdown::from_trace_with(&t, &snap);
+    let names: Vec<&str> = b.skills.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["real_from_trace"]);
+}
+
+#[test]
+fn compaction_section_empty_when_no_events_and_not_triggered() {
+    let t = trace(100_000, 1_000, 0, 0, 0, 0);
+    let b = ContextBreakdown::from_trace(&t);
+    assert!(b.compaction.is_empty());
+}
+
+#[test]
+fn compaction_section_populated_from_trace_and_snapshot() {
+    use super::model::ContextSnapshot;
+    let mut t = trace(100_000, 1_000, 10_000, 0, 0, 0);
+    t.token_budget.compression_triggered = true;
+    t.history.tokens_before = 15_000;
+    t.history.tokens_after = 8_000;
+    t.history.turns_compressed = vec![TurnCompression {
+        turn_index: 3,
+        role: "assistant".into(),
+        original_tokens: 5_000,
+        compressed_tokens: 500,
+        compression_method: CompressionMethod::ReactiveCompact,
+        information_lost: vec![
+            "Tool outputs from turn 3 were truncated".into(),
+            "Assistant reasoning shortened to 1 sentence".into(),
+        ],
+    }];
+    let mut snap = ContextSnapshot::default();
+    snap.compressed_turns = vec![3, 7, 12];
+    let b = ContextBreakdown::from_trace_with(&t, &snap);
+    assert!(b.compaction.triggered_this_turn);
+    assert_eq!(b.compaction.compressed_turns, vec![3, 7, 12]);
+    assert_eq!(b.compaction.events.len(), 1);
+    let e = &b.compaction.events[0];
+    assert_eq!(e.turn_index, 3);
+    assert!(e.method.contains("ReactiveCompact"));
+    assert_eq!(e.original_tokens, 5_000);
+    assert_eq!(e.information_lost.len(), 2);
+    assert_eq!(b.compaction.tokens_saved(), 7_000);
+}
+
 #[test]
 fn session_summary_flows_through_snapshot() {
     use super::model::{ContextSnapshot, SessionSummary};

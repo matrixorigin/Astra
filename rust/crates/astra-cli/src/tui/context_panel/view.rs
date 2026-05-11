@@ -174,6 +174,7 @@ pub(crate) fn section_item_count(b: &ContextBreakdown, section: Section) -> usiz
         Section::Memory => b.memories.len(),
         Section::Tools => b.tools.len(),
         Section::Decisions => b.decisions.len(),
+        Section::Compaction => b.compaction.events.len(),
         Section::SystemPrompt
         | Section::PromptSignals
         | Section::Session
@@ -203,6 +204,7 @@ pub(crate) fn section_line_index(
         | Section::History
         | Section::Session
         | Section::PromptSignals
+        | Section::Compaction
         | Section::Decisions => target.label(),
         Section::Tools => "Tools · /tool",
         Section::Memory => "Memory · /memory",
@@ -298,6 +300,7 @@ pub(crate) fn build_lines_with(
     render_section(&mut out, b, state, Section::Skills);
     render_section(&mut out, b, state, Section::Memory);
     render_section(&mut out, b, state, Section::History);
+    render_section(&mut out, b, state, Section::Compaction);
     render_section(&mut out, b, state, Section::Decisions);
 
     // Drop the last blank line if we pushed one — trailing blanks
@@ -421,6 +424,21 @@ fn render_section(
                 append_decisions_section(
                     out,
                     &b.decisions,
+                    focused,
+                    expanded,
+                    state.selected_item,
+                );
+            }
+        }
+        Section::Compaction => {
+            if state.is_drilled(Section::Compaction) {
+                out.push(section_heading_for(Section::Compaction, focused, expanded));
+                render_compaction_drill(out, &b.compaction, state.selected_item);
+                out.push(Line::default());
+            } else {
+                append_compaction_section(
+                    out,
+                    &b.compaction,
                     focused,
                     expanded,
                     state.selected_item,
@@ -1523,6 +1541,202 @@ fn append_decisions_section(
     out.push(Line::default());
 }
 
+fn append_compaction_section(
+    out: &mut Vec<Line<'static>>,
+    c: &super::model::CompactionSummary,
+    focused: bool,
+    expanded: bool,
+    selected_item: usize,
+) {
+    if c.is_empty() {
+        return;
+    }
+    out.push(section_heading_for(Section::Compaction, focused, expanded));
+    // Aggregate lines (always shown).
+    let trig = if c.triggered_this_turn {
+        "⚠ fired this turn"
+    } else {
+        "not triggered this turn"
+    };
+    out.push(Line::from(vec![
+        Span::raw("    └ "),
+        Span::styled(
+            trig.to_string(),
+            if c.triggered_this_turn {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+    ]));
+    if c.tokens_before > 0 && c.tokens_before != c.tokens_after {
+        let pct_saved = (1.0 - c.tokens_after as f64 / c.tokens_before as f64) * 100.0;
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::raw(format!(
+                "{} → {} tokens",
+                fmt_tokens(c.tokens_before),
+                fmt_tokens(c.tokens_after)
+            )),
+            Span::styled(
+                format!(
+                    "  (saved {}, −{:.0}%)",
+                    fmt_tokens(c.tokens_saved()),
+                    pct_saved
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    if !c.compressed_turns.is_empty() {
+        let rendered: Vec<String> = c.compressed_turns.iter().map(|i| i.to_string()).collect();
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::raw(format!(
+                "{} compaction{} in session — turns: {}",
+                c.compressed_turns.len(),
+                if c.compressed_turns.len() == 1 { "" } else { "s" },
+                rendered.join(", "),
+            )),
+        ]));
+    }
+    // Per-event detail on expand.
+    if expanded && !c.events.is_empty() {
+        out.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                "↑/↓ select · Enter drill · Esc back",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+        for (i, e) in c.events.iter().enumerate() {
+            let selected = i == selected_item;
+            let marker: Span<'static> = if selected {
+                Span::styled(
+                    "▸ ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("  ")
+            };
+            let name_style = if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            out.push(Line::from(vec![
+                Span::raw("    "),
+                marker,
+                Span::raw("└ "),
+                Span::styled(format!("#{} {}", e.turn_index, e.role), name_style),
+                Span::styled(
+                    format!(
+                        "   {} → {} tokens",
+                        fmt_tokens(e.original_tokens),
+                        fmt_tokens(e.compressed_tokens)
+                    ),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    format!("  via {}", e.method),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            if selected && !e.information_lost.is_empty() {
+                for lost in e.information_lost.iter().take(3) {
+                    for line in wrap_text(lost, 66, 2) {
+                        out.push(Line::from(vec![
+                            Span::raw("          · "),
+                            Span::styled(line, Style::default().add_modifier(Modifier::DIM)),
+                        ]));
+                    }
+                }
+            }
+        }
+    }
+    out.push(Line::default());
+}
+
+fn render_compaction_drill(
+    out: &mut Vec<Line<'static>>,
+    c: &super::model::CompactionSummary,
+    selected_item: usize,
+) {
+    let Some(event) = c.events.get(selected_item) else {
+        return;
+    };
+    out.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(
+            "Esc back · drill: compaction ",
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            format!("#{} {}", event.turn_index, event.role),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    let pct_saved = if event.original_tokens > 0 {
+        (1.0 - event.compressed_tokens as f64 / event.original_tokens as f64) * 100.0
+    } else {
+        0.0
+    };
+    out.push(Line::from(vec![
+        Span::raw("        "),
+        Span::raw(format!(
+            "{} → {} tokens",
+            fmt_tokens(event.original_tokens),
+            fmt_tokens(event.compressed_tokens)
+        )),
+        Span::styled(
+            format!(
+                "  (saved {}, −{:.0}%)",
+                fmt_tokens(event.original_tokens.saturating_sub(event.compressed_tokens)),
+                pct_saved
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    out.push(Line::from(vec![
+        Span::raw("        "),
+        Span::styled(
+            format!("method: {}", event.method),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    if !event.information_lost.is_empty() {
+        out.push(Line::from(vec![
+            Span::raw("        "),
+            Span::styled(
+                format!("Information lost ({})", event.information_lost.len()),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        for lost in &event.information_lost {
+            for line in wrap_text(lost, 66, 4) {
+                out.push(Line::from(vec![
+                    Span::raw("          · "),
+                    Span::raw(line),
+                ]));
+            }
+        }
+    } else {
+        out.push(Line::from(vec![
+            Span::raw("        "),
+            Span::styled(
+                "(no information-lost notes recorded)".to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+}
+
 fn fmt_tokens_u64(n: u64) -> String {
     if n < 1_000 {
         n.to_string()
@@ -2288,6 +2502,66 @@ mod tests {
         assert!(text.contains("Need symbol-aware context"));
         assert!(text.contains("grep-only"));
         assert!(text.contains("would miss imports"));
+    }
+
+    #[test]
+    fn compaction_section_renders_counts_and_timeline_when_collapsed() {
+        use super::super::model::ContextSnapshot;
+        let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
+        t.token_budget.compression_triggered = true;
+        t.history.tokens_before = 30_000;
+        t.history.tokens_after = 12_000;
+        t.history.turns_compressed = vec![TurnCompression {
+            turn_index: 2,
+            role: "assistant".into(),
+            original_tokens: 18_000,
+            compressed_tokens: 1_000,
+            compression_method: CompressionMethod::TieredCompaction,
+            information_lost: Vec::new(),
+        }];
+        let mut snap = ContextSnapshot::default();
+        snap.compressed_turns = vec![2, 5];
+        let b = ContextBreakdown::from_trace_with(&t, &snap);
+        let state = ViewState::collapsed(Some(Section::Compaction));
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("fired this turn"));
+        assert!(text.contains("30.0k → 12.0k"));
+        assert!(text.contains("turns: 2, 5"));
+    }
+
+    #[test]
+    fn compaction_drill_shows_information_lost_bullets() {
+        let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
+        t.history.turns_compressed = vec![TurnCompression {
+            turn_index: 4,
+            role: "assistant".into(),
+            original_tokens: 8_000,
+            compressed_tokens: 500,
+            compression_method: CompressionMethod::LlmSummarization,
+            information_lost: vec![
+                "Tool result for read_file truncated (1.2k → 0.1k chars)".into(),
+                "Assistant draft #2 dropped (superseded by #3)".into(),
+            ],
+        }];
+        let b = ContextBreakdown::from_trace(&t);
+        let state = ViewState {
+            focus: Some(Section::Compaction),
+            expanded: Some(Section::Compaction),
+            selected_item: 0,
+            drilled: true,
+        };
+        let text: String = build_lines_with(&b, 100, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("LlmSummarization"));
+        assert!(text.contains("Tool result for read_file"));
+        assert!(text.contains("Assistant draft #2 dropped"));
     }
 
     #[test]

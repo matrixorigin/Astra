@@ -23,9 +23,9 @@ expression: "render_panel(&b, 80, 28)"
 │    └ 8 turns  (1 retained · 1 compressed · 2 dropped)                        │
 │    └ 32.0k → 22.0k tokens  (−31%)                                            │
 │                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
+│   Compaction · context trimming                                              │
+│    └ not triggered this turn                                                 │
+│    └ 32.0k → 22.0k tokens  (saved 10.0k, −31%)                               │
 │                                                                              │
 │                                                                              │
 │                                                                              │
