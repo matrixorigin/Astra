@@ -271,13 +271,23 @@ pub(crate) fn build_lines_with(
             Style::default().fg(Color::Yellow),
         )));
     }
+    // Top-of-panel hint tracks the current interaction mode so the
+    // user always knows which keys do what RIGHT NOW.  The hint in
+    // the bottom-pane footer repeats this, but having it inline
+    // keeps the info visible while the user scrolls.
     if let Some(focused) = state.focus {
-        let hint = if state.expanded.is_some() {
-            "  Tab next · Esc collapse · j/k scroll"
+        let selectable = section_item_count(b, focused) > 0;
+        let hint = if state.drilled {
+            "  Esc back · j/k scroll"
+        } else if state.expanded.is_some() && selectable {
+            "  ↑/↓ select · Enter drill · Tab next · Esc back"
+        } else if state.expanded.is_some() {
+            // Expanded section has no drillable items — Enter just
+            // collapses (and so does Esc).  Spell that out.
+            "  Tab next · Enter/Esc collapse · j/k scroll"
         } else {
-            "  Tab next · Enter expand · j/k scroll"
+            "  Tab next · Enter expand · j/k scroll · Esc close"
         };
-        let _ = focused;
         out.push(Line::from(Span::styled(
             hint,
             Style::default().add_modifier(Modifier::DIM),

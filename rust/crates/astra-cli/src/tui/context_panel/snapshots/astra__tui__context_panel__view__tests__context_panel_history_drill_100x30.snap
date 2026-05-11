@@ -3,7 +3,7 @@ source: crates/astra-cli/src/tui/context_panel/view.rs
 expression: buffer_to_string(&buf)
 ---
   2.0k / 100.0k tokens  (2.0%)
-  Tab next · Esc collapse · j/k scroll
+  Esc back · j/k scroll
 
   ⛁ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System prompt     2.0k  ( 2.0%)
   ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛶ Free space       98.0k  (98.0%)

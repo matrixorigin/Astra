@@ -860,22 +860,45 @@ pub(super) async fn execute_cli_command(
 
         Some(Command::Context(ctx_cmd)) => {
             // Forensic `/context dump` — reads a persisted journal
-            // and writes a snapshot JSON file.  No TUI, no REPL —
-            // just enough to let users share a full context state
-            // from a session that's already been closed.
+            // and writes a snapshot JSON file (or prints a
+            // human-readable summary with `--summary`). No TUI,
+            // no REPL — just enough to let users share a full
+            // context state from a session that's already been
+            // closed.
             match ctx_cmd {
                 crate::cli_args::ContextCmd::Dump(args) => {
-                    match crate::context_dump::write_dump_from_journal(
-                        &args.session,
-                        args.output.as_deref(),
+                    // Resolve session: explicit arg → prefix match;
+                    // omitted → most recently touched session on disk.
+                    let sid = match crate::context_dump::resolve_session_id(
+                        args.session.as_deref(),
                     ) {
-                        Ok(p) => {
-                            println!("Context snapshot written to {}", p.display());
-                            Ok(ExitCode::Success)
-                        }
+                        Ok(s) => s,
                         Err(e) => {
-                            eprintln!("context dump failed: {e}");
-                            Ok(ExitCode::ApiError)
+                            eprintln!("context dump: {e}");
+                            return Ok(ExitCode::ApiError);
+                        }
+                    };
+                    if args.summary {
+                        match crate::context_dump::print_summary(&sid) {
+                            Ok(()) => Ok(ExitCode::Success),
+                            Err(e) => {
+                                eprintln!("context dump failed: {e}");
+                                Ok(ExitCode::ApiError)
+                            }
+                        }
+                    } else {
+                        match crate::context_dump::write_dump_from_journal(
+                            &sid,
+                            args.output.as_deref(),
+                        ) {
+                            Ok(p) => {
+                                println!("Context snapshot written to {}", p.display());
+                                Ok(ExitCode::Success)
+                            }
+                            Err(e) => {
+                                eprintln!("context dump failed: {e}");
+                                Ok(ExitCode::ApiError)
+                            }
                         }
                     }
                 }

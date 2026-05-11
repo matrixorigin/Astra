@@ -217,21 +217,34 @@ pub(crate) enum Command {
 /// REPL — useful for forensic replay from a persisted session.
 #[derive(Subcommand, Debug)]
 pub(crate) enum ContextCmd {
-    /// Write a full JSON snapshot of the session's latest context
-    /// to disk.  The session's journal must exist under
-    /// `~/.astra/sessions/<id>.jsonl`.
+    /// Dump a session's context as JSON, or a human-readable
+    /// summary to stdout.
+    ///
+    /// Examples:
+    ///     astra context dump                # most-recent session, JSON to ~/.astra/context-dumps/
+    ///     astra context dump -s 01e363ed    # 8-char prefix (any unique prefix works)
+    ///     astra context dump --summary      # plain-text summary to stdout, no file write
+    ///     astra context dump -s abc -o snap.json
+    #[command(verbatim_doc_comment)]
     Dump(ContextDumpArgs),
 }
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct ContextDumpArgs {
-    /// Session id (full UUID, or any prefix that uniquely matches).
+    /// Session id — any unique prefix (e.g. first 8 chars) works.
+    /// When omitted, falls back to the most recently modified
+    /// session in `~/.astra/sessions/`.
     #[arg(short = 's', long)]
-    pub session: String,
-    /// Optional explicit output path.  When omitted, writes to
-    /// `~/.astra/context-dumps/<session>-<turn>-<ts>.json`.
+    pub session: Option<String>,
+    /// Write a JSON dump to this path instead of the default
+    /// `~/.astra/context-dumps/<sid>-t<turn>-<ts>.json`.  Ignored
+    /// when `--summary` is set.
     #[arg(short = 'o', long)]
     pub output: Option<String>,
+    /// Print a human-readable summary to stdout instead of writing
+    /// a JSON file.  Useful for `| grep`, CI logs, bug reports.
+    #[arg(long)]
+    pub summary: bool,
 }
 
 /// Headless plan commands (no interactive `plan>` prompt).

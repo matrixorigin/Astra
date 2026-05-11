@@ -158,6 +158,152 @@ fn build_dump_from_repl(state: &ReplState, chat_history: Vec<ChatTurnDump>) -> C
     }
 }
 
+/// Resolve a user-supplied session id to a full UUID, with two
+/// conveniences:
+///   1. Prefix match — any unique prefix (e.g. first 8 chars) of
+///      an on-disk session resolves to the full id. Ambiguous
+///      prefixes error out with the candidate list so the user
+///      can pick.
+///   2. Default-latest — when `arg` is `None`, returns the most
+///      recently modified `.jsonl` in `~/.astra/sessions/`.  Makes
+///      `astra context dump` a zero-arg operation for bug reports.
+pub fn resolve_session_id(arg: Option<&str>) -> Result<String, String> {
+    let sessions_dir = sessions_dir()?;
+    let entries = list_session_ids(&sessions_dir)?;
+    if entries.is_empty() {
+        return Err(format!(
+            "no sessions found in {} — is ASTRA running?",
+            sessions_dir.display()
+        ));
+    }
+    match arg {
+        None => {
+            // Pick the most recently modified. `list_session_ids`
+            // returns entries sorted newest-first by mtime.
+            Ok(entries[0].0.clone())
+        }
+        Some(raw) => {
+            let needle = raw.trim();
+            if needle.is_empty() {
+                return Err("empty --session value".to_string());
+            }
+            // Full match wins first — a user who types the full
+            // UUID should never get a "multiple matches" error.
+            if entries.iter().any(|(id, _)| id == needle) {
+                return Ok(needle.to_string());
+            }
+            let matches: Vec<&String> = entries
+                .iter()
+                .filter_map(|(id, _)| id.starts_with(needle).then_some(id))
+                .collect();
+            match matches.len() {
+                0 => Err(format!(
+                    "no session matches prefix `{needle}` in {}",
+                    sessions_dir.display()
+                )),
+                1 => Ok(matches[0].clone()),
+                _ => {
+                    // Ambiguous — list the first few so the user
+                    // can copy-paste one.
+                    let sample: Vec<&String> = matches.iter().take(5).copied().collect();
+                    let mut msg = format!(
+                        "prefix `{needle}` matches {} sessions:",
+                        matches.len()
+                    );
+                    for id in &sample {
+                        msg.push_str(&format!("\n  • {id}"));
+                    }
+                    if matches.len() > sample.len() {
+                        msg.push_str(&format!(
+                            "\n  … and {} more",
+                            matches.len() - sample.len()
+                        ));
+                    }
+                    Err(msg)
+                }
+            }
+        }
+    }
+}
+
+/// Plain-text summary of a session's latest context state.  Printed
+/// to stdout by `astra context dump --summary`.  Intentionally
+/// skips the full trace JSON and the chat bodies — the goal is
+/// "what does /context's collapsed view look like?" readable in a
+/// terminal.
+pub fn print_summary(session_id: &str) -> Result<(), String> {
+    let dump = build_dump_from_journal(session_id)?;
+    println!("Session {}  ·  turn {}", dump.session_id.as_deref().unwrap_or("?"), dump.turn);
+    if let Some(m) = &dump.model {
+        println!("  model: {m}");
+    }
+    println!(
+        "  tokens: in {} · out {} · cache-read {} · cache-create {}",
+        fmt_tokens_u64(dump.totals.prompt_tokens),
+        fmt_tokens_u64(dump.totals.completion_tokens),
+        fmt_tokens_u64(dump.totals.cache_read_tokens),
+        fmt_tokens_u64(dump.totals.cache_creation_tokens),
+    );
+    println!(
+        "  chat turns: {} recorded",
+        dump.chat_history.len()
+    );
+    if !dump.compressed_turns.is_empty() {
+        let rendered: Vec<String> = dump.compressed_turns.iter().map(|t| t.to_string()).collect();
+        println!("  compaction fired on turns: {}", rendered.join(", "));
+    }
+    if dump.trace.is_none() {
+        println!("  trace: (none captured in journal)");
+    }
+    Ok(())
+}
+
+fn fmt_tokens_u64(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
+/// Path to the on-disk session directory. Follows the same
+/// convention as `session_journal::journal_file_path` — we only
+/// need the directory, so we compute it independently to avoid
+/// dragging in more of the journal crate.
+fn sessions_dir() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME env var is unset".to_string())?;
+    Ok(PathBuf::from(home).join(".astra").join("sessions"))
+}
+
+/// Return `(session_id, mtime)` pairs for every `*.jsonl` in the
+/// sessions dir, newest first.  Non-UTF-8 filenames are skipped.
+fn list_session_ids(dir: &Path) -> Result<Vec<(String, SystemTime)>, String> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<(String, SystemTime)> = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| format!("read dir entry: {e}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        out.push((stem.to_string(), mtime));
+    }
+    // Newest first so `[0]` is the most recent session.
+    out.sort_by_key(|e| std::cmp::Reverse(e.1));
+    Ok(out)
+}
+
 /// Rebuild a dump from a persisted session journal.  Used by the
 /// standalone `astra context dump --session <id>` CLI.  Returns
 /// an error when the journal can't be found or parsed.
@@ -351,25 +497,42 @@ mod tests {
         assert_eq!(p, explicit);
     }
 
-    /// RAII guard that snapshots `$HOME` on construction and
-    /// restores it on drop — other tests in the crate read HOME
-    /// during path validation and would break if we leaked a
-    /// stale override.
-    struct HomeGuard(Option<String>);
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Process-wide mutex that serialises every $HOME-mutating
+    /// test in the crate. Several sibling tests (edge_tools::shell,
+    /// …) read $HOME through `dirs::home_dir()` while our resolver
+    /// tests temporarily point $HOME at a tempdir — without the
+    /// mutex, `cargo test`'s default thread pool lets those races
+    /// flake the unrelated tests. This guard pairs mutex-hold with
+    /// $HOME-save/restore as a single RAII unit.
+    static HOME_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct HomeGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
     impl HomeGuard {
         fn set(new: &str) -> Self {
+            let lock = HOME_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var("HOME").ok();
-            // SAFETY: tests in this module serialize their env
-            // mutations via `HomeGuard` so there is no concurrent
-            // reader of HOME during the set/restore window.
+            // SAFETY: the mutex above guarantees no other test in
+            // this crate is reading or writing $HOME while we hold
+            // the guard.
             unsafe { std::env::set_var("HOME", new) };
-            Self(prev)
+            Self { _lock: lock, prev }
         }
     }
     impl Drop for HomeGuard {
         fn drop(&mut self) {
+            // SAFETY: still holding the lock — same guarantee as
+            // `set`. After Drop releases `_lock`, other tests can
+            // observe the restored $HOME.
             unsafe {
-                match &self.0 {
+                match &self.prev {
                     Some(v) => std::env::set_var("HOME", v),
                     None => std::env::remove_var("HOME"),
                 }
@@ -479,4 +642,93 @@ mod tests {
         );
     }
 
+    // ─── Session resolver ────────────────────────────────────────
+
+    /// Seed a fake `~/.astra/sessions/*.jsonl` tree under a tempdir
+    /// and return the guarded `HomeGuard` alongside the tempdir
+    /// handle (so the tempdir outlives the test).
+    ///
+    /// `ids` are written IN ORDER. On filesystems with per-file
+    /// mtime granularity (nsec on Linux) this gives ascending
+    /// mtimes; the last one written is the "newest". That's
+    /// enough to cover the default-latest resolver path.
+    fn seed_sessions_tmp(ids: &[&str]) -> (HomeGuard, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".astra/sessions");
+        fs::create_dir_all(&dir).unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            let path = dir.join(format!("{id}.jsonl"));
+            fs::write(&path, "{}\n").unwrap();
+            // Some filesystems coalesce mtimes written in the same
+            // tick. A 10ms nap between writes keeps ordering
+            // deterministic across Linux/macOS without pulling in
+            // an mtime-setting crate.
+            if i + 1 < ids.len() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let g = HomeGuard::set(tmp.path().to_str().unwrap());
+        (g, tmp)
+    }
+
+    #[test]
+    fn resolve_session_returns_most_recent_when_arg_none() {
+        let (_g, _tmp) = seed_sessions_tmp(&[
+            "01010101-aaaa-bbbb-cccc-dddddddddddd",
+            "03030303-aaaa-bbbb-cccc-dddddddddddd",
+            // Written last → highest mtime → resolver picks this.
+            "02020202-aaaa-bbbb-cccc-dddddddddddd",
+        ]);
+        let id = resolve_session_id(None).unwrap();
+        assert_eq!(id, "02020202-aaaa-bbbb-cccc-dddddddddddd");
+    }
+
+    #[test]
+    fn resolve_session_matches_unique_prefix() {
+        let (_g, _tmp) = seed_sessions_tmp(&[
+            "01010101-aaaa-bbbb-cccc-dddddddddddd",
+            "02020202-aaaa-bbbb-cccc-dddddddddddd",
+        ]);
+        let id = resolve_session_id(Some("0101")).unwrap();
+        assert_eq!(id, "01010101-aaaa-bbbb-cccc-dddddddddddd");
+    }
+
+    #[test]
+    fn resolve_session_errors_on_ambiguous_prefix() {
+        let (_g, _tmp) = seed_sessions_tmp(&[
+            "ab111111-aaaa-bbbb-cccc-dddddddddddd",
+            "ab222222-aaaa-bbbb-cccc-dddddddddddd",
+            "ab333333-aaaa-bbbb-cccc-dddddddddddd",
+        ]);
+        let err = resolve_session_id(Some("ab")).unwrap_err();
+        assert!(
+            err.contains("matches 3 sessions"),
+            "expected ambiguity message, got {err}"
+        );
+        assert!(err.contains("ab111111"));
+    }
+
+    #[test]
+    fn resolve_session_errors_on_unknown_prefix() {
+        let (_g, _tmp) = seed_sessions_tmp(&["01010101-aaaa-bbbb-cccc-dddddddddddd"]);
+        let err = resolve_session_id(Some("zzzzzz")).unwrap_err();
+        assert!(err.contains("no session matches prefix"));
+    }
+
+    #[test]
+    fn resolve_session_errors_when_sessions_dir_is_empty() {
+        let (_g, _tmp) = seed_sessions_tmp(&[]);
+        let err = resolve_session_id(None).unwrap_err();
+        assert!(err.contains("no sessions found"));
+    }
+
+    #[test]
+    fn resolve_session_accepts_full_uuid_even_if_overlapping_prefixes_exist() {
+        // If a full UUID is typed it should never trigger the
+        // ambiguous-prefix guard — full matches win.
+        let full = "01010101-aaaa-bbbb-cccc-dddddddddddd";
+        let (_g, _tmp) = seed_sessions_tmp(&[full, "01010101-extra-overlap-prefix"]);
+        let id = resolve_session_id(Some(full)).unwrap();
+        assert_eq!(id, full);
+    }
 }

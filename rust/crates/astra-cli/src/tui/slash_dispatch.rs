@@ -294,22 +294,26 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Context panel (TUI-native) ──────────────────────────────
         //
-        // `/context` with no args pops a live breakdown view built from
-        // the most recent turn's `TokenBudgetTrace`. Subcommands
-        // (`breakdown`, `explain`, `cognition`) fall through to the
-        // existing rustyline-style printer via Fallback.
+        // Only two forms are supported:
+        //   `/context`            → open the TUI panel
+        //   `/context dump [path]` → write a JSON snapshot to disk
+        //
+        // Earlier iterations fell through to a rustyline-style
+        // `breakdown`/`explain`/`cognition` printer, but those just
+        // duplicate what the panel shows.  Anything else now gets
+        // a short error that points the user at the two valid forms.
         "/context" => {
-            // `/context dump [path]` writes a JSON snapshot of the
-            // current breakdown + trace + chat history to disk.
-            // Handled inline so the output path lands as a
-            // SystemCell in scrollback.  Any other argument falls
-            // through to the line-mode printer.
             let args_trim = args.trim();
             if let Some(rest) = args_trim.strip_prefix("dump") {
                 return handle_context_dump(rest.trim(), ctx);
             }
-            if !args.is_empty() {
-                return SlashResult::Fallback;
+            if !args_trim.is_empty() {
+                use crate::tui::history_cell::system::SystemCell;
+                ctx.chat_widget.commit_system(SystemCell::info(
+                    "Usage: /context          — open the context panel\n       \
+                     /context dump [path] — write a JSON snapshot",
+                ));
+                return SlashResult::Handled;
             }
             use crate::tui::bottom_pane::context_panel_view::ContextPanelView;
             use crate::tui::context_panel::{ContextBreakdown, ContextSnapshot};

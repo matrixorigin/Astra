@@ -276,13 +276,15 @@ impl BottomPaneView for ContextPanelView {
 
     fn handle_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
-            // Three-level Esc: drill → expanded → close.
+            // Three-level Esc: drill → expanded → focus/close.
             (KeyCode::Esc, _) => {
                 if self.drilled {
                     self.exit_drill();
                 } else if self.expanded.is_some() {
                     self.expanded = None;
                     self.selected_item = 0;
+                    // Keep focus so a second Tab keeps cycling; a
+                    // second Esc closes the panel.
                 } else {
                     self.completed = true;
                 }
@@ -290,15 +292,33 @@ impl BottomPaneView for ContextPanelView {
             (KeyCode::Char('q'), _) => {
                 self.completed = true;
             }
-            // Enter: inside drill → no-op; inside expanded section
-            // with a selected item → enter drill; inside focused
-            // section → toggle expand; no focus → close panel
-            // (preserves pre-drill-in Enter-closes muscle memory).
+            // Enter walks depth-first through the hierarchy:
+            //   flat/no focus → close panel
+            //   focused, not expanded → expand (M1 → M2)
+            //   expanded, drillable items → drill selected (M2 → M3)
+            //   expanded, no drillable items → collapse (M2 → M1)
+            //   drilled → ignored (Esc to back out)
+            //
+            // This reads as "keep going deeper on Enter, Esc to
+            // back out". Hint text tells the user exactly which
+            // transition is next for the current mode.
             (KeyCode::Enter, _) => {
                 if self.drilled {
-                    // Already as deep as you can go.
-                } else if self.expanded.is_some() && self.selectable_count() > 0 {
-                    self.enter_drill();
+                    // Already at max depth — make this a no-op so
+                    // a stray Enter inside a drill doesn't close
+                    // the panel.
+                } else if self.expanded.is_some() {
+                    if self.selectable_count() > 0 {
+                        self.enter_drill();
+                    } else {
+                        // Section has nothing to drill into
+                        // (System prompt / Prompt signals /
+                        // Session). Treat Enter as a collapse —
+                        // the alternative (silent no-op) is
+                        // worse UX.
+                        self.expanded = None;
+                        self.selected_item = 0;
+                    }
                 } else if self.focus.is_some() {
                     self.toggle_expand();
                     self.scroll_to_focus();
@@ -388,13 +408,15 @@ impl BottomPaneView for ContextPanelView {
 
     fn hint_keys(&self) -> Option<String> {
         // Hint text tracks the current mode so the user sees
-        // exactly which keys do what at this depth.
+        // exactly which keys do what at this depth. Matches the
+        // in-panel hint in `build_lines_with` so scrolled-out
+        // state doesn't leave the user guessing.
         let hint = if self.drilled {
             "j/k scroll · Esc back"
         } else if self.expanded.is_some() && self.selectable_count() > 0 {
-            "↑/↓ select · Enter drill · Tab next section · Esc back"
+            "↑/↓ select · Enter drill · Tab next · Esc back"
         } else if self.expanded.is_some() {
-            "Tab next section · Enter close · Esc back"
+            "Tab next · Enter/Esc collapse · j/k scroll"
         } else if self.focus.is_some() {
             "Tab next · Enter expand · j/k scroll · Esc close"
         } else {
@@ -715,6 +737,72 @@ mod tests {
         assert!(v.expanded.is_some());
         v.handle_key(press(KeyCode::Tab));
         assert!(v.expanded.is_none(), "moving focus must collapse");
+    }
+
+    #[test]
+    fn enter_progression_expand_then_drill() {
+        // The canonical Enter flow: Tab → focused; 1st Enter →
+        // expand; 2nd Enter → drill. 3rd Enter (inside drill) is
+        // a no-op so a stray keypress doesn't close the panel.
+        let mut v = ContextPanelView::new(big_breakdown());
+        prime_viewport(&v, 80, 14);
+        v.handle_key(press(KeyCode::Tab));
+        while v.focus != Some(Section::Tools) {
+            v.handle_key(press(KeyCode::Tab));
+        }
+        assert!(v.expanded.is_none() && !v.drilled);
+        v.handle_key(press(KeyCode::Enter));
+        assert!(v.expanded.is_some());
+        assert!(!v.drilled);
+        v.handle_key(press(KeyCode::Enter));
+        assert!(v.drilled, "second Enter must drill");
+        v.handle_key(press(KeyCode::Enter));
+        assert!(v.drilled, "third Enter is a no-op inside drill");
+        assert!(!v.is_complete(), "panel must not close on Enter inside drill");
+    }
+
+    #[test]
+    fn enter_on_section_with_no_selectable_items_collapses_instead_of_drilling() {
+        // System prompt / Prompt signals / Session have
+        // section_item_count == 0. Enter on an expanded but
+        // non-drillable section should collapse (not drill a
+        // nonexistent item and not close the panel).
+        let mut v = ContextPanelView::new(big_breakdown());
+        prime_viewport(&v, 80, 14);
+        while v.focus != Some(Section::SystemPrompt) {
+            v.handle_key(press(KeyCode::Tab));
+        }
+        assert_eq!(v.selectable_count(), 0, "precondition: no drillable items");
+        v.handle_key(press(KeyCode::Enter)); // expand
+        assert!(v.expanded.is_some());
+        v.handle_key(press(KeyCode::Enter)); // "drill" → actually collapse
+        assert!(v.expanded.is_none());
+        assert!(!v.drilled);
+        assert!(!v.is_complete());
+    }
+
+    #[test]
+    fn hint_keys_tracks_every_mode() {
+        // Hint text must match the current interaction mode so
+        // the user always sees which keys do what. Cover each of
+        // the four modes (flat, focused, expanded-drillable,
+        // drilled) — the no-items variant is rarer and covered
+        // separately via the handler test above.
+        let mut v = ContextPanelView::new(big_breakdown());
+        assert!(v.hint_keys().unwrap().contains("Tab focus"));
+        v.handle_key(press(KeyCode::Tab));
+        assert!(v.hint_keys().unwrap().contains("Enter expand"));
+        prime_viewport(&v, 80, 14);
+        while v.focus != Some(Section::Tools) {
+            v.handle_key(press(KeyCode::Tab));
+        }
+        v.handle_key(press(KeyCode::Enter));
+        let hint = v.hint_keys().unwrap();
+        assert!(hint.contains("↑/↓ select"), "got {hint}");
+        assert!(hint.contains("Enter drill"), "got {hint}");
+        v.handle_key(press(KeyCode::Enter));
+        let hint = v.hint_keys().unwrap();
+        assert!(hint.contains("Esc back"), "drill hint: {hint}");
     }
 
     #[test]
