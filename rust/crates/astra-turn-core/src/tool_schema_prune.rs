@@ -434,6 +434,61 @@ mod tests {
     }
 
     #[test]
+    fn prune_aggressive_keeps_allof_conditional_required_fields() {
+        // Regression: consolidated tools express per-action required
+        // via `allOf[].then.required`. If AggressivePrune only looked
+        // at top-level `required`, the LLM would lose the ability to
+        // call `agent spawn` (description/prompt stripped), `git
+        // commit` (message stripped), etc. under context pressure.
+        let tool = json!({
+            "type": "function",
+            "function": {
+                "name": "agent",
+                "description": "Consolidated multi-agent tool.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["spawn","delegate"]},
+                        "description": {"type": "string"},
+                        "prompt": {"type": "string"},
+                        "task": {"type": "string"},
+                        "background": {"type": "boolean"}
+                    },
+                    "required": ["action"],
+                    "allOf": [
+                        {"if": {"properties": {"action": {"const": "spawn"}}, "required": ["action"]},
+                         "then": {"required": ["description", "prompt"]}},
+                        {"if": {"properties": {"action": {"const": "delegate"}}, "required": ["action"]},
+                         "then": {"required": ["task"]}}
+                    ]
+                }
+            }
+        });
+        let result = prune_tool_schemas(&[tool], CompactionTier::AggressivePrune);
+        let props = &result[0]["function"]["parameters"]["properties"];
+        // Union of all `then.required` across branches must survive
+        // pruning even though they aren't in top-level `required`.
+        assert!(
+            props.get("description").is_some(),
+            "description must survive"
+        );
+        assert!(props.get("prompt").is_some(), "prompt must survive");
+        assert!(
+            props.get("task").is_some(),
+            "task (delegate required) must survive"
+        );
+        assert!(
+            props.get("action").is_some(),
+            "action (top-level required) must survive"
+        );
+        // Pure optional stays stripped.
+        assert!(
+            props.get("background").is_none(),
+            "purely-optional props still get pruned"
+        );
+    }
+
+    #[test]
     fn filter_excluded_names_removes_matching_tools() {
         let tools = vec![
             make_tool_schema("keep", "x", true),

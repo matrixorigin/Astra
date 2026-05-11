@@ -1703,6 +1703,16 @@ impl ToolExecutor {
             outcome.output = output;
             return outcome;
         }
+        // Consolidated `mo` tool (action=query|snapshot|branch).
+        // Only `query` has a metadata path — snapshot/branch fall
+        // through to `execute()` which dispatches without metadata.
+        if name == "mo" && args.get("action").and_then(Value::as_str) == Some("query") {
+            let mut outcome = self.mo_query_with_metadata(args);
+            let output = self.finalize_tool_output(outcome.output, name);
+            self.record_output_size(output.len());
+            outcome.output = output;
+            return outcome;
+        }
         if name == "git" {
             let action = args
                 .get("action")
@@ -1876,6 +1886,26 @@ impl ToolExecutor {
                 "mo_query" => self.mo_query(args),
                 "mo_snapshot" => self.mo_snapshot(args),
                 "mo_branch" => self.mo_branch(args),
+                // Consolidated `mo` tool (matches the schema in
+                // astra-tools/schemas.rs). Routes by `action` to the
+                // existing legacy handlers. Without this arm, calls
+                // to `mo` fall to DefaultToolExecutor which doesn't
+                // know about it either — the tool was effectively
+                // dead-wired. Per-action required fields (sql for
+                // query, sub_action for snapshot/branch) are
+                // enforced by the schema's `allOf` block.
+                "mo" => {
+                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    match action {
+                        "query" => self.mo_query(args),
+                        "snapshot" => self.mo_snapshot(args),
+                        "branch" => self.mo_branch(args),
+                        "" => "Error: missing required parameter 'action'. Use one of: query, snapshot, branch".to_string(),
+                        other => format!(
+                            "Error: unknown mo action '{other}'. Use one of: query, snapshot, branch"
+                        ),
+                    }
+                }
                 "github_list_prs" => self.github_list_prs(args).await,
                 "github_get_pr" => self.github_get_pr(args).await,
                 "github_ci_status" => self.github_ci_status(args).await,
