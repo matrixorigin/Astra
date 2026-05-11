@@ -308,7 +308,13 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 Some(session) => {
                     let guard = session.read().unwrap_or_else(|e| e.into_inner());
                     match guard.context_traces.last() {
-                        Some(trace) => ContextBreakdown::from_trace(&trace.token_budget),
+                        // Use the full assembly trace so the panel
+                        // can render the nested tool / memory /
+                        // skill / section rows under the top-level
+                        // category bar. Old code only passed the
+                        // scalar TokenBudgetTrace which lost that
+                        // detail.
+                        Some(trace) => ContextBreakdown::from_trace(trace),
                         None => ContextBreakdown::empty(),
                     }
                 }

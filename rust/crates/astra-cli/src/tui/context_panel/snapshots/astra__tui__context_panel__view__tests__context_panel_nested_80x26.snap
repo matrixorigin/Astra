@@ -1,0 +1,30 @@
+---
+source: crates/astra-cli/src/tui/context_panel/view.rs
+expression: "render_panel(&b, 80, 26)"
+---
+┌ Context window (32% · low) ──────────────────────────────────────────────────┐
+│  32.5k / 100.0k tokens  (32.5%)                                              │
+│                                                                              │
+│  ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁   ⛁ System prompt     4.0k  ( 4.0%)                     │
+│  ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛶ ⛶ ⛶ ⛶   ⛁ Tools             6.0k  ( 6.0%)                     │
+│  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Memory            2.0k  ( 2.0%)                     │
+│  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ History          20.0k  (20.0%)                     │
+│  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Current turn       500  ( 0.5%)                     │
+│                        ⛶ Free space       67.5k  (67.5%)                     │
+│                                                                              │
+│  System prompt                                                               │
+│    └ Persona   1.5k tokens                                                   │
+│    └ Environment   800 tokens                                                │
+│    └ User preferences   200 tokens                                           │
+│                                                                              │
+│  Tools · /tool                                                               │
+│    └ read_file   1.2k tokens                                                 │
+│    └ write_file   900 tokens                                                 │
+│                                                                              │
+│  Skills · /skills                                                            │
+│    └ review_changes   650 tokens                                             │
+│                                                                              │
+│  Memory · /memory                                                            │
+│    └ "User prefers terse answers"   400 tokens  (rel 0.91)                   │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
