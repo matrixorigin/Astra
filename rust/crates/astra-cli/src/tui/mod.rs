@@ -971,6 +971,45 @@ pub(crate) async fn run_tui_repl(
                                         frame_requester.schedule_frame();
                                         continue;
                                     }
+                                    // `/session fork` picker → run the fork
+                                    // RPC inline and surface the new id as a
+                                    // system cell. Uses the services API
+                                    // directly so we stay in the TUI.
+                                    if let Some(parent_sid) = name.strip_prefix("__fork__\n") {
+                                        let opts = astra_services::session_fork::ForkSessionOptions {
+                                            parent_session_id: parent_sid.to_string(),
+                                            new_session_id: None,
+                                            label: None,
+                                            forked_after_turn: None,
+                                            data_branch: None,
+                                            snapshot_spec: None,
+                                        };
+                                        match astra_services::session_fork::fork_local_session(opts) {
+                                            Ok(res) => {
+                                                chat_widget.commit_system(history_cell::system::SystemCell::response(
+                                                    format!(
+                                                        "Forked {} → {} (at turn {}, {} events copied)",
+                                                        &parent_sid[..8.min(parent_sid.len())],
+                                                        &res.new_session_id[..8.min(res.new_session_id.len())],
+                                                        res.forked_at_turn,
+                                                        res.events_copied,
+                                                    ),
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::error(
+                                                        format!("Fork failed: {e}"),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
                                     // Session picker result → run the async
                                     // `/resume <id>` pipeline via the usual
                                     // slash fallback path. This is the same

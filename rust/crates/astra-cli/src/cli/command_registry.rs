@@ -125,6 +125,13 @@ impl CommandMeta {
 
 // ── Subcommand completion arrays ────────────────────────────────────────────
 
+const MODEL_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("info", "Show details for the current model"),
+    ("list", "Open the picker to choose a model"),
+    ("set", "Switch model: /model set <name>"),
+    ("clear", "Reset to the API default model"),
+];
+
 const STATS_SUBCOMMANDS: &[(&str, &str)] = &[
     ("cost", "Per-session API cost estimate"),
     ("health", "Tool health dashboard"),
@@ -339,10 +346,11 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_subcommands(HELP_SUBCOMMANDS),
     CommandMeta::new(
         "/model",
-        "List models or set active: /model <name>",
+        "Open the model picker, show current model, or switch",
         CommandGroup::Core,
     )
-    .with_arg_hint("<name>"),
+    .with_subcommands(MODEL_SUBCOMMANDS)
+    .with_arg_hint("[info | list | set <name> | clear | <name>]"),
     CommandMeta::new("/clear", "Start a new session", CommandGroup::Core),
     CommandMeta::new("/undo", "Undo last turn(s): /undo [N]", CommandGroup::Core)
         .with_arg_hint("[N]"),
@@ -426,11 +434,11 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── Session & plan ───────────────────────────────────────────────────
     CommandMeta::new(
         "/session",
-        "Session: history|errors|export|fork|list|cleanup|verify",
+        "Open the session hub, or run a subcommand",
         CommandGroup::SessionPlan,
     )
     .with_subcommands(SESSION_SUBCOMMANDS)
-    .with_arg_hint("[history|errors|export|fork|list|cleanup|verify]"),
+    .with_arg_hint("[list | history | context | fork | analyze | export | …]"),
     CommandMeta::new(
         "/session history",
         "Session journal-style history",
@@ -1049,7 +1057,10 @@ mod tests {
     #[test]
     fn get_arg_hint_from_registry() {
         // Commands with arg_hint defined in registry
-        assert_eq!(get_arg_hint("/model"), Some("<name>"));
+        assert_eq!(
+            get_arg_hint("/model"),
+            Some("[info | list | set <name> | clear | <name>]")
+        );
         assert_eq!(get_arg_hint("/undo"), Some("[N]"));
         assert_eq!(get_arg_hint("/resume"), Some("[session_id]"));
 

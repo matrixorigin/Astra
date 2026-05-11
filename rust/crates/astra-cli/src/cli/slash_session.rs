@@ -2726,7 +2726,10 @@ fn format_tool_calls_md(calls: &[session_journal::ToolCallRecord]) -> String {
 }
 
 /// Build a markdown export from journal events.
-fn build_export_markdown(session_id: &str, events: &[session_journal::JournalEvent]) -> String {
+pub(crate) fn build_export_markdown(
+    session_id: &str,
+    events: &[session_journal::JournalEvent],
+) -> String {
     let mut md = format!("# Session: {session_id}\n\n");
     for evt in events {
         let ts_short = evt.ts.get(..19).unwrap_or(&evt.ts);

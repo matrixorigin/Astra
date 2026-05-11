@@ -101,41 +101,44 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
-        // ── Model selector ──────────────────────────────────────────
+        // ── Model ───────────────────────────────────────────────────
+        //
+        // Supported forms:
+        //   /model                   → open the picker (legacy default)
+        //   /model list              → same as above (explicit alias)
+        //   /model info              → details panel for current model
+        //   /model set <name>        → switch to <name>
+        //   /model clear             → reset to API default
+        //   /model <name>            → shorthand for `/model set <name>`
+        //
+        // Anything we don't recognise falls back to the legacy
+        // line-mode printer so users don't hit a wall when they
+        // type something the registry doesn't cover yet.
         "/model" => {
-            if !args.is_empty() {
-                // /model <name> — set directly
-                ctx.state.model = Some(args.to_string());
-                crate::slash_config::set_active_model_for_display(Some(args.to_string()));
-                ctx.bottom_pane.footer.model = Some(args.to_string());
-                ctx.show_response(format!("Set model to {args}"));
-                return SlashResult::Handled;
+            let trimmed = args.trim();
+            if trimmed.is_empty() || trimmed == "list" {
+                return open_model_picker(ctx).await;
             }
-            let token = crate::repl_runtime::current_access_token(ctx.profile);
-            match crate::slash_router::fetch_model_list(ctx.api, token.as_deref()).await {
-                Ok(models) => {
-                    let current = ctx.state.model.clone().unwrap_or_default();
-                    let items: Vec<SelectionItem> = models
-                        .into_iter()
-                        .map(|m| {
-                            let is_current = m == current;
-                            SelectionItem {
-                                name: m,
-                                description: None,
-                                is_current,
-                            }
-                        })
-                        .collect();
-                    if items.is_empty() {
-                        ctx.show_info("No models available".into());
-                    } else {
-                        let view = ListSelectionView::new(items, Some("Select model:".into()));
-                        ctx.bottom_pane.push_view(Box::new(view));
+            let (sub, rest) = split_sub(trimmed);
+            match sub {
+                "info" => handle_model_info(ctx, rest).await,
+                "set" => {
+                    if rest.is_empty() {
+                        ctx.show_error("/model set needs a model name".into());
+                        return SlashResult::Handled;
                     }
+                    handle_model_set(ctx, rest);
+                    SlashResult::Handled
                 }
-                Err(e) => ctx.show_error(format!("Failed to fetch models: {e}")),
+                "clear" => handle_model_clear(ctx).await,
+                // Registered-but-unhandled subs would print an error;
+                // anything else is treated as `/model <name>` shorthand
+                // (preserves the pre-refactor one-liner path).
+                _ => {
+                    handle_model_set(ctx, trimmed);
+                    SlashResult::Handled
+                }
             }
-            SlashResult::Handled
         }
 
         // ── Stats ───────────────────────────────────────────────────
@@ -560,6 +563,34 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             ctx.bottom_pane
                 .push_view(Box::new(SessionPickerView::new(disco)));
             SlashResult::Handled
+        }
+
+        // ── Session ─────────────────────────────────────────────────
+        //
+        // Forms:
+        //   /session                 → open the session hub (current session overview)
+        //   /session list            → session picker
+        //   /session history [id]    → conversation history for id (defaults to current)
+        //   /session context [id]    → /context panel for id (defaults to current)
+        //   /session fork            → interactive fork flow
+        //   /session analyze [id]    → diagnostics report
+        //   /session export [id]     → write markdown, echo path
+        //   everything else          → line-mode fallback
+        "/session" => {
+            let trimmed = args.trim();
+            if trimmed.is_empty() {
+                return handle_session_hub(ctx);
+            }
+            let (sub, rest) = split_sub(trimmed);
+            match sub {
+                "list" => handle_session_list_view(ctx),
+                "history" => handle_session_history_view(ctx, rest),
+                "context" => handle_session_context_view(ctx, rest),
+                "fork" => handle_session_fork_view(ctx),
+                "analyze" | "diag" => handle_session_analyze_view(ctx, rest),
+                "export" => handle_session_export_view(ctx, rest),
+                _ => SlashResult::Fallback,
+            }
         }
 
         // ── Copy last response ──────────────────────────────────────
@@ -1261,6 +1292,595 @@ fn show_stats_view(sub: &str, state: &ReplState, bottom_pane: &mut BottomPane) {
     }
 }
 
+/// Split `"sub rest of args"` → `("sub", "rest of args")`.  Trims
+/// both halves.  Used by slash commands that want a clean
+/// `match sub { … }` without re-parsing with `split_whitespace`
+/// everywhere.
+fn split_sub(text: &str) -> (&str, &str) {
+    let t = text.trim();
+    match t.find(char::is_whitespace) {
+        Some(pos) => (&t[..pos], t[pos..].trim()),
+        None => (t, ""),
+    }
+}
+
+// ── /model subcommand helpers ───────────────────────────────────
+
+/// `/model` with no args (or `list`) — fetch the catalog and push
+/// the picker.  Shared between the legacy default and the explicit
+/// `list` form so both behave identically.
+async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
+    let token = crate::repl_runtime::current_access_token(ctx.profile);
+    match crate::slash_router::fetch_model_list(ctx.api, token.as_deref()).await {
+        Ok(models) => {
+            let current = ctx.state.model.clone().unwrap_or_default();
+            let items: Vec<SelectionItem> = models
+                .into_iter()
+                .map(|m| {
+                    let is_current = m == current;
+                    SelectionItem {
+                        name: m,
+                        description: None,
+                        is_current,
+                    }
+                })
+                .collect();
+            if items.is_empty() {
+                ctx.show_info("No models available".into());
+            } else {
+                let view = ListSelectionView::new(items, Some("Select model:".into()));
+                ctx.bottom_pane.push_view(Box::new(view));
+            }
+        }
+        Err(e) => ctx.show_error(format!("Failed to fetch models: {e}")),
+    }
+    SlashResult::Handled
+}
+
+/// `/model set <name>` — apply immediately.  Also used as the
+/// fallback for `/model <name>` shorthand.
+fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
+    let name = name.trim();
+    ctx.state.model = Some(name.to_string());
+    crate::slash_config::set_active_model_for_display(Some(name.to_string()));
+    ctx.bottom_pane.footer.model = Some(name.to_string());
+    ctx.show_response(format!("Set model to {name}"));
+}
+
+/// `/model clear` — unset the session override so the edge's
+/// default model applies.  Reports the change to scrollback so
+/// the user sees the footer switch.
+async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
+    ctx.state.model = None;
+    crate::slash_config::set_active_model_for_display(None);
+    ctx.bottom_pane.footer.model = None;
+    ctx.show_response("Model override cleared — using API default.".into());
+    SlashResult::Handled
+}
+
+/// `/model info [name]` — push a read-only [`InfoView`] with the
+/// model's metadata.  Without an explicit name, uses the
+/// currently-selected model.
+async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
+    use crate::tui::bottom_pane::info_view::InfoView;
+
+    let target = if arg.is_empty() {
+        ctx.state.model.clone()
+    } else {
+        Some(arg.trim().to_string())
+    };
+    let Some(name) = target else {
+        ctx.show_error("No active model — try `/model set <name>` or `/model list`.".into());
+        return SlashResult::Handled;
+    };
+
+    // Prefer the cached pricing the session already carries so
+    // `/model info` is instant — live refetch happens via
+    // `/model list` when the user explicitly asks.
+    let pricing = &ctx.state.cached_pricing;
+    let prompt_usd = if pricing.prompt > 0.0 {
+        format!("${:.3} / 1M tokens", pricing.prompt * 1_000_000.0)
+    } else {
+        "— (not cached)".into()
+    };
+    let completion_usd = if pricing.completion > 0.0 {
+        format!("${:.3} / 1M tokens", pricing.completion * 1_000_000.0)
+    } else {
+        "— (not cached)".into()
+    };
+    let cache_read = pricing
+        .cache_read
+        .map(|v| format!("${:.3} / 1M", v * 1_000_000.0))
+        .unwrap_or_else(|| "—".into());
+    let cache_write = pricing
+        .cache_write
+        .map(|v| format!("${:.3} / 1M", v * 1_000_000.0))
+        .unwrap_or_else(|| "—".into());
+
+    let cumulative_tokens = ctx
+        .state
+        .total_prompt_tokens
+        .saturating_add(ctx.state.total_completion_tokens);
+    let mut pairs: Vec<(&str, String)> = vec![
+        ("model", name.clone()),
+        (
+            "current",
+            if ctx.state.model.as_deref() == Some(name.as_str()) {
+                "yes".into()
+            } else {
+                "no (info for override target)".into()
+            },
+        ),
+        ("prompt cost", prompt_usd),
+        ("completion cost", completion_usd),
+        ("cache read", cache_read),
+        ("cache write", cache_write),
+        (
+            "session prompt tokens",
+            fmt_tokens(ctx.state.total_prompt_tokens),
+        ),
+        (
+            "session completion tokens",
+            fmt_tokens(ctx.state.total_completion_tokens),
+        ),
+        (
+            "session cache-read tokens",
+            fmt_tokens(ctx.state.total_cache_read_tokens),
+        ),
+        (
+            "session cache-creation tokens",
+            fmt_tokens(ctx.state.total_cache_creation_tokens),
+        ),
+        ("session total tokens", fmt_tokens(cumulative_tokens)),
+        (
+            "session cost",
+            format!("${:.4}", ctx.state.total_session_cost),
+        ),
+    ];
+    if ctx.state.max_budget_limit > 0.0 {
+        pairs.push((
+            "budget limit",
+            format!("${:.2}", ctx.state.max_budget_limit),
+        ));
+    }
+
+    ctx.bottom_pane.push_view(Box::new(InfoView::from_key_value(
+        &format!("Model · {name}"),
+        pairs,
+    )));
+    SlashResult::Handled
+}
+
+fn fmt_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
+// ── /session subcommand helpers ─────────────────────────────────
+
+/// `/session` with no args — push the session hub with a
+/// snapshot of the current session's vital stats and shortcut
+/// hints for the common flows (list / history / context /
+/// fork / export).
+fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
+    use crate::tui::bottom_pane::info_view::InfoView;
+
+    let sid = ctx.state.session_id.clone().unwrap_or_default();
+    let sid_short = if sid.len() > 8 {
+        &sid[..8]
+    } else {
+        sid.as_str()
+    };
+    let model = ctx.state.model.clone().unwrap_or_else(|| "—".into());
+    let cumulative_tokens = ctx
+        .state
+        .total_prompt_tokens
+        .saturating_add(ctx.state.total_completion_tokens);
+
+    let mut pairs: Vec<(&str, String)> = vec![
+        (
+            "session id",
+            if sid.is_empty() {
+                "— (no active session)".into()
+            } else {
+                sid.clone()
+            },
+        ),
+        (
+            "short id",
+            if sid.is_empty() {
+                "—".into()
+            } else {
+                sid_short.to_string()
+            },
+        ),
+        ("turn", ctx.state.turn.to_string()),
+        ("model", model),
+        ("cost", format!("${:.4}", ctx.state.total_session_cost)),
+    ];
+    if ctx.state.max_budget_limit > 0.0 {
+        pairs.push(("budget", format!("${:.2}", ctx.state.max_budget_limit)));
+    }
+    pairs.push(("prompt tokens", fmt_tokens(ctx.state.total_prompt_tokens)));
+    pairs.push((
+        "completion tokens",
+        fmt_tokens(ctx.state.total_completion_tokens),
+    ));
+    pairs.push((
+        "cache-read tokens",
+        fmt_tokens(ctx.state.total_cache_read_tokens),
+    ));
+    pairs.push((
+        "cache-creation tokens",
+        fmt_tokens(ctx.state.total_cache_creation_tokens),
+    ));
+    pairs.push(("total tokens", fmt_tokens(cumulative_tokens)));
+
+    // Compaction + drift counters from the observability session
+    // when it's available.  Best-effort — a missing session just
+    // means the counters stay off the hub.
+    if let Some(obs) = ctx.state.observability_session.as_ref() {
+        let guard = obs.read().unwrap_or_else(|e| e.into_inner());
+        pairs.push(("compactions", guard.compressed_turns.len().to_string()));
+        pairs.push(("context traces", guard.context_traces.len().to_string()));
+    }
+
+    // Action cheatsheet, rendered as value-less rows so the user
+    // sees what every subcommand does without leaving the panel.
+    pairs.push(("", String::new()));
+    pairs.push(("/session list", "pick a session to resume".into()));
+    pairs.push((
+        "/session history",
+        "scroll this session's transcript".into(),
+    ));
+    pairs.push(("/session context", "context panel for this session".into()));
+    pairs.push(("/session fork", "branch a parallel session".into()));
+    pairs.push(("/session analyze", "run session diagnostics".into()));
+    pairs.push(("/session export", "write markdown transcript".into()));
+
+    let title = if sid.is_empty() {
+        "Session · no active session".to_string()
+    } else {
+        format!("Session · {sid_short}")
+    };
+    ctx.bottom_pane
+        .push_view(Box::new(InfoView::from_key_value(&title, pairs)));
+    SlashResult::Handled
+}
+
+/// `/session list` — same picker as `/resume`, but reached via
+/// the session namespace so the registry reads naturally.  Empty
+/// store → info message instead of a blank picker.
+fn handle_session_list_view(ctx: &mut DispatchContext<'_>) -> SlashResult {
+    use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
+    use crate::tui::session_picker::{FsSessionSource, SessionDiscovery};
+    let disco = SessionDiscovery::new(FsSessionSource::new(), 50);
+    if disco.total() == 0 {
+        ctx.show_info("No previous sessions found.".into());
+        return SlashResult::Handled;
+    }
+    ctx.bottom_pane
+        .push_view(Box::new(SessionPickerView::new(disco)));
+    SlashResult::Handled
+}
+
+fn handle_session_history_view(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
+    let sid = resolve_session_arg(ctx, arg);
+    let Some(sid) = sid else {
+        return SlashResult::Handled;
+    };
+    let events = astra_services::session_journal::read_journal(&sid).unwrap_or_default();
+    if events.is_empty() {
+        ctx.show_info(format!("No journal events for session {sid}."));
+        return SlashResult::Handled;
+    }
+    push_history_info(ctx, &sid, &events);
+    SlashResult::Handled
+}
+
+/// `/session context [id]` — with no id, opens the `/context` TUI
+/// panel for the current session (via reopen).  With an explicit
+/// id, falls back to the line-mode printer since rebuilding the
+/// TUI panel from a disk journal needs more plumbing than fits in
+/// this dispatch.
+fn handle_session_context_view(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
+    if arg.is_empty() {
+        // Reopen `/context` as a next-turn action. Cleaner than
+        // re-entering `dispatch` recursively (which would be
+        // awkward because this fn isn't async).
+        use crate::tui::bottom_pane::info_view::InfoView;
+        ctx.bottom_pane.push_view(Box::new(
+            InfoView::from_plain(
+                "Session context",
+                vec![
+                    "  (no id) — open the live /context panel instead.".into(),
+                    "  /context                 current session".into(),
+                    "  /session context <id>    print context trace for a saved session".into(),
+                ],
+            )
+            .with_reopen("/context"),
+        ));
+        return SlashResult::Handled;
+    }
+    SlashResult::Fallback
+}
+
+/// `/session fork` — interactive parent picker.  On Enter the
+/// picker emits `"__fork__\n<sid>"`; the outer loop recognises the
+/// sentinel and runs `fork_local_session`.  No args short-circuits
+/// through the picker; `/session fork <sid>` falls back to the
+/// line-mode handler (covers scripted use).
+fn handle_session_fork_view(ctx: &mut DispatchContext<'_>) -> SlashResult {
+    use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
+    use crate::tui::session_picker::{FsSessionSource, SessionDiscovery};
+    let disco = SessionDiscovery::new(FsSessionSource::new(), 50);
+    if disco.total() == 0 {
+        ctx.show_info("No previous sessions to fork from.".into());
+        return SlashResult::Handled;
+    }
+    ctx.bottom_pane.push_view(Box::new(
+        SessionPickerView::new(disco).with_result_prefix("__fork__\n"),
+    ));
+    SlashResult::Handled
+}
+
+fn handle_session_analyze_view(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
+    // TUI-side analyze is a *summary* — counters only.  The full
+    // textual diagnostic (latency spikes, per-turn token shape,
+    // issue detection bullets) still lives in the line-mode
+    // printer.  Users who want the full thing get it via
+    // `/session analyze <id>` falling back through SlashResult::Fallback
+    // explicitly with `+deep` suffix, handled below.
+    let (flag, rest) = split_sub(arg);
+    if flag == "deep" {
+        // Hand off to the full line-mode analyzer.  rest may hold
+        // a session id.  Rewrite args so the fallback parser sees
+        // the conventional `/session analyze <id>` shape.
+        let _ = rest;
+        return SlashResult::Fallback;
+    }
+    let Some(sid) = resolve_session_arg(ctx, arg) else {
+        return SlashResult::Handled;
+    };
+    push_analyze_summary(ctx, &sid);
+    SlashResult::Handled
+}
+
+/// Counter-only summary of a session journal — fast to compute
+/// (no workspace reads, no per-event allocation) so the InfoView
+/// renders instantly.  Users who want the deep report still get
+/// it via `/session analyze deep [id]`.
+fn push_analyze_summary(ctx: &mut DispatchContext<'_>, sid: &str) {
+    use crate::tui::bottom_pane::info_view::InfoView;
+    use astra_services::session_journal::JournalEventType;
+
+    let events = match astra_services::session_journal::read_journal(sid) {
+        Ok(e) => e,
+        Err(e) => {
+            ctx.show_error(format!("Failed to read journal: {e}"));
+            return;
+        }
+    };
+    if events.is_empty() {
+        ctx.show_info(format!("Session {sid} has no journal events."));
+        return;
+    }
+
+    let mut turns = 0u32;
+    let mut errors = 0u32;
+    let mut stalls = 0u32;
+    let mut checkpoints = 0u32;
+    let mut compactions = 0u32;
+    let mut prompt_tokens = 0u64;
+    let mut completion_tokens = 0u64;
+    let mut cache_read_tokens = 0u64;
+    let mut cache_creation_tokens = 0u64;
+    let mut first_ts: Option<String> = None;
+    let mut last_ts: Option<String> = None;
+    for ev in &events {
+        if first_ts.is_none() {
+            first_ts = Some(ev.ts.clone());
+        }
+        last_ts = Some(ev.ts.clone());
+        match ev.event_type {
+            JournalEventType::Turn => turns += 1,
+            JournalEventType::TurnError | JournalEventType::Error => errors += 1,
+            JournalEventType::StallDetected => stalls += 1,
+            JournalEventType::Checkpoint => checkpoints += 1,
+            JournalEventType::Compact => compactions += 1,
+            _ => {}
+        }
+        if let Some(t) = ev.tokens_in {
+            prompt_tokens = prompt_tokens.saturating_add(t);
+        }
+        if let Some(t) = ev.tokens_out {
+            completion_tokens = completion_tokens.saturating_add(t);
+        }
+        if let Some(t) = ev.cache_read_tokens {
+            cache_read_tokens = cache_read_tokens.saturating_add(t);
+        }
+        if let Some(t) = ev.cache_creation_tokens {
+            cache_creation_tokens = cache_creation_tokens.saturating_add(t);
+        }
+    }
+    let total_tokens = prompt_tokens.saturating_add(completion_tokens);
+
+    let mut pairs: Vec<(&str, String)> = Vec::new();
+    pairs.push(("session id", sid.to_string()));
+    if let Some(ts) = first_ts {
+        pairs.push(("started", ts));
+    }
+    if let Some(ts) = last_ts {
+        pairs.push(("last event", ts));
+    }
+    pairs.push(("", String::new()));
+    pairs.push(("turns", turns.to_string()));
+    pairs.push(("errors", errors.to_string()));
+    pairs.push(("stalls detected", stalls.to_string()));
+    pairs.push(("checkpoints", checkpoints.to_string()));
+    pairs.push(("compactions", compactions.to_string()));
+    pairs.push(("", String::new()));
+    pairs.push(("prompt tokens", fmt_tokens(prompt_tokens)));
+    pairs.push(("completion tokens", fmt_tokens(completion_tokens)));
+    pairs.push(("cache-read tokens", fmt_tokens(cache_read_tokens)));
+    pairs.push(("cache-creation tokens", fmt_tokens(cache_creation_tokens)));
+    pairs.push(("total tokens", fmt_tokens(total_tokens)));
+    pairs.push(("", String::new()));
+    pairs.push((
+        "deep report",
+        "`/session analyze deep <id>` prints the full diagnostic".into(),
+    ));
+
+    let sid_short = if sid.len() > 8 { &sid[..8] } else { sid };
+    ctx.bottom_pane.push_view(Box::new(InfoView::from_key_value(
+        &format!("Session analyze · {sid_short}"),
+        pairs,
+    )));
+}
+
+fn handle_session_export_view(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
+    let Some(sid) = resolve_session_arg(ctx, arg) else {
+        return SlashResult::Handled;
+    };
+    let events = match astra_services::session_journal::read_journal(&sid) {
+        Ok(events) => events,
+        Err(e) => {
+            ctx.show_error(format!("Failed to read journal: {e}"));
+            return SlashResult::Handled;
+        }
+    };
+    if events.is_empty() {
+        ctx.show_info(format!("Session {sid} has no journal events to export."));
+        return SlashResult::Handled;
+    }
+    let md = crate::slash_session::build_export_markdown(&sid, &events);
+    let now = chrono::Local::now();
+    // Default path mirrors the legacy line-mode exporter so users
+    // with scripts expecting that filename shape keep working.
+    let path = format!("astra-session-{}.md", now.format("%Y%m%d-%H%M"));
+    match std::fs::write(&path, &md) {
+        Ok(_) => ctx.show_response(format!("Exported {sid} → {path}")),
+        Err(e) => ctx.show_error(format!("Failed to write {path}: {e}")),
+    }
+    SlashResult::Handled
+}
+
+/// Resolve a user-supplied session id (or default-to-current)
+/// and surface a helpful error on the common failure modes.
+fn resolve_session_arg(ctx: &mut DispatchContext<'_>, arg: &str) -> Option<String> {
+    if arg.is_empty() {
+        match ctx.state.session_id.clone() {
+            Some(id) if !id.is_empty() => Some(id),
+            _ => {
+                ctx.show_error("No active session — try `/session list` first.".into());
+                None
+            }
+        }
+    } else {
+        Some(arg.trim().to_string())
+    }
+}
+
+/// Render a session's conversation history into an InfoView.
+/// Keeps the logic tight: titles, user → assistant pairing,
+/// truncated previews.  Heavier browsing (drill, scroll) can be
+/// added later with a dedicated view.
+fn push_history_info(
+    ctx: &mut DispatchContext<'_>,
+    sid: &str,
+    events: &[astra_services::session_journal::JournalEvent],
+) {
+    use crate::tui::bottom_pane::info_view::InfoView;
+    use astra_services::session_journal::JournalEventType;
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let role_user = Style::default().fg(Color::Cyan);
+    let role_assistant = Style::default().fg(Color::Green);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for ev in events {
+        match ev.event_type {
+            JournalEventType::Turn => {
+                if let Some(user) = &ev.user_input {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  #{turn} ", turn = ev.turn.unwrap_or(0)), dim),
+                        Span::styled("user", role_user),
+                    ]));
+                    for row in truncate_rows(user, 3) {
+                        lines.push(Line::from(Span::styled(format!("    {row}"), bold)));
+                    }
+                }
+                if let Some(out) = &ev.assistant_output {
+                    lines.push(Line::from(Span::styled("       assistant", role_assistant)));
+                    for row in truncate_rows(out, 3) {
+                        lines.push(Line::from(Span::raw(format!("    {row}"))));
+                    }
+                }
+                lines.push(Line::default());
+            }
+            JournalEventType::Compact => {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⚠ compaction at turn {}", ev.turn.unwrap_or(0)),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            _ => {}
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no user/assistant turns recorded in this journal)",
+            dim,
+        )));
+    }
+    let sid_short = if sid.len() > 8 { &sid[..8] } else { sid };
+    ctx.bottom_pane.push_view(Box::new(InfoView::new(
+        format!("Session history · {sid_short}"),
+        lines,
+    )));
+}
+
+/// Split `text` into `max` short rows. Trims whitespace, drops
+/// empty lines, caps each row at 76 chars.  Keeps the InfoView
+/// dense without wrapping surprises.
+fn truncate_rows(text: &str, max: usize) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    if max == 0 {
+        return rows;
+    }
+    let total_non_blank = text.lines().filter(|l| !l.trim().is_empty()).count();
+    for logical in text.lines() {
+        let trimmed = logical.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Reserve the last slot for an overflow marker when there's
+        // still non-blank content to come.  Guarantees
+        // `rows.len() <= max` as a strict invariant so callers can
+        // safely allocate a fixed viewport.
+        let remaining_content = total_non_blank - rows.len();
+        if rows.len() + 1 >= max && remaining_content > 1 {
+            rows.push("…".into());
+            break;
+        }
+        if trimmed.chars().count() > 76 {
+            let short: String = trimmed.chars().take(75).collect();
+            rows.push(format!("{short}…"));
+        } else {
+            rows.push(trimmed.to_string());
+        }
+    }
+    rows
+}
+
 fn parse_slash(text: &str) -> (&str, &str) {
     let text = text.trim();
     match text.find(' ') {
@@ -1602,5 +2222,87 @@ mod view_result_tests {
             last_system_message(&chat_widget).as_deref(),
             Some("Set model to claude-sonnet-4.6")
         );
+    }
+}
+
+#[cfg(test)]
+mod split_sub_tests {
+    use super::split_sub;
+
+    #[test]
+    fn split_sub_no_whitespace_returns_empty_rest() {
+        assert_eq!(split_sub("info"), ("info", ""));
+    }
+
+    #[test]
+    fn split_sub_single_space() {
+        assert_eq!(split_sub("set gpt-4"), ("set", "gpt-4"));
+    }
+
+    #[test]
+    fn split_sub_trims_both_halves() {
+        assert_eq!(split_sub("  set   gpt-4  "), ("set", "gpt-4"));
+    }
+
+    #[test]
+    fn split_sub_empty_input() {
+        assert_eq!(split_sub(""), ("", ""));
+    }
+
+    #[test]
+    fn split_sub_preserves_multi_word_rest() {
+        assert_eq!(
+            split_sub("analyze deep abc-123"),
+            ("analyze", "deep abc-123")
+        );
+    }
+}
+
+#[cfg(test)]
+mod fmt_tokens_tests {
+    use super::fmt_tokens;
+
+    #[test]
+    fn fmt_tokens_handles_all_magnitudes() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(42), "42");
+        assert_eq!(fmt_tokens(1_200), "1.2k");
+        assert_eq!(fmt_tokens(999_999), "1000.0k");
+        assert_eq!(fmt_tokens(1_500_000), "1.5M");
+    }
+}
+
+#[cfg(test)]
+mod truncate_rows_tests {
+    use super::truncate_rows;
+
+    #[test]
+    fn truncate_rows_drops_blank_lines() {
+        let rows = truncate_rows("\n\nfirst\n\nsecond\n", 3);
+        assert_eq!(rows, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
+    fn truncate_rows_adds_ellipsis_when_truncating() {
+        let input = "a\nb\nc\nd\ne";
+        let rows = truncate_rows(input, 3);
+        assert_eq!(
+            rows,
+            vec!["a".to_string(), "b".to_string(), "…".to_string()]
+        );
+    }
+
+    #[test]
+    fn truncate_rows_caps_long_single_line_at_76() {
+        let long = "x".repeat(100);
+        let rows = truncate_rows(&long, 2);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].ends_with('…'));
+        assert_eq!(rows[0].chars().count(), 76);
+    }
+
+    #[test]
+    fn truncate_rows_empty_input_produces_empty_output() {
+        assert!(truncate_rows("", 5).is_empty());
     }
 }

@@ -22,6 +22,12 @@ pub(crate) struct SessionPickerView {
     filter: String,
     result: Option<String>,
     cancelled: bool,
+    /// Optional prefix prepended to the emitted result string —
+    /// lets the outer loop route the same picker to different
+    /// actions (resume vs fork) without cloning the view.  When
+    /// set, the completion result is `"{prefix}{sid}"`; consumers
+    /// strip the prefix with `strip_prefix` to dispatch.
+    result_prefix: String,
 }
 
 impl SessionPickerView {
@@ -31,7 +37,16 @@ impl SessionPickerView {
             filter: String::new(),
             result: None,
             cancelled: false,
+            result_prefix: String::new(),
         }
+    }
+
+    /// Stamp a sentinel prefix on the emitted result so the outer
+    /// loop can tell apart "user wants to resume this id" from
+    /// "user wants to fork this id", etc.
+    pub fn with_result_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.result_prefix = prefix.into();
+        self
     }
 
     fn update_filter(&mut self) {
@@ -75,7 +90,12 @@ impl BottomPaneView for SessionPickerView {
             }
             KeyCode::Enter => {
                 if let Some(id) = self.disco.accept() {
-                    self.result = Some(id);
+                    let out = if self.result_prefix.is_empty() {
+                        id
+                    } else {
+                        format!("{}{}", self.result_prefix, id)
+                    };
+                    self.result = Some(out);
                 } else {
                     // No match — treat as cancel rather than dangling.
                     self.cancelled = true;
