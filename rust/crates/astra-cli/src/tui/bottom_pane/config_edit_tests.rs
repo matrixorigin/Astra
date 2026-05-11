@@ -182,7 +182,10 @@ fn esc_while_child_editor_open_cancels_child_only() {
         !v.has_inner_editor(),
         "Esc in child closes the child, not the parent"
     );
-    assert!(!v.is_dirty(), "cancelled child must not alter working config");
+    assert!(
+        !v.is_dirty(),
+        "cancelled child must not alter working config"
+    );
     assert!(!v.is_complete(), "parent view still alive");
 }
 
@@ -228,9 +231,12 @@ fn render_fits_height_budget_at_reasonable_width() {
     v.render(area, &mut buf);
     // Spot-check: the list should render at least one setting's id or
     // label somewhere in the buffer.
-    let text: String = (0..area.height)
-        .flat_map(|y| (0..area.width).map(move |x| buf[(x, y)].symbol().to_string()))
-        .collect();
+    let mut text = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            text.push_str(buf[(x, y)].symbol());
+        }
+    }
     assert!(
         text.contains("budget")
             || text.contains("compression")

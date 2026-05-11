@@ -318,6 +318,20 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
+        // ── /config edit (TUI-native) ───────────────────────────────
+        //
+        // Only `/config edit` gets a TUI-native view. Read-only views
+        // (`/config`, `show`, `paths`, `diff`, `sources`, `export`)
+        // fall back to the line-mode printer via with_restored — they
+        // print static output and don't need to stay inside the TUI.
+        "/config" if args.trim() == "edit" => {
+            use crate::tui::bottom_pane::config_edit_view::ConfigEditView;
+            let cfg = astra_config::runtime_config::RuntimeConfig::load();
+            ctx.bottom_pane
+                .push_view(Box::new(ConfigEditView::new(cfg)));
+            SlashResult::Handled
+        }
+
         // ── SQL table view (TUI-native, astra-unique) ───────────────
         //
         // Runs a SQL query against MatrixOne via the existing `mo_query`
@@ -694,6 +708,11 @@ pub(crate) fn build_panels_cheat_sheet_lines() -> Vec<String> {
             "/worktrees",
             "list git worktrees with per-worktree session counts",
             "↑↓ navigate · q / Esc close",
+        ),
+        (
+            "/config edit",
+            "search, pick, and edit runtime config (bool / number / enum)",
+            "↑↓ navigate · Enter edit · type to search · Esc save/close",
         ),
         (
             "/help",

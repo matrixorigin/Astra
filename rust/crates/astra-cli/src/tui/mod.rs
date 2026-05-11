@@ -6,6 +6,7 @@ mod tests;
 mod app_event;
 mod approval;
 mod bottom_pane;
+mod config_edit_router;
 mod context_panel;
 // Core (post-refactor): HistoryCell trait + TurnEvent schema +
 // single ChatWidget router + on-disk JSONL transcript. See
@@ -840,6 +841,31 @@ pub(crate) async fn run_tui_repl(
                                                 chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Register failed: {e}")));
                                             }
                                         }
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
+                                    // /config edit completion. Token format:
+                                    //   __config_edit__\n<action>\n<toml-body>
+                                    // Actions: save_user | save_project | discard | cancel.
+                                    // save_* writes the TOML to the target scope
+                                    // AND refreshes the process-wide overlay so
+                                    // the new values take effect for the next turn.
+                                    if let Some(rest) = name.strip_prefix("__config_edit__\n") {
+                                        let mut parts = rest.splitn(2, '\n');
+                                        let action = parts.next().unwrap_or("").to_string();
+                                        let toml_body = parts.next().unwrap_or("").to_string();
+                                        let result = crate::tui::config_edit_router::finalize(
+                                            &action,
+                                            &toml_body,
+                                        );
+                                        let msg = match result {
+                                            Ok(m) => history_cell::system::SystemCell::response(m),
+                                            Err(e) => history_cell::system::SystemCell::error(e),
+                                        };
+                                        chat_widget.commit_system(msg);
+                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
                                         bottom_pane.sync_popups();
                                         frame_requester.schedule_frame();
                                         continue;

@@ -1,5 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/slash_dispatch.rs
+assertion_line: 1205
 expression: "build_panels_cheat_sheet_lines().join(\"\\n\")"
 ---
   /resume
@@ -21,6 +22,10 @@ expression: "build_panels_cheat_sheet_lines().join(\"\\n\")"
   /worktrees
       list git worktrees with per-worktree session counts
       ↑↓ navigate · q / Esc close
+
+  /config edit
+      search, pick, and edit runtime config (bool / number / enum)
+      ↑↓ navigate · Enter edit · type to search · Esc save/close
 
   /help
       list every slash command grouped by category
