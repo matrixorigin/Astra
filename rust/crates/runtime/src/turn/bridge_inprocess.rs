@@ -1879,6 +1879,35 @@ impl InProcessChatTurnBridge {
                         skill_injections,
                         memory_injections,
                     );
+                    // Emit per-turn injection-channel texts so the CLI's
+                    // observability layer can fingerprint every live
+                    // channel (wip-5). Bridge echoes the CLI-owned
+                    // channels (self_awareness / memoria_insights /
+                    // recent_arg_hints / skill_listing) for symmetry so
+                    // the single post-turn `observe_bridge_injections`
+                    // call has one canonical source. Bridge-generated
+                    // channels (feedback_rules / implicit_feedback /
+                    // memoria_prefetch / tool_round_guidance / volatile)
+                    // are only visible here.
+                    let volatile_joined = env_volatile.as_deref().unwrap_or("").to_string();
+                    let memoria_prefetch_str = memoria_prefetch_section.as_deref().unwrap_or("");
+                    yield render_sse(&json!({
+                        "type": "injection_freshness",
+                        "texts": {
+                            "self_awareness": self_awareness_hint,
+                            "memoria_insights": memoria_insights_hint,
+                            "recent_arg_hints": recent_arg_hints_hint,
+                            "skill_listing": skill_listing_hint,
+                            // CLI owns lessons — bridge leaves empty so the
+                            // CLI post-turn merge can supply the live value.
+                            "lessons": "",
+                            "memoria_prefetch": memoria_prefetch_str,
+                            "feedback_rules": feedback_rules_hint,
+                            "implicit_feedback": implicit_feedback_hint,
+                            "tool_round_guidance": tool_round_guidance,
+                            "volatile": volatile_joined,
+                        }
+                    }));
                     yield render_sse(&json!({
                         "type": "context_meta",
                         "system_prompt_tokens": breakdown.total_tokens,

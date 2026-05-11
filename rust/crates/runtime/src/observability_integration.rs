@@ -402,22 +402,11 @@ impl ObservabilitySession {
     /// from the caller because only the bridge / CLI sees what actually
     /// landed in `edge_profile` / `dynamic_sections` this turn.
     ///
-    /// Call site: CLI's `build_self_model_for_agent` (edge_tools.rs)
-    /// after the session has been repopulated with the per-turn signals
-    /// but before the SelfModel snapshot is built.
-    pub fn observe_injections(&mut self, lessons_text: &str, volatile_text: &str) {
-        self.observe_bridge_injections(BridgeInjectionTexts {
-            lessons: lessons_text,
-            volatile: volatile_text,
-            ..BridgeInjectionTexts::EMPTY
-        });
-    }
-
-    /// Structured variant of [`Self::observe_injections`]. Callers that
-    /// have visibility into the full `dynamic_sections` list (bridge,
-    /// full CLI turn path) should use this so every live channel gets
-    /// fingerprinted — the older two-arg form leaves 8 channels
-    /// permanently `Untracked` in the freshness report.
+    /// Call site: CLI's post-turn observation hook in
+    /// `cli_loop_host::execute_turn` — fires AFTER the bridge's SSE
+    /// stream has emitted `injection_freshness` so every live channel
+    /// gets fingerprinted with the exact string the model actually
+    /// consumed this turn.
     pub fn observe_bridge_injections(&mut self, texts: BridgeInjectionTexts<'_>) {
         use astra_turn_core::injection_tracking::{InjectionChannel, InjectionFingerprint};
         let round = self.turn_number;
@@ -475,47 +464,6 @@ impl ObservabilitySession {
                 InjectionFingerprint::from_content(text),
             );
         }
-    }
-
-    /// Partial observation for call sites that cannot see the per-turn
-    /// volatile lane (e.g. the CLI `prepare_chat_turn_payload` path).
-    ///
-    /// Observing a volatile lane with an empty string from a call site
-    /// that never sees the real content would make the channel appear
-    /// permanently `Empty` in `introspect subtopic=noise`, masking
-    /// genuine staleness. This method observes only the three channels
-    /// that ARE reachable from the CLI path — failing tests, outcome
-    /// bias, and lessons — and deliberately leaves the volatile lane
-    /// untouched so the dedicated volatile-aware observation point
-    /// (full `observe_injections`, called further downstream) owns it.
-    pub fn observe_lessons_only(&mut self, lessons_text: &str) {
-        use astra_turn_core::injection_tracking::{InjectionChannel, InjectionFingerprint};
-        let round = self.turn_number;
-
-        let failing_text = self.recent_failing_tests.join(",");
-        self.injection_history.observe(
-            round,
-            InjectionChannel::RecentFailingTests,
-            InjectionFingerprint::from_content(&failing_text),
-        );
-
-        let bias_text = self
-            .outcome_bias
-            .iter()
-            .map(|(t, b)| format!("{t}={:.3}", b.score))
-            .collect::<Vec<_>>()
-            .join(",");
-        self.injection_history.observe(
-            round,
-            InjectionChannel::OutcomeBias,
-            InjectionFingerprint::from_content(&bias_text),
-        );
-
-        self.injection_history.observe(
-            round,
-            InjectionChannel::Lessons,
-            InjectionFingerprint::from_content(lessons_text),
-        );
     }
 
     /// Publish the four SelfModel inputs that were previously hard-coded to
@@ -1462,7 +1410,7 @@ mod tests {
         // f85a02bb number — any N ≥ DEFAULT_STALE_THRESHOLD works).
         for t in 0..=58 {
             session.turn_number = t;
-            session.observe_injections("", "");
+            session.observe_bridge_injections(BridgeInjectionTexts::EMPTY);
         }
         let report = freshness_report(&session.injection_history, session.turn_number);
         let failing = report
@@ -1490,13 +1438,13 @@ mod tests {
         session.recent_failing_tests = vec!["old failure".to_string()];
         for t in 0..20 {
             session.turn_number = t;
-            session.observe_injections("", "");
+            session.observe_bridge_injections(BridgeInjectionTexts::EMPTY);
         }
         // Content changes on turn 20 — e.g., the underlying bug was
         // fixed and a new unrelated test fails next.
         session.turn_number = 20;
         session.recent_failing_tests = vec!["different failure".to_string()];
-        session.observe_injections("", "");
+        session.observe_bridge_injections(BridgeInjectionTexts::EMPTY);
         let report = freshness_report(&session.injection_history, session.turn_number);
         let failing = report
             .iter()
@@ -1524,7 +1472,10 @@ mod tests {
         for t in 0..15 {
             session.turn_number = t;
             let lessons = format!("lesson-v{t}");
-            session.observe_injections(&lessons, "");
+            session.observe_bridge_injections(BridgeInjectionTexts {
+                lessons: &lessons,
+                ..BridgeInjectionTexts::EMPTY
+            });
         }
         let report = freshness_report(&session.injection_history, session.turn_number);
         let bias = report
@@ -1921,12 +1872,12 @@ mod tests {
         // r0: record the initial cwd-failure (f85a02bb shape).
         s.turn_number = 0;
         s.record_failing_test_names(vec!["could not find Cargo.toml".into()]);
-        s.observe_injections("", "");
+        s.observe_bridge_injections(BridgeInjectionTexts::EMPTY);
 
         // r1..r20: signal persists (the agent can't clear it without Tier 1).
         for t in 1..=20 {
             s.turn_number = t;
-            s.observe_injections("", "");
+            s.observe_bridge_injections(BridgeInjectionTexts::EMPTY);
         }
         let stale_report = freshness_report(&s.injection_history, s.turn_number);
         let stale_entry = stale_report
@@ -1942,7 +1893,7 @@ mod tests {
         // r21: cargo invocation passes → Tier 1 expiry clears the ring.
         s.turn_number = 21;
         s.clear_failing_tests();
-        s.observe_injections("", "");
+        s.observe_bridge_injections(BridgeInjectionTexts::EMPTY);
 
         let fresh_report = freshness_report(&s.injection_history, s.turn_number);
         let cleared = fresh_report

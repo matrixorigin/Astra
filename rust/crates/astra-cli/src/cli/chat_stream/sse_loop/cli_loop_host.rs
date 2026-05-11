@@ -355,6 +355,66 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             self.token = refreshed_token;
         }
 
+        // ─── Injection-freshness observation (post-turn) ────────────────────
+        // Merge CLI-owned `lessons` with the 5 bridge-generated channels
+        // (feedback_rules / implicit_feedback / memoria_prefetch /
+        // tool_round_guidance / volatile) plus the 4 CLI-supplied channels
+        // echoed by the bridge (self_awareness / memoria_insights /
+        // recent_arg_hints / skill_listing), all captured from the
+        // `injection_freshness` SSE event. One canonical observation
+        // point → introspect's freshness report sees every live channel
+        // with the exact string the model actually consumed this turn.
+        //
+        // `lessons` is recomputed here (cheap — `session_lessons_snapshot`
+        // is an Arc clone) rather than threaded from `prepare_chat_turn_payload`
+        // to avoid widening the prepare/fetch signature. The fingerprint uses
+        // `LessonKind::as_str()` (stable snake_case DB tag), NOT `Debug`, so
+        // enum-variant renames do not flip every channel from Stale→Fresh.
+        if let Some(session_lock) = &self.executor.observability_session {
+            let lessons_text = self
+                .executor
+                .session_lessons_snapshot()
+                .iter()
+                .map(|l| format!("{}:{}:{}", l.kind.as_str(), l.trigger_signal, l.action))
+                .collect::<Vec<_>>()
+                .join("|");
+            static EMPTY_BRIDGE_TEXTS:
+                astra_turn_core::chat_turn_sse_dispatch::BridgeInjectionTextsOwned =
+                astra_turn_core::chat_turn_sse_dispatch::BridgeInjectionTextsOwned {
+                    lessons: String::new(),
+                    volatile: String::new(),
+                    memoria_insights: String::new(),
+                    memoria_prefetch: String::new(),
+                    self_awareness: String::new(),
+                    feedback_rules: String::new(),
+                    implicit_feedback: String::new(),
+                    recent_arg_hints: String::new(),
+                    skill_listing: String::new(),
+                    tool_round_guidance: String::new(),
+                };
+            let bridge = turn_result
+                .core
+                .bridge_injection_texts
+                .as_ref()
+                .unwrap_or(&EMPTY_BRIDGE_TEXTS);
+            if let Ok(mut session) = session_lock.write() {
+                session.observe_bridge_injections(
+                    astra_runtime::observability_integration::BridgeInjectionTexts {
+                        lessons: &lessons_text,
+                        volatile: &bridge.volatile,
+                        memoria_insights: &bridge.memoria_insights,
+                        memoria_prefetch: &bridge.memoria_prefetch,
+                        self_awareness: &bridge.self_awareness,
+                        feedback_rules: &bridge.feedback_rules,
+                        implicit_feedback: &bridge.implicit_feedback,
+                        recent_arg_hints: &bridge.recent_arg_hints,
+                        skill_listing: &bridge.skill_listing,
+                        tool_round_guidance: &bridge.tool_round_guidance,
+                    },
+                );
+            }
+        }
+
         // Update introspect snapshot so the `introspect` tool returns fresh
         // data if the model calls it on a subsequent round this turn.
         let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;

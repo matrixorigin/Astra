@@ -848,9 +848,7 @@ impl ToolExecutor {
                 // plain success string otherwise. Capture the failure flag BEFORE we
                 // append session-restore text (which would break prefix inference).
                 let is_error = output.starts_with("Error:");
-                if !is_error
-                    && let Some(worktree_path) = normalized_path.as_ref()
-                {
+                if !is_error && let Some(worktree_path) = normalized_path.as_ref() {
                     self.remove_git_worktree_rollback(worktree_path);
                     if let Some(original_root) =
                         self.maybe_restore_session_after_manual_worktree_removal(worktree_path)

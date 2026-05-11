@@ -10,6 +10,29 @@ use std::time::Instant;
 
 use super::sse_blocks::SseBlankLineUtf8Buf;
 
+/// Per-turn injection-channel texts emitted by the bridge via the
+/// `injection_freshness` SSE event. Owned strings (vs the borrowing
+/// `astra_runtime::observability_integration::BridgeInjectionTexts<'a>`)
+/// because the payload arrives as parsed JSON and must outlive the
+/// originating event buffer.
+///
+/// Absent channels are represented as empty strings, matching the
+/// observability contract that an empty injection is semantically
+/// distinct from a missing observation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BridgeInjectionTextsOwned {
+    pub lessons: String,
+    pub volatile: String,
+    pub memoria_insights: String,
+    pub memoria_prefetch: String,
+    pub self_awareness: String,
+    pub feedback_rules: String,
+    pub implicit_feedback: String,
+    pub recent_arg_hints: String,
+    pub skill_listing: String,
+    pub tool_round_guidance: String,
+}
+
 /// State collected from one `/chat/turn` SSE stream (excluding edge executor bookkeeping).
 #[derive(Debug, Clone, Default)]
 pub struct ChatTurnSseAccum {
@@ -35,6 +58,9 @@ pub struct ChatTurnSseAccum {
     pub system_prompt_tokens: Option<u32>,
     /// Detailed system prompt breakdown from runtime (via `context_meta` SSE event).
     pub system_prompt_breakdown: Option<Value>,
+    /// Per-turn injection-channel texts captured from the bridge's
+    /// `injection_freshness` SSE event. `None` until the event fires.
+    pub bridge_injection_texts: Option<BridgeInjectionTextsOwned>,
 }
 
 /// Deferred edge work from `tool_request` / `approval_required` events.
@@ -370,6 +396,29 @@ fn apply_one_event(
             }
             if let Some(b) = event.get("system_prompt_breakdown") {
                 accum.system_prompt_breakdown = Some(b.clone());
+            }
+        }
+        "injection_freshness" => {
+            if let Some(texts) = event.get("texts").and_then(|v| v.as_object()) {
+                let g = |k: &str| {
+                    texts
+                        .get(k)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                accum.bridge_injection_texts = Some(BridgeInjectionTextsOwned {
+                    lessons: g("lessons"),
+                    volatile: g("volatile"),
+                    memoria_insights: g("memoria_insights"),
+                    memoria_prefetch: g("memoria_prefetch"),
+                    self_awareness: g("self_awareness"),
+                    feedback_rules: g("feedback_rules"),
+                    implicit_feedback: g("implicit_feedback"),
+                    recent_arg_hints: g("recent_arg_hints"),
+                    skill_listing: g("skill_listing"),
+                    tool_round_guidance: g("tool_round_guidance"),
+                });
             }
         }
         "run_started" => {

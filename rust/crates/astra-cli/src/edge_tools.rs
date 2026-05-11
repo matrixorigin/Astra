@@ -762,7 +762,7 @@ impl ToolExecutor {
     }
 
     /// Snapshot the currently-stashed session lessons. Used by the
-    /// injection-freshness observer (`observe_injections`) so it can
+    /// injection-freshness observer (`observe_bridge_injections`) so it can
     /// fingerprint the same slice the next SelfModel snapshot will
     /// project into the system prompt.
     pub fn session_lessons_snapshot(&self) -> Vec<astra_runtime::self_model::LessonHint> {
@@ -1305,7 +1305,7 @@ impl ToolExecutor {
         // Overlay session-scoped injection freshness. The per-turn
         // snapshot lives on `AgenticLoopState` (not session) so the
         // runtime leaves this empty; we fill it here from the
-        // session-scoped history maintained via `observe_injections`.
+        // session-scoped history maintained via `observe_bridge_injections`.
         // Subtopic-agnostic: `render_all` and `noise` both need it.
         if let Some(obs) = self.observability_session.as_ref()
             && let Ok(s) = obs.read()
