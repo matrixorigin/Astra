@@ -3694,37 +3694,60 @@ impl StreamRenderState {
             "memory" => {
                 let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                 match action {
-                    "retrieve" => {
+                    "recall" => {
                         let query = args.get("query").and_then(Value::as_str).unwrap_or("");
                         format!("Recalling: \"{}\"", truncate_line(query, path_budget(13)))
                     }
-                    "store" => {
+                    "remember" => {
                         let content = args.get("content").and_then(Value::as_str).unwrap_or("");
-                        format!("Storing: \"{}\"", truncate_line(content, path_budget(11)))
-                    }
-                    "search" => {
-                        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
                         format!(
-                            "Searching memory: \"{}\"",
-                            truncate_line(query, path_budget(20))
+                            "Remembering: \"{}\"",
+                            truncate_line(content, path_budget(13))
                         )
                     }
-                    "purge" => match args.get("topic").and_then(Value::as_str) {
-                        Some(topic) => format!(
-                            "Purging memory: \"{}\"",
-                            truncate_line(topic, path_budget(18))
-                        ),
-                        None => "Purging memory".to_string(),
+                    "expand" => match args.get("memory_id").and_then(Value::as_str) {
+                        Some(mid) => {
+                            format!("Expanding memory: {}", truncate_line(mid, path_budget(18)))
+                        }
+                        None => "Expanding memory".to_string(),
                     },
-                    "correct" => match args.get("memory_id").and_then(Value::as_str) {
-                        Some(memory_id) => format!(
-                            "Correcting memory: {}",
-                            truncate_line(memory_id, path_budget(20))
-                        ),
-                        None => "Correcting memory".to_string(),
+                    "forget" => {
+                        match args
+                            .get("memory_id")
+                            .and_then(Value::as_str)
+                            .or_else(|| args.get("topic").and_then(Value::as_str))
+                        {
+                            Some(target) => format!(
+                                "Forgetting: \"{}\"",
+                                truncate_line(target, path_budget(18))
+                            ),
+                            None => "Forgetting".to_string(),
+                        }
+                    }
+                    "update" => match args.get("memory_id").and_then(Value::as_str) {
+                        Some(mid) => {
+                            format!("Updating memory: {}", truncate_line(mid, path_budget(18)))
+                        }
+                        None => "Updating memory".to_string(),
                     },
+                    "focus" => {
+                        let value = args
+                            .get("focus_value")
+                            .or_else(|| args.get("value"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        format!("Focus on: \"{}\"", truncate_line(value, path_budget(16)))
+                    }
+                    "reflect" => "Reflecting on memories".to_string(),
                     "profile" => "Checking profile".to_string(),
-                    "feedback" => "Memory feedback".to_string(),
+                    "feedback" => {
+                        let signal = args.get("signal").and_then(Value::as_str).unwrap_or("");
+                        if signal.is_empty() {
+                            "Memory feedback".to_string()
+                        } else {
+                            format!("Memory feedback: {signal}")
+                        }
+                    }
                     _ => format!("Memory: {action}"),
                 }
             }
@@ -5175,22 +5198,28 @@ impl StreamRenderState {
             "memory" => {
                 let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                 match action {
-                    "retrieve" | "search" => args
+                    "recall" => args
                         .get("query")
                         .and_then(Value::as_str)
                         .map(|q| truncate_line(q, 50)),
-                    "store" => args
+                    "remember" => args
                         .get("content")
                         .and_then(Value::as_str)
                         .map(|c| truncate_line(c, 50)),
-                    "purge" => args
-                        .get("topic")
+                    "forget" => args
+                        .get("memory_id")
                         .and_then(Value::as_str)
-                        .map(|topic| truncate_line(topic, 40)),
-                    "correct" => args
+                        .or_else(|| args.get("topic").and_then(Value::as_str))
+                        .map(|t| truncate_line(t, 40)),
+                    "update" | "expand" | "feedback" => args
                         .get("memory_id")
                         .and_then(Value::as_str)
                         .map(|memory_id| truncate_line(memory_id, 40)),
+                    "focus" => args
+                        .get("focus_value")
+                        .or_else(|| args.get("value"))
+                        .and_then(Value::as_str)
+                        .map(|v| truncate_line(v, 40)),
                     _ => None,
                 }
             }
@@ -7333,20 +7362,28 @@ mod tests {
     #[test]
     fn format_memory_maintenance_descriptions() {
         let r = StreamRenderState::new();
-        let purge = r.format_tool_description(
+        let forget = r.format_tool_description(
             "memory",
-            &serde_json::json!({"action": "purge", "topic": "renderer drift"}),
+            &serde_json::json!({"action": "forget", "topic": "renderer drift"}),
         );
-        let correct = r.format_tool_description(
+        let update = r.format_tool_description(
             "memory",
-            &serde_json::json!({"action": "correct", "memory_id": "mem-123"}),
+            &serde_json::json!({"action": "update", "memory_id": "mem-123"}),
         );
         let profile =
             r.format_tool_description("memory", &serde_json::json!({"action": "profile"}));
+        let focus = r.format_tool_description(
+            "memory",
+            &serde_json::json!({"action": "focus", "focus_value": "oauth"}),
+        );
+        let reflect =
+            r.format_tool_description("memory", &serde_json::json!({"action": "reflect"}));
 
-        assert_eq!(purge, "Purging memory: \"renderer drift\"");
-        assert_eq!(correct, "Correcting memory: mem-123");
+        assert_eq!(forget, "Forgetting: \"renderer drift\"");
+        assert_eq!(update, "Updating memory: mem-123");
         assert_eq!(profile, "Checking profile");
+        assert_eq!(focus, "Focus on: \"oauth\"");
+        assert_eq!(reflect, "Reflecting on memories");
     }
 
     #[test]

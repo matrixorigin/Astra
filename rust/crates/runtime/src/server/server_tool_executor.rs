@@ -1262,14 +1262,16 @@ impl ServerToolExecutor {
             "memory" => {
                 let op = match args.get("action").and_then(|v| v.as_str()) {
                     Some(a) => a,
-                    None => return tool_result_from_output("Error: missing required parameter 'action'. Use: store, retrieve, purge, correct, profile, search, feedback".to_string()),
+                    None => return tool_result_from_output(
+                        "Error: missing required parameter `action`. \
+                         Use one of: remember, recall, expand, forget, update, focus, reflect, profile, feedback".to_string()),
                 };
                 let mut isolated_args = args.clone();
                 if let Some(obj) = isolated_args.as_object_mut() {
-                    obj.remove("action"); // Memoria API doesn't expect this field
+                    obj.remove("action"); // the verb is routed via `op`, not sent to Memoria
                     obj.insert(
                         "session_id".to_string(),
-                        Value::String(self.user_id.clone()),
+                        Value::String(self.session_id.clone()),
                     );
                     obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
                 }
@@ -4782,7 +4784,7 @@ esac
         // We can't actually call Memoria, but we can verify the execute path
         // doesn't panic and returns a reasonable error (no MEMORIA_BASE_URL set).
         let result = exec
-            .execute("memory", &json!({"action": "store", "content": "test"}))
+            .execute("memory", &json!({"action": "remember", "content": "test"}))
             .await;
         // Should attempt the call (may fail due to no server, but shouldn't crash)
         assert!(!result.is_empty());

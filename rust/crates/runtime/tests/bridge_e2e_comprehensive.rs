@@ -774,7 +774,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
                     "tool_calls": [tool_call(
                         "tc-matrix-memory-store",
                         "memory",
-                        json!({"action": "store", "content": "User likes Rust"}),
+                        json!({"action": "remember", "content": "User likes Rust"}),
                     )],
                     "usage": { "prompt_tokens": 650, "completion_tokens": 35, "total_tokens": 685 }
                 }]
@@ -798,7 +798,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
                     "tool_calls": [tool_call(
                         "tc-matrix-memory-search",
                         "memory",
-                        json!({"action": "search", "query": "preferred language"}),
+                        json!({"action": "recall", "query": "preferred language"}),
                     )],
                     "usage": { "prompt_tokens": 640, "completion_tokens": 35, "total_tokens": 675 }
                 }]

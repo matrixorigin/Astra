@@ -456,29 +456,36 @@ fn fmt_mo_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
 }
 
 fn fmt_memory_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
-    // `memory` is the single consolidated tool; the `action` field selects
-    // retrieve / search / store / purge / correct / profile / feedback.
+    // `memory` is the single consolidated tool; the `action` field picks
+    // a v2 cognitive verb (remember / recall / expand / forget / update /
+    // focus / reflect / profile / feedback).
     if name != "memory" {
         return None;
     }
     let action = obj.get("action").and_then(|v| v.as_str()).unwrap_or("");
     match action {
-        "retrieve" | "search" => obj
+        "recall" => obj
             .get("query")
             .and_then(|v| v.as_str())
             .map(|q| truncate_str(q, 50)),
-        "store" => obj
+        "remember" => obj
             .get("content")
             .and_then(|v| v.as_str())
             .map(|content| truncate_str(content, 50)),
-        "purge" => obj
-            .get("topic")
+        "forget" => obj
+            .get("memory_id")
             .and_then(|v| v.as_str())
-            .map(|topic| truncate_str(topic, 40)),
-        "correct" => obj
+            .or_else(|| obj.get("topic").and_then(|v| v.as_str()))
+            .map(|t| truncate_str(t, 40)),
+        "update" | "expand" | "feedback" => obj
             .get("memory_id")
             .and_then(|v| v.as_str())
             .map(|memory_id| truncate_str(memory_id, 40)),
+        "focus" => obj
+            .get("focus_value")
+            .or_else(|| obj.get("value"))
+            .and_then(|v| v.as_str())
+            .map(|v| truncate_str(v, 40)),
         _ => None,
     }
 }
@@ -1321,30 +1328,39 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_detail_memory_shows_query() {
+    fn tool_call_detail_memory_recall_shows_query() {
         let detail = tool_call_detail(
             "memory",
-            &json!({"action": "search", "query": "memoria repo"}),
+            &json!({"action": "recall", "query": "memoria repo"}),
         );
         assert_eq!(detail.as_deref(), Some("memoria repo"));
     }
 
     #[test]
-    fn tool_call_detail_memory_purge_shows_topic() {
+    fn tool_call_detail_memory_forget_shows_target() {
         let detail = tool_call_detail(
             "memory",
-            &json!({"action": "purge", "topic": "renderer drift"}),
+            &json!({"action": "forget", "topic": "renderer drift"}),
         );
         assert_eq!(detail.as_deref(), Some("renderer drift"));
     }
 
     #[test]
-    fn tool_call_detail_memory_correct_shows_id() {
+    fn tool_call_detail_memory_update_shows_id() {
         let detail = tool_call_detail(
             "memory",
-            &json!({"action": "correct", "memory_id": "mem-123"}),
+            &json!({"action": "update", "memory_id": "mem-123"}),
         );
         assert_eq!(detail.as_deref(), Some("mem-123"));
+    }
+
+    #[test]
+    fn tool_call_detail_memory_focus_shows_value() {
+        let detail = tool_call_detail(
+            "memory",
+            &json!({"action": "focus", "focus_value": "oauth"}),
+        );
+        assert_eq!(detail.as_deref(), Some("oauth"));
     }
 
     #[test]

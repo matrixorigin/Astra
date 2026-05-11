@@ -4139,7 +4139,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
             steps: vec![MockToolScenarioStep {
                 request_id: "tc-matrix-mstore",
                 tool_name: "memory",
-                args: json!({"action": "store", "content": "User likes Rust"}),
+                args: json!({"action": "remember", "content": "User likes Rust"}),
                 result_output: "memory stored",
                 requires_approval: false,
             }],
@@ -4153,7 +4153,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
             steps: vec![MockToolScenarioStep {
                 request_id: "tc-matrix-msearch",
                 tool_name: "memory",
-                args: json!({"action": "search", "query": "preferred language"}),
+                args: json!({"action": "recall", "query": "preferred language"}),
                 result_output: "User likes Rust",
                 requires_approval: false,
             }],
@@ -4225,7 +4225,7 @@ async fn mock_llm_memory_followup_preserves_session_local_and_cloud_state() {
                         "tool_calls": [tool_call(
                             "tc-memory-store",
                             "memory",
-                            json!({"action": "store", "content": "User likes Rust"})
+                            json!({"action": "remember", "content": "User likes Rust"})
                         )]
                     },
                     { "full_text": "我记住了你的偏好。" }
@@ -4237,7 +4237,7 @@ async fn mock_llm_memory_followup_preserves_session_local_and_cloud_state() {
         &[MockToolScenarioStep {
             request_id: "tc-memory-store",
             tool_name: "memory",
-            args: json!({"action": "store", "content": "User likes Rust"}),
+            args: json!({"action": "remember", "content": "User likes Rust"}),
             result_output: "memory stored",
             requires_approval: false,
         }],
@@ -4260,7 +4260,7 @@ async fn mock_llm_memory_followup_preserves_session_local_and_cloud_state() {
                         "tool_calls": [tool_call(
                             "tc-memory-search",
                             "memory",
-                            json!({"action": "search", "query": "latest remembered preference"})
+                            json!({"action": "recall", "query": "latest remembered preference"})
                         )]
                     },
                     { "full_text": "你刚才让我记住你喜欢 Rust。" }
@@ -4272,7 +4272,7 @@ async fn mock_llm_memory_followup_preserves_session_local_and_cloud_state() {
         &[MockToolScenarioStep {
             request_id: "tc-memory-search",
             tool_name: "memory",
-            args: json!({"action": "search", "query": "latest remembered preference"}),
+            args: json!({"action": "recall", "query": "latest remembered preference"}),
             result_output: "User likes Rust",
             requires_approval: false,
         }],

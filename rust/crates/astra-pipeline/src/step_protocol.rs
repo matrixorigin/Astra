@@ -2158,19 +2158,19 @@ mod tests {
     fn tool_classification_memory_actions() {
         use serde_json::json;
         assert_eq!(
-            classify_tool_idempotency("memory", Some(&json!({"action": "retrieve"}))),
+            classify_tool_idempotency("memory", Some(&json!({"action": "recall"}))),
             ToolIdempotency::PureRead,
         );
         assert_eq!(
-            classify_tool_idempotency("memory", Some(&json!({"action": "search"}))),
+            classify_tool_idempotency("memory", Some(&json!({"action": "expand"}))),
             ToolIdempotency::PureRead,
         );
         assert_eq!(
-            classify_tool_idempotency("memory", Some(&json!({"action": "store"}))),
+            classify_tool_idempotency("memory", Some(&json!({"action": "remember"}))),
             ToolIdempotency::NonIdempotent,
         );
         assert_eq!(
-            classify_tool_idempotency("memory", Some(&json!({"action": "purge"}))),
+            classify_tool_idempotency("memory", Some(&json!({"action": "forget"}))),
             ToolIdempotency::NonIdempotent,
         );
     }

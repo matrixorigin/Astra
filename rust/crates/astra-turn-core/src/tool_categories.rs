@@ -353,9 +353,10 @@ impl ToolRegistry {
     pub fn category_for(&self, name: &str, args: Option<&serde_json::Value>) -> ToolCategory {
         if name == "memory" {
             return match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
-                Some("retrieve") | Some("search") | Some("profile") | Some("feedback") => {
-                    ToolCategory::ReadOnly
-                }
+                // Pure reads
+                Some("recall") | Some("expand") | Some("profile") => ToolCategory::ReadOnly,
+                // Everything else (remember / forget / update / focus /
+                // reflect / feedback / unknown) is mutating.
                 _ => ToolCategory::Mutating,
             };
         }
@@ -803,8 +804,8 @@ mod tests {
         assert!(!r.is_read_only("memory"));
         assert!(!r.is_compactable("memory"));
 
-        // Action-aware: retrieve/search/profile/feedback are ReadOnly.
-        for action in ["retrieve", "search", "profile", "feedback"] {
+        // Action-aware: recall/expand/profile are pure reads.
+        for action in ["recall", "expand", "profile"] {
             let args = json!({"action": action});
             assert!(
                 r.is_read_only_for("memory", Some(&args)),
@@ -816,8 +817,10 @@ mod tests {
             );
         }
 
-        // Mutating actions stay Mutating.
-        for action in ["store", "purge", "correct"] {
+        // Mutating / side-effecting actions stay Mutating.
+        for action in [
+            "remember", "forget", "update", "focus", "reflect", "feedback",
+        ] {
             let args = json!({"action": action});
             assert!(
                 r.is_mutating_for("memory", Some(&args)),
@@ -1049,10 +1052,10 @@ mod tests {
 
         // `memory` is parallelizable iff the action is read-only.
         use serde_json::json;
-        assert!(r.is_parallelizable_for("memory", Some(&json!({"action": "retrieve"}))));
-        assert!(r.is_parallelizable_for("memory", Some(&json!({"action": "search"}))));
-        assert!(!r.is_parallelizable_for("memory", Some(&json!({"action": "store"}))));
-        assert!(!r.is_parallelizable_for("memory", Some(&json!({"action": "purge"}))));
+        assert!(r.is_parallelizable_for("memory", Some(&json!({"action": "recall"}))));
+        assert!(r.is_parallelizable_for("memory", Some(&json!({"action": "expand"}))));
+        assert!(!r.is_parallelizable_for("memory", Some(&json!({"action": "remember"}))));
+        assert!(!r.is_parallelizable_for("memory", Some(&json!({"action": "forget"}))));
     }
 
     // ── Complex cross-system scenario tests ────────────────────────────
@@ -1145,8 +1148,8 @@ mod tests {
 
         // `memory` must be partitioned by action, not by name.
         use serde_json::json;
-        assert!(r.is_parallelizable_for("memory", Some(&json!({"action": "retrieve"}))));
-        assert!(!r.is_parallelizable_for("memory", Some(&json!({"action": "store"}))));
+        assert!(r.is_parallelizable_for("memory", Some(&json!({"action": "recall"}))));
+        assert!(!r.is_parallelizable_for("memory", Some(&json!({"action": "remember"}))));
     }
 
     /// Stall detector scenario: 5 rounds of pure exploration tools should
@@ -1750,7 +1753,7 @@ mod tests {
         }
         // `memory` is action-sensitive: validated via idempotency_for with args.
         use serde_json::json;
-        for action in ["retrieve", "search", "profile", "feedback"] {
+        for action in ["recall", "expand", "profile"] {
             assert_eq!(
                 r.idempotency_for("memory", Some(&json!({"action": action}))),
                 ToolIdempotency::PureRead,
@@ -1959,11 +1962,11 @@ mod tests {
         // `memory` replaces the six legacy memory_* entries — action-aware.
         use serde_json::json;
         assert_eq!(
-            r.idempotency_for("memory", Some(&json!({"action": "search"}))),
+            r.idempotency_for("memory", Some(&json!({"action": "recall"}))),
             ToolIdempotency::PureRead,
         );
         assert_eq!(
-            r.idempotency_for("memory", Some(&json!({"action": "store"}))),
+            r.idempotency_for("memory", Some(&json!({"action": "remember"}))),
             ToolIdempotency::NonIdempotent,
         );
     }

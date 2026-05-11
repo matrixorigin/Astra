@@ -37,13 +37,15 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
     match tool_name {
         // ── Consolidated `memory` tool: branch on the `action` field. ──
         //
-        // `store` / `purge` / `correct` mutate state → NonIdempotent.
-        // `retrieve` / `search` / `profile` / `feedback` are pure reads.
+        // Mutating actions (write state, session-scoped attention, feedback
+        // signal, cross-memory synthesis): `remember`, `forget`, `update`,
+        // `focus`, `reflect`, `feedback`. Must NOT be blindly retried.
+        //
+        // Pure reads (no side effects): `recall`, `expand`, `profile`.
+        //
         // Unknown or absent action → conservative NonIdempotent.
         "memory" => match args.and_then(|a| a.get("action")).and_then(Value::as_str) {
-            Some("retrieve") | Some("search") | Some("profile") | Some("feedback") => {
-                ToolIdempotency::PureRead
-            }
+            Some("recall") | Some("expand") | Some("profile") => ToolIdempotency::PureRead,
             _ => ToolIdempotency::NonIdempotent,
         },
 
@@ -117,15 +119,17 @@ mod tests {
     #[test]
     fn memory_action_aware() {
         // Read actions
-        for action in ["retrieve", "search", "profile", "feedback"] {
+        for action in ["recall", "expand", "profile"] {
             assert_eq!(
                 classify_tool_idempotency("memory", Some(&json!({ "action": action }))),
                 ToolIdempotency::PureRead,
                 "memory(action={action}) should be PureRead"
             );
         }
-        // Write actions
-        for action in ["store", "purge", "correct"] {
+        // Write / side-effecting actions
+        for action in [
+            "remember", "forget", "update", "focus", "reflect", "feedback",
+        ] {
             assert_eq!(
                 classify_tool_idempotency("memory", Some(&json!({ "action": action }))),
                 ToolIdempotency::NonIdempotent,

@@ -298,12 +298,17 @@ pub fn make_args_preview(tool_name: &str, args: &Value) -> Option<String> {
         "memory" => {
             let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
             match action {
-                "search" | "retrieve" => args
+                "recall" => args
                     .get("query")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()),
-                "store" => args
+                "remember" => args
                     .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                "focus" => args
+                    .get("focus_value")
+                    .or_else(|| args.get("value"))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()),
                 _ => None,

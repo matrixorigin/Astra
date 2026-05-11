@@ -173,14 +173,18 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
             Some(format!("{}:{}", tool_name, normalize_path(file)))
         }
         // Memory tool is action-aware; dedup keys depend on the action.
+        // Only pure-read / idempotent actions should dedupe — write verbs
+        // (remember, forget, update, focus, reflect, feedback) must not be
+        // merged across duplicate calls.
         "memory" => {
             let action = arg_str(args, "action").unwrap_or("");
             match action {
-                "search" | "retrieve" => {
+                "recall" => {
                     let query = arg_str(args, "query").unwrap_or("");
-                    Some(format!("memory_{action}:{}", query.to_lowercase()))
+                    Some(format!("memory_recall:{}", query.to_lowercase()))
                 }
                 "profile" => Some("memory_profile".to_string()),
+                "expand" => arg_str(args, "memory_id").map(|id| format!("memory_expand:{id}")),
                 _ => None,
             }
         }

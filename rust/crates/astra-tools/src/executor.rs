@@ -1362,7 +1362,7 @@ mod tests {
         let result = exec
             .execute(
                 "memory",
-                &serde_json::json!({"action": "store", "content": "test"}),
+                &serde_json::json!({"action": "remember", "content": "test"}),
             )
             .await;
         assert!(result.is_error);

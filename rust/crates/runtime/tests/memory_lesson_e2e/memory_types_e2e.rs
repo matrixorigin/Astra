@@ -205,7 +205,7 @@ fn full_mode_prompt_exercises_all_business_types() {
     assert!(prompt.contains("git log"));
 
     // Deduplication + staleness
-    assert!(prompt.contains("memory(action=correct)"));
+    assert!(prompt.contains("memory(action=update)"));
     assert!(prompt.contains("outdated"));
 }
 

@@ -1958,11 +1958,25 @@ impl ToolExecutor {
                 "memory" => {
                     let op = match args.get("action").and_then(|v| v.as_str()) {
                         Some(a) => a,
-                        None => return "Error: missing required parameter 'action'. Use one of: store, retrieve, purge, correct, profile, search, feedback".to_string(),
+                        None => return "Error: missing required parameter `action`. \
+                             Use one of: remember, recall, expand, forget, update, focus, reflect, profile, feedback".to_string(),
                     };
                     let mut clean_args = args.clone();
                     if let Some(obj) = clean_args.as_object_mut() {
                         obj.remove("action");
+                        // Inject the active session id so focus hints and
+                        // session-scoped recalls work. CLI does not own a
+                        // user_id — leave it to the cloud proxy / Memoria
+                        // server to fill in via the bearer token.
+                        let sid = self
+                            .active_session_id
+                            .lock()
+                            .ok()
+                            .and_then(|guard| guard.clone())
+                            .unwrap_or_default();
+                        if !sid.is_empty() {
+                            obj.insert("session_id".to_string(), serde_json::Value::String(sid));
+                        }
                     }
                     self.memoria_call(op, &clean_args).await
                 }
