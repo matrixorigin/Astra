@@ -341,8 +341,12 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             // the trace's turn indices.  We use the cell ordering
             // (user/assistant pairs) as a rough proxy — the trace
             // doesn't emit a stable cell→turn_index mapping today,
-            // so we populate by position.
-            snap.history_previews = collect_history_previews(ctx.chat_widget);
+            // so we populate by position.  Each turn contributes a
+            // one-line preview for the collapsed view plus the
+            // full body text for the drill-in view.
+            let (previews, bodies) = collect_history_text(ctx.chat_widget);
+            snap.history_previews = previews;
+            snap.history_bodies = bodies;
 
             let breakdown = match ctx.state.observability_session.as_ref() {
                 Some(session) => {
@@ -1282,52 +1286,54 @@ fn find_user_rules_path() -> Option<String> {
 ///
 /// The mapping is heuristic (cells don't carry a turn id) but
 /// matches the common case: each user/assistant pair is one turn.
-fn collect_history_previews(
+fn collect_history_text(
     chat: &crate::tui::chat_widget::ChatWidget,
-) -> std::collections::HashMap<u32, String> {
+) -> (
+    std::collections::HashMap<u32, String>,
+    std::collections::HashMap<u32, String>,
+) {
     use crate::tui::history_cell::{
         assistant::AssistantCell, reasoning::ReasoningCell, user::UserCell,
     };
-    let mut out = std::collections::HashMap::new();
+    let mut previews: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    let mut bodies: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
     // Walk history cells; each user cell advances the turn index.
-    // Assistant / reasoning text for turn N preview the user cell
-    // of turn N's reply — what the user usually wants to scan for.
+    // For both preview (one-line) and body (full text) we follow
+    // the same priority: user message wins; otherwise assistant
+    // reply for that turn; otherwise reasoning text as last resort.
     let mut turn_idx: u32 = 0;
+    let record = |idx: u32,
+                      text: &str,
+                      previews: &mut std::collections::HashMap<u32, String>,
+                      bodies: &mut std::collections::HashMap<u32, String>,
+                      force: bool| {
+        if text.trim().is_empty() {
+            return;
+        }
+        if force || !previews.contains_key(&idx) {
+            let p = one_line_preview(text);
+            if !p.is_empty() {
+                previews.insert(idx, p);
+            }
+        }
+        if force || !bodies.contains_key(&idx) {
+            bodies.insert(idx, text.to_string());
+        }
+    };
     for cell in chat.history() {
         let any = cell.as_any_ref();
         if let Some(u) = any.downcast_ref::<UserCell>() {
-            insert_preview(&mut out, turn_idx, u.text());
+            record(turn_idx, u.text(), &mut previews, &mut bodies, true);
             turn_idx = turn_idx.saturating_add(1);
         } else if let Some(a) = any.downcast_ref::<AssistantCell>() {
-            // Assistant preview improves over the user prompt when
-            // the user asks "what was #2" — show the model reply
-            // if it hasn't been captured by a user cell already.
-            // Only fill if the slot is still empty so we don't
-            // clobber a concrete user message.
-            if !out.contains_key(&turn_idx.saturating_sub(1)) {
-                insert_preview(&mut out, turn_idx.saturating_sub(1), a.source());
-            }
-        } else if let Some(r) = any.downcast_ref::<ReasoningCell>() {
-            // Reasoning rarely wins — only fill when absolutely
-            // nothing else is populated.
             let slot = turn_idx.saturating_sub(1);
-            out.entry(slot)
-                .or_insert_with(|| one_line_preview(r.text()));
+            record(slot, a.source(), &mut previews, &mut bodies, false);
+        } else if let Some(r) = any.downcast_ref::<ReasoningCell>() {
+            let slot = turn_idx.saturating_sub(1);
+            record(slot, r.text(), &mut previews, &mut bodies, false);
         }
     }
-    out
-}
-
-fn insert_preview(
-    out: &mut std::collections::HashMap<u32, String>,
-    idx: u32,
-    text: &str,
-) {
-    let preview = one_line_preview(text);
-    if preview.is_empty() {
-        return;
-    }
-    out.insert(idx, preview);
+    (previews, bodies)
 }
 
 fn one_line_preview(text: &str) -> String {

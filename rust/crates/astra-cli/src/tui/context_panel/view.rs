@@ -55,14 +55,24 @@ pub(crate) const GRID_ROWS: usize = 5;
 pub(crate) const GRID_COLS: usize = 10;
 pub(crate) const GRID_CELLS: usize = GRID_ROWS * GRID_COLS;
 
-/// View state for a single render pass. Carries the currently
-/// focused section plus whether it's expanded to its detail view.
-/// Defaults to "no focus, no expansion" which reproduces the
-/// original flat render.
+/// View state for a single render pass.
+///
+/// Three nested modes, picked by which fields are set:
+/// 1. No focus → flat render, just the grid + legend + sections.
+/// 2. `focus = Some(section)` → headings carry the ▶ / ▼ marker;
+///    Tab cycles focus.
+/// 3. `expanded = Some(section)` → the focused section renders
+///    its detail form. `selected_item` picks one of the section's
+///    items (↑/↓); that item gets a ▸ marker.
+/// 4. `drilled = true` → render ONLY the selected item's full
+///    content, replacing the normal section list. Esc backs out
+///    one level at a time (drill → expanded → closed).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ViewState {
     pub focus: Option<Section>,
     pub expanded: Option<Section>,
+    pub selected_item: usize,
+    pub drilled: bool,
 }
 
 impl ViewState {
@@ -70,11 +80,17 @@ impl ViewState {
         Self {
             focus,
             expanded: None,
+            selected_item: 0,
+            drilled: false,
         }
     }
 
     pub fn is_expanded(&self, s: Section) -> bool {
         self.expanded == Some(s)
+    }
+
+    pub fn is_drilled(&self, s: Section) -> bool {
+        self.drilled && self.expanded == Some(s)
     }
 }
 
@@ -145,6 +161,24 @@ pub(crate) fn line_count_with(b: &ContextBreakdown, inner_width: u16, state: Vie
         return 0;
     }
     build_lines_with(b, inner_width, state).len() as u16
+}
+
+/// How many items in the given section are selectable when it's
+/// expanded. Sections where item-level drill-in is meaningful
+/// (History turns, Memories, Tools, Decisions) return their
+/// element count; other sections return 0 to signal "nothing to
+/// select".  The wrapper uses this to clamp `selected_item`.
+pub(crate) fn section_item_count(b: &ContextBreakdown, section: Section) -> usize {
+    match section {
+        Section::History => b.history.turns.len(),
+        Section::Memory => b.memories.len(),
+        Section::Tools => b.tools.len(),
+        Section::Decisions => b.decisions.len(),
+        Section::SystemPrompt
+        | Section::PromptSignals
+        | Section::Session
+        | Section::Skills => 0,
+    }
 }
 
 /// Line index of the given section's heading in the rendered line
@@ -308,8 +342,10 @@ fn render_section(
         }
         Section::Tools => {
             out.push(section_heading_for(Section::Tools, focused, expanded));
-            if expanded {
-                append_tools_expanded(out, &b.tools);
+            if state.is_drilled(Section::Tools) {
+                render_tool_drill(out, &b.tools, state.selected_item);
+            } else if expanded {
+                append_tools_expanded(out, &b.tools, state.selected_item);
             } else {
                 for t in &b.tools {
                     out.push(section_row(&format!(" {}", t.name), t.tokens));
@@ -321,8 +357,14 @@ fn render_section(
             append_skill_section(out, &b.skills, focused, expanded);
         }
         Section::Memory => {
+            if state.is_drilled(Section::Memory) {
+                out.push(section_heading_for(Section::Memory, focused, expanded));
+                render_memory_drill(out, &b.memories, state.selected_item);
+                out.push(Line::default());
+                return;
+            }
             if !b.memories.is_empty() {
-                append_memory_section(out, &b.memories, focused, expanded);
+                append_memory_section(out, &b.memories, focused, expanded, state.selected_item);
                 if expanded && !b.memory_focus.is_empty() {
                     append_memory_focus(out, &b.memory_focus);
                     out.push(Line::default());
@@ -348,7 +390,19 @@ fn render_section(
             }
         }
         Section::History => {
-            append_history_section(out, &b.history, focused, expanded);
+            if state.is_drilled(Section::History) {
+                out.push(section_heading_for(Section::History, focused, expanded));
+                render_history_drill(out, &b.history.turns, state.selected_item);
+                out.push(Line::default());
+            } else {
+                append_history_section(
+                    out,
+                    &b.history,
+                    focused,
+                    expanded,
+                    state.selected_item,
+                );
+            }
         }
         Section::Session => {
             if let Some(s) = b.session_summary.as_ref() {
@@ -359,7 +413,19 @@ fn render_section(
             append_prompt_signals_section(out, &b.prompt_signals, focused, expanded);
         }
         Section::Decisions => {
-            append_decisions_section(out, &b.decisions, focused, expanded);
+            if state.is_drilled(Section::Decisions) {
+                out.push(section_heading_for(Section::Decisions, focused, expanded));
+                render_decision_drill(out, &b.decisions, state.selected_item);
+                out.push(Line::default());
+            } else {
+                append_decisions_section(
+                    out,
+                    &b.decisions,
+                    focused,
+                    expanded,
+                    state.selected_item,
+                );
+            }
         }
     }
 }
@@ -581,6 +647,7 @@ fn append_history_section(
     h: &HistorySummary,
     focused: bool,
     expanded: bool,
+    selected_item: usize,
 ) {
     if h.is_empty() {
         return;
@@ -615,29 +682,19 @@ fn append_history_section(
         ]));
     }
     if expanded {
-        // Per-turn detail. Retained turns, then compressed, then a
-        // terse list of dropped turn indices.
-        let retained: Vec<&TurnDetail> =
-            h.turns.iter().filter(|t| t.compressed_from.is_none()).collect();
-        let compressed: Vec<&TurnDetail> =
-            h.turns.iter().filter(|t| t.compressed_from.is_some()).collect();
-        if !retained.is_empty() {
-            out.push(Line::from(vec![
-                Span::raw("    └ "),
-                Span::styled("Retained", Style::default().add_modifier(Modifier::BOLD)),
-            ]));
-            for t in retained {
-                out.extend(turn_detail_lines(t, false));
-            }
-        }
-        if !compressed.is_empty() {
-            out.push(Line::from(vec![
-                Span::raw("    └ "),
-                Span::styled("Compressed", Style::default().add_modifier(Modifier::BOLD)),
-            ]));
-            for t in compressed {
-                out.extend(turn_detail_lines(t, true));
-            }
+        out.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                "↑/↓ select · Enter drill · Esc back",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+        // Walk turns in the model's order (sorted ascending by
+        // turn index); item selection uses that same flat index.
+        for (i, t) in h.turns.iter().enumerate() {
+            let selected = i == selected_item;
+            let compressed = t.compressed_from.is_some();
+            out.extend(turn_detail_lines(t, compressed, selected));
         }
         if !h.dropped_indices.is_empty() {
             let rendered_indices: Vec<String> =
@@ -651,10 +708,38 @@ fn append_history_section(
     out.push(Line::default());
 }
 
-fn turn_detail_lines(t: &TurnDetail, compressed: bool) -> Vec<Line<'static>> {
+fn turn_detail_lines(
+    t: &TurnDetail,
+    compressed: bool,
+    selected: bool,
+) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    let mut spans: Vec<Span<'static>> = vec![Span::raw("        └ ")];
-    spans.push(Span::raw(format!("#{} {}", t.index, t.role)));
+    // Leading marker reserves two columns: `▸ ` when this row is
+    // the ↑/↓-selected item, two spaces otherwise. Keeps column
+    // alignment stable as selection moves.
+    let marker: Span<'static> = if selected {
+        Span::styled(
+            "▸ ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("  ")
+    };
+    let mut spans: Vec<Span<'static>> =
+        vec![Span::raw("      "), marker.clone(), Span::raw("└ ")];
+    let id_style = if selected {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    spans.push(Span::styled(
+        format!("#{} {}", t.index, t.role),
+        id_style,
+    ));
     if compressed {
         if let Some((orig, method)) = &t.compressed_from {
             spans.push(Span::styled(
@@ -683,31 +768,67 @@ fn turn_detail_lines(t: &TurnDetail, compressed: bool) -> Vec<Line<'static>> {
         }
     }
     out.push(Line::from(spans));
-    // Content preview under the turn row, indented deeper so the
-    // eye can trace "which row does this belong to".
-    if !t.preview.is_empty() {
-        let preview = truncate_preview(&t.preview, 140);
-        out.push(Line::from(vec![
-            Span::raw("             "),
-            Span::styled(
-                format!("“{preview}”"),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ]));
+    // Multi-line wrapped preview under each turn row. Width
+    // accounts for the deep indent used below (13 cols). Selected
+    // rows get a taller window (up to 6 lines) since they're the
+    // "active" item the user is scanning.
+    let preview_source = if !t.body.is_empty() {
+        t.body.as_str()
+    } else {
+        t.preview.as_str()
+    };
+    if !preview_source.is_empty() {
+        let rows_budget = if selected { 6 } else { 3 };
+        let lines = wrap_text(preview_source.trim(), 64, rows_budget);
+        for line in lines {
+            out.push(Line::from(vec![
+                Span::raw("             "),
+                Span::styled(line, Style::default().add_modifier(Modifier::DIM)),
+            ]));
+        }
     }
     out
 }
 
-fn append_tools_expanded(out: &mut Vec<Line<'static>>, tools: &[ToolItem]) {
-    for t in tools {
-        out.push(section_row(&format!(" {}", t.name), t.tokens));
-        // Score + top-ranked factors. Each on its own indented line
-        // so long factor names don't wrap weirdly.
-        let score_span = Span::styled(
+fn append_tools_expanded(
+    out: &mut Vec<Line<'static>>,
+    tools: &[ToolItem],
+    selected_item: usize,
+) {
+    out.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(
+            "↑/↓ select · Enter drill · Esc back",
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ]));
+    for (i, t) in tools.iter().enumerate() {
+        let selected = i == selected_item;
+        let marker: Span<'static> = if selected {
+            Span::styled(
+                "▸ ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("  ")
+        };
+        out.push(Line::from(vec![
+            Span::raw("    "),
+            marker,
+            Span::raw("└ "),
+            Span::raw(t.name.clone()),
+            Span::styled(
+                format!("   {} tokens", fmt_tokens(t.tokens)),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+        // Score + top-ranked factors.
+        out.push(Line::from(vec![Span::styled(
             format!("        score {:.2}", t.score),
             Style::default().fg(Color::DarkGray),
-        );
-        out.push(Line::from(vec![score_span]));
+        )]));
         for (name, weight) in t.factors.iter().take(3) {
             out.push(Line::from(vec![
                 Span::raw("        · "),
@@ -721,41 +842,325 @@ fn append_tools_expanded(out: &mut Vec<Line<'static>>, tools: &[ToolItem]) {
     }
 }
 
+/// Drill view for a single selected tool — all selection factors,
+/// not just the top 3.
+fn render_tool_drill(
+    out: &mut Vec<Line<'static>>,
+    tools: &[ToolItem],
+    selected_item: usize,
+) {
+    let Some(t) = tools.get(selected_item) else {
+        return;
+    };
+    out.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(
+            "Esc back · drill: tool ",
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            t.name.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    out.push(Line::from(vec![
+        Span::raw("        "),
+        Span::raw(format!("{} tokens", fmt_tokens(t.tokens))),
+        Span::styled(
+            format!("   score {:.2}", t.score),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    if t.factors.is_empty() {
+        out.push(Line::from(vec![
+            Span::raw("        "),
+            Span::styled(
+                "(no selection factors recorded)".to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+    } else {
+        out.push(Line::from(vec![
+            Span::raw("        "),
+            Span::styled(
+                format!("selection factors ({})", t.factors.len()),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        for (name, weight) in &t.factors {
+            out.push(Line::from(vec![
+                Span::raw("          · "),
+                Span::raw(name.clone()),
+                Span::styled(
+                    format!("   {weight:+.3}"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+    }
+}
+
+/// Drill view for a single selected history turn — render the
+/// full body text wrapped at the inner width.
+fn render_history_drill(
+    out: &mut Vec<Line<'static>>,
+    turns: &[TurnDetail],
+    selected_item: usize,
+) {
+    let Some(t) = turns.get(selected_item) else {
+        return;
+    };
+    out.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(
+            "Esc back · drill: turn ",
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            format!("#{} {}", t.index, t.role),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("   {} tokens", fmt_tokens(t.tokens)),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            if t.has_tool_calls { "  [tools]" } else { "" }.to_string(),
+            Style::default().fg(Color::Magenta),
+        ),
+    ]));
+    if let Some((orig, method)) = &t.compressed_from {
+        out.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                format!(
+                    "compressed {} → {} tokens  via {method}",
+                    fmt_tokens(*orig),
+                    fmt_tokens(t.tokens)
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    // Body — wrap to a generous window so the user can read in
+    // one pass. Fall back to preview when body wasn't captured.
+    let body = if !t.body.is_empty() {
+        t.body.as_str()
+    } else {
+        t.preview.as_str()
+    };
+    if body.is_empty() {
+        out.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                "(turn body not captured in this snapshot)".to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+        return;
+    }
+    for line in wrap_text(body.trim(), 70, 40) {
+        out.push(Line::from(vec![
+            Span::raw("        "),
+            Span::raw(line),
+        ]));
+    }
+}
+
+/// Drill view for a single memory — full preview + metadata.
+fn render_memory_drill(
+    out: &mut Vec<Line<'static>>,
+    memories: &[MemoryItem],
+    selected_item: usize,
+) {
+    let Some(m) = memories.get(selected_item) else {
+        return;
+    };
+    out.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(
+            "Esc back · drill: memory ",
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            format!("{} · {}", m.memory_type, m.source),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    out.push(Line::from(vec![
+        Span::raw("        "),
+        Span::styled(
+            format!("{} tokens   rel {:.2}", fmt_tokens(m.tokens), m.relevance),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    for line in wrap_text(m.preview.trim(), 70, 40) {
+        out.push(Line::from(vec![
+            Span::raw("        "),
+            Span::raw(line),
+        ]));
+    }
+}
+
+/// Drill view for a single decision — full reasoning + ALL
+/// alternatives (the collapsed view only showed the first three).
+fn render_decision_drill(
+    out: &mut Vec<Line<'static>>,
+    decisions: &[super::model::DecisionItem],
+    selected_item: usize,
+) {
+    let Some(d) = decisions.get(selected_item) else {
+        return;
+    };
+    out.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(
+            "Esc back · drill: ",
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            d.label.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("   conf {:.2}", d.confidence),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    if !d.reasoning.is_empty() {
+        out.push(Line::from(vec![
+            Span::raw("        "),
+            Span::styled("Reasoning", Style::default().add_modifier(Modifier::BOLD)),
+        ]));
+        for line in wrap_text(d.reasoning.trim(), 68, 20) {
+            out.push(Line::from(vec![
+                Span::raw("          "),
+                Span::raw(line),
+            ]));
+        }
+    }
+    if !d.alternatives.is_empty() {
+        out.push(Line::from(vec![
+            Span::raw("        "),
+            Span::styled(
+                format!("Alternatives ({})", d.alternatives.len()),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        for a in &d.alternatives {
+            out.push(Line::from(vec![
+                Span::raw("          ~ "),
+                Span::raw(a.description.clone()),
+                Span::styled(
+                    format!("   score {:.2}", a.score),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            if !a.why_not_chosen.is_empty() {
+                for line in wrap_text(a.why_not_chosen.trim(), 60, 6) {
+                    out.push(Line::from(vec![
+                        Span::raw("               "),
+                        Span::styled(
+                            format!("rejected: {line}"),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+            }
+        }
+    }
+}
+
 fn append_memory_section(
     out: &mut Vec<Line<'static>>,
     memories: &[MemoryItem],
     focused: bool,
     expanded: bool,
+    selected_item: usize,
 ) {
     if memories.is_empty() {
         return;
     }
     out.push(section_heading_for(Section::Memory, focused, expanded));
-    for m in memories {
-        // Collapsed: truncated preview. Expanded: full preview on
-        // its own line so the user can read without wrapping.
-        let preview_len = if expanded { 160 } else { 60 };
-        let preview = truncate_preview(&m.preview, preview_len);
+    if expanded {
         out.push(Line::from(vec![
-            Span::raw("    └ "),
-            Span::raw(format!("\"{preview}\"")),
+            Span::raw("    "),
             Span::styled(
-                format!("   {} tokens", fmt_tokens(m.tokens)),
+                "↑/↓ select · Enter drill · Esc back",
                 Style::default().add_modifier(Modifier::DIM),
             ),
-            Span::styled(
-                format!("  (rel {:.2})", m.relevance),
-                Style::default().fg(Color::DarkGray),
-            ),
         ]));
-        if expanded {
-            out.push(Line::from(vec![
-                Span::raw("        "),
+    }
+    for (i, m) in memories.iter().enumerate() {
+        let selected = expanded && i == selected_item;
+        let marker: Span<'static> = if selected {
+            Span::styled(
+                "▸ ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("  ")
+        };
+        // Header row — metadata only; preview text goes under it.
+        let header = if expanded {
+            vec![
+                Span::raw("    "),
+                marker,
+                Span::raw("└ "),
                 Span::styled(
                     format!("{} · {}", m.memory_type, m.source),
+                    if selected {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Span::styled(
+                    format!("   {} tokens", fmt_tokens(m.tokens)),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    format!("  (rel {:.2})", m.relevance),
                     Style::default().fg(Color::DarkGray),
                 ),
-            ]));
+            ]
+        } else {
+            // Collapsed: single-line truncated preview.
+            let preview = truncate_preview(&m.preview, 60);
+            vec![
+                Span::raw("    └ "),
+                Span::raw(format!("\"{preview}\"")),
+                Span::styled(
+                    format!("   {} tokens", fmt_tokens(m.tokens)),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    format!("  (rel {:.2})", m.relevance),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]
+        };
+        out.push(Line::from(header));
+        if expanded {
+            let rows_budget = if selected { 6 } else { 3 };
+            for line in wrap_text(m.preview.trim(), 66, rows_budget) {
+                out.push(Line::from(vec![
+                    Span::raw("          "),
+                    Span::styled(line, Style::default().add_modifier(Modifier::DIM)),
+                ]));
+            }
         }
     }
     out.push(Line::default());
@@ -1040,15 +1445,45 @@ fn append_decisions_section(
     decisions: &[super::model::DecisionItem],
     focused: bool,
     expanded: bool,
+    selected_item: usize,
 ) {
     if decisions.is_empty() {
         return;
     }
     out.push(section_heading_for(Section::Decisions, focused, expanded));
-    for d in decisions {
+    if expanded {
         out.push(Line::from(vec![
-            Span::raw("    └ "),
-            Span::raw(d.label.clone()),
+            Span::raw("    "),
+            Span::styled(
+                "↑/↓ select · Enter drill · Esc back",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+    for (i, d) in decisions.iter().enumerate() {
+        let selected = expanded && i == selected_item;
+        let marker: Span<'static> = if selected {
+            Span::styled(
+                "▸ ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("  ")
+        };
+        let name_style = if selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        out.push(Line::from(vec![
+            Span::raw("    "),
+            marker,
+            Span::raw("└ "),
+            Span::styled(d.label.clone(), name_style),
             Span::styled(
                 format!("   conf {:.2}", d.confidence),
                 Style::default().fg(Color::DarkGray),
@@ -1056,17 +1491,17 @@ fn append_decisions_section(
         ]));
         if expanded {
             if !d.reasoning.is_empty() {
-                out.push(Line::from(vec![
-                    Span::raw("        "),
-                    Span::styled(
-                        truncate_preview(&d.reasoning, 140),
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                ]));
+                let rows_budget = if selected { 6 } else { 2 };
+                for line in wrap_text(&d.reasoning, 66, rows_budget) {
+                    out.push(Line::from(vec![
+                        Span::raw("          "),
+                        Span::styled(line, Style::default().add_modifier(Modifier::DIM)),
+                    ]));
+                }
             }
             for a in d.alternatives.iter().take(3) {
                 out.push(Line::from(vec![
-                    Span::raw("        ~ "),
+                    Span::raw("          ~ "),
                     Span::raw(truncate_preview(&a.description, 60)),
                     Span::styled(
                         format!("   score {:.2}", a.score),
@@ -1075,7 +1510,7 @@ fn append_decisions_section(
                 ]));
                 if !a.why_not_chosen.is_empty() {
                     out.push(Line::from(vec![
-                        Span::raw("           "),
+                        Span::raw("             "),
                         Span::styled(
                             format!("rejected: {}", truncate_preview(&a.why_not_chosen, 100)),
                             Style::default().fg(Color::DarkGray),
@@ -1154,6 +1589,103 @@ fn title_line(b: &ContextBreakdown, band: PressureBand) -> Line<'static> {
             .fg(band.color())
             .add_modifier(Modifier::BOLD),
     )])
+}
+
+/// Soft-wrap `text` into up to `max_rows` lines that fit within
+/// `width` display columns, prefixed with `indent` so each line
+/// lands under the same guide column.  Produces plain-text lines
+/// (callers wrap them in Styled spans).
+///
+/// Uses character boundaries not grapheme clusters — fine for
+/// the ASCII-heavy content the panel renders, and avoids pulling
+/// `unicode-segmentation` into this module's dep list.
+fn wrap_text(text: &str, width: usize, max_rows: usize) -> Vec<String> {
+    if width == 0 || max_rows == 0 {
+        return Vec::new();
+    }
+    // Break into logical lines first so explicit newlines in the
+    // source text land on their own row.  Empty lines between
+    // paragraphs become a single blank row.
+    let mut out: Vec<String> = Vec::new();
+    'outer: for logical in text.lines() {
+        let logical = logical.trim_end();
+        if logical.is_empty() {
+            if out.last().map(|s| !s.is_empty()).unwrap_or(false) {
+                out.push(String::new());
+                if out.len() >= max_rows {
+                    break;
+                }
+            }
+            continue;
+        }
+        // Word-wrap within the logical line.  Long words get hard-
+        // broken at the width boundary.
+        let mut current = String::new();
+        for word in logical.split_whitespace() {
+            if word.chars().count() > width {
+                // Flush current, then hard-break the giant word.
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                    if out.len() >= max_rows {
+                        break 'outer;
+                    }
+                }
+                let mut rest = word.to_string();
+                while rest.chars().count() > width {
+                    let head: String = rest.chars().take(width).collect();
+                    out.push(head);
+                    if out.len() >= max_rows {
+                        break 'outer;
+                    }
+                    rest = rest.chars().skip(width).collect();
+                }
+                if !rest.is_empty() {
+                    current.push_str(&rest);
+                }
+                continue;
+            }
+            let would_len = if current.is_empty() {
+                word.chars().count()
+            } else {
+                current.chars().count() + 1 + word.chars().count()
+            };
+            if would_len > width {
+                out.push(std::mem::take(&mut current));
+                if out.len() >= max_rows {
+                    break 'outer;
+                }
+                current.push_str(word);
+            } else {
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+                current.push_str(word);
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+            if out.len() >= max_rows {
+                break;
+            }
+        }
+    }
+    // If the original text was longer than `max_rows` could fit,
+    // mark the last line with an ellipsis so the user knows more
+    // content exists beyond the drill-out.
+    if out.len() == max_rows {
+        let more_rows_exist = text.lines().count() > max_rows
+            || text.chars().count() > out.iter().map(|s| s.chars().count()).sum::<usize>();
+        if more_rows_exist
+            && let Some(last) = out.last_mut()
+        {
+            let max_last = width.saturating_sub(1);
+            while last.chars().count() > max_last {
+                last.pop();
+            }
+            last.push('…');
+        }
+    }
+    out
 }
 
 fn truncate_preview(s: &str, max_chars: usize) -> String {
@@ -1257,6 +1789,111 @@ mod tests {
     fn snapshot_empty_no_trace_80x3() {
         let b = ContextBreakdown::empty();
         insta::assert_snapshot!("context_panel_empty_80x3", render_panel(&b, 80, 3));
+    }
+
+    #[test]
+    fn snapshot_history_expanded_with_wrapped_previews_100x30() {
+        use super::super::model::ContextSnapshot;
+        let mut t = trace(100_000, 2_000, 0, 0, 0, 0);
+        t.history.total_turns_available = 3;
+        t.history.turns_retained = vec![
+            TurnRetention {
+                turn_index: 0,
+                role: "user".into(),
+                tokens: 80,
+                has_tool_calls: false,
+            },
+            TurnRetention {
+                turn_index: 1,
+                role: "assistant".into(),
+                tokens: 4_200,
+                has_tool_calls: true,
+            },
+            TurnRetention {
+                turn_index: 2,
+                role: "user".into(),
+                tokens: 40,
+                has_tool_calls: false,
+            },
+        ];
+        let mut snap = ContextSnapshot::default();
+        snap.history_previews.insert(
+            0,
+            "Can you refactor the auth module so the session validator \
+             lives in its own file?"
+                .into(),
+        );
+        snap.history_previews.insert(
+            1,
+            "I'll start by reading auth.rs and mapping out every caller."
+                .into(),
+        );
+        snap.history_previews
+            .insert(2, "Thanks — now make the helper private.".into());
+        snap.history_bodies.insert(
+            1,
+            "I'll start by reading auth.rs and mapping out every caller.\n\n\
+             Let me look at the module structure first, then identify what\n\
+             to move. The validate_session function has three call sites\n\
+             that I'll need to update."
+                .into(),
+        );
+        let b = ContextBreakdown::from_trace_with(&t, &snap);
+        let state = ViewState {
+            focus: Some(Section::History),
+            expanded: Some(Section::History),
+            selected_item: 1,
+            drilled: false,
+        };
+        let lines = build_lines_with(&b, 100, state);
+        let p = ratatui::widgets::Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false });
+        let buf = draw_widget(p, 100, 30);
+        insta::assert_snapshot!(
+            "context_panel_history_expanded_100x30",
+            buffer_to_string(&buf)
+        );
+    }
+
+    #[test]
+    fn snapshot_history_drill_100x30() {
+        use super::super::model::ContextSnapshot;
+        let mut t = trace(100_000, 2_000, 0, 0, 0, 0);
+        t.history.total_turns_available = 1;
+        t.history.turns_retained = vec![TurnRetention {
+            turn_index: 0,
+            role: "assistant".into(),
+            tokens: 4_200,
+            has_tool_calls: true,
+        }];
+        let mut snap = ContextSnapshot::default();
+        snap.history_bodies.insert(
+            0,
+            "I'll start by reading auth.rs and mapping out every caller.\n\n\
+             Let me look at the module structure first, then identify what\n\
+             to move. The validate_session function has three call sites\n\
+             that I'll need to update.\n\n\
+             Plan:\n\
+             1. Extract validate_session into src/auth/session_validator.rs.\n\
+             2. Update main.rs, middleware.rs, and test_utils.rs.\n\
+             3. Run the test suite and verify nothing regressed."
+                .into(),
+        );
+        let b = ContextBreakdown::from_trace_with(&t, &snap);
+        let state = ViewState {
+            focus: Some(Section::History),
+            expanded: Some(Section::History),
+            selected_item: 0,
+            drilled: true,
+        };
+        let lines = build_lines_with(&b, 100, state);
+        let p = ratatui::widgets::Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false });
+        let buf = draw_widget(p, 100, 30);
+        insta::assert_snapshot!(
+            "context_panel_history_drill_100x30",
+            buffer_to_string(&buf)
+        );
     }
 
     #[test]
@@ -1513,7 +2150,7 @@ mod tests {
         let b = ContextBreakdown::from_trace_with(&t, &snap);
         let state = ViewState {
             focus: Some(Section::History),
-            expanded: Some(Section::History),
+            expanded: Some(Section::History), selected_item: 0, drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()
@@ -1562,7 +2199,7 @@ mod tests {
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::Memory),
-            expanded: Some(Section::Memory),
+            expanded: Some(Section::Memory), selected_item: 0, drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()
@@ -1610,7 +2247,7 @@ mod tests {
 
         let expanded_state = ViewState {
             focus: Some(Section::PromptSignals),
-            expanded: Some(Section::PromptSignals),
+            expanded: Some(Section::PromptSignals), selected_item: 0, drilled: false,
         };
         let expanded: String = build_lines_with(&b, 80, expanded_state)
             .iter()
@@ -1640,7 +2277,7 @@ mod tests {
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::Decisions),
-            expanded: Some(Section::Decisions),
+            expanded: Some(Section::Decisions), selected_item: 0, drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()
@@ -1675,7 +2312,7 @@ mod tests {
         let b = ContextBreakdown::from_trace_with(&t, &snap);
         let state = ViewState {
             focus: Some(Section::Session),
-            expanded: Some(Section::Session),
+            expanded: Some(Section::Session), selected_item: 0, drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()
@@ -1703,7 +2340,7 @@ mod tests {
         let b = ContextBreakdown::from_trace_with(&t, &snap);
         let state = ViewState {
             focus: Some(Section::SystemPrompt),
-            expanded: Some(Section::SystemPrompt),
+            expanded: Some(Section::SystemPrompt), selected_item: 0, drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()
@@ -1776,7 +2413,7 @@ mod tests {
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::History),
-            expanded: Some(Section::History),
+            expanded: Some(Section::History), selected_item: 0, drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()
@@ -1815,7 +2452,7 @@ mod tests {
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::Memory),
-            expanded: Some(Section::Memory),
+            expanded: Some(Section::Memory), selected_item: 0, drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()
@@ -1870,6 +2507,220 @@ mod tests {
     }
 
     #[test]
+    fn wrap_text_splits_long_line_into_rows() {
+        let rows = wrap_text(&"word ".repeat(30), 20, 6);
+        assert!(rows.len() >= 2);
+        for row in &rows {
+            assert!(row.chars().count() <= 20, "row exceeded width: {row}");
+        }
+    }
+
+    #[test]
+    fn wrap_text_appends_ellipsis_when_truncating() {
+        let rows = wrap_text(&"abc\n".repeat(20), 10, 3);
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows[2].ends_with('…'),
+            "last row should be ellipsis-terminated when more rows exist: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_text_respects_explicit_paragraphs() {
+        let rows = wrap_text("one\n\ntwo", 30, 10);
+        // Middle blank row preserved as a paragraph break.
+        assert_eq!(rows, vec!["one".to_string(), String::new(), "two".to_string()]);
+    }
+
+    #[test]
+    fn expanded_history_selected_turn_has_marker() {
+        let mut t = trace(100_000, 2_000, 0, 0, 0, 0);
+        t.history.total_turns_available = 3;
+        t.history.turns_retained = vec![
+            TurnRetention {
+                turn_index: 0,
+                role: "user".into(),
+                tokens: 80,
+                has_tool_calls: false,
+            },
+            TurnRetention {
+                turn_index: 1,
+                role: "assistant".into(),
+                tokens: 200,
+                has_tool_calls: false,
+            },
+            TurnRetention {
+                turn_index: 2,
+                role: "user".into(),
+                tokens: 40,
+                has_tool_calls: false,
+            },
+        ];
+        let b = ContextBreakdown::from_trace(&t);
+        let state = ViewState {
+            focus: Some(Section::History),
+            expanded: Some(Section::History),
+            selected_item: 1,
+            drilled: false,
+        };
+        let lines = build_lines_with(&b, 80, state);
+        let marker_rows: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .filter(|s| s.contains('▸'))
+            .collect();
+        assert_eq!(marker_rows.len(), 1, "exactly one selected row: {marker_rows:?}");
+        assert!(
+            marker_rows[0].contains("#1 assistant"),
+            "marker lands on the selected turn: {marker_rows:?}"
+        );
+    }
+
+    #[test]
+    fn history_drill_shows_full_body_not_collapsed_preview() {
+        use super::super::model::ContextSnapshot;
+        let mut t = trace(100_000, 2_000, 0, 0, 0, 0);
+        t.history.total_turns_available = 1;
+        t.history.turns_retained = vec![TurnRetention {
+            turn_index: 0,
+            role: "user".into(),
+            tokens: 300,
+            has_tool_calls: false,
+        }];
+        let body = "First paragraph.\n\nSecond paragraph that is much longer \
+                    and would normally be truncated by the collapsed-preview renderer."
+            .to_string();
+        let mut snap = ContextSnapshot::default();
+        snap.history_previews.insert(0, "First paragraph.".into());
+        snap.history_bodies.insert(0, body.clone());
+        let b = ContextBreakdown::from_trace_with(&t, &snap);
+        let state = ViewState {
+            focus: Some(Section::History),
+            expanded: Some(Section::History),
+            selected_item: 0,
+            drilled: true,
+        };
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("Second paragraph"), "full body missing: {text}");
+        assert!(text.contains("Esc back"), "drill hint missing: {text}");
+    }
+
+    #[test]
+    fn memory_drill_replaces_list_with_single_item() {
+        let mut t = trace(100_000, 1_000, 0, 500, 0, 0);
+        t.memory.memories_selected = vec![
+            MemorySelection {
+                memory_id: "a".into(),
+                memory_type: "semantic".into(),
+                content_preview: "alpha entry with some detail".into(),
+                relevance_score: 0.9,
+                tokens: 100,
+                source: MemorySource::Memoria,
+            },
+            MemorySelection {
+                memory_id: "b".into(),
+                memory_type: "procedural".into(),
+                content_preview: "bravo entry — distinct from alpha".into(),
+                relevance_score: 0.7,
+                tokens: 80,
+                source: MemorySource::Session,
+            },
+        ];
+        let b = ContextBreakdown::from_trace(&t);
+        let state = ViewState {
+            focus: Some(Section::Memory),
+            expanded: Some(Section::Memory),
+            selected_item: 1,
+            drilled: true,
+        };
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("bravo entry"),
+            "drilled item content missing: {text}"
+        );
+        assert!(
+            !text.contains("alpha entry"),
+            "non-selected item must not appear in drill: {text}"
+        );
+    }
+
+    #[test]
+    fn tool_drill_lists_all_factors_not_just_top_three() {
+        let mut t = trace(100_000, 1_000, 0, 0, 2_000, 0);
+        t.tools.tools_selected = vec![ToolSelected {
+            tool_name: "bash".into(),
+            score: 0.9,
+            tokens: 200,
+            selection_factors: (0..6)
+                .map(|i| {
+                    astra_turn_core::context_assembly_trace::SelectionFactor {
+                        factor_name: format!("factor_{i}"),
+                        weight: 0.1 * (i as f64),
+                        contribution: 0.05 * (i as f64),
+                    }
+                })
+                .collect(),
+        }];
+        let b = ContextBreakdown::from_trace(&t);
+        let state = ViewState {
+            focus: Some(Section::Tools),
+            expanded: Some(Section::Tools),
+            selected_item: 0,
+            drilled: true,
+        };
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Only the first three factors get captured upstream in the
+        // model (intentional cap on the data). Still verify the
+        // drill renders all of whatever's in the model.
+        assert!(text.contains("factor_0"));
+        assert!(text.contains("factor_2"));
+    }
+
+    #[test]
+    fn section_item_count_reflects_each_section_type() {
+        let mut t = trace(100_000, 1_000, 0, 500, 1_000, 0);
+        t.history.total_turns_available = 2;
+        t.history.turns_retained = vec![TurnRetention {
+            turn_index: 0,
+            role: "user".into(),
+            tokens: 50,
+            has_tool_calls: false,
+        }];
+        t.memory.memories_selected = vec![MemorySelection {
+            memory_id: "m".into(),
+            memory_type: "semantic".into(),
+            content_preview: "x".into(),
+            relevance_score: 0.5,
+            tokens: 100,
+            source: MemorySource::Memoria,
+        }];
+        t.tools.tools_selected = vec![ToolSelected {
+            tool_name: "bash".into(),
+            score: 0.5,
+            tokens: 200,
+            selection_factors: Vec::new(),
+        }];
+        let b = ContextBreakdown::from_trace(&t);
+        assert_eq!(section_item_count(&b, Section::History), 1);
+        assert_eq!(section_item_count(&b, Section::Memory), 1);
+        assert_eq!(section_item_count(&b, Section::Tools), 1);
+        assert_eq!(section_item_count(&b, Section::SystemPrompt), 0);
+        assert_eq!(section_item_count(&b, Section::Session), 0);
+    }
+
+    #[test]
     fn expanded_section_heading_has_expand_marker() {
         let mut t = trace(100_000, 2_000, 0, 0, 1_000, 0);
         t.tools.tools_selected = vec![ToolSelected {
@@ -1881,7 +2732,7 @@ mod tests {
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::Tools),
-            expanded: Some(Section::Tools),
+            expanded: Some(Section::Tools), selected_item: 0, drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()

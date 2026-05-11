@@ -31,6 +31,17 @@ pub(crate) struct ContextPanelView {
     /// the focused section.
     focus: Option<Section>,
     expanded: Option<Section>,
+    /// Position of the currently-selected item within the expanded
+    /// section. `0` when no expansion / no selectable items.
+    /// Clamped to the section's item count at key-handling time.
+    selected_item: usize,
+    /// `true` when the user has pressed Enter on a selected item —
+    /// the section renders only that item's full content.
+    drilled: bool,
+    /// Scroll position captured the moment we entered drill mode,
+    /// restored when Esc exits the drill.  Keeps the eye on the
+    /// same item the user drilled from.
+    pre_drill_scroll: u16,
     /// Cached last-known viewport height (content rows minus
     /// border). Populated by `render` so `handle_key` can page by
     /// a meaningful amount even though it doesn't see the Rect.
@@ -50,6 +61,9 @@ impl ContextPanelView {
             scroll: 0,
             focus: None,
             expanded: None,
+            selected_item: 0,
+            drilled: false,
+            pre_drill_scroll: 0,
             last_viewport_rows: Cell::new(0),
             last_inner_width: Cell::new(80),
         }
@@ -59,7 +73,30 @@ impl ContextPanelView {
         panel_view::ViewState {
             focus: self.focus,
             expanded: self.expanded,
+            selected_item: self.selected_item,
+            drilled: self.drilled,
         }
+    }
+
+    /// Number of items in the currently-expanded section (0 when
+    /// no expansion or the section has no drillable items).
+    fn selectable_count(&self) -> usize {
+        let Some(section) = self.expanded else {
+            return 0;
+        };
+        panel_view::section_item_count(&self.breakdown, section)
+    }
+
+    /// Move selection by +/-1 clamped to the item count.  When the
+    /// section has no drillable items, no-op so the keypress
+    /// doesn't drop silently.
+    fn select_item(&mut self, delta: i32) {
+        let n = self.selectable_count();
+        if n == 0 {
+            return;
+        }
+        let next = (self.selected_item as i32 + delta).clamp(0, (n - 1) as i32);
+        self.selected_item = next as usize;
     }
 
     /// Return the max scroll offset — one past the last line that
@@ -114,6 +151,8 @@ impl ContextPanelView {
         // detail on a section the user isn't looking at anymore.
         if self.expanded != Some(next) {
             self.expanded = None;
+            self.selected_item = 0;
+            self.drilled = false;
         }
     }
 
@@ -121,9 +160,73 @@ impl ContextPanelView {
         let Some(focus) = self.focus else { return };
         if self.expanded == Some(focus) {
             self.expanded = None;
+            self.selected_item = 0;
+            self.drilled = false;
         } else {
             self.expanded = Some(focus);
+            // Reset item state so the freshly-expanded section
+            // starts with its first item selected.
+            self.selected_item = 0;
+            self.drilled = false;
         }
+    }
+
+    /// Enter drill mode on the currently-focused section's
+    /// currently-selected item. No-op when no expansion, no
+    /// focus, or the section has no drillable items.  Remembers
+    /// the pre-drill scroll position so Esc can restore it.
+    fn enter_drill(&mut self) {
+        if self.expanded.is_none() || self.selectable_count() == 0 {
+            return;
+        }
+        self.pre_drill_scroll = self.scroll;
+        self.drilled = true;
+        self.scroll = 0;
+    }
+
+    fn exit_drill(&mut self) {
+        self.drilled = false;
+        self.scroll = self.pre_drill_scroll;
+    }
+
+    /// Adjust the scroll window so the row containing the ▸
+    /// marker stays in view. Called after every Up/Down inside an
+    /// expanded section. Renders the line list to find the
+    /// marker's row, then clamps scroll so it lands within the
+    /// visible viewport (with one row of breathing room top and
+    /// bottom).
+    fn scroll_to_selected_item(&mut self) {
+        let inner_w = self.last_inner_width.get();
+        let inner_h = self.last_viewport_rows.get();
+        if inner_w == 0 || inner_h == 0 {
+            return;
+        }
+        let state = self.view_state();
+        let lines =
+            crate::tui::context_panel::view::build_lines_with(&self.breakdown, inner_w, state);
+        let Some(row) = lines.iter().position(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.content.as_ref().contains('▸'))
+        }) else {
+            return;
+        };
+        let row = row as u16;
+        let top_margin = 1u16;
+        let bottom_margin = 1u16;
+        let visible_top = self.scroll;
+        let visible_bottom = self
+            .scroll
+            .saturating_add(inner_h.saturating_sub(bottom_margin));
+        if row + top_margin <= visible_top {
+            // Selection moved above the visible window.
+            self.scroll = row.saturating_sub(top_margin);
+        } else if row >= visible_bottom {
+            // Selection moved below.
+            self.scroll = row.saturating_sub(inner_h.saturating_sub(bottom_margin + 1));
+        }
+        let max = self.max_scroll();
+        self.scroll = self.scroll.min(max);
     }
 
     /// Adjust scroll so the currently-focused section's heading is
@@ -173,12 +276,13 @@ impl BottomPaneView for ContextPanelView {
 
     fn handle_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
-            // Close first: Esc with nothing expanded closes the
-            // panel; Esc while a section is expanded just collapses
-            // it (stepwise dismiss matches editors users know).
+            // Three-level Esc: drill → expanded → close.
             (KeyCode::Esc, _) => {
-                if self.expanded.is_some() {
+                if self.drilled {
+                    self.exit_drill();
+                } else if self.expanded.is_some() {
                     self.expanded = None;
+                    self.selected_item = 0;
                 } else {
                     self.completed = true;
                 }
@@ -186,31 +290,54 @@ impl BottomPaneView for ContextPanelView {
             (KeyCode::Char('q'), _) => {
                 self.completed = true;
             }
-            // Enter expands the focused section — or closes the
-            // panel when there's no focus (preserves the old
-            // "Enter closes" gesture for users who don't drill in).
+            // Enter: inside drill → no-op; inside expanded section
+            // with a selected item → enter drill; inside focused
+            // section → toggle expand; no focus → close panel
+            // (preserves pre-drill-in Enter-closes muscle memory).
             (KeyCode::Enter, _) => {
-                if self.focus.is_some() {
+                if self.drilled {
+                    // Already as deep as you can go.
+                } else if self.expanded.is_some() && self.selectable_count() > 0 {
+                    self.enter_drill();
+                } else if self.focus.is_some() {
                     self.toggle_expand();
-                    // Re-anchor the scroll so the heading stays
-                    // visible after the expansion grew the content.
                     self.scroll_to_focus();
                 } else {
                     self.completed = true;
                 }
             }
-            // Tab cycles section focus; Shift+Tab walks backwards.
-            (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
+            // Tab cycles section focus (disabled inside drill so
+            // the same key doesn't mean "fly away from this view").
+            (KeyCode::Tab, _) | (KeyCode::BackTab, _) if !self.drilled => {
                 let reverse = matches!(key.code, KeyCode::BackTab)
                     || key.modifiers.contains(KeyModifiers::SHIFT);
                 self.focus_next(reverse);
-                // Land the newly-focused heading in view — the
-                // previous "scroll=0" forced users to scan for it.
                 self.scroll_to_focus();
             }
-            // Fine scroll.
-            (KeyCode::Down | KeyCode::Char('j'), _) => self.scroll_by(1),
-            (KeyCode::Up | KeyCode::Char('k'), _) => self.scroll_by(-1),
+            // ↑/↓ pivots behavior: inside an expanded (non-drilled)
+            // section with drillable items, move selection. Drill
+            // and flat views use them as scroll.
+            (KeyCode::Down, _) => {
+                if !self.drilled && self.expanded.is_some() && self.selectable_count() > 0 {
+                    self.select_item(1);
+                    self.scroll_to_selected_item();
+                } else {
+                    self.scroll_by(1);
+                }
+            }
+            (KeyCode::Up, _) => {
+                if !self.drilled && self.expanded.is_some() && self.selectable_count() > 0 {
+                    self.select_item(-1);
+                    self.scroll_to_selected_item();
+                } else {
+                    self.scroll_by(-1);
+                }
+            }
+            // j/k stay as pure scroll — avoids accidental selection
+            // moves when the user is scanning content inside a
+            // drill or a section without selectable items.
+            (KeyCode::Char('j'), _) => self.scroll_by(1),
+            (KeyCode::Char('k'), _) => self.scroll_by(-1),
             // Page scroll.
             (KeyCode::PageDown, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 let page = self.last_viewport_rows.get().max(1) as i32;
@@ -260,7 +387,20 @@ impl BottomPaneView for ContextPanelView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        Some("Tab focus · Enter expand · j/k scroll · Esc close".into())
+        // Hint text tracks the current mode so the user sees
+        // exactly which keys do what at this depth.
+        let hint = if self.drilled {
+            "j/k scroll · Esc back"
+        } else if self.expanded.is_some() && self.selectable_count() > 0 {
+            "↑/↓ select · Enter drill · Tab next section · Esc back"
+        } else if self.expanded.is_some() {
+            "Tab next section · Enter close · Esc back"
+        } else if self.focus.is_some() {
+            "Tab next · Enter expand · j/k scroll · Esc close"
+        } else {
+            "Tab focus · Enter close · j/k scroll · Esc close"
+        };
+        Some(hint.into())
     }
 
     fn reserve_status_footer(&self) -> bool {
@@ -595,6 +735,152 @@ mod tests {
             second_scroll >= first_scroll,
             "Tab must scroll forward to reach later sections: {first_scroll} → {second_scroll}"
         );
+    }
+
+    #[test]
+    fn down_inside_expanded_section_advances_item_selection() {
+        let mut v = ContextPanelView::new(big_breakdown());
+        prime_viewport(&v, 80, 14);
+        // Jump to Tools (has drillable items).
+        for _ in 0..4 {
+            v.handle_key(press(KeyCode::Tab));
+            if v.focus == Some(Section::Tools) {
+                break;
+            }
+        }
+        assert_eq!(v.focus, Some(Section::Tools));
+        v.handle_key(press(KeyCode::Enter));
+        assert!(v.expanded.is_some());
+        assert_eq!(v.selected_item, 0);
+        v.handle_key(press(KeyCode::Down));
+        assert_eq!(v.selected_item, 1);
+        v.handle_key(press(KeyCode::Up));
+        assert_eq!(v.selected_item, 0);
+    }
+
+    #[test]
+    fn down_outside_expansion_scrolls_instead() {
+        let mut v = ContextPanelView::new(big_breakdown());
+        prime_viewport(&v, 80, 10);
+        let before = v.scroll;
+        v.handle_key(press(KeyCode::Down));
+        assert!(
+            v.scroll >= before,
+            "Down without expansion must scroll: {} → {}",
+            before,
+            v.scroll
+        );
+    }
+
+    #[test]
+    fn down_selection_clamps_at_last_item() {
+        let mut v = ContextPanelView::new(big_breakdown());
+        prime_viewport(&v, 80, 20);
+        // Focus Tools.
+        while v.focus != Some(Section::Tools) {
+            v.handle_key(press(KeyCode::Tab));
+        }
+        v.handle_key(press(KeyCode::Enter));
+        let tools_n = v.selectable_count();
+        assert!(tools_n >= 2);
+        for _ in 0..(tools_n + 5) {
+            v.handle_key(press(KeyCode::Down));
+        }
+        assert_eq!(v.selected_item, tools_n - 1);
+    }
+
+    #[test]
+    fn enter_on_selected_item_drills_in() {
+        let mut v = ContextPanelView::new(big_breakdown());
+        prime_viewport(&v, 80, 14);
+        while v.focus != Some(Section::Tools) {
+            v.handle_key(press(KeyCode::Tab));
+        }
+        v.handle_key(press(KeyCode::Enter)); // expand
+        assert!(!v.drilled);
+        v.handle_key(press(KeyCode::Enter)); // drill
+        assert!(v.drilled);
+        assert!(v.expanded.is_some());
+    }
+
+    #[test]
+    fn esc_level_back_drill_then_collapse_then_close() {
+        let mut v = ContextPanelView::new(big_breakdown());
+        prime_viewport(&v, 80, 14);
+        while v.focus != Some(Section::Tools) {
+            v.handle_key(press(KeyCode::Tab));
+        }
+        v.handle_key(press(KeyCode::Enter)); // expand
+        v.handle_key(press(KeyCode::Enter)); // drill
+        assert!(v.drilled);
+
+        v.handle_key(press(KeyCode::Esc));
+        assert!(!v.drilled, "Esc leaves drill");
+        assert!(v.expanded.is_some(), "section still expanded");
+
+        v.handle_key(press(KeyCode::Esc));
+        assert!(v.expanded.is_none(), "Esc collapses section");
+        assert!(!v.is_complete(), "panel still open");
+
+        v.handle_key(press(KeyCode::Esc));
+        assert!(v.is_complete(), "Esc closes panel");
+    }
+
+    #[test]
+    fn drill_scroll_resets_and_restores() {
+        let mut v = ContextPanelView::new(big_breakdown());
+        prime_viewport(&v, 80, 14);
+        while v.focus != Some(Section::Tools) {
+            v.handle_key(press(KeyCode::Tab));
+        }
+        v.handle_key(press(KeyCode::Enter));
+        // Scroll down a few rows, then drill; scroll should reset to 0.
+        v.scroll = 5;
+        v.handle_key(press(KeyCode::Enter));
+        assert!(v.drilled);
+        assert_eq!(v.scroll, 0, "drill resets scroll");
+        // Esc should restore the pre-drill scroll so the eye
+        // lands on the same item.
+        v.handle_key(press(KeyCode::Esc));
+        assert_eq!(v.scroll, 5, "exit-drill restores pre-drill scroll");
+    }
+
+    #[test]
+    fn focus_change_clears_selection_and_drill() {
+        let mut v = ContextPanelView::new(big_breakdown());
+        prime_viewport(&v, 80, 14);
+        while v.focus != Some(Section::Tools) {
+            v.handle_key(press(KeyCode::Tab));
+        }
+        v.handle_key(press(KeyCode::Enter));
+        v.handle_key(press(KeyCode::Down));
+        assert_eq!(v.selected_item, 1);
+        // Move focus elsewhere — selection resets, expansion
+        // clears (the new focused section starts from a clean
+        // collapsed state). Drill isn't active here because we
+        // haven't Entered drill yet, but the clearing rule
+        // extends to drill too (see `tab_ignored_inside_drill`
+        // for the drill path, which requires Esc first).
+        v.handle_key(press(KeyCode::Tab));
+        assert_eq!(v.selected_item, 0);
+        assert!(v.expanded.is_none());
+    }
+
+    #[test]
+    fn tab_ignored_inside_drill() {
+        // Tab should not fly away from a drill — users expect Esc
+        // to back out first.
+        let mut v = ContextPanelView::new(big_breakdown());
+        prime_viewport(&v, 80, 14);
+        while v.focus != Some(Section::Tools) {
+            v.handle_key(press(KeyCode::Tab));
+        }
+        v.handle_key(press(KeyCode::Enter));
+        v.handle_key(press(KeyCode::Enter));
+        let focus_before = v.focus;
+        v.handle_key(press(KeyCode::Tab));
+        assert_eq!(v.focus, focus_before, "Tab must be a no-op inside drill");
+        assert!(v.drilled);
     }
 
     #[test]

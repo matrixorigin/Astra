@@ -251,10 +251,12 @@ pub(crate) struct TurnDetail {
     /// compressed with that method.
     pub compressed_from: Option<(u32, String)>,
     /// Short content preview taken from the turn body (first
-    /// non-blank line, truncated). Empty when the caller didn't
-    /// attach transcript text — in that case the expanded view
-    /// renders only tokens + markers.
+    /// non-blank line). Empty when the caller didn't attach
+    /// transcript text.
     pub preview: String,
+    /// Full turn body — used when the user drills into this turn.
+    /// Empty when the caller didn't attach transcript text.
+    pub body: String,
 }
 
 
@@ -385,9 +387,13 @@ impl PressureBand {
 /// callers can opt in incrementally.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ContextSnapshot<'a> {
-    /// Per-history-turn plain-text preview, indexed by turn number
-    /// matching [`TurnRetention::turn_index`] / [`TurnCompression::turn_index`].
+    /// Per-history-turn plain-text preview (first non-blank line).
+    /// Key matches [`TurnRetention::turn_index`] / [`TurnCompression::turn_index`].
     pub history_previews: std::collections::HashMap<u32, String>,
+    /// Per-history-turn full body. Used when the user drills into
+    /// a turn. Same key as `history_previews`. Missing entries
+    /// fall back to the preview in the drill view.
+    pub history_bodies: std::collections::HashMap<u32, String>,
     /// Current model identifier (for the System-prompt Persona row).
     pub model: Option<&'a str>,
     /// cwd rendered as a display string, e.g. `~/github/astra`.
@@ -563,6 +569,12 @@ impl ContextBreakdown {
                 .cloned()
                 .unwrap_or_default()
         };
+        let body_of = |idx: u32| -> String {
+            snap.history_bodies
+                .get(&idx)
+                .cloned()
+                .unwrap_or_default()
+        };
         for r in &h.turns_retained {
             turns.push(TurnDetail {
                 index: r.turn_index,
@@ -571,6 +583,7 @@ impl ContextBreakdown {
                 has_tool_calls: r.has_tool_calls,
                 compressed_from: None,
                 preview: preview_of(r.turn_index),
+                body: body_of(r.turn_index),
             });
         }
         for c in &h.turns_compressed {
@@ -581,6 +594,7 @@ impl ContextBreakdown {
                 has_tool_calls: false,
                 compressed_from: Some((c.original_tokens, format!("{:?}", c.compression_method))),
                 preview: preview_of(c.turn_index),
+                body: body_of(c.turn_index),
             });
         }
         // Sort ascending by turn index so the expanded view reads
