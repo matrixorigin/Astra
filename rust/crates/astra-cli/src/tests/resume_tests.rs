@@ -397,6 +397,7 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
         consecutive_context_window_errors: 0,
         pipeline_state: None,
         compaction_state: None,
+        config_version_id: None,
     };
     astra_pipeline::step_checkpoint::write_step_checkpoint(
         &sid,

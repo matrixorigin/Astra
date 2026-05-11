@@ -40,8 +40,7 @@ fn load_with_version_returns_config_and_matching_id() {
         .expect("id must resolve");
     let reparsed: RuntimeConfig = toml::from_str(&roundtrip_toml).expect("reparse");
     assert_eq!(
-        reparsed.token_budget.max_turn_input_tokens,
-        config.token_budget.max_turn_input_tokens,
+        reparsed.token_budget.max_turn_input_tokens, config.token_budget.max_turn_input_tokens,
         "pointer must resolve to the same content that was loaded"
     );
 }

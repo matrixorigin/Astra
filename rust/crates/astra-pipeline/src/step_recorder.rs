@@ -863,8 +863,9 @@ impl StepRecorder {
             interruption,
             approval_overrides,
             consecutive_context_window_errors,
-            pipeline_state: None,   // Set by caller after construction
-            compaction_state: None, // Set by caller after construction
+            pipeline_state: None,    // Set by caller after construction
+            compaction_state: None,  // Set by caller after construction
+            config_version_id: None, // Set by caller after construction (Step 2a)
         })
     }
 

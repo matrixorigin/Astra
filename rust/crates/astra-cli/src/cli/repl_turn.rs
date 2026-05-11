@@ -2951,6 +2951,11 @@ fn build_manual_heavy_step_checkpoint(
         consecutive_context_window_errors: 0,
         compaction_state: None,
         pipeline_state: None,
+        // Step 2a: this file's call-site doesn't own the startup
+        // config-version resolution. Leave None; run_lifecycle's heavy
+        // checkpoint write path (the primary write) stamps the pointer
+        // from ReplState in a follow-up wiring commit.
+        config_version_id: None,
     };
     StepCheckpoint::Heavy(Box::new(heavy))
 }

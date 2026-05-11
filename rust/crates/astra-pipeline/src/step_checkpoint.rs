@@ -508,6 +508,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             compaction_state: None,
             pipeline_state: None,
+            config_version_id: None,
         }
     }
 

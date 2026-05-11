@@ -816,6 +816,16 @@ pub struct HeavyCheckpoint {
     /// last_was_insufficient — enabling enriched resume guidance and tier selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_state: Option<serde_json::Value>,
+    /// Pointer to the `astra-config` version store: which `RuntimeConfig`
+    /// this session ran under. `None` on legacy checkpoints from before
+    /// Step 2a of the config-versions rollout; consumers treat that as
+    /// "unknown / fall back to `RuntimeConfig::load()` at resume time".
+    ///
+    /// Opaque `String` here (not a `VersionId`) so astra-pipeline does
+    /// not have to pull in astra-config just to serialize this field —
+    /// the id is content-addressed hex, `cfg_<16-hex>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_version_id: Option<String>,
 }
 /// Summary of a completed delegation sub-run, stored in HeavyCheckpoint for recovery.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -926,6 +936,7 @@ impl StepCheckpoint {
             consecutive_context_window_errors: 0,
             pipeline_state: None,
             compaction_state: None,
+            config_version_id: None,
         }))
     }
 
@@ -2942,6 +2953,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             compaction_state: None,
             pipeline_state: None,
+            config_version_id: None,
         }));
         let err = cp.validate().unwrap_err();
         assert!(matches!(err, ProtocolError::CheckpointCorrupt(_)));
@@ -2976,6 +2988,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             compaction_state: None,
             pipeline_state: None,
+            config_version_id: None,
         }));
         assert!(cp.validate().is_ok());
     }

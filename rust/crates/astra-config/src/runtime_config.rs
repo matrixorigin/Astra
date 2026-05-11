@@ -1380,6 +1380,26 @@ impl RuntimeConfig {
         config
     }
 
+    /// Load the resolved config and simultaneously record it in a
+    /// content-addressed version store. Returns `(config, version_id)`.
+    ///
+    /// This is the "front door" every session should walk through at
+    /// startup. The returned id is the single small value that flows
+    /// into checkpoints, journals, and (later) cloud mirrors as the
+    /// canonical reference to "what config this session ran under".
+    ///
+    /// The store is taken by reference so callers can choose between
+    /// the default `~/.astra/config/versions/` `LocalFileStore` and a
+    /// tempdir store (tests, ephemeral CLI modes).
+    pub fn load_with_version(
+        store: &dyn crate::config_versions::ConfigVersionStore,
+        meta: crate::config_versions::PutMetadata,
+    ) -> Result<(Self, crate::config_versions::VersionId), crate::config_versions::StoreError> {
+        let config = Self::load();
+        let id = store.put(&config, meta)?;
+        Ok((config, id))
+    }
+
     /// Merge another config into this one (other takes precedence).
     pub fn merge(mut self, other: RuntimeConfig) -> Self {
         let RuntimeConfig {

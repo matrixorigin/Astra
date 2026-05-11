@@ -18,13 +18,23 @@
 //! 3. Serde is backward-compatible: a checkpoint JSON from before
 //!    this field existed still deserializes (field absent = None).
 
-use astra_pipeline::step_protocol::{HeavyCheckpoint, LightCheckpoint};
+use astra_pipeline::step_protocol::{ExecutionCursor, HeavyCheckpoint, LightCheckpoint};
 
 fn sample_light() -> LightCheckpoint {
-    // Use the constructor pattern established in the rest of the
-    // pipeline crate (other tests use Default + a few setters). This
-    // keeps this test file independent of internal shape churn.
-    LightCheckpoint::default()
+    // LightCheckpoint doesn't derive Default (it carries an explicit
+    // protocol_version and id fields that callers should not forget
+    // to set). Build one by hand with the minimum fields; ExecutionCursor
+    // does provide Default so we reuse that.
+    LightCheckpoint {
+        protocol_version: 0,
+        cursor: ExecutionCursor::default(),
+        step_id: "step_test".into(),
+        task_id: "task_test".into(),
+        agent_id: "agent_test".into(),
+        progress: 0.0,
+        total_tokens: 0,
+        created_at: 0,
+    }
 }
 
 fn sample_heavy_with_pointer(id: Option<String>) -> HeavyCheckpoint {
@@ -80,19 +90,23 @@ fn heavy_checkpoint_serde_roundtrip_preserves_pointer() {
 fn heavy_checkpoint_deserializes_pre_field_json_without_error() {
     // Old checkpoint files on disk don't carry the new key. The field
     // must be `#[serde(default)]` so loading those files still works.
-    // Build a minimal JSON body containing only the fields that existed
-    // before this field landed.
-    let json = serde_json::json!({
-        "light": {},
-        "messages": [],
-        "budget_remaining_tokens": 0,
-        "budget_remaining_rounds": 0,
-        "blocked_tools": [],
-        "recent_tools": [],
-        "memory_context": null,
-        "consecutive_context_window_errors": 0
-    });
+    // Build a JSON body that has the full pre-change schema, minus
+    // only the new config_version_id field — that's the regression
+    // we're guarding.
+    let pre = sample_heavy_with_pointer(Some("cfg_toremove".into()));
+    let full = serde_json::to_value(&pre).unwrap();
+    // Drop the new field to simulate an old on-disk checkpoint.
+    let mut obj = match full {
+        serde_json::Value::Object(m) => m,
+        _ => unreachable!(),
+    };
+    obj.remove("config_version_id");
+    let legacy = serde_json::Value::Object(obj);
+
     let de: HeavyCheckpoint =
-        serde_json::from_value(json).expect("pre-field JSON must still deserialize");
-    assert!(de.config_version_id.is_none());
+        serde_json::from_value(legacy).expect("pre-field JSON must still deserialize");
+    assert!(
+        de.config_version_id.is_none(),
+        "missing field must default to None"
+    );
 }
