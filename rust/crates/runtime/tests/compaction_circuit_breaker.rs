@@ -136,8 +136,7 @@ fn checked_helper_increments_futile_on_no_progress() {
         json!({"role": "system", "content": "sys"}),
         json!({"role": "user", "content": "hi"}),
     ];
-    let outcome =
-        try_compact_for_retry_checked(&mut msgs, &mut tracker, Some(10_000), 1_000, 1);
+    let outcome = try_compact_for_retry_checked(&mut msgs, &mut tracker, Some(10_000), 1_000, 1);
     assert_eq!(outcome, CompactionReplayOutcome::Futile);
     assert_eq!(tracker.consecutive_futile_attempts, 1);
 }
@@ -150,13 +149,7 @@ fn checked_helper_resets_on_progress() {
     assert_eq!(tracker.consecutive_futile_attempts, 2);
 
     let mut msgs = make_messages(20);
-    let outcome = try_compact_for_retry_checked(
-        &mut msgs,
-        &mut tracker,
-        Some(200_000),
-        100_000,
-        1,
-    );
+    let outcome = try_compact_for_retry_checked(&mut msgs, &mut tracker, Some(200_000), 100_000, 1);
     match outcome {
         CompactionReplayOutcome::Compacted(result) => {
             assert!(result.tokens_freed > 0);

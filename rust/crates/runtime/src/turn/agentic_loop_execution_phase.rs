@@ -839,61 +839,85 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     sess.recovery.record_ptl_error();
                 }
 
-                if let Some(result) = super::compaction_replay::try_compact_for_retry_tiered(
+                let outcome = super::compaction_replay::try_compact_for_retry_checked(
                     &mut state.messages,
+                    &mut state.compaction_effectiveness,
                     state.last_measured_prompt_tokens,
                     state.max_turn_input_tokens,
                     state.consecutive_context_window_errors,
-                ) {
-                    let tier_label = result.tier.label();
-                    state
-                        .compaction_effectiveness
-                        .record_compaction(result.tokens_freed);
-                    // Feed compaction stats into pipeline for reserve estimation.
-                    if let Some(ref mut sess) = state.pipeline_session {
-                        sess.recovery.record_reactive_compact();
-                        sess.stats.record_compaction(result.tokens_freed);
-                    }
-                    let summary = super::compaction_replay::compaction_summary(&result);
-                    if !prep.quiet {
-                        host.emit_headless_line(
-                            HeadlessStderrStyle::Yellow,
-                            format!(
-                                "♻ Context overflow — {} pipeline: {}; retrying turn…",
-                                tier_label, summary,
-                            ),
-                        );
-                    }
+                );
+                match outcome {
+                    super::compaction_replay::CompactionReplayOutcome::Compacted(result) => {
+                        let tier_label = result.tier.label();
+                        // Feed compaction stats into pipeline for reserve estimation.
+                        if let Some(ref mut sess) = state.pipeline_session {
+                            sess.recovery.record_reactive_compact();
+                            sess.stats.record_compaction(result.tokens_freed);
+                        }
+                        let summary = super::compaction_replay::compaction_summary(&result);
+                        if !prep.quiet {
+                            host.emit_headless_line(
+                                HeadlessStderrStyle::Yellow,
+                                format!(
+                                    "♻ Context overflow — {} pipeline: {}; retrying turn…",
+                                    tier_label, summary,
+                                ),
+                            );
+                        }
 
-                    // Emit structured compaction telemetry for observability.
-                    if let Some(sid) = state.current_session_id.as_deref() {
-                        let tokens_freed = result.pipeline_outcome.total_tokens_freed;
-                        let budget_likely_satisfied = result.budget_likely_satisfied;
-                        let layers: Vec<(String, u64)> = result
-                            .pipeline_outcome
-                            .layer_results
-                            .iter()
-                            .map(|(name, cr)| (name.clone(), cr.estimated_tokens_freed))
-                            .collect();
-                        let evt = astra_services::session_journal::JournalEvent::compaction_retry(
-                            Some(sid),
-                            session_turn_number(state),
-                            tier_label,
-                            tokens_freed,
-                            budget_likely_satisfied,
-                            state.consecutive_context_window_errors,
-                            layers,
-                            state.consecutive_context_window_errors,
-                        )
-                        .with_agentic_step(Some(current_agentic_step(state)));
-                        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid)
-                        {
-                            let _ = writer.append(&evt);
+                        // Emit structured compaction telemetry for observability.
+                        if let Some(sid) = state.current_session_id.as_deref() {
+                            let tokens_freed = result.pipeline_outcome.total_tokens_freed;
+                            let budget_likely_satisfied = result.budget_likely_satisfied;
+                            let layers: Vec<(String, u64)> = result
+                                .pipeline_outcome
+                                .layer_results
+                                .iter()
+                                .map(|(name, cr)| (name.clone(), cr.estimated_tokens_freed))
+                                .collect();
+                            let evt =
+                                astra_services::session_journal::JournalEvent::compaction_retry(
+                                    Some(sid),
+                                    session_turn_number(state),
+                                    tier_label,
+                                    tokens_freed,
+                                    budget_likely_satisfied,
+                                    state.consecutive_context_window_errors,
+                                    layers,
+                                    state.consecutive_context_window_errors,
+                                )
+                                .with_agentic_step(Some(current_agentic_step(state)));
+                            if let Ok(writer) =
+                                astra_services::session_journal::JournalWriter::new(sid)
+                            {
+                                let _ = writer.append(&evt);
+                            }
+                        }
+
+                        try_write_heavy_checkpoint(state);
+                        return Ok(TurnExecutionControl::ContinueLoop);
+                    }
+                    super::compaction_replay::CompactionReplayOutcome::CircuitOpen => {
+                        // Session has burned enough futile attempts; don't
+                        // run the pipeline again. Fall through to the
+                        // ContextOverflow interruption path below so the
+                        // caller can resume from checkpoint.
+                        if !prep.quiet {
+                            host.emit_headless_line(
+                                HeadlessStderrStyle::Yellow,
+                                format!(
+                                    "♻ Context overflow — compaction circuit open after {} \
+                                     futile attempts; giving up for this session.",
+                                    state.compaction_effectiveness.consecutive_futile_attempts,
+                                ),
+                            );
                         }
                     }
-
-                    try_write_heavy_checkpoint(state);
-                    return Ok(TurnExecutionControl::ContinueLoop);
+                    super::compaction_replay::CompactionReplayOutcome::Futile => {
+                        // Single futile attempt — counter advanced by the
+                        // checked helper. Next turn's check may trip the
+                        // breaker. Fall through to interruption.
+                    }
                 }
             }
             // If we reach here with a context overflow that couldn't be
