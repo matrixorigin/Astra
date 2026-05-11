@@ -124,6 +124,15 @@ pub(crate) struct ReplState {
     pub active_system_skills: Vec<prompts::SystemSkill>,
     /// Runtime configuration loaded from config files + env vars (M3).
     pub runtime_config: astra_config::runtime_config::RuntimeConfig,
+    /// Content-addressed id of `runtime_config`. Set by
+    /// `RuntimeConfig::load_with_version` at startup and whenever
+    /// `/config` saves an edit. Threaded into HeavyCheckpoint writes
+    /// and ConfigChange journal events so post-hoc audit can answer
+    /// "what config did this session/turn run under".
+    ///
+    /// `None` only for legacy code paths that don't walk through the
+    /// version front door yet (covered by follow-up commits).
+    pub config_version_id: Option<String>,
     pub context_budget: prompts::ContextBudget,
     pub journal: Option<session_journal::JournalWriter>,
     /// Tools used in the last turn — fed into selection for recency boost.
@@ -412,6 +421,12 @@ impl Default for ReplState {
             // Load RuntimeConfig from config files + env vars, then create
             // ContextBudget using the loaded config (M3 wiring).
             runtime_config: { astra_config::runtime_config::RuntimeConfig::load() },
+            // Startup id is resolved after ReplState is constructed so
+            // `adopt_session_id` can stamp the pointer with the actual
+            // session id as PutMetadata.source_session. See
+            // `repl_runtime::resolve_startup_config_version`. Until
+            // then, legacy code paths treat None as "unknown".
+            config_version_id: None,
             // Temporary: will be replaced with from_runtime_config when model is known
             context_budget: prompts::ContextBudget::default(),
             journal: None,

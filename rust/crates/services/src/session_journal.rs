@@ -2524,6 +2524,38 @@ impl JournalEvent {
         evt
     }
 
+    /// Config-version transition event.
+    ///
+    /// Emitted when the active content-addressed config version changes
+    /// — either at session startup (`from = None`, `source = "startup"`),
+    /// after the user saves an edit via `/config` (`from = Some(prev_id)`,
+    /// `source = "slash_config_edit"`), or when the CLI `--settings`
+    /// overlay resolves to a new id (`source = "settings_overlay"`).
+    ///
+    /// Carries the ids in `metadata.config_version.{from, to, source}`
+    /// so downstream audit queries (`astra audit show <session>`,
+    /// `astra config version diff`) can reconstruct the sequence of
+    /// configs a session actually ran under without needing a separate
+    /// table join.
+    pub fn config_version_change(
+        session_id: Option<&str>,
+        turn: u32,
+        from: Option<&str>,
+        to: &str,
+        source: &str,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::ConfigChange, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(serde_json::json!({
+            "config_version": {
+                "from": from,
+                "to": to,
+                "source": source,
+            }
+        }));
+        evt
+    }
+
     /// Error event (non-turn).
     pub fn error(session_id: Option<&str>, error: &str) -> Self {
         let mut evt = Self::base(JournalEventType::Error, session_id);

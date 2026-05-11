@@ -48,8 +48,14 @@ fn config_version_change_metadata_carries_from_to_source() {
     let cfg = meta
         .get("config_version")
         .expect("metadata.config_version object");
-    assert_eq!(cfg.get("from").and_then(|v| v.as_str()), Some("cfg_from01234567"));
-    assert_eq!(cfg.get("to").and_then(|v| v.as_str()), Some("cfg_to0123456789"));
+    assert_eq!(
+        cfg.get("from").and_then(|v| v.as_str()),
+        Some("cfg_from01234567")
+    );
+    assert_eq!(
+        cfg.get("to").and_then(|v| v.as_str()),
+        Some("cfg_to0123456789")
+    );
     assert_eq!(
         cfg.get("source").and_then(|v| v.as_str()),
         Some("settings_overlay")
@@ -60,16 +66,26 @@ fn config_version_change_metadata_carries_from_to_source() {
 fn config_version_change_accepts_none_from_for_initial_load() {
     // First load of a session has no predecessor — `from` may be
     // absent. The event must still serialize cleanly.
-    let evt =
-        JournalEvent::config_version_change(Some("sess_test"), 0, None, "cfg_initial000000", "startup");
+    let evt = JournalEvent::config_version_change(
+        Some("sess_test"),
+        0,
+        None,
+        "cfg_initial000000",
+        "startup",
+    );
     let meta = evt.metadata.expect("must have metadata");
     let cfg = meta.get("config_version").expect("object");
     assert!(
-        cfg.get("from").map(|v| v.is_null() || v.is_string()).unwrap_or(true),
+        cfg.get("from")
+            .map(|v| v.is_null() || v.is_string())
+            .unwrap_or(true),
         "from should be null or string, got {:?}",
         cfg.get("from")
     );
-    assert_eq!(cfg.get("to").and_then(|v| v.as_str()), Some("cfg_initial000000"));
+    assert_eq!(
+        cfg.get("to").and_then(|v| v.as_str()),
+        Some("cfg_initial000000")
+    );
     assert_eq!(cfg.get("source").and_then(|v| v.as_str()), Some("startup"));
 }
 
@@ -88,6 +104,12 @@ fn config_version_change_round_trips_through_serde() {
     assert_eq!(de.turn, Some(7));
     let meta = de.metadata.expect("metadata survives");
     let cfg = meta.get("config_version").expect("object survives");
-    assert_eq!(cfg.get("to").and_then(|v| v.as_str()), Some("cfg_to0123456789"));
-    assert_eq!(cfg.get("from").and_then(|v| v.as_str()), Some("cfg_from01234567"));
+    assert_eq!(
+        cfg.get("to").and_then(|v| v.as_str()),
+        Some("cfg_to0123456789")
+    );
+    assert_eq!(
+        cfg.get("from").and_then(|v| v.as_str()),
+        Some("cfg_from01234567")
+    );
 }

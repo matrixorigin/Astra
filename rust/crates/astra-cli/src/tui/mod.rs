@@ -860,7 +860,34 @@ pub(crate) async fn run_tui_repl(
                                             &toml_body,
                                         );
                                         let msg = match result {
-                                            Ok(m) => history_cell::system::SystemCell::response(m),
+                                            Ok(outcome) => {
+                                                // If the save produced a new version id,
+                                                // emit a ConfigChange journal event
+                                                // recording the transition and update
+                                                // ReplState so subsequent HeavyCheckpoints
+                                                // carry the new pointer.
+                                                if let Some(save) = outcome.save.as_ref() {
+                                                    let prev = state.config_version_id.clone();
+                                                    if let (Some(ref j), Some(ref sid)) = (
+                                                        state.journal.as_ref(),
+                                                        state.session_id.as_ref(),
+                                                    ) {
+                                                        let ev = astra_services::session_journal::JournalEvent::config_version_change(
+                                                            Some(sid.as_str()),
+                                                            state.turn,
+                                                            prev.as_deref(),
+                                                            &save.new_version_id,
+                                                            save.source,
+                                                        );
+                                                        let _ = j.append(&ev);
+                                                    }
+                                                    state.config_version_id =
+                                                        Some(save.new_version_id.clone());
+                                                }
+                                                history_cell::system::SystemCell::response(
+                                                    outcome.message,
+                                                )
+                                            }
                                             Err(e) => history_cell::system::SystemCell::error(e),
                                         };
                                         chat_widget.commit_system(msg);

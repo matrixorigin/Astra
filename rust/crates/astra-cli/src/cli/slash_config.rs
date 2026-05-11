@@ -13,14 +13,23 @@
 use astra_config::runtime_config::RuntimeConfig;
 use crossterm::style::Stylize;
 use std::path::PathBuf;
+use std::sync::{OnceLock, RwLock};
 
-/// Resolve the active model for "effective budget" display. Reads the
-/// `ASTRA_CLI_ACTIVE_MODEL` env var set at startup by main.rs. Returns
+static ACTIVE_MODEL_FOR_DISPLAY: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+pub(crate) fn set_active_model_for_display(model: Option<String>) {
+    let lock = ACTIVE_MODEL_FOR_DISPLAY.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = model;
+    }
+}
+
+/// Resolve the active model for "effective budget" display. Returns
 /// `None` when no model is pinned (legacy sub-runs, tests, etc.).
 fn active_model_for_display() -> Option<String> {
-    std::env::var("ASTRA_CLI_ACTIVE_MODEL")
-        .ok()
-        .filter(|s| !s.is_empty())
+    ACTIVE_MODEL_FOR_DISPLAY
+        .get()
+        .and_then(|lock| lock.read().ok().and_then(|guard| guard.clone()))
 }
 
 /// Handle /config command.
@@ -663,6 +672,21 @@ fn run_config_edit() {
                 "✓".green(),
                 format!("Saved to {}", path.display()).cyan()
             );
+            // Content-addressed put so the saved config lands in the
+            // version store and shows up in `astra config version list`.
+            // Best-effort: no session / journal context in line mode;
+            // the next session startup will write a `startup` journal
+            // event with the new id.
+            use astra_config::config_versions::ConfigVersionStore;
+            if let Some(store) = astra_config::config_versions::LocalFileStore::at_default_root() {
+                let meta = astra_config::config_versions::PutMetadata {
+                    source_session: None,
+                    parent: None,
+                };
+                if let Ok(id) = store.put(&working, meta) {
+                    println!("  {}  config version: {}", "·".dim(), id.to_string().cyan());
+                }
+            }
         }
         Err(err) => {
             eprintln!("  {} Failed to save: {}", "✗".red(), err.to_string().red());
@@ -704,7 +728,7 @@ fn prompt_new_value(item: &astra_config::config_overlay::SettingItem) -> Option<
                 .flatten()
                 .map(serde_json::Value::from)
         }
-        SettingKind::Number { min, max } => {
+        SettingKind::Number { min, max, .. } => {
             let current = item
                 .value_as_number()
                 .map(|n| n.to_string())

@@ -7,25 +7,54 @@
 //! module does the blocking work: TOML write + in-memory overlay
 //! refresh so subsequent turns see the new values.
 
+use astra_config::config_versions::{ConfigVersionStore, LocalFileStore, PutMetadata, VersionId};
 use astra_config::runtime_config::{RuntimeConfig, set_cli_overlay};
 use std::path::PathBuf;
 
-/// Resolve a completion token into user-facing text for the scrollback.
+/// Result of resolving the `__config_edit__` completion token.
+///
+/// `message` goes to the scrollback as-is. `save` is populated only
+/// when the save succeeded; the caller uses it to stamp the ReplState
+/// pointer and emit a `ConfigChange` journal event carrying
+/// `from → to`. None means cancel / discard / error — no state change.
+#[derive(Debug)]
+pub(crate) struct FinalizeOutcome {
+    pub message: String,
+    pub save: Option<SaveRecord>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SaveRecord {
+    pub new_version_id: String,
+    pub source: &'static str,
+}
+
+/// Resolve a completion token.
 ///
 /// `action` is one of: `save_user` | `save_project` | `discard` | `cancel`.
 /// `toml_body` is the serialized `RuntimeConfig` for save_* actions; the
 /// other two ignore it.
-pub(crate) fn finalize(action: &str, toml_body: &str) -> Result<String, String> {
+pub(crate) fn finalize(action: &str, toml_body: &str) -> Result<FinalizeOutcome, String> {
     match action {
-        "save_user" => save_and_report("user", toml_body),
-        "save_project" => save_and_report("project", toml_body),
-        "discard" => Ok("Discarded config edits. Nothing written.".to_string()),
-        "cancel" => Ok("Config edit cancelled.".to_string()),
+        "save_user" => save_and_report("user", "slash_config_edit", toml_body),
+        "save_project" => save_and_report("project", "slash_config_edit", toml_body),
+        "discard" => Ok(FinalizeOutcome {
+            message: "Discarded config edits. Nothing written.".to_string(),
+            save: None,
+        }),
+        "cancel" => Ok(FinalizeOutcome {
+            message: "Config edit cancelled.".to_string(),
+            save: None,
+        }),
         other => Err(format!("Unknown config-edit action: {other}")),
     }
 }
 
-fn save_and_report(scope: &str, toml_body: &str) -> Result<String, String> {
+fn save_and_report(
+    scope: &str,
+    source: &'static str,
+    toml_body: &str,
+) -> Result<FinalizeOutcome, String> {
     let parsed: RuntimeConfig =
         toml::from_str(toml_body).map_err(|e| format!("Could not parse edited config: {e}"))?;
     let path = scope_path(scope)?;
@@ -35,7 +64,31 @@ fn save_and_report(scope: &str, toml_body: &str) -> Result<String, String> {
     }
     let pretty = toml::to_string_pretty(&parsed)
         .map_err(|e| format!("Could not serialize config back to TOML: {e}"))?;
-    std::fs::write(&path, pretty).map_err(|e| format!("Write failed {}: {e}", path.display()))?;
+    std::fs::write(&path, &pretty).map_err(|e| format!("Write failed {}: {e}", path.display()))?;
+
+    // Content-addressed put: computes the new id and dedups on repeat
+    // saves. Best-effort — if the store is unavailable (no HOME, disk
+    // full) we still report the file-system save and fall back to a
+    // pure-hash id for the journal row.
+    let new_id = match LocalFileStore::at_default_root() {
+        Some(store) => {
+            let meta = PutMetadata {
+                source_session: None, // caller stamps this when emitting the journal event
+                parent: None,
+            };
+            store
+                .put(&parsed, meta)
+                .map(|id| id.as_str().to_string())
+                .unwrap_or_else(|_| {
+                    VersionId::from_toml_bytes(pretty.as_bytes())
+                        .as_str()
+                        .to_string()
+                })
+        }
+        None => VersionId::from_toml_bytes(pretty.as_bytes())
+            .as_str()
+            .to_string(),
+    };
 
     // Refresh the process-wide overlay so the current session's next
     // turn sees the edits without having to restart. load() merges the
@@ -43,7 +96,13 @@ fn save_and_report(scope: &str, toml_body: &str) -> Result<String, String> {
     // precedence ladder take over from here.
     set_cli_overlay(None);
 
-    Ok(format!("Saved config to {}", path.display()))
+    Ok(FinalizeOutcome {
+        message: format!("Saved config to {}", path.display()),
+        save: Some(SaveRecord {
+            new_version_id: new_id,
+            source,
+        }),
+    })
 }
 
 fn scope_path(scope: &str) -> Result<PathBuf, String> {
@@ -67,9 +126,11 @@ mod tests {
     #[test]
     fn discard_and_cancel_produce_friendly_messages() {
         let a = finalize("discard", "").unwrap();
-        assert!(a.to_lowercase().contains("discard"));
+        assert!(a.message.to_lowercase().contains("discard"));
+        assert!(a.save.is_none());
         let b = finalize("cancel", "").unwrap();
-        assert!(b.to_lowercase().contains("cancel"));
+        assert!(b.message.to_lowercase().contains("cancel"));
+        assert!(b.save.is_none());
     }
 
     #[test]

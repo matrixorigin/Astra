@@ -2646,6 +2646,33 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
         let _ = journal.append(&start_event);
         // enqueue_ingestion skips if matrix_runtime is None
         enqueue_ingestion(state, &start_event);
+
+        // Resolve the content-addressed version of the config this
+        // session will run under and emit a paired `startup`
+        // ConfigChange event. If resolution fails (HOME unreadable,
+        // disk full), we degrade gracefully — state.config_version_id
+        // stays None and downstream checkpoints carry None.
+        use astra_config::config_versions::ConfigVersionStore;
+        if state.config_version_id.is_none()
+            && let Some(store) = astra_config::config_versions::LocalFileStore::at_default_root()
+        {
+            let meta = astra_config::config_versions::PutMetadata {
+                source_session: Some(session_id.to_string()),
+                parent: None,
+            };
+            if let Ok(id) = store.put(&state.runtime_config, meta) {
+                let ev = session_journal::JournalEvent::config_version_change(
+                    Some(session_id),
+                    state.turn,
+                    None,
+                    id.as_str(),
+                    "startup",
+                );
+                let _ = journal.append(&ev);
+                enqueue_ingestion(state, &ev);
+                state.config_version_id = Some(id.as_str().to_string());
+            }
+        }
     }
 
     // Keep workspace metadata in sync without resetting accumulated counters.
@@ -2951,11 +2978,10 @@ fn build_manual_heavy_step_checkpoint(
         consecutive_context_window_errors: 0,
         compaction_state: None,
         pipeline_state: None,
-        // Step 2a: this file's call-site doesn't own the startup
-        // config-version resolution. Leave None; run_lifecycle's heavy
-        // checkpoint write path (the primary write) stamps the pointer
-        // from ReplState in a follow-up wiring commit.
-        config_version_id: None,
+        // Step 2b: stamp the pointer from ReplState so this checkpoint
+        // records exactly which version of the runtime config the
+        // session ran under at the time it was written.
+        config_version_id: state.config_version_id.clone(),
     };
     StepCheckpoint::Heavy(Box::new(heavy))
 }
@@ -3309,9 +3335,23 @@ mod tests {
                 .count(),
             2,
         );
+        // initialize_journal emits SessionStart immediately followed
+        // by a ConfigChange (`source = "startup"`) recording the
+        // content-addressed version of the active RuntimeConfig. The
+        // most recent reopen must produce both events in that order.
+        let last_two: Vec<_> = events
+            .iter()
+            .rev()
+            .take(2)
+            .map(|e| e.event_type.clone())
+            .collect();
         assert_eq!(
-            events.last().map(|event| &event.event_type),
-            Some(&session_journal::JournalEventType::SessionStart)
+            last_two,
+            vec![
+                session_journal::JournalEventType::ConfigChange,
+                session_journal::JournalEventType::SessionStart,
+            ],
+            "reopen must produce SessionStart followed by a startup ConfigChange",
         );
 
         let restored_ws = astra_services::session_workspace::read_workspace(&sid).unwrap();
