@@ -26,9 +26,37 @@
 //! final column set.
 
 use astra_services::config_version_cloud::{
-    CONFIG_VERSIONS_CREATE_SQL, ConfigVersionRow, config_versions_insert_params,
-    parse_config_version_row,
+    CONFIG_VERSIONS_CREATE_SQL, CONFIG_VERSIONS_LIST_SQL, CONFIG_VERSIONS_SELECT_TOML_SQL,
+    ConfigVersionRow, config_versions_insert_params, parse_config_version_row,
 };
+
+#[test]
+fn select_toml_sql_scopes_to_user_and_version() {
+    // Pull path: exactly (user_id, version_id) positional binds.
+    // Order matters because sqlx bind positions are by index.
+    let sql = CONFIG_VERSIONS_SELECT_TOML_SQL;
+    assert!(sql.contains("FROM config_versions"), "sql: {sql}");
+    assert!(sql.contains("user_id = ?"), "sql: {sql}");
+    assert!(sql.contains("version_id = ?"), "sql: {sql}");
+    assert_eq!(
+        sql.matches('?').count(),
+        2,
+        "SELECT by id must bind exactly two positional params: {sql}"
+    );
+}
+
+#[test]
+fn list_sql_scopes_to_user_and_paginates() {
+    let sql = CONFIG_VERSIONS_LIST_SQL;
+    assert!(sql.contains("WHERE user_id = ?"));
+    assert!(sql.contains("ORDER BY created_at DESC"));
+    assert!(sql.contains("LIMIT ?"));
+    assert_eq!(
+        sql.matches('?').count(),
+        2,
+        "list expects (user_id, limit) binds only: {sql}"
+    );
+}
 
 #[test]
 fn create_sql_names_expected_columns_and_types() {
