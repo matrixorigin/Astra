@@ -1,12 +1,14 @@
 //! `/config` slash command — view and manage runtime configuration.
 //!
-//! Commands:
-//! - `/config` — Show current configuration
-//! - `/config show` — Show current configuration (same as `/config`)
+//! Primary entry point (matches the reference implementation):
+//! - `/config` — Open the interactive panel (search, pick, edit).
+//!
+//! Sub-commands (unchanged, used by scripts / for introspection):
+//! - `/config show` — Print current configuration
 //! - `/config paths` — Show configuration file paths
 //! - `/config export [path]` — Export configuration to file
 //! - `/config diff` — Show difference from defaults
-//! - `/config edit` — Interactive edit (search, pick, write back)
+//! - `/config edit` — Alias for `/config` (kept for muscle memory)
 
 use astra_config::runtime_config::RuntimeConfig;
 use crossterm::style::Stylize;
@@ -22,12 +24,18 @@ fn active_model_for_display() -> Option<String> {
 }
 
 /// Handle /config command.
+///
+/// Primary dispatch matches the reference CLI: bare `/config` opens the
+/// interactive panel. The explicit `show` sub-command is retained for
+/// scripts / introspection that want the static print.
 pub fn handle_config_command(arg: &str) {
     let parts: Vec<&str> = arg.split_whitespace().collect();
-    let subcommand = parts.first().copied().unwrap_or("show");
+    // Empty arg → open interactive panel. `edit` is an alias.
+    let subcommand = parts.first().copied().unwrap_or("");
 
     match subcommand {
-        "show" | "" => show_config(),
+        "" | "edit" => run_config_edit(),
+        "show" => show_config(),
         "paths" => show_paths(),
         "sources" => show_sources(),
         "export" => {
@@ -35,7 +43,6 @@ pub fn handle_config_command(arg: &str) {
             export_config(path);
         }
         "diff" => show_diff(),
-        "edit" => run_config_edit(),
         "help" | "-h" | "--help" => print_help(),
         _ => {
             eprintln!("{}", format!("Unknown subcommand: {}", subcommand).red());
@@ -511,13 +518,13 @@ fn print_help() {
 {title}
 
 {usage}
-  /config               Show current configuration
-  /config show          Show current configuration
+  /config               Open the interactive panel (search, pick, edit)
+  /config edit          Alias for /config
+  /config show          Print current configuration (non-interactive)
   /config paths         Show configuration file paths
   /config sources       Show where each non-default value came from
   /config export [path] Export configuration to file (or stdout)
   /config diff          Show differences from defaults
-  /config edit          Interactive: search, pick, edit a setting
 
 {hierarchy}
   Priority (higher overrides lower):
