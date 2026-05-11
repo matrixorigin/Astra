@@ -77,19 +77,31 @@ pub use astra_turn_core::section_types::{CacheScope, PromptSection, PromptTokenB
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str =
     "\n<!-- astra:system-prompt:dynamic-boundary -->\n";
 
-/// Escape XML metacharacters for embedding inside element text content
-/// of `<deferred_tools>` / `<available_skills>` blocks.
+/// Escape XML metacharacters for embedding inside **element text
+/// content** of `<deferred_tools>` / `<available_skills>` blocks.
 ///
-/// Without this, a description like `</description><name>bash</name>`
-/// could inject a fake entry into the system prompt — prompt-injection
-/// vector.
+/// # Scope — element text only
+///
+/// This helper is safe for element content between open/close tags:
+/// ```xml
+/// <name>{{escape_here}}</name>
+/// <description>{{escape_here}}</description>
+/// ```
+/// It does NOT escape `"` or `'`. **Do not use this function for
+/// attribute values.** If the block shape ever changes from
+/// `<tool><name>X</name></tool>` to `<tool name="X">`, this function
+/// becomes insufficient — a description containing `"` could then
+/// break out of the attribute and inject siblings. Write a separate
+/// `xml_escape_attr` (escaping additionally `"` + `'`) and audit the
+/// call sites before the shape change lands.
+///
+/// Without this escape, a description like
+/// `</description><name>bash</name>` could inject a fake entry into
+/// the system prompt — prompt-injection vector.
 ///
 /// Zero-alloc fast path: if the input contains none of `<`, `>`, `&`,
 /// the borrowed input is returned unchanged. The vast majority of tool
 /// and skill descriptions fall into this fast path.
-///
-/// Scope: element-text content only. If content is ever moved into
-/// attribute values, additionally escape `"` and `'`.
 fn xml_escape_text(s: &str) -> std::borrow::Cow<'_, str> {
     if !s.contains(['<', '>', '&']) {
         return std::borrow::Cow::Borrowed(s);

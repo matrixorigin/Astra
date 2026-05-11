@@ -645,10 +645,22 @@ impl ToolExecutor {
     /// Install plugin-registered schemas so `tool_search(select:NAME)`
     /// can resolve MCP / skill-backed tools. Called once at REPL start
     /// after `PluginRegistry::register` loads manifests.
+    ///
+    /// Poison handling: recovers via `into_inner()` so a prior panic
+    /// doesn't permanently disable plugin lookup. Logs a warning so
+    /// operators notice the underlying panic. Silent-drop (the previous
+    /// `if let Ok` form) would leave deferred activation broken with
+    /// zero observability — the exact class of footgun that motivated
+    /// this rewrite's other fixes.
     pub fn set_plugin_schemas(&self, schemas: Vec<Value>) {
-        if let Ok(mut guard) = self.plugin_schemas.write() {
-            *guard = schemas;
-        }
+        let mut guard = self.plugin_schemas.write().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                "CLI plugin_schemas RwLock was poisoned; recovering inner. \
+                 A prior panic held the write lock — investigate that panic first."
+            );
+            poisoned.into_inner()
+        });
+        *guard = schemas;
     }
 
     /// Set the shared context cache for cross-agent knowledge sharing.
@@ -2734,6 +2746,49 @@ mod tests {
         );
         assert_eq!(parsed["matches"][0]["name"].as_str(), Some("mcp__weather"));
         assert!(parsed["matches"][0].get("parameters").is_some());
+    }
+
+    /// Poison recovery: if a prior panic poisoned the plugin_schemas
+    /// RwLock, tool_search must STILL function rather than silently
+    /// drop the plugin pool. Silent drop would leave deferred
+    /// activation broken with zero observability.
+    #[tokio::test]
+    async fn tool_search_recovers_from_poisoned_plugin_schemas_lock() {
+        let executor = test_executor();
+        let plugin = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calc",
+                "description": "Evaluate expressions.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        });
+        executor.set_plugin_schemas(vec![plugin]);
+
+        // Simulate a prior panic-poisoned write lock.
+        let arc = std::sync::Arc::new(&executor.plugin_schemas);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = arc.write().unwrap();
+            panic!("simulated panic under write lock");
+        }));
+        assert!(
+            executor.plugin_schemas.read().is_err() || executor.plugin_schemas.write().is_err(),
+            "lock should be poisoned for the test to be meaningful"
+        );
+
+        // Now the select must still resolve the plugin via recovery.
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:mcp__calc"}),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "poisoned lock must not silently drop plugins; got: {out}"
+        );
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("mcp__calc"));
     }
 
     #[tokio::test]

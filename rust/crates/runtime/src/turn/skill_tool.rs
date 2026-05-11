@@ -167,18 +167,10 @@ pub const DISCOVER_SKILLS_TOOL_NAME: &str = "discover_skills";
 /// Max skills returned from a single `discover_skills` call.
 const DISCOVER_SKILLS_MAX_RESULTS: usize = 8;
 
-/// Character budget for the skill listing section.
-///
-/// The listing rides the volatile `<system-reminder>` every turn, so
-/// tokens here are paid per-turn (not once-per-session like the cached
-/// system prefix). 2,500c fits ~15 compact entries at the 120-char cap
-/// below; anything more is noise — the LLM picks relevant skills from
-/// the shortlist, full details come from `skill`/`discover_skills`.
-///
-/// Trimmed from 8,000 (observed 2.3K-char skill blocks in production
-/// consuming ~575 tokens/turn on default skill sets).
-#[cfg(test)]
-const DEFAULT_SKILL_LISTING_BUDGET: usize = 2_500;
+// `DEFAULT_SKILL_LISTING_BUDGET` was removed — its only consumer,
+// `format_skills_within_budget`, is now test-only scaffolding that no
+// longer relies on a shared budget constant. Current production uses
+// `build_skill_listing_section` which doesn't truncate.
 
 /// Per-entry description cap. Listing is for discovery only — the full content
 /// is loaded when a skill is actually invoked. Trimmed from 250 to 120:

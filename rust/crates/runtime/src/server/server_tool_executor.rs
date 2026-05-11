@@ -1074,10 +1074,19 @@ impl ServerToolExecutor {
     /// Install plugin-registered schemas (MCP, etc.) so
     /// `tool_search(select:NAME)` can resolve them for deferred activation.
     /// Called by the server loop host after MCP manager refresh.
+    ///
+    /// Poison handling: recovers via `into_inner()` so a prior panic
+    /// doesn't permanently disable plugin lookup server-side. Logs a
+    /// warning so operators can trace the underlying panic.
     pub fn set_plugin_schemas(&self, schemas: Vec<Value>) {
-        if let Ok(mut guard) = self.plugin_schemas.write() {
-            *guard = schemas;
-        }
+        let mut guard = self.plugin_schemas.write().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                "server plugin_schemas RwLock was poisoned; recovering inner. \
+                 A prior panic held the write lock — investigate that panic first."
+            );
+            poisoned.into_inner()
+        });
+        *guard = schemas;
     }
 
     /// Inject the plan repository so plan-mode tools and the write-tool guard
@@ -1300,9 +1309,13 @@ impl ServerToolExecutor {
             // MCP/skill-backed tools would never resolve.
             "tool_search" => {
                 let mut pool = astra_tools::schemas::server_executor_tool_schemas();
-                if let Ok(guard) = self.plugin_schemas.read() {
-                    pool.extend(guard.iter().cloned());
-                }
+                // Poison recovery: recover inner so deferred activation
+                // survives a prior panic. See set_plugin_schemas doc.
+                let guard = self.plugin_schemas.read().unwrap_or_else(|poisoned| {
+                    tracing::warn!("server plugin_schemas RwLock poisoned on read; recovering.");
+                    poisoned.into_inner()
+                });
+                pool.extend(guard.iter().cloned());
                 tool_result_from_output(astra_tools::tool_search::tool_search(&pool, args))
             }
             // ── Web search (standalone function) ───────────────────────

@@ -257,11 +257,23 @@ impl Default for RuntimeConfig {
 ///   system-reminder block. The model calls `tool_search(query="select:X")`
 ///   to pull a schema into context when it needs X.
 ///
-/// Entries in `pinned_tools`:
+/// # `pinned_tools` semantics
+///
+/// **Within a single config file** (e.g. one `runtime.toml`), entries
+/// apply additively to the built-in [`DEFAULT_PINNED`](runtime crate) set:
 /// - A plain name (e.g. `"github"`) *adds* that tool to the pinned set.
-/// - A name prefixed with `-` (e.g. `"-grep"`) *removes* a default from the
-///   pinned set (it lands in deferred instead).
-/// - Unknown names are silently ignored.
+/// - A name prefixed with `-` (e.g. `"-grep"`) *removes* a default from
+///   the pinned set (it lands in deferred instead).
+/// - Unknown names, whitespace-only, bare `-`, or `--foo` are silently
+///   ignored (see `ToolSurface::build`).
+///
+/// **Across config layers** (user `~/.astra/config/runtime.toml` vs.
+/// project `.astra/config/runtime.toml`), the merge is **atomic, not
+/// additive**: a project-level `pinned_tools` list fully replaces the
+/// user-level one. This is intentional — a project should own its tool
+/// surface without silently inheriting a user's personal pins. If you
+/// want user-level pins in a project session, copy them into the project
+/// file. See `merge()` at the bottom of this file for the precise rule.
 ///
 /// Example `runtime.toml`:
 /// ```toml
@@ -270,8 +282,9 @@ impl Default for RuntimeConfig {
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolSurfaceConfig {
-    /// Tools to pin into the LLM `tools[]` array. Additive over defaults;
-    /// `"-name"` removes a default.
+    /// Tools to pin into the LLM `tools[]` array. See struct-level
+    /// doc for within-file (additive) vs cross-file (atomic replace)
+    /// semantics.
     #[serde(default)]
     pub pinned_tools: Vec<String>,
 }
