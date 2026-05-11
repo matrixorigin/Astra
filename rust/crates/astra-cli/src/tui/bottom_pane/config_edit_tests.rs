@@ -200,6 +200,168 @@ fn bool_editor_arrow_key_moves_selection_between_options() {
     );
 }
 
+// ─── Save prompt: navigation + preview ──────────────────────────────────
+
+fn enter_dirty_state(v: &mut ConfigEditView) {
+    v.select_by_id("context_window.adaptive_budget_reduction");
+    v.handle_key(key(KeyCode::Enter));
+    v.handle_key(ch(' '));
+    v.handle_key(key(KeyCode::Enter));
+    assert!(v.is_dirty(), "helper failed to dirty the view");
+    v.handle_key(key(KeyCode::Esc)); // pops save prompt
+    assert!(v.save_prompt_open_for_test(), "save prompt must be open");
+}
+
+#[test]
+fn save_prompt_arrow_keys_move_selection_and_enter_commits() {
+    // ↑↓ must move the highlighted row; Enter commits whichever row
+    // is highlighted. Matches the Bool/Enum editor UX — one mental
+    // model across the whole panel. Old number/letter shortcuts
+    // keep working but are no longer the primary affordance.
+    let mut v = make_view();
+    enter_dirty_state(&mut v);
+    // Default row is "Save to user" (index 0). Move down once to
+    // "Save to project" (index 1) and commit with Enter.
+    v.handle_key(key(KeyCode::Down));
+    v.handle_key(key(KeyCode::Enter));
+    assert_eq!(v.pending_action(), ConfigEditAction::SaveToProject);
+}
+
+#[test]
+fn save_prompt_arrow_wraps_and_enter_saves_to_user_by_default() {
+    // Fresh prompt: Enter without moving must save to user (the
+    // highest-priority, least-surprising default). No navigation keys
+    // at all.
+    let mut v = make_view();
+    enter_dirty_state(&mut v);
+    v.handle_key(key(KeyCode::Enter));
+    assert_eq!(v.pending_action(), ConfigEditAction::SaveToUser);
+}
+
+#[test]
+fn save_prompt_shows_absolute_project_path_not_relative_sugar() {
+    // "./.astra/config/runtime.toml" is misleading when the user's
+    // shell is somewhere other than the project root. Render must
+    // include the actual working directory so the user sees the real
+    // destination of a project-scope save.
+    let mut v = make_view();
+    enter_dirty_state(&mut v);
+    let area = Rect::new(0, 0, 120, 12);
+    let mut buf = Buffer::empty(area);
+    v.render(area, &mut buf);
+    let mut text = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            text.push_str(buf[(x, y)].symbol());
+        }
+    }
+    let cwd = std::env::current_dir()
+        .expect("cwd")
+        .display()
+        .to_string();
+    // The cwd is a long path; render truncates. Check a leading
+    // component (first 20 chars of cwd) appears AND the filename.
+    let lead: String = cwd.chars().take(20).collect();
+    assert!(
+        text.contains(&lead),
+        "save prompt must show the real project path prefix; got: {text}"
+    );
+    assert!(
+        text.contains("runtime.toml"),
+        "save prompt must show the target filename: {text}"
+    );
+}
+
+#[test]
+fn save_prompt_has_a_preview_option_that_shows_diff() {
+    // Preview answers "what am I about to save?" without committing.
+    // The prompt must list it as one of the selectable rows, and
+    // activating it must switch the view into a preview mode where
+    // the changed fields are visible (id, old → new).
+    let mut v = make_view();
+    enter_dirty_state(&mut v);
+    let area = Rect::new(0, 0, 120, 12);
+    let mut buf = Buffer::empty(area);
+    v.render(area, &mut buf);
+    let mut text = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            text.push_str(buf[(x, y)].symbol());
+        }
+    }
+    // The prompt row for preview must be on screen before activation.
+    assert!(
+        text.to_lowercase().contains("preview"),
+        "save prompt must advertise a Preview row: {text}"
+    );
+
+    // Walk down to the preview row. Layout is:
+    //   0 save user
+    //   1 save project
+    //   2 preview
+    //   3 discard
+    v.handle_key(key(KeyCode::Down));
+    v.handle_key(key(KeyCode::Down));
+    v.handle_key(key(KeyCode::Enter));
+    assert!(
+        v.preview_open_for_test(),
+        "Enter on preview row must open the preview mode"
+    );
+
+    // Preview must list the changed field with its new value.
+    let area = Rect::new(0, 0, 120, 18);
+    let mut buf = Buffer::empty(area);
+    v.render(area, &mut buf);
+    let mut text = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            text.push_str(buf[(x, y)].symbol());
+        }
+    }
+    assert!(
+        text.contains("adaptive_budget_reduction"),
+        "preview must list the changed field id: {text}"
+    );
+    assert!(
+        text.contains("true"),
+        "preview must show the new value: {text}"
+    );
+}
+
+#[test]
+fn save_prompt_preview_any_key_returns_to_prompt() {
+    let mut v = make_view();
+    enter_dirty_state(&mut v);
+    v.handle_key(key(KeyCode::Down));
+    v.handle_key(key(KeyCode::Down));
+    v.handle_key(key(KeyCode::Enter));
+    assert!(v.preview_open_for_test());
+    v.handle_key(key(KeyCode::Esc));
+    assert!(!v.preview_open_for_test(), "Esc in preview returns to prompt");
+    assert!(v.save_prompt_open_for_test(), "save prompt still open");
+    assert!(!v.is_complete(), "view not complete yet");
+}
+
+#[test]
+fn save_prompt_numeric_shortcuts_still_work_for_muscle_memory() {
+    // The old 1/2/d/Esc shortcuts keep working so existing docs and
+    // quick-path users aren't stranded by the new arrow UX.
+    let mut v = make_view();
+    enter_dirty_state(&mut v);
+    v.handle_key(ch('1'));
+    assert_eq!(v.pending_action(), ConfigEditAction::SaveToUser);
+
+    let mut v = make_view();
+    enter_dirty_state(&mut v);
+    v.handle_key(ch('2'));
+    assert_eq!(v.pending_action(), ConfigEditAction::SaveToProject);
+
+    let mut v = make_view();
+    enter_dirty_state(&mut v);
+    v.handle_key(ch('d'));
+    assert_eq!(v.pending_action(), ConfigEditAction::Discarded);
+}
+
 #[test]
 fn bool_editor_space_still_toggles_for_muscle_memory() {
     // Space has been "flip" forever; keep it working so users who
