@@ -1,9 +1,9 @@
 //! Rendering layer for the `/context` panel.
 //!
-//! Mirrors Claude Code's `/context` view: a grid visualization on the
-//! left (one glyph ≈ 2 % of the context window) paired with a
-//! category legend on the right, then nested sub-sections below for
-//! tools / memory / skills / system-prompt sections.  Everything
+//! Visual grammar: a grid on the left (one glyph ≈ 2 % of the
+//! context window) paired with a category legend on the right,
+//! then nested sub-sections below for tools / memory / skills /
+//! system-prompt sections.  Everything
 //! goes through `build_lines(breakdown, width)` which produces a
 //! `Vec<Line<'static>>` — the wrapping view renders whatever slice
 //! of that list fits the current area, offset by the scroll position
@@ -50,7 +50,7 @@ use super::model::{
 
 /// Grid geometry. The grid lives in the left column of the two-pane
 /// top section. 5 rows × 10 cols = 50 glyphs — each glyph therefore
-/// represents 2 % of the budget. Matches Claude Code's density.
+/// represents 2 % of the budget.
 pub(crate) const GRID_ROWS: usize = 5;
 pub(crate) const GRID_COLS: usize = 10;
 pub(crate) const GRID_CELLS: usize = GRID_ROWS * GRID_COLS;
@@ -181,10 +181,7 @@ pub(crate) fn section_item_count(b: &ContextBreakdown, section: Section) -> usiz
         Section::Tools => b.tools.len(),
         Section::Decisions => b.decisions.len(),
         Section::Compaction => b.compaction.events.len(),
-        Section::SystemPrompt
-        | Section::PromptSignals
-        | Section::Session
-        | Section::Skills => 0,
+        Section::SystemPrompt | Section::PromptSignals | Section::Session | Section::Skills => 0,
     }
 }
 
@@ -344,12 +341,14 @@ fn render_section(
     let expanded = state.is_expanded(section);
     match section {
         Section::SystemPrompt => {
-            out.push(section_heading_for(Section::SystemPrompt, focused, expanded));
+            out.push(section_heading_for(
+                Section::SystemPrompt,
+                focused,
+                expanded,
+            ));
             for s in &b.system_sections {
                 out.push(section_row(&format!(" {}", s.name), s.tokens));
-                if expanded
-                    && let Some(preview) = &s.preview
-                {
+                if expanded && let Some(preview) = &s.preview {
                     out.push(Line::from(vec![
                         Span::raw("        "),
                         Span::styled(
@@ -416,13 +415,7 @@ fn render_section(
                 render_history_drill(out, &b.history.turns, state.selected_item);
                 out.push(Line::default());
             } else {
-                append_history_section(
-                    out,
-                    &b.history,
-                    focused,
-                    expanded,
-                    state.selected_item,
-                );
+                append_history_section(out, &b.history, focused, expanded, state.selected_item);
             }
         }
         Section::Session => {
@@ -439,13 +432,7 @@ fn render_section(
                 render_decision_drill(out, &b.decisions, state.selected_item);
                 out.push(Line::default());
             } else {
-                append_decisions_section(
-                    out,
-                    &b.decisions,
-                    focused,
-                    expanded,
-                    state.selected_item,
-                );
+                append_decisions_section(out, &b.decisions, focused, expanded, state.selected_item);
             }
         }
         Section::Compaction => {
@@ -526,9 +513,9 @@ fn top_block_lines(b: &ContextBreakdown, inner_width: u16) -> Vec<Line<'static>>
     out
 }
 
-/// A single grid cell (glyph + trailing space). Glyph choice mimics
-/// Claude Code: filled block `⛁` for consumed tokens, empty `⛶` for
-/// free space. Coloured by the category that owns the cell.
+/// A single grid cell (glyph + trailing space). Glyph choice: a
+/// filled block `⛁` for consumed tokens, empty `⛶` for free
+/// space. Coloured by the category that owns the cell.
 fn render_grid_cells(b: &ContextBreakdown) -> Vec<Span<'static>> {
     let mut out = Vec::with_capacity(GRID_CELLS);
     // Fill the cells category-by-category proportionally. Rounding
@@ -744,11 +731,7 @@ fn append_history_section(
     out.push(Line::default());
 }
 
-fn turn_detail_lines(
-    t: &TurnDetail,
-    compressed: bool,
-    selected: bool,
-) -> Vec<Line<'static>> {
+fn turn_detail_lines(t: &TurnDetail, compressed: bool, selected: bool) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     // Leading marker reserves two columns: `▸ ` when this row is
     // the ↑/↓-selected item, two spaces otherwise. Keeps column
@@ -763,8 +746,7 @@ fn turn_detail_lines(
     } else {
         Span::raw("  ")
     };
-    let mut spans: Vec<Span<'static>> =
-        vec![Span::raw("      "), marker.clone(), Span::raw("└ ")];
+    let mut spans: Vec<Span<'static>> = vec![Span::raw("      "), marker.clone(), Span::raw("└ ")];
     let id_style = if selected {
         Style::default()
             .fg(Color::Cyan)
@@ -772,18 +754,11 @@ fn turn_detail_lines(
     } else {
         Style::default()
     };
-    spans.push(Span::styled(
-        format!("#{} {}", t.index, t.role),
-        id_style,
-    ));
+    spans.push(Span::styled(format!("#{} {}", t.index, t.role), id_style));
     if compressed {
         if let Some((orig, method)) = &t.compressed_from {
             spans.push(Span::styled(
-                format!(
-                    "   {} → {} tokens",
-                    fmt_tokens(*orig),
-                    fmt_tokens(t.tokens)
-                ),
+                format!("   {} → {} tokens", fmt_tokens(*orig), fmt_tokens(t.tokens)),
                 Style::default().add_modifier(Modifier::DIM),
             ));
             spans.push(Span::styled(
@@ -831,11 +806,7 @@ fn turn_detail_lines(
     out
 }
 
-fn append_tools_expanded(
-    out: &mut Vec<Line<'static>>,
-    tools: &[ToolItem],
-    selected_item: usize,
-) {
+fn append_tools_expanded(out: &mut Vec<Line<'static>>, tools: &[ToolItem], selected_item: usize) {
     out.push(Line::from(vec![
         Span::raw("    "),
         Span::styled(
@@ -885,11 +856,7 @@ fn append_tools_expanded(
 
 /// Drill view for a single selected tool — all selection factors,
 /// not just the top 3.
-fn render_tool_drill(
-    out: &mut Vec<Line<'static>>,
-    tools: &[ToolItem],
-    selected_item: usize,
-) {
+fn render_tool_drill(out: &mut Vec<Line<'static>>, tools: &[ToolItem], selected_item: usize) {
     let Some(t) = tools.get(selected_item) else {
         return;
     };
@@ -945,11 +912,7 @@ fn render_tool_drill(
 
 /// Drill view for a single selected history turn — render the
 /// full body text wrapped at the inner width.
-fn render_history_drill(
-    out: &mut Vec<Line<'static>>,
-    turns: &[TurnDetail],
-    selected_item: usize,
-) {
+fn render_history_drill(out: &mut Vec<Line<'static>>, turns: &[TurnDetail], selected_item: usize) {
     let Some(t) = turns.get(selected_item) else {
         return;
     };
@@ -1005,10 +968,7 @@ fn render_history_drill(
         return;
     }
     for line in wrap_text(body.trim(), 70, 40) {
-        out.push(Line::from(vec![
-            Span::raw("        "),
-            Span::raw(line),
-        ]));
+        out.push(Line::from(vec![Span::raw("        "), Span::raw(line)]));
     }
 }
 
@@ -1042,10 +1002,7 @@ fn render_memory_drill(
         ),
     ]));
     for line in wrap_text(m.preview.trim(), 70, 40) {
-        out.push(Line::from(vec![
-            Span::raw("        "),
-            Span::raw(line),
-        ]));
+        out.push(Line::from(vec![Span::raw("        "), Span::raw(line)]));
     }
 }
 
@@ -1082,10 +1039,7 @@ fn render_decision_drill(
             Span::styled("Reasoning", Style::default().add_modifier(Modifier::BOLD)),
         ]));
         for line in wrap_text(d.reasoning.trim(), 68, 20) {
-            out.push(Line::from(vec![
-                Span::raw("          "),
-                Span::raw(line),
-            ]));
+            out.push(Line::from(vec![Span::raw("          "), Span::raw(line)]));
         }
     }
     if !d.alternatives.is_empty() {
@@ -1281,18 +1235,12 @@ fn append_memory_focus(out: &mut Vec<Line<'static>>, focus: &super::model::Memor
                 "Repository memories",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                "  (.astra/memories)",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("  (.astra/memories)", Style::default().fg(Color::DarkGray)),
         ]));
         for r in &focus.repository {
             out.push(Line::from(vec![
                 Span::raw("        └ "),
-                Span::raw(format!(
-                    "\"{}\"",
-                    truncate_preview(&r.preview, 100)
-                )),
+                Span::raw(format!("\"{}\"", truncate_preview(&r.preview, 100))),
                 Span::styled(
                     format!("   {} tokens", fmt_tokens(r.tokens)),
                     Style::default().add_modifier(Modifier::DIM),
@@ -1424,7 +1372,11 @@ fn append_prompt_signals_section(
     if signals.is_empty() {
         return;
     }
-    out.push(section_heading_for(Section::PromptSignals, focused, expanded));
+    out.push(section_heading_for(
+        Section::PromptSignals,
+        focused,
+        expanded,
+    ));
     // Collapsed: one row listing all active names separated by `·`.
     // Expanded: one row per signal with a description.
     if expanded {
@@ -1616,7 +1568,11 @@ fn append_compaction_section(
             Span::raw(format!(
                 "{} compaction{} in session — turns: {}",
                 c.compressed_turns.len(),
-                if c.compressed_turns.len() == 1 { "" } else { "s" },
+                if c.compressed_turns.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
                 rendered.join(", "),
             )),
         ]));
@@ -1718,7 +1674,11 @@ fn render_compaction_drill(
         Span::styled(
             format!(
                 "  (saved {}, −{:.0}%)",
-                fmt_tokens(event.original_tokens.saturating_sub(event.compressed_tokens)),
+                fmt_tokens(
+                    event
+                        .original_tokens
+                        .saturating_sub(event.compressed_tokens)
+                ),
                 pct_saved
             ),
             Style::default().fg(Color::DarkGray),
@@ -1741,10 +1701,7 @@ fn render_compaction_drill(
         ]));
         for lost in &event.information_lost {
             for line in wrap_text(lost, 66, 4) {
-                out.push(Line::from(vec![
-                    Span::raw("          · "),
-                    Span::raw(line),
-                ]));
+                out.push(Line::from(vec![Span::raw("          · "), Span::raw(line)]));
             }
         }
     } else {
@@ -1910,9 +1867,7 @@ fn wrap_text(text: &str, width: usize, max_rows: usize) -> Vec<String> {
     if out.len() == max_rows {
         let more_rows_exist = text.lines().count() > max_rows
             || text.chars().count() > out.iter().map(|s| s.chars().count()).sum::<usize>();
-        if more_rows_exist
-            && let Some(last) = out.last_mut()
-        {
+        if more_rows_exist && let Some(last) = out.last_mut() {
             let max_last = width.saturating_sub(1);
             while last.chars().count() > max_last {
                 last.pop();
@@ -2002,8 +1957,7 @@ mod tests {
 
     #[test]
     fn snapshot_low_pressure_80x14() {
-        let b =
-            ContextBreakdown::from_trace(&trace(100_000, 2_000, 15_000, 500, 4_000, 200));
+        let b = ContextBreakdown::from_trace(&trace(100_000, 2_000, 15_000, 500, 4_000, 200));
         insta::assert_snapshot!("context_panel_low_80x14", render_panel(&b, 80, 14));
     }
 
@@ -2015,8 +1969,7 @@ mod tests {
 
     #[test]
     fn snapshot_critical_pressure_80x14() {
-        let b =
-            ContextBreakdown::from_trace(&trace(100_000, 12_000, 70_000, 2_000, 10_000, 1_500));
+        let b = ContextBreakdown::from_trace(&trace(100_000, 12_000, 70_000, 2_000, 10_000, 1_500));
         insta::assert_snapshot!("context_panel_critical_80x14", render_panel(&b, 80, 14));
     }
 
@@ -2060,8 +2013,7 @@ mod tests {
         );
         snap.history_previews.insert(
             1,
-            "I'll start by reading auth.rs and mapping out every caller."
-                .into(),
+            "I'll start by reading auth.rs and mapping out every caller.".into(),
         );
         snap.history_previews
             .insert(2, "Thanks — now make the helper private.".into());
@@ -2081,8 +2033,8 @@ mod tests {
             drilled: false,
         };
         let lines = build_lines_with(&b, 100, state);
-        let p = ratatui::widgets::Paragraph::new(lines)
-            .wrap(ratatui::widgets::Wrap { trim: false });
+        let p =
+            ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         let buf = draw_widget(p, 100, 30);
         insta::assert_snapshot!(
             "context_panel_history_expanded_100x30",
@@ -2122,13 +2074,10 @@ mod tests {
             drilled: true,
         };
         let lines = build_lines_with(&b, 100, state);
-        let p = ratatui::widgets::Paragraph::new(lines)
-            .wrap(ratatui::widgets::Wrap { trim: false });
+        let p =
+            ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         let buf = draw_widget(p, 100, 30);
-        insta::assert_snapshot!(
-            "context_panel_history_drill_100x30",
-            buffer_to_string(&buf)
-        );
+        insta::assert_snapshot!("context_panel_history_drill_100x30", buffer_to_string(&buf));
     }
 
     #[test]
@@ -2196,7 +2145,10 @@ mod tests {
             },
         ];
         let b = ContextBreakdown::from_trace(&t);
-        insta::assert_snapshot!("context_panel_history_shortlist_80x28", render_panel(&b, 80, 28));
+        insta::assert_snapshot!(
+            "context_panel_history_shortlist_80x28",
+            render_panel(&b, 80, 28)
+        );
     }
 
     #[test]
@@ -2241,7 +2193,10 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(text.contains("shortlist"), "shortlist label missing: {text}");
+        assert!(
+            text.contains("shortlist"),
+            "shortlist label missing: {text}"
+        );
         assert!(text.contains("my_skill"), "skill name missing: {text}");
         // No fake "0 tokens" noise for shortlist entries.
         assert!(
@@ -2339,7 +2294,10 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(text.contains("Free space"), "free space row missing: {text}");
+        assert!(
+            text.contains("Free space"),
+            "free space row missing: {text}"
+        );
     }
 
     #[test]
@@ -2385,7 +2343,9 @@ mod tests {
         let b = ContextBreakdown::from_trace_with(&t, &snap);
         let state = ViewState {
             focus: Some(Section::History),
-            expanded: Some(Section::History), selected_item: 0, drilled: false,
+            expanded: Some(Section::History),
+            selected_item: 0,
+            drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()
@@ -2434,7 +2394,9 @@ mod tests {
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::Memory),
-            expanded: Some(Section::Memory), selected_item: 0, drilled: false,
+            expanded: Some(Section::Memory),
+            selected_item: 0,
+            drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()
@@ -2446,10 +2408,7 @@ mod tests {
         assert!(text.contains("42ms"), "latency missing: {text}");
         assert!(text.contains("Rejected (1)"), "rejected header: {text}");
         assert!(text.contains("below threshold"), "reason: {text}");
-        assert!(
-            text.contains("Repository memories"),
-            "repo header: {text}"
-        );
+        assert!(text.contains("Repository memories"), "repo header: {text}");
         assert!(text.contains("# Project rules"), "repo preview: {text}");
     }
 
@@ -2482,7 +2441,9 @@ mod tests {
 
         let expanded_state = ViewState {
             focus: Some(Section::PromptSignals),
-            expanded: Some(Section::PromptSignals), selected_item: 0, drilled: false,
+            expanded: Some(Section::PromptSignals),
+            selected_item: 0,
+            drilled: false,
         };
         let expanded: String = build_lines_with(&b, 80, expanded_state)
             .iter()
@@ -2512,7 +2473,9 @@ mod tests {
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::Decisions),
-            expanded: Some(Section::Decisions), selected_item: 0, drilled: false,
+            expanded: Some(Section::Decisions),
+            selected_item: 0,
+            drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()
@@ -2593,7 +2556,7 @@ mod tests {
         snap.session = Some(SessionSummary {
             session_id: "abcdef12-full".into(),
             turn: 5,
-            model: Some("claude-sonnet-4.6".into()),
+            model: Some("test-model-x".into()),
             total_cost: 0.12,
             max_budget: 1.0,
             prompt_tokens: 1200,
@@ -2607,7 +2570,9 @@ mod tests {
         let b = ContextBreakdown::from_trace_with(&t, &snap);
         let state = ViewState {
             focus: Some(Section::Session),
-            expanded: Some(Section::Session), selected_item: 0, drilled: false,
+            expanded: Some(Section::Session),
+            selected_item: 0,
+            drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()
@@ -2616,7 +2581,7 @@ mod tests {
             .join(" ");
         assert!(text.contains("sid abcdef12"), "short sid: {text}");
         assert!(text.contains("turn 5"));
-        assert!(text.contains("claude-sonnet-4.6"));
+        assert!(text.contains("test-model-x"));
         assert!(text.contains("$0.1200"));
         assert!(text.contains("/ $1.00"));
         assert!(text.contains("refactoring auth"));
@@ -2631,11 +2596,13 @@ mod tests {
         let mut snap = ContextSnapshot::default();
         snap.cwd = Some("~/github/astra".into());
         snap.git_branch = Some("improve_tui3".into());
-        snap.model = Some("claude-sonnet-4.6");
+        snap.model = Some("test-model-x");
         let b = ContextBreakdown::from_trace_with(&t, &snap);
         let state = ViewState {
             focus: Some(Section::SystemPrompt),
-            expanded: Some(Section::SystemPrompt), selected_item: 0, drilled: false,
+            expanded: Some(Section::SystemPrompt),
+            selected_item: 0,
+            drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()
@@ -2646,12 +2613,9 @@ mod tests {
             text.contains("~/github/astra"),
             "cwd preview missing: {text}"
         );
+        assert!(text.contains("improve_tui3"), "git branch missing: {text}");
         assert!(
-            text.contains("improve_tui3"),
-            "git branch missing: {text}"
-        );
-        assert!(
-            text.contains("claude-sonnet-4.6"),
+            text.contains("test-model-x"),
             "model persona missing: {text}"
         );
     }
@@ -2708,7 +2672,9 @@ mod tests {
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::History),
-            expanded: Some(Section::History), selected_item: 0, drilled: false,
+            expanded: Some(Section::History),
+            selected_item: 0,
+            drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()
@@ -2727,10 +2693,7 @@ mod tests {
             "compressed turn missing: {text}"
         );
         assert!(text.contains("via"), "compression method missing: {text}");
-        assert!(
-            text.contains("Dropped: #3"),
-            "dropped turn missing: {text}"
-        );
+        assert!(text.contains("Dropped: #3"), "dropped turn missing: {text}");
     }
 
     #[test]
@@ -2747,7 +2710,9 @@ mod tests {
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::Memory),
-            expanded: Some(Section::Memory), selected_item: 0, drilled: false,
+            expanded: Some(Section::Memory),
+            selected_item: 0,
+            drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()
@@ -2824,7 +2789,10 @@ mod tests {
     fn wrap_text_respects_explicit_paragraphs() {
         let rows = wrap_text("one\n\ntwo", 30, 10);
         // Middle blank row preserved as a paragraph break.
-        assert_eq!(rows, vec!["one".to_string(), String::new(), "two".to_string()]);
+        assert_eq!(
+            rows,
+            vec!["one".to_string(), String::new(), "two".to_string()]
+        );
     }
 
     #[test]
@@ -2861,10 +2829,19 @@ mod tests {
         let lines = build_lines_with(&b, 80, state);
         let marker_rows: Vec<String> = lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .filter(|s| s.contains('▸'))
             .collect();
-        assert_eq!(marker_rows.len(), 1, "exactly one selected row: {marker_rows:?}");
+        assert_eq!(
+            marker_rows.len(),
+            1,
+            "exactly one selected row: {marker_rows:?}"
+        );
         assert!(
             marker_rows[0].contains("#1 assistant"),
             "marker lands on the selected turn: {marker_rows:?}"
@@ -2900,7 +2877,10 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(text.contains("Second paragraph"), "full body missing: {text}");
+        assert!(
+            text.contains("Second paragraph"),
+            "full body missing: {text}"
+        );
         assert!(text.contains("Esc back"), "drill hint missing: {text}");
     }
 
@@ -2955,13 +2935,13 @@ mod tests {
             score: 0.9,
             tokens: 200,
             selection_factors: (0..6)
-                .map(|i| {
-                    astra_turn_core::context_assembly_trace::SelectionFactor {
+                .map(
+                    |i| astra_turn_core::context_assembly_trace::SelectionFactor {
                         factor_name: format!("factor_{i}"),
                         weight: 0.1 * (i as f64),
                         contribution: 0.05 * (i as f64),
-                    }
-                })
+                    },
+                )
                 .collect(),
         }];
         let b = ContextBreakdown::from_trace(&t);
@@ -3027,7 +3007,9 @@ mod tests {
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::Tools),
-            expanded: Some(Section::Tools), selected_item: 0, drilled: false,
+            expanded: Some(Section::Tools),
+            selected_item: 0,
+            drilled: false,
         };
         let text: String = build_lines_with(&b, 80, state)
             .iter()
@@ -3119,6 +3101,6 @@ mod tests {
         let b = ContextBreakdown::from_trace(&trace(100_000, 10_000, 0, 0, 0, 0));
         let cells = render_grid_cells(&b);
         assert_eq!(cells.len(), GRID_CELLS);
-        assert_eq!(cells.len(), 50, "5 × 10 grid is Claude Code's density");
+        assert_eq!(cells.len(), 50, "5 × 10 grid: one glyph ≈ 2% of budget");
     }
 }

@@ -441,7 +441,12 @@ fn memory_rejection_reasons_render_human_readable() {
         },
     ];
     let b = ContextBreakdown::from_trace(&t);
-    let reasons: Vec<&str> = b.memory_focus.rejected.iter().map(|r| r.reason.as_str()).collect();
+    let reasons: Vec<&str> = b
+        .memory_focus
+        .rejected
+        .iter()
+        .map(|r| r.reason.as_str())
+        .collect();
     assert!(reasons[0].contains("below threshold"));
     assert!(reasons[1].contains("token budget"));
     assert!(reasons[2].contains("duplicate of m-kept"));
@@ -633,7 +638,7 @@ fn session_summary_flows_through_snapshot() {
     snap.session = Some(SessionSummary {
         session_id: "abcdef12-full-uuid".into(),
         turn: 5,
-        model: Some("claude-sonnet-4.6".into()),
+        model: Some("test-model-x".into()),
         total_cost: 0.1234,
         max_budget: 1.0,
         prompt_tokens: 12_000,

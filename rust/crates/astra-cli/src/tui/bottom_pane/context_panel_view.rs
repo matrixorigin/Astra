@@ -143,7 +143,11 @@ impl ContextPanelView {
         // Walk the cycle until we hit a section with content or
         // wrap back to where we started (safety against all-empty).
         let start = current;
-        let mut next = if reverse { current.prev() } else { current.next() };
+        let mut next = if reverse {
+            current.prev()
+        } else {
+            current.next()
+        };
         while next != start {
             if self.breakdown.section_non_empty(next) {
                 break;
@@ -223,11 +227,10 @@ impl ContextPanelView {
         // Find the marker row. Every selected-item header carries
         // a literal `▸` in exactly one span — and only one item
         // per section is selected at a time.
-        let Some(marker_row) = lines.iter().position(|l| {
-            l.spans
-                .iter()
-                .any(|s| s.content.as_ref().contains('▸'))
-        }) else {
+        let Some(marker_row) = lines
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.as_ref().contains('▸')))
+        else {
             return;
         };
 
@@ -238,10 +241,7 @@ impl ContextPanelView {
         // or the end of the line list.
         let mut block_bottom = marker_row;
         for (i, line) in lines.iter().enumerate().skip(marker_row + 1) {
-            let has_marker = line
-                .spans
-                .iter()
-                .any(|s| s.content.as_ref().contains('▸'));
+            let has_marker = line.spans.iter().any(|s| s.content.as_ref().contains('▸'));
             if has_marker {
                 break;
             }
@@ -260,7 +260,8 @@ impl ContextPanelView {
             // preview-indent column (text_offset >= 13). Anything
             // looking like a new `#N role` sibling wraps us up.
             let trimmed = text.trim_start();
-            if trimmed.starts_with("└ #") || trimmed.starts_with("└ bash")
+            if trimmed.starts_with("└ #")
+                || trimmed.starts_with("└ bash")
                 || trimmed.starts_with("└ ") && trimmed.contains(" tokens")
             {
                 break;
@@ -839,7 +840,10 @@ mod tests {
         assert!(v.drilled, "second Enter must drill");
         v.handle_key(press(KeyCode::Enter));
         assert!(v.drilled, "third Enter is a no-op inside drill");
-        assert!(!v.is_complete(), "panel must not close on Enter inside drill");
+        assert!(
+            !v.is_complete(),
+            "panel must not close on Enter inside drill"
+        );
     }
 
     #[test]
@@ -1095,11 +1099,10 @@ mod tests {
                 v.last_inner_width.get(),
                 state,
             );
-            let marker = lines.iter().position(|l| {
-                l.spans
-                    .iter()
-                    .any(|s| s.content.as_ref().contains('▸'))
-            }).unwrap() as u16;
+            let marker = lines
+                .iter()
+                .position(|l| l.spans.iter().any(|s| s.content.as_ref().contains('▸')))
+                .unwrap() as u16;
             let viewport_top = v.scroll;
             let viewport_bottom = viewport_top + v.last_viewport_rows.get();
             assert!(

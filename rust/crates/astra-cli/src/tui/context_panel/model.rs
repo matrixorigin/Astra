@@ -1,12 +1,11 @@
 //! Pure data model for the `/context` panel.
 //!
 //! Sourced from the most recent [`ContextAssemblyTrace`] captured by
-//! the observability session. Mirrors Claude Code's `/context`
-//! visualization (grid + category legend + nested sections) but
-//! adapted to the data that astra's trace actually carries:
-//! token-budget breakdown, tool / memory / skill / system-prompt
-//! sub-rows, and an explicit "free space" category derived from
-//! `max_tokens - total_used`.
+//! the observability session. The shape is a grid + category
+//! legend + nested sections, driven by what astra's trace actually
+//! carries: token-budget breakdown, tool / memory / skill /
+//! system-prompt sub-rows, and an explicit "free space" category
+//! derived from `max_tokens - total_used`.
 //!
 //! This module has no render logic — it just produces a structured
 //! snapshot the view can walk top-down. Keeping the model pure
@@ -70,9 +69,7 @@ pub(crate) struct CompactionSummary {
 
 impl CompactionSummary {
     pub fn is_empty(&self) -> bool {
-        !self.triggered_this_turn
-            && self.compressed_turns.is_empty()
-            && self.events.is_empty()
+        !self.triggered_this_turn && self.compressed_turns.is_empty() && self.events.is_empty()
     }
 
     pub fn tokens_saved(&self) -> u32 {
@@ -304,7 +301,6 @@ pub(crate) struct TurnDetail {
     pub body: String,
 }
 
-
 /// A labelled sub-section of the system prompt (e.g. "Environment",
 /// "Guidance signals").  We keep the structure flat — the trace
 /// doesn't currently surface named sections, so most deployments
@@ -399,7 +395,10 @@ impl ContextBreakdown {
     /// First section that has content, or None if nothing to drill
     /// into.
     pub fn first_focusable_section(&self) -> Option<Section> {
-        Section::all().iter().copied().find(|s| self.section_non_empty(*s))
+        Section::all()
+            .iter()
+            .copied()
+            .find(|s| self.section_non_empty(*s))
     }
 }
 
@@ -450,7 +449,7 @@ pub(crate) struct ContextSnapshot<'a> {
     /// Current git branch, e.g. `improve_tui3`.
     pub git_branch: Option<String>,
     /// Path to the user-rules file backing the User-preferences
-    /// section (e.g. `~/.claude/rules/…`).
+    /// section (e.g. `~/.astra/rules/…`).
     pub user_rules_path: Option<String>,
     /// Session + budget state the trace doesn't carry. Populated
     /// by the `/context` dispatch from `ReplState`.
@@ -566,9 +565,9 @@ impl ContextBreakdown {
             .collect();
 
         // Memories: sort by tokens desc so the biggest contributors
-        // appear at the top — matches how Claude Code lists memory
-        // files under /memory.  Content preview is truncated to
-        // ~80 chars by the trace builder; we just pass it through.
+        // appear at the top — users scan for what's eating the
+        // budget first.  Content preview is truncated to ~80 chars
+        // by the trace builder; we just pass it through.
         let mut memories: Vec<MemoryItem> = trace
             .memory
             .memories_selected
@@ -655,21 +654,12 @@ impl ContextBreakdown {
         // Rendered as a dedicated section so users can see how much
         // of their backlog survived the compactor this turn.
         let h = &trace.history;
-        let mut turns: Vec<TurnDetail> = Vec::with_capacity(
-            h.turns_retained.len() + h.turns_compressed.len(),
-        );
-        let preview_of = |idx: u32| -> String {
-            snap.history_previews
-                .get(&idx)
-                .cloned()
-                .unwrap_or_default()
-        };
-        let body_of = |idx: u32| -> String {
-            snap.history_bodies
-                .get(&idx)
-                .cloned()
-                .unwrap_or_default()
-        };
+        let mut turns: Vec<TurnDetail> =
+            Vec::with_capacity(h.turns_retained.len() + h.turns_compressed.len());
+        let preview_of =
+            |idx: u32| -> String { snap.history_previews.get(&idx).cloned().unwrap_or_default() };
+        let body_of =
+            |idx: u32| -> String { snap.history_bodies.get(&idx).cloned().unwrap_or_default() };
         for r in &h.turns_retained {
             turns.push(TurnDetail {
                 index: r.turn_index,
@@ -968,7 +958,11 @@ fn build_system_sections(
     let raw: [(&str, u32, Option<String>); 3] = [
         ("Persona", sp.base_persona_tokens, persona_preview),
         ("Environment", sp.environment_tokens, env_preview),
-        ("User preferences", sp.user_preferences_tokens, prefs_preview),
+        (
+            "User preferences",
+            sp.user_preferences_tokens,
+            prefs_preview,
+        ),
     ];
     raw.into_iter()
         .filter(|(_, t, _)| *t > 0)

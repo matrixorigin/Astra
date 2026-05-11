@@ -316,8 +316,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 return SlashResult::Handled;
             }
             use crate::tui::bottom_pane::context_panel_view::ContextPanelView;
-            use crate::tui::context_panel::{ContextBreakdown, ContextSnapshot};
             use crate::tui::context_panel::model::{ActiveSkill, SessionSummary};
+            use crate::tui::context_panel::{ContextBreakdown, ContextSnapshot};
 
             // Collect human-readable previews the trace doesn't
             // carry: per-turn transcript snippets (from the chat
@@ -1292,19 +1292,15 @@ fn detect_git_branch() -> Option<String> {
     Some(name.shorten().to_string())
 }
 
-/// Locate the first user-rules file that ships with the current
-/// profile (Claude Code keeps them in `~/.claude/rules/`, astra in
-/// `~/.astra/rules/`).  Returns the first path that exists, or
-/// `None` if neither directory is present.  The path is rendered
-/// with `display_path` so it lands in the snapshot already
-/// home-shortened.
+/// Locate the user-rules directory under `~/.astra/rules/`, if
+/// present.  Returns the home-shortened path via `display_path`
+/// so the snapshot already reads like `~/.astra/rules`.  `None`
+/// when the directory doesn't exist.
 fn find_user_rules_path() -> Option<String> {
     let home = std::env::var("HOME").ok()?;
-    for sub in &[".astra/rules", ".claude/rules"] {
-        let p = std::path::PathBuf::from(&home).join(sub);
-        if p.exists() {
-            return Some(display_path(&p));
-        }
+    let p = std::path::PathBuf::from(&home).join(".astra/rules");
+    if p.exists() {
+        return Some(display_path(&p));
     }
     None
 }
@@ -1333,10 +1329,10 @@ fn collect_history_text(
     // reply for that turn; otherwise reasoning text as last resort.
     let mut turn_idx: u32 = 0;
     let record = |idx: u32,
-                      text: &str,
-                      previews: &mut std::collections::HashMap<u32, String>,
-                      bodies: &mut std::collections::HashMap<u32, String>,
-                      force: bool| {
+                  text: &str,
+                  previews: &mut std::collections::HashMap<u32, String>,
+                  bodies: &mut std::collections::HashMap<u32, String>,
+                  force: bool| {
         if text.trim().is_empty() {
             return;
         }

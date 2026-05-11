@@ -18,7 +18,7 @@
 //!   "captured_at": "2026-05-20T11:13:00Z",
 //!   "session_id": "abc…",
 //!   "turn": 5,
-//!   "model": "claude-sonnet-4.6",
+//!   "model": "<model-id>",
 //!   "cwd": "~/github/astra",
 //!   "git_branch": "improve_tui3",
 //!   "trace": { … full ContextAssemblyTrace … },
@@ -102,11 +102,7 @@ pub fn write_dump_for_repl(
     arg: Option<&str>,
 ) -> Result<PathBuf, String> {
     let dump = build_dump_from_repl(state, chat_history);
-    let path = resolve_dump_path(
-        arg,
-        state.session_id.as_deref(),
-        state.turn,
-    )?;
+    let path = resolve_dump_path(arg, state.session_id.as_deref(), state.turn)?;
     write_json(&path, &dump)?;
     Ok(path)
 }
@@ -206,18 +202,12 @@ pub fn resolve_session_id(arg: Option<&str>) -> Result<String, String> {
                     // Ambiguous — list the first few so the user
                     // can copy-paste one.
                     let sample: Vec<&String> = matches.iter().take(5).copied().collect();
-                    let mut msg = format!(
-                        "prefix `{needle}` matches {} sessions:",
-                        matches.len()
-                    );
+                    let mut msg = format!("prefix `{needle}` matches {} sessions:", matches.len());
                     for id in &sample {
                         msg.push_str(&format!("\n  • {id}"));
                     }
                     if matches.len() > sample.len() {
-                        msg.push_str(&format!(
-                            "\n  … and {} more",
-                            matches.len() - sample.len()
-                        ));
+                        msg.push_str(&format!("\n  … and {} more", matches.len() - sample.len()));
                     }
                     Err(msg)
                 }
@@ -233,7 +223,11 @@ pub fn resolve_session_id(arg: Option<&str>) -> Result<String, String> {
 /// terminal.
 pub fn print_summary(session_id: &str) -> Result<(), String> {
     let dump = build_dump_from_journal(session_id)?;
-    println!("Session {}  ·  turn {}", dump.session_id.as_deref().unwrap_or("?"), dump.turn);
+    println!(
+        "Session {}  ·  turn {}",
+        dump.session_id.as_deref().unwrap_or("?"),
+        dump.turn
+    );
     if let Some(m) = &dump.model {
         println!("  model: {m}");
     }
@@ -244,12 +238,13 @@ pub fn print_summary(session_id: &str) -> Result<(), String> {
         fmt_tokens_u64(dump.totals.cache_read_tokens),
         fmt_tokens_u64(dump.totals.cache_creation_tokens),
     );
-    println!(
-        "  chat turns: {} recorded",
-        dump.chat_history.len()
-    );
+    println!("  chat turns: {} recorded", dump.chat_history.len());
     if !dump.compressed_turns.is_empty() {
-        let rendered: Vec<String> = dump.compressed_turns.iter().map(|t| t.to_string()).collect();
+        let rendered: Vec<String> = dump
+            .compressed_turns
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
         println!("  compaction fired on turns: {}", rendered.join(", "));
     }
     if dump.trace.is_none() {
@@ -307,10 +302,7 @@ fn list_session_ids(dir: &Path) -> Result<Vec<(String, SystemTime)>, String> {
 /// Rebuild a dump from a persisted session journal.  Used by the
 /// standalone `astra context dump --session <id>` CLI.  Returns
 /// an error when the journal can't be found or parsed.
-pub fn write_dump_from_journal(
-    session_id: &str,
-    arg: Option<&str>,
-) -> Result<PathBuf, String> {
+pub fn write_dump_from_journal(session_id: &str, arg: Option<&str>) -> Result<PathBuf, String> {
     let dump = build_dump_from_journal(session_id)?;
     let path = resolve_dump_path(arg, Some(session_id), dump.turn)?;
     write_json(&path, &dump)?;
@@ -414,7 +406,6 @@ fn build_dump_from_journal(session_id: &str) -> Result<ContextDump, String> {
     })
 }
 
-
 // ─── Path resolution + I/O ────────────────────────────────────────
 
 fn resolve_dump_path(
@@ -492,8 +483,7 @@ mod tests {
     fn resolve_path_uses_arg_when_given() {
         let tmp = tempfile::tempdir().unwrap();
         let explicit = tmp.path().join("snap.json");
-        let p = resolve_dump_path(Some(explicit.to_str().unwrap()), Some("sess1234"), 3)
-            .unwrap();
+        let p = resolve_dump_path(Some(explicit.to_str().unwrap()), Some("sess1234"), 3).unwrap();
         assert_eq!(p, explicit);
     }
 

@@ -87,7 +87,11 @@ fn derive_mode(buffer: &str, items: &[SlashItem]) -> Mode {
             if has_subs {
                 Mode::Subcommand {
                     parent,
-                    token: after.split_whitespace().next().unwrap_or("").to_ascii_lowercase(),
+                    token: after
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase(),
                 }
             } else {
                 // No subcommands → menu collapses to "no matches"
@@ -227,7 +231,11 @@ impl SlashMenu {
         if n == 0 {
             return;
         }
-        self.selected = if self.selected == 0 { n - 1 } else { self.selected - 1 };
+        self.selected = if self.selected == 0 {
+            n - 1
+        } else {
+            self.selected - 1
+        };
     }
 
     pub fn move_down(&mut self) {

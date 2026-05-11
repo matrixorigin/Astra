@@ -613,10 +613,7 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Open the context panel (TUI) or dump a snapshot to disk",
         CommandGroup::Observability,
     )
-    .with_subcommands(&[(
-        "dump",
-        "Write a JSON snapshot of the live context to disk",
-    )])
+    .with_subcommands(&[("dump", "Write a JSON snapshot of the live context to disk")])
     .with_arg_hint("[dump [path]]"),
     CommandMeta::new(
         "/rewind",

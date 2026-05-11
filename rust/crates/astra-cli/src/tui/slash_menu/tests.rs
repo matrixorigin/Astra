@@ -285,7 +285,10 @@ fn empty_subcommand_token_lists_all_subs() {
     let mut menu = SlashMenu::new(items_with_subs());
     menu.set_filter("/skill ");
     let names: Vec<&str> = menu.matches().iter().map(|it| it.name).collect();
-    assert_eq!(names, vec!["/skill browse", "/skill install", "/skill list"]);
+    assert_eq!(
+        names,
+        vec!["/skill browse", "/skill install", "/skill list"]
+    );
 }
 
 #[test]
@@ -322,5 +325,8 @@ fn selected_item_in_subcommand_mode_returns_full_cmd_sub_name() {
     // user doesn't have to retype the parent.
     let mut menu = SlashMenu::new(items_with_subs());
     menu.set_filter("/context ");
-    assert_eq!(menu.selected_item().map(|it| it.name), Some("/context dump"));
+    assert_eq!(
+        menu.selected_item().map(|it| it.name),
+        Some("/context dump")
+    );
 }

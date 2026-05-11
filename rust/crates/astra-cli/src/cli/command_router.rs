@@ -869,9 +869,8 @@ pub(super) async fn execute_cli_command(
                 crate::cli_args::ContextCmd::Dump(args) => {
                     // Resolve session: explicit arg → prefix match;
                     // omitted → most recently touched session on disk.
-                    let sid = match crate::context_dump::resolve_session_id(
-                        args.session.as_deref(),
-                    ) {
+                    let sid = match crate::context_dump::resolve_session_id(args.session.as_deref())
+                    {
                         Ok(s) => s,
                         Err(e) => {
                             eprintln!("context dump: {e}");
