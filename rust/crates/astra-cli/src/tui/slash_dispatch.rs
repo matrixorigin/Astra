@@ -304,6 +304,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
             use crate::tui::bottom_pane::context_panel_view::ContextPanelView;
             use crate::tui::context_panel::{ContextBreakdown, ContextSnapshot};
+            use crate::tui::context_panel::model::SessionSummary;
 
             // Collect human-readable previews the trace doesn't
             // carry: per-turn transcript snippets (from the chat
@@ -318,6 +319,23 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
             snap.git_branch = detect_git_branch();
             snap.user_rules_path = find_user_rules_path();
+
+            // Build the Session / Budget summary from ReplState.
+            // All fields are cheap reads — no I/O, no extra locks.
+            snap.session = Some(SessionSummary {
+                session_id: ctx.state.session_id.clone().unwrap_or_default(),
+                turn: ctx.state.turn,
+                model: ctx.state.model.clone(),
+                total_cost: ctx.state.total_session_cost,
+                max_budget: ctx.state.max_budget_limit,
+                prompt_tokens: ctx.state.total_prompt_tokens,
+                completion_tokens: ctx.state.total_completion_tokens,
+                cache_read_tokens: ctx.state.total_cache_read_tokens,
+                cache_creation_tokens: ctx.state.total_cache_creation_tokens,
+                continuation_anchor: ctx.state.continuation_anchor.clone(),
+                queued_message: ctx.state.queued_message.clone(),
+                diagnostics_context: ctx.state.diagnostics_context.clone(),
+            });
 
             // Walk the committed history cells and pair them with
             // the trace's turn indices.  We use the cell ordering

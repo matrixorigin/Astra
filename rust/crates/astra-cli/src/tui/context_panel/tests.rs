@@ -4,9 +4,10 @@
 
 use super::model::{CategoryKind, ContextBreakdown, PressureBand};
 use astra_turn_core::context_assembly_trace::{
-    CompressionMethod, ContextAssemblyTrace, HistorySelectionTrace, MemorySelection, MemorySource,
-    SkillInjection, SystemPromptBreakdown, TokenBudgetTrace, ToolSelected, TurnCompression,
-    TurnRetention,
+    Alternative, CompressionMethod, ContextAssemblyTrace, DecisionExplanation, DecisionType,
+    HistorySelectionTrace, MemoryInjection, MemoryRejection, MemorySelection, MemorySource,
+    PromptContextSignals, PromptGuidanceSignals, RejectionReason, SkillInjection,
+    SystemPromptBreakdown, TokenBudgetTrace, ToolSelected, TurnCompression, TurnRetention,
 };
 use astra_turn_core::skill_selector_metrics::{
     SkillSelectorShortlistEntry, SkillSelectorShortlistTrace,
@@ -390,6 +391,176 @@ fn history_summary_is_empty_when_trace_has_no_history_data() {
     let t = trace(100_000, 1_000, 5_000, 0, 0, 0);
     let b = ContextBreakdown::from_trace(&t);
     assert!(b.history.is_empty());
+}
+
+// ─── Memory focus ─────────────────────────────────────────────────
+
+#[test]
+fn memory_focus_carries_query_candidates_and_latency() {
+    let mut t = trace(100_000, 1_000, 0, 1_000, 0, 0);
+    t.memory.query = "benchmark optimization".into();
+    t.memory.candidates_considered = 42;
+    t.memory.retrieval_latency_ms = 87;
+    let b = ContextBreakdown::from_trace(&t);
+    assert_eq!(b.memory_focus.query, "benchmark optimization");
+    assert_eq!(b.memory_focus.candidates_considered, 42);
+    assert_eq!(b.memory_focus.retrieval_latency_ms, 87);
+}
+
+#[test]
+fn memory_rejection_reasons_render_human_readable() {
+    let mut t = trace(100_000, 1_000, 0, 500, 0, 0);
+    t.memory.memories_rejected = vec![
+        MemoryRejection {
+            memory_id: "m-low".into(),
+            relevance_score: 0.3,
+            rejection_reason: RejectionReason::BelowThreshold {
+                threshold: 0.5,
+                score: 0.3,
+            },
+        },
+        MemoryRejection {
+            memory_id: "m-big".into(),
+            relevance_score: 0.9,
+            rejection_reason: RejectionReason::TokenBudgetExceeded {
+                available: 200,
+                required: 800,
+            },
+        },
+        MemoryRejection {
+            memory_id: "m-dup".into(),
+            relevance_score: 0.8,
+            rejection_reason: RejectionReason::Duplicate {
+                of_memory_id: "m-kept".into(),
+            },
+        },
+        MemoryRejection {
+            memory_id: "m-old".into(),
+            relevance_score: 0.7,
+            rejection_reason: RejectionReason::Stale { age_days: 120 },
+        },
+    ];
+    let b = ContextBreakdown::from_trace(&t);
+    let reasons: Vec<&str> = b.memory_focus.rejected.iter().map(|r| r.reason.as_str()).collect();
+    assert!(reasons[0].contains("below threshold"));
+    assert!(reasons[1].contains("token budget"));
+    assert!(reasons[2].contains("duplicate of m-kept"));
+    assert!(reasons[3].contains("stale"));
+}
+
+#[test]
+fn repository_memories_lifted_from_system_prompt() {
+    let mut t = trace(100_000, 2_000, 0, 500, 0, 0);
+    t.system_prompt = SystemPromptBreakdown {
+        repository_memories: vec![
+            MemoryInjection {
+                memory_id: "repo-1".into(),
+                memory_type: "repository".into(),
+                tokens: 180,
+                relevance_score: 0.85,
+                content_preview: "# Project guide".into(),
+            },
+            MemoryInjection {
+                memory_id: "zero".into(),
+                memory_type: "repository".into(),
+                tokens: 0,
+                relevance_score: 0.5,
+                content_preview: "".into(),
+            },
+        ],
+        ..SystemPromptBreakdown::default()
+    };
+    let b = ContextBreakdown::from_trace(&t);
+    let ids: Vec<&str> = b
+        .memory_focus
+        .repository
+        .iter()
+        .map(|r| r.memory_id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["repo-1"], "zero-token entries filtered");
+}
+
+// ─── Prompt signals ────────────────────────────────────────────────
+
+#[test]
+fn prompt_signals_flip_matches_trace_flags() {
+    let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
+    t.system_prompt.context_signals = PromptContextSignals {
+        memory_signal_detected: true,
+        memoria_insights: true,
+        ..PromptContextSignals::default()
+    };
+    t.system_prompt.guidance_signals = PromptGuidanceSignals {
+        parallel_batching_nudge: true,
+        ..PromptGuidanceSignals::default()
+    };
+    let b = ContextBreakdown::from_trace(&t);
+    let names: Vec<&str> = b.prompt_signals.iter().map(|s| s.name).collect();
+    assert!(names.contains(&"memory_signal_detected"));
+    assert!(names.contains(&"memoria_insights"));
+    assert!(names.contains(&"parallel_batching_nudge"));
+    assert_eq!(names.len(), 3, "only set flags should appear: {names:?}");
+}
+
+#[test]
+fn prompt_signals_empty_when_no_flags_set() {
+    let t = trace(100_000, 1_000, 0, 0, 0, 0);
+    let b = ContextBreakdown::from_trace(&t);
+    assert!(b.prompt_signals.is_empty());
+}
+
+// ─── Decisions ─────────────────────────────────────────────────────
+
+#[test]
+fn decisions_populated_from_explanations() {
+    let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
+    t.explanations = vec![DecisionExplanation {
+        decision_type: DecisionType::ToolSelection {
+            tools: vec!["bash".into(), "read_file".into()],
+        },
+        reasoning: "Query mentioned files and shell commands.".into(),
+        alternatives_considered: vec![Alternative {
+            description: "grep-only shortlist".into(),
+            score: 0.4,
+            why_not_chosen: "user's prompt referenced shell execution".into(),
+        }],
+        confidence: 0.82,
+    }];
+    let b = ContextBreakdown::from_trace(&t);
+    assert_eq!(b.decisions.len(), 1);
+    let d = &b.decisions[0];
+    assert!(d.label.contains("Tool selection"));
+    assert!(d.label.contains("bash"));
+    assert!((d.confidence - 0.82).abs() < 0.001);
+    assert_eq!(d.alternatives.len(), 1);
+}
+
+// ─── Session summary ───────────────────────────────────────────────
+
+#[test]
+fn session_summary_flows_through_snapshot() {
+    use super::model::{ContextSnapshot, SessionSummary};
+    let t = trace(100_000, 1_000, 0, 0, 0, 0);
+    let mut snap = ContextSnapshot::default();
+    snap.session = Some(SessionSummary {
+        session_id: "abcdef12-full-uuid".into(),
+        turn: 5,
+        model: Some("claude-sonnet-4.6".into()),
+        total_cost: 0.1234,
+        max_budget: 1.0,
+        prompt_tokens: 12_000,
+        completion_tokens: 3_000,
+        cache_read_tokens: 8_000,
+        cache_creation_tokens: 500,
+        continuation_anchor: Some("refactoring auth".into()),
+        queued_message: None,
+        diagnostics_context: None,
+    });
+    let b = ContextBreakdown::from_trace_with(&t, &snap);
+    let s = b.session_summary.expect("session populated");
+    assert_eq!(s.turn, 5);
+    assert!((s.total_cost - 0.1234).abs() < 1e-9);
+    assert_eq!(s.continuation_anchor.as_deref(), Some("refactoring auth"));
 }
 
 #[test]

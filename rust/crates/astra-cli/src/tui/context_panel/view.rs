@@ -165,7 +165,11 @@ pub(crate) fn section_line_index(
     }
     let lines = build_lines_with(b, inner_width, state);
     let heading_text = match target {
-        Section::SystemPrompt | Section::History => target.label(),
+        Section::SystemPrompt
+        | Section::History
+        | Section::Session
+        | Section::PromptSignals
+        | Section::Decisions => target.label(),
         Section::Tools => "Tools · /tool",
         Section::Memory => "Memory · /memory",
         Section::Skills => {
@@ -253,11 +257,14 @@ pub(crate) fn build_lines_with(
     out.push(Line::default());
 
     // Nested sub-sections. Only rendered when non-empty.
+    render_section(&mut out, b, state, Section::Session);
     render_section(&mut out, b, state, Section::SystemPrompt);
+    render_section(&mut out, b, state, Section::PromptSignals);
     render_section(&mut out, b, state, Section::Tools);
     render_section(&mut out, b, state, Section::Skills);
     render_section(&mut out, b, state, Section::Memory);
     render_section(&mut out, b, state, Section::History);
+    render_section(&mut out, b, state, Section::Decisions);
 
     // Drop the last blank line if we pushed one — trailing blanks
     // render as empty lines at the bottom of the scroll view which
@@ -314,10 +321,45 @@ fn render_section(
             append_skill_section(out, &b.skills, focused, expanded);
         }
         Section::Memory => {
-            append_memory_section(out, &b.memories, focused, expanded);
+            if !b.memories.is_empty() {
+                append_memory_section(out, &b.memories, focused, expanded);
+                if expanded && !b.memory_focus.is_empty() {
+                    append_memory_focus(out, &b.memory_focus);
+                    out.push(Line::default());
+                }
+            } else if !b.memory_focus.is_empty() {
+                // No selected memories this turn but retrieval
+                // still happened (e.g. everything rejected). Show
+                // the heading + retrieval detail so the user sees
+                // why memory came up empty.
+                out.push(section_heading_for(Section::Memory, focused, expanded));
+                if expanded {
+                    append_memory_focus(out, &b.memory_focus);
+                } else {
+                    out.push(Line::from(vec![
+                        Span::raw("    └ "),
+                        Span::styled(
+                            "no memories selected this turn".to_string(),
+                            Style::default().add_modifier(Modifier::DIM),
+                        ),
+                    ]));
+                }
+                out.push(Line::default());
+            }
         }
         Section::History => {
             append_history_section(out, &b.history, focused, expanded);
+        }
+        Section::Session => {
+            if let Some(s) = b.session_summary.as_ref() {
+                append_session_section(out, s, focused, expanded);
+            }
+        }
+        Section::PromptSignals => {
+            append_prompt_signals_section(out, &b.prompt_signals, focused, expanded);
+        }
+        Section::Decisions => {
+            append_decisions_section(out, &b.decisions, focused, expanded);
         }
     }
 }
@@ -719,6 +761,343 @@ fn append_memory_section(
     out.push(Line::default());
 }
 
+/// When the Memory section is expanded, render the richer
+/// retrieval-pipeline detail the trace carries: the query that
+/// drove retrieval, how many candidates were considered, the
+/// rejected list with reasons, and repository-memory injections
+/// (distinct from selected memories — they live in the system
+/// prompt rather than the retrieval output).
+fn append_memory_focus(out: &mut Vec<Line<'static>>, focus: &super::model::MemoryFocus) {
+    if focus.is_empty() {
+        return;
+    }
+    if !focus.query.is_empty() {
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::styled("query: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!("\"{}\"", truncate_preview(&focus.query, 120))),
+        ]));
+    }
+    if focus.candidates_considered > 0 || focus.retrieval_latency_ms > 0 {
+        let mut spans = vec![Span::raw("    └ ")];
+        if focus.candidates_considered > 0 {
+            spans.push(Span::raw(format!(
+                "{} candidates",
+                focus.candidates_considered
+            )));
+        }
+        if focus.retrieval_latency_ms > 0 {
+            if !spans.last().unwrap().content.is_empty() {
+                spans.push(Span::raw("  ·  "));
+            }
+            spans.push(Span::styled(
+                format!("{}ms retrieval", focus.retrieval_latency_ms),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        out.push(Line::from(spans));
+    }
+    if !focus.rejected.is_empty() {
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::styled(
+                format!("Rejected ({})", focus.rejected.len()),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        for r in focus.rejected.iter().take(8) {
+            out.push(Line::from(vec![
+                Span::raw("        └ "),
+                Span::raw(truncate_preview(&r.memory_id, 18)),
+                Span::styled(
+                    format!("   rel {:.2}", r.relevance),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    format!("  ({})", r.reason),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        if focus.rejected.len() > 8 {
+            out.push(Line::from(vec![
+                Span::raw("        └ "),
+                Span::styled(
+                    format!("… {} more rejected", focus.rejected.len() - 8),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+    }
+    if !focus.repository.is_empty() {
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::styled(
+                "Repository memories",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  (.astra/memories)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        for r in &focus.repository {
+            out.push(Line::from(vec![
+                Span::raw("        └ "),
+                Span::raw(format!(
+                    "\"{}\"",
+                    truncate_preview(&r.preview, 100)
+                )),
+                Span::styled(
+                    format!("   {} tokens", fmt_tokens(r.tokens)),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    format!("  (rel {:.2})", r.relevance),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+    }
+}
+
+fn append_session_section(
+    out: &mut Vec<Line<'static>>,
+    s: &super::model::SessionSummary,
+    focused: bool,
+    expanded: bool,
+) {
+    out.push(section_heading_for(Section::Session, focused, expanded));
+    // Collapsed view: id + turn + cost/budget on one line, token
+    // totals on a second.  Enough for an at-a-glance read.
+    let sid_short = if s.session_id.len() > 8 {
+        &s.session_id[..8]
+    } else {
+        s.session_id.as_str()
+    };
+    let mut line1: Vec<Span<'static>> = vec![Span::raw("    └ ")];
+    line1.push(Span::styled(
+        format!("sid {sid_short}"),
+        Style::default().fg(Color::DarkGray),
+    ));
+    line1.push(Span::raw("  ·  "));
+    line1.push(Span::raw(format!("turn {}", s.turn)));
+    if let Some(model) = &s.model {
+        line1.push(Span::raw("  ·  "));
+        line1.push(Span::styled(
+            format!("model {model}"),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    out.push(Line::from(line1));
+
+    let mut line2: Vec<Span<'static>> = vec![Span::raw("    └ ")];
+    line2.push(Span::raw(format!("cost ${:.4}", s.total_cost)));
+    if s.max_budget > 0.0 {
+        let pct = s.total_cost / s.max_budget * 100.0;
+        line2.push(Span::styled(
+            format!(" / ${:.2}  ({:.0}%)", s.max_budget, pct),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    out.push(Line::from(line2));
+
+    out.push(Line::from(vec![
+        Span::raw("    └ "),
+        Span::styled(
+            format!(
+                "in {}  ·  out {}  ·  cache-read {}  ·  cache-create {}",
+                fmt_tokens_u64(s.prompt_tokens),
+                fmt_tokens_u64(s.completion_tokens),
+                fmt_tokens_u64(s.cache_read_tokens),
+                fmt_tokens_u64(s.cache_creation_tokens),
+            ),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ]));
+
+    if expanded {
+        if let Some(a) = &s.continuation_anchor {
+            out.push(Line::from(vec![
+                Span::raw("    └ "),
+                Span::styled(
+                    "continuation anchor",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            out.push(Line::from(vec![
+                Span::raw("        "),
+                Span::styled(
+                    format!("\"{}\"", truncate_preview(a, 140)),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+        if let Some(q) = &s.queued_message {
+            out.push(Line::from(vec![
+                Span::raw("    └ "),
+                Span::styled(
+                    "queued message",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            out.push(Line::from(vec![
+                Span::raw("        "),
+                Span::styled(
+                    format!("\"{}\"", truncate_preview(q, 140)),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+        if let Some(d) = &s.diagnostics_context {
+            out.push(Line::from(vec![
+                Span::raw("    └ "),
+                Span::styled(
+                    "diagnostics context",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            out.push(Line::from(vec![
+                Span::raw("        "),
+                Span::styled(
+                    format!("\"{}\"", truncate_preview(d, 140)),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+    }
+
+    out.push(Line::default());
+}
+
+fn append_prompt_signals_section(
+    out: &mut Vec<Line<'static>>,
+    signals: &[super::model::SignalItem],
+    focused: bool,
+    expanded: bool,
+) {
+    if signals.is_empty() {
+        return;
+    }
+    out.push(section_heading_for(Section::PromptSignals, focused, expanded));
+    // Collapsed: one row listing all active names separated by `·`.
+    // Expanded: one row per signal with a description.
+    if expanded {
+        let (ctx_group, guide_group): (Vec<_>, Vec<_>) = signals
+            .iter()
+            .partition(|s| matches!(s.kind, super::model::SignalKind::Context));
+        if !ctx_group.is_empty() {
+            out.push(Line::from(vec![
+                Span::raw("    └ "),
+                Span::styled("Context", Style::default().add_modifier(Modifier::BOLD)),
+            ]));
+            for s in ctx_group {
+                out.push(Line::from(vec![
+                    Span::raw("        └ "),
+                    Span::raw(s.name.to_string()),
+                    Span::styled(
+                        format!("   {}", s.description),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+        if !guide_group.is_empty() {
+            out.push(Line::from(vec![
+                Span::raw("    └ "),
+                Span::styled("Guidance", Style::default().add_modifier(Modifier::BOLD)),
+            ]));
+            for s in guide_group {
+                out.push(Line::from(vec![
+                    Span::raw("        └ "),
+                    Span::raw(s.name.to_string()),
+                    Span::styled(
+                        format!("   {}", s.description),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+    } else {
+        let names: Vec<String> = signals.iter().map(|s| s.name.to_string()).collect();
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::styled(
+                format!("{} active", signals.len()),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                format!("  ·  {}", truncate_preview(&names.join(" · "), 90)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    out.push(Line::default());
+}
+
+fn append_decisions_section(
+    out: &mut Vec<Line<'static>>,
+    decisions: &[super::model::DecisionItem],
+    focused: bool,
+    expanded: bool,
+) {
+    if decisions.is_empty() {
+        return;
+    }
+    out.push(section_heading_for(Section::Decisions, focused, expanded));
+    for d in decisions {
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::raw(d.label.clone()),
+            Span::styled(
+                format!("   conf {:.2}", d.confidence),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        if expanded {
+            if !d.reasoning.is_empty() {
+                out.push(Line::from(vec![
+                    Span::raw("        "),
+                    Span::styled(
+                        truncate_preview(&d.reasoning, 140),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ),
+                ]));
+            }
+            for a in d.alternatives.iter().take(3) {
+                out.push(Line::from(vec![
+                    Span::raw("        ~ "),
+                    Span::raw(truncate_preview(&a.description, 60)),
+                    Span::styled(
+                        format!("   score {:.2}", a.score),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                if !a.why_not_chosen.is_empty() {
+                    out.push(Line::from(vec![
+                        Span::raw("           "),
+                        Span::styled(
+                            format!("rejected: {}", truncate_preview(&a.why_not_chosen, 100)),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+            }
+        }
+    }
+    out.push(Line::default());
+}
+
+fn fmt_tokens_u64(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
 fn section_heading(text: &str) -> Line<'static> {
     section_heading_raw(text, false, false)
 }
@@ -802,9 +1181,10 @@ mod tests {
     use super::*;
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
     use astra_turn_core::context_assembly_trace::{
-        CompressionMethod, ContextAssemblyTrace, HistorySelectionTrace, MemorySelection,
-        MemorySource, SkillInjection, SystemPromptBreakdown, TokenBudgetTrace, ToolSelected,
-        TurnCompression, TurnRetention,
+        Alternative, CompressionMethod, ContextAssemblyTrace, DecisionExplanation, DecisionType,
+        HistorySelectionTrace, MemoryInjection, MemoryRejection, MemorySelection, MemorySource,
+        PromptContextSignals, PromptGuidanceSignals, RejectionReason, SkillInjection,
+        SystemPromptBreakdown, TokenBudgetTrace, ToolSelected, TurnCompression, TurnRetention,
     };
     use astra_turn_core::skill_selector_metrics::{
         SkillSelectorShortlistEntry, SkillSelectorShortlistTrace,
@@ -1148,6 +1528,166 @@ mod tests {
             text.contains("I'll start by reading auth.rs"),
             "assistant preview missing: {text}"
         );
+    }
+
+    #[test]
+    fn memory_section_renders_rejected_and_repository_on_expand() {
+        let mut t = trace(100_000, 1_000, 0, 500, 0, 0);
+        t.memory.memories_selected = vec![MemorySelection {
+            memory_id: "m1".into(),
+            memory_type: "semantic".into(),
+            content_preview: "kept".into(),
+            relevance_score: 0.9,
+            tokens: 100,
+            source: MemorySource::Memoria,
+        }];
+        t.memory.query = "retrieval bug".into();
+        t.memory.candidates_considered = 7;
+        t.memory.retrieval_latency_ms = 42;
+        t.memory.memories_rejected = vec![MemoryRejection {
+            memory_id: "m-low".into(),
+            relevance_score: 0.3,
+            rejection_reason: RejectionReason::BelowThreshold {
+                threshold: 0.5,
+                score: 0.3,
+            },
+        }];
+        t.system_prompt.repository_memories = vec![MemoryInjection {
+            memory_id: "repo".into(),
+            memory_type: "repository".into(),
+            tokens: 80,
+            relevance_score: 0.85,
+            content_preview: "# Project rules".into(),
+        }];
+        let b = ContextBreakdown::from_trace(&t);
+        let state = ViewState {
+            focus: Some(Section::Memory),
+            expanded: Some(Section::Memory),
+        };
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("retrieval bug"), "query missing: {text}");
+        assert!(text.contains("7 candidates"), "candidates missing: {text}");
+        assert!(text.contains("42ms"), "latency missing: {text}");
+        assert!(text.contains("Rejected (1)"), "rejected header: {text}");
+        assert!(text.contains("below threshold"), "reason: {text}");
+        assert!(
+            text.contains("Repository memories"),
+            "repo header: {text}"
+        );
+        assert!(text.contains("# Project rules"), "repo preview: {text}");
+    }
+
+    #[test]
+    fn prompt_signals_section_collapsed_lists_names_expanded_describes() {
+        use super::super::model::ContextSnapshot;
+        let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
+        t.system_prompt.context_signals = PromptContextSignals {
+            memoria_insights: true,
+            learned_feedback_rules: true,
+            ..PromptContextSignals::default()
+        };
+        t.system_prompt.guidance_signals = PromptGuidanceSignals {
+            parallel_batching_nudge: true,
+            ..PromptGuidanceSignals::default()
+        };
+        let b = ContextBreakdown::from_trace_with(&t, &ContextSnapshot::default());
+        let focus = ViewState::collapsed(Some(Section::PromptSignals));
+        let collapsed: String = build_lines_with(&b, 80, focus)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(collapsed.contains("3 active"));
+        assert!(collapsed.contains("memoria_insights"));
+        assert!(
+            !collapsed.contains("cross-session"),
+            "description must stay hidden when collapsed: {collapsed}"
+        );
+
+        let expanded_state = ViewState {
+            focus: Some(Section::PromptSignals),
+            expanded: Some(Section::PromptSignals),
+        };
+        let expanded: String = build_lines_with(&b, 80, expanded_state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(expanded.contains("Context"), "sub-header: {expanded}");
+        assert!(expanded.contains("Guidance"), "sub-header: {expanded}");
+        assert!(expanded.contains("cross-session"), "desc: {expanded}");
+    }
+
+    #[test]
+    fn decisions_section_renders_reasoning_and_alternatives_on_expand() {
+        let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
+        t.explanations = vec![DecisionExplanation {
+            decision_type: DecisionType::StrategyChoice {
+                strategy: "code-intel".into(),
+            },
+            reasoning: "Need symbol-aware context.".into(),
+            alternatives_considered: vec![Alternative {
+                description: "grep-only".into(),
+                score: 0.4,
+                why_not_chosen: "would miss imports".into(),
+            }],
+            confidence: 0.9,
+        }];
+        let b = ContextBreakdown::from_trace(&t);
+        let state = ViewState {
+            focus: Some(Section::Decisions),
+            expanded: Some(Section::Decisions),
+        };
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("code-intel"));
+        assert!(text.contains("Need symbol-aware context"));
+        assert!(text.contains("grep-only"));
+        assert!(text.contains("would miss imports"));
+    }
+
+    #[test]
+    fn session_section_renders_when_snapshot_carries_summary() {
+        use super::super::model::{ContextSnapshot, SessionSummary};
+        let t = trace(100_000, 1_000, 0, 0, 0, 0);
+        let mut snap = ContextSnapshot::default();
+        snap.session = Some(SessionSummary {
+            session_id: "abcdef12-full".into(),
+            turn: 5,
+            model: Some("claude-sonnet-4.6".into()),
+            total_cost: 0.12,
+            max_budget: 1.0,
+            prompt_tokens: 1200,
+            completion_tokens: 300,
+            cache_read_tokens: 800,
+            cache_creation_tokens: 0,
+            continuation_anchor: Some("refactoring auth".into()),
+            queued_message: None,
+            diagnostics_context: None,
+        });
+        let b = ContextBreakdown::from_trace_with(&t, &snap);
+        let state = ViewState {
+            focus: Some(Section::Session),
+            expanded: Some(Section::Session),
+        };
+        let text: String = build_lines_with(&b, 80, state)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("sid abcdef12"), "short sid: {text}");
+        assert!(text.contains("turn 5"));
+        assert!(text.contains("claude-sonnet-4.6"));
+        assert!(text.contains("$0.1200"));
+        assert!(text.contains("/ $1.00"));
+        assert!(text.contains("refactoring auth"));
     }
 
     #[test]

@@ -16,7 +16,8 @@
 #![allow(dead_code)]
 
 use astra_turn_core::context_assembly_trace::{
-    ContextAssemblyTrace, MemorySelection, SkillInjection, ToolSelected,
+    ContextAssemblyTrace, DecisionExplanation, DecisionType, MemoryInjection, MemoryRejection,
+    MemorySelection, RejectionReason, SkillInjection, ToolSelected,
 };
 use astra_turn_core::skill_selector_metrics::SkillSelectorShortlistEntry;
 use ratatui::style::Color;
@@ -39,6 +40,106 @@ pub(crate) struct ContextBreakdown {
     pub skills: Vec<SkillItem>,
     pub system_sections: Vec<SectionItem>,
     pub history: HistorySummary,
+    pub memory_focus: MemoryFocus,
+    pub prompt_signals: Vec<SignalItem>,
+    pub session_summary: Option<SessionSummary>,
+    pub decisions: Vec<DecisionItem>,
+}
+
+/// Extra detail for the Memory section.  Populated directly from
+/// `MemoryRetrievalTrace` — query, candidates considered, rejection
+/// list with reasons, retrieval latency.  Plus `repository_memories`
+/// from the system prompt (distinct from `memories` which covers
+/// retrieval-pipeline selections) so `.astra/memories` files get
+/// their own rows.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct MemoryFocus {
+    pub query: String,
+    pub candidates_considered: u32,
+    pub retrieval_latency_ms: u64,
+    pub rejected: Vec<MemoryRejectionItem>,
+    pub repository: Vec<RepositoryMemoryItem>,
+}
+
+impl MemoryFocus {
+    pub fn is_empty(&self) -> bool {
+        self.query.is_empty()
+            && self.candidates_considered == 0
+            && self.retrieval_latency_ms == 0
+            && self.rejected.is_empty()
+            && self.repository.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MemoryRejectionItem {
+    pub memory_id: String,
+    pub relevance: f64,
+    /// Human-readable rendering of the rejection reason.
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RepositoryMemoryItem {
+    pub memory_id: String,
+    pub memory_type: String,
+    pub tokens: u32,
+    pub relevance: f64,
+    pub preview: String,
+}
+
+/// A single bit from `PromptContextSignals` or `PromptGuidanceSignals`
+/// that was active this turn.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SignalItem {
+    pub name: &'static str,
+    pub description: &'static str,
+    /// Distinguishes context signals (dynamic prompt sections) from
+    /// guidance signals (late-round nudges) so the rendered
+    /// section can sub-group them.
+    pub kind: SignalKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignalKind {
+    Context,
+    Guidance,
+}
+
+/// Session + budget summary built from [`ContextSnapshot::session`]
+/// (which in turn wraps `ReplState` fields).  Rendered as a
+/// dedicated section so users can see cost, token totals, and
+/// sticky state that drives follow-up turns.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SessionSummary {
+    pub session_id: String,
+    pub turn: u32,
+    pub model: Option<String>,
+    pub total_cost: f64,
+    pub max_budget: f64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub continuation_anchor: Option<String>,
+    pub queued_message: Option<String>,
+    pub diagnostics_context: Option<String>,
+}
+
+/// One decision lifted from `ContextAssemblyTrace::explanations`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DecisionItem {
+    pub label: String,
+    pub reasoning: String,
+    pub confidence: f64,
+    pub alternatives: Vec<AlternativeItem>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AlternativeItem {
+    pub description: String,
+    pub score: f64,
+    pub why_not_chosen: String,
 }
 
 /// Aggregate summary of the history slice the context carried into
@@ -176,31 +277,40 @@ pub(crate) struct SectionItem {
 /// via Tab / Shift+Tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Section {
+    Session,
     SystemPrompt,
+    PromptSignals,
     Tools,
     Skills,
     Memory,
     History,
+    Decisions,
 }
 
 impl Section {
     pub fn all() -> &'static [Section] {
         &[
+            Section::Session,
             Section::SystemPrompt,
+            Section::PromptSignals,
             Section::Tools,
             Section::Skills,
             Section::Memory,
             Section::History,
+            Section::Decisions,
         ]
     }
 
     pub fn label(self) -> &'static str {
         match self {
+            Section::Session => "Session · budget & state",
             Section::SystemPrompt => "System prompt",
+            Section::PromptSignals => "Prompt signals",
             Section::Tools => "Tools · /tool",
             Section::Skills => "Skills · /skills",
             Section::Memory => "Memory · /memory",
             Section::History => "History · conversation turns",
+            Section::Decisions => "Decisions · why did it pick this",
         }
     }
 
@@ -224,11 +334,14 @@ impl Section {
 impl ContextBreakdown {
     pub fn section_non_empty(&self, s: Section) -> bool {
         match s {
+            Section::Session => self.session_summary.is_some(),
             Section::SystemPrompt => !self.system_sections.is_empty(),
+            Section::PromptSignals => !self.prompt_signals.is_empty(),
             Section::Tools => !self.tools.is_empty(),
             Section::Skills => !self.skills.is_empty(),
-            Section::Memory => !self.memories.is_empty(),
+            Section::Memory => !self.memories.is_empty() || !self.memory_focus.is_empty(),
             Section::History => !self.history.is_empty(),
+            Section::Decisions => !self.decisions.is_empty(),
         }
     }
 
@@ -284,6 +397,9 @@ pub(crate) struct ContextSnapshot<'a> {
     /// Path to the user-rules file backing the User-preferences
     /// section (e.g. `~/.claude/rules/…`).
     pub user_rules_path: Option<String>,
+    /// Session + budget state the trace doesn't carry. Populated
+    /// by the `/context` dispatch from `ReplState`.
+    pub session: Option<SessionSummary>,
 }
 
 impl ContextBreakdown {
@@ -301,6 +417,10 @@ impl ContextBreakdown {
             skills: Vec::new(),
             system_sections: Vec::new(),
             history: HistorySummary::default(),
+            memory_focus: MemoryFocus::default(),
+            prompt_signals: Vec::new(),
+            session_summary: None,
+            decisions: Vec::new(),
         }
     }
 
@@ -479,6 +599,11 @@ impl ContextBreakdown {
             dropped_indices: h.turns_dropped.clone(),
         };
 
+        let memory_focus = build_memory_focus(trace);
+        let prompt_signals = build_prompt_signals(trace);
+        let decisions = build_decisions(trace);
+        let session_summary = snap.session.clone();
+
         Self {
             total_used: budget.total_used,
             limit,
@@ -491,6 +616,10 @@ impl ContextBreakdown {
             skills,
             system_sections,
             history,
+            memory_focus,
+            prompt_signals,
+            session_summary,
+            decisions,
         }
     }
 
@@ -511,6 +640,178 @@ impl ContextBreakdown {
         } else {
             self.total_used as f64 / self.limit as f64 * 100.0
         }
+    }
+}
+
+fn build_memory_focus(trace: &ContextAssemblyTrace) -> MemoryFocus {
+    let m = &trace.memory;
+    let rejected: Vec<MemoryRejectionItem> = m
+        .memories_rejected
+        .iter()
+        .map(|r: &MemoryRejection| MemoryRejectionItem {
+            memory_id: r.memory_id.clone(),
+            relevance: r.relevance_score,
+            reason: render_rejection_reason(&r.rejection_reason),
+        })
+        .collect();
+    let repository: Vec<RepositoryMemoryItem> = trace
+        .system_prompt
+        .repository_memories
+        .iter()
+        .filter(|mi: &&MemoryInjection| mi.tokens > 0)
+        .map(|mi| RepositoryMemoryItem {
+            memory_id: mi.memory_id.clone(),
+            memory_type: mi.memory_type.clone(),
+            tokens: mi.tokens,
+            relevance: mi.relevance_score,
+            preview: mi.content_preview.clone(),
+        })
+        .collect();
+    MemoryFocus {
+        query: m.query.clone(),
+        candidates_considered: m.candidates_considered,
+        retrieval_latency_ms: m.retrieval_latency_ms,
+        rejected,
+        repository,
+    }
+}
+
+fn render_rejection_reason(r: &RejectionReason) -> String {
+    match r {
+        RejectionReason::BelowThreshold { threshold, score } => {
+            format!("below threshold (score {score:.2} < {threshold:.2})")
+        }
+        RejectionReason::TokenBudgetExceeded {
+            available,
+            required,
+        } => format!("token budget exceeded ({required} needed, {available} free)"),
+        RejectionReason::Duplicate { of_memory_id } => {
+            format!("duplicate of {of_memory_id}")
+        }
+        RejectionReason::Stale { age_days } => format!("stale ({age_days}d old)"),
+    }
+}
+
+fn build_prompt_signals(trace: &ContextAssemblyTrace) -> Vec<SignalItem> {
+    let cs = &trace.system_prompt.context_signals;
+    let gs = &trace.system_prompt.guidance_signals;
+    let ctx = |on: bool, name: &'static str, desc: &'static str| -> Option<SignalItem> {
+        on.then_some(SignalItem {
+            name,
+            description: desc,
+            kind: SignalKind::Context,
+        })
+    };
+    let guide = |on: bool, name: &'static str, desc: &'static str| -> Option<SignalItem> {
+        on.then_some(SignalItem {
+            name,
+            description: desc,
+            kind: SignalKind::Guidance,
+        })
+    };
+    [
+        ctx(
+            cs.active_output_skills,
+            "active_output_skills",
+            "The session has output-shaping skills that mutate the reply format",
+        ),
+        ctx(
+            cs.memory_signal_detected,
+            "memory_signal_detected",
+            "Retrieval found a memory worth surfacing this turn",
+        ),
+        ctx(
+            cs.memoria_insights,
+            "memoria_insights",
+            "Memoria MCP provided cross-session insights",
+        ),
+        ctx(
+            cs.system_prompt_override,
+            "system_prompt_override",
+            "User/config overrode the default system prompt",
+        ),
+        ctx(
+            cs.effort_hint,
+            "effort_hint",
+            "Turn carries a target effort level (light / thorough / …)",
+        ),
+        ctx(
+            cs.agent_type_hint,
+            "agent_type_hint",
+            "Prompt declares a specific agent sub-type for this turn",
+        ),
+        ctx(
+            cs.self_awareness,
+            "self_awareness",
+            "Self-awareness nudge (remind model of its own constraints)",
+        ),
+        ctx(
+            cs.implicit_feedback,
+            "implicit_feedback",
+            "Implicit-feedback block injected (recent turn outcomes)",
+        ),
+        ctx(
+            cs.learned_feedback_rules,
+            "learned_feedback_rules",
+            "Learned corrections from prior sessions are active",
+        ),
+        guide(
+            gs.round_budget_warning,
+            "round_budget_warning",
+            "Per-round token budget is tight — warn the model",
+        ),
+        guide(
+            gs.synthesize_or_batch,
+            "synthesize_or_batch",
+            "Encourage synthesis / batching instead of drive-by actions",
+        ),
+        guide(
+            gs.parallel_feedback,
+            "parallel_feedback",
+            "Parallel-execution feedback attached",
+        ),
+        guide(
+            gs.parallel_batching_nudge,
+            "parallel_batching_nudge",
+            "Recent rounds each ran one tool — nudge toward parallel batches",
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn build_decisions(trace: &ContextAssemblyTrace) -> Vec<DecisionItem> {
+    trace
+        .explanations
+        .iter()
+        .map(|d: &DecisionExplanation| DecisionItem {
+            label: render_decision_label(&d.decision_type),
+            reasoning: d.reasoning.clone(),
+            confidence: d.confidence,
+            alternatives: d
+                .alternatives_considered
+                .iter()
+                .map(|a| AlternativeItem {
+                    description: a.description.clone(),
+                    score: a.score,
+                    why_not_chosen: a.why_not_chosen.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn render_decision_label(t: &DecisionType) -> String {
+    match t {
+        DecisionType::ToolSelection { tools } => format!("Tool selection ({})", tools.join(", ")),
+        DecisionType::HistoryCompression { turns_affected } => {
+            format!("History compression ({} turns)", turns_affected.len())
+        }
+        DecisionType::MemoryRetrieval { memories } => {
+            format!("Memory retrieval ({} memories)", memories.len())
+        }
+        DecisionType::StrategyChoice { strategy } => format!("Strategy choice ({strategy})"),
     }
 }
 
