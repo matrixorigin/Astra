@@ -77,8 +77,12 @@ pub(crate) struct ConfigEditView {
     inner: Option<Box<dyn InnerEditor>>,
     /// Dirty-esc save prompt. `Some` means the outer view is in
     /// "confirm what to do" mode; the list/detail drop and we render a
-    /// 3-way choice instead.
+    /// 4-way choice instead.
     save_prompt: Option<SavePrompt>,
+    /// Save-prompt → Preview sub-state. `true` means we render the
+    /// diff view instead of the prompt; any key (including Esc)
+    /// returns to the prompt with state preserved.
+    preview: bool,
     completed: bool,
     action: ConfigEditAction,
 }
@@ -92,6 +96,7 @@ impl ConfigEditView {
             selected: 0,
             inner: None,
             save_prompt: None,
+            preview: false,
             completed: false,
             action: ConfigEditAction::None,
         }
@@ -157,6 +162,16 @@ impl ConfigEditView {
     #[cfg(test)]
     pub(crate) fn working_config_for_test(&self) -> &RuntimeConfig {
         &self.working
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_prompt_open_for_test(&self) -> bool {
+        self.save_prompt.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preview_open_for_test(&self) -> bool {
+        self.preview
     }
 
     // ── internal ───────────────────────────────────────────────────
@@ -240,6 +255,12 @@ impl BottomPaneView for ConfigEditView {
             return;
         }
 
+        // Preview layer — rendered on top of the (still-alive) save
+        // prompt state so returning to the prompt is just a flag flip.
+        if self.preview {
+            render_preview(&self.original, &self.working, area, buf);
+            return;
+        }
         // Save prompt takes over the whole area when active.
         if let Some(ref prompt) = self.save_prompt {
             render_save_prompt(prompt, area, buf);
@@ -302,7 +323,16 @@ impl BottomPaneView for ConfigEditView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
-        // Save prompt takes precedence.
+        // Preview absorbs everything — any key returns to the prompt
+        // without committing. This mirrors `context_panel_view`'s
+        // "press anything to close" semantics and keeps the diff view
+        // strictly read-only.
+        if self.preview {
+            self.preview = false;
+            return;
+        }
+
+        // Save prompt takes precedence over the edit list.
         if let Some(ref mut prompt) = self.save_prompt {
             match prompt.handle_key(key) {
                 SavePromptOutcome::Pending => {}
@@ -315,6 +345,12 @@ impl BottomPaneView for ConfigEditView {
                     self.save_prompt = None;
                     self.action = ConfigEditAction::SaveToProject;
                     self.completed = true;
+                }
+                SavePromptOutcome::OpenPreview => {
+                    // Prompt stays open under the preview layer;
+                    // handle_key will flip `preview` back off on any
+                    // key press.
+                    self.preview = true;
                 }
                 SavePromptOutcome::Discard => {
                     self.working = self.original.clone();
@@ -401,8 +437,11 @@ impl BottomPaneView for ConfigEditView {
     }
 
     fn hint_keys(&self) -> Option<String> {
+        if self.preview {
+            return Some("preview · any key returns".into());
+        }
         if self.save_prompt.is_some() {
-            return Some("1 user · 2 project · d discard · Esc back".into());
+            return Some("↑↓ move · Enter confirm · Esc back".into());
         }
         if let Some(ref inner) = self.inner {
             return Some(inner.hint_keys().to_string());
@@ -896,21 +935,66 @@ impl InnerEditor for EnumEditor {
 }
 
 // ─── Save prompt ─────────────────────────────────────────────────────────
+//
+// Four-row picker: save to user / save to project / preview / discard.
+// Arrow keys move the cursor (matches Bool/Enum editor UX); Enter commits
+// the highlighted row; numeric/letter shortcuts bypass navigation for
+// muscle memory.
+//
+// "Preview" doesn't commit — it flips an internal `preview` flag on the
+// outer view that swaps the render to a diff list. Any key returns to
+// the prompt with state intact (filter position, selection).
 
-struct SavePrompt;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavePromptRow {
+    SaveUser,
+    SaveProject,
+    Preview,
+    Discard,
+}
+
+const SAVE_PROMPT_ROWS: [SavePromptRow; 4] = [
+    SavePromptRow::SaveUser,
+    SavePromptRow::SaveProject,
+    SavePromptRow::Preview,
+    SavePromptRow::Discard,
+];
+
+struct SavePrompt {
+    selected: usize,
+}
 
 impl SavePrompt {
     fn new() -> Self {
-        Self
+        Self { selected: 0 }
     }
+
     fn handle_key(&mut self, key: KeyEvent) -> SavePromptOutcome {
         match key.code {
+            // Arrow navigation + Enter — primary UX.
+            KeyCode::Up => {
+                self.selected = if self.selected == 0 {
+                    SAVE_PROMPT_ROWS.len() - 1
+                } else {
+                    self.selected - 1
+                };
+                SavePromptOutcome::Pending
+            }
+            KeyCode::Down => {
+                self.selected = (self.selected + 1) % SAVE_PROMPT_ROWS.len();
+                SavePromptOutcome::Pending
+            }
+            KeyCode::Enter => row_outcome(SAVE_PROMPT_ROWS[self.selected]),
+
+            // Muscle-memory shortcuts — one key = one choice, no
+            // navigation needed.
             KeyCode::Char('1') | KeyCode::Char('u') | KeyCode::Char('U') => {
                 SavePromptOutcome::SaveToUser
             }
             KeyCode::Char('2') | KeyCode::Char('p') | KeyCode::Char('P') => {
                 SavePromptOutcome::SaveToProject
             }
+            KeyCode::Char('v') | KeyCode::Char('V') => SavePromptOutcome::OpenPreview,
             KeyCode::Char('d') | KeyCode::Char('D') => SavePromptOutcome::Discard,
             KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => SavePromptOutcome::BackToEdit,
             _ => SavePromptOutcome::Pending,
@@ -918,38 +1002,127 @@ impl SavePrompt {
     }
 }
 
+fn row_outcome(row: SavePromptRow) -> SavePromptOutcome {
+    match row {
+        SavePromptRow::SaveUser => SavePromptOutcome::SaveToUser,
+        SavePromptRow::SaveProject => SavePromptOutcome::SaveToProject,
+        SavePromptRow::Preview => SavePromptOutcome::OpenPreview,
+        SavePromptRow::Discard => SavePromptOutcome::Discard,
+    }
+}
+
 enum SavePromptOutcome {
     Pending,
     SaveToUser,
     SaveToProject,
+    OpenPreview,
     Discard,
     BackToEdit,
 }
 
-fn render_save_prompt(_p: &SavePrompt, area: Rect, buf: &mut Buffer) {
+/// Resolve scope labels. User path uses the conventional `~/.astra/...`
+/// because home is stable across shell cwds; project path is resolved
+/// against the CURRENT working directory so the user sees the real
+/// filename, not the `./` sugar that hid the actual destination.
+fn user_path_label() -> String {
+    dirs::home_dir()
+        .map(|h| h.join(".astra/config/runtime.toml").display().to_string())
+        .unwrap_or_else(|| "~/.astra/config/runtime.toml".to_string())
+}
+
+fn project_path_label() -> String {
+    std::env::current_dir()
+        .map(|d| d.join(".astra/config/runtime.toml").display().to_string())
+        .unwrap_or_else(|_| "./.astra/config/runtime.toml".to_string())
+}
+
+fn render_save_prompt(p: &SavePrompt, area: Rect, buf: &mut Buffer) {
     let head = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::DarkGray);
-    let lines = vec![
+    let sel = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    let rows: [(&str, String); 4] = [
+        ("[1]", format!("Save to {}  (user)", user_path_label())),
+        (
+            "[2]",
+            format!("Save to {}  (project)", project_path_label()),
+        ),
+        ("[v]", "Preview changes".to_string()),
+        ("[d]", "Discard changes".to_string()),
+    ];
+
+    let mut lines = vec![
         Line::from(Span::styled("  Save changes?", head)),
         Line::from(Span::raw("")),
-        Line::from(vec![
-            Span::styled("  [1] ", dim),
-            Span::raw("Save to ~/.astra/config/runtime.toml (user)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  [2] ", dim),
-            Span::raw("Save to ./.astra/config/runtime.toml (project)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  [d] ", dim),
-            Span::raw("Discard changes"),
-        ]),
-        Line::from(vec![
-            Span::styled("  [Esc] ", dim),
-            Span::raw("Back to edit"),
-        ]),
     ];
+    for (idx, (key_hint, label)) in rows.iter().enumerate() {
+        let is_sel = idx == p.selected;
+        let marker = if is_sel { "› " } else { "  " };
+        let row_style = if is_sel { sel } else { dim };
+        let label_style = if is_sel { sel } else { Style::default() };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {marker}"), row_style),
+            Span::styled(format!("{key_hint} "), dim),
+            Span::styled(label.clone(), label_style),
+        ]));
+    }
+    lines.push(Line::from(Span::raw("")));
+    lines.push(Line::from(Span::styled(
+        "  ↑↓ move · Enter confirm · Esc back · [1][2][v][d] shortcuts",
+        dim,
+    )));
+    Widget::render(Paragraph::new(lines), area, buf);
+}
+
+// ─── Preview ────────────────────────────────────────────────────────────
+//
+// Rendered when `preview` is on. Walks the catalog comparing the
+// `original` snapshot against `working`, lists each differing row as
+// `id: old → new`. Any key returns to the prompt; no commit, no I/O.
+
+fn render_preview(original: &RuntimeConfig, working: &RuntimeConfig, area: Rect, buf: &mut Buffer) {
+    let head = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let before = Style::default().fg(Color::DarkGray);
+    let after = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    let before_cat = build_settings_catalog(original);
+    let after_cat = build_settings_catalog(working);
+    // Catalogs are built from the same function so the id order matches;
+    // zip is safe. Guard anyway.
+    let mut lines = vec![
+        Line::from(Span::styled("  Preview changes", head)),
+        Line::from(Span::raw("")),
+    ];
+    let mut any = false;
+    for (a, b) in before_cat.iter().zip(after_cat.iter()) {
+        if a.id != b.id {
+            continue; // shape drift, skip row
+        }
+        if a.value != b.value {
+            any = true;
+            lines.push(Line::from(vec![
+                Span::styled("  ", dim),
+                Span::raw(a.id.clone()),
+                Span::styled(": ", dim),
+                Span::styled(render_value_short(&a.value), before),
+                Span::styled(" → ", dim),
+                Span::styled(render_value_short(&b.value), after),
+            ]));
+        }
+    }
+    if !any {
+        lines.push(Line::from(Span::styled("  (no changes)", dim)));
+    }
+    lines.push(Line::from(Span::raw("")));
+    lines.push(Line::from(Span::styled("  any key returns to prompt", dim)));
     Widget::render(Paragraph::new(lines), area, buf);
 }

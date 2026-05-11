@@ -255,10 +255,7 @@ fn save_prompt_shows_absolute_project_path_not_relative_sugar() {
             text.push_str(buf[(x, y)].symbol());
         }
     }
-    let cwd = std::env::current_dir()
-        .expect("cwd")
-        .display()
-        .to_string();
+    let cwd = std::env::current_dir().expect("cwd").display().to_string();
     // The cwd is a long path; render truncates. Check a leading
     // component (first 20 chars of cwd) appears AND the filename.
     let lead: String = cwd.chars().take(20).collect();
@@ -337,7 +334,10 @@ fn save_prompt_preview_any_key_returns_to_prompt() {
     v.handle_key(key(KeyCode::Enter));
     assert!(v.preview_open_for_test());
     v.handle_key(key(KeyCode::Esc));
-    assert!(!v.preview_open_for_test(), "Esc in preview returns to prompt");
+    assert!(
+        !v.preview_open_for_test(),
+        "Esc in preview returns to prompt"
+    );
     assert!(v.save_prompt_open_for_test(), "save prompt still open");
     assert!(!v.is_complete(), "view not complete yet");
 }
