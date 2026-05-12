@@ -648,7 +648,8 @@ impl MemoriaClient {
                 }
 
                 // Tags: explicit caller tags + the astra v2 category tag
-                // (so v2 migration doesn't require re-writing history).
+                // (so v2 migration doesn't require re-writing history) +
+                // the team-scope tag when visibility=team.
                 let mut tags: Vec<Value> = args
                     .get("tags")
                     .and_then(Value::as_array)
@@ -659,6 +660,54 @@ impl MemoriaClient {
                 {
                     tags.push(json!(tag));
                 }
+
+                // Visibility: `team` requires `team_id` and encodes as an
+                // `astra:team:<id>` tag. `private` (or absent) writes a
+                // user-scoped memory with no team tag. `visibility=team`
+                // without a `team_id` short-circuits to a clear error —
+                // silently falling back to private would leak a fact the
+                // agent believed was shared.
+                let visibility = args
+                    .get("visibility")
+                    .and_then(Value::as_str)
+                    .unwrap_or("private");
+                match visibility {
+                    "team" => {
+                        let Some(team_id) = args
+                            .get("team_id")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        else {
+                            return (
+                                String::new(),
+                                json!({"error":
+                                    "memory(action=remember, visibility=\"team\") requires a \
+                                     non-empty `team_id`; falling back to private would silently \
+                                     narrow the audience."}),
+                                HttpMethod::Post,
+                            );
+                        };
+                        let team_tag = format!("astra:team:{team_id}");
+                        if !tags.iter().any(|t| t.as_str() == Some(team_tag.as_str())) {
+                            tags.push(json!(team_tag));
+                        }
+                    }
+                    "private" | "" => {
+                        // Default — no team tag.
+                    }
+                    other => {
+                        return (
+                            String::new(),
+                            json!({"error": format!(
+                                "memory(action=remember): invalid visibility {other:?}; \
+                                 expected \"private\" or \"team\""
+                            )}),
+                            HttpMethod::Post,
+                        );
+                    }
+                }
+
                 if !tags.is_empty() {
                     payload["tags"] = Value::Array(tags);
                 }
@@ -741,6 +790,32 @@ impl MemoriaClient {
                 // v2 backend see the hint without code change.
                 if let Some(view) = args.get("view").and_then(Value::as_str) {
                     pl["view"] = json!(view);
+                }
+                // Visibility: when `visibility=team` is requested, the
+                // client-side post-filter (see `call_with_timeout`) unions
+                // team-tagged hits into the result. Here we forward
+                // `include_tags` to the backend — v1 ignores unknown
+                // fields; v2 will honor them for server-side filtering.
+                // The team_id(s) to union come from either `team_id`
+                // (single) or `team_ids` (array); the dispatcher injects
+                // the caller's default team when absent.
+                let visibility = args.get("visibility").and_then(Value::as_str);
+                if matches!(visibility, Some("team")) {
+                    let mut team_tags = Vec::new();
+                    if let Some(tid) = args.get("team_id").and_then(Value::as_str) {
+                        team_tags.push(format!("astra:team:{}", tid.trim()));
+                    }
+                    if let Some(arr) = args.get("team_ids").and_then(Value::as_array) {
+                        for v in arr {
+                            if let Some(s) = v.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                                team_tags.push(format!("astra:team:{s}"));
+                            }
+                        }
+                    }
+                    if !team_tags.is_empty() {
+                        pl["include_tags"] =
+                            Value::Array(team_tags.into_iter().map(Value::String).collect());
+                    }
                 }
                 (format!("{base}/v1/memories/retrieve"), pl, HttpMethod::Post)
             }
@@ -1349,6 +1424,154 @@ mod tests {
         let args = json!({"query": "test", "top_k": 10});
         let (endpoint, _, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
         assert_eq!(endpoint, "http://mem/v1/memories/retrieve");
+    }
+
+    // ── Visibility (private / team) ─────────────────────────────────
+
+    #[test]
+    fn remember_defaults_to_private_no_team_tag() {
+        let args = json!({"content": "private fact", "memory_type": "feedback"});
+        let (endpoint, pl, _) =
+            MemoriaClient::build_direct_request("http://mem", "remember", &args);
+        assert_eq!(endpoint, "http://mem/v1/memories");
+        // Category tag is present but no team tag.
+        let tags: Vec<&str> = pl["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(tags.contains(&"astra:feedback"));
+        assert!(
+            !tags.iter().any(|t| t.starts_with("astra:team:")),
+            "private memory must not carry a team tag"
+        );
+    }
+
+    #[test]
+    fn remember_team_visibility_adds_team_tag() {
+        let args = json!({
+            "content": "team-wide convention",
+            "memory_type": "feedback",
+            "visibility": "team",
+            "team_id": "core-infra",
+        });
+        let (endpoint, pl, _) =
+            MemoriaClient::build_direct_request("http://mem", "remember", &args);
+        assert_eq!(endpoint, "http://mem/v1/memories");
+        let tags: Vec<&str> = pl["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(tags.contains(&"astra:team:core-infra"));
+        assert!(tags.contains(&"astra:feedback"));
+    }
+
+    #[test]
+    fn remember_team_visibility_without_team_id_fails_loudly() {
+        let args = json!({
+            "content": "whatever",
+            "memory_type": "feedback",
+            "visibility": "team",
+        });
+        let (endpoint, pl, _) =
+            MemoriaClient::build_direct_request("http://mem", "remember", &args);
+        assert!(endpoint.is_empty(), "must short-circuit without team_id");
+        assert!(
+            pl["error"].as_str().unwrap_or("").contains("team_id"),
+            "error must mention team_id"
+        );
+    }
+
+    #[test]
+    fn remember_rejects_unknown_visibility() {
+        let args = json!({
+            "content": "x",
+            "memory_type": "feedback",
+            "visibility": "world",
+        });
+        let (endpoint, pl, _) =
+            MemoriaClient::build_direct_request("http://mem", "remember", &args);
+        assert!(endpoint.is_empty());
+        assert!(
+            pl["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("invalid visibility"),
+            "error must call out invalid visibility: {pl:?}"
+        );
+    }
+
+    #[test]
+    fn remember_preserves_caller_tags_alongside_team_tag() {
+        let args = json!({
+            "content": "x",
+            "memory_type": "feedback",
+            "visibility": "team",
+            "team_id": "t1",
+            "tags": ["custom:tag", "astra:feedback"],  // include one duplicate
+        });
+        let (_endpoint, pl, _) =
+            MemoriaClient::build_direct_request("http://mem", "remember", &args);
+        let tags: Vec<&str> = pl["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // No duplicates of astra:feedback or astra:team:t1
+        assert_eq!(
+            tags.iter().filter(|t| **t == "astra:feedback").count(),
+            1,
+            "category tag must not duplicate: {tags:?}"
+        );
+        assert_eq!(tags.iter().filter(|t| **t == "astra:team:t1").count(), 1);
+        assert!(tags.contains(&"custom:tag"));
+    }
+
+    #[test]
+    fn recall_team_visibility_forwards_include_tags() {
+        let args = json!({
+            "query": "testing conventions",
+            "top_k": 5,
+            "visibility": "team",
+            "team_id": "core-infra",
+        });
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
+        let include_tags: Vec<&str> = pl["include_tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(include_tags, vec!["astra:team:core-infra"]);
+    }
+
+    #[test]
+    fn recall_team_visibility_supports_multiple_team_ids() {
+        let args = json!({
+            "query": "q",
+            "top_k": 5,
+            "visibility": "team",
+            "team_ids": ["t1", "t2"],
+        });
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
+        let include_tags: Vec<&str> = pl["include_tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(include_tags, vec!["astra:team:t1", "astra:team:t2"]);
+    }
+
+    #[test]
+    fn recall_private_visibility_omits_include_tags() {
+        let args = json!({"query": "q", "top_k": 5});
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
+        assert!(pl.get("include_tags").is_none());
     }
 
     // ── purge exclusivity (Memoria requires ONE of memory_ids/topic/session_id) ──

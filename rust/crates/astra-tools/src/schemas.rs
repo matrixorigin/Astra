@@ -470,7 +470,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     `reflect` (cross-memory pattern synthesis; consolidates recent memories into higher-level scenes), \
                     `profile` (return the user profile summary), \
                     `feedback` (signal that a recalled memory was useful/irrelevant/outdated/wrong — shapes future recall ranking). \
-                    Supports `agent_type` scoping for per-agent-type memory isolation.",
+                    Supports `agent_type` scoping for per-agent-type memory isolation. \
+                    Visibility: `visibility=\"private\"` (default) keeps the memory to your account; \
+                    `visibility=\"team\"` tags it for team sharing (requires `team_id`), and on recall \
+                    the union includes the current user's team-tagged memories.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -504,6 +507,15 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "tags": {"type": "array", "items": {"type": "string"}, "description": "remember: tags to attach."},
                         "tags_add": {"type": "array", "items": {"type": "string"}, "description": "update: tags to append."},
                         "tags_remove": {"type": "array", "items": {"type": "string"}, "description": "update: tags to detach."},
+                        "visibility": {
+                            "type": "string",
+                            "enum": ["private","team"],
+                            "description": "remember: who else should see this memory. `private` (default) — only you on this account. `team` — shared with other agents that belong to the same team (`team_id` required). recall: when set to `team`, the retrieval union includes team-tagged memories in addition to your private ones."
+                        },
+                        "team_id": {
+                            "type": "string",
+                            "description": "remember with visibility=team: the team to tag (encoded as `astra:team:<id>` in the memory's tag set). recall with visibility=team: union with the given team's shared pool. Omit to fall back to the executor's default team from session context."
+                        },
                         "reason": {"type": "string", "description": "forget / update / feedback: short explanation for audit trail."},
                         "level": {
                             "type": "string",
