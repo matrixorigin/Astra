@@ -31,30 +31,37 @@ fn items() -> Vec<SlashItem> {
         SlashItem {
             name: "/help",
             description: "show help",
+            subcommands: &[],
         },
         SlashItem {
             name: "/history",
             description: "browse history",
+            subcommands: &[],
         },
         SlashItem {
             name: "/model",
             description: "pick a model",
+            subcommands: &[],
         },
         SlashItem {
             name: "/resume",
             description: "resume a session",
+            subcommands: &[],
         },
         SlashItem {
             name: "/review",
             description: "review changes",
+            subcommands: &[],
         },
         SlashItem {
             name: "/agent-create",
             description: "create a new agent",
+            subcommands: &[],
         },
         SlashItem {
             name: "/exit",
             description: "exit astra",
+            subcommands: &[],
         },
     ]
 }

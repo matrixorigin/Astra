@@ -76,6 +76,18 @@ pub(crate) struct Cli {
     /// Load MCP server config from JSON file(s) or inline JSON strings
     #[arg(long = "mcp-config", num_args = 1..)]
     pub mcp_config: Vec<String>,
+    /// Overlay runtime settings from a JSON string or file path.
+    ///
+    /// Partial overlay: the JSON needs to mention only the fields you
+    /// want to change; everything else keeps the value from config file
+    /// + env + defaults. Inline vs. file is decided by a leading `{`.
+    ///
+    /// Examples:
+    ///   astra -p 'fix tests' --model sonnet-4-6 \
+    ///     --settings '{"token_budget":{"max_turn_input_tokens":500000}}'
+    ///   astra --settings overrides.json
+    #[arg(long = "settings", value_name = "JSON-OR-PATH")]
+    pub settings: Option<String>,
     /// Use a specific session ID (must be a valid UUID)
     #[arg(long = "session-id")]
     pub session_id: Option<String>,
@@ -192,9 +204,47 @@ pub(crate) enum Command {
     Agent(AgentArgs),
     /// Inspect inter-agent messaging state
     Messaging(MessagingArgs),
+    /// Dump the `/context` snapshot for a persisted session
+    #[command(subcommand)]
+    Context(ContextCmd),
     /// Direct message: astra "your question here"
     #[command(external_subcommand)]
     Message(Vec<String>),
+}
+
+/// Subcommands for the standalone `astra context` group.  Mirrors
+/// the TUI's `/context` slash command but works without a running
+/// REPL — useful for forensic replay from a persisted session.
+#[derive(Subcommand, Debug)]
+pub(crate) enum ContextCmd {
+    /// Dump a session's context as JSON, or a human-readable
+    /// summary to stdout.
+    ///
+    /// Examples:
+    ///     astra context dump                # most-recent session, JSON to ~/.astra/context-dumps/
+    ///     astra context dump -s 01e363ed    # 8-char prefix (any unique prefix works)
+    ///     astra context dump --summary      # plain-text summary to stdout, no file write
+    ///     astra context dump -s abc -o snap.json
+    #[command(verbatim_doc_comment)]
+    Dump(ContextDumpArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct ContextDumpArgs {
+    /// Session id — any unique prefix (e.g. first 8 chars) works.
+    /// When omitted, falls back to the most recently modified
+    /// session in `~/.astra/sessions/`.
+    #[arg(short = 's', long)]
+    pub session: Option<String>,
+    /// Write a JSON dump to this path instead of the default
+    /// `~/.astra/context-dumps/<sid>-t<turn>-<ts>.json`.  Ignored
+    /// when `--summary` is set.
+    #[arg(short = 'o', long)]
+    pub output: Option<String>,
+    /// Print a human-readable summary to stdout instead of writing
+    /// a JSON file.  Useful for `| grep`, CI logs, bug reports.
+    #[arg(long)]
+    pub summary: bool,
 }
 
 /// Headless plan commands (no interactive `plan>` prompt).
@@ -444,9 +494,12 @@ pub(crate) struct TaskQueryArgs {
 }
 
 #[derive(Args, Debug)]
-#[command(
-    after_help = "Examples:\n  astra memory list\n  astra memory search team bootstrap\n  astra memory search 用户偏好"
-)]
+#[command(after_help = "Examples:\n  \
+        astra memory list\n  \
+        astra memory list --type profile\n  \
+        astra memory search 用户偏好\n  \
+        astra memory show <memory_id>\n  \
+        astra memory forget <memory_id>")]
 pub(crate) struct MemoryArgs {
     #[command(subcommand)]
     pub command: Option<MemorySubcommand>,
@@ -454,10 +507,25 @@ pub(crate) struct MemoryArgs {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum MemorySubcommand {
-    /// List recent memories
-    List,
-    /// Search memories
+    /// List recent memories, newest first.
+    List(MemoryListArgs),
+    /// Semantic search across all memories.
     Search(MemorySearchArgs),
+    /// Show full content of a single memory by id.
+    Show(MemoryShowArgs),
+    /// Soft-delete a memory by id (can be restored by an admin).
+    Forget(MemoryForgetArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct MemoryListArgs {
+    /// Filter to a single memory_type (profile / semantic / procedural /
+    /// episodic / working). When omitted, all types are listed.
+    #[arg(long = "type")]
+    pub memory_type: Option<String>,
+    /// Maximum number of entries to print.
+    #[arg(long, default_value_t = 20)]
+    pub limit: u32,
 }
 
 #[derive(Args, Debug)]
@@ -465,6 +533,21 @@ pub(crate) struct MemorySearchArgs {
     /// Search query
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub query: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct MemoryShowArgs {
+    /// Memory id to inspect (UUID from `astra memory list`).
+    pub memory_id: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct MemoryForgetArgs {
+    /// Memory id to delete.
+    pub memory_id: String,
+    /// Optional reason for the audit trail.
+    #[arg(long)]
+    pub reason: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -797,8 +880,6 @@ pub(crate) enum SelfMutateCmd {
     Preview(SelfMutateConfigArgs),
     /// Apply a RuntimeConfig mutation to persisted session state
     Apply(SelfMutateConfigArgs),
-    /// Set the persisted session goal text
-    Goal(SelfMutateGoalArgs),
 }
 
 #[derive(Args, Debug)]
@@ -812,16 +893,6 @@ pub(crate) struct SelfMutateConfigArgs {
     /// New value as JSON (falls back to a raw string when not valid JSON)
     #[arg(long)]
     pub value: String,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct SelfMutateGoalArgs {
-    /// Session id or unique prefix (defaults to the most recent resumable session)
-    #[arg(long)]
-    pub session_id: Option<String>,
-    /// New session goal text
-    #[arg(long)]
-    pub text: String,
 }
 
 #[derive(Args, Debug)]
@@ -1117,6 +1188,55 @@ pub(crate) enum ConfigCmd {
     Set(ConfigSetArgs),
     /// Show the resolved workflow-guard policy for a model
     ShowPolicy(ConfigShowPolicyArgs),
+    /// Inspect the content-addressed history of saved configs.
+    #[command(subcommand)]
+    Version(ConfigVersionCmd),
+}
+
+/// `astra config version ...` — browse, diff, and inspect saved config
+/// versions. Every `/config` save and every session startup writes an
+/// entry to the version store (`~/.astra/config/versions/`); these
+/// commands are the read-side of that store.
+#[derive(Subcommand, Debug)]
+pub(crate) enum ConfigVersionCmd {
+    /// List versions newest-first.
+    List(ConfigVersionListArgs),
+    /// Print the TOML body of a specific version.
+    Show(ConfigVersionShowArgs),
+    /// Show field-level diff between two versions.
+    Diff(ConfigVersionDiffArgs),
+    /// Print the id of the config the current process would run under.
+    Current,
+    /// Pull cloud-mirrored versions into the local store.
+    Pull(ConfigVersionPullArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConfigVersionPullArgs {
+    /// Maximum number of versions to pull (default: 500).
+    #[arg(long, default_value_t = 500)]
+    pub limit: i64,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConfigVersionListArgs {
+    /// Maximum number of rows to render (default: all).
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConfigVersionShowArgs {
+    /// Version id (full or a unique prefix, e.g. `cfg_a7b2`).
+    pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConfigVersionDiffArgs {
+    /// First version id (or unique prefix).
+    pub a: String,
+    /// Second version id (or unique prefix).
+    pub b: String,
 }
 
 #[derive(Args, Debug)]

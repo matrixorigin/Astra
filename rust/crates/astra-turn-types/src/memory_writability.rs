@@ -147,13 +147,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_attention_manifest() {
-        assert!(!should_store_in_memory(&user(
-            "[attention:v1]\ngoal: fix bug"
-        )));
-    }
-
-    #[test]
     fn rejects_system_messages() {
         assert!(!should_store_in_memory(
             &json!({"role": "system", "content": "any content"})

@@ -325,25 +325,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_relevant_file_matches_current_subtask() {
-        let facts = SessionFacts {
-            plan_state: Some(PlanFact {
-                goal: "fix compaction".to_string(),
-                completed: 1,
-                total: 3,
-                current_subtask: Some(
-                    "preserve rust/crates/runtime/src/server/run_lifecycle.rs while validating"
-                        .to_string(),
-                ),
-            }),
-            ..Default::default()
-        };
-
-        assert!(facts.is_pending_relevant_file("rust/crates/runtime/src/server/run_lifecycle.rs"));
-        assert!(!facts.is_pending_relevant_file("rust/crates/runtime/src/other.rs"));
-    }
-
-    #[test]
     fn to_injection_format() {
         let facts = SessionFacts {
             turn: 5,
@@ -367,74 +348,6 @@ mod tests {
         assert!(injection.contains("write src/main.rs (t5)"));
         assert!(injection.contains("Errors: 1 total, last: compile error"));
         assert!(injection.contains("Blocked tools: web_fetch"));
-    }
-
-    #[test]
-    fn working_set_injection_has_stable_order_and_preserves_key_facts() {
-        let facts = SessionFacts {
-            turn: 5,
-            active_files: vec![
-                FileEntry {
-                    path: "src/z.rs".to_string(),
-                    last_action: "read".to_string(),
-                    turn: 4,
-                },
-                FileEntry {
-                    path: "src/a.rs".to_string(),
-                    last_action: "write".to_string(),
-                    turn: 5,
-                },
-            ],
-            recent_tool_calls: vec![
-                ToolFact {
-                    name: "read_file".to_string(),
-                    ok: true,
-                    turn: 4,
-                },
-                ToolFact {
-                    name: "str_replace".to_string(),
-                    ok: false,
-                    turn: 5,
-                },
-            ],
-            plan_state: Some(PlanFact {
-                goal: "fix context continuity".to_string(),
-                completed: 1,
-                total: 3,
-                current_subtask: Some("add canonical working set".to_string()),
-            }),
-            blocked_tools: vec!["str_replace".to_string(), "web_fetch".to_string()],
-            error_state: ErrorFact {
-                total_errors: 2,
-                last_error: Some("old_str not found".to_string()),
-                last_error_turn: Some(5),
-            },
-            estimated_tokens: 0,
-        };
-
-        let injection = facts.to_working_set_injection("fallback goal");
-        assert!(injection.starts_with("[working-set:v1]\n"));
-        assert!(injection.contains("goal: fix context continuity\n"));
-        assert!(injection.contains("pending_work: add canonical working set\n"));
-        assert!(
-            injection.find("- src/a.rs").unwrap() < injection.find("- src/z.rs").unwrap(),
-            "active files should be sorted for deterministic rendering: {injection}"
-        );
-        assert!(injection.contains("- read_file [ok t4]"));
-        assert!(injection.contains("- str_replace [error t5]"));
-        assert!(injection.contains("- blocked: str_replace, web_fetch"));
-        assert!(injection.contains("- errors: 2 total, last: old_str not found"));
-    }
-
-    #[test]
-    fn working_set_injection_uses_none_placeholders_for_empty_sections() {
-        let facts = SessionFacts::default();
-        let injection = facts.to_working_set_injection("");
-        assert!(injection.contains("goal: none\n"));
-        assert!(injection.contains("pending_work: none\n"));
-        assert!(injection.contains("active_files:\n- none\n"));
-        assert!(injection.contains("recent_tools:\n- none\n"));
-        assert!(injection.contains("tool_risks:\n- none\n"));
     }
 
     #[test]

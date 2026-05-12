@@ -78,6 +78,18 @@ pub(crate) enum AppEvent {
         output: Option<String>,
     },
 
+    /// Mid-flight progress signal for the active ToolCell —
+    /// `lines`/`bytes` are cumulative counters since the tool
+    /// started. Used to render real "streaming · N lines · K KB"
+    /// status on long-running cells; the cell falls back to an
+    /// indeterminate animation when this event never arrives (non-
+    /// streaming tools like `read_file` / `git_log`).
+    ToolOutput {
+        name: String,
+        lines: u64,
+        bytes: u64,
+    },
+
     /// Turn ended cleanly; ChatWidget should emit a summary cell.
     TurnComplete(Box<TurnStats>),
 
@@ -268,6 +280,7 @@ impl ChatWidget {
                 output_summary,
                 output,
             ),
+            AppEvent::ToolOutput { name, lines, bytes } => self.on_tool_output(&name, lines, bytes),
             AppEvent::TurnComplete(stats) => self.on_turn_complete(*stats),
             AppEvent::TurnError(msg) => self.on_turn_error(msg),
         }
@@ -356,6 +369,20 @@ impl ChatWidget {
     fn on_tool_started(&mut self, name: String, description: String) {
         self.commit_active();
         self.active_cell = Some(Box::new(ToolCell::new_running(name, description)));
+    }
+
+    /// Route a `ToolOutput` progress tick to the currently active
+    /// ToolCell. The `name` arg is advisory — we only forward if the
+    /// active cell is a running tool; cells from a completed prior
+    /// tool are ignored rather than synthesised, since progress
+    /// without a live cell has no visual home.
+    fn on_tool_output(&mut self, name: &str, lines: u64, bytes: u64) {
+        if let Some(cell) = self.active_cell.as_mut()
+            && let Some(tc) = cell.as_any_mut().downcast_mut::<ToolCell>()
+            && tc.name == name
+        {
+            tc.set_progress(lines, bytes);
+        }
     }
 
     fn on_tool_completed(

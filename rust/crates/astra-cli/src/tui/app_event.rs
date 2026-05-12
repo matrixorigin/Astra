@@ -19,6 +19,11 @@ pub(crate) enum TuiAppEvent {
         output_summary: Option<String>,
         output: Option<String>,
     },
+    ToolOutput {
+        name: String,
+        lines: u64,
+        bytes: u64,
+    },
     WaitingForModel,
     ModelResponding,
     StatusLine(String),

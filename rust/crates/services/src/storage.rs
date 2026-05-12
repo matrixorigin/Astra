@@ -1476,27 +1476,6 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    // ── Learning state convergence (Phase F) ──
-
-    query(
-        "CREATE TABLE IF NOT EXISTS learning_snapshots (
-            snapshot_id VARCHAR(64) PRIMARY KEY,
-            user_id VARCHAR(64) NOT NULL,
-            profile_name VARCHAR(100) NOT NULL,
-            snapshot_json LONGTEXT NOT NULL,
-            entity_count INT NOT NULL DEFAULT 0,
-            pattern_count INT NOT NULL DEFAULT 0,
-            has_calibration SMALLINT NOT NULL DEFAULT 0,
-            version INT NOT NULL DEFAULT 1,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY idx_learning_user_profile (user_id, profile_name),
-            INDEX idx_learning_user_updated (user_id, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     query(
         "CREATE TABLE IF NOT EXISTS user_preferences (
             pref_id VARCHAR(64) PRIMARY KEY,
@@ -2576,6 +2555,18 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
+    // ─── Content-addressed config versions (Step 4a) ────────────────────────────
+    //
+    // One row per unique RuntimeConfig hash per tenant. Populated by
+    // the CLI via enqueue_journal_events → IngestionEvent::ConfigVersionSaved,
+    // consumed by `astra config sync pull` on new machines. See
+    // `crate::config_version_cloud` for the DDL string and bind helpers
+    // that the push / pull pipeline uses.
+
+    query(crate::config_version_cloud::CONFIG_VERSIONS_CREATE_SQL)
+        .execute(&pool)
+        .await?;
+
     // ─── Schema migration tracking ──────────────────────────────────────────────
 
     query(
@@ -2750,6 +2741,37 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
          ADD COLUMN trace_id VARCHAR(64) DEFAULT NULL, \
          ADD COLUMN message_count INT DEFAULT NULL, \
          ADD INDEX idx_csl_turn (session_id, turn)",
+    )
+    .await?;
+
+    // Step 4a — content-addressed config versions.
+    //
+    // Two migrations so fresh DBs get everything via the CREATE TABLE
+    // above and existing DBs catch up here.
+
+    run_migration(
+        pool,
+        10,
+        "create config_versions table (Step 4a cloud mirror of local version store)",
+        crate::config_version_cloud::CONFIG_VERSIONS_CREATE_SQL,
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        11,
+        "add config_version_id pointer column to agent_sessions",
+        "ALTER TABLE agent_sessions \
+         ADD COLUMN config_version_id VARCHAR(24) DEFAULT NULL",
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        12,
+        "add config_version_id index on agent_sessions",
+        "ALTER TABLE agent_sessions \
+         ADD INDEX idx_agent_sessions_config_version (config_version_id)",
     )
     .await?;
 

@@ -853,7 +853,6 @@ impl StepRecorder {
             budget_remaining_rounds,
             blocked_tools: blocked_tools.to_vec(),
             recent_tools: recent_tools.to_vec(),
-            learning_snapshot_id: None,
             memory_context: self
                 .current_step
                 .as_ref()
@@ -864,9 +863,9 @@ impl StepRecorder {
             interruption,
             approval_overrides,
             consecutive_context_window_errors,
-            pipeline_state: None,   // Set by caller after construction
-            compaction_state: None, // Set by caller after construction
-            continuity_state: None, // Set by caller after construction
+            pipeline_state: None,    // Set by caller after construction
+            compaction_state: None,  // Set by caller after construction
+            config_version_id: None, // Set by caller after construction (Step 2a)
         })
     }
 

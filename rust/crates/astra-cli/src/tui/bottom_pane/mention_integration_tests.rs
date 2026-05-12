@@ -167,6 +167,7 @@ fn slash_and_mention_are_mutually_exclusive() {
     bp.set_slash_items(vec![SlashItem {
         name: "/help",
         description: "show help",
+        subcommands: &[],
     }]);
 
     let _ = bp.handle_key(key('/'));

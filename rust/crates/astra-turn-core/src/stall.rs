@@ -734,8 +734,7 @@ pub enum IntentDrift {
 pub const INTENT_DRIFT_WINDOW: usize = 3;
 
 /// Tools that are always considered on-task (utility/meta tools).
-const ALWAYS_ON_TASK_TOOLS: &[&str] =
-    &["memory_search", "memory_store", "reflect", "get_agent_info"];
+const ALWAYS_ON_TASK_TOOLS: &[&str] = &["memory", "reflect", "get_agent_info"];
 
 /// Extract keywords from user query for intent matching.
 /// Lowercases and splits on whitespace/punctuation, filters short words.
@@ -1060,7 +1059,7 @@ mod tests {
 
     #[test]
     fn divergence_healthy_productive() {
-        let sigs = make_sigs(&[&["github_list_prs"], &["memory_store"]]);
+        let sigs = make_sigs(&[&["github_list_prs"], &["memory"]]);
         assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
@@ -1131,7 +1130,7 @@ mod tests {
 
     #[test]
     fn divergence_multi_tool_with_productive() {
-        let sigs = make_sigs(&[&["bash", "memory_store"]]);
+        let sigs = make_sigs(&[&["bash", "memory"]]);
         assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
@@ -1396,7 +1395,7 @@ mod tests {
         let avoid = vec!["bash".to_string(), "git_log".to_string()];
         let mut used = std::collections::HashSet::new();
         used.insert("bash".to_string());
-        used.insert("memory_store".to_string());
+        used.insert("memory".to_string());
         let ignored = detect_nudge_ignored(&avoid, &used);
         assert_eq!(ignored, vec!["bash".to_string()]);
     }
@@ -1405,7 +1404,7 @@ mod tests {
     fn nudge_ignored_empty_when_obeyed() {
         let avoid = vec!["bash".to_string()];
         let mut used = std::collections::HashSet::new();
-        used.insert("memory_store".to_string());
+        used.insert("memory".to_string());
         let ignored = detect_nudge_ignored(&avoid, &used);
         assert!(ignored.is_empty());
     }
@@ -1539,7 +1538,7 @@ mod tests {
         let turns = make_intent_turns(&[
             (&["write_file"], "random"),
             (&["write_file"], "random"),
-            (&["memory_search"], "anything"), // meta tool: always on-task
+            (&["memory"], "anything"), // meta tool: always on-task
         ]);
         let result = detect_intent_drift("review 最新的commit", &turns);
         assert_eq!(result, IntentDrift::OnTask);

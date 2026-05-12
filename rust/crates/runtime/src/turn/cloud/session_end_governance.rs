@@ -1,17 +1,22 @@
-//! P7: Session-end governance — learnings backflow + working memory cleanup.
+//! Session-end governance — cleanup + episode persistence + reflection.
 //!
-//! At session end:
-//! 1. Extract reusable knowledge from L1b (User Corrections + Learnings)
-//!    → store as semantic memory (cross-session)
-//! 2. Purge working memory for this session
+//! At session end we:
 //!
-//! See `docs/design/session-memory-protocol.md` Section 6.2.
+//! 1. **Purge working memory** tied to the session (same as before).
+//! 2. **Write an `episodic` memory** summarising what happened — derived
+//!    from [`SessionFacts`] (deterministic, no LLM call). Replaces the
+//!    retired L1b narrative protocol.
+//! 3. **Trigger reflection** so Memoria's graph-consolidation picks up
+//!    recent memories into scene nodes. Respects the backend's cooldown
+//!    (v1 defaults to 1h), so hot sessions won't thrash.
+//!
+//! All three are best-effort — a failure in any step logs a warning and
+//! moves on; the rest still runs.
 
-use super::session_memory_protocol::SessionMemory;
 use astra_turn_types::session_facts::SessionFacts;
 
 /// Knowledge extracted from a session for cross-session persistence.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionKnowledge {
     /// User corrections (highest priority — explicit preferences).
     pub corrections: Vec<String>,
@@ -23,222 +28,126 @@ pub struct SessionKnowledge {
     pub error_patterns: Vec<String>,
 }
 
-/// Extract reusable knowledge from session facts + narrative.
-/// This is called at session end to persist cross-session knowledge.
-pub fn extract_session_knowledge(
-    facts: &SessionFacts,
-    narrative: Option<&SessionMemory>,
-) -> SessionKnowledge {
-    let mut knowledge = SessionKnowledge {
-        corrections: Vec::new(),
-        learnings: Vec::new(),
-        decisions: Vec::new(),
-        error_patterns: Vec::new(),
-    };
+/// Extract reusable knowledge from session facts.
+pub fn extract_session_knowledge(facts: &SessionFacts) -> SessionKnowledge {
+    let mut knowledge = SessionKnowledge::default();
 
-    if let Some(n) = narrative {
-        // User Corrections — highest priority, always persist
-        if let Some(corrections) = n.section("User Corrections") {
-            knowledge.corrections = extract_bullet_items(corrections);
-        }
-        // Learnings — reusable patterns
-        if let Some(learnings) = n.section("Learnings") {
-            knowledge.learnings = extract_bullet_items(learnings);
-        }
-        // Decisions — key technical choices
-        if let Some(decisions) = n.section("Decisions") {
-            knowledge.decisions = extract_bullet_items(decisions);
-        }
-        // Also check v1 "Errors & Corrections" section for backward compat
-        if let Some(errors) = n.section("Errors & Corrections") {
-            for item in extract_bullet_items(errors) {
-                // Only keep items that look like corrections (contain "should", "use", "don't")
-                let lower = item.to_lowercase();
-                if lower.contains("should")
-                    || lower.contains("use ")
-                    || lower.contains("don't")
-                    || lower.contains("prefer")
-                    || lower.contains("avoid")
-                {
-                    knowledge.corrections.push(item);
-                }
-            }
-        }
-    }
-
-    // Error patterns from system facts
-    if facts.error_state.total_errors > 0 {
-        if let Some(err) = &facts.error_state.last_error {
-            knowledge
-                .error_patterns
-                .push(format!("Error encountered: {err}"));
-        }
+    if facts.error_state.total_errors > 0
+        && let Some(err) = &facts.error_state.last_error
+    {
+        knowledge
+            .error_patterns
+            .push(format!("Error encountered: {err}"));
     }
 
     knowledge
 }
 
-/// Format extracted knowledge as a layered-body memory string for
-/// Memoria storage.
+/// Build the episodic summary content for a finished session. Pure
+/// function — deterministic, no LLM call. ~200-500 chars.
 ///
-/// Layers emitted:
-/// - **abstract** (deterministic, single line, 30–150 chars):
-///   `"Session <sid>: N corrections, M learnings, K decisions"`.
-///   No LLM call — session-end is a hot path on shutdown and we don't
-///   want extra latency here.
-/// - **overview** (short narrative): count summary plus the first
-///   correction/learning/decision preview so the overview view is
-///   useful without expanding.
-/// - **detail** (bullet sections): the existing User Corrections /
-///   Learnings / Decisions markdown — unchanged payload, just moved
-///   into the detail layer.
-pub fn format_knowledge_for_storage(
-    knowledge: &SessionKnowledge,
-    session_id: &str,
-) -> Option<String> {
-    if knowledge.corrections.is_empty()
-        && knowledge.learnings.is_empty()
-        && knowledge.decisions.is_empty()
+/// Shape (matches the category layout in `astra_prompts::memory_types`):
+/// ```text
+/// [episode] turn=N, ~Kt tokens
+/// Files touched: <k1>, <k2>, ...
+/// Tools: <n1>:ok, <n2>:fail, ...
+/// Errors: <last_error>
+/// ```
+pub fn build_episode_overview(facts: &SessionFacts) -> Option<String> {
+    // Skip trivial sessions (nothing happened worth remembering).
+    if facts.turn == 0 && facts.active_files.is_empty() && facts.recent_tool_calls.is_empty() {
+        return None;
+    }
+
+    let mut s = String::with_capacity(512);
+    s.push_str("[episode] ");
+    s.push_str(&format!(
+        "turn={}, ~{}K tokens\n",
+        facts.turn,
+        facts.estimated_tokens / 1000
+    ));
+
+    // Files (most recent last — keep final FILES_CAP for brevity).
+    // When truncating, append `(+N more)` so the reader knows the list
+    // is abbreviated — silent truncation makes the episode look
+    // complete when it isn't.
+    const FILES_CAP: usize = 8;
+    if !facts.active_files.is_empty() {
+        let total = facts.active_files.len();
+        let recent: Vec<&str> = facts
+            .active_files
+            .iter()
+            .rev()
+            .take(FILES_CAP)
+            .map(|f| f.path.as_str())
+            .collect();
+        s.push_str("Files: ");
+        s.push_str(&recent.iter().rev().copied().collect::<Vec<_>>().join(", "));
+        if total > FILES_CAP {
+            s.push_str(&format!(" (+{} more)", total - FILES_CAP));
+        }
+        s.push('\n');
+    }
+
+    // Tools: a compact ok/fail tally by name.
+    const TOOLS_CAP: usize = 6;
+    if !facts.recent_tool_calls.is_empty() {
+        use std::collections::BTreeMap;
+        let mut by_name: BTreeMap<&str, (u32, u32)> = BTreeMap::new();
+        for tc in &facts.recent_tool_calls {
+            let e = by_name.entry(tc.name.as_str()).or_insert((0, 0));
+            if tc.ok {
+                e.0 += 1;
+            } else {
+                e.1 += 1;
+            }
+        }
+        let total = by_name.len();
+        let parts: Vec<String> = by_name
+            .iter()
+            .take(TOOLS_CAP)
+            .map(|(name, (ok, fail))| match (*ok, *fail) {
+                (o, 0) => format!("{name}:{o}ok"),
+                (0, f) => format!("{name}:{f}fail"),
+                (o, f) => format!("{name}:{o}ok/{f}fail"),
+            })
+            .collect();
+        if !parts.is_empty() {
+            s.push_str("Tools: ");
+            s.push_str(&parts.join(", "));
+            if total > TOOLS_CAP {
+                s.push_str(&format!(" (+{} more)", total - TOOLS_CAP));
+            }
+            s.push('\n');
+        }
+    }
+
+    // Errors (last one is the most informative; cap at 120 chars).
+    if facts.error_state.total_errors > 0
+        && let Some(err) = &facts.error_state.last_error
     {
-        return None; // Nothing worth persisting
+        let err_snip: String = err.chars().take(120).collect();
+        s.push_str("Last error: ");
+        s.push_str(&err_snip);
+        s.push('\n');
     }
 
-    let abstract_ = synthesize_session_abstract(knowledge, session_id);
-    let overview = synthesize_session_overview(knowledge);
-    let detail = format_session_detail(knowledge);
-
-    Some(astra_prompts::memory_proto::encode_body_layers(
-        &abstract_,
-        Some(&overview),
-        Some(&detail),
-    ))
+    if s.trim().is_empty() { None } else { Some(s) }
 }
 
-/// Deterministic abstract for session-end knowledge. Must clear L2's
-/// `ABSTRACT_MIN_CHARS` (30) and stay under `ABSTRACT_MAX_CHARS`
-/// (150).
-fn synthesize_session_abstract(knowledge: &SessionKnowledge, session_id: &str) -> String {
-    // Truncate session id to a stable prefix so very long UUIDs don't
-    // blow the abstract cap. 12 chars = enough to disambiguate in
-    // retrieval without dominating the budget.
-    let sid_short: String = session_id.chars().take(12).collect();
-    format!(
-        "Session {sid_short}: {} corrections, {} learnings, {} decisions",
-        knowledge.corrections.len(),
-        knowledge.learnings.len(),
-        knowledge.decisions.len(),
-    )
-}
-
-/// Overview layer: a short narrative that previews each bucket's
-/// first entry so the `overview` view stays informative.
-fn synthesize_session_overview(knowledge: &SessionKnowledge) -> String {
-    let mut out = String::new();
-    if let Some(first) = knowledge.corrections.first() {
-        out.push_str(&format!("First correction: {}.", preview(first, 120)));
-    }
-    if let Some(first) = knowledge.learnings.first() {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(&format!("First learning: {}.", preview(first, 120)));
-    }
-    if let Some(first) = knowledge.decisions.first() {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(&format!("First decision: {}.", preview(first, 120)));
-    }
-    out
-}
-
-/// Detail layer: the full bullet sections as before.
-fn format_session_detail(knowledge: &SessionKnowledge) -> String {
-    let mut out = String::new();
-    if !knowledge.corrections.is_empty() {
-        out.push_str("## User Corrections\n");
-        for c in &knowledge.corrections {
-            out.push_str(&format!("- {c}\n"));
-        }
-    }
-    if !knowledge.learnings.is_empty() {
-        out.push_str("## Learnings\n");
-        for l in &knowledge.learnings {
-            out.push_str(&format!("- {l}\n"));
-        }
-    }
-    if !knowledge.decisions.is_empty() {
-        out.push_str("## Decisions\n");
-        for d in &knowledge.decisions {
-            out.push_str(&format!("- {d}\n"));
-        }
-    }
-    out
-}
-
-fn preview(s: &str, max_chars: usize) -> String {
-    let trimmed = s.trim().replace('\n', " ");
-    let count = trimmed.chars().count();
-    if count <= max_chars {
-        trimmed
-    } else {
-        let mut out: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
-}
-
-/// Full session-end governance: extract knowledge, store to Memoria, purge working memory.
+/// Full session-end governance:
+///
+/// 1. Purge working memory tied to this session.
+/// 2. Persist an `episodic` memory with a deterministic overview.
+/// 3. Trigger Memoria reflection (cooldown-respecting).
 pub async fn run_session_end_governance(
     facts: &SessionFacts,
-    narrative: Option<&SessionMemory>,
     session_id: &str,
     client: &dyn super::memoria_compact::MemoriaClient,
 ) -> Result<SessionEndReport, String> {
-    let knowledge = extract_session_knowledge(facts, narrative);
-    let mut report = SessionEndReport {
-        learnings_stored: 0,
-        working_purged: 0,
-    };
+    let mut report = SessionEndReport::default();
 
-    // Store knowledge as semantic memory (cross-session). Route through
-    // the L2 structural gate so a malformed envelope (short abstract,
-    // missing `[@ns/type]` prefix) fails fast at write rather than
-    // polluting retrieval on future sessions.
-    if let Some(body) = format_knowledge_for_storage(&knowledge, session_id) {
-        let items =
-            knowledge.corrections.len() + knowledge.learnings.len() + knowledge.decisions.len();
-        // Wrap the layered body with the `[@knowledge/curated]` tag —
-        // the formatter intentionally returns body-only so callers can
-        // choose namespace/status explicitly.
-        let wire = astra_prompts::memory_proto::MemoryEntry::new(
-            astra_prompts::memory_proto::NS_KNOWLEDGE,
-            "curated",
-            &body,
-        )
-        .encode();
-        match astra_turn_types::should_store_persistent_memory(&wire, "semantic") {
-            Ok(()) => match client
-                .store(&wire, "semantic", Some(session_id), Some("T2"))
-                .await
-            {
-                Ok(_) => {
-                    report.learnings_stored = items;
-                    eprintln!(
-                        "[session-end] Stored {items} knowledge items for session {session_id}"
-                    );
-                }
-                Err(e) => {
-                    eprintln!("[session-end] Failed to store knowledge: {e}");
-                }
-            },
-            Err(reason) => {
-                eprintln!("[session-end] L2 rejected knowledge write: {reason}");
-            }
-        }
-    }
-
-    // Purge working memory
+    // ── 1. Purge working memory ────────────────────────────────────
     match client.purge_working(session_id).await {
         Ok(n) => {
             report.working_purged = n;
@@ -246,6 +155,63 @@ pub async fn run_session_end_governance(
         }
         Err(e) => {
             eprintln!("[session-end] Failed to purge working memory: {e}");
+        }
+    }
+
+    // ── 2. Persist episodic summary ────────────────────────────────
+    if let Some(overview) = build_episode_overview(facts) {
+        match client.store_episode(session_id, &overview).await {
+            Ok(memory_id) if !memory_id.is_empty() => {
+                report.episode_memory_id = Some(memory_id);
+                report.episode_chars = overview.chars().count();
+                eprintln!(
+                    "[session-end] Stored episode ({} chars) for session {session_id}",
+                    report.episode_chars
+                );
+            }
+            Ok(_) => {
+                // store succeeded but response didn't include a memory_id;
+                // count it as a write but leave id blank.
+                report.episode_chars = overview.chars().count();
+            }
+            Err(e) => {
+                eprintln!("[session-end] store_episode failed: {e}");
+            }
+        }
+    }
+
+    // ── 3. Reflect + forward-feed scene candidates ─────────────────
+    //
+    // Reflect in `candidates` mode returns a list of scene clusters the
+    // backend has grouped but not synthesized into scene nodes (the v1
+    // LLM path requires a backend-side LLM_API_KEY that often isn't
+    // configured). We forward-feed those clusters as `astra:scene`-
+    // tagged semantic memories ourselves so the next session's prewarm
+    // surfaces them alongside episodes. Without this step `reflect`
+    // runs, produces output, and the output is silently discarded.
+    match client.reflect_session(session_id, false).await {
+        Ok(summary) => {
+            report.reflect_candidates = summary.candidates;
+            report.reflect_synthesized = summary.synthesized;
+            for cand in &summary.candidate_payloads {
+                match client
+                    .store_scene(session_id, &cand.signal, &cand.summary)
+                    .await
+                {
+                    Ok(memory_id) if !memory_id.is_empty() => {
+                        report.scenes_stored += 1;
+                    }
+                    Ok(_) => report.scenes_stored += 1,
+                    Err(e) => {
+                        eprintln!("[session-end] store_scene failed: {e}");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            // Cooldown rejection is expected under hot activity; log at
+            // warn and keep going.
+            eprintln!("[session-end] reflect skipped/failed: {e}");
         }
     }
 
@@ -257,66 +223,34 @@ pub async fn run_session_end_governance(
 pub struct SessionEndReport {
     pub learnings_stored: usize,
     pub working_purged: u64,
+    /// Memoria memory_id of the persisted episode, if any.
+    pub episode_memory_id: Option<String>,
+    /// Characters written to the episode content (0 = no episode stored).
+    pub episode_chars: usize,
+    /// Number of scene / cluster candidates produced by reflect.
+    pub reflect_candidates: u64,
+    /// Whether reflect synthesized new scene nodes (v2 only).
+    pub reflect_synthesized: bool,
+    /// Number of `astra:scene`-tagged semantic memories the client
+    /// forward-fed from reflect candidates into the store for
+    /// next-session prewarm.
+    pub scenes_stored: usize,
 }
-
-fn extract_bullet_items(text: &str) -> Vec<String> {
-    text.lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            trimmed
-                .strip_prefix("- ")
-                .map(|content| content.to_string())
-        })
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_narrative(sections: &[(&str, &str)]) -> SessionMemory {
-        let mut text = String::from("[session-memory:v1]\n");
-        for (name, content) in sections {
-            text.push_str(&format!("# {name}\n{content}\n"));
-        }
-        SessionMemory::parse(&text).unwrap()
-    }
-
-    #[test]
-    fn extract_knowledge_from_narrative() {
-        let facts = SessionFacts::default();
-        let narrative = make_narrative(&[
-            (
-                "User Corrections",
-                "- Use RS256 not HS256\n- Don't use rm -rf",
-            ),
-            (
-                "Learnings",
-                "- CJK needs char_indices\n- floor_char_boundary for truncation",
-            ),
-            ("Decisions", "- Use axum over actix\n- Use sqlx for DB"),
-        ]);
-        let knowledge = extract_session_knowledge(&facts, Some(&narrative));
-        assert_eq!(knowledge.corrections.len(), 2);
-        assert_eq!(knowledge.learnings.len(), 2);
-        assert_eq!(knowledge.decisions.len(), 2);
-        assert!(knowledge.corrections[0].contains("RS256"));
-        assert!(knowledge.learnings[0].contains("CJK"));
-    }
+    use astra_turn_types::session_facts::{ErrorFact, FileEntry, ToolFact};
 
     #[test]
     fn extract_knowledge_includes_error_patterns() {
-        use astra_turn_types::session_facts::ErrorFact;
         let mut facts = SessionFacts::default();
         facts.error_state = ErrorFact {
             total_errors: 3,
             last_error: Some("sqlx column not found".to_string()),
             last_error_turn: Some(5),
         };
-        let knowledge = extract_session_knowledge(&facts, None);
+        let knowledge = extract_session_knowledge(&facts);
         assert_eq!(knowledge.error_patterns.len(), 1);
         assert!(knowledge.error_patterns[0].contains("sqlx"));
     }
@@ -324,7 +258,7 @@ mod tests {
     #[test]
     fn extract_knowledge_empty_session() {
         let facts = SessionFacts::default();
-        let knowledge = extract_session_knowledge(&facts, None);
+        let knowledge = extract_session_knowledge(&facts);
         assert!(knowledge.corrections.is_empty());
         assert!(knowledge.learnings.is_empty());
         assert!(knowledge.decisions.is_empty());
@@ -332,169 +266,263 @@ mod tests {
     }
 
     #[test]
-    fn format_knowledge_returns_none_when_empty() {
-        let knowledge = SessionKnowledge {
-            corrections: vec![],
-            learnings: vec![],
-            decisions: vec![],
-            error_patterns: vec![],
-        };
-        assert!(format_knowledge_for_storage(&knowledge, "sess1").is_none());
-    }
-
-    #[test]
-    fn format_knowledge_emits_layered_body() {
-        let knowledge = SessionKnowledge {
-            corrections: vec!["Use RS256".to_string()],
-            learnings: vec!["CJK needs char_indices".to_string()],
-            decisions: vec!["Use axum".to_string()],
-            error_patterns: vec![],
-        };
-        let formatted = format_knowledge_for_storage(&knowledge, "sess1").unwrap();
-        // The formatter now emits wire-body (no tag prefix — the tag is
-        // added when the writer calls `MemoryEntry::encode` or stores
-        // directly). Callers wrap it with the `[@knowledge/curated]`
-        // tag via `MemoryEntry`.
-        let entry =
-            astra_prompts::memory_proto::MemoryEntry::new("knowledge", "curated", &formatted);
-        // Abstract: deterministic count line.
-        assert_eq!(
-            entry.abstract_layer(),
-            "Session sess1: 1 corrections, 1 learnings, 1 decisions"
-        );
-        // Overview: contains first-of-each preview.
-        let overview = entry.overview_layer().expect("overview emitted");
-        assert!(overview.contains("First correction"));
-        assert!(overview.contains("RS256"));
-        // Detail: full markdown sections.
-        let detail = entry.detail_layer().expect("detail emitted");
-        assert!(detail.contains("## User Corrections"));
-        assert!(detail.contains("- Use RS256"));
-        assert!(detail.contains("## Learnings"));
-        assert!(detail.contains("## Decisions"));
-        // The full wire form must pass the L2 gate.
-        let wire = entry.encode();
-        assert!(
-            astra_turn_types::should_store_persistent_memory(&wire, "semantic").is_ok(),
-            "wire-form must pass L2 gate; got: {wire}"
-        );
-    }
-
-    #[test]
-    fn format_knowledge_abstract_truncates_long_session_id() {
-        // Long UUIDs should be shortened in the abstract so they don't
-        // dominate the 150-char budget.
-        let knowledge = SessionKnowledge {
-            corrections: vec!["a".to_string()],
-            learnings: vec![],
-            decisions: vec![],
-            error_patterns: vec![],
-        };
-        let sid = "1234567890abcdef-extra-very-long-suffix";
-        let formatted = format_knowledge_for_storage(&knowledge, sid).unwrap();
-        let entry =
-            astra_prompts::memory_proto::MemoryEntry::new("knowledge", "curated", &formatted);
-        // Should use the first 12 chars of the session id.
-        assert!(
-            entry.abstract_layer().starts_with("Session 1234567890ab"),
-            "got abstract: {}",
-            entry.abstract_layer()
-        );
-    }
-
-    #[test]
-    fn v1_errors_corrections_backcompat() {
+    fn episode_overview_none_for_trivial_session() {
         let facts = SessionFacts::default();
-        let narrative = make_narrative(&[(
-            "Errors & Corrections",
-            "- User said: should use RS256\n- sqlx error on migration\n- Prefer axum over actix",
-        )]);
-        let knowledge = extract_session_knowledge(&facts, Some(&narrative));
-        // "should use RS256" and "Prefer axum" match correction heuristics
-        assert!(knowledge.corrections.iter().any(|c| c.contains("RS256")));
-        assert!(knowledge.corrections.iter().any(|c| c.contains("Prefer")));
-        // "sqlx error" doesn't match correction heuristics
-        assert!(!knowledge.corrections.iter().any(|c| c.contains("sqlx")));
+        assert!(build_episode_overview(&facts).is_none());
+    }
+
+    #[test]
+    fn episode_overview_captures_files_tools_errors() {
+        let facts = SessionFacts {
+            active_files: vec![
+                FileEntry {
+                    path: "src/main.rs".into(),
+                    last_action: "read".into(),
+                    turn: 1,
+                },
+                FileEntry {
+                    path: "src/lib.rs".into(),
+                    last_action: "write".into(),
+                    turn: 2,
+                },
+            ],
+            recent_tool_calls: vec![
+                ToolFact {
+                    name: "read_file".into(),
+                    ok: true,
+                    turn: 1,
+                },
+                ToolFact {
+                    name: "read_file".into(),
+                    ok: true,
+                    turn: 2,
+                },
+                ToolFact {
+                    name: "bash".into(),
+                    ok: false,
+                    turn: 3,
+                },
+            ],
+            error_state: ErrorFact {
+                total_errors: 1,
+                last_error: Some("cargo build failed: missing dep".into()),
+                last_error_turn: Some(3),
+            },
+            turn: 3,
+            estimated_tokens: 12_000,
+            blocked_tools: vec![],
+        };
+        let overview = build_episode_overview(&facts).expect("non-trivial session");
+        assert!(overview.starts_with("[episode]"));
+        assert!(overview.contains("turn=3"));
+        assert!(overview.contains("~12K tokens"));
+        assert!(overview.contains("src/main.rs"));
+        assert!(overview.contains("src/lib.rs"));
+        assert!(overview.contains("read_file:2ok"));
+        assert!(overview.contains("bash:1fail"));
+        assert!(overview.contains("cargo build failed"));
+    }
+
+    #[test]
+    fn episode_overview_marks_files_overflow_with_plus_n_more() {
+        // 12 files exceeds the 8-file cap → "(+4 more)" annotation.
+        let files: Vec<FileEntry> = (0..12)
+            .map(|i| FileEntry {
+                path: format!("src/file_{i}.rs"),
+                last_action: "read".into(),
+                turn: i,
+            })
+            .collect();
+        let facts = SessionFacts {
+            active_files: files,
+            turn: 12,
+            estimated_tokens: 5_000,
+            ..Default::default()
+        };
+        let overview = build_episode_overview(&facts).expect("non-trivial session");
+        assert!(overview.contains("(+4 more)"), "got: {overview}");
+    }
+
+    #[test]
+    fn episode_overview_files_under_cap_has_no_plus_n_more() {
+        let files: Vec<FileEntry> = (0..3)
+            .map(|i| FileEntry {
+                path: format!("src/file_{i}.rs"),
+                last_action: "read".into(),
+                turn: i,
+            })
+            .collect();
+        let facts = SessionFacts {
+            active_files: files,
+            turn: 3,
+            estimated_tokens: 1_000,
+            ..Default::default()
+        };
+        let overview = build_episode_overview(&facts).expect("non-trivial session");
+        assert!(!overview.contains("+ more"));
+        assert!(!overview.contains("(+"));
+    }
+
+    #[test]
+    fn episode_overview_marks_tools_overflow_with_plus_n_more() {
+        // 9 distinct tool names exceeds the 6-tool cap → "(+3 more)".
+        let tools: Vec<ToolFact> = (0..9)
+            .map(|i| ToolFact {
+                name: format!("tool_{i}"),
+                ok: true,
+                turn: i,
+            })
+            .collect();
+        let facts = SessionFacts {
+            recent_tool_calls: tools,
+            turn: 9,
+            estimated_tokens: 2_000,
+            ..Default::default()
+        };
+        let overview = build_episode_overview(&facts).expect("non-trivial session");
+        let tools_line = overview
+            .lines()
+            .find(|l| l.starts_with("Tools:"))
+            .expect("tools line");
+        assert!(
+            tools_line.contains("(+3 more)"),
+            "tools line missing overflow marker: {tools_line}"
+        );
+    }
+
+    #[test]
+    fn episode_overview_truncates_long_error() {
+        let mut facts = SessionFacts {
+            turn: 1,
+            estimated_tokens: 500,
+            ..Default::default()
+        };
+        facts.error_state = ErrorFact {
+            total_errors: 1,
+            last_error: Some("x".repeat(500)),
+            last_error_turn: Some(1),
+        };
+        let overview = build_episode_overview(&facts).expect("non-trivial session");
+        // 120-char cap on error snippet.
+        assert!(!overview.contains(&"x".repeat(121)));
+    }
+
+    // ── P7: reflect candidates forward-fed as scene memories ───────────
+
+    use super::super::memoria_compact::{
+        MemoriaClient, MemoriaMemory, ReflectCandidate, ReflectSummary,
+    };
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct SceneCaptureClient {
+        scenes: Mutex<Vec<(String, String, String)>>, // session, signal, summary
+        episodes: Mutex<Vec<String>>,
+        reflect_response: Mutex<ReflectSummary>,
+    }
+
+    #[async_trait::async_trait]
+    impl MemoriaClient for SceneCaptureClient {
+        async fn retrieve_ext(
+            &self,
+            _q: &str,
+            _sid: Option<&str>,
+            _k: usize,
+            _fs: bool,
+        ) -> Result<Vec<MemoriaMemory>, String> {
+            Ok(Vec::new())
+        }
+        async fn store(
+            &self,
+            _c: &str,
+            _t: &str,
+            _s: Option<&str>,
+            _tier: Option<&str>,
+        ) -> Result<String, String> {
+            Ok("m".into())
+        }
+        async fn purge_working(&self, _s: &str) -> Result<u64, String> {
+            Ok(0)
+        }
+        async fn store_episode(&self, sid: &str, overview: &str) -> Result<String, String> {
+            self.episodes
+                .lock()
+                .unwrap()
+                .push(format!("{sid}:{overview}"));
+            Ok("ep_1".into())
+        }
+        async fn reflect_session(
+            &self,
+            _sid: &str,
+            _force: bool,
+        ) -> Result<ReflectSummary, String> {
+            Ok(self.reflect_response.lock().unwrap().clone())
+        }
+        async fn store_scene(
+            &self,
+            sid: &str,
+            signal: &str,
+            summary: &str,
+        ) -> Result<String, String> {
+            self.scenes.lock().unwrap().push((
+                sid.to_string(),
+                signal.to_string(),
+                summary.to_string(),
+            ));
+            Ok("scene_1".into())
+        }
     }
 
     #[tokio::test]
-    async fn run_session_end_stores_and_purges() {
-        use std::sync::{Arc, Mutex};
-
-        struct MockClient {
-            stored: Arc<Mutex<Vec<(String, String)>>>,
-            purged: Arc<Mutex<Vec<String>>>,
-        }
-
-        #[async_trait::async_trait]
-        impl super::super::memoria_compact::MemoriaClient for MockClient {
-            async fn retrieve_ext(
-                &self,
-                _q: &str,
-                _sid: Option<&str>,
-                _k: usize,
-                _filter: bool,
-            ) -> Result<Vec<super::super::memoria_compact::MemoriaMemory>, String> {
-                Ok(vec![])
-            }
-            async fn store(
-                &self,
-                content: &str,
-                mem_type: &str,
-                _sid: Option<&str>,
-                _tier: Option<&str>,
-            ) -> Result<String, String> {
-                self.stored
-                    .lock()
-                    .unwrap()
-                    .push((content.to_string(), mem_type.to_string()));
-                Ok("id1".to_string())
-            }
-            async fn purge_working(&self, sid: &str) -> Result<u64, String> {
-                self.purged.lock().unwrap().push(sid.to_string());
-                Ok(2)
-            }
-            async fn delete(&self, _id: &str) -> Result<(), String> {
-                Ok(())
-            }
-        }
-
-        let facts = SessionFacts::default();
-        let narrative = make_narrative(&[
-            ("User Corrections", "- Use RS256"),
-            ("Learnings", "- CJK handling"),
-        ]);
-        let stored = Arc::new(Mutex::new(Vec::new()));
-        let purged = Arc::new(Mutex::new(Vec::new()));
-        let client = MockClient {
-            stored: stored.clone(),
-            purged: purged.clone(),
+    async fn governance_forward_feeds_reflect_candidates_as_scenes() {
+        let client = Arc::new(SceneCaptureClient::default());
+        *client.reflect_response.lock().unwrap() = ReflectSummary {
+            synthesized: false,
+            candidates: 2,
+            candidate_payloads: vec![
+                ReflectCandidate {
+                    signal: "auth".into(),
+                    importance: 0.8,
+                    summary: "- fixed OAuth redirect\n- added MFA".into(),
+                },
+                ReflectCandidate {
+                    signal: "tests".into(),
+                    importance: 0.5,
+                    summary: "- flaky integration suite".into(),
+                },
+            ],
+            diagnostics: String::new(),
         };
-
-        let report = run_session_end_governance(&facts, Some(&narrative), "sess1", &client)
+        let facts = SessionFacts {
+            turn: 2,
+            estimated_tokens: 1_000,
+            ..Default::default()
+        };
+        let report = run_session_end_governance(&facts, "sess-p7", client.as_ref())
             .await
-            .unwrap();
+            .expect("governance ok");
+        assert_eq!(report.scenes_stored, 2);
+        let scenes = client.scenes.lock().unwrap().clone();
+        assert_eq!(scenes.len(), 2);
+        assert_eq!(scenes[0].0, "sess-p7");
+        assert_eq!(scenes[0].1, "auth");
+        assert!(scenes[0].2.contains("OAuth redirect"));
+        assert_eq!(scenes[1].1, "tests");
+    }
 
-        assert_eq!(report.learnings_stored, 2); // 1 correction + 1 learning
-        assert_eq!(report.working_purged, 2);
-
-        let stored = stored.lock().unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].1, "semantic");
-        // L2 structural envelope + layered body. The abstract is the
-        // deterministic count line; the detail still carries the
-        // bullet sections so a future `memory_expand` can surface them.
-        assert!(stored[0].0.starts_with("[@knowledge/curated]"));
-        assert!(stored[0].0.contains("Session sess1:"));
-        assert!(stored[0].0.contains("RS256"));
-        // The wire form must pass the same L2 gate production uses.
-        assert!(
-            astra_turn_types::should_store_persistent_memory(&stored[0].0, "semantic").is_ok(),
-            "stored wire must pass L2 gate"
-        );
-
-        let purged = purged.lock().unwrap();
-        assert_eq!(purged.len(), 1);
-        assert_eq!(purged[0], "sess1");
+    #[tokio::test]
+    async fn governance_skips_scene_store_when_reflect_has_no_candidates() {
+        let client = Arc::new(SceneCaptureClient::default());
+        // Default = empty candidate_payloads
+        let facts = SessionFacts {
+            turn: 2,
+            estimated_tokens: 500,
+            ..Default::default()
+        };
+        let report = run_session_end_governance(&facts, "sess-p7-empty", client.as_ref())
+            .await
+            .expect("governance ok");
+        assert_eq!(report.scenes_stored, 0);
+        assert!(client.scenes.lock().unwrap().is_empty());
     }
 }

@@ -20,7 +20,6 @@ use crate::context_sources::{
     AgentContext, ContextSources, ExternalSources, SessionContext, StaticSections, TurnState,
 };
 use crate::emergent_context::EmergentContext;
-use crate::goal_tracker::{GoalTracker, MilestoneSignal};
 use crate::optimize_limits::OptimizeLimits;
 use crate::pipeline_config::PipelineConfig;
 use crate::pipeline_stats::PipelineStats;
@@ -79,7 +78,6 @@ pub struct PipelineSession {
     pub emergent: EmergentContext,
     pub recovery: RecoveryState,
     working_memory: WorkingMemoryState,
-    goal_tracker: Option<GoalTracker>,
     turns_completed: u32,
     pending_audits: Vec<crate::pipeline_journal::PipelineJournalEvent>,
 }
@@ -95,7 +93,6 @@ impl PipelineSession {
             emergent: EmergentContext::default(),
             recovery: RecoveryState::default(),
             working_memory: WorkingMemoryState::default(),
-            goal_tracker: None,
             turns_completed: 0,
             pending_audits: Vec::new(),
         }
@@ -111,7 +108,6 @@ impl PipelineSession {
             emergent: EmergentContext::default(),
             recovery: RecoveryState::default(),
             working_memory: WorkingMemoryState::default(),
-            goal_tracker: None,
             turns_completed: 0,
             pending_audits: Vec::new(),
         }
@@ -136,7 +132,6 @@ impl PipelineSession {
             emergent: EmergentContext::default(),
             recovery,
             working_memory: WorkingMemoryState::default(),
-            goal_tracker: None,
             turns_completed: 0,
             pending_audits: Vec::new(),
         }
@@ -310,25 +305,6 @@ impl PipelineSession {
         &mut self.working_memory
     }
 
-    /// Start goal tracking if a non-empty user goal is available.
-    pub fn start_goal(&mut self, goal: impl AsRef<str>) {
-        let goal = goal.as_ref();
-        if goal.trim().is_empty() {
-            return;
-        }
-        let tracker = GoalTracker::new(goal);
-        self.working_memory.set_goal_progress(tracker.snapshot());
-        self.goal_tracker = Some(tracker);
-    }
-
-    /// Record a goal-relevant milestone and refresh the rendered progress.
-    pub fn record_goal_signal(&mut self, signal: MilestoneSignal) {
-        if let Some(tracker) = self.goal_tracker.as_mut() {
-            tracker.record(self.turns_completed, signal);
-            self.working_memory.set_goal_progress(tracker.snapshot());
-        }
-    }
-
     /// Access the underlying pipeline config.
     #[must_use]
     pub fn config(&self) -> &PipelineConfig {
@@ -491,10 +467,6 @@ impl PipelineSession {
             latches: snapshot.latches,
             emergent: snapshot.emergent,
             recovery,
-            goal_tracker: snapshot
-                .working_memory
-                .goal_progress()
-                .map(GoalTracker::from_snapshot),
             working_memory: snapshot.working_memory,
             turns_completed: 0,
             pending_audits: Vec::new(),
@@ -566,6 +538,8 @@ mod tests {
             project_context: "test project".into(),
             edge_profile: EdgeProfile::default(),
             self_model: None,
+            deferred_tools_block: String::new(),
+            skill_listing_block: String::new(),
         }
     }
 

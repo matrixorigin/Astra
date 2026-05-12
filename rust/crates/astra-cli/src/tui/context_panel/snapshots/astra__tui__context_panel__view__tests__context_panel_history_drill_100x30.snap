@@ -1,0 +1,27 @@
+---
+source: crates/astra-cli/src/tui/context_panel/view.rs
+expression: buffer_to_string(&buf)
+---
+  2.0k / 100.0k tokens  (2.0%)
+  Esc back · j/k scroll
+
+  ⛁ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System prompt     2.0k  ( 2.0%)
+  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛶ Free space       98.0k  (98.0%)
+  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶
+  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶
+  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶
+
+ ▼ History · conversation turns
+    Esc back · drill: turn #0 assistant   4.2k tokens  [tools]
+        I'll start by reading auth.rs and mapping out every caller.
+
+
+        Let me look at the module structure first, then identify what
+        to move. The validate_session function has three call sites
+        that I'll need to update.
+
+
+        Plan:
+        1. Extract validate_session into src/auth/session_validator.rs.
+        2. Update main.rs, middleware.rs, and test_utils.rs.
+        3. Run the test suite and verify nothing regressed.

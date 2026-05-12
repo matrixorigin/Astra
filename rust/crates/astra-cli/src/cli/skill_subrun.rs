@@ -233,7 +233,6 @@ impl AgenticLoopHost for SubRunHost {
             &mut state.restricted_tools,
             None,  // no selection report
             0.5,   // neutral confidence
-            "",    // no learned context
             None,  // no learned task type
         );
         state.last_turn_policy = turn_policy_from_payload_edge_tools(&payload, interaction_mode);
@@ -602,7 +601,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             context_manifest_user_id: None,
             context_manifest_model_name: None,
             recursion_depth: child_recursion_depth,
-            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -614,6 +612,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             has_any_usage: false,
             max_turns: SUBRUN_MAX_TURNS,
             remaining_turns: SUBRUN_MAX_TURNS,
+            turn_budget_hint_emitted_50: false,
+            turn_budget_hint_emitted_20: false,
             agentic_turn_budget: task_profile.agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
@@ -668,7 +668,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
-            evolution_service: None,
             rate_limit_cooldown: Default::default(),
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -689,12 +688,11 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             tactical_adapter: None,
             step_signal_collector: None,
             tool_budget_override: None,
-            pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
-            continuity: Default::default(),
+            memory_extraction_service: None,
             compact_strategy,
             approval_overrides: None,
             confidence_trend: Default::default(),
@@ -845,7 +843,6 @@ mod tests {
             &mut restricted_tools,
             None,
             0.5,
-            "",
             None,
         );
 

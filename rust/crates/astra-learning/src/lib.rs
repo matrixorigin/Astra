@@ -4,6 +4,3 @@
 //! and evolution triggers — decoupled from runtime infrastructure.
 
 pub mod auto_tuning;
-pub mod drift_source;
-
-pub use drift_source::DriftSource;

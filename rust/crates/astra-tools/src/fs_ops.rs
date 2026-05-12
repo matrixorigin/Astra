@@ -623,13 +623,19 @@ impl PreparedWriteFile {
             return ToolResult::error(format!("Error: Cannot create directories: {e}"));
         }
 
-        match std::fs::write(&self.path, &self.content) {
-            Ok(()) => ToolResult::text(format!(
-                "Successfully wrote {} bytes to {}",
-                self.content.len(),
-                self.path_str
-            )),
-            Err(e) => ToolResult::error(format!("Error: Cannot write file: {e}")),
+        match write_file_atomic_with_format(&self.path, self.content.as_bytes(), false) {
+            Ok(warning) => {
+                let mut message = format!(
+                    "Successfully wrote {} bytes to {}",
+                    self.content.len(),
+                    self.path_str
+                );
+                if let Some(warning) = warning {
+                    message.push_str(&format!("\nWarning: {warning}"));
+                }
+                ToolResult::text(message)
+            }
+            Err(e) => ToolResult::error(e),
         }
     }
 }
@@ -654,11 +660,12 @@ pub fn prepare_write_file(
         Ok(p) => p,
         Err(e) => return Err(ToolResult::error(e)),
     };
+    let content = normalize_content_before_write(&path, content);
 
     Ok(PreparedWriteFile {
         path,
         path_str: path_str.to_string(),
-        content: content.to_string(),
+        content,
     })
 }
 
@@ -674,6 +681,7 @@ pub struct PreparedStrReplace {
     path: PathBuf,
     new_content: String,
     dry_run: bool,
+    allow_structural_change: bool,
     success_message: String,
 }
 
@@ -694,9 +702,19 @@ impl PreparedStrReplace {
         if self.dry_run {
             return ToolResult::text(self.success_message);
         }
-        match std::fs::write(&self.path, &self.new_content) {
-            Ok(()) => ToolResult::text(self.success_message),
-            Err(e) => ToolResult::error(format!("Error: Cannot write file: {e}")),
+        match write_file_atomic_with_format(
+            &self.path,
+            self.new_content.as_bytes(),
+            self.allow_structural_change,
+        ) {
+            Ok(warning) => {
+                let mut message = self.success_message;
+                if let Some(warning) = warning {
+                    message.push_str(&format!("\nWarning: {warning}"));
+                }
+                ToolResult::text(message)
+            }
+            Err(e) => ToolResult::error(e),
         }
     }
 }
@@ -733,6 +751,10 @@ pub fn prepare_str_replace(
         .get("dry_run")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let allow_structural_change = args
+        .get("allow_structural_change")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let path = match resolve_path(workspace_root, path_str) {
         Ok(p) => p,
         Err(e) => return Err(ToolResult::error(e)),
@@ -758,11 +780,22 @@ pub fn prepare_str_replace(
             } else {
                 new_str.to_string()
             };
-            let new_content = if replace_all {
+            let mut new_content = if replace_all {
                 content.replace(fuzzy_match.actual, &replacement)
             } else {
                 content.replacen(fuzzy_match.actual, &replacement, 1)
             };
+            if !allow_structural_change {
+                validate_structural_edit(
+                    &path,
+                    &content,
+                    &new_content,
+                    fuzzy_match.actual,
+                    new_str,
+                )
+                .map_err(ToolResult::error)?;
+            }
+            new_content = normalize_content_before_write(&path, &new_content);
             let success_message = if dry_run {
                 unified_diff(&content, &new_content, path_str)
             } else {
@@ -775,6 +808,7 @@ pub fn prepare_str_replace(
                 path,
                 new_content,
                 dry_run,
+                allow_structural_change,
                 success_message,
             });
         }
@@ -795,11 +829,16 @@ pub fn prepare_str_replace(
         )));
     }
 
-    let new_content = if replace_all {
+    let mut new_content = if replace_all {
         content.replace(old_str, new_str)
     } else {
         content.replacen(old_str, new_str, 1)
     };
+    if !allow_structural_change {
+        validate_structural_edit(&path, &content, &new_content, old_str, new_str)
+            .map_err(ToolResult::error)?;
+    }
+    new_content = normalize_content_before_write(&path, &new_content);
     let success_message = if dry_run {
         unified_diff(&content, &new_content, path_str)
     } else if replace_all {
@@ -814,6 +853,7 @@ pub fn prepare_str_replace(
         path,
         new_content,
         dry_run,
+        allow_structural_change,
         success_message,
     })
 }
@@ -832,6 +872,7 @@ pub struct PreparedMultiEdit {
     new_content: String,
     edit_count: usize,
     dry_run: bool,
+    allow_structural_change: bool,
 }
 
 impl PreparedMultiEdit {
@@ -851,12 +892,22 @@ impl PreparedMultiEdit {
             ));
         }
 
-        match std::fs::write(&self.path, &self.new_content) {
-            Ok(()) => ToolResult::text(format!(
-                "Successfully applied {} edit(s) to {}",
-                self.edit_count, self.path_str
-            )),
-            Err(e) => ToolResult::error(format!("Error: Cannot write file: {e}")),
+        match write_file_atomic_with_format(
+            &self.path,
+            self.new_content.as_bytes(),
+            self.allow_structural_change,
+        ) {
+            Ok(warning) => {
+                let mut message = format!(
+                    "Successfully applied {} edit(s) to {}",
+                    self.edit_count, self.path_str
+                );
+                if let Some(warning) = warning {
+                    message.push_str(&format!("\nWarning: {warning}"));
+                }
+                ToolResult::text(message)
+            }
+            Err(e) => ToolResult::error(e),
         }
     }
 }
@@ -880,6 +931,10 @@ pub fn prepare_multi_edit(
         .get("dry_run")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let allow_structural_change = args
+        .get("allow_structural_change")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let path = match resolve_path(workspace_root, path_str) {
         Ok(p) => p,
@@ -890,7 +945,8 @@ pub fn prepare_multi_edit(
         Err(e) => return Err(ToolResult::error(format!("Error: Cannot read file: {e}"))),
     };
 
-    let mut working = content;
+    let original_content = content;
+    let mut working = original_content.clone();
     for (i, edit) in edits.iter().enumerate() {
         let old_str = match edit.get("old_str").and_then(|v| v.as_str()) {
             Some(s) => s,
@@ -924,8 +980,14 @@ pub fn prepare_multi_edit(
                 "Error: edit[{i}] old_str found {count} times in {path_str}. Must match exactly once."
             )));
         }
-        working = working.replacen(old_str, new_str, 1);
+        let next = working.replacen(old_str, new_str, 1);
+        if !allow_structural_change {
+            validate_structural_edit(&path, &working, &next, old_str, new_str)
+                .map_err(ToolResult::error)?;
+        }
+        working = next;
     }
+    working = normalize_content_before_write(&path, &working);
 
     Ok(PreparedMultiEdit {
         path,
@@ -933,6 +995,7 @@ pub fn prepare_multi_edit(
         new_content: working,
         edit_count: edits.len(),
         dry_run,
+        allow_structural_change,
     })
 }
 
@@ -1054,6 +1117,360 @@ pub fn multi_edit(workspace_root: &Path, args: &Value) -> ToolResult {
         Ok(prepared) => prepared.apply(),
         Err(error) => error,
     }
+}
+
+const TEXT_TRAILING_NEWLINE_EXTS: &[&str] = &[
+    "bash", "c", "cc", "cfg", "conf", "cpp", "css", "csv", "go", "h", "hpp", "html", "java", "js",
+    "jsx", "json", "jsonl", "kt", "lua", "md", "py", "rb", "rs", "sh", "sql", "toml", "ts", "tsx",
+    "txt", "xml", "yaml", "yml", "zsh",
+];
+
+const BINARY_WRITE_EXTS: &[&str] = &[
+    "bin", "dat", "pdf", "zip", "gz", "tar", "bz2", "xz", "7z", "rar", "exe", "dll", "so", "dylib",
+    "o", "a", "lib", "wasm", "class", "pyc", "pyo", "mp3", "mp4", "avi", "mov", "wav", "flac",
+    "ogg", "png", "jpg", "jpeg", "gif", "bmp", "webp", "ttf", "otf", "woff", "woff2", "eot",
+    "sqlite", "db", "mdb", "ico",
+];
+
+/// Common extensionless text files that still want POSIX-style
+/// trailing newlines. Matched case-insensitively on the file
+/// basename. Without this, files like `Makefile` and `Dockerfile`
+/// silently fell off the normalization path because
+/// `path.extension()` returns `None` for them.
+const TEXT_NEWLINE_BASENAMES: &[&str] = &[
+    "makefile",
+    "dockerfile",
+    "rakefile",
+    "gemfile",
+    ".gitignore",
+    ".gitattributes",
+    ".dockerignore",
+    ".editorconfig",
+    ".env",
+    ".bashrc",
+    ".zshrc",
+    ".profile",
+    "license",
+    "readme",
+    "authors",
+    "contributors",
+    "changelog",
+];
+
+fn extension_lower(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+}
+
+fn basename_lower(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_ascii_lowercase())
+}
+
+fn should_ensure_trailing_newline(path: &Path) -> bool {
+    // Extension-based classification is authoritative first: it
+    // distinguishes binary (jpg, wasm) from text even when the
+    // basename alone would be ambiguous.
+    if let Some(ext) = extension_lower(path) {
+        if BINARY_WRITE_EXTS.contains(&ext.as_str()) {
+            return false;
+        }
+        if TEXT_TRAILING_NEWLINE_EXTS.contains(&ext.as_str()) {
+            return true;
+        }
+    }
+    // Fall back to the basename whitelist for common extensionless
+    // text files. This is conservative — we don't infer from content
+    // sniffing, so unknown extensions we haven't listed stay
+    // unaffected.
+    if let Some(base) = basename_lower(path) {
+        // Match the full basename (`Makefile`) or the "leading dot"
+        // form (`.gitignore`). A file path like `src/Makefile` matches
+        // the basename `makefile`.
+        if TEXT_NEWLINE_BASENAMES.contains(&base.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn normalize_content_before_write(path: &Path, content: &str) -> String {
+    // Normalize line endings before the trailing-newline check. Files
+    // with mixed `\r\n` / `\n` are a cross-platform data-corruption
+    // source: the trailing-newline check was only string-matching
+    // `\n`, so a `\r\n`-terminated line "fake-passed" and the file
+    // went to disk with mixed endings. Downstream diff tooling then
+    // shows a spurious "everything changed" view.
+    //
+    // Rule: on text files we're ensuring a trailing newline for,
+    // unify to LF. Binary / unknown files are passed through
+    // untouched so we don't mangle content we haven't classified.
+    let enforce_newline = should_ensure_trailing_newline(path);
+    let mut out = if enforce_newline {
+        normalize_line_endings_to_lf(content)
+    } else {
+        content.to_string()
+    };
+    if enforce_newline && !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Convert `\r\n` pairs to `\n`. Standalone `\r` (old Mac endings)
+/// is also folded to `\n`. Idempotent — `\n\n` stays `\n\n`.
+fn normalize_line_endings_to_lf(s: &str) -> String {
+    // Fast path: ASCII `\n`-only content is returned without
+    // allocation when no `\r` appears.
+    if !s.contains('\r') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            // `\r\n` → `\n`. Lone `\r` → `\n`.
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+enum FormatterOutcome {
+    Success,
+    NotFound,
+    Warning(String),
+    SyntaxError(String),
+}
+
+fn format_file_in_place_best_effort(path: &Path) -> FormatterOutcome {
+    match extension_lower(path).as_deref() {
+        Some("rs") => run_formatter(path, "rustfmt", &["--emit=files"]),
+        Some("py") => run_formatter(path, "ruff", &["format", "--quiet"]),
+        Some("ts" | "tsx" | "js" | "jsx" | "json" | "md" | "yaml" | "yml") => {
+            run_formatter(path, "prettier", &["--write", "--log-level=warn"])
+        }
+        _ => FormatterOutcome::NotFound,
+    }
+}
+
+/// Atomic write pipeline for edits + formatter: stage content in a
+/// sibling tmp file, run the best-effort formatter on the tmp, then
+/// rename tmp over the real path. The real path never observes a
+/// half-written or half-formatted state.
+///
+/// Returns a formatter warning string when the formatter reported a
+/// non-fatal error. Syntax-level formatter failures abort the write:
+/// returning success while writing syntactically broken code gives the
+/// caller a false signal that the edit is valid.
+///
+/// Pre-commit hooks / editors watching the target via inotify see
+/// **one** `MODIFY` event (the rename), not `CREATE` + partial
+/// writes during formatting.
+fn write_file_atomic_with_format(
+    path: &Path,
+    content: &[u8],
+    allow_formatter_syntax_error: bool,
+) -> Result<Option<String>, String> {
+    // Staging file lives next to the target — POSIX rename() is
+    // only atomic within the same filesystem. Using a /tmp staging
+    // file would break across mount points.
+    let tmp = staging_tmp_path(path);
+
+    // Best-effort cleanup of a stale tmp from a prior crashed write.
+    let _ = std::fs::remove_file(&tmp);
+
+    if let Err(e) = std::fs::write(&tmp, content) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Error: Cannot stage write: {e}"));
+    }
+
+    let warning = match format_file_in_place_best_effort(&tmp) {
+        FormatterOutcome::Success | FormatterOutcome::NotFound => None,
+        FormatterOutcome::Warning(warning) => Some(warning),
+        FormatterOutcome::SyntaxError(error) => {
+            if allow_formatter_syntax_error {
+                Some(error)
+            } else {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(error);
+            }
+        }
+    };
+
+    // Atomic rename commits the final state. Only here does the
+    // target path change.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Error: Cannot commit write (rename failed): {e}"));
+    }
+
+    Ok(warning)
+}
+
+fn staging_tmp_path(target: &Path) -> PathBuf {
+    let pid = std::process::id();
+    // Timestamp via nanos reduces the chance of collision when
+    // multiple writers race on the same path in the same pid (e.g.
+    // tests).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut tmp = target.to_path_buf();
+    let base = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("astra_write");
+    // Preserve the original EXTENSION at the tail so external
+    // formatters (rustfmt, prettier, ruff) recognize the staged file
+    // as the right language. Pattern: `.astra-tmp.<pid>.<nanos>.<basename>`.
+    // The leading dot keeps it hidden; the original extension at
+    // tail drives formatter detection.
+    tmp.set_file_name(format!(".astra-tmp.{pid}.{nanos}.{base}"));
+    tmp
+}
+
+fn run_formatter(path: &Path, program: &str, args: &[&str]) -> FormatterOutcome {
+    let mut command = std::process::Command::new(program);
+    command.args(args).arg(path);
+    match command.output() {
+        Ok(output) if output.status.success() => FormatterOutcome::Success,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let diagnostic = format!(
+                "{program} failed for {}: {}{}",
+                path.display(),
+                stdout.trim(),
+                stderr.trim()
+            );
+            if formatter_failure_is_syntax_error(&diagnostic) {
+                FormatterOutcome::SyntaxError(format!("Error: SYNTAX ERROR: {diagnostic}"))
+            } else {
+                FormatterOutcome::Warning(diagnostic)
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FormatterOutcome::NotFound,
+        Err(e) => {
+            FormatterOutcome::Warning(format!("{program} failed for {}: {e}", path.display()))
+        }
+    }
+}
+
+fn formatter_failure_is_syntax_error(diagnostic: &str) -> bool {
+    let lower = diagnostic.to_ascii_lowercase();
+    [
+        "syntax",
+        "parse error",
+        "failed to parse",
+        "unterminated",
+        "unclosed",
+        "mismatched",
+        "unexpected",
+        "expected",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn validate_structural_edit(
+    path: &Path,
+    original: &str,
+    updated: &str,
+    old_str: &str,
+    new_str: &str,
+) -> Result<(), String> {
+    let Some(lang) = crate::code_intel::detect_language(path) else {
+        return Ok(());
+    };
+
+    if comment_line_count(new_str) < comment_line_count(old_str) {
+        return Err(format!(
+            "Error: structural validation rejected edit to {}: replacement removes comment/doc-comment lines. If this is intentional, retry with allow_structural_change=true.",
+            path.display()
+        ));
+    }
+
+    let Some(original_has_error) = tree_sitter_has_error(original, lang) else {
+        return Ok(());
+    };
+    if original_has_error {
+        return Ok(());
+    }
+    if tree_sitter_has_error(updated, lang).unwrap_or(false) {
+        return Err(format!(
+            "Error: structural validation rejected edit to {}: updated file has syntax errors. If this is intentional, retry with allow_structural_change=true.",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Count lines that look like **documentation** (not ordinary code
+/// comments). Intentionally conservative — the caller uses this to
+/// flag edits that strip out documentation the author likely wants
+/// to keep. The old implementation also matched any `#`-prefixed
+/// line, which mistakenly fired on Python `#!/usr/bin/env python`
+/// shebangs, `# coding: utf-8` pragmas, Python commented-out code,
+/// shell scripts, TOML section headers (`[deps]` is obviously not a
+/// comment but `# comment` in toml looks like one), etc. — too broad
+/// to be signal, so edits that intentionally refactored out dead `#`
+/// lines got rejected.
+///
+/// New rule: only count doc-comments and multi-line
+/// doc blocks — the stuff an IDE hover or rustdoc/jsdoc picks up.
+fn comment_line_count(s: &str) -> usize {
+    s.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            // Rust doc comments.
+            trimmed.starts_with("///")
+                || trimmed.starts_with("//!")
+                // JSDoc / Doxygen / Rust module-level block doc.
+                || trimmed.starts_with("/**")
+                || trimmed.starts_with("/*!")
+                // Continuation lines of a block doc comment ("* …").
+                // Scoped enough to not collide with plain prose or
+                // markdown bullets (those are typically `-` / `+`
+                // inside code here, not ` * `).
+                || trimmed.starts_with("* ")
+                || trimmed == "*/"
+                // Python / TypeScript / Markdown triple-quoted
+                // docstring delimiters. One-sided match is OK for a
+                // loss count; the caller just compares old vs new.
+                || trimmed.starts_with("\"\"\"")
+                || trimmed.starts_with("'''")
+        })
+        .count()
+}
+
+fn tree_sitter_has_error(source: &str, lang: crate::code_intel::Language) -> Option<bool> {
+    let mut parser = tree_sitter::Parser::new();
+    let language = match lang {
+        crate::code_intel::Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+        crate::code_intel::Language::Python => tree_sitter_python::LANGUAGE.into(),
+        crate::code_intel::Language::TypeScript | crate::code_intel::Language::JavaScript => {
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+        }
+        crate::code_intel::Language::Go => tree_sitter_go::LANGUAGE.into(),
+        crate::code_intel::Language::Java => tree_sitter_java::LANGUAGE.into(),
+        crate::code_intel::Language::C | crate::code_intel::Language::Cpp => {
+            tree_sitter_cpp::LANGUAGE.into()
+        }
+        crate::code_intel::Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+    };
+    parser.set_language(&language).ok()?;
+    parser
+        .parse(source, None)
+        .map(|tree| tree.root_node().has_error())
 }
 
 fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> String {
@@ -1718,6 +2135,69 @@ mod tests {
     }
 
     #[test]
+    fn write_file_text_extensions_get_trailing_newline() {
+        let tmp = TempDir::new().unwrap();
+        let args = serde_json::json!({"path": "permissions.json", "content": "{\"allow\":[]}"});
+
+        let result = write_file(tmp.path(), &args);
+
+        assert!(!result.is_error, "got error: {}", result.output);
+        let content = std::fs::read_to_string(tmp.path().join("permissions.json")).unwrap();
+        assert_eq!(content, "{\"allow\":[]}\n");
+    }
+
+    #[test]
+    fn write_file_binary_extensions_do_not_get_trailing_newline() {
+        let tmp = TempDir::new().unwrap();
+        let args = serde_json::json!({"path": "payload.bin", "content": "abc"});
+
+        let result = write_file(tmp.path(), &args);
+
+        assert!(!result.is_error, "got error: {}", result.output);
+        let content = std::fs::read(tmp.path().join("payload.bin")).unwrap();
+        assert_eq!(content, b"abc");
+    }
+
+    #[test]
+    fn write_file_rust_runs_rustfmt_best_effort() {
+        let tmp = TempDir::new().unwrap();
+        let args =
+            serde_json::json!({"path": "main.rs", "content": "fn main(){println!(\"hi\");}"});
+
+        let result = write_file(tmp.path(), &args);
+
+        assert!(!result.is_error, "got error: {}", result.output);
+        let content = std::fs::read_to_string(tmp.path().join("main.rs")).unwrap();
+        assert_eq!(content, "fn main() {\n    println!(\"hi\");\n}\n");
+    }
+
+    #[test]
+    fn write_file_rust_syntax_formatter_failure_is_error_and_preserves_target() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("main.rs");
+        std::fs::write(&target, "fn main() {}\n").unwrap();
+        let args = serde_json::json!({
+            "path": "main.rs",
+            "content": "fn main(){ println!(\"hi); }"
+        });
+
+        let result = write_file(tmp.path(), &args);
+
+        assert!(
+            result.is_error,
+            "syntax failure must be an error: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("SYNTAX ERROR"),
+            "syntax failure must be prominent: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(target).unwrap();
+        assert_eq!(content, "fn main() {}\n");
+    }
+
+    #[test]
     fn str_replace_basic() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("f.txt"), "foo bar baz").unwrap();
@@ -1725,7 +2205,95 @@ mod tests {
         let result = str_replace(tmp.path(), &args);
         assert!(!result.is_error);
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
-        assert_eq!(content, "foo qux baz");
+        assert_eq!(content, "foo qux baz\n");
+    }
+
+    #[test]
+    fn str_replace_text_extensions_get_trailing_newline() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("lib.rs"), "fn main() {}").unwrap();
+        let args = serde_json::json!({"path": "lib.rs", "old_str": "main", "new_str": "run"});
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(!result.is_error, "got error: {}", result.output);
+        let content = std::fs::read_to_string(tmp.path().join("lib.rs")).unwrap();
+        assert!(
+            content.ends_with('\n'),
+            "missing trailing newline: {content:?}"
+        );
+    }
+
+    #[test]
+    fn str_replace_rejects_new_rust_parse_errors_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let original = "fn main() {\n    println!(\"ok\");\n}\n";
+        std::fs::write(tmp.path().join("main.rs"), original).unwrap();
+        let args = serde_json::json!({
+            "path": "main.rs",
+            "old_str": "println!(\"ok\");",
+            "new_str": "println!(\"ok);"
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(result.is_error, "invalid Rust edit should be rejected");
+        assert!(
+            result.output.contains("structural validation"),
+            "got: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("main.rs")).unwrap();
+        assert_eq!(content, original);
+    }
+
+    #[test]
+    fn str_replace_rejects_comment_line_loss_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let original = "/// One\n/// Two\n/// Three\npub fn thing() {}\n";
+        std::fs::write(tmp.path().join("lib.rs"), original).unwrap();
+        let args = serde_json::json!({
+            "path": "lib.rs",
+            "old_str": original,
+            "new_str": "/// One\n/// Three\npub fn thing() {}\n"
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(result.is_error, "doc-comment loss should be rejected");
+        assert!(
+            result.output.contains("comment/doc-comment"),
+            "got: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("lib.rs")).unwrap();
+        assert_eq!(content, original);
+    }
+
+    #[test]
+    fn str_replace_allows_structural_change_when_explicitly_requested() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("main.rs"),
+            "fn main() {\n    println!(\"ok\");\n}\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "path": "main.rs",
+            "old_str": "println!(\"ok\");",
+            "new_str": "println!(\"ok);",
+            "allow_structural_change": true
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(
+            !result.is_error,
+            "explicit bypass should allow edit: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("main.rs")).unwrap();
+        assert!(content.contains("println!(\"ok);"));
     }
 
     #[test]
@@ -1801,7 +2369,7 @@ mod tests {
         let result = str_replace(tmp.path(), &args);
         assert!(!result.is_error, "got error: {}", result.output);
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
-        assert_eq!(content, "let x = \u{201C}world\u{201D};");
+        assert_eq!(content, "let x = \u{201C}world\u{201D};\n");
     }
 
     #[test]
@@ -2353,7 +2921,7 @@ mod tests {
         let result = multi_edit(tmp.path(), &args);
         assert!(!result.is_error);
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
-        assert_eq!(content, "AAA bbb CCC");
+        assert_eq!(content, "AAA bbb CCC\n");
     }
 
     #[test]
@@ -2456,5 +3024,300 @@ mod tests {
         let allowed = vec![PathBuf::from("/tmp")];
         let result = resolve_path_sandboxed(workspace.path(), "hello.txt", &allowed);
         assert!(result.is_ok(), "workspace-relative paths must still work");
+    }
+
+    // ── normalize_line_endings_to_lf ─────────────────────────────
+
+    #[test]
+    fn normalize_crlf_to_lf_preserves_line_count() {
+        let s = "a\r\nb\r\nc";
+        assert_eq!(normalize_line_endings_to_lf(s), "a\nb\nc");
+    }
+
+    #[test]
+    fn normalize_lone_cr_becomes_lf() {
+        // Classic Mac line endings — rare but the conversion must
+        // still produce valid Unix text, not silent corruption.
+        let s = "a\rb\rc";
+        assert_eq!(normalize_line_endings_to_lf(s), "a\nb\nc");
+    }
+
+    #[test]
+    fn normalize_lf_only_is_idempotent_and_allocation_free() {
+        // Fast path: no `\r` anywhere → function returns identical
+        // content. The caller's fast path relies on this.
+        let s = "a\nb\nc";
+        assert_eq!(normalize_line_endings_to_lf(s), "a\nb\nc");
+    }
+
+    #[test]
+    fn normalize_mixed_crlf_and_lf_is_uniform() {
+        let s = "a\r\nb\nc\r\nd";
+        assert_eq!(normalize_line_endings_to_lf(s), "a\nb\nc\nd");
+    }
+
+    // ── normalize_content_before_write: CRLF + trailing newline ──
+
+    #[test]
+    fn write_file_crlf_input_gets_normalized_to_lf_before_newline_check() {
+        // Regression guard: previously a file with `\r\n` endings
+        // would pass `ends_with('\n')` (it literally did) and the
+        // "already has newline" branch kicked in, leaving the file
+        // on disk with mixed endings.
+        let tmp = TempDir::new().unwrap();
+        let content_crlf = "one\r\ntwo\r\nthree";
+        let args = serde_json::json!({
+            "path": "notes.txt",
+            "content": content_crlf,
+        });
+        let result = write_file(tmp.path(), &args);
+        assert!(!result.is_error, "write should succeed: {}", result.output);
+        let written = std::fs::read_to_string(tmp.path().join("notes.txt")).unwrap();
+        assert!(
+            !written.contains('\r'),
+            "file must not contain \\r: {written:?}"
+        );
+        assert!(written.ends_with('\n'), "file must end with LF");
+    }
+
+    // ── should_ensure_trailing_newline: basename fallback ────────
+
+    #[test]
+    fn extensionless_text_basenames_enforce_newline() {
+        for name in ["Makefile", "Dockerfile", "Rakefile", "README", "LICENSE"] {
+            let tmp = TempDir::new().unwrap();
+            let args = serde_json::json!({
+                "path": name,
+                "content": "body-without-newline",
+            });
+            let result = write_file(tmp.path(), &args);
+            assert!(
+                !result.is_error,
+                "write of {name} failed: {}",
+                result.output
+            );
+            let written = std::fs::read_to_string(tmp.path().join(name)).unwrap();
+            assert!(
+                written.ends_with('\n'),
+                "{name} must gain trailing newline (extensionless text); got {written:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dotfile_text_basenames_enforce_newline() {
+        for name in [".gitignore", ".editorconfig", ".bashrc"] {
+            let tmp = TempDir::new().unwrap();
+            let args = serde_json::json!({
+                "path": name,
+                "content": "*.log",
+            });
+            let result = write_file(tmp.path(), &args);
+            assert!(!result.is_error, "{name}: {}", result.output);
+            let written = std::fs::read_to_string(tmp.path().join(name)).unwrap();
+            assert!(written.ends_with('\n'), "{name} must gain trailing newline");
+        }
+    }
+
+    #[test]
+    fn unknown_extension_does_not_force_newline() {
+        // Conservative: unknown extension → leave content alone. We
+        // don't want to mangle binary files we haven't classified.
+        let tmp = TempDir::new().unwrap();
+        let args = serde_json::json!({
+            "path": "data.unknownext",
+            "content": "raw-bytes",
+        });
+        let result = write_file(tmp.path(), &args);
+        assert!(!result.is_error);
+        let written = std::fs::read_to_string(tmp.path().join("data.unknownext")).unwrap();
+        assert!(
+            !written.ends_with('\n'),
+            "unknown extension must not gain a synthetic newline; got {written:?}"
+        );
+    }
+
+    // ── comment_line_count: narrowed to doc-comments ─────────────
+
+    #[test]
+    fn comment_line_count_narrowed_ignores_shebang() {
+        // Regression: the old `#`-prefix rule treated the shebang
+        // as a comment, so any edit that dropped the shebang was
+        // rejected as "comment loss" even when intentional (e.g.
+        // converting a script into a module).
+        let with_shebang = "#!/usr/bin/env python\n# coding: utf-8\nx = 1\n";
+        let without_shebang = "x = 1\n";
+        assert_eq!(
+            comment_line_count(with_shebang),
+            comment_line_count(without_shebang),
+            "shebang + coding pragma must not inflate the doc-comment count"
+        );
+    }
+
+    #[test]
+    fn comment_line_count_counts_rust_doc_comments() {
+        let s = "/// Doc1\n/// Doc2\n//! Module doc\nfn plain_code() {}\n// regular comment\n";
+        // Only the 3 rust doc lines count; the `//` is not a doc comment.
+        assert_eq!(comment_line_count(s), 3);
+    }
+
+    #[test]
+    fn comment_line_count_counts_jsdoc_opener() {
+        let s = "/**\n * Hello\n */\nfunction f() {}\n";
+        assert_eq!(comment_line_count(s), 3);
+    }
+
+    #[test]
+    fn str_replace_rejects_jsdoc_continuation_line_loss_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let original = "/**\n * Important details\n */\nfunction thing() {}\n";
+        std::fs::write(tmp.path().join("doc.js"), original).unwrap();
+        let args = serde_json::json!({
+            "path": "doc.js",
+            "old_str": original,
+            "new_str": "/**\n */\nfunction thing() {}\n"
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(
+            result.is_error,
+            "JSDoc continuation line loss should be rejected: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("comment/doc-comment"),
+            "got: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("doc.js")).unwrap();
+        assert_eq!(content, original);
+    }
+
+    // ── Atomic write pipeline ────────────────────────────────────
+
+    #[test]
+    fn atomic_write_staging_path_is_sibling_not_target() {
+        // Rename is only atomic within the same filesystem, so the
+        // staging tmp MUST sit in the target's parent directory.
+        let target = PathBuf::from("/workspace/project/src/lib.rs");
+        let tmp = staging_tmp_path(&target);
+        assert_eq!(
+            tmp.parent(),
+            target.parent(),
+            "staging tmp must live beside the target, not in /tmp"
+        );
+        // And must not equal the target.
+        assert_ne!(tmp.file_name(), target.file_name());
+    }
+
+    #[test]
+    fn atomic_write_preserves_extension_for_formatters() {
+        // rustfmt / prettier / ruff detect the file's language by
+        // extension. The staging path MUST end in the original
+        // extension so the formatter treats it as the right kind.
+        let target = PathBuf::from("/workspace/proj/src/lib.rs");
+        let tmp = staging_tmp_path(&target);
+        let tmp_name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            tmp_name.ends_with(".rs"),
+            "staging path must end in .rs so rustfmt recognizes it; got {tmp_name}"
+        );
+    }
+
+    #[test]
+    fn atomic_write_completes_cleanly_with_no_stale_tmp() {
+        // After a successful atomic write, the staging tmp must be
+        // renamed (not left behind) and the target must have the
+        // final content.
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("lib.rs");
+        std::fs::write(&target, "original\n").unwrap();
+
+        let _warning =
+            write_file_atomic_with_format(&target, b"pub fn new_body() {}\n", false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "pub fn new_body() {}\n",
+            "target must have the new content after atomic write"
+        );
+        // Directory must contain exactly `lib.rs` — no lingering
+        // `.astra-tmp.*` staging file after the rename.
+        let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".astra-tmp."))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no staging tmp files should remain; got {leftover:?}"
+        );
+    }
+
+    #[test]
+    fn atomic_write_target_contains_new_content_after_success() {
+        // End-to-end: write, check content lands.
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("hello.txt");
+        let result = write_file_atomic_with_format(&target, b"hello world\n", false);
+        assert!(result.is_ok(), "atomic write must succeed: {result:?}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello world\n");
+    }
+
+    #[test]
+    fn atomic_write_target_preserved_on_staging_failure() {
+        // If the staging write fails (e.g. the parent dir is not
+        // writable), the existing target must NOT be touched. Guard
+        // against the old behaviour where a partial `fs::write`
+        // could truncate the target before erroring.
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("existing.txt");
+        std::fs::write(&target, "ORIGINAL\n").unwrap();
+
+        // Force staging failure by making the parent directory
+        // read-only on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let orig_perm = std::fs::metadata(tmp.path()).unwrap().permissions();
+            let mut ro = orig_perm.clone();
+            ro.set_mode(0o500); // r-x only, no write for owner
+            std::fs::set_permissions(tmp.path(), ro).unwrap();
+
+            let result = write_file_atomic_with_format(&target, b"NEW\n", false);
+
+            // Restore perms before asserting so tempdir drop works.
+            std::fs::set_permissions(tmp.path(), orig_perm).unwrap();
+
+            assert!(result.is_err(), "staging write should have failed");
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                "ORIGINAL\n",
+                "target must remain untouched when staging fails"
+            );
+        }
+    }
+
+    #[test]
+    fn str_replace_allows_shebang_removal() {
+        // Concrete end-to-end regression: before the narrowing,
+        // dropping a shebang raised "removes comment/doc-comment
+        // lines". After the fix, the edit should proceed — shebangs
+        // aren't doc comments.
+        let tmp = TempDir::new().unwrap();
+        let original = "#!/usr/bin/env python3\nprint('hi')\n";
+        std::fs::write(tmp.path().join("run.py"), original).unwrap();
+        let args = serde_json::json!({
+            "path": "run.py",
+            "old_str": original,
+            "new_str": "print('hi')\n",
+        });
+        let result = str_replace(tmp.path(), &args);
+        assert!(
+            !result.is_error,
+            "shebang removal should succeed (not a doc comment): {}",
+            result.output
+        );
     }
 }

@@ -699,10 +699,9 @@ pub(crate) fn worktree_add_with_metadata(
     let branch = match args.get("branch").and_then(Value::as_str) {
         Some(b) if !b.is_empty() => b,
         _ => {
-            return super::ToolExecutionOutcome {
-                output: "Error: 'branch' is required for add".to_string(),
-                tool_result_fields: None,
-            };
+            return super::ToolExecutionOutcome::error(
+                "Error: 'branch' is required for add".to_string(),
+            );
         }
     };
 
@@ -711,23 +710,17 @@ pub(crate) fn worktree_add_with_metadata(
         .chars()
         .any(|c| matches!(c, ';' | '|' | '&' | '`' | '$' | '(' | ')' | '{' | '}'))
     {
-        return super::ToolExecutionOutcome {
-            output: "Error: invalid branch name".to_string(),
-            tool_result_fields: None,
-        };
+        return super::ToolExecutionOutcome::error("Error: invalid branch name".to_string());
     }
 
     let worktree_path = resolve_worktree_add_path(project_root, args, branch);
 
     // Check if path already exists
     if worktree_path.exists() {
-        return super::ToolExecutionOutcome {
-            output: format!(
-                "Error: worktree path already exists: {}",
-                worktree_path.display()
-            ),
-            tool_result_fields: None,
-        };
+        return super::ToolExecutionOutcome::error(format!(
+            "Error: worktree path already exists: {}",
+            worktree_path.display()
+        ));
     }
 
     // Determine if we create a new branch or use existing
@@ -778,19 +771,19 @@ pub(crate) fn worktree_add_with_metadata(
                     worktree_path.display()
                 ),
                 tool_result_fields: Some(tool_result_fields),
+                is_error: false,
             }
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            super::ToolExecutionOutcome {
-                output: format!("Error: git worktree add failed: {}", stderr.trim()),
-                tool_result_fields: None,
-            }
+            super::ToolExecutionOutcome::error(format!(
+                "Error: git worktree add failed: {}",
+                stderr.trim()
+            ))
         }
-        Err(e) => super::ToolExecutionOutcome {
-            output: format!("Error: git worktree add failed: {e}"),
-            tool_result_fields: None,
-        },
+        Err(e) => {
+            super::ToolExecutionOutcome::error(format!("Error: git worktree add failed: {e}"))
+        }
     }
 }
 

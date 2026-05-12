@@ -26,8 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop_host::{
-    AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult, HostTurnResult,
-    TurnInteractionMode, TurnInteractionPolicy, interaction_scoped_tool_restrictions,
+    AgenticLoopHost, AgenticLoopState, HostTurnResult, TurnInteractionMode, TurnInteractionPolicy,
+    interaction_scoped_tool_restrictions,
 };
 use crate::turn::agentic_loop_tool_support::edge_tool_status_exit_code;
 use crate::turn::bridge_llm_stream::rate_limit_cooldown;
@@ -657,6 +657,13 @@ pub struct ServerAgenticLoopHost {
     edge_tools: Vec<Value>,
     edge_profile: Map<String, Value>,
     valid_tools: HashSet<String>,
+    /// Names the validator should admit beyond the static catalog.
+    ///
+    /// Covers runtime-injected tools (`skill`, `spawn_agent`, `web_search`,
+    /// etc.) plus plugin/MCP tool names. Populated by the host's init
+    /// path before the first `sync_valid_tools_to_visible` call; stable
+    /// for the rest of the session.
+    admissible_extras: Vec<String>,
     selection_confidence: f64,
     /// `true` when tools were auto-populated from astra-tools (no CLI connected).
     server_side_tools: bool,
@@ -970,6 +977,7 @@ impl ServerAgenticLoopHostBuilder {
             edge_tools,
             edge_profile: self.edge_profile,
             valid_tools,
+            admissible_extras: Vec::new(),
             selection_confidence: self.selection_confidence,
             server_side_tools,
             interactive_client: self.interactive_client,
@@ -1796,15 +1804,24 @@ impl ServerAgenticLoopHost {
     }
 
     fn sync_valid_tools_to_visible(&mut self, visible_tools: &[Value]) {
-        self.valid_tools = visible_tools
-            .iter()
-            .filter_map(|tool| {
-                tool.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    .map(String::from)
-            })
-            .collect();
+        // Post-Phase-4/6: the validator's admitted set is the union of
+        // currently-visible names, every name in the static catalog, AND
+        // the session's runtime-injected + plugin names. Without the
+        // `admissible_extras` piece, calling an MCP tool after
+        // `tool_search(select:mcp__X)` would be rejected as unknown
+        // even though the executor can dispatch it.
+        self.valid_tools =
+            crate::turn::headless_tool_pipeline::admissible_tool_names_from_visible_and_extras(
+                visible_tools,
+                &self.admissible_extras,
+            );
+    }
+
+    /// Set the extras list (runtime-injected names + plugin names) so
+    /// the validator admits them after deferred activation. Should be
+    /// called once at session start, before the first tool round.
+    pub fn set_admissible_extras(&mut self, extras: Vec<String>) {
+        self.admissible_extras = extras;
     }
 
     /// Compute the tool schemas visible for the current turn after applying
@@ -1906,9 +1923,6 @@ impl ServerAgenticLoopHost {
             .pipeline_session
             .as_mut()
             .expect("pipeline_session must be initialized for all production paths");
-        if pipeline_sess.working_memory().is_empty() {
-            pipeline_sess.start_goal(user_content);
-        }
         let input = AdaptiveTurnInput {
             statics: &statics,
             agent: &agent,
@@ -2156,6 +2170,13 @@ impl ServerAgenticLoopHost {
         };
         let memoria_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
 
+        // Observatory is owned by the memory_extraction_service; clone the
+        // Arc so both extraction (service) and injection (compaction) write
+        // into the same ring set.
+        let observatory = state
+            .memory_extraction_service
+            .as_ref()
+            .and_then(|svc| svc.observatory().cloned());
         let ctx = crate::turn::wire_assembly::MemoriaContext {
             session_id: &self.session_id,
             model_name: &llm_cfg.model_name,
@@ -2166,8 +2187,9 @@ impl ServerAgenticLoopHost {
                 &summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
             ),
             tier,
-            cwd: self.edge_profile.get("cwd").and_then(|v| v.as_str()),
             session_facts: None,
+            turn_number: state.llm_rounds_completed,
+            observatory,
         };
         ctx.compact(&state.messages, system_messages, visible_tools)
             .await
@@ -2934,222 +2956,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         })
     }
 
-    fn supports_auto_reflection(&self) -> bool {
-        true
-    }
-
-    async fn execute_reflection(
-        &mut self,
-        state: &mut AgenticLoopState,
-        request: HostReflectionRequest<'_>,
-    ) -> Result<Option<HostReflectionResult>, astra_core::ClassifiedError> {
-        let effective_model_override = state
-            .skills
-            .model_override
-            .as_deref()
-            .or(self.model_override.as_deref());
-        let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
-        let mut llm_cfg = match resolve_llm_model_for_turn(
-            &self.matrixone,
-            self.encryptor.as_ref(),
-            effective_model_override,
-            pool_ref,
-            self.llm_token_service.as_ref(),
-            &state.hooks.forward_headers,
-        )
-        .await
-        {
-            Ok(m) => m,
-            Err(e) => return Err(format!("Model resolution failed: {e}").into()),
-        };
-        let has_fallback = !llm_cfg.fallback_chain.is_empty();
-
-        match rate_limit_cooldown().with(&llm_cfg.model_name, |c| c.check_request(has_fallback)) {
-            RateLimitAction::Proceed => {}
-            RateLimitAction::WaitAndRetry { delay_ms } => {
-                sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
-            }
-            RateLimitAction::UseFallback { reason } => {
-                let cooldown = rate_limit_cooldown();
-                let mut resolved = false;
-                for fb_name in &llm_cfg.fallback_chain {
-                    let fb_ok = cooldown.with(fb_name, |c| c.check_request(false));
-                    if !matches!(
-                        fb_ok,
-                        RateLimitAction::Proceed | RateLimitAction::WaitAndRetry { .. }
-                    ) {
-                        continue;
-                    }
-                    if let Ok(fb) = resolve_llm_model_for_turn(
-                        &self.matrixone,
-                        self.encryptor.as_ref(),
-                        Some(fb_name.as_str()),
-                        pool_ref,
-                        self.llm_token_service.as_ref(),
-                        &state.hooks.forward_headers,
-                    )
-                    .await
-                    {
-                        llm_cfg = fb;
-                        resolved = true;
-                        break;
-                    }
-                }
-                if !resolved && !llm_cfg.fallback_chain.is_empty() {
-                    astra_core::agent_warn!(
-                        "llm",
-                        "reflection fallback: all {} models exhausted ({})",
-                        llm_cfg.fallback_chain.len(),
-                        reason.as_str()
-                    );
-                }
-            }
-            RateLimitAction::Reject {
-                reason,
-                reset_in_ms,
-            } => {
-                return Err(astra_core::ClassifiedError::new(
-                    astra_core::ErrorKind::RateLimit,
-                    format!(
-                        "Rate limit cooldown active ({}). Resets in {}s.",
-                        reason.as_str(),
-                        reset_in_ms / 1000
-                    ),
-                ));
-            }
-        }
-
-        let reflection_messages = vec![
-            json!({"role": "system", "content": request.system_prompt}),
-            json!({"role": "user", "content": request.user_prompt}),
-        ];
-        let result = match call_llm_and_collect_with_request_overrides(
-            &reflection_messages,
-            &[],
-            &llm_cfg.model_name,
-            llm_cfg.wire_model_name.as_deref(),
-            &llm_cfg.api_key,
-            &llm_cfg.base_url,
-            &llm_cfg.provider,
-            request.max_output_tokens,
-            has_fallback,
-            llm_cancel_for_state(state),
-            (!llm_cfg.header_overrides.is_empty()).then_some(&llm_cfg.header_overrides),
-            llm_cfg.completions_url_override.as_deref(),
-            llm_cfg.request_timeout,
-            &ThinkingConfig::Off,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                if !self.session_id.is_empty() {
-                    let mut artifact_store =
-                        astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone());
-                    if let Some(pool) = self.shared_pool.clone() {
-                        artifact_store = artifact_store.with_pool(pool);
-                    }
-                    let dump = astra_turn_core::llm_request_dump::build_llm_request_dump(
-                        &self.session_id,
-                        None,
-                        &llm_cfg.model_name,
-                        &llm_cfg.provider,
-                        &error.message,
-                        &reflection_messages,
-                        &[],
-                        i64::from(state.llm_rounds_completed),
-                        request.max_output_tokens,
-                    );
-                    if let Err(error) = dump.persist_remote(&self.user_id, &artifact_store).await {
-                        astra_core::agent_error!(
-                            "llm-dump",
-                            "server_loop_reflection error dump persist failed: {error}"
-                        );
-                    }
-                    crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
-                        "server_loop_reflection error capture",
-                        self.full_llm_capture,
-                        Some(&artifact_store),
-                        &self.session_id,
-                        &self.user_id,
-                        state.session_turn,
-                        state.llm_rounds_completed,
-                        None,
-                        "server_loop_reflection",
-                        &llm_cfg.model_name,
-                        &llm_cfg.provider,
-                        &reflection_messages,
-                        &[],
-                        request.max_output_tokens,
-                        "error",
-                        llm_capture_error_response(&error),
-                        Some(crate::turn::llm_exchange_capture::CaptureTrace {
-                            session_turn_source: Some("state"),
-                            turn_chain_id: None,
-                            user_query_event_id: None,
-                        }),
-                    )
-                    .await;
-                }
-                return Err(error);
-            }
-        };
-        if !self.session_id.is_empty() {
-            let mut artifact_store =
-                astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone());
-            if let Some(pool) = self.shared_pool.clone() {
-                artifact_store = artifact_store.with_pool(pool);
-            }
-            crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
-                "server_loop_reflection success capture",
-                self.full_llm_capture,
-                Some(&artifact_store),
-                &self.session_id,
-                &self.user_id,
-                state.session_turn,
-                state.llm_rounds_completed,
-                None,
-                "server_loop_reflection",
-                &llm_cfg.model_name,
-                &llm_cfg.provider,
-                &reflection_messages,
-                &[],
-                request.max_output_tokens,
-                "success",
-                json!({
-                    "finish_reason": result.finish_reason.clone(),
-                    "full_text": result.full_text.clone(),
-                    "reasoning": result.reasoning.clone(),
-                    "tool_calls": result.tool_calls.clone(),
-                    "usage": result.usage.clone(),
-                }),
-                Some(crate::turn::llm_exchange_capture::CaptureTrace {
-                    session_turn_source: Some("state"),
-                    turn_chain_id: None,
-                    user_query_event_id: None,
-                }),
-            )
-            .await;
-        }
-        let accum = Self::result_to_accum(&result);
-
-        if accum.has_tool_calls {
-            return Err(astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::InvalidRequest,
-                "auto-reflection unexpectedly returned tool calls",
-            ));
-        }
-
-        Ok(Some(HostReflectionResult {
-            full_text: accum.full_text.trim().to_string(),
-            prompt_tokens: accum.prompt_tokens,
-            completion_tokens: accum.completion_tokens,
-            cache_read_tokens: accum.cache_read_tokens,
-            cache_creation_tokens: accum.cache_creation_tokens,
-            has_usage: accum.has_usage,
-        }))
-    }
-
     fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
         self.emit_event(json!({
             "type": "headless_line",
@@ -3627,7 +3433,6 @@ mod tests {
         for context in [
             "server_loop_host context window dump persist failed",
             "server_loop_host error dump persist failed",
-            "server_loop_reflection error dump persist failed",
         ] {
             let start = production
                 .find(context)
@@ -3703,7 +3508,6 @@ mod tests {
         for context in [
             "server_loop_host context window capture",
             "server_loop_host error capture",
-            "server_loop_reflection error capture",
         ] {
             let start = production
                 .find(context)
@@ -4686,7 +4490,6 @@ mod tests {
             context_manifest_user_id: None,
             context_manifest_model_name: None,
             recursion_depth: 0,
-            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -4698,6 +4501,8 @@ mod tests {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            turn_budget_hint_emitted_50: false,
+            turn_budget_hint_emitted_20: false,
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
@@ -4735,7 +4540,6 @@ mod tests {
             delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
-            evolution_service: None,
             rate_limit_cooldown: Default::default(),
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -4756,12 +4560,11 @@ mod tests {
             tactical_adapter: None,
             step_signal_collector: None,
             tool_budget_override: None,
-            pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
-            continuity: Default::default(),
+            memory_extraction_service: None,
             compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),

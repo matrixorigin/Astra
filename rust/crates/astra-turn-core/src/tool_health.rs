@@ -48,6 +48,37 @@ pub struct RecentOutcomeHint {
     pub failure_category: Option<FailureCategory>,
 }
 
+/// Per-tool outcome bias entry returned by
+/// [`ToolHealthTracker::outcome_bias_by_tool`].
+///
+/// `score` is the clamped bias in `[-0.16, +0.10]` (negative = penalize,
+/// positive = boost). `last_failure_tag` is the failure class tag of the
+/// most recent failing outcome (only populated for negative biases); lets
+/// renderers replace the generic "recent failures" reason with the actual
+/// failure kind (e.g. `"recent failures: timeout"`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OutcomeBiasEntry {
+    pub score: f64,
+    /// Failure-class tag (e.g. `"timeout"`, `"permission"`) of the most
+    /// recent failing outcome for this tool. Stored as `String` for
+    /// Serde compatibility; callers can match on it as a stable tag set
+    /// defined by [`failure_category_tag`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_tag: Option<String>,
+}
+
+impl OutcomeBiasEntry {
+    /// Convenience: build an entry with no failure tag. Used by callers
+    /// that reconstruct a bias map purely from a numeric score.
+    #[must_use]
+    pub fn from_score(score: f64) -> Self {
+        Self {
+            score,
+            last_failure_tag: None,
+        }
+    }
+}
+
 impl ToolOutcome {
     /// Build a `ToolOutcome` from a raw result payload.
     ///
@@ -741,14 +772,22 @@ impl ToolHealthTracker {
     ///   clipped to `[-0.16, +0.10]`.
     ///
     /// Only entries with `|bias| > 0.001` are returned to keep the map sparse.
+    ///
+    /// Each entry also carries the `last_failure_tag` — the tag (e.g. `"timeout"`,
+    /// `"permission"`) of the most recent failing outcome across this tool's
+    /// signatures. `None` for tools with no recent failures or unclassified
+    /// failures. Lets downstream rendering say *why* the selector is
+    /// penalizing a tool instead of just "recent failures".
     #[must_use]
-    pub fn outcome_bias_by_tool(&self, max_age_secs: u64) -> HashMap<String, f64> {
+    pub fn outcome_bias_by_tool(&self, max_age_secs: u64) -> HashMap<String, OutcomeBiasEntry> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default();
         let mut successes: HashMap<String, usize> = HashMap::new();
         let mut fails: HashMap<String, usize> = HashMap::new();
+        // Per-tool newest failure: (epoch, tag).
+        let mut newest_fail: HashMap<String, (u64, Option<String>)> = HashMap::new();
         for (signature, ring) in &self.outcome_cache {
             let Some(outcome) = ring.back() else { continue };
             if outcome.at_epoch > 0
@@ -764,10 +803,21 @@ impl ToolHealthTracker {
             if outcome.success {
                 *successes.entry(tool_name).or_default() += 1;
             } else {
-                *fails.entry(tool_name).or_default() += 1;
+                *fails.entry(tool_name.clone()).or_default() += 1;
+                let tag = outcome
+                    .failure_category
+                    .map(|c| failure_category_tag(c).to_string());
+                newest_fail
+                    .entry(tool_name)
+                    .and_modify(|slot| {
+                        if outcome.at_epoch >= slot.0 {
+                            *slot = (outcome.at_epoch, tag.clone());
+                        }
+                    })
+                    .or_insert((outcome.at_epoch, tag));
             }
         }
-        let mut bias: HashMap<String, f64> = HashMap::new();
+        let mut bias: HashMap<String, OutcomeBiasEntry> = HashMap::new();
         let keys: std::collections::HashSet<&String> =
             successes.keys().chain(fails.keys()).collect();
         for key in keys {
@@ -776,7 +826,18 @@ impl ToolHealthTracker {
             let raw = 0.05 * s - 0.08 * f;
             let clamped = raw.clamp(-0.16, 0.10);
             if clamped.abs() > 0.001 {
-                bias.insert(key.clone(), clamped);
+                let last_failure_tag = if clamped < 0.0 {
+                    newest_fail.get(key).and_then(|(_, tag)| tag.clone())
+                } else {
+                    None
+                };
+                bias.insert(
+                    key.clone(),
+                    OutcomeBiasEntry {
+                        score: clamped,
+                        last_failure_tag,
+                    },
+                );
             }
         }
         bias
@@ -834,19 +895,51 @@ impl ToolHealthTracker {
     /// Latest known outcomes across signatures, newest first.
     #[must_use]
     pub fn latest_outcomes(&self, limit: usize) -> Vec<RecentOutcomeHint> {
+        self.latest_outcomes_within(limit, u64::MAX)
+    }
+
+    /// Age-bounded variant. Only returns outcomes whose monotonic
+    /// `at_epoch` is within `max_age_epochs` of the most recent
+    /// outcome across all signatures. Lets callers filter out stale
+    /// entries (e.g. from earlier tasks in the same session) that
+    /// the LLM would otherwise see as still-relevant advice.
+    ///
+    /// `at_epoch` is a per-session monotonic counter (one tick per
+    /// tool result), not wall-clock. So `max_age_epochs=30` roughly
+    /// means "from the last ~30 tool calls".
+    #[must_use]
+    pub fn latest_outcomes_within(
+        &self,
+        limit: usize,
+        max_age_epochs: u64,
+    ) -> Vec<RecentOutcomeHint> {
+        let max_epoch = self
+            .outcome_cache
+            .values()
+            .filter_map(|ring| ring.back().map(|o| o.at_epoch))
+            .max()
+            .unwrap_or(0);
+        let min_epoch = max_epoch.saturating_sub(max_age_epochs);
+
         let mut hints: Vec<_> = self
             .outcome_cache
             .iter()
             .filter_map(|(signature, ring)| {
-                ring.back().map(|outcome| RecentOutcomeHint {
-                    tool_name: signature
-                        .split_once(':')
-                        .map(|(tool_name, _)| tool_name.to_string())
-                        .unwrap_or_else(|| signature.clone()),
-                    signature: signature.clone(),
-                    success: outcome.success,
-                    at_epoch: outcome.at_epoch,
-                    failure_category: outcome.failure_category,
+                ring.back().and_then(|outcome| {
+                    if outcome.at_epoch < min_epoch {
+                        None
+                    } else {
+                        Some(RecentOutcomeHint {
+                            tool_name: signature
+                                .split_once(':')
+                                .map(|(tool_name, _)| tool_name.to_string())
+                                .unwrap_or_else(|| signature.clone()),
+                            signature: signature.clone(),
+                            success: outcome.success,
+                            at_epoch: outcome.at_epoch,
+                            failure_category: outcome.failure_category,
+                        })
+                    }
                 })
             })
             .collect();
@@ -1662,10 +1755,10 @@ mod tests {
         );
 
         let bias = tracker.outcome_bias_by_tool(3600);
-        assert!(bias.get("bash").copied().unwrap_or_default() > 0.0);
-        assert!(bias.get("read_file").copied().unwrap_or_default() < 0.0);
+        assert!(bias.get("bash").map(|e| e.score).unwrap_or(0.0) > 0.0);
+        assert!(bias.get("read_file").map(|e| e.score).unwrap_or(0.0) < 0.0);
         for value in bias.values() {
-            assert!((-0.16..=0.10).contains(value));
+            assert!((-0.16..=0.10).contains(&value.score));
         }
     }
 

@@ -679,7 +679,7 @@ pub fn create_local_lifecycle(
     session_dir: &std::path::Path,
     work_dir: &std::path::Path,
 ) -> Arc<dyn DurableTaskLifecycle> {
-    create_local_lifecycle_full(session_dir, work_dir, None, None, None, None, None, None)
+    create_local_lifecycle_full(session_dir, work_dir, None, None, None, None, None)
 }
 /// Full lifecycle creation with optional cloud LLM judge.
 ///
@@ -694,7 +694,6 @@ pub fn create_local_lifecycle_full(
     session_id: Option<&str>,
     user_id: Option<&str>,
     cloud_judge: Option<Arc<dyn astra_services::LlmJudge>>,
-    learning_bridge: Option<Arc<dyn astra_services::TaskLearningBridge>>,
     server_proxy_judge: Option<Arc<dyn astra_services::LlmJudge>>,
 ) -> Arc<dyn DurableTaskLifecycle> {
     let contracts_dir = session_dir.join("contracts");
@@ -714,11 +713,6 @@ pub fn create_local_lifecycle_full(
     }
     if let (Some(sid), Some(uid)) = (session_id, user_id) {
         lifecycle.set_session_context(sid, uid);
-    }
-
-    // Wire up learning bridge for verification → learning feedback loop
-    if let Some(bridge) = learning_bridge {
-        lifecycle.set_learning_bridge(bridge);
     }
 
     // Wire up live output streaming — tees build/test stderr to the terminal
@@ -742,7 +736,6 @@ pub fn create_cloud_lifecycle_full(
     session_id: Option<&str>,
     user_id: Option<&str>,
     cloud_judge: Option<Arc<dyn astra_services::LlmJudge>>,
-    learning_bridge: Option<Arc<dyn astra_services::TaskLearningBridge>>,
     server_proxy_judge: Option<Arc<dyn astra_services::LlmJudge>>,
 ) -> Arc<dyn DurableTaskLifecycle> {
     let mut lifecycle = MatrixOneDurableTaskLifecycle::new(pool, work_dir.to_path_buf());
@@ -758,10 +751,6 @@ pub fn create_cloud_lifecycle_full(
     }
     if let (Some(sid), Some(uid)) = (session_id, user_id) {
         lifecycle.set_session_context(sid, uid);
-    }
-
-    if let Some(bridge) = learning_bridge {
-        lifecycle.set_learning_bridge(bridge);
     }
 
     lifecycle.set_output_sink(Arc::new(|line: &str| {
@@ -2000,8 +1989,7 @@ mod tests {
             None,
             Some("sess"),
             Some("user"),
-            None, // cloud_judge: None
-            None,
+            None,                                               // cloud_judge: None
             Some(Arc::clone(&fake_judge) as Arc<dyn LlmJudge>), // server_proxy_judge
         );
 
@@ -2060,7 +2048,6 @@ mod tests {
             Some("sess"),
             Some("user"),
             Some(Arc::clone(&cloud_judge) as Arc<dyn LlmJudge>),
-            None,
             Some(Arc::clone(&proxy_judge) as Arc<dyn LlmJudge>),
         );
 

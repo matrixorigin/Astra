@@ -250,13 +250,7 @@ fn infer_domain_from_tools(tools: &[String]) -> Option<DomainHint> {
         "git_contributors",
         "git_log_search",
     ];
-    let memory_tools = [
-        "memory_store",
-        "memory_search",
-        "memory_profile",
-        "memory_correct",
-        "memory_purge",
-    ];
+    let memory_tools = ["memory"];
     let db_tools = ["mo_query", "mo_snapshot", "mo_branch"];
 
     let has_github = tools

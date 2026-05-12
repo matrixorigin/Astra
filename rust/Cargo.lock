@@ -143,7 +143,6 @@ version = "0.1.0"
 dependencies = [
  "astra-config",
  "astra-core",
- "astra-evolution",
  "astra-harness",
  "astra-learning",
  "astra-logging",
@@ -202,6 +201,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "tokio-util",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -227,10 +227,16 @@ name = "astra-config"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "chrono",
  "dirs 6.0.0",
+ "fs2",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
  "toml 1.1.2+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]
@@ -267,22 +273,6 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "astra-evolution"
-version = "0.1.0"
-dependencies = [
- "astra-core",
- "astra-pipeline",
- "astra-services",
- "astra-turn-core",
- "dirs 6.0.0",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -391,7 +381,6 @@ version = "0.1.0"
 dependencies = [
  "astra-config",
  "astra-core",
- "astra-evolution",
  "astra-harness",
  "astra-learning",
  "astra-logging",
@@ -403,7 +392,6 @@ dependencies = [
  "astra-server-types",
  "astra-services",
  "astra-skills",
- "astra-sync-adapters",
  "astra-text-utils",
  "astra-thin-client",
  "astra-tools",
@@ -488,6 +476,7 @@ dependencies = [
 name = "astra-services"
 version = "0.1.0"
 dependencies = [
+ "astra-config",
  "astra-core",
  "astra-logging",
  "astra-turn-types",
@@ -543,20 +532,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "astra-sync-adapters"
-version = "0.1.0"
-dependencies = [
- "astra-evolution",
- "astra-pipeline",
- "astra-services",
- "astra-text-utils",
- "async-trait",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "astra-test-harness"
 version = "0.1.0"
 dependencies = [
@@ -609,6 +584,7 @@ dependencies = [
  "astra-core",
  "astra-prompts",
  "astra-sandbox",
+ "astra-turn-types",
  "async-trait",
  "base64",
  "chrono",

@@ -158,10 +158,10 @@ async fn execute_reflect_uses_local_surface_with_session() {
     let value: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(value["session_id"], session_id);
     assert_eq!(value["focus"], "performance");
-    assert_eq!(
-        value["reflection_context"]["tool_stats"][0]["tool_name"],
-        "bash"
-    );
+    // Liquid-reflection subsystem removed. `recent_turns` surfaces the
+    // focused journal preview that downstream UIs read directly.
+    let recent = value["recent_turns"].as_array().expect("recent_turns");
+    assert!(!recent.is_empty(), "turn journal preview should be present");
 }
 
 #[test]

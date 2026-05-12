@@ -23,7 +23,7 @@ pub fn build_agentic_tool_selection_context<'a>(
     memory_domain_hints: Vec<DomainHint>,
     restricted_tools: Vec<String>,
     file_context: Vec<String>,
-    outcome_bias: HashMap<String, f64>,
+    outcome_bias: HashMap<String, astra_turn_core::tool_health::OutcomeBiasEntry>,
     _follow_up_tool_round: bool,
     tool_budget_override: Option<u32>,
     previous_confidence_fallback: Option<astra_turn_core::confidence_contract::ConfidenceFallback>,

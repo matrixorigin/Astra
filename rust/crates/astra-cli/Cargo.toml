@@ -21,7 +21,6 @@ astra-runtime.workspace = true
 astra-pipeline.workspace = true
 astra-messaging.workspace = true
 astra-skills.workspace = true
-astra-evolution.workspace = true
 astra-learning.workspace = true
 astra-config.workspace = true
 astra-turn-core.workspace = true
@@ -84,6 +83,7 @@ clap_complete = "4.6.0"
 inquire = "0.7"
 urlencoding = "2.1.3"
 nucleo-matcher = "0.3"
+toml = { version = "1.1.2", features = ["preserve_order"] }
 
 [dev-dependencies]
 itertools = "0.13"

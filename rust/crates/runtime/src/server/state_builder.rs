@@ -36,9 +36,6 @@ pub async fn build_server_state(
         }
     };
 
-    // Build shared pipeline learning modules (server-wide singleton).
-    let learning_stack = build_pipeline_learning_stack(None);
-
     let state = AppState::new(
         ServiceInfo::default(),
         Arc::new(MatrixOneHealthChecker::new(settings.matrixone.clone())),
@@ -185,7 +182,6 @@ pub async fn build_server_state(
         astra_services::DatabaseAdminConfigService::new(settings.matrixone.clone())
             .with_pool(shared_pool.clone()),
     ))
-    .with_turn_learning_writer(learning_stack.writer.clone())
     .with_task_service(Arc::new(MatrixOneTaskService::from_shared(&shared_pool)))
     .with_edge_registry_service(Arc::new(DatabaseEdgeRegistryService::from_shared(
         &shared_pool,
@@ -201,7 +197,6 @@ pub async fn build_server_state(
     let bridge_edge_ledger = state.edge_callback_ledger.clone();
     let bridge_matrixone = settings.matrixone.clone();
     let bridge_pool = shared_pool.clone();
-    let bridge_learning_writer = learning_stack.writer.clone();
     let bridge_chat_turn_bridge_secret = settings.bridge_secret;
     let state = state.with_memoria_config(settings.memoria.base_url, settings.memoria.master_key);
 
@@ -261,17 +256,39 @@ pub async fn build_server_state(
         crate::server::delegation_engine::DelegationTracker::new()
             .with_progress_broadcaster(Arc::clone(&progress_broadcaster)),
     );
+
+    let user_id = astra_core::cli_user_id();
+
+    // Build MatrixCloudRuntime early so its memory-extraction service
+    // (which needs both ingestion and encryptor) can be shared with the
+    // lifecycle service + delegation sub-run executor, and later
+    // reused as the bridge persist tracker.
+    let matrix_rt = Arc::new(
+        crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(
+            shared_pool.clone(),
+            "default",
+            &user_id,
+            Arc::clone(&lease_hold_cache),
+        )
+        .with_encryptor(run_encryptor.clone()),
+    );
+    let memory_extraction_service = matrix_rt.clone_memory_extraction_service();
+
     // Wire a real sub-run executor backed by ServerAgenticLoopHost.
-    let sub_run_executor: Arc<dyn crate::server::delegation_engine::SubRunExecutor> = Arc::new(
-        super::run_lifecycle::ServerSubRunExecutor::new(
+    let sub_run_executor: Arc<dyn crate::server::delegation_engine::SubRunExecutor> = {
+        let mut exec = super::run_lifecycle::ServerSubRunExecutor::new(
             settings.matrixone.clone(),
             run_encryptor.clone(),
             state.edge_callback_ledger.clone(),
         )
         .with_pool(shared_pool.clone())
         .with_edge_connection_pool(state.edge_connection_pool.clone())
-        .with_skill_service(state.skill_service.clone()),
-    );
+        .with_skill_service(state.skill_service.clone());
+        if let Some(svc) = memory_extraction_service.as_ref() {
+            exec = exec.with_memory_extraction_service(Arc::clone(svc));
+        }
+        Arc::new(exec)
+    };
     let delegation_engine = Arc::new(
         crate::server::delegation_engine::DelegationEngine::with_executor(
             Arc::new(tokio::sync::RwLock::new((*profile_registry).clone())),
@@ -296,7 +313,7 @@ pub async fn build_server_state(
         std::sync::Arc::new(resource_governor);
 
     // Create lifecycle service with delegation engine wired in.
-    let run_lifecycle = super::run_lifecycle::AgenticRunLifecycleService::new(
+    let mut run_lifecycle = super::run_lifecycle::AgenticRunLifecycleService::new(
         settings.matrixone.clone(),
         run_encryptor.clone(),
         state.edge_callback_ledger.clone(),
@@ -310,6 +327,9 @@ pub async fn build_server_state(
     .with_hook_db_writer(state.turn_hook_db_writer.clone())
     .with_observer_worker(state.turn_observer_worker.clone())
     .with_tool_event_writer(state.turn_tool_event_writer.clone());
+    if let Some(svc) = memory_extraction_service.as_ref() {
+        run_lifecycle = run_lifecycle.with_memory_extraction_service(Arc::clone(svc));
+    }
 
     #[cfg(feature = "harness")]
     let run_lifecycle = run_lifecycle.with_harness_registry(state.harness_registry.clone());
@@ -317,7 +337,6 @@ pub async fn build_server_state(
     // Wire team persistence store backed by MatrixOne.
     let team_store =
         astra_services::team_persistence::MatrixOneTeamStore::new(shared_pool.get().clone());
-    let user_id = astra_core::cli_user_id();
     if let Err(e) = team_store.ensure_builtins(&user_id).await {
         tracing::warn!(
             target: "astra_runtime::state_builder",
@@ -335,17 +354,6 @@ pub async fn build_server_state(
         .with_team_store(team_store)
         .with_resource_governor(resource_governor.clone());
 
-    let matrix_rt = Arc::new(crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(
-        shared_pool.clone(),
-        "default",
-        &user_id,
-        learning_stack.entity_graph.clone(),
-        learning_stack.pattern_library.clone(),
-        learning_stack.calibrator.clone(),
-        Arc::new(Mutex::new(Vec::new())),
-        None,
-        Arc::clone(&lease_hold_cache),
-    ));
     // Wire in-process chat turn bridge with matrix_rt as the persist tracker.
     // HIGH #4: attach matrix_rt as BridgePersistTracker so SSE persist tasks drain on shutdown.
     let state = state
@@ -355,7 +363,6 @@ pub async fn build_server_state(
                 bridge_encryptor,
             )
             .with_pool(bridge_pool)
-            .with_learning_writer(bridge_learning_writer)
             .with_edge_callback_ledger(bridge_edge_ledger)
             .with_persist_tracker(Arc::clone(&matrix_rt)
                 as Arc<dyn crate::matrix_cloud_runtime::BridgePersistTracker>),
@@ -367,195 +374,4 @@ pub async fn build_server_state(
 
     let state = state.with_matrix_cloud_runtime(Some(matrix_rt));
     Ok(state)
-}
-
-/// Owns the same `Arc` pipeline module handles as [`PipelineLearningWriter`] for wiring
-/// [`crate::matrix_cloud_runtime::MatrixCloudRuntime`] without duplicate pools.
-pub(super) struct PipelineLearningStack {
-    pub writer: Arc<dyn TurnLearningWriter>,
-    pub entity_graph: Arc<Mutex<astra_pipeline::entity::EntityGraph>>,
-    pub pattern_library: Arc<Mutex<astra_pipeline::pattern::PatternLibrary>>,
-    pub calibrator: Arc<Mutex<astra_pipeline::calibration::ProgressiveCalibrator>>,
-    pub active_canary: Option<astra_evolution::types::PersistedActiveCanary>,
-    /// Profile name used for cross-session persistence.
-    pub profile: Option<String>,
-}
-
-impl PipelineLearningStack {
-    /// Persist current learning state to disk if a profile was configured.
-    pub fn save_with_active_canary(
-        &self,
-        active_canary: Option<astra_evolution::types::PersistedActiveCanary>,
-    ) {
-        if let Some(ref profile) = self.profile {
-            let _ = crate::pipeline::persistence::save_learning_state_with_health_and_canary(
-                profile,
-                &self.entity_graph,
-                &self.pattern_library,
-                &self.calibrator,
-                &[],
-                active_canary,
-            );
-        }
-    }
-}
-
-/// Creates pipeline modules (EntityGraph, PatternLibrary, ProgressiveCalibrator)
-/// and wires them into a PipelineLearningWriter for turn-outcome-driven learning.
-///
-/// Bootstrap defaults are layered first so common patterns/entities exist on a
-/// cold start. When `profile` is provided, persisted per-profile state from
-/// `~/.astra/learning/<profile>.json` is then overlaid on top so user-learned
-/// patterns (including recent block/deprioritize signals) are not erased by the
-/// bootstrap priors.
-pub(super) fn build_pipeline_learning_stack(profile: Option<&str>) -> PipelineLearningStack {
-    use astra_pipeline::{
-        calibration::ProgressiveCalibrator,
-        defaults::{default_calibration, default_entities, default_patterns},
-        entity::EntityGraph,
-        pattern::PatternLibrary,
-    };
-    use astra_turn_core::pipeline_learning::PipelineLearningWriter;
-
-    let entity_graph = Arc::new(Mutex::new(EntityGraph::new()));
-    let pattern_library = Arc::new(Mutex::new(PatternLibrary::new()));
-    // Use 0.70 as initial threshold — requires some confidence before auto-routing
-    let calibrator = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.70)));
-
-    // Layer bootstrap defaults first so built-in patterns/entities are always present.
-    if let Ok(mut eg) = entity_graph.lock() {
-        eg.merge(&default_entities());
-    }
-    if let Ok(mut pl) = pattern_library.lock() {
-        pl.merge(&default_patterns());
-    }
-    if let Ok(mut cal) = calibrator.lock() {
-        cal.merge(&default_calibration());
-    }
-
-    // Overlay cross-session persisted state after bootstrap so user-learned
-    // patterns win over defaults even when the defaults carry larger priors.
-    let mut active_canary = None;
-    if let Some(p) = profile
-        && let Some(snapshot) = crate::pipeline::persistence::load_snapshot(p)
-    {
-        if let Ok(mut eg) = entity_graph.lock() {
-            eg.merge(&snapshot.entities);
-        }
-        if let Ok(mut pl) = pattern_library.lock() {
-            pl.overlay(&snapshot.patterns);
-        }
-        if let Some(calibration) = snapshot.calibration.as_ref()
-            && let Ok(mut cal) = calibrator.lock()
-        {
-            cal.merge(calibration);
-        }
-        active_canary = snapshot.active_canary;
-    }
-
-    let writer = Arc::new(
-        PipelineLearningWriter::new()
-            .with_entity_graph(entity_graph.clone())
-            .with_pattern_library(pattern_library.clone())
-            .with_progressive_calibrator(calibrator.clone()),
-    );
-    PipelineLearningStack {
-        writer,
-        entity_graph,
-        pattern_library,
-        calibrator,
-        active_canary,
-        profile: profile.map(str::to_string),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::pipeline::routing::{DomainHint, TaskType};
-    use astra_evolution::types::PatternAction;
-    use astra_pipeline::defaults::default_patterns;
-    use astra_turn_core::contracts::TurnLearningOutcome;
-
-    #[tokio::test]
-    async fn build_pipeline_learning_writer_creates_functional_writer() {
-        let writer = build_pipeline_learning_stack(None).writer;
-        // Should accept an outcome without panic
-        let outcome = TurnLearningOutcome {
-            query: "matrixorigin PR check".to_string(),
-            tools_selected: vec!["github_search".to_string()],
-            tools_used: vec!["github_search".to_string()],
-            success: true,
-            quality: 0.8,
-            was_corrected: false,
-            task_type_label: Some("code".to_string()),
-            domain_hint_label: Some("github".to_string()),
-            user_feedback_score: None,
-            reward_hacking_risk: 0.0,
-            reward_hacking_flags: Vec::new(),
-            causal_support_score: 1.0,
-            causal_support_flags: Vec::new(),
-        };
-        let _ = writer.record_outcome(outcome).await;
-    }
-
-    #[tokio::test]
-    async fn build_pipeline_learning_writer_learns_across_calls() {
-        let writer = build_pipeline_learning_stack(None).writer;
-        // Record two outcomes to meet PatternLibrary minimum
-        for i in 0..2 {
-            let outcome = TurnLearningOutcome {
-                query: format!("test query {i}"),
-                tools_selected: vec!["bash".to_string()],
-                tools_used: vec!["bash".to_string()],
-                success: true,
-                quality: 0.7,
-                was_corrected: false,
-                task_type_label: Some("code".to_string()),
-                domain_hint_label: None,
-                user_feedback_score: None,
-                reward_hacking_risk: 0.0,
-                reward_hacking_flags: Vec::new(),
-                causal_support_score: 1.0,
-                causal_support_flags: Vec::new(),
-            };
-            let _ = writer.record_outcome(outcome).await;
-        }
-        // No panics = writer accumulates state correctly
-    }
-
-    #[test]
-    fn pipeline_learning_stack_shares_arcs_between_writer_and_fields() {
-        let s = build_pipeline_learning_stack(None);
-        assert_eq!(Arc::strong_count(&s.entity_graph), 2);
-        assert_eq!(Arc::strong_count(&s.pattern_library), 2);
-        assert_eq!(Arc::strong_count(&s.calibrator), 2);
-    }
-
-    #[test]
-    fn persisted_patterns_overlay_defaults_without_losing_blocked_state() {
-        let tools = vec!["grep".to_string()];
-        let mut persisted = astra_pipeline::pattern::PatternLibrary::new();
-        persisted.record_outcome(
-            &tools,
-            TaskType::Code,
-            Some(DomainHint::Code),
-            true,
-            0.8,
-            None,
-        );
-        persisted.apply_evolution_action("grep", PatternAction::Block);
-
-        let mut layered = astra_pipeline::pattern::PatternLibrary::new();
-        layered.merge(&default_patterns());
-        layered.overlay(&persisted.export());
-
-        assert!(
-            layered
-                .blocked_tool_names()
-                .iter()
-                .any(|name| name == "grep"),
-            "persisted blocked tools should survive bootstrap default layering"
-        );
-    }
 }

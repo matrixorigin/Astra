@@ -10,6 +10,37 @@ use std::time::Instant;
 
 use super::sse_blocks::SseBlankLineUtf8Buf;
 
+/// Per-channel fingerprint emitted by the bridge via the
+/// `injection_freshness` SSE event. Carries only opaque metadata
+/// (content hash, byte length, empty-flag) — never the raw channel
+/// text. wip-7 migrated away from `BridgeInjectionTextsOwned` (which
+/// shipped raw text) because the external
+/// `transform_run_event_for_client` transform passed the event through
+/// verbatim, leaking learned feedback rules, memoria recall digests,
+/// self-awareness summaries, and user-correction excerpts to any
+/// authenticated `/chat/turn` client.
+///
+/// The fingerprint is enough for `ObservabilitySession` to detect
+/// content change (for the freshness report). The raw preview is
+/// derived CLI-side from channels the CLI already owns
+/// (`lessons`, `self_awareness`, `memoria_insights`,
+/// `recent_arg_hints`, `skill_listing`). Bridge-internal channels
+/// (`memoria_prefetch`, `feedback_rules`, `implicit_feedback`,
+/// `tool_round_guidance`, `volatile`) carry an empty preview in the
+/// CLI history — introspect still sees tag + hash + bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BridgeChannelFingerprint {
+    pub tag: String,
+    pub hash: u64,
+    pub bytes: u64,
+    pub is_empty: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BridgeInjectionFingerprints {
+    pub channels: Vec<BridgeChannelFingerprint>,
+}
+
 /// State collected from one `/chat/turn` SSE stream (excluding edge executor bookkeeping).
 #[derive(Debug, Clone, Default)]
 pub struct ChatTurnSseAccum {
@@ -35,6 +66,14 @@ pub struct ChatTurnSseAccum {
     pub system_prompt_tokens: Option<u32>,
     /// Detailed system prompt breakdown from runtime (via `context_meta` SSE event).
     pub system_prompt_breakdown: Option<Value>,
+    /// Per-turn injection-channel fingerprints captured from the
+    /// bridge's `injection_freshness` SSE event. `None` until the
+    /// event fires. wip-7 contract: the CLI MUST NOT default this to
+    /// an empty bundle when the event is missing — that would mask a
+    /// broken observation pipe by reporting every bridge channel as
+    /// `Empty` in the freshness report. Stays `None` → downstream
+    /// observers skip those channels (history remains `Untracked`).
+    pub bridge_injection_fingerprints: Option<BridgeInjectionFingerprints>,
 }
 
 /// Deferred edge work from `tool_request` / `approval_required` events.
@@ -370,6 +409,50 @@ fn apply_one_event(
             }
             if let Some(b) = event.get("system_prompt_breakdown") {
                 accum.system_prompt_breakdown = Some(b.clone());
+            }
+        }
+        "injection_freshness" => {
+            // wip-7 wire shape: fingerprints only, no raw text.
+            // `channels: [{tag, hash, bytes, is_empty}, ...]`. If the
+            // event arrives in any legacy shape (e.g. wip-5's `texts:`
+            // container) we deliberately drop it — the transform
+            // allowlist already strips that at the external boundary,
+            // but we don't want to populate a fingerprint bundle from
+            // a raw-text event either (that would suggest the channel
+            // was observed when the bridge actually regressed to the
+            // old shape). `bridge_injection_fingerprints` stays `None`
+            // so the CLI observer treats those channels as untracked.
+            if let Some(arr) = event.get("channels").and_then(|v| v.as_array()) {
+                let mut channels = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let Some(obj) = item.as_object() else {
+                        continue;
+                    };
+                    let tag = obj
+                        .get("tag")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if tag.is_empty() {
+                        continue;
+                    }
+                    let hash = obj.get("hash").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let bytes = obj.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                    // `is_empty` is authoritative when present; else
+                    // derive from bytes==0 for robustness.
+                    let is_empty = obj
+                        .get("is_empty")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(bytes == 0);
+                    channels.push(BridgeChannelFingerprint {
+                        tag,
+                        hash,
+                        bytes,
+                        is_empty,
+                    });
+                }
+                accum.bridge_injection_fingerprints =
+                    Some(BridgeInjectionFingerprints { channels });
             }
         }
         "run_started" => {

@@ -1,3 +1,5 @@
+use serde_json::Value;
+
 /// Tool idempotency classification — determines retry safety.
 ///
 /// Shared across `astra-pipeline` (retry policies) and `astra-turn-core`
@@ -23,12 +25,30 @@ impl ToolIdempotency {
     }
 }
 
-/// Canonical name → idempotency classification.
+/// Canonical (name, args) → idempotency classification.
 ///
-/// This is the single source of truth for tool idempotency, used by both
-/// `tool_categories::ToolMeta` and `step_protocol::tool_retry_policy`.
-pub fn classify_tool_idempotency(tool_name: &str) -> ToolIdempotency {
+/// Single source of truth. Most tools dispatch on `name` alone, but a few
+/// consolidated tools (e.g. `memory`) carry an `action` field whose value
+/// changes read/write semantics — those branches consult `args`.
+///
+/// Pass `args = None` when args are unavailable (e.g. static schema audits);
+/// action-sensitive tools then return the conservative `NonIdempotent`.
+pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolIdempotency {
     match tool_name {
+        // ── Consolidated `memory` tool: branch on the `action` field. ──
+        //
+        // Mutating actions (write state, session-scoped attention, feedback
+        // signal, cross-memory synthesis): `remember`, `forget`, `update`,
+        // `focus`, `reflect`, `feedback`. Must NOT be blindly retried.
+        //
+        // Pure reads (no side effects): `recall`, `expand`, `profile`.
+        //
+        // Unknown or absent action → conservative NonIdempotent.
+        "memory" => match args.and_then(|a| a.get("action")).and_then(Value::as_str) {
+            Some("recall") | Some("expand") | Some("profile") => ToolIdempotency::PureRead,
+            _ => ToolIdempotency::NonIdempotent,
+        },
+
         // Pure read tools — safe to re-execute
         "read_file"
         | "file_read"
@@ -109,6 +129,11 @@ pub fn classify_tool_idempotency(tool_name: &str) -> ToolIdempotency {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn classify(name: &str) -> ToolIdempotency {
+        classify_tool_idempotency(name, None)
+    }
 
     #[test]
     fn pure_read_tools() {
@@ -131,14 +156,12 @@ mod tests {
             "github_ci_status",
             "github_repo_stats",
             "mo_query",
-            "memory_search",
-            "memory_profile",
             "web_fetch",
             "get_agent_info",
             "reflect",
         ] {
             assert_eq!(
-                classify_tool_idempotency(name),
+                classify(name),
                 ToolIdempotency::PureRead,
                 "Expected PureRead for {name}"
             );
@@ -146,15 +169,38 @@ mod tests {
     }
 
     #[test]
+    fn memory_action_aware() {
+        // Read actions
+        for action in ["recall", "expand", "profile"] {
+            assert_eq!(
+                classify_tool_idempotency("memory", Some(&json!({ "action": action }))),
+                ToolIdempotency::PureRead,
+                "memory(action={action}) should be PureRead"
+            );
+        }
+        // Write / side-effecting actions
+        for action in [
+            "remember", "forget", "update", "focus", "reflect", "feedback",
+        ] {
+            assert_eq!(
+                classify_tool_idempotency("memory", Some(&json!({ "action": action }))),
+                ToolIdempotency::NonIdempotent,
+                "memory(action={action}) should be NonIdempotent"
+            );
+        }
+        // Missing args → conservative
+        assert_eq!(classify("memory"), ToolIdempotency::NonIdempotent);
+        // Unknown action → conservative
+        assert_eq!(
+            classify_tool_idempotency("memory", Some(&json!({ "action": "nuke" }))),
+            ToolIdempotency::NonIdempotent
+        );
+    }
+
+    #[test]
     fn idempotent_write() {
-        assert_eq!(
-            classify_tool_idempotency("write_file"),
-            ToolIdempotency::IdempotentWrite
-        );
-        assert_eq!(
-            classify_tool_idempotency("WriteFileTool"),
-            ToolIdempotency::IdempotentWrite
-        );
+        assert_eq!(classify("write_file"), ToolIdempotency::IdempotentWrite);
+        assert_eq!(classify("WriteFileTool"), ToolIdempotency::IdempotentWrite);
     }
 
     #[test]
@@ -162,19 +208,19 @@ mod tests {
         // ask_user has a side effect: it blocks until user responds.
         // Retrying it would double-prompt the user — must NOT be PureRead.
         assert_eq!(
-            classify_tool_idempotency("ask_user"),
+            classify("ask_user"),
             ToolIdempotency::NonIdempotent,
             "ask_user must be NonIdempotent — retrying double-prompts the user"
         );
-        assert!(!classify_tool_idempotency("ask_user").is_safe_to_retry());
+        assert!(!classify("ask_user").is_safe_to_retry());
 
         // sleep has a wall-clock side effect and is not safe to retry transparently.
         assert_eq!(
-            classify_tool_idempotency("sleep"),
+            classify("sleep"),
             ToolIdempotency::NonIdempotent,
             "sleep must be NonIdempotent — wall-clock side effect"
         );
-        assert!(!classify_tool_idempotency("sleep").is_safe_to_retry());
+        assert!(!classify("sleep").is_safe_to_retry());
     }
 
     #[test]
@@ -183,9 +229,6 @@ mod tests {
             "bash",
             "str_replace",
             "github_create_issue",
-            "memory_store",
-            "memory_purge",
-            "memory_correct",
             "delete_file",
             "multi_edit",
             "edit_file",
@@ -193,7 +236,7 @@ mod tests {
             "sleep",
         ] {
             assert_eq!(
-                classify_tool_idempotency(name),
+                classify(name),
                 ToolIdempotency::NonIdempotent,
                 "Expected NonIdempotent for {name}"
             );
@@ -202,10 +245,7 @@ mod tests {
 
     #[test]
     fn unknown_tool_defaults_to_non_idempotent() {
-        assert_eq!(
-            classify_tool_idempotency("some_future_tool"),
-            ToolIdempotency::NonIdempotent
-        );
+        assert_eq!(classify("some_future_tool"), ToolIdempotency::NonIdempotent);
     }
 
     #[test]
@@ -235,8 +275,8 @@ mod tests {
         ];
         for (canonical, alias) in pairs {
             assert_eq!(
-                classify_tool_idempotency(canonical),
-                classify_tool_idempotency(alias),
+                classify(canonical),
+                classify(alias),
                 "{canonical} and {alias} should have same idempotency"
             );
         }

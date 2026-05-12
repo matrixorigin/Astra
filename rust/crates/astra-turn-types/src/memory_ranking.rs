@@ -43,7 +43,7 @@ pub const SESSION_SCOPED_TYPE: &str = "working";
 /// build this from their Memoria client's result type — we keep the
 /// shaping layer free of crate dependencies so it can run in tests
 /// and in any future memdir/file-based fallback.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RankableMemory {
     pub memory_id: String,
     pub content: String,
@@ -51,6 +51,116 @@ pub struct RankableMemory {
     /// Server-side `final_score` from Memoria. Already tier-weighted.
     pub retrieval_score: Option<f64>,
     pub trust_tier: Option<String>,
+    /// RFC3339 timestamp of first observation — used to render a
+    /// freshness suffix so the LLM knows if the memory is stale.
+    pub observed_at: Option<String>,
+    /// RFC3339 timestamp of the most recent update, if any.
+    pub updated_at: Option<String>,
+    /// Session id this memory was scoped to at write time (only
+    /// present for working / episodic memories).
+    pub session_id: Option<String>,
+}
+
+impl RankableMemory {
+    /// Days elapsed since `observed_at` (or `updated_at` as fallback).
+    /// `None` when neither timestamp is present or parseable.
+    pub fn age_days(&self) -> Option<i64> {
+        let ts = self.observed_at.as_deref().or(self.updated_at.as_deref())?;
+        // Minimal RFC3339 parse without a date crate dep: take the first
+        // 10 chars (YYYY-MM-DD) and rely on callers for richer parsing.
+        // In practice Memoria always emits RFC3339 so we defer to the
+        // runtime-side `MemoriaMemory::age_days` which owns chrono. This
+        // shim uses a lightweight parse so tests can still exercise the
+        // age-suffix formatting without pulling chrono into turn-types.
+        parse_rfc3339_days_ago(ts)
+    }
+
+    /// Compact freshness suffix.
+    ///
+    /// Bucketed, not exact-day, so the prompt cache is stable across
+    /// midnight boundaries — the label only flips when a memory
+    /// actually crosses into the next freshness bucket (~once per
+    /// week / once per half-life). An exact-days label would re-render
+    /// every day for every memory and invalidate cached blocks daily.
+    ///
+    /// Buckets:
+    /// - `≤ 1 day`  → empty (fresh enough to trust)
+    /// - `≤ 7 days` → ` (this week)`
+    /// - `≤ half-life` → ` (this month)` or ` (this year)` etc. — see
+    ///   [`tier_mid_label`]
+    /// - `> half-life` → ` (stale — verify first)`
+    pub fn freshness_suffix(&self) -> String {
+        let Some(days) = self.age_days() else {
+            return String::new();
+        };
+        freshness_suffix_for(days, self.trust_tier.as_deref())
+    }
+}
+
+/// Pure helper so both `RankableMemory::freshness_suffix` and the
+/// runtime-side `MemoriaMemory::freshness_suffix` share the exact
+/// same bucket boundaries + labels.
+pub fn freshness_suffix_for(days: i64, trust_tier: Option<&str>) -> String {
+    if days <= 1 {
+        return String::new();
+    }
+    let (half_life, mid_label) = tier_params(trust_tier);
+    if days > half_life {
+        return " (stale — verify first)".to_string();
+    }
+    if days <= 7 {
+        return " (this week)".to_string();
+    }
+    format!(" ({mid_label})")
+}
+
+fn tier_params(trust_tier: Option<&str>) -> (i64, &'static str) {
+    match trust_tier {
+        Some("T1") => (365, "within the year"),
+        Some("T2") => (180, "within the half-year"),
+        Some("T4") => (30, "within the month"),
+        // T3 default when tier unknown.
+        _ => (60, "within the two months"),
+    }
+}
+
+/// Very small RFC3339-ish parser: returns "days since" for a
+/// timestamp of the form `YYYY-MM-DDTHH:MM:SSZ` (or any prefix with
+/// a valid `YYYY-MM-DD`). Returns `None` on malformed input or when
+/// the date is in the future (clock skew).
+fn parse_rfc3339_days_ago(ts: &str) -> Option<i64> {
+    // Parse YYYY-MM-DD.
+    let date_part = ts.get(..10)?;
+    let mut parts = date_part.split('-');
+    let y: i32 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    // Convert to days since epoch via the proleptic Gregorian formula.
+    let date_days = days_from_civil(y, m, d)?;
+    let now_days = days_from_civil_now()?;
+    let diff = now_days - date_days;
+    if diff < 0 { None } else { Some(diff) }
+}
+
+/// Howard Hinnant's days-from-civil algorithm.
+fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i64> {
+    if !(1..=12).contains(&m) || d == 0 || d > 31 {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y } as i64;
+    let era = y.div_euclid(400);
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * if m > 2 { m - 3 } else { m + 9 } as i64 + 2) / 5 + d as i64 - 1;
+    let doe = yoe as i64 * 365 + (yoe / 4) as i64 - (yoe / 100) as i64 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+fn days_from_civil_now() -> Option<i64> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some(secs / 86_400)
 }
 
 /// Sort `memories` in-place by descending `retrieval_score` (the
@@ -121,10 +231,138 @@ mod tests {
             memory_type: mem_type.to_string(),
             retrieval_score: Some(score),
             trust_tier: tier.map(str::to_string),
+            observed_at: None,
+            updated_at: None,
+            session_id: None,
         }
     }
 
-    // ── sort_by_retrieval_score ────────────────────────────────────
+    // ── Freshness suffix ────────────────────────────────────────────
+
+    fn mem_with_observed(id: &str, observed: &str, tier: Option<&str>) -> RankableMemory {
+        RankableMemory {
+            memory_id: id.into(),
+            content: "x".into(),
+            memory_type: "semantic".into(),
+            retrieval_score: Some(0.5),
+            trust_tier: tier.map(str::to_string),
+            observed_at: Some(observed.into()),
+            updated_at: None,
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn freshness_suffix_empty_without_timestamp() {
+        let m = RankableMemory {
+            memory_id: "m".into(),
+            content: "x".into(),
+            memory_type: "semantic".into(),
+            retrieval_score: None,
+            trust_tier: None,
+            observed_at: None,
+            updated_at: None,
+            session_id: None,
+        };
+        assert!(m.freshness_suffix().is_empty());
+    }
+
+    #[test]
+    fn freshness_suffix_empty_within_one_day() {
+        let today = chrono_like_today();
+        let m = mem_with_observed("m", &today, Some("T3"));
+        assert_eq!(m.freshness_suffix(), "");
+    }
+
+    #[test]
+    fn freshness_suffix_reports_this_week_under_7_days() {
+        // 5 days ago → within-week bucket, no exact day count (cache-stable).
+        let ts = chrono_like_days_ago(5);
+        let m = mem_with_observed("m", &ts, Some("T3"));
+        assert_eq!(m.freshness_suffix(), " (this week)");
+    }
+
+    #[test]
+    fn freshness_suffix_stale_past_half_life() {
+        // 120 days ago — past T3's 60-day half-life → stale/verify.
+        let ts = chrono_like_days_ago(120);
+        let m = mem_with_observed("m", &ts, Some("T3"));
+        assert_eq!(m.freshness_suffix(), " (stale — verify first)");
+    }
+
+    #[test]
+    fn freshness_suffix_respects_trust_tier_half_life() {
+        // 100 days ago. T1 (365d half-life) → mid bucket; T4 (30d) → stale.
+        let ts = chrono_like_days_ago(100);
+        let t1 = mem_with_observed("m", &ts, Some("T1"));
+        let t4 = mem_with_observed("m", &ts, Some("T4"));
+        assert!(!t1.freshness_suffix().contains("stale"));
+        assert_eq!(t4.freshness_suffix(), " (stale — verify first)");
+    }
+
+    #[test]
+    fn freshness_suffix_is_bucket_stable_across_days() {
+        // Two timestamps within the same bucket must render identical
+        // bytes. Day 2 and day 6 are both "this week" under T3.
+        let ts_a = chrono_like_days_ago(2);
+        let ts_b = chrono_like_days_ago(6);
+        let a = mem_with_observed("m", &ts_a, Some("T3"));
+        let b = mem_with_observed("m", &ts_b, Some("T3"));
+        assert_eq!(
+            a.freshness_suffix(),
+            b.freshness_suffix(),
+            "day-2 and day-6 must share the `this week` bucket"
+        );
+    }
+
+    #[test]
+    fn freshness_suffix_includes_no_exact_day_count() {
+        // Regression: no suffix may include a raw day number — that was
+        // the cache-churn source the bucket scheme replaced.
+        for d in [2_i64, 5, 10, 30, 100, 365, 1000] {
+            let ts = chrono_like_days_ago(d);
+            let m = mem_with_observed("m", &ts, Some("T1"));
+            let s = m.freshness_suffix();
+            assert!(
+                !s.chars().any(|c| c.is_ascii_digit()),
+                "suffix must be digit-free for day={d}: {s:?}"
+            );
+        }
+    }
+
+    fn chrono_like_today() -> String {
+        format_iso_days_ago(0)
+    }
+
+    fn chrono_like_days_ago(days: i64) -> String {
+        format_iso_days_ago(days)
+    }
+
+    fn format_iso_days_ago(days: i64) -> String {
+        // Produce a YYYY-MM-DD timestamp `days` days before today in UTC.
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let total_days = secs / 86_400 - days;
+        let (y, m, d) = civil_from_days(total_days);
+        format!("{y:04}-{m:02}-{d:02}T00:00:00Z")
+    }
+
+    /// Inverse of `days_from_civil` — needed only by tests.
+    fn civil_from_days(days: i64) -> (i32, u32, u32) {
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = (z - era * 146_097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+        let y = if m <= 2 { y + 1 } else { y };
+        (y as i32, m, d)
+    }
 
     #[test]
     fn sort_descends_by_server_score() {
@@ -167,6 +405,9 @@ mod tests {
                 memory_type: "semantic".into(),
                 retrieval_score: Some(f64::NAN),
                 trust_tier: None,
+                observed_at: None,
+                updated_at: None,
+                session_id: None,
             },
             mk("ok", 0.5, Some("T1"), "semantic"),
             RankableMemory {
@@ -175,6 +416,9 @@ mod tests {
                 memory_type: "semantic".into(),
                 retrieval_score: None,
                 trust_tier: None,
+                observed_at: None,
+                updated_at: None,
+                session_id: None,
             },
         ];
         sort_by_retrieval_score(&mut mems);

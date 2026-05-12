@@ -6,16 +6,14 @@
 //! restore_session(session_id)
 //!   ├─ 1. Pull workspace metadata (local → fallback to MatrixOne)
 //!   ├─ 2. Pull events (agent_events → reconstruct turn_count, recent_tools)
-//!   ├─ 3. Pull learning state (learning_snapshots → merge into pipeline modules)
-//!   ├─ 4. Pull checkpoints (session_checkpoints → optional rewind target)
-//!   └─ 5. Return RestoredSession for the REPL to continue
+//!   ├─ 3. Pull checkpoints (session_checkpoints → optional rewind target)
+//!   └─ 4. Return RestoredSession for the REPL to continue
 //! ```
 //!
 //! The restore is local-first: tries local files first, falls back to MatrixOne
 //! for data that may have been created on a different device.
 
 use astra_core::is_duplicate_key_error;
-use astra_turn_types::continuity::ContinuityState;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -45,8 +43,6 @@ pub struct RestoredSession {
     pub total_tokens_out: u64,
     /// Recently used tools (for context carry-forward).
     pub recent_tools: Vec<String>,
-    /// Learning snapshot JSON (for pipeline module merge).
-    pub learning_snapshot_json: Option<String>,
     /// Number of checkpoints available.
     pub checkpoint_count: u32,
     /// Status of the session when last active.
@@ -77,9 +73,6 @@ pub struct RestoredSession {
     /// Serialized context pipeline state (stats + latches + recovery).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_state: Option<serde_json::Value>,
-    /// Validated runtime-owned continuity state restored from a heavy checkpoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continuity_state: Option<astra_turn_types::continuity::ContinuityState>,
     /// Active plan being executed (JSON-serialized TaskPlan).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executing_plan_json: Option<String>,
@@ -122,9 +115,6 @@ pub struct CloudHeavyCheckpointState {
     pub interruption: Option<serde_json::Value>,
     pub compaction_state: Option<serde_json::Value>,
     pub pipeline_state: Option<serde_json::Value>,
-    /// Already-validated and deserialized continuity state. Avoids double-parse
-    /// (validate_restored_continuity_state → downstream restore).
-    pub continuity_state: Option<ContinuityState>,
 }
 
 /// A restored checkpoint entry (lightweight, for listing).
@@ -237,7 +227,7 @@ impl HybridRestoreService {
         use sqlx::Row;
 
         let row = sqlx::query(
-            "SELECT user_id, content_json \
+            "SELECT content_json \
              FROM session_artifacts \
              WHERE session_id = ? AND artifact_kind = ? \
              ORDER BY created_at DESC LIMIT 1",
@@ -258,9 +248,8 @@ impl HybridRestoreService {
         let metadata =
             serde_json::from_str::<super::session_workspace::WorkspaceMetadata>(&metadata_json)
                 .map_err(|e| format!("restore_cloud_workspace: {e}"))?;
-        let user_id: String = row.try_get("user_id").unwrap_or_default();
 
-        Ok(Some(CloudWorkspaceArtifact { metadata, user_id }))
+        Ok(Some(CloudWorkspaceArtifact { metadata }))
     }
 
     async fn restore_cloud_composite_snapshot_index(
@@ -334,7 +323,6 @@ impl HybridRestoreService {
         match row {
             Some(row) => {
                 use sqlx::Row;
-                let user_id: String = row.try_get("user_id").unwrap_or_default();
                 let status: String = row.try_get("status").unwrap_or_default();
                 let title: Option<String> = row.try_get("title").ok().flatten();
                 let turn_count: i64 = row.try_get("turn_count").unwrap_or(0);
@@ -378,14 +366,6 @@ impl HybridRestoreService {
                 }
                 let latest_model: Option<String> = row.try_get("latest_model").ok().flatten();
                 let model = metadata_state.model.clone().or(latest_model);
-                let learning_snapshot_json = if user_id.is_empty() {
-                    None
-                } else {
-                    self.restore_learning(&user_id, "default")
-                        .await
-                        .ok()
-                        .flatten()
-                };
 
                 // Load active contract from task_contracts table
                 let mut contract_json = Self::load_cloud_contract(pool, session_id)
@@ -412,7 +392,6 @@ impl HybridRestoreService {
                     title,
                     restored_from_cloud: true,
                     recent_tools,
-                    learning_snapshot_json,
                     checkpoint_count: checkpoint_count.max(0) as u32,
                     git_branch: metadata_state.git_branch.clone(),
                     model,
@@ -436,9 +415,6 @@ impl HybridRestoreService {
                     pipeline_state: heavy_state
                         .as_ref()
                         .and_then(|heavy| heavy.pipeline_state.clone()),
-                    continuity_state: heavy_state
-                        .as_ref()
-                        .and_then(|heavy| heavy.continuity_state.clone()),
                     executing_plan_json: metadata_state.executing_plan_json,
                     plan_goal: metadata_state.plan_goal,
                     plan_config_json: metadata_state.plan_config_json,
@@ -601,40 +577,6 @@ impl HybridRestoreService {
                 .flatten()
                 .and_then(|meta| serde_json::from_str(&meta).ok())
         }))
-    }
-
-    /// Pull learning snapshot from MatrixOne.
-    async fn restore_learning(
-        &self,
-        user_id: &str,
-        profile: &str,
-    ) -> Result<Option<String>, String> {
-        let pool = match &self.pool {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-
-        let row = sqlx::query(
-            "SELECT snapshot_json FROM learning_snapshots \
-             WHERE user_id = ? AND profile_name = ? \
-             ORDER BY updated_at DESC LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(profile)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| format!("restore_learning: {e}"))?;
-
-        match row {
-            Some(row) => {
-                use sqlx::Row;
-                let json: String = row
-                    .try_get("snapshot_json")
-                    .map_err(|e| format!("decode learning: {e}"))?;
-                Ok(Some(json))
-            }
-            None => Ok(None),
-        }
     }
 
     async fn restore_latest_heavy_checkpoint_state(
@@ -863,7 +805,6 @@ struct LocalJournalSummary {
 #[derive(Debug, Clone)]
 struct CloudWorkspaceArtifact {
     metadata: super::session_workspace::WorkspaceMetadata,
-    user_id: String,
 }
 
 fn summarize_local_journal(session_id: &str) -> Option<LocalJournalSummary> {
@@ -925,7 +866,6 @@ fn restored_session_from_workspace(
     ws: super::session_workspace::WorkspaceMetadata,
     local_journal: Option<&LocalJournalSummary>,
     recent_tools: Vec<String>,
-    learning_snapshot_json: Option<String>,
     checkpoint_count: u32,
     restored_from_cloud: bool,
 ) -> RestoredSession {
@@ -945,7 +885,6 @@ fn restored_session_from_workspace(
         total_tokens_in,
         total_tokens_out,
         recent_tools,
-        learning_snapshot_json,
         checkpoint_count,
         last_status: ws.status,
         git_branch: ws.git_branch,
@@ -973,7 +912,6 @@ fn cloud_heavy_payload(root: &serde_json::Value) -> Option<&serde_json::Value> {
         || root.get("approval_overrides").is_some()
         || root.get("interruption").is_some()
         || root.get("compaction_state").is_some()
-        || root.get("continuity_state").is_some()
     {
         return Some(root);
     }
@@ -992,17 +930,6 @@ pub fn parse_cloud_heavy_checkpoint_state(
     };
     let Some(heavy) = cloud_heavy_payload(&root) else {
         return Ok(None);
-    };
-    let continuity_state = heavy
-        .get("continuity_state")
-        .cloned()
-        .filter(|v| !v.is_null());
-    let continuity_state = match validate_restored_continuity_state(continuity_state) {
-        Ok(continuity_state) => continuity_state,
-        Err(error) => {
-            tracing::debug!(error = %error, "dropping invalid continuity_state from cloud checkpoint");
-            None
-        }
     };
     Ok(Some(CloudHeavyCheckpointState {
         messages: heavy
@@ -1031,26 +958,7 @@ pub fn parse_cloud_heavy_checkpoint_state(
             .get("pipeline_state")
             .cloned()
             .filter(|v| !v.is_null()),
-        continuity_state,
     }))
-}
-
-fn validate_restored_continuity_state(
-    continuity_state: Option<serde_json::Value>,
-) -> Result<Option<ContinuityState>, String> {
-    let Some(value) = continuity_state else {
-        return Ok(None);
-    };
-    astra_turn_types::continuity::try_from_checkpoint_value(&value)
-        .map(Some)
-        .map_err(|e| {
-            let error = e.to_string();
-            tracing::warn!(
-                error = %error,
-                "continuity_state blob rejected at cloud restore"
-            );
-            error
-        })
 }
 
 #[async_trait]
@@ -1075,12 +983,6 @@ impl SessionRestoreService for HybridRestoreService {
                 recent_tools = summary.recent_tools.clone();
             }
 
-            // Try local learning file
-            let learning = self
-                .restore_learning("local", "default")
-                .await
-                .unwrap_or(None);
-
             let ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
                 .map(|v| v.len() as u32)
                 .unwrap_or(0);
@@ -1089,7 +991,6 @@ impl SessionRestoreService for HybridRestoreService {
                 ws,
                 local_journal.as_ref(),
                 recent_tools,
-                learning,
                 ckpt_count,
                 false,
             )));
@@ -1110,13 +1011,6 @@ impl SessionRestoreService for HybridRestoreService {
                 recent_tools = summary.recent_tools.clone();
             }
 
-            let learning = if ws.user_id.is_empty() {
-                None
-            } else {
-                self.restore_learning(&ws.user_id, "default")
-                    .await
-                    .unwrap_or(None)
-            };
             let local_ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
                 .map(|v| v.len() as u32)
                 .unwrap_or(0);
@@ -1130,17 +1024,12 @@ impl SessionRestoreService for HybridRestoreService {
                 ws.metadata,
                 local_journal.as_ref(),
                 recent_tools,
-                learning,
                 cloud_ckpt_count.max(local_ckpt_count),
                 true,
             )));
         }
 
         if let Some(summary) = local_journal {
-            let learning = self
-                .restore_learning("local", "default")
-                .await
-                .unwrap_or(None);
             let ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
                 .map(|v| v.len() as u32)
                 .unwrap_or(0);
@@ -1151,7 +1040,6 @@ impl SessionRestoreService for HybridRestoreService {
                 total_tokens_in: summary.total_tokens_in,
                 total_tokens_out: summary.total_tokens_out,
                 recent_tools: summary.recent_tools,
-                learning_snapshot_json: learning,
                 checkpoint_count: ckpt_count,
                 last_status: summary.last_status,
                 model: summary.model,
@@ -2000,7 +1888,6 @@ mod tests {
         let s = RestoredSession::default();
         assert_eq!(s.turn_count, 0);
         assert!(s.recent_tools.is_empty());
-        assert!(s.learning_snapshot_json.is_none());
         assert!(!s.restored_from_cloud);
         assert!(s.last_context_trace.is_none());
     }
@@ -2013,7 +1900,6 @@ mod tests {
             total_tokens_in: 5000,
             total_tokens_out: 3000,
             recent_tools: vec!["git_status".into(), "grep".into()],
-            learning_snapshot_json: Some("{\"entities\":[]}".into()),
             checkpoint_count: 3,
             last_status: "active".into(),
             git_branch: Some("main".into()),
@@ -2284,7 +2170,6 @@ mod tests {
             total_tokens_in: 100_000,
             total_tokens_out: 80_000,
             recent_tools: vec!["bash".into(), "grep".into(), "read_file".into()],
-            learning_snapshot_json: Some(r#"{"entities":["Rust","MatrixOne"]}"#.into()),
             checkpoint_count: 5,
             last_status: "active".into(),
             git_branch: Some("feature/resume".into()),
@@ -2301,7 +2186,6 @@ mod tests {
         assert_eq!(loaded.total_tokens_in, 100_000);
         assert_eq!(loaded.total_tokens_out, 80_000);
         assert_eq!(loaded.recent_tools.len(), 3);
-        assert!(loaded.learning_snapshot_json.is_some());
         assert_eq!(loaded.checkpoint_count, 5);
         assert_eq!(loaded.last_status, "active");
         assert_eq!(loaded.git_branch.as_deref(), Some("feature/resume"));
@@ -2321,7 +2205,6 @@ mod tests {
             ..Default::default()
         };
         assert!(s.recent_tools.is_empty());
-        assert!(s.learning_snapshot_json.is_none());
         assert!(s.git_branch.is_none());
         assert!(s.model.is_none());
         assert!(s.title.is_none());
@@ -2331,13 +2214,6 @@ mod tests {
     }
 
     // ── HybridRestoreService local_only behavior ──
-
-    #[tokio::test]
-    async fn local_only_learning_restore_returns_none() {
-        let svc = HybridRestoreService::local_only();
-        let result = svc.restore_learning("user1", "default").await.unwrap();
-        assert!(result.is_none());
-    }
 
     #[tokio::test]
     async fn local_only_recent_tools_returns_empty() {
@@ -2627,11 +2503,8 @@ mod tests {
 
     #[test]
     fn restored_session_null_optional_fields() {
-        let json = minimal_session_json(
-            r#""learning_snapshot_json":null,"git_branch":null,"model":null,"title":null"#,
-        );
+        let json = minimal_session_json(r#""git_branch":null,"model":null,"title":null"#);
         let s: RestoredSession = serde_json::from_str(&json).unwrap();
-        assert!(s.learning_snapshot_json.is_none());
         assert!(s.git_branch.is_none());
         assert!(s.model.is_none());
         assert!(s.title.is_none());
@@ -2808,29 +2681,6 @@ mod tests {
         let approval_overrides = serde_json::json!({"rules": []});
         let interruption = serde_json::json!({"kind":"rate_limited"});
         let compaction_state = serde_json::json!({"attempt_count": 2});
-        let continuity_state = serde_json::json!({
-            "goal": {"text": "continue durable todo"},
-            "todos": {"items": []},
-            "facts": {
-                "active_files": [],
-                "recent_tool_calls": [],
-                "plan_state": null,
-                "blocked_tools": [],
-                "error_state": {
-                    "total_errors": 0,
-                    "last_error": null,
-                    "last_error_turn": null
-                },
-                "turn": 0,
-                "estimated_tokens": 0
-            },
-            "user_corrections": [],
-            "verification": {
-                "last_status": null,
-                "last_evidence": null,
-                "last_turn": null
-            }
-        });
         let expected = CloudHeavyCheckpointState {
             messages: messages.clone(),
             blocked_tools: vec!["bash".into()],
@@ -2839,10 +2689,6 @@ mod tests {
             interruption: Some(interruption.clone()),
             compaction_state: Some(compaction_state.clone()),
             pipeline_state: None,
-            continuity_state: astra_turn_types::continuity::try_from_checkpoint_value(
-                &continuity_state,
-            )
-            .ok(),
         };
         let tagged = serde_json::json!({
             "Heavy": {
@@ -2852,8 +2698,7 @@ mod tests {
                 "recent_tools": ["rg"],
                 "approval_overrides": approval_overrides,
                 "interruption": interruption,
-                "compaction_state": compaction_state,
-                "continuity_state": continuity_state
+                "compaction_state": compaction_state
             }
         })
         .to_string();
@@ -2863,8 +2708,7 @@ mod tests {
             "recent_tools": expected.recent_tools.clone(),
             "approval_overrides": expected.approval_overrides.clone(),
             "interruption": expected.interruption.clone(),
-            "compaction_state": expected.compaction_state.clone(),
-            "continuity_state": expected.continuity_state.clone()
+            "compaction_state": expected.compaction_state.clone()
         })
         .to_string();
 
@@ -2876,29 +2720,6 @@ mod tests {
             parse_cloud_heavy_checkpoint_state(&legacy),
             Ok(Some(expected))
         );
-    }
-
-    #[test]
-    fn parse_cloud_heavy_checkpoint_state_drops_bad_continuity_state() {
-        let tagged = serde_json::json!({
-            "Heavy": {
-                "messages": [{"role": "user", "content": "hi"}],
-                "continuity_state": {
-                    "goal": {"text": "x"},
-                    "todos": "not-an-object",
-                    "facts": {},
-                    "user_corrections": [],
-                    "verification": {}
-                }
-            }
-        })
-        .to_string();
-
-        let restored = parse_cloud_heavy_checkpoint_state(&tagged)
-            .unwrap()
-            .expect("heavy payload should still restore");
-        assert_eq!(restored.messages.len(), 1);
-        assert!(restored.continuity_state.is_none());
     }
 
     #[test]

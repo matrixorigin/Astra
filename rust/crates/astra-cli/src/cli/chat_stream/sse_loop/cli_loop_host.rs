@@ -16,22 +16,19 @@ use astra_runtime::{
     tool_selector::ToolSelector,
     turn::agentic_headless_round::HeadlessStderrStyle,
     turn::agentic_loop_host::{
-        AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult,
-        HostTurnResult, TurnInteractionMode, interaction_scoped_tool_restrictions,
+        AgenticLoopHost, AgenticLoopState, HostTurnResult, TurnInteractionMode,
+        interaction_scoped_tool_restrictions,
     },
-    turn::chat_turn_api_error::CHAT_TURN_POST_MAX_RETRIES,
-    turn::chat_turn_payload::{ChatTurnBasePayloadInput, chat_turn_base_payload},
 };
 use async_trait::async_trait;
 use crossterm::style::Stylize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::{
     ExplainMode,
     edge_tools::ToolExecutor,
-    effects::ChatTurnPrepLineGuard,
     permission_manager::{PermissionManager, PermissionMode},
-    stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse},
+    stream_render::RenderPolicy,
 };
 
 use super::agentic_loop_turn::{
@@ -358,6 +355,61 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             self.token = refreshed_token;
         }
 
+        // ─── Injection-freshness observation (post-turn) ────────────────────
+        // wip-7: split observation across two input lanes.
+        //   1. CLI-owned raw text for channels the CLI authoritatively
+        //      knows (lessons from session_lessons_snapshot, self_awareness
+        //      from build_self_model_snapshot). These fingerprint with a
+        //      full preview so introspect can render the first 80 chars.
+        //   2. Bridge-supplied opaque fingerprints for the 5 bridge-internal
+        //      channels (memoria_prefetch, feedback_rules, implicit_feedback,
+        //      tool_round_guidance, volatile_pending) and the 3 CLI-visible
+        //      channels the bridge echoes (memoria_insights, recent_arg_hints,
+        //      skill_listing) whose source strings the CLI doesn't have
+        //      trivial post-turn access to. Wire carries only
+        //      hash+bytes+is_empty — no raw text leaves the bridge.
+        //
+        // If the bridge's `injection_freshness` SSE event was missing
+        // (`bridge_injection_fingerprints` is None), the bridge-internal
+        // channels are NOT defaulted to empty — they stay Untracked so
+        // the freshness report surfaces the broken pipe rather than
+        // hiding it behind uniformly-"empty" entries.
+        //
+        // `lessons_text` is recomputed here (cheap — `session_lessons_snapshot`
+        // is an Arc clone) rather than threaded from `prepare_chat_turn_payload`
+        // to avoid widening the prepare/fetch signature. The fingerprint uses
+        // `LessonKind::as_str()` (stable snake_case DB tag), NOT `Debug`, so
+        // enum-variant renames do not flip every channel from Stale→Fresh.
+        if let Some(session_lock) = &self.executor.observability_session {
+            let lessons_text = self
+                .executor
+                .session_lessons_snapshot()
+                .iter()
+                .map(|l| format!("{}:{}:{}", l.kind.as_str(), l.trigger_signal, l.action))
+                .collect::<Vec<_>>()
+                .join("|");
+            // Rebuild the self-awareness section off the same
+            // SelfModel snapshot the CLI injects into edge_profile so
+            // the fingerprint matches the bytes the model saw.
+            let self_awareness_text = self
+                .executor
+                .build_self_model_snapshot()
+                .filter(|m| m.has_meaningful_self_awareness())
+                .map(|m| m.to_system_prompt_section())
+                .unwrap_or_default();
+            let bridge_fps = turn_result.core.bridge_injection_fingerprints.as_ref();
+            if let Ok(mut session) = session_lock.write() {
+                session.observe_bridge_injections_partial(
+                    astra_runtime::observability_integration::BridgeInjectionTexts {
+                        lessons: &lessons_text,
+                        self_awareness: &self_awareness_text,
+                        ..astra_runtime::observability_integration::BridgeInjectionTexts::EMPTY
+                    },
+                    bridge_fps,
+                );
+            }
+        }
+
         // Update introspect snapshot so the `introspect` tool returns fresh
         // data if the model calls it on a subsequent round this turn.
         let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
@@ -446,95 +498,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             edge_tool_round: turn_result.edge_tool_round,
             error_kind: None,
         })
-    }
-
-    fn supports_auto_reflection(&self) -> bool {
-        true
-    }
-
-    async fn execute_reflection(
-        &mut self,
-        state: &mut AgenticLoopState,
-        request: HostReflectionRequest<'_>,
-    ) -> Result<Option<HostReflectionResult>, astra_core::ClassifiedError> {
-        let effective_model = state.skills.model_override.as_deref().or(self.model);
-        let reflection_messages = vec![
-            json!({"role": "system", "content": request.system_prompt}),
-            json!({"role": "user", "content": request.user_prompt}),
-        ];
-
-        let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
-            messages: &reflection_messages,
-            session_id: state.current_session_id.as_deref(),
-            agent_id: Some("astra-cli-reflect"),
-            model: effective_model,
-            explain_verbose: false,
-            explain_on: false,
-            edge_executor_id: "auto-reflection",
-            capabilities: astra_thin_client::builtin_capability_preset(),
-            project_root: self.project_root.as_path(),
-            git_branch: None,
-            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
-        });
-        if let Some(max_tokens) = request.max_output_tokens {
-            payload["max_tokens"] = json!(max_tokens);
-        }
-
-        let resp = self
-            .api
-            .post_chat_turn_retry_429(&self.token, &payload, CHAT_TURN_POST_MAX_RETRIES, true)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            return Err(format!("auto-reflection API error {status}: {body}").into());
-        }
-
-        let prep_line = ChatTurnPrepLineGuard::maybe_start(false, None);
-        let turn = consume_turn_sse(
-            prep_line,
-            resp,
-            false,
-            self.term_width,
-            RenderPolicy::Silent,
-            Some(EdgeSseContext {
-                api: self.api,
-                token: &self.token,
-                executor_id: "auto-reflection",
-                executor: Arc::clone(&self.executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: Some(self.perm_manager),
-                cancel_token: state.cancellation.token.as_deref(),
-                stream_event_tx: None,
-                approval_request_tx: None,
-                skill_resolver: None,
-                skill_continuation: false,
-                turn_rollback_on_failure: false,
-                tool_cache: &mut self.tool_cache,
-                observability_hub: None,
-            }),
-            0,
-            self.auth_profile,
-            state.cancellation.token.as_deref(),
-        )
-        .await;
-
-        if turn.core.has_tool_calls {
-            return Err("auto-reflection unexpectedly returned tool calls"
-                .to_string()
-                .into());
-        }
-
-        Ok(Some(HostReflectionResult {
-            full_text: turn.core.full_text.trim().to_string(),
-            prompt_tokens: turn.core.prompt_tokens,
-            completion_tokens: turn.core.completion_tokens,
-            cache_read_tokens: turn.core.cache_read_tokens,
-            cache_creation_tokens: turn.core.cache_creation_tokens,
-            has_usage: turn.core.has_usage,
-        }))
     }
 
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String) {

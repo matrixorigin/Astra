@@ -161,9 +161,12 @@ pub fn build_memory_prompt(mode: MemoryPromptMode) -> String {
 }
 
 const MINIMAL_RULES: &str = "\
-When user expresses a preference, decision, or fact worth remembering → call memory_store IMMEDIATELY.\n\
-- Do NOT ask whether to store — just store, then confirm.\n\
-- Do NOT explore codebase for interest expressions.\n";
+Store only when the user states a durable preference, correction, decision, \
+or project fact you will want in a future conversation.\n\
+- Favor *false negatives*: not storing a marginal memory is cheaper than storing noise.\n\
+- Do NOT ask permission before storing a clearly durable fact — just call `memory(action=remember, ...)`.\n\
+- Do NOT store ephemeral state (\"currently on line 42\", \"just ran the test\").\n\
+- Do NOT explore the codebase to fabricate reasons to store.\n";
 
 const TYPES_SECTION: &str = "\
 <types>
@@ -222,12 +225,22 @@ const TYPES_SECTION: &str = "\
 </types>
 
 ### Storage rules
-- Do NOT ask whether to store — just store, then confirm.
-- Do NOT explore codebase for interest expressions.
-- Before storing, check if a similar memory exists. Use memory_correct to update instead of duplicating.
-- Negative preferences (\"不喜欢\", \"don't want\", \"stop using\") → store and respect in future decisions.
-- If a memory seems outdated, correct it rather than storing a new one.
-- '## User Memories' (when present) = user context — check it BEFORE calling any tool.\n";
+- Store only when the user made the content durable: an explicit preference, correction, \
+decision, or fact that matters beyond the current turn. When in doubt, don't store — \
+silence is cheaper than noise.
+- Do NOT ask permission to store a clearly durable fact — the runtime's conflict gate will \
+surface near-duplicates. Just call `memory(action=remember, ...)`.
+- If the gate redirects you to an existing memory, follow the redirect: call \
+`memory(action=update, memory_id=..., reason=...)` instead of writing a duplicate.
+- Negative preferences (\"不喜欢\", \"don't want\", \"stop using\") count as durable \
+corrections — store them and respect in future decisions.
+- If a recalled memory seems outdated, call `memory(action=update, ...)` with the \
+corrected content and a reason that names what changed; never silently ignore.
+- Destructive ops (`forget`, `update`) REQUIRE a non-empty `reason` string — the runtime \
+rejects them without one, so state your why up front for the audit trail.
+- `<session_memory>` and '## User Memories' (when present) = cross-session context — \
+scan them BEFORE calling any tool; respect `(stale — verify first)` suffixes by \
+checking the claim against current state first.\n";
 
 const WHAT_NOT_TO_SAVE: &str = "\
 ### What NOT to save
@@ -247,10 +260,17 @@ const WHEN_TO_ACCESS: &str = "\
 
 const BEFORE_RECOMMENDING: &str = "\
 ### Before recommending from memory
-A memory is a claim about what was true *when it was written*. Before acting on it:
-- If it names a file path: check the file exists.
+A memory is a claim about what was true *when it was written*. Freshness hints \
+(`(this week)`, `(within the month)`, `(within the year)`, `(stale — verify first)`) \
+appear on each memory in the `<session_memory>` block — respect them:
+
+- If it names a file path: check the file exists before citing it.
 - If it names a function or flag: grep for it.
-- If a memory conflicts with current state: trust what you observe now.\n";
+- If the suffix says `stale — verify first` (past the tier half-life) OR the memory \
+  conflicts with current state: trust what you observe now and call \
+  `memory(action=update, memory_id=..., content=...)` to correct the stale record.
+- A memory that cites `[project]` or `[episode]` content is a snapshot of past work; \
+  prefer `git log` / reading current files for anything about *current* repo state.\n";
 
 #[cfg(test)]
 mod tests {
@@ -503,7 +523,10 @@ mod tests {
     #[test]
     fn full_mode_has_deduplication_rule() {
         let prompt = build_memory_prompt(MemoryPromptMode::Full);
-        assert!(prompt.contains("memory_correct"));
+        assert!(
+            prompt.contains("memory(action=update"),
+            "prompt must mention memory(action=update ...) as the refinement path"
+        );
     }
 
     #[test]
@@ -515,5 +538,48 @@ mod tests {
     #[test]
     fn all_categories_count() {
         assert_eq!(MemoryCategory::ALL.len(), 6);
+    }
+
+    /// P10 regression: the prompt must not tell the model to "just store,
+    /// then confirm". That phrasing contradicted the explicit-save gate
+    /// and caused over-saving.
+    #[test]
+    fn full_mode_no_unconditional_store_phrase() {
+        let prompt = build_memory_prompt(MemoryPromptMode::Full);
+        assert!(
+            !prompt.contains("just store, then confirm"),
+            "prompt must not push unconditional stores — it should guide \
+             the model to save only when durable"
+        );
+    }
+
+    #[test]
+    fn full_mode_surfaces_false_negative_preference() {
+        let prompt = build_memory_prompt(MemoryPromptMode::Full);
+        assert!(
+            prompt.contains("false negatives") || prompt.contains("silence is cheaper"),
+            "prompt must tell the model to prefer not-storing when marginal"
+        );
+    }
+
+    #[test]
+    fn full_mode_surfaces_reason_required_on_destructive_ops() {
+        let prompt = build_memory_prompt(MemoryPromptMode::Full);
+        assert!(
+            prompt.contains("reason"),
+            "prompt must explain that destructive ops require a reason"
+        );
+    }
+
+    #[test]
+    fn full_mode_uses_new_freshness_vocabulary() {
+        let prompt = build_memory_prompt(MemoryPromptMode::Full);
+        // The old "(N days ago)" label was replaced by bucketed labels
+        // in P5; the prompt must reflect the new vocabulary.
+        assert!(prompt.contains("stale — verify first"));
+        assert!(
+            !prompt.contains("(N days ago)"),
+            "prompt must not reference the retired exact-day freshness label"
+        );
     }
 }

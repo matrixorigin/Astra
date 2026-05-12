@@ -77,6 +77,8 @@ mod command_registry;
 mod command_router;
 #[path = "cli/command_usage.rs"]
 mod command_usage;
+#[path = "cli/context_dump.rs"]
+mod context_dump;
 #[path = "cli/context_references.rs"]
 mod context_references;
 
@@ -296,7 +298,6 @@ use plan_monitor::{
     sync_plan_run_task_progress,
 };
 pub(crate) use plan_monitor::{format_duration_short, format_plan_progress};
-pub(crate) use plan_runtime::build_learning_bridge;
 use plan_runtime::start_and_monitor_plan;
 pub(crate) use repl_state::{ExplainMode, ReplState, SkillDevState};
 
@@ -307,9 +308,8 @@ pub(crate) use repl_state::{ExplainMode, ReplState, SkillDevState};
 
 pub(crate) use cloud_sync::post_auth_cloud_resync;
 use cloud_sync::{
-    append_cloud_pull_sync_journal, merge_learning_snapshot, try_cloud_pull,
-    try_cloud_pull_preferences, try_cloud_push_delta, try_cloud_push_preferences,
-    try_cloud_push_versioned,
+    append_cloud_pull_sync_journal, try_cloud_pull, try_cloud_pull_preferences,
+    try_cloud_push_preferences,
 };
 
 // ═══════════════════════════════════════════════════════ Task Commands ════
@@ -392,8 +392,7 @@ async fn run_chat_repl(
 
     let repl_startup::ReplStartupArtifacts {
         selector,
-        pipeline_modules,
-        profile_name_str,
+        pipeline_modules: _pipeline_modules,
         mut edge_heartbeat_task,
         skill_quality_path,
         pinned_skills_path,
@@ -573,15 +572,6 @@ async fn run_chat_repl(
                         if should_exit {
                             break ReplExit::Command;
                         }
-                        // Merge learning snapshot if /resume deposited one
-                        if let Some(json) = state.learning_snapshot.take() {
-                            merge_learning_snapshot(
-                                &json,
-                                &pipeline_modules.entity_graph,
-                                &pipeline_modules.pattern_library,
-                                &pipeline_modules.calibrator,
-                            );
-                        }
 
                         // /ask (and future slash commands) can queue a message for
                         // immediate dispatch — send it as if the user typed it.
@@ -635,14 +625,6 @@ async fn run_chat_repl(
                                 .await?;
                                 if should_exit {
                                     break ReplExit::Command;
-                                }
-                                if let Some(json) = state.learning_snapshot.take() {
-                                    merge_learning_snapshot(
-                                        &json,
-                                        &pipeline_modules.entity_graph,
-                                        &pipeline_modules.pattern_library,
-                                        &pipeline_modules.calibrator,
-                                    );
                                 }
                                 if state.executing_plan.is_some() && state.plan_mode.is_none() {
                                     start_and_monitor_plan(
@@ -858,46 +840,6 @@ async fn run_chat_repl(
                             update_panic_guard(sid, state.turn);
                         }
 
-                        // Periodic learning sync: push to cloud at checkpoint boundaries
-                        // to prevent data loss on crash (every CHECKPOINT_INTERVAL turns)
-                        if state.matrix_runtime.is_some()
-                            && state.turn > 0
-                            && state.turn.is_multiple_of(
-                                astra_services::session_checkpoint::CHECKPOINT_INTERVAL,
-                            )
-                        {
-                            // Use delta push at checkpoints to reduce sync bandwidth.
-                            // Final session-end sync still uses full push for convergence.
-                            if let Some(new_version) = try_cloud_push_delta(
-                                &profile_name_str,
-                                &pipeline_modules.entity_graph,
-                                &pipeline_modules.pattern_library,
-                                &pipeline_modules.calibrator,
-                                &state.tool_health_entries,
-                                &mut state.synced_tool_health_entries,
-                                state.cloud_learning_version,
-                            )
-                            .await
-                            {
-                                state.cloud_learning_version = Some(new_version);
-                                // Update orchestrator envelope to reflect the push
-                                if let Some(ref mc) = state.matrix_runtime {
-                                    let orch = mc.sync_orchestrator_lock().await;
-                                    if let Some(mut env) =
-                                        orch.envelope(astra_services::SyncDomain::Learning)
-                                    {
-                                        env.mark_synced(new_version as u64);
-                                        orch.update_envelope(
-                                            astra_services::SyncDomain::Learning,
-                                            env,
-                                        );
-                                    }
-                                }
-                            }
-                            // On conflict, we skip this push — the final push at session end
-                            // will resolve conflicts via pull-merge-push cycle
-                        }
-
                         // --max-budget enforcement: check accumulated cost against budget limit
                         if state.max_budget_limit > 0.0 {
                             let current_cost = slash_stats::cost_for_tokens(
@@ -1000,60 +942,15 @@ async fn run_chat_repl(
             .as_ref()
             .and_then(|t| t.lock().ok().map(|g| g.export()))
             .unwrap_or_default();
-        if let Err(e) = astra_evolution::persistence::save_learning_state_full(
+        if let Err(e) = astra_turn_core::tool_health_persistence::save_learning_state(
             profile_name,
-            &pipeline_modules.entity_graph,
-            &pipeline_modules.pattern_library,
-            &pipeline_modules.calibrator,
             &state.tool_health_entries,
             &tool_quality_entries,
-            None,
         ) {
             eprintln!(
                 "{}",
                 format!("  ⚠ Learning state not saved (will retry next session): {e}").yellow()
             );
-        }
-        // Push learning to cloud with versioned API (conflict resolution loop)
-        // On conflict: pull fresh data, merge, retry push (max 3 attempts)
-        const MAX_SYNC_RETRIES: u32 = 3;
-        let mut expected_version = state.cloud_learning_version;
-        for attempt in 0..MAX_SYNC_RETRIES {
-            if try_cloud_push_versioned(
-                profile_name,
-                &pipeline_modules.entity_graph,
-                &pipeline_modules.pattern_library,
-                &pipeline_modules.calibrator,
-                &state.tool_health_entries,
-                expected_version,
-            )
-            .await
-            .is_some()
-            {
-                // Success — done
-                break;
-            }
-            // Conflict or failure — pull fresh, merge, retry
-            if attempt + 1 < MAX_SYNC_RETRIES {
-                eprintln!("{}", "  ↻ Pulling fresh cloud state for merge...".dim());
-                let pull_result = try_cloud_pull(
-                    profile_name,
-                    &pipeline_modules.entity_graph,
-                    &pipeline_modules.pattern_library,
-                    &pipeline_modules.calibrator,
-                )
-                .await;
-                expected_version = pull_result.version;
-                // Merge tool health from cloud pull
-                if !pull_result.tool_health.is_empty() {
-                    let (merged, _, _) = astra_evolution::persistence::merge_tool_health(
-                        &state.tool_health_entries,
-                        &pull_result.tool_health,
-                    );
-                    // Update tool health in memory (though session is ending)
-                    state.tool_health_entries = merged;
-                }
-            }
         }
         // Push preferences to cloud (best-effort)
         try_cloud_push_preferences(&state).await;
@@ -1083,6 +980,36 @@ async fn main() {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
     diagnostic_log::init_cli_observability(&cli);
+    // `--settings <JSON-or-path>` must install its overlay BEFORE any
+    // code calls `RuntimeConfig::load()` — the first such call below is
+    // the safety-config apply. parse_settings_source handles inline JSON
+    // vs. filesystem path; apply_settings_json parses the JSON into a
+    // RuntimeConfig (all fields default) that `load()` will then merge
+    // with non-default-wins semantics. Malformed input aborts with a
+    // clear message instead of silently dropping the flag.
+    if let Some(raw) = cli.settings.as_deref() {
+        match astra_config::config_overlay::parse_settings_source(raw) {
+            Ok(json) => match astra_config::config_overlay::apply_settings_json(
+                astra_config::runtime_config::RuntimeConfig::default(),
+                &json,
+            ) {
+                Ok(overlay) => {
+                    astra_config::runtime_config::set_cli_overlay(Some(overlay));
+                }
+                Err(err) => {
+                    eprintln!(
+                        "{}",
+                        format!("Error: --settings JSON is invalid: {err}").red()
+                    );
+                    std::process::exit(2);
+                }
+            },
+            Err(err) => {
+                eprintln!("{}", format!("Error: --settings: {err}").red());
+                std::process::exit(2);
+            }
+        }
+    }
     // Apply safety.trust_mode from runtime config to the global guard.
     // Defaults to Strict — users must explicitly opt in via
     // `~/.astra/config/runtime.toml` [safety] trust_mode = "trusted".
@@ -1140,6 +1067,7 @@ async fn main() {
         add_dir,
         verbose,
         mcp_config,
+        settings: _settings_already_applied,
         session_id: cli_session_id,
         session_name,
         bare,
@@ -1284,6 +1212,10 @@ async fn main() {
     // Resolve model: --model flag > config default_model > None
     let resolved_model =
         cli_model.or_else(|| command_router::read_config_default_model().ok().flatten());
+
+    // Make the resolved model available to slash commands that print
+    // model-aware diagnostics without mutating the process environment.
+    slash_config::set_active_model_for_display(resolved_model.clone());
 
     let use_tui = enable_tui
         && std::io::stdin().is_terminal()
@@ -1728,7 +1660,7 @@ mod tests {
         ));
         let mut state = ReplState {
             tool_health_entries: vec![
-                astra_evolution::persistence::ToolHealthEntry {
+                astra_turn_core::tool_health_persistence::ToolHealthEntry {
                     name: "bash".into(),
                     total_calls: 15,
                     total_failures: 3,
@@ -1736,7 +1668,7 @@ mod tests {
                     last_updated_epoch: 0,
                     recent_outcomes: vec![],
                 },
-                astra_evolution::persistence::ToolHealthEntry {
+                astra_turn_core::tool_health_persistence::ToolHealthEntry {
                     name: "grep".into(),
                     total_calls: 8,
                     total_failures: 0,
@@ -1760,7 +1692,7 @@ mod tests {
             edge_tools::all_tool_schemas(),
         ));
         let mut state = ReplState {
-            tool_health_entries: vec![astra_evolution::persistence::ToolHealthEntry {
+            tool_health_entries: vec![astra_turn_core::tool_health_persistence::ToolHealthEntry {
                 name: "bash".into(),
                 total_calls: 10,
                 total_failures: 5,
@@ -2084,111 +2016,7 @@ total_tokens_out: 3
         // that the journal exists, not that the user owns it. This is a known limitation.
     }
 
-    // ── Learning snapshot restoration ────────────────────────────────────────
-
-    #[tokio::test]
-    async fn resume_restores_learning_snapshot() {
-        use astra_services::session_restore::RestoredSession;
-
-        // Create a mock RestoredSession with learning snapshot
-        let restored = RestoredSession {
-            session_id: "test-learning".into(),
-            turn_count: 5,
-            total_tokens_in: 1000,
-            total_tokens_out: 500,
-            recent_tools: vec!["grep".into()],
-            learning_snapshot_json: Some(
-                r#"{"entities":["Rust","MatrixOne"],"patterns":["*.rs"]}"#.into(),
-            ),
-            checkpoint_count: 1,
-            last_status: "active".into(),
-            git_branch: Some("main".into()),
-            model: Some("gpt-4o".into()),
-            title: Some("Test".into()),
-            restored_from_cloud: true, // Cloud restore has learning
-            ..Default::default()
-        };
-
-        // Verify the learning snapshot is present
-        assert!(restored.learning_snapshot_json.is_some());
-        let json = restored.learning_snapshot_json.as_ref().unwrap();
-        assert!(json.contains("Rust"));
-        assert!(json.contains("MatrixOne"));
-
-        // Simulate what handle_resume_command does
-        let learning_snapshot = if let Some(ref l) = restored.learning_snapshot_json {
-            if !l.is_empty() { Some(l.clone()) } else { None }
-        } else {
-            None
-        };
-
-        assert!(learning_snapshot.is_some());
-        assert_eq!(learning_snapshot.unwrap().as_str(), json);
-    }
-
-    #[tokio::test]
-    async fn resume_local_restore_has_no_learning_snapshot() {
-        use astra_services::session_restore::RestoredSession;
-
-        // Local restore should not have learning snapshot
-        let restored = RestoredSession {
-            session_id: "test-local".into(),
-            turn_count: 3,
-            total_tokens_in: 500,
-            total_tokens_out: 200,
-            recent_tools: vec![],
-            learning_snapshot_json: None, // Local restore doesn't have this
-            checkpoint_count: 1,
-            last_status: "active".into(),
-            git_branch: None,
-            model: None,
-            title: None,
-            restored_from_cloud: false,
-            ..Default::default()
-        };
-
-        assert!(restored.learning_snapshot_json.is_none());
-    }
-
     // ── Edge cases ───────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn resume_handles_empty_learning_snapshot() {
-        use astra_services::session_restore::RestoredSession;
-
-        // Empty string should be treated as None
-        let restored = RestoredSession {
-            learning_snapshot_json: Some("".into()),
-            ..Default::default()
-        };
-
-        // Simulate the logic in handle_resume_command
-        let learning_snapshot = if let Some(ref l) = restored.learning_snapshot_json {
-            if !l.is_empty() { Some(l.clone()) } else { None }
-        } else {
-            None
-        };
-
-        assert!(
-            learning_snapshot.is_none(),
-            "empty string should be ignored"
-        );
-    }
-
-    #[tokio::test]
-    async fn resume_handles_invalid_learning_json() {
-        use astra_services::session_restore::RestoredSession;
-
-        // Invalid JSON should still be stored (will fail at merge time)
-        let restored = RestoredSession {
-            learning_snapshot_json: Some("not valid json {{{".into()),
-            ..Default::default()
-        };
-
-        assert!(restored.learning_snapshot_json.is_some());
-        let json = restored.learning_snapshot_json.as_ref().unwrap();
-        assert!(json.contains("{"));
-    }
 
     #[tokio::test]
     async fn resume_handles_malformed_workspace_yaml() {
@@ -2259,71 +2087,6 @@ total_tokens_out: 3
         assert!(!result.restored_from_cloud);
     }
 
-    // ── Integration: full resume flow simulation ─────────────────────────────
-
-    #[tokio::test]
-    async fn resume_full_flow_cloud_restore() {
-        use astra_services::session_restore::RestoredSession;
-
-        // Simulate a complete cloud restore scenario
-        let restored = RestoredSession {
-            session_id: "cloud-sess-123".into(),
-            turn_count: 42,
-            total_tokens_in: 150_000,
-            total_tokens_out: 80_000,
-            recent_tools: vec!["git".into(), "bash".into(), "grep".into()],
-            learning_snapshot_json: Some(
-                r#"{"entities":["Rust","SQL"],"patterns":["*.rs"]}"#.into(),
-            ),
-            checkpoint_count: 5,
-            last_status: "active".into(),
-            git_branch: Some("feature/resume".into()),
-            model: Some("claude-3-opus".into()),
-            title: Some("Implement session resume".into()),
-            restored_from_cloud: true,
-            ..Default::default()
-        };
-        assert_eq!(restored.session_id, "cloud-sess-123");
-        assert_eq!(restored.turn_count, 42);
-        assert!(restored.restored_from_cloud);
-        assert!(restored.learning_snapshot_json.is_some());
-        assert_eq!(restored.recent_tools.len(), 3);
-
-        // Simulate state application
-        let mut state = super::ReplState::default();
-        #[allow(clippy::field_reassign_with_default)]
-        {
-            state.session_id = Some(restored.session_id.clone());
-            state.turn = restored.turn_count;
-            state.total_prompt_tokens = restored.total_tokens_in;
-            state.total_completion_tokens = restored.total_tokens_out;
-            state.recent_tools = restored.recent_tools.clone();
-            state.model = restored.model.clone();
-            if let Some(ref m) = state.model {
-                state.cached_pricing = slash_stats::fallback_pricing(m);
-                // M3: Use RuntimeConfig-driven context budget on session restore (test code)
-                state.context_budget =
-                    prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(m));
-            }
-        }
-
-        // Apply learning snapshot
-        if let Some(ref l) = restored.learning_snapshot_json
-            && !l.is_empty()
-        {
-            state.learning_snapshot = Some(l.clone());
-        }
-
-        // Verify state
-        assert_eq!(state.session_id, Some("cloud-sess-123".into()));
-        assert_eq!(state.turn, 42);
-        assert_eq!(state.total_prompt_tokens, 150_000);
-        assert_eq!(
-            state.learning_snapshot.unwrap(),
-            r#"{"entities":["Rust","SQL"],"patterns":["*.rs"]}"#
-        );
-    }
-
     // ── Checkpoint listing ───────────────────────────────────────────────────
 
     #[tokio::test]
@@ -2371,183 +2134,9 @@ total_tokens_out: 500
         assert!(ckpts.is_empty(), "no checkpoints created yet");
     }
 
-    // ── merge_learning_snapshot ───────────────────────────────────────────────
-
-    #[test]
-    fn merge_learning_valid_snapshot() {
-        use astra_pipeline::{calibration, entity, pattern};
-
-        let json = serde_json::json!({
-            "version": 1,
-            "entities": [{
-                "name": "rust",
-                "aliases": ["rs"],
-                "domain": null,
-                "associated_tools": ["cargo"],
-                "confidence": 0.8,
-                "observation_count": 5
-            }],
-            "patterns": [{
-                "signature": "cargo",
-                "tools": ["cargo"],
-                "task_type": "Code",
-                "domain": null,
-                "success_count": 3,
-                "failure_count": 0,
-                "quality_sum": 2.4
-            }],
-            "calibration": null
-        })
-        .to_string();
-
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            calibration::ProgressiveCalibrator::default(),
-        ));
-
-        merge_learning_snapshot(&json, &eg, &pl, &cal);
-
-        // Verify entity content, not just count
-        let entities = eg.lock().unwrap().export();
-        assert_eq!(entities.len(), 1);
-        let e = &entities[0];
-        assert_eq!(e.name, "rust");
-        assert_eq!(e.aliases, vec!["rs"]);
-        assert_eq!(e.associated_tools, vec!["cargo"]);
-        assert!((e.confidence - 0.8).abs() < 1e-6);
-        assert_eq!(e.observation_count, 5);
-
-        // Verify pattern content, not just count
-        let patterns = pl.lock().unwrap().export();
-        assert_eq!(patterns.len(), 1);
-        let p = &patterns[0];
-        assert_eq!(p.signature, "cargo");
-        assert_eq!(p.tools, vec!["cargo"]);
-        assert_eq!(p.success_count, 3);
-        assert_eq!(p.failure_count, 0);
-    }
-
-    #[test]
-    fn merge_learning_invalid_json_does_not_panic() {
-        use astra_pipeline::{calibration, entity, pattern};
-
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            calibration::ProgressiveCalibrator::default(),
-        ));
-
-        // Invalid JSON — should not panic, just print warning
-        merge_learning_snapshot("not valid json", &eg, &pl, &cal);
-
-        // Modules should remain empty
-        assert!(eg.lock().unwrap().export().is_empty());
-        assert!(pl.lock().unwrap().export().is_empty());
-    }
-
-    #[test]
-    fn merge_learning_empty_snapshot() {
-        use astra_pipeline::{calibration, entity, pattern};
-
-        let json = serde_json::json!({
-            "version": 1,
-            "entities": [],
-            "patterns": [],
-            "calibration": null
-        })
-        .to_string();
-
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            calibration::ProgressiveCalibrator::default(),
-        ));
-
-        merge_learning_snapshot(&json, &eg, &pl, &cal);
-
-        assert!(eg.lock().unwrap().export().is_empty());
-        assert!(pl.lock().unwrap().export().is_empty());
-    }
-
-    #[test]
-    fn merge_learning_idempotent() {
-        use astra_pipeline::{calibration, entity, pattern};
-
-        let json = serde_json::json!({
-            "version": 1,
-            "entities": [{"name": "rust", "aliases": [], "domain": null,
-                "associated_tools": ["cargo"], "confidence": 0.8, "observation_count": 5}],
-            "patterns": [{"signature": "cargo", "tools": ["cargo"], "task_type": "Code",
-                "domain": null, "success_count": 3, "failure_count": 0, "quality_sum": 2.4}],
-            "calibration": null
-        })
-        .to_string();
-
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            calibration::ProgressiveCalibrator::default(),
-        ));
-
-        // Merge twice — should not duplicate
-        merge_learning_snapshot(&json, &eg, &pl, &cal);
-        merge_learning_snapshot(&json, &eg, &pl, &cal);
-
-        assert_eq!(
-            eg.lock().unwrap().export().len(),
-            1,
-            "entities should not duplicate"
-        );
-        assert_eq!(
-            pl.lock().unwrap().export().len(),
-            1,
-            "patterns should not duplicate"
-        );
-    }
-
-    #[test]
-    fn merge_learning_multiple_entities_and_patterns() {
-        use astra_pipeline::{calibration, entity, pattern};
-
-        let json = serde_json::json!({
-            "version": 1,
-            "entities": [
-                {"name": "rust", "aliases": [], "domain": null,
-                    "associated_tools": ["cargo"], "confidence": 0.9, "observation_count": 10},
-                {"name": "matrixone", "aliases": ["mo"], "domain": "Database",
-                    "associated_tools": ["sql_query"], "confidence": 0.7, "observation_count": 3}
-            ],
-            "patterns": [
-                {"signature": "cargo|grep", "tools": ["cargo", "grep"], "task_type": "Code",
-                    "domain": null, "success_count": 5, "failure_count": 1, "quality_sum": 4.0},
-                {"signature": "sql_query", "tools": ["sql_query"], "task_type": "Fetch",
-                    "domain": "Database", "success_count": 2, "failure_count": 0, "quality_sum": 1.8}
-            ],
-            "calibration": null
-        })
-        .to_string();
-
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            calibration::ProgressiveCalibrator::default(),
-        ));
-
-        merge_learning_snapshot(&json, &eg, &pl, &cal);
-
-        let entities = eg.lock().unwrap().export();
-        assert_eq!(entities.len(), 2);
-        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"rust"));
-        assert!(names.contains(&"matrixone"));
-
-        let patterns = pl.lock().unwrap().export();
-        assert_eq!(patterns.len(), 2);
-        let sigs: Vec<&str> = patterns.iter().map(|p| p.signature.as_str()).collect();
-        assert!(sigs.contains(&"cargo|grep"));
-        assert!(sigs.contains(&"sql_query"));
-    }
+    // merge_learning_snapshot tests removed: the entity/pattern/calibration
+    // learning subsystem has been deleted. Tool-health sync is exercised in
+    // the tests below.
 
     // ── handle_stats_command ─────────────────────────────────────────────────
 
@@ -2876,12 +2465,9 @@ total_tokens_out: 500
     #[test]
     fn display_sync_status_no_crash_full_data() {
         let status = astra_services::SyncStatus {
-            learning_last_push: Some(chrono::Utc::now().to_rfc3339()),
-            learning_last_pull: Some(chrono::Utc::now().to_rfc3339()),
             preferences_last_sync: Some(chrono::Utc::now().to_rfc3339()),
             pending_pushes: 2,
             last_error: Some("connection reset by peer".into()),
-            cloud_version: None,
         };
         slash_health::display_sync_status(&status);
     }
@@ -2923,29 +2509,13 @@ total_tokens_out: 500
     #[test]
     fn cloud_pull_warrants_sync_marker_only_when_reachable_and_nonempty() {
         let dead = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: false,
         };
         assert!(!cloud_pull_warrants_sync_marker(&dead, &[]));
-        let offline_version = CloudPullResult {
-            tool_health: Vec::new(),
-            version: Some(9),
-            cloud_reachable: false,
-        };
-        assert!(!cloud_pull_warrants_sync_marker(&offline_version, &[]));
         let online_empty = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: true,
         };
         assert!(!cloud_pull_warrants_sync_marker(&online_empty, &[]));
-        let online_version = CloudPullResult {
-            tool_health: Vec::new(),
-            version: Some(3),
-            cloud_reachable: true,
-        };
-        assert!(cloud_pull_warrants_sync_marker(&online_version, &[]));
         assert!(cloud_pull_warrants_sync_marker(
             &online_empty,
             &["explain_mode".into()]
@@ -2955,8 +2525,6 @@ total_tokens_out: 500
     #[test]
     fn should_append_cloud_pull_journal_post_login_reachable_empty() {
         let pull = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: true,
         };
         assert!(should_append_cloud_pull_journal(&pull, &[], "post_login"));
@@ -2969,8 +2537,6 @@ total_tokens_out: 500
             std::env::remove_var(ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
         }
         let pull = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: true,
         };
         assert!(!should_append_cloud_pull_journal(
@@ -2984,8 +2550,6 @@ total_tokens_out: 500
     #[test]
     fn should_append_repl_startup_when_empty_ack_env_set() {
         let pull = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: true,
         };
         unsafe {
@@ -3008,8 +2572,6 @@ total_tokens_out: 500
     #[test]
     fn append_cloud_pull_sync_journal_skips_without_session_id() {
         let pull = CloudPullResult {
-            tool_health: Vec::new(),
-            version: Some(1),
             cloud_reachable: true,
         };
         let state = ReplState::default();
@@ -3024,8 +2586,6 @@ total_tokens_out: 500
             ..Default::default()
         };
         let pull = CloudPullResult {
-            tool_health: Vec::new(),
-            version: Some(99),
             cloud_reachable: true,
         };
         let prefs = vec!["explain_mode".to_string()];
@@ -3043,10 +2603,6 @@ total_tokens_out: 500
             .expect("cloud_pull");
         assert_eq!(cp.get("profile").and_then(|v| v.as_str()), Some("work"));
         assert_eq!(
-            cp.get("learning_version").and_then(|v| v.as_i64()),
-            Some(99)
-        );
-        assert_eq!(
             cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
             Some(false)
         );
@@ -3061,8 +2617,6 @@ total_tokens_out: 500
             ..Default::default()
         };
         let pull = CloudPullResult {
-            tool_health: Vec::new(),
-            version: None,
             cloud_reachable: true,
         };
         append_cloud_pull_sync_journal(&state, "default", "post_login", &pull, &[]);
@@ -3085,71 +2639,11 @@ total_tokens_out: 500
         unsafe {
             std::env::remove_var("MATRIXONE_HOST");
         }
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::entity::EntityGraph::new(),
-        ));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::pattern::PatternLibrary::new(),
-        ));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::calibration::ProgressiveCalibrator::new(0.15),
-        ));
-        let result = try_cloud_pull("default", &eg, &pl, &cal).await;
-        assert!(
-            result.tool_health.is_empty(),
-            "Without MatrixOne, cloud pull should return empty tool health"
-        );
-        assert!(
-            result.version.is_none(),
-            "Without MatrixOne, cloud pull should return no version"
-        );
+        let result = try_cloud_pull("default").await;
         assert!(
             !result.cloud_reachable,
             "Without MatrixOne, cloud should be unreachable"
         );
-    }
-
-    #[tokio::test]
-    async fn try_cloud_push_is_noop_without_matrixone() {
-        unsafe {
-            std::env::remove_var("MATRIXONE_HOST");
-        }
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::entity::EntityGraph::new(),
-        ));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::pattern::PatternLibrary::new(),
-        ));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::calibration::ProgressiveCalibrator::new(0.15),
-        ));
-        // Should not panic (was the original bug)
-        // Use versioned API (None = new snapshot or unconditional push)
-        let _result = try_cloud_push_versioned("default", &eg, &pl, &cal, &[], None).await;
-    }
-
-    #[tokio::test]
-    async fn try_cloud_push_delta_is_noop_without_matrixone() {
-        unsafe {
-            std::env::remove_var("MATRIXONE_HOST");
-        }
-        let eg = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::entity::EntityGraph::new(),
-        ));
-        let pl = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::pattern::PatternLibrary::new(),
-        ));
-        let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_pipeline::calibration::ProgressiveCalibrator::new(0.15),
-        ));
-        let mut synced = Vec::new();
-        eg.lock().unwrap().learn(
-            "rust",
-            astra_turn_core::routing_engine::DomainHint::Code,
-            &[],
-            None,
-        );
-        let _result = try_cloud_push_delta("default", &eg, &pl, &cal, &[], &mut synced, None).await;
     }
 
     #[tokio::test]
@@ -4138,6 +3632,55 @@ total_tokens_out: 500
             Some(Command::Memory(args)) => match args.command {
                 Some(MemorySubcommand::Search(search)) => {
                     assert_eq!(search.query, vec!["team", "history"]);
+                }
+                other => panic!("unexpected memory subcommand: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_memory_list_with_type_and_limit() {
+        let cli = Cli::try_parse_from([
+            "astra", "memory", "list", "--type", "profile", "--limit", "5",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Memory(args)) => match args.command {
+                Some(MemorySubcommand::List(list)) => {
+                    assert_eq!(list.memory_type.as_deref(), Some("profile"));
+                    assert_eq!(list.limit, 5);
+                }
+                other => panic!("unexpected memory subcommand: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_memory_show_takes_memory_id() {
+        let cli = Cli::try_parse_from(["astra", "memory", "show", "m-12345"]).unwrap();
+        match cli.command {
+            Some(Command::Memory(args)) => match args.command {
+                Some(MemorySubcommand::Show(show)) => {
+                    assert_eq!(show.memory_id, "m-12345");
+                }
+                other => panic!("unexpected memory subcommand: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_memory_forget_accepts_reason() {
+        let cli =
+            Cli::try_parse_from(["astra", "memory", "forget", "m-42", "--reason", "duplicate"])
+                .unwrap();
+        match cli.command {
+            Some(Command::Memory(args)) => match args.command {
+                Some(MemorySubcommand::Forget(forget)) => {
+                    assert_eq!(forget.memory_id, "m-42");
+                    assert_eq!(forget.reason.as_deref(), Some("duplicate"));
                 }
                 other => panic!("unexpected memory subcommand: {other:?}"),
             },

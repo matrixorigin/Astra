@@ -144,18 +144,39 @@ pub async fn handle_get_agent_result_tool(args: &Value, ctx: Option<&SpawnAgentC
     // returns as soon as the child finishes (or times out).
     let timeout = std::time::Duration::from_secs(120);
     match ctx.spawner.wait_for_agent(agent_id, timeout).await {
-        Some(AgentStatus::Completed { result }) => json!({
-            "status": "completed",
-            "agent_id": agent_id,
-            "result": result,
-        })
-        .to_string(),
-        Some(AgentStatus::Failed { error }) => json!({
-            "status": "failed",
-            "agent_id": agent_id,
-            "error": error,
-        })
-        .to_string(),
+        Some(AgentStatus::Completed {
+            result,
+            finish_reason,
+        }) => {
+            // Surface `finish_reason` so the parent agent can
+            // distinguish normal completion from budget-exhaustion
+            // and other resumable interruptions without regex-
+            // matching the output string. A value other than
+            // `"normal"` signals "the child still had more work to
+            // do" — the parent may want to spawn a continuation or
+            // raise the budget.
+            let reason = finish_reason.as_deref().unwrap_or("normal");
+            json!({
+                "status": "completed",
+                "agent_id": agent_id,
+                "result": result,
+                "finish_reason": reason,
+            })
+            .to_string()
+        }
+        Some(AgentStatus::Failed {
+            error,
+            finish_reason,
+        }) => {
+            let reason = finish_reason.as_deref().unwrap_or("failed");
+            json!({
+                "status": "failed",
+                "agent_id": agent_id,
+                "error": error,
+                "finish_reason": reason,
+            })
+            .to_string()
+        }
         Some(status) => json!({
             "status": "unknown",
             "agent_id": agent_id,
@@ -343,9 +364,13 @@ mod tests {
         // still want the decision to be clear.
         for terminal in [
             AgentStatus::Cancelled,
-            AgentStatus::Failed { error: "x".into() },
+            AgentStatus::Failed {
+                error: "x".into(),
+                finish_reason: None,
+            },
             AgentStatus::Completed {
                 result: "done".into(),
+                finish_reason: None,
             },
         ] {
             let out = render_wait_timeout_outcome("ag", Some(&terminal), Duration::from_secs(30));

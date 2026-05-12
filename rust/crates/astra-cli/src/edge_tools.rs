@@ -298,6 +298,48 @@ fn parse_grep_file_line(line: &str) -> Option<(&str, usize)> {
 ///
 /// Examines the content after the `file:line:` prefix for language-specific
 /// patterns to determine the kind of reference.
+/// One-line label for an extraction outcome. Matches the
+/// [`ExtractionOutcome`] variants but renders terse strings suitable
+/// for a bullet list in the introspect output.
+fn render_extraction_outcome_label(
+    outcome: &astra_runtime::session_memory::observatory::ExtractionOutcome,
+) -> String {
+    use astra_runtime::session_memory::observatory::ExtractionOutcome;
+    match outcome {
+        ExtractionOutcome::Persisted {
+            source,
+            bytes_written,
+            store_attempt,
+        } => format!("persisted({source:?},bytes={bytes_written},attempt={store_attempt})"),
+        ExtractionOutcome::LlmFailedFallbackPersisted {
+            reason,
+            bytes_written,
+            store_attempt,
+        } => {
+            format!("llm_failed_fallback({reason:?},bytes={bytes_written},attempt={store_attempt})")
+        }
+        ExtractionOutcome::PersistFailed { reason } => format!("persist_failed({reason:?})"),
+        ExtractionOutcome::Skipped { reason } => format!("skipped({reason})"),
+    }
+}
+
+/// Compact staleness display: `-` when clean, else a slash-separated
+/// list of flags that fired. Keeps the injection line short.
+fn render_staleness(s: &astra_runtime::session_memory::observatory::StalenessSignals) -> String {
+    let mut tags = Vec::new();
+    if s.task_contradicted {
+        tags.push("task_contradicted");
+    }
+    if s.missing_corrections {
+        tags.push("missing_corrections");
+    }
+    if tags.is_empty() {
+        "-".to_string()
+    } else {
+        tags.join("/")
+    }
+}
+
 fn categorize_reference(line: &str, _symbol: &str) -> &'static str {
     // Extract content after file:line: prefix
     let content = if let Some(first_colon) = line.find(':') {
@@ -402,6 +444,15 @@ pub struct ToolExecutor {
     /// more aggressively.
     /// Per-turn aggregate budget is 200K.
     aggregate_output_bytes: std::sync::atomic::AtomicUsize,
+    /// Optional progress sink for the *currently running* bash
+    /// invocation. `stream_render::execute_tool` installs a fresh
+    /// sink before dispatching bash and clears it on completion,
+    /// so the sink pointer is alive only for the duration of a
+    /// single in-flight call. Read by `shell_ops`/`edge_tools::shell`
+    /// wait loops to record byte/line counters; polled by a
+    /// `StreamEvent::ToolOutput` ticker.
+    pub(crate) bash_progress_sink:
+        std::sync::RwLock<Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>>,
     /// After a `.rs` file is written under a Rust workspace, set so the next
     /// `/chat` turn with `tool_results` can run passive `cargo check` and inject diagnostics.
     passive_cargo_pending: AtomicBool,
@@ -464,6 +515,13 @@ pub struct ToolExecutor {
     /// state to the model.
     introspect_snapshot:
         std::sync::Arc<std::sync::RwLock<Option<astra_turn_core::introspect::IntrospectSnapshot>>>,
+    /// Session-memory observatory shared with
+    /// [`MemoryExtractionService`] and the compaction path. `None` in
+    /// tests and offline modes — `introspect subtopic=session_memory`
+    /// then renders a short placeholder telling the model the
+    /// observatory isn't wired rather than silently returning empty.
+    session_memory_observatory:
+        Option<std::sync::Arc<astra_runtime::session_memory::SessionMemoryObservatory>>,
     /// Session id for persisting self-modification state and serving `astra self`
     /// compatible diagnostics from inside the live agent loop.
     active_session_id: std::sync::Mutex<Option<String>>,
@@ -486,6 +544,11 @@ pub struct ToolExecutor {
     self_mod_mutation_counter: std::sync::Mutex<(u32, u32)>,
     /// Shared tool executor for delegating unknown tools to astra-tools.
     default_executor: astra_tools::executor::DefaultToolExecutor,
+    /// Plugin-registered tool schemas (e.g. MCP servers). Joined with the
+    /// static catalog when `tool_search(select:X)` runs, so deferred
+    /// activation can reach plugin tools. Populated by the REPL after
+    /// `PluginRegistry::register` loads the user's skill manifests.
+    plugin_schemas: std::sync::RwLock<Vec<Value>>,
 }
 
 impl ToolExecutor {
@@ -510,6 +573,7 @@ impl ToolExecutor {
             )
             .build()
             .unwrap_or_else(|_| Client::new()),
+            plugin_schemas: std::sync::RwLock::new(Vec::new()),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
             preferred_repos: std::sync::Mutex::new(preferred_repos),
             budget_pressure: std::sync::Mutex::new(0.0),
@@ -518,6 +582,7 @@ impl ToolExecutor {
             memoria_notified_down: std::sync::atomic::AtomicBool::new(false),
             file_state: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             aggregate_output_bytes: std::sync::atomic::AtomicUsize::new(0),
+            bash_progress_sink: std::sync::RwLock::new(None),
             passive_cargo_pending: AtomicBool::new(false),
             passive_tsc_pending: AtomicBool::new(false),
             passive_lsp: passive_lsp::PassiveLspManager::new(),
@@ -549,6 +614,7 @@ impl ToolExecutor {
             send_message_context: std::sync::Mutex::new(None),
             observability_session: None,
             introspect_snapshot: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            session_memory_observatory: None,
             active_session_id: std::sync::Mutex::new(None),
             self_mod_pinned_tools: std::sync::Mutex::new(Vec::new()),
             self_mod_deprioritized_tools: std::sync::Mutex::new(Vec::new()),
@@ -574,6 +640,27 @@ impl ToolExecutor {
     pub fn with_spawn_context(mut self, ctx: agent_spawning::SpawnAgentContext) -> Self {
         self.spawn_context = Some(ctx);
         self
+    }
+
+    /// Install plugin-registered schemas so `tool_search(select:NAME)`
+    /// can resolve MCP / skill-backed tools. Called once at REPL start
+    /// after `PluginRegistry::register` loads manifests.
+    ///
+    /// Poison handling: recovers via `into_inner()` so a prior panic
+    /// doesn't permanently disable plugin lookup. Logs a warning so
+    /// operators notice the underlying panic. Silent-drop (the previous
+    /// `if let Ok` form) would leave deferred activation broken with
+    /// zero observability — the exact class of footgun that motivated
+    /// this rewrite's other fixes.
+    pub fn set_plugin_schemas(&self, schemas: Vec<Value>) {
+        let mut guard = self.plugin_schemas.write().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                "CLI plugin_schemas RwLock was poisoned; recovering inner. \
+                 A prior panic held the write lock — investigate that panic first."
+            );
+            poisoned.into_inner()
+        });
+        *guard = schemas;
     }
 
     /// Set the shared context cache for cross-agent knowledge sharing.
@@ -608,9 +695,43 @@ impl ToolExecutor {
         self
     }
 
+    /// Attach the shared session-memory observatory so
+    /// `introspect subtopic=session_memory` can read the rings. Callers
+    /// supply the same `Arc` they gave to `MemoryExtractionService`.
+    pub fn with_session_memory_observatory(
+        mut self,
+        observatory: std::sync::Arc<astra_runtime::session_memory::SessionMemoryObservatory>,
+    ) -> Self {
+        self.session_memory_observatory = Some(observatory);
+        self
+    }
+
     pub fn with_active_session_id(self, session_id: impl Into<String>) -> Self {
         self.set_active_session_id(session_id);
         self
+    }
+
+    /// Install a progress sink for the next/currently-running bash
+    /// invocation. Passing `None` clears the sink. Kept as a
+    /// pointer rather than passed on every call so `shell.rs` can
+    /// reach it from the sync wait loop without threading a new arg
+    /// through half the shell module.
+    pub fn set_bash_progress_sink(
+        &self,
+        sink: Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>,
+    ) {
+        if let Ok(mut slot) = self.bash_progress_sink.write() {
+            *slot = sink;
+        }
+    }
+
+    /// Non-blocking read of the active bash progress sink. Used by
+    /// `shell.rs`'s read-with-timeout loop to bump counters; returns
+    /// `None` when no sink is installed (non-TUI callers, tests).
+    pub(crate) fn current_bash_progress_sink(
+        &self,
+    ) -> Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>> {
+        self.bash_progress_sink.read().ok().and_then(|g| g.clone())
     }
 
     pub fn set_active_session_id(&self, session_id: impl Into<String>) {
@@ -691,6 +812,27 @@ impl ToolExecutor {
         self.active_session_id.lock().ok().and_then(|g| g.clone())
     }
 
+    fn memory_args_with_context(&self, args: &Value) -> Value {
+        let mut clean_args = args.clone();
+        if let Some(obj) = clean_args.as_object_mut() {
+            obj.remove("action");
+            // Inject the active session id so focus hints and session-scoped
+            // recalls work. CLI does not own a user_id — leave it to the
+            // cloud proxy / Memoria server to fill in via the bearer token.
+            if let Some(sid) = self.active_session_id().filter(|sid| !sid.is_empty()) {
+                obj.insert("session_id".to_string(), serde_json::Value::String(sid));
+            }
+            let turn = self
+                .journal_turn_index
+                .load(std::sync::atomic::Ordering::Acquire);
+            obj.insert(
+                "turn".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(turn)),
+            );
+        }
+        clean_args
+    }
+
     /// P3.1 seam: stash cross-session lessons loaded at session bootstrap.
     /// Every subsequent `build_self_model_snapshot` will project them via
     /// [`astra_runtime::self_model::SelfModel::with_lessons`].
@@ -701,7 +843,7 @@ impl ToolExecutor {
     }
 
     /// Snapshot the currently-stashed session lessons. Used by the
-    /// injection-freshness observer (`observe_injections`) so it can
+    /// injection-freshness observer (`observe_bridge_injections`) so it can
     /// fingerprint the same slice the next SelfModel snapshot will
     /// project into the system prompt.
     pub fn session_lessons_snapshot(&self) -> Vec<astra_runtime::self_model::LessonHint> {
@@ -1034,7 +1176,6 @@ impl ToolExecutor {
         let mut errors = 0u32;
         let mut agents_spawned = 0u32;
         let mut agents_completed = 0u32;
-        let mut current_goal = String::new();
 
         for evt in &events {
             let etype = evt.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1056,15 +1197,6 @@ impl ToolExecutor {
             }
         }
 
-        // Try to get current goal from observability session
-        if let Some(obs) = self.observability_session.as_ref()
-            && let Ok(s) = obs.read()
-        {
-            if let Some(gt) = s.goal_tracker.as_ref() {
-                current_goal = gt.goal().to_string();
-            }
-        }
-
         let mut out = String::from("## Session Summary\n");
         out.push_str(&format!("Session: {session_id}\n"));
         out.push_str(&format!(
@@ -1081,10 +1213,6 @@ impl ToolExecutor {
                 "Agents: {agents_spawned} spawned, {agents_completed} completed\n"
             ));
         }
-        if !current_goal.is_empty() {
-            out.push_str(&format!("Current goal: {current_goal}\n"));
-        }
-
         // Task status nudge: if there are active tasks, remind the
         // agent to update them (Claude Code parity: proactive nudge).
         let tasks = self.task_manager.snapshot();
@@ -1258,7 +1386,7 @@ impl ToolExecutor {
         // Overlay session-scoped injection freshness. The per-turn
         // snapshot lives on `AgenticLoopState` (not session) so the
         // runtime leaves this empty; we fill it here from the
-        // session-scoped history maintained via `observe_injections`.
+        // session-scoped history maintained via `observe_bridge_injections`.
         // Subtopic-agnostic: `render_all` and `noise` both need it.
         if let Some(obs) = self.observability_session.as_ref()
             && let Ok(s) = obs.read()
@@ -1286,6 +1414,9 @@ impl ToolExecutor {
             "noise" | "injection" | "injections" | "freshness" => {
                 return astra_turn_core::introspect::render_injection_freshness(&snap);
             }
+            "session_memory" | "session-memory" | "memory" | "extraction" | "extractions" => {
+                return self.render_session_memory_introspect();
+            }
             "all" => {
                 return astra_turn_core::introspect::render_all(&snap);
             }
@@ -1293,6 +1424,128 @@ impl ToolExecutor {
         }
 
         astra_turn_core::introspect::render_introspect(&snap, detail)
+    }
+
+    /// Render `introspect subtopic=session_memory`. Answers the
+    /// recurring question "what did astra extract this session, and
+    /// what did the last compaction inject?" without dumping enough
+    /// content to pressure context.
+    ///
+    /// Output cap: the last 8 extractions + last 4 injections are
+    /// included verbatim; older rings are summarised as counts. Each
+    /// record renders in one line plus an optional short preview,
+    /// keeping the total under ~400 tokens even when both rings are
+    /// full.
+    fn render_session_memory_introspect(&self) -> String {
+        use std::fmt::Write as _;
+
+        let Some(obs) = self.session_memory_observatory.as_ref() else {
+            return "# session-memory observatory\n\n\
+                No observatory attached to this runtime. This is expected \
+                for offline CLI or legacy test modes; production servers \
+                attach one so extractions + injections are traceable here."
+                .to_string();
+        };
+
+        let ext = obs.extractions_snapshot();
+        let inj = obs.injections_snapshot();
+        let mut out = String::from("# session-memory observatory\n\n");
+
+        writeln!(
+            out,
+            "extractions_ring: {} / {}    injections_ring: {} / {}\n",
+            ext.len(),
+            astra_runtime::session_memory::observatory::EXTRACTION_RING_CAPACITY,
+            inj.len(),
+            astra_runtime::session_memory::observatory::INJECTION_RING_CAPACITY,
+        )
+        .ok();
+
+        // ── Extractions: last 8, newest-last ────────────────────────
+        out.push_str("## extractions (newest last)\n");
+        if ext.is_empty() {
+            out.push_str("(none recorded this session)\n\n");
+        } else {
+            let tail = ext.iter().rev().take(8).collect::<Vec<_>>();
+            for rec in tail.iter().rev() {
+                writeln!(
+                    out,
+                    "- t{turn} {trigger:?} {outcome} model={model} sections={sections:?}",
+                    turn = rec.turn,
+                    trigger = rec.trigger,
+                    outcome = render_extraction_outcome_label(&rec.outcome),
+                    model = rec.selector_model.as_deref().unwrap_or("-"),
+                    sections = rec.narrative_sections,
+                )
+                .ok();
+                if !rec.content_preview.is_empty() {
+                    // Preview is already capped to PREVIEW_CHAR_CAP by
+                    // the observatory; further truncate for display.
+                    let line = rec.content_preview.replace('\n', " ⏎ ");
+                    let short: String = line.chars().take(120).collect();
+                    writeln!(out, "    preview: {short}").ok();
+                }
+            }
+            if ext.len() > 8 {
+                writeln!(out, "… ({} older records elided)", ext.len() - 8).ok();
+            }
+            out.push('\n');
+        }
+
+        // ── Injections: last 4, newest-last ─────────────────────────
+        out.push_str("## compaction injections (newest last)\n");
+        if inj.is_empty() {
+            out.push_str("(none recorded this session)\n");
+        } else {
+            let tail = inj.iter().rev().take(4).collect::<Vec<_>>();
+            for rec in tail.iter().rev() {
+                writeln!(
+                    out,
+                    "- t{turn} level={level:?} pressure={pressure:.2} chars={chars} plan={cmp}/{tot} files={files} errs={errs} staleness={stale}",
+                    turn = rec.turn,
+                    level = rec.level,
+                    pressure = rec.pressure,
+                    chars = rec.injected_chars,
+                    cmp = rec.facts_summary.plan_completed,
+                    tot = rec.facts_summary.plan_total,
+                    files = rec.facts_summary.active_files_count,
+                    errs = rec.facts_summary.error_count,
+                    stale = render_staleness(&rec.staleness),
+                )
+                .ok();
+                if !rec.narrative_sections_kept.is_empty() {
+                    writeln!(
+                        out,
+                        "    narrative_sections: {:?}",
+                        rec.narrative_sections_kept
+                    )
+                    .ok();
+                }
+                if !rec.retrieved_memories.is_empty() {
+                    let mems = rec
+                        .retrieved_memories
+                        .iter()
+                        .map(|m| {
+                            format!(
+                                "{}[{}]{}",
+                                m.memory_type,
+                                // Truncate id to 8 chars so the line
+                                // doesn't balloon with UUIDs.
+                                m.memory_id.chars().take(8).collect::<String>(),
+                                m.score.map(|s| format!("={s:.2}")).unwrap_or_default(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    writeln!(out, "    retrieved: {mems}").ok();
+                }
+            }
+            if inj.len() > 4 {
+                writeln!(out, "… ({} older records elided)", inj.len() - 4).ok();
+            }
+        }
+
+        out
     }
 
     /// `introspect(subtopic="cache")` — scan recent `llm_capture_*.json`
@@ -1498,6 +1751,16 @@ impl ToolExecutor {
             outcome.output = output;
             return outcome;
         }
+        // Consolidated `mo` tool (action=query|snapshot|branch).
+        // Only `query` has a metadata path — snapshot/branch fall
+        // through to `execute()` which dispatches without metadata.
+        if name == "mo" && args.get("action").and_then(Value::as_str) == Some("query") {
+            let mut outcome = self.mo_query_with_metadata(args);
+            let output = self.finalize_tool_output(outcome.output, name);
+            self.record_output_size(output.len());
+            outcome.output = output;
+            return outcome;
+        }
         if name == "git" {
             let action = args
                 .get("action")
@@ -1573,6 +1836,12 @@ impl ToolExecutor {
                 "bash" => self.bash(args),
                 #[cfg(windows)]
                 "powershell" => self.powershell(args),
+                // Activation primitive for the deferred tool layer.
+                // MUST use the CLI-side full catalog (`all_tool_schemas()`)
+                // so `select:NAME` can reach every cataloged tool — not
+                // just the 14 in `default_executor_tool_schemas()` that
+                // the fallback `default_executor.execute()` would hit.
+                "tool_search" => self.tool_search(args),
                 "read_file" => self.read_file(args),
                 "write_file" => {
                     // delete=true routes to delete_file handler
@@ -1671,6 +1940,26 @@ impl ToolExecutor {
                 "mo_query" => self.mo_query(args),
                 "mo_snapshot" => self.mo_snapshot(args),
                 "mo_branch" => self.mo_branch(args),
+                // Consolidated `mo` tool (matches the schema in
+                // astra-tools/schemas.rs). Routes by `action` to the
+                // existing legacy handlers. Without this arm, calls
+                // to `mo` fall to DefaultToolExecutor which doesn't
+                // know about it either — the tool was effectively
+                // dead-wired. Per-action required fields (sql for
+                // query, sub_action for snapshot/branch) are
+                // enforced by the schema's `allOf` block.
+                "mo" => {
+                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    match action {
+                        "query" => self.mo_query(args),
+                        "snapshot" => self.mo_snapshot(args),
+                        "branch" => self.mo_branch(args),
+                        "" => "Error: missing required parameter 'action'. Use one of: query, snapshot, branch".to_string(),
+                        other => format!(
+                            "Error: unknown mo action '{other}'. Use one of: query, snapshot, branch"
+                        ),
+                    }
+                }
                 "github_list_prs" => self.github_list_prs(args).await,
                 "github_get_pr" => self.github_get_pr(args).await,
                 "github_ci_status" => self.github_ci_status(args).await,
@@ -1690,24 +1979,15 @@ impl ToolExecutor {
                 "memory" => {
                     let op = match args.get("action").and_then(|v| v.as_str()) {
                         Some(a) => a,
-                        None => return "Error: missing required parameter 'action'. Use one of: store, retrieve, purge, correct, profile, search, feedback".to_string(),
+                        None => return "Error: missing required parameter `action`. \
+                             Use one of: remember, recall, expand, forget, update, focus, reflect, profile, feedback".to_string(),
                     };
-                    let mut clean_args = args.clone();
-                    if let Some(obj) = clean_args.as_object_mut() {
-                        obj.remove("action");
-                    }
+                    let clean_args = self.memory_args_with_context(args);
                     self.memoria_call(op, &clean_args).await
                 }
-                "memory_retrieve" => self.memoria_call("retrieve", args).await,
-                "memory_store" => self.memoria_call("store", args).await,
-                "memory_search" => self.memoria_call("search", args).await,
-                "memory_purge" => self.memoria_call("purge", args).await,
-                "memory_correct" => self.memoria_call("correct", args).await,
-                "memory_profile" => self.memoria_call("profile", args).await,
                 "adjust_config" => self.adjust_config(args),
                 "prioritize_tool" => self.prioritize_tool(args),
                 "deprioritize_tool" => self.deprioritize_tool(args),
-                "set_goal" => self.set_goal(args),
                 "compress_context" => self.compress_context(args),
                 "get_agent_info" => self.get_agent_info(args).await,
                 "reflect" => {
@@ -1812,16 +2092,14 @@ impl ToolExecutor {
                         "config" => self.adjust_config(args),
                         "prioritize" => self.prioritize_tool(args),
                         "deprioritize" => self.deprioritize_tool(args),
-                        "set_goal" => self.set_goal(args),
                         "compact" => self.compress_context(args),
                         "rollback_edits" => self.rollback_file_edits(args),
                         "ask_user" => self.ask_user(args),
                         "sleep" => self.sleep_tool(args).await,
-                        "tool_search" => self.tool_search(args),
                         "timeline" => self.render_session_timeline(args),
                         "summary" => self.render_session_summary(),
                         "history" => self.render_session_history(args),
-                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, tool_search, timeline, summary, history".to_string(),
+                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, timeline, summary, history".to_string(),
                         other => format!("Unknown session action: '{other}'"),
                     }
                 }
@@ -1906,6 +2184,31 @@ impl ToolExecutor {
         };
         // Normalize empty output, then apply global safety net
         let output = self.finalize_tool_output(output, name);
+        if name != "memory"
+            && !output.starts_with("Error")
+            && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
+        {
+            let client = astra_tools::memoria::MemoriaClient::new(
+                self.cloud_base.clone(),
+                self.cloud_token(),
+            );
+            let ctx = format!("cli-tool:{name}");
+            tokio::spawn(async move {
+                let report = client
+                    .feedback_pending_recalls(&session_id, "useful", &ctx)
+                    .await;
+                if report.attempted > 0 {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        context = %ctx,
+                        attempted = report.attempted,
+                        succeeded = report.succeeded,
+                        failed = report.failed,
+                        "closed recall feedback after successful cli tool"
+                    );
+                }
+            });
+        }
         self.record_output_size(output.len());
         output
     }
@@ -2233,27 +2536,6 @@ impl ToolExecutor {
                     .to_string()
                 }
             }
-            "goals" => {
-                if let Some(ref model) = self_model {
-                    serde_json::json!({
-                        "goal": model.goals.goal,
-                        "session_goal": model.goals.session_goal,
-                        "plan_goal": model.goals.plan_goal,
-                        "tracked_goal": model.goals.tracked_goal,
-                        "goal_source": model.goals.goal_source,
-                        "tracking_status": model.goals.tracking_status,
-                        "progress": model.goals.progress,
-                        "recent_milestones": model.goals.recent_milestones,
-                        "milestone_count": model.goals.milestone_count,
-                    })
-                    .to_string()
-                } else {
-                    serde_json::json!({
-                        "note": "No goal tracker available."
-                    })
-                    .to_string()
-                }
-            }
             "context_snapshot" | "context_trend" => {
                 if let Some(ref model) = self_model {
                     serde_json::json!({
@@ -2313,15 +2595,6 @@ impl ToolExecutor {
         // Latest token budget from context traces.
         let latest_budget = session.context_traces.last().map(|ct| &ct.token_budget);
 
-        // Goal information.
-        let goal_text = session.goal_tracker.as_ref().map(|gt| gt.goal());
-        let goal_progress = session.goal_tracker.as_ref().map(|gt| gt.progress());
-        let milestones: Option<Vec<_>> = session
-            .goal_tracker
-            .as_ref()
-            .map(|gt| gt.milestones().to_vec());
-        let milestone_slice = milestones.as_deref();
-
         let skills_slice: &[String] = &session.cached_skill_names;
         let tool_health_tracker = if session.last_tool_health_export.is_empty() {
             None
@@ -2348,11 +2621,7 @@ impl ToolExecutor {
             elapsed,
             session.user_corrections.len(),
             session.compressed_turns.len(),
-            goal_text,
             None,
-            goal_text,
-            goal_progress.as_ref(),
-            milestone_slice,
             signals_slice,
             &session.config,
             session.last_strategy_application.as_ref(),
@@ -2428,6 +2697,155 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         (dir, executor)
+    }
+
+    // ── tool_search dispatch: CLI must route to the full catalog ───────
+    //
+    // Before this fix: `execute()` had no `"tool_search"` arm, so
+    // `default_executor.execute("tool_search")` was called. That uses
+    // `default_executor_tool_schemas()` — a 14-tool subset without
+    // github, memory, session, agent, lsp, symbols. CLI users hitting
+    // `tool_search(select:github)` got `missing:["github"]` and the
+    // entire deferred-activation flow was dead on CLI.
+
+    #[tokio::test]
+    async fn tool_search_select_github_returns_schema_on_cli_path() {
+        let executor = test_executor();
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:github"}),
+            )
+            .await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("tool_search must return valid JSON");
+        let missing = parsed["missing"].as_array().expect("missing field");
+        assert!(
+            missing.is_empty(),
+            "CLI tool_search(select:github) must resolve, not return missing; got: {out}"
+        );
+        let matches = parsed["matches"].as_array().expect("matches field");
+        assert_eq!(matches.len(), 1, "exactly one match; got: {out}");
+        assert_eq!(matches[0]["name"].as_str(), Some("github"));
+        assert!(
+            matches[0].get("parameters").is_some(),
+            "must include full parameters for activation"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_search_select_memory_returns_schema_on_cli_path() {
+        // memory is in DEFAULT_PINNED but deferred activation must still
+        // return its schema on demand. Tests that the CLI dispatch pool
+        // covers all pinned catalog tools.
+        let executor = test_executor();
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:memory"}),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed["missing"].as_array().unwrap().is_empty());
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("memory"));
+    }
+
+    #[tokio::test]
+    async fn tool_search_select_finds_plugin_schema_once_installed() {
+        // MCP / skill-backed plugins are installed via `set_plugin_schemas`
+        // at REPL startup. After install, `tool_search(select:mcp__X)`
+        // must resolve — that's the whole deferred activation contract
+        // for plugin tools.
+        let executor = test_executor();
+        let plugin = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__weather",
+                "description": "Get weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        });
+        executor.set_plugin_schemas(vec![plugin]);
+
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:mcp__weather"}),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "plugin must resolve after set_plugin_schemas; got: {out}"
+        );
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("mcp__weather"));
+        assert!(parsed["matches"][0].get("parameters").is_some());
+    }
+
+    /// Poison recovery: if a prior panic poisoned the plugin_schemas
+    /// RwLock, tool_search must STILL function rather than silently
+    /// drop the plugin pool. Silent drop would leave deferred
+    /// activation broken with zero observability.
+    #[tokio::test]
+    async fn tool_search_recovers_from_poisoned_plugin_schemas_lock() {
+        let executor = test_executor();
+        let plugin = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calc",
+                "description": "Evaluate expressions.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        });
+        executor.set_plugin_schemas(vec![plugin]);
+
+        // Simulate a prior panic-poisoned write lock.
+        let arc = std::sync::Arc::new(&executor.plugin_schemas);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = arc.write().unwrap();
+            panic!("simulated panic under write lock");
+        }));
+        assert!(
+            executor.plugin_schemas.read().is_err() || executor.plugin_schemas.write().is_err(),
+            "lock should be poisoned for the test to be meaningful"
+        );
+
+        // Now the select must still resolve the plugin via recovery.
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:mcp__calc"}),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "poisoned lock must not silently drop plugins; got: {out}"
+        );
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("mcp__calc"));
+    }
+
+    #[tokio::test]
+    async fn tool_search_select_web_fetch_returns_schema_on_cli_path() {
+        // web_fetch is DEFERRED (not in DEFAULT_PINNED). The whole point
+        // of this test is to exercise the deferred activation flow.
+        let executor = test_executor();
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:web_fetch"}),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "select:web_fetch must resolve on CLI; got: {out}"
+        );
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("web_fetch"));
     }
 
     // ── introspect tool: first-turn behavior (regression guard) ────────
@@ -2521,6 +2939,23 @@ mod tests {
 
         executor.set_cloud_token("new-token");
         assert_eq!(executor.cloud_token().as_deref(), Some("new-token"));
+    }
+
+    #[test]
+    fn memory_args_include_session_and_current_turn() {
+        let executor = test_executor().with_active_session_id("mem-session");
+        executor
+            .journal_turn_index
+            .store(9, std::sync::atomic::Ordering::Release);
+
+        let args = executor.memory_args_with_context(&serde_json::json!({
+            "action": "recall",
+            "query": "memory loop",
+        }));
+
+        assert!(args.get("action").is_none());
+        assert_eq!(args["session_id"].as_str(), Some("mem-session"));
+        assert_eq!(args["turn"].as_u64(), Some(9));
     }
 
     // ── File-journal persistence wiring (regression guard) ──────────────
@@ -3068,6 +3503,186 @@ mod tests {
             || {
                 let _ = ToolExecutor::new(dir.path());
             },
+        );
+    }
+
+    // ── introspect subtopic=session_memory (unhappy first) ────────────
+
+    fn attach_empty_observatory(
+        executor: ToolExecutor,
+    ) -> (
+        ToolExecutor,
+        std::sync::Arc<astra_runtime::session_memory::SessionMemoryObservatory>,
+    ) {
+        let obs =
+            std::sync::Arc::new(astra_runtime::session_memory::SessionMemoryObservatory::new());
+        (
+            executor.with_session_memory_observatory(std::sync::Arc::clone(&obs)),
+            obs,
+        )
+    }
+
+    #[test]
+    fn introspect_session_memory_missing_observatory_returns_placeholder() {
+        // Offline executor never wires the observatory — output must be
+        // a short, honest placeholder rather than silently empty so the
+        // model knows the tool works but isn't wired.
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        assert!(
+            out.contains("No observatory attached"),
+            "expected placeholder, got: {out}"
+        );
+    }
+
+    #[test]
+    fn introspect_session_memory_empty_rings_renders_cleanly() {
+        let (executor, _obs) = attach_empty_observatory(test_executor());
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        assert!(out.contains("extractions_ring: 0"));
+        assert!(out.contains("injections_ring: 0"));
+        assert!(out.contains("(none recorded this session)"));
+    }
+
+    #[test]
+    fn introspect_session_memory_renders_extraction_and_injection() {
+        use astra_runtime::session_memory::observatory::{
+            ExtractionOutcome, ExtractionRecord, ExtractionSource, ExtractionTrigger, FactsSummary,
+            InjectionLevel, InjectionRecord, RetrievedMemoryRef, StalenessSignals,
+        };
+        use std::time::{Duration, SystemTime};
+
+        let (executor, obs) = attach_empty_observatory(test_executor());
+        obs.record_extraction(ExtractionRecord {
+            session_id: "s1".into(),
+            turn: 3,
+            at: SystemTime::UNIX_EPOCH,
+            trigger: ExtractionTrigger::GrowthGate,
+            selector_model: Some("mini-judge".into()),
+            outcome: ExtractionOutcome::Persisted {
+                source: ExtractionSource::Llm,
+                bytes_written: 1234,
+                store_attempt: 2,
+            },
+            narrative_sections: vec!["Task Specification".into(), "Learnings".into()],
+            content_preview: "[session-memory:v1] full\ndetails".into(),
+            latency: Duration::from_millis(120),
+        });
+        obs.record_injection(InjectionRecord {
+            session_id: "s1".into(),
+            turn: 4,
+            at: SystemTime::UNIX_EPOCH,
+            pressure: 0.82,
+            level: InjectionLevel::L1Minimal,
+            injected_chars: 140,
+            facts_summary: FactsSummary {
+                turn: 4,
+                plan_completed: 2,
+                plan_total: 5,
+                active_files_count: 3,
+                error_count: 1,
+                last_error_preview: Some("compile error".into()),
+                ..Default::default()
+            },
+            staleness: StalenessSignals {
+                task_contradicted: false,
+                missing_corrections: true,
+            },
+            retrieved_memories: vec![RetrievedMemoryRef {
+                memory_id: "abcdef12-3456".into(),
+                memory_type: "working".into(),
+                score: Some(0.71),
+            }],
+            narrative_sections_kept: vec!["Task Specification".into()],
+        });
+
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        // Extraction line
+        assert!(
+            out.contains("t3 GrowthGate persisted(Llm,bytes=1234,attempt=2)"),
+            "extraction line missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("preview:"),
+            "preview line missing; got:\n{out}"
+        );
+        // Newline in preview must be collapsed so one record stays one
+        // visual line (the arrow-return marker keeps it debuggable).
+        assert!(out.contains(" ⏎ "), "expected newline marker; got:\n{out}");
+        // Injection line
+        assert!(
+            out.contains("level=L1Minimal pressure=0.82"),
+            "injection line missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("plan=2/5 files=3 errs=1 staleness=missing_corrections"),
+            "injection summary missing; got:\n{out}"
+        );
+        // Retrieved memories show short id + score
+        assert!(
+            out.contains("retrieved: working[abcdef12]=0.71"),
+            "retrieved line missing; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn introspect_session_memory_output_size_is_bounded_under_full_ring() {
+        // Under capacity, output must stay under 4KB (a comfortable
+        // upper bound well below any reasonable context concern).
+        // Guards against accidental regressions that would dump the
+        // full injection content.
+        use astra_runtime::session_memory::observatory::{
+            ExtractionOutcome, ExtractionRecord, ExtractionSource, ExtractionTrigger, FactsSummary,
+            InjectionLevel, InjectionRecord, StalenessSignals,
+        };
+        use std::time::{Duration, SystemTime};
+
+        let (executor, obs) = attach_empty_observatory(test_executor());
+        let big = "x".repeat(1000); // > PREVIEW_CHAR_CAP on purpose
+        for i in 0..64u32 {
+            obs.record_extraction(ExtractionRecord {
+                session_id: format!("s{i}"),
+                turn: i,
+                at: SystemTime::UNIX_EPOCH,
+                trigger: ExtractionTrigger::GrowthGate,
+                selector_model: Some("m".into()),
+                outcome: ExtractionOutcome::Persisted {
+                    source: ExtractionSource::Llm,
+                    bytes_written: 42,
+                    store_attempt: 1,
+                },
+                narrative_sections: vec!["Task Specification".into()],
+                content_preview: big.clone(), // test overrides; real path clips
+                latency: Duration::from_millis(10),
+            });
+        }
+        for i in 0..32u32 {
+            obs.record_injection(InjectionRecord {
+                session_id: format!("s{i}"),
+                turn: i,
+                at: SystemTime::UNIX_EPOCH,
+                pressure: 0.6,
+                level: InjectionLevel::L1Full,
+                injected_chars: 500,
+                facts_summary: FactsSummary::default(),
+                staleness: StalenessSignals::default(),
+                retrieved_memories: vec![],
+                narrative_sections_kept: vec![],
+            });
+        }
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        assert!(
+            out.len() < 8_000,
+            "introspect output must stay bounded; got {} bytes",
+            out.len()
+        );
+        // Last 8 extractions visible — the oldest must be hidden.
+        assert!(out.contains("t63"), "newest extraction missing");
+        assert!(!out.contains("t0 GrowthGate"), "oldest must be elided");
+        // Elision breadcrumb present.
+        assert!(
+            out.contains("older records elided"),
+            "must indicate elision; got:\n{out}"
         );
     }
 }

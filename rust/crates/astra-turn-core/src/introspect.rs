@@ -661,25 +661,15 @@ mod tests {
         assert!(render_volatile_pending(&empty).contains("Empty"));
 
         let snap = IntrospectSnapshot {
-            volatile_pending: vec![
-                VolatileSnapshotEntry {
-                    kind: "WorkingSet".into(),
-                    content: "[working-set:v1]\ngoal: fix bug\nactive_files: src/foo.rs".into(),
-                    round_index: 2,
-                },
-                VolatileSnapshotEntry {
-                    kind: "StallNudge".into(),
-                    content: "⚠ REFLECTION: same read_file 3 times in a row".into(),
-                    round_index: 2,
-                },
-            ],
+            volatile_pending: vec![VolatileSnapshotEntry {
+                kind: "StallNudge".into(),
+                content: "⚠ REFLECTION: same read_file 3 times in a row".into(),
+                round_index: 2,
+            }],
             ..Default::default()
         };
         let out = render_volatile_pending(&snap);
-        assert!(out.contains("WorkingSet"));
         assert!(out.contains("StallNudge"));
-        // Preview shows first line only.
-        assert!(out.contains("[working-set:v1]"));
         assert!(out.contains("round 2"));
     }
 
@@ -710,8 +700,8 @@ mod tests {
             ..Default::default()
         });
         snap.volatile_pending.push(VolatileSnapshotEntry {
-            kind: "WorkingSet".into(),
-            content: "[working-set:v1]".into(),
+            kind: "StallNudge".into(),
+            content: "⚠ stall nudge".into(),
             round_index: 0,
         });
         snap.stall_state.nudge_count = 1;

@@ -2985,6 +2985,172 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+// ── Non-blocking pipe drain helpers ──────────────────────────────
+//
+// These are split by pipe type (`ChildStdout` vs `ChildStderr`)
+// because `std::process::ChildStd{out,err}` are distinct types —
+// using a generic-over-`Read` form would force us to own the pipe,
+// and we want to *borrow* it across loop iterations so the wait
+// loop can progressively drain bytes instead of reading only once
+// at the very end.
+
+fn set_pipe_nonblocking_stdout(pipe: Option<&mut std::process::ChildStdout>) {
+    #[cfg(unix)]
+    if let Some(p) = pipe {
+        use std::os::unix::io::{AsRawFd, BorrowedFd};
+        let fd = p.as_raw_fd();
+        // SAFETY: the ChildStdout handle owns the fd and stays alive
+        // for the duration of our borrow — no concurrent close.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        if let Ok(flags) = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_GETFL) {
+            // `from_bits_retain` preserves platform-specific bits
+            // (O_LARGEFILE, O_CLOEXEC, etc.) that `from_bits_truncate`
+            // would silently drop when writing back via F_SETFL.
+            let new_flags =
+                nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK;
+            let _ = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_SETFL(new_flags));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pipe;
+}
+
+fn set_pipe_nonblocking_stderr(pipe: Option<&mut std::process::ChildStderr>) {
+    #[cfg(unix)]
+    if let Some(p) = pipe {
+        use std::os::unix::io::{AsRawFd, BorrowedFd};
+        let fd = p.as_raw_fd();
+        // SAFETY: same reasoning as stdout variant.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        if let Ok(flags) = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_GETFL) {
+            // See stdout variant: retain unknown platform bits.
+            let new_flags =
+                nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK;
+            let _ = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_SETFL(new_flags));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pipe;
+}
+
+/// Read everything currently available on the pipe without
+/// blocking, append to `buf`, and `record_chunk` into the
+/// progress sink. Stops as soon as `read` returns `WouldBlock`.
+fn drain_pipe_nonblocking(
+    pipe: Option<&mut std::process::ChildStdout>,
+    buf: &mut Vec<u8>,
+    sink: &Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>,
+) {
+    use std::io::Read;
+    let Some(p) = pipe else { return };
+    let mut chunk = [0u8; 4096];
+    loop {
+        match p.read(&mut chunk) {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                if let Some(s) = sink {
+                    s.record_chunk(&chunk[..n]);
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            // Retry on EINTR — a signal interrupted read() before any
+            // bytes were consumed, and the pipe may still hold data.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+fn drain_pipe_nonblocking_stderr(
+    pipe: Option<&mut std::process::ChildStderr>,
+    buf: &mut Vec<u8>,
+    sink: &Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>,
+) {
+    use std::io::Read;
+    let Some(p) = pipe else { return };
+    let mut chunk = [0u8; 4096];
+    loop {
+        match p.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(s) = sink {
+                    s.record_chunk(&chunk[..n]);
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+/// Post-exit drain. Blocks with a short deadline — pipes are
+/// already non-blocking so `WouldBlock` triggers a sleep-and-retry,
+/// letting us catch trailing bytes flushed at exit.
+fn final_drain_stdout(
+    pipe: &mut std::process::ChildStdout,
+    buf: &mut Vec<u8>,
+    timeout: Duration,
+    sink: &Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>,
+) {
+    use std::io::Read;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut chunk = [0u8; 4096];
+    loop {
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(s) = sink {
+                    s.record_chunk(&chunk[..n]);
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Retry on signal interruption — discarding here would
+            // drop trailing output written just before exit.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+fn final_drain_stderr(
+    pipe: &mut std::process::ChildStderr,
+    buf: &mut Vec<u8>,
+    timeout: Duration,
+    sink: &Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>,
+) {
+    use std::io::Read;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut chunk = [0u8; 4096];
+    loop {
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(s) = sink {
+                    s.record_chunk(&chunk[..n]);
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
 /// Execute a command with streaming output and optional auto-backgrounding on timeout.
 ///
 /// - Streams stdout/stderr incrementally via `on_output` callback
@@ -3450,12 +3616,31 @@ impl ToolExecutor {
 
         // Take ownership of stdout/stderr handles before the wait loop.
         // This allows us to read available output even if background processes keep pipes open.
-        let stdout_handle = child.stdout.take();
-        let stderr_handle = child.stderr.take();
+        let mut stdout_handle = child.stdout.take();
+        let mut stderr_handle = child.stderr.take();
+
+        // Switch pipes to non-blocking up front so the wait loop can
+        // drain them progressively — that lets us (a) bump the
+        // `bash_progress_sink` counters as bytes arrive and (b)
+        // avoid the classic "child blocks on write once pipe buffer
+        // fills" hang for commands whose output exceeds the pipe
+        // buffer (~64 KiB on Linux).
+        set_pipe_nonblocking_stdout(stdout_handle.as_mut());
+        set_pipe_nonblocking_stderr(stderr_handle.as_mut());
+
+        let progress_sink = self.current_bash_progress_sink();
 
         let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout_secs);
         let exit_status;
+        let mut stdout_buf: Vec<u8> = Vec::new();
+        let mut stderr_buf: Vec<u8> = Vec::new();
         loop {
+            // Drain whatever's currently available on each pipe
+            // without blocking. Updates the progress sink so the
+            // TUI can show real counters mid-flight.
+            drain_pipe_nonblocking(stdout_handle.as_mut(), &mut stdout_buf, &progress_sink);
+            drain_pipe_nonblocking_stderr(stderr_handle.as_mut(), &mut stderr_buf, &progress_sink);
+
             match child.try_wait() {
                 Ok(Some(status)) => {
                     exit_status = status;
@@ -3475,92 +3660,16 @@ impl ToolExecutor {
             }
         }
 
-        // Read available output with a short timeout. Don't use wait_with_output()
-        // because it blocks until ALL pipe handles are closed. When the command
-        // spawns background processes (e.g., `python app.py &`), those processes
-        // inherit the pipes and keep them open indefinitely, causing a hang.
-        //
-        // Solution: Set pipes to non-blocking mode and read until timeout.
-        use std::io::Read;
+        // Final drain: post-exit pipes may still have a trailing
+        // chunk not yet read. Use the same `read_timeout` budget as
+        // before (drains until EOF or timeout).
         let read_timeout = bash_pipe_read_timeout();
-
-        // Helper to read from a pipe with timeout using non-blocking I/O
-        fn read_with_timeout(mut pipe: std::process::ChildStdout, timeout: Duration) -> Vec<u8> {
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::{AsRawFd, BorrowedFd};
-                // Set non-blocking mode
-                let fd = pipe.as_raw_fd();
-                // SAFETY: pipe is valid and we're not closing it
-                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-                if let Ok(flags) = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_GETFL) {
-                    let new_flags = nix::fcntl::OFlag::from_bits_truncate(flags)
-                        | nix::fcntl::OFlag::O_NONBLOCK;
-                    let _ = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_SETFL(new_flags));
-                }
-            }
-
-            let deadline = std::time::Instant::now() + timeout;
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                if std::time::Instant::now() > deadline {
-                    break;
-                }
-                match pipe.read(&mut chunk) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No data available right now, wait a bit
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => break,
-                }
-            }
-            buf
+        if let Some(h) = stdout_handle.as_mut() {
+            final_drain_stdout(h, &mut stdout_buf, read_timeout, &progress_sink);
         }
-
-        fn read_stderr_with_timeout(
-            mut pipe: std::process::ChildStderr,
-            timeout: Duration,
-        ) -> Vec<u8> {
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::{AsRawFd, BorrowedFd};
-                let fd = pipe.as_raw_fd();
-                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-                if let Ok(flags) = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_GETFL) {
-                    let new_flags = nix::fcntl::OFlag::from_bits_truncate(flags)
-                        | nix::fcntl::OFlag::O_NONBLOCK;
-                    let _ = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_SETFL(new_flags));
-                }
-            }
-
-            let deadline = std::time::Instant::now() + timeout;
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                if std::time::Instant::now() > deadline {
-                    break;
-                }
-                match pipe.read(&mut chunk) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => break,
-                }
-            }
-            buf
+        if let Some(h) = stderr_handle.as_mut() {
+            final_drain_stderr(h, &mut stderr_buf, read_timeout, &progress_sink);
         }
-
-        let stdout_buf = stdout_handle
-            .map(|h| read_with_timeout(h, read_timeout))
-            .unwrap_or_default();
-        let stderr_buf = stderr_handle
-            .map(|h| read_stderr_with_timeout(h, read_timeout))
-            .unwrap_or_default();
 
         Ok(std::process::Output {
             status: exit_status,

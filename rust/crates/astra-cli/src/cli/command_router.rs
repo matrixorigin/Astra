@@ -209,8 +209,30 @@ fn render_task_args(args: &TaskArgs) -> String {
 
 fn render_memory_args(args: &MemoryArgs) -> String {
     match &args.command {
-        None | Some(MemorySubcommand::List) => String::new(),
+        None => String::new(),
+        Some(MemorySubcommand::List(cmd)) => {
+            let mut parts = Vec::new();
+            if let Some(ty) = &cmd.memory_type {
+                parts.push(format!("--type {ty}"));
+            }
+            if cmd.limit != 20 {
+                parts.push(format!("--limit {}", cmd.limit));
+            }
+            if parts.is_empty() {
+                String::new()
+            } else {
+                parts.join(" ")
+            }
+        }
         Some(MemorySubcommand::Search(cmd)) => format!("search {}", join_words(&cmd.query)),
+        Some(MemorySubcommand::Show(cmd)) => format!("show {}", cmd.memory_id),
+        Some(MemorySubcommand::Forget(cmd)) => {
+            if let Some(reason) = &cmd.reason {
+                format!("forget {} --reason {}", cmd.memory_id, reason)
+            } else {
+                format!("forget {}", cmd.memory_id)
+            }
+        }
     }
 }
 
@@ -362,28 +384,6 @@ async fn execute_repl_bridge_command(
     maybe_load_project_instructions(&mut state);
 
     let (_selector, pipeline_modules) = create_tool_selector(api, profile);
-    state.pattern_library = Some(pipeline_modules.pattern_library.clone());
-    state.entity_graph = Some(pipeline_modules.entity_graph.clone());
-    state.calibrator = Some(pipeline_modules.calibrator.clone());
-
-    // Initialize evolution service with pattern library for drift detection.
-    {
-        let mut evo = astra_runtime::evolution::service::EvolutionService::new()
-            .with_pattern_library(pipeline_modules.pattern_library.clone())
-            .with_calibrator(pipeline_modules.calibrator.clone());
-        if let Some(skills_dir) = astra_skills::loader::skill_search_paths()
-            .into_iter()
-            .next()
-        {
-            evo = evo.with_evolution_store(std::sync::Arc::new(
-                astra_runtime::evolution::store::EvolutionStore::new(skills_dir),
-            ));
-        }
-        state.evolution_service = Some(std::sync::Arc::new(evo));
-    }
-    if let Some(hub) = &state.observability_hub {
-        hub.attach_pattern_library(pipeline_modules.pattern_library.clone());
-    }
     state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
@@ -869,6 +869,52 @@ pub(super) async fn execute_cli_command(
                 api,
             )
             .await
+        }
+
+        Some(Command::Context(ctx_cmd)) => {
+            // Forensic `/context dump` — reads a persisted journal
+            // and writes a snapshot JSON file (or prints a
+            // human-readable summary with `--summary`). No TUI,
+            // no REPL — just enough to let users share a full
+            // context state from a session that's already been
+            // closed.
+            match ctx_cmd {
+                crate::cli_args::ContextCmd::Dump(args) => {
+                    // Resolve session: explicit arg → prefix match;
+                    // omitted → most recently touched session on disk.
+                    let sid = match crate::context_dump::resolve_session_id(args.session.as_deref())
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("context dump: {e}");
+                            return Ok(ExitCode::ApiError);
+                        }
+                    };
+                    if args.summary {
+                        match crate::context_dump::print_summary(&sid) {
+                            Ok(()) => Ok(ExitCode::Success),
+                            Err(e) => {
+                                eprintln!("context dump failed: {e}");
+                                Ok(ExitCode::ApiError)
+                            }
+                        }
+                    } else {
+                        match crate::context_dump::write_dump_from_journal(
+                            &sid,
+                            args.output.as_deref(),
+                        ) {
+                            Ok(p) => {
+                                println!("Context snapshot written to {}", p.display());
+                                Ok(ExitCode::Success)
+                            }
+                            Err(e) => {
+                                eprintln!("context dump failed: {e}");
+                                Ok(ExitCode::ApiError)
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         Some(Command::Chat(args)) => {
@@ -1541,7 +1587,7 @@ pub(super) async fn execute_cli_command(
 
         // ── Config management ───────────────────────────────────────────
         Some(Command::Config(cfg_cmd)) => {
-            execute_config_command(cfg_cmd)?;
+            execute_config_command(cfg_cmd).await?;
             Ok(ExitCode::Success)
         }
     }
@@ -2517,13 +2563,90 @@ const KNOWN_SETTINGS: &[(&str, &str)] = &[
     ),
 ];
 
-fn execute_config_command(cmd: ConfigCmd) -> Result<(), String> {
+async fn execute_config_command(cmd: ConfigCmd) -> Result<(), String> {
     match cmd {
         ConfigCmd::List => config_list(),
         ConfigCmd::Get(args) => config_get(&args.key),
         ConfigCmd::Set(args) => config_set(&args.key, &args.value),
         ConfigCmd::ShowPolicy(args) => config_show_policy(args.model.as_deref(), args.json),
+        ConfigCmd::Version(sub) => config_version_dispatch(sub).await,
     }
+}
+
+/// Dispatch for `astra config version ...`. Uses the default
+/// `LocalFileStore` at `~/.astra/config/versions/`; if home dir is
+/// unresolvable we surface that as an error instead of silently using
+/// the process cwd, which would mislead users about where their
+/// versions live.
+async fn config_version_dispatch(sub: ConfigVersionCmd) -> Result<(), String> {
+    use astra_config::config_version_cli::{
+        format_current, format_version_diff, format_version_list, format_version_show,
+    };
+    use astra_config::config_versions::LocalFileStore;
+
+    let store = LocalFileStore::at_default_root()
+        .ok_or_else(|| "could not locate home directory for version store".to_string())?;
+    match sub {
+        ConfigVersionCmd::List(args) => {
+            let out = format_version_list(&store, args.limit).map_err(|e| e.to_string())?;
+            print!("{out}");
+            Ok(())
+        }
+        ConfigVersionCmd::Show(args) => {
+            let out = format_version_show(&store, &args.id).map_err(|e| e.to_string())?;
+            print!("{out}");
+            Ok(())
+        }
+        ConfigVersionCmd::Diff(args) => {
+            let out = format_version_diff(&store, &args.a, &args.b).map_err(|e| e.to_string())?;
+            print!("{out}");
+            Ok(())
+        }
+        ConfigVersionCmd::Current => {
+            let id = format_current().map_err(|e| e.to_string())?;
+            println!("{id}");
+            Ok(())
+        }
+        ConfigVersionCmd::Pull(args) => config_version_pull(args.limit, &store).await,
+    }
+}
+
+/// Fetch every cloud-mirrored config version for the current user
+/// and write blobs into the local version store. No-op when the
+/// cloud isn't configured (MATRIXONE_* unset / unreachable) —
+/// returns a clear error instead of hanging on a dead connection.
+async fn config_version_pull(
+    limit: i64,
+    local: &astra_config::config_versions::LocalFileStore,
+) -> Result<(), String> {
+    let settings = astra_runtime::matrix_settings_from_env()
+        .map_err(|e| format!("cloud not configured: {e} (set MATRIXONE_PASSWORD)"))?;
+    // Make sure the table exists — CLI clients against a fresh DB
+    // might arrive before the server's ensure_core_schema has ever
+    // run. ensure_core_schema connects once to bootstrap + applies
+    // the DDL; idempotent on re-runs.
+    astra_services::storage::ensure_core_schema(&settings, "mo_catalog")
+        .await
+        .map_err(|e| format!("schema sync failed: {e}"))?;
+    let pool = astra_core::SharedPool::new(&settings)
+        .await
+        .map_err(|e| format!("cloud connect failed: {e}"))?;
+    let user_id = astra_core::cli_user_id();
+    let outcome = astra_services::config_version_cloud::pull_all_into_local_store(
+        pool.get(),
+        &user_id,
+        local,
+        limit,
+    )
+    .await
+    .map_err(|e| format!("pull failed: {e}"))?;
+    println!(
+        "Pulled {fetched} versions from cloud ({written} new, {skipped} skipped).",
+        fetched = outcome.fetched,
+        written = outcome.written,
+        skipped = outcome.skipped_hash_mismatch
+    );
+    Ok(())
 }
 
 fn config_show_policy(model: Option<&str>, json: bool) -> Result<(), String> {
@@ -3111,7 +3234,6 @@ mod exit_code_tests {
             step_recorder_summary: None,
             tool_health_export: vec![],
             last_heavy_checkpoint: None,
-            runtime_continuity: Default::default(),
             ttft_ms: None,
             context_ms: None,
             selector_strategy: None,
@@ -3400,7 +3522,6 @@ mod final_json_output_tests {
             step_recorder_summary: None,
             tool_health_export: vec![],
             last_heavy_checkpoint: None,
-            runtime_continuity: Default::default(),
             ttft_ms: None,
             context_ms: None,
             selector_strategy: None,

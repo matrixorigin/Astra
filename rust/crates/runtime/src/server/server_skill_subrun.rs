@@ -79,6 +79,10 @@ pub struct ServerSkillSubRunExecutor {
     /// so sub-run snapshots appear in the parent's history.
     #[cfg(feature = "harness")]
     harness_sink: Option<std::sync::Arc<dyn astra_harness::SnapshotSink>>,
+    /// Shared background session-memory extraction coordinator cloned
+    /// from the parent lifecycle service. `None` → no extraction in
+    /// skill sub-runs (rarely surfaces user-relevant memory).
+    memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
 }
 
 impl ServerSkillSubRunExecutor {
@@ -105,7 +109,16 @@ impl ServerSkillSubRunExecutor {
             dedup_state: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
+            memory_extraction_service: None,
         }
+    }
+
+    pub fn with_memory_extraction_service(
+        mut self,
+        svc: Arc<crate::session_memory::MemoryExtractionService>,
+    ) -> Self {
+        self.memory_extraction_service = Some(svc);
+        self
     }
 
     /// Share the parent host's `emitted_tool_call_ids` HashSet so that sub-run
@@ -348,7 +361,6 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             context_manifest_user_id: None,
             context_manifest_model_name: None,
             recursion_depth: child_recursion_depth,
-            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -360,6 +372,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             has_any_usage: false,
             max_turns: SUBRUN_MAX_TURNS,
             remaining_turns: SUBRUN_MAX_TURNS,
+            turn_budget_hint_emitted_50: false,
+            turn_budget_hint_emitted_20: false,
             agentic_turn_budget: task_profile.agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
@@ -420,7 +434,6 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
-            evolution_service: None,
             rate_limit_cooldown: Default::default(),
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -441,12 +454,11 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             tactical_adapter: None,
             step_signal_collector: None,
             tool_budget_override: None,
-            pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
-            continuity: Default::default(),
+            memory_extraction_service: self.memory_extraction_service.clone(),
             compact_strategy,
             approval_overrides: None,
             confidence_trend: Default::default(),

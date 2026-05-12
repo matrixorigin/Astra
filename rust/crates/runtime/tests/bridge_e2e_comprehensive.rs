@@ -768,40 +768,48 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
             payload: json!({
                 "agent_id": "matrix-memory-store",
                 "messages": [{ "role": "user", "content": "记住我喜欢 Rust" }],
-                "edge_tools": [tool_schema("memory_store"), tool_schema("memory_search")],
+                "edge_tools": [tool_schema("memory")],
                 "explain": true,
                 "test_llm_rounds": [{
-                    "tool_calls": [tool_call("tc-matrix-memory-store", "memory_store", json!({"content": "User likes Rust"}))],
+                    "tool_calls": [tool_call(
+                        "tc-matrix-memory-store",
+                        "memory",
+                        json!({"action": "remember", "content": "User likes Rust"}),
+                    )],
                     "usage": { "prompt_tokens": 650, "completion_tokens": 35, "total_tokens": 685 }
                 }]
             }),
             expected_text: None,
             expect_explain: true,
-            expected_tools_available_min: Some(2),
+            expected_tools_available_min: Some(1),
             expected_tools_selected_min: Some(1),
-            expected_tool_event_names: vec!["memory_store"],
+            expected_tool_event_names: vec!["memory"],
             expect_user_query_event: true,
-            expected_skill_selection: vec!["memory_store"],
+            expected_skill_selection: vec!["memory"],
         },
         BridgeTurnScenario {
             name: "memory_search_tool_selection",
             payload: json!({
                 "agent_id": "matrix-memory-search",
                 "messages": [{ "role": "user", "content": "我之前说过我喜欢什么语言?" }],
-                "edge_tools": [tool_schema("memory_store"), tool_schema("memory_search")],
+                "edge_tools": [tool_schema("memory")],
                 "explain": true,
                 "test_llm_rounds": [{
-                    "tool_calls": [tool_call("tc-matrix-memory-search", "memory_search", json!({"query": "preferred language"}))],
+                    "tool_calls": [tool_call(
+                        "tc-matrix-memory-search",
+                        "memory",
+                        json!({"action": "recall", "query": "preferred language"}),
+                    )],
                     "usage": { "prompt_tokens": 640, "completion_tokens": 35, "total_tokens": 675 }
                 }]
             }),
             expected_text: None,
             expect_explain: true,
-            expected_tools_available_min: Some(2),
+            expected_tools_available_min: Some(1),
             expected_tools_selected_min: Some(1),
-            expected_tool_event_names: vec!["memory_search"],
+            expected_tool_event_names: vec!["memory"],
             expect_user_query_event: true,
-            expected_skill_selection: vec!["memory_search"],
+            expected_skill_selection: vec!["memory"],
         },
     ];
 

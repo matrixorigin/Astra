@@ -14,12 +14,11 @@ pub(super) fn create_tool_selector_quiet(
     create_tool_selector_with_quality_internal(api, profile, None, None, false)
 }
 
-/// Shared pipeline learning modules — kept accessible for cross-session persistence.
+/// Shared runtime modules created during tool-selector construction.
+///
+/// Holds the unified skill registry, MCP client manager, and skill-watcher
+/// handle so the REPL can wire them into its shared state after startup.
 pub(super) struct PipelineModules {
-    pub entity_graph: std::sync::Arc<std::sync::Mutex<astra_pipeline::entity::EntityGraph>>,
-    pub pattern_library: std::sync::Arc<std::sync::Mutex<astra_pipeline::pattern::PatternLibrary>>,
-    pub calibrator:
-        std::sync::Arc<std::sync::Mutex<astra_pipeline::calibration::ProgressiveCalibrator>>,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// MCP client manager for external tool servers.
@@ -54,10 +53,6 @@ fn create_tool_selector_with_quality_internal(
     >,
     _announce_skills: bool,
 ) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
-    use astra_pipeline::{
-        calibration::ProgressiveCalibrator, entity::EntityGraph, pattern::PatternLibrary,
-    };
-
     let all_schemas =
         astra_runtime::capabilities::cli_local_tool_schemas(edge_tools::all_tool_schemas(), vec![]);
     // spawn_agent, get_agent_result, send_message are now consolidated into
@@ -79,15 +74,6 @@ fn create_tool_selector_with_quality_internal(
     if let Some(cal) = confidence_calibrator {
         tfidf = tfidf.with_confidence_calibrator(cal);
     }
-
-    // Wire pipeline learning modules for progressive improvement
-    let entity_graph = std::sync::Arc::new(std::sync::Mutex::new(EntityGraph::new()));
-    let pattern_library = std::sync::Arc::new(std::sync::Mutex::new(PatternLibrary::new()));
-    let calibrator = std::sync::Arc::new(std::sync::Mutex::new(ProgressiveCalibrator::new(0.15)));
-    tfidf = tfidf
-        .with_entity_graph(entity_graph.clone())
-        .with_pattern_library(pattern_library.clone())
-        .with_progressive_calibrator(calibrator.clone());
 
     // Initialize the local CLI capability catalog.
     //
@@ -200,9 +186,6 @@ fn create_tool_selector_with_quality_internal(
         .cloned();
 
     let modules = PipelineModules {
-        entity_graph,
-        pattern_library,
-        calibrator,
         unified_skill_registry,
         mcp_manager,
         _skill_watcher: skill_watcher,
@@ -221,10 +204,8 @@ fn create_tool_selector_with_quality_internal(
 /// Tool selector for background plan execution.
 ///
 /// Uses TF-IDF selector only — no LLM-based tool selection (same as foreground REPL).
-/// Attaches entity_graph, pattern_library, and calibrator `Arc`s when available so
-/// subtasks read the same learned state as the REPL.
 pub(crate) fn create_background_plan_selector(
-    ctx: &crate::plan_executor::BackgroundPlanContext,
+    _ctx: &crate::plan_executor::BackgroundPlanContext,
 ) -> Box<dyn tool_selector::ToolSelector> {
     let all_schemas =
         astra_runtime::capabilities::cli_local_tool_schemas(edge_tools::all_tool_schemas(), vec![]);
@@ -233,18 +214,7 @@ pub(crate) fn create_background_plan_selector(
     manifest_loader::load_skills_directory(&mut plugin_registry);
     registry.register_plugins(&plugin_registry);
 
-    let mut tfidf = tool_selector::TfIdfSelector::new(registry);
-    if let (Some(eg), Some(pl), Some(cal)) = (
-        ctx.entity_graph.as_ref(),
-        ctx.pattern_library.as_ref(),
-        ctx.calibrator.as_ref(),
-    ) {
-        tfidf = tfidf
-            .with_entity_graph(eg.clone())
-            .with_pattern_library(pl.clone())
-            .with_progressive_calibrator(cal.clone());
-    }
-
+    let tfidf = tool_selector::TfIdfSelector::new(registry);
     Box::new(tfidf)
 }
 
@@ -530,7 +500,6 @@ pub(crate) fn initialize_repl_state(
         state.observability_session = Some(hub.start_session(&user_id, "pending"));
         // Apply any adaptive state stashed during workspace restore.
         super::repl_turn::apply_pending_adaptive_state(&mut state);
-        super::repl_turn::apply_pending_goal_progress_state(&mut state);
     }
 
     // Restore persisted feedback aggregator state (if any)

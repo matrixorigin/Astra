@@ -73,7 +73,6 @@ pub mod bash_intent;
 pub mod bridge;
 pub mod capabilities;
 pub mod evaluation;
-pub mod evolution;
 pub mod guardrail_tuning;
 pub mod introspection;
 pub mod lesson_checkpoint;
@@ -87,13 +86,10 @@ pub mod pipeline;
 pub use astra_plan as plan;
 pub use astra_plan as plan_decompose;
 pub use astra_sandbox as tool_sandbox;
-pub use astra_sync_adapters as sync_adapters;
-pub mod liquid {
-    pub use astra_evolution::reflection;
-}
 pub mod prompts;
 pub mod self_model;
 pub mod server;
+pub mod session_memory;
 pub mod tool_registry;
 pub mod tool_selector;
 pub mod turn;
@@ -259,11 +255,11 @@ pub(crate) use astra_turn_core::contracts::TurnReflectionLessonRequest;
 pub use astra_turn_core::contracts::{
     TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnCoreEventRecord, TurnCoreEventWriter,
     TurnCorePersistOutcome, TurnCorePersistPlan, TurnDecisionAuditRecord, TurnHookDbPersistPlan,
-    TurnHookDbWriter, TurnImplicitFeedbackRecord, TurnLearningOutcome, TurnLearningWriter,
-    TurnObserverRequest, TurnObserverWorker, TurnReflectionLessonRecord,
-    TurnReflectionLessonWriter, TurnReflectionMark, TurnReflectionStateStore,
-    TurnSessionActivityWriter, TurnSkillSelectionRecord, TurnSkillSelectorMetricRecord,
-    TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
+    TurnHookDbWriter, TurnImplicitFeedbackRecord, TurnObserverRequest, TurnObserverWorker,
+    TurnReflectionLessonRecord, TurnReflectionLessonWriter, TurnReflectionMark,
+    TurnReflectionStateStore, TurnSessionActivityWriter, TurnSkillSelectionRecord,
+    TurnSkillSelectorMetricRecord, TurnToolEventPersistPlan, TurnToolEventRecord,
+    TurnToolEventWriter,
 };
 
 pub use turn::services::{
@@ -289,7 +285,7 @@ pub use astra_turn_core::{
         SESSION_MEMORY_TEMPLATE, SessionMemoryExtractConfig, SessionMemoryState,
         build_extraction_prompt, build_learnings_extraction_prompt, extract_learnings_for_backflow,
         extract_section, parse_learnings_response, should_extract as should_extract_session_memory,
-        should_extract_with_error_trigger, truncate_for_prompt, write_session_memory_file,
+        should_extract_with_error_trigger, truncate_for_prompt,
     },
     cloud_summary::{HttpSummaryClient, LlmConnParams, SummaryLlmClient, SummaryResponse},
     complete::build_turn_complete_event,
@@ -346,10 +342,8 @@ pub use turn::{
         },
         memoria_compact::{
             HttpMemoriaClient, MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams,
-            MemoriaMemory, SessionMemoryFileCombine, claude_code_session_memory_path,
-            compact_with_memoria, memoria_compact_retrieve_query, read_session_memory_file,
-            resolve_resume_session_memory_file, resolve_session_memory_file_options,
-            sanitize_path_for_claude_projects,
+            MemoriaMemory, claude_code_session_memory_path, compact_with_memoria,
+            memoria_compact_retrieve_query, sanitize_path_for_claude_projects,
         },
     },
     implicit_feedback::{
@@ -363,7 +357,5 @@ pub use astra_learning::auto_tuning;
 pub use astra_text_utils::semantic_dedup;
 pub use astra_text_utils::text_tokenize;
 pub use astra_turn_core::cloud_session_facts::update_from_journal_event;
-pub use astra_turn_types::session_facts::{ErrorFact, FileEntry, PlanFact, SessionFacts, ToolFact};
-pub use matrix_cloud_runtime::{
-    MatrixCloudRuntime, build_sync_orchestrator_with_adapters, matrix_settings_from_env,
-};
+pub use astra_turn_types::session_facts::{ErrorFact, FileEntry, SessionFacts, ToolFact};
+pub use matrix_cloud_runtime::{MatrixCloudRuntime, matrix_settings_from_env};

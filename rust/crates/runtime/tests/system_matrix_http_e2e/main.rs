@@ -44,8 +44,6 @@
 //!   isolation tests).
 //! - **`e2e_matrix_models_admin_crud`** — grant `astra_admin`, `POST/PUT/DELETE /models` with
 //!   `provider: mock` + `infra_llm_models` SQL checks (replaces `model_crud_contract`).
-//! - **`e2e_matrix_audit_cross_session_analytics_http`** — SQL-seeded `agent_events` / `ctx_decision_audits`,
-//!   then `GET /audit/stats`, `/audit/mutations`, `/audit/promotions` with JWT auth (cross-session audit).
 //! - **`e2e_matrix_trusted_moi_user_system_integration`** — run server in `trusted_moi` mode,
 //!   authenticate via external JWT claims, verify local auth endpoints are disabled, and assert
 //!   session/memory ownership maps to upstream user id.
@@ -118,7 +116,6 @@
 
 mod harness;
 mod journey_admin_smoke_matrix;
-mod journey_audit_cross_session;
 mod journey_branches_matrix;
 mod journey_chat_route_models_matrix;
 mod journey_context_decision_chain_matrix;
@@ -268,13 +265,6 @@ async fn e2e_matrix_memory_proxy_user_isolation() {
 async fn e2e_matrix_models_admin_crud() {
     require_system_e2e_env();
     journey_extended::run_models_admin_crud_with_db().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_audit_cross_session_analytics_http() {
-    require_system_e2e_env();
-    journey_audit_cross_session::run_audit_cross_session_analytics_http().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

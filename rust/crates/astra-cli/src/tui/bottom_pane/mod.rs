@@ -1,5 +1,6 @@
 pub(crate) mod busy_view;
 pub(crate) mod chat_composer;
+pub(crate) mod config_edit_view;
 pub(crate) mod context_panel_view;
 pub(crate) mod footer;
 pub(crate) mod help_view;
@@ -18,6 +19,8 @@ pub(crate) mod worktrees_view;
 
 #[cfg(test)]
 mod approval_integration_tests;
+#[cfg(test)]
+mod config_edit_tests;
 #[cfg(test)]
 mod hint_tests;
 #[cfg(test)]
@@ -512,12 +515,40 @@ impl BottomPane {
             }
 
             match key.code {
-                KeyCode::Left => {
+                // Horizontal navigation: ←/→ move the focused-button
+                // cursor within the approval cell's button row.
+                // Up/Down intentionally mirror left/right. Many users
+                // reach for the arrow keys without reading the hint
+                // and expected a vertical menu; rather than force
+                // them to learn an arrow-axis mapping, we accept all
+                // four arrows as equivalent. No ambiguity: the
+                // composer never consumes arrow keys while an
+                // approval is pending (early-return below), so
+                // there's no cost to this looseness.
+                KeyCode::Left | KeyCode::Up => {
                     self.move_approval_button_left();
                     return BottomPaneAction::Consumed;
                 }
-                KeyCode::Right => {
+                KeyCode::Right | KeyCode::Down => {
                     self.move_approval_button_right();
+                    return BottomPaneAction::Consumed;
+                }
+                // Tab cycles between PENDING approvals (not buttons).
+                // Previously gated on `composer.is_empty()` so stray
+                // whitespace in the composer would hand Tab to
+                // completion instead — an accidental footgun during
+                // an approval flow. Relaxed to: route Tab to the
+                // approval queue UNLESS an inline menu (slash or
+                // mention) is actively capturing Tab for completion.
+                // That menu exception is what the
+                // `slash_menu_open_with_approval_pending_routes_tab_
+                // to_slash_selection` integration test enforces.
+                KeyCode::Tab if self.slash_menu.is_none() && self.mention_menu.is_none() => {
+                    self.move_approval_focus_down();
+                    return BottomPaneAction::Consumed;
+                }
+                KeyCode::BackTab if self.slash_menu.is_none() && self.mention_menu.is_none() => {
+                    self.move_approval_focus_up();
                     return BottomPaneAction::Consumed;
                 }
                 KeyCode::Enter
@@ -552,15 +583,6 @@ impl BottomPane {
                     if let Some(id) = self.reject_focused_approval() {
                         return BottomPaneAction::ApprovalResolved { id };
                     }
-                }
-                KeyCode::Tab
-                    if self.composer.is_empty()
-                        && self.slash_menu.is_none()
-                        && self.mention_menu.is_none()
-                        && self.skill_popup.is_none() =>
-                {
-                    self.move_approval_focus_down();
-                    return BottomPaneAction::Consumed;
                 }
                 _ => {}
             }

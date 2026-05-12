@@ -9,7 +9,6 @@ use session_guard::{
 pub(crate) struct ReplStartupArtifacts {
     pub selector: Box<dyn tool_selector::ToolSelector>,
     pub pipeline_modules: PipelineModules,
-    pub profile_name_str: String,
     pub edge_heartbeat_task: Option<tokio::task::JoinHandle<()>>,
     pub skill_quality_path: std::path::PathBuf,
     pub pinned_skills_path: std::path::PathBuf,
@@ -130,7 +129,7 @@ pub(crate) async fn complete_repl_startup(
     // Seed from prior session snapshot (if any) so boost factors don't reset.
     let profile_name_for_quality = profile.unwrap_or("default");
     let persisted_quality =
-        astra_evolution::persistence::load_tool_quality(profile_name_for_quality);
+        astra_turn_core::tool_health_persistence::load_tool_quality(profile_name_for_quality);
     let quality_tracker = {
         let mut tracker = tool_registry::ToolQualityTracker::new();
         if !persisted_quality.is_empty() {
@@ -159,26 +158,13 @@ pub(crate) async fn complete_repl_startup(
     );
     tracer.phase("tool_selector");
 
-    // Load cross-session learning state (entity graph, patterns, calibration, tool health)
+    // Load cross-session tool-health state from local files.
     let profile_name = profile.unwrap_or("default");
     let (cross_session_health_entries, cloud_pull_result, pref_keys_after_pull) = {
-        let loaded = astra_evolution::persistence::load_learning_state(
-            profile_name,
-            &pipeline_modules.entity_graph,
-            &pipeline_modules.pattern_library,
-            &pipeline_modules.calibrator,
-        );
-        if loaded {
-            eprintln!(
-                "  {} {}",
-                theme::icon_ok(),
-                "Loaded learning state from prior sessions".dim()
-            );
-        }
-        let mut cross_session_health_entries =
-            astra_evolution::persistence::load_tool_health(profile_name);
+        let cross_session_health_entries =
+            astra_turn_core::tool_health_persistence::load_tool_health(profile_name);
         state.synced_tool_health_entries =
-            astra_evolution::persistence::load_synced_tool_health(profile_name);
+            astra_turn_core::tool_health_persistence::load_synced_tool_health(profile_name);
         if !cross_session_health_entries.is_empty() {
             eprintln!(
                 "{}",
@@ -189,34 +175,7 @@ pub(crate) async fn complete_repl_startup(
                 .dim()
             );
         }
-        let cloud_pull_result = try_cloud_pull(
-            profile_name,
-            &pipeline_modules.entity_graph,
-            &pipeline_modules.pattern_library,
-            &pipeline_modules.calibrator,
-        )
-        .await;
-        state.cloud_learning_version = cloud_pull_result.version;
-        if !cloud_pull_result.tool_health.is_empty() {
-            let (merged, cloud_wins, cloud_only) = astra_evolution::persistence::merge_tool_health(
-                &cross_session_health_entries,
-                &cloud_pull_result.tool_health,
-            );
-            cross_session_health_entries = merged;
-            if cloud_wins > 0 || cloud_only > 0 {
-                let mut parts = Vec::new();
-                if cloud_wins > 0 {
-                    parts.push(format!("{cloud_wins} updated from cloud"));
-                }
-                if cloud_only > 0 {
-                    parts.push(format!("{cloud_only} new from cloud"));
-                }
-                eprintln!(
-                    "{}",
-                    format!("  ✓ Merged tool health: {}", parts.join(", ")).dim()
-                );
-            }
-        }
+        let cloud_pull_result = try_cloud_pull(profile_name).await;
         let pref_keys = try_cloud_pull_preferences(state).await;
         (cross_session_health_entries, cloud_pull_result, pref_keys)
     };
@@ -234,18 +193,11 @@ pub(crate) async fn complete_repl_startup(
         state.matrix_runtime = match SharedPool::new(&settings).await {
             Ok(pool) => {
                 let user_id = astra_core::cli_user_id();
-                let th =
-                    std::sync::Arc::new(std::sync::Mutex::new(state.tool_health_entries.clone()));
                 let lease = std::sync::Arc::new(astra_services::TaskLeaseHoldCache::default());
                 let mut runtime = astra_runtime::MatrixCloudRuntime::attach(
                     pool,
                     profile.unwrap_or("default"),
                     &user_id,
-                    pipeline_modules.entity_graph.clone(),
-                    pipeline_modules.pattern_library.clone(),
-                    pipeline_modules.calibrator.clone(),
-                    th,
-                    state.cloud_learning_version,
                     lease,
                 );
                 if let Ok(enc) = astra_services::FernetTokenEncryptor::from_env() {
@@ -275,16 +227,14 @@ pub(crate) async fn complete_repl_startup(
                 eprintln!("  {} team store builtins: {e}", theme::icon_warn());
             }
             state.team_store = std::sync::Arc::new(mo_team_store);
+            // Session-memory.md background extractor. Shares broker +
+            // ingestion with the rest of the runtime so events land in
+            // agent_events and the CLI can bridge UX signals.
+            state.session_memory_extractor = mc.clone_memory_extraction_service();
         }
     }
     tracer.phase("matrix_pool");
 
-    state.pattern_library = Some(pipeline_modules.pattern_library.clone());
-    state.entity_graph = Some(pipeline_modules.entity_graph.clone());
-    state.calibrator = Some(pipeline_modules.calibrator.clone());
-    if let Some(hub) = &state.observability_hub {
-        hub.attach_pattern_library(pipeline_modules.pattern_library.clone());
-    }
     state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
@@ -295,8 +245,6 @@ pub(crate) async fn complete_repl_startup(
         &cloud_pull_result,
         &pref_keys_after_pull,
     );
-
-    let profile_name_str = profile_name.to_string();
 
     if let Some(token) = current_access_token(profile) {
         let has_models = check_server_has_models(api, &token).await;
@@ -391,7 +339,6 @@ pub(crate) async fn complete_repl_startup(
     Ok(ReplStartupArtifacts {
         selector,
         pipeline_modules,
-        profile_name_str,
         edge_heartbeat_task,
         skill_quality_path,
         pinned_skills_path,

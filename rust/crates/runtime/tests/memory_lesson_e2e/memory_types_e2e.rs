@@ -205,7 +205,7 @@ fn full_mode_prompt_exercises_all_business_types() {
     assert!(prompt.contains("git log"));
 
     // Deduplication + staleness
-    assert!(prompt.contains("memory_correct"));
+    assert!(prompt.contains("memory(action=update"));
     assert!(prompt.contains("outdated"));
 }
 
@@ -281,7 +281,7 @@ fn v2_tag_names_are_unique() {
 #[test]
 fn system_prompt_without_lessons_has_no_lessons_header() {
     let prompt =
-        astra_runtime::prompts::build_main_system_prompt(&["bash", "memory_store"], "", 1.0, None);
+        astra_runtime::prompts::build_main_system_prompt(&["bash", "memory"], "", 1.0, None);
     assert!(
         !prompt.contains("📚 Lessons"),
         "prompt without lesson injection should not render Lessons header"

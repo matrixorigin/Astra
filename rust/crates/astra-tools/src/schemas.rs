@@ -37,6 +37,8 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "mo",
     "agent",
     "introspect",
+    "tool_search",
+    "lsp",
     "web_fetch",
     "web_search",
     "publish_artifact",
@@ -189,7 +191,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run"},
-                        "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."}
+                        "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."},
+                        "force": {"type": "boolean", "description": "If true, bypass the per-session identical-command cache and execute even when the same command already succeeded."}
                     },
                     "required": ["command"]
                 }
@@ -252,7 +255,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             }
                         },
                         "dry_run": {"type": "boolean", "description": "Preview diff without applying (default: false)"},
-                        "replace_all": {"type": "boolean", "description": "Replace ALL occurrences (default: false)"}
+                        "replace_all": {"type": "boolean", "description": "Replace ALL occurrences (default: false)"},
+                        "allow_structural_change": {"type": "boolean", "description": "Bypass structural safety checks for intentional syntax-breaking or comment-removing edits (default: false)"}
                     },
                     "required": ["path"]
                 }
@@ -488,7 +492,16 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "description": "Exact stash selector or OID. Used by: stash with sub_action=apply. Takes precedence over index."
                         }
                     },
-                    "required": ["action"]
+                    "required": ["action"],
+                    "x-astra-per-action-required": {
+                        "commit": ["message"],
+                        "revert_commit": ["commit_sha"],
+                        "file_history": ["file"],
+                        "log_search": ["query"],
+                        "stash": ["sub_action"],
+                        "checkout_file": ["path", "ref"],
+                        "worktree": ["sub_action"]
+                    }
                 }
             }
         }),
@@ -496,16 +509,24 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "github",
-                "description": "GitHub operations. Actions: list_prs, get_pr, ci_status, repo_stats, list_issues, get_issue, create_issue.",
+                "description": "GitHub operations. Per-action required fields: get_pr/ci_status→pr_number, get_issue→issue_number, create_issue→title. `repo` (owner/name or bare name) is inferred from git remote when omitted.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["list_prs","get_pr","ci_status","repo_stats","list_issues","get_issue","create_issue"], "description": "GitHub operation"},
-                        "owner": {"type": "string"},
-                        "repo": {"type": "string"},
-                        "number": {"type": "integer", "description": "PR or issue number"}
+                        "repo": {"type": "string", "description": "owner/name or bare name (e.g. 'anthropics/claude-code' or 'memoria'). Inferred from current git remote when omitted."},
+                        "pr_number": {"type": "integer", "description": "PR number. REQUIRED when action=get_pr or action=ci_status."},
+                        "issue_number": {"type": "integer", "description": "Issue number. REQUIRED when action=get_issue."},
+                        "title": {"type": "string", "description": "Issue title. REQUIRED when action=create_issue."},
+                        "body": {"type": "string", "description": "Issue body (create_issue)."}
                     },
-                    "required": ["action"]
+                    "required": ["action"],
+                    "x-astra-per-action-required": {
+                        "get_pr": ["pr_number"],
+                        "ci_status": ["pr_number"],
+                        "get_issue": ["issue_number"],
+                        "create_issue": ["title"]
+                    }
                 }
             }
         }),
@@ -513,18 +534,97 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Memory operations. Actions: store, retrieve, purge, correct, profile, search, feedback. Supports agent_type scoping for per-agent-type memory isolation.",
+                "description": "Cognitive memory operations. Actions (model-facing verbs): \
+                    `remember` (persist a fact for future turns/sessions), \
+                    `recall` (retrieve relevant memories by query — combines keyword + vector + temporal + confidence), \
+                    `expand` (drill into one memory by id to get overview/detail + linked related memories), \
+                    `forget` (soft-delete by id), \
+                    `update` (correct or enrich an existing memory), \
+                    `focus` (session-scoped attention boost: subsequent `recall` weights the given topic/tag higher for ttl_secs), \
+                    `reflect` (cross-memory pattern synthesis; consolidates recent memories into higher-level scenes), \
+                    `profile` (return the user profile summary), \
+                    `feedback` (signal that a recalled memory was useful/irrelevant/outdated/wrong — shapes future recall ranking). \
+                    Supports `agent_type` scoping for per-agent-type memory isolation. \
+                    Visibility: `visibility=\"private\"` (default) keeps the memory to your account; \
+                    `visibility=\"team\"` tags it for team sharing (requires `team_id`), and on recall \
+                    the union includes the current user's team-tagged memories.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["store","retrieve","purge","correct","profile","search","feedback"], "description": "Memory operation"},
-                        "content": {"type": "string", "description": "Content to store/correct"},
-                        "query": {"type": "string", "description": "Query for retrieve/search"},
-                        "memory_id": {"type": "string", "description": "ID for purge/correct/feedback"},
-                        "memory_type": {"type": "string", "description": "Type: semantic, profile, procedural, working, episodic"},
-                        "agent_type": {"type": "string", "description": "Scope to a specific agent type (explore, code-review, task, general-purpose). When set on store, tags the memory; on retrieve/search, filters to only that type's memories + unscoped globals."}
+                        "action": {
+                            "type": "string",
+                            "enum": ["remember","recall","expand","forget","update","focus","reflect","profile","feedback"],
+                            "description": "Cognitive memory verb."
+                        },
+                        "content": {"type": "string", "description": "remember: the fact to store. update: replacement content."},
+                        "query": {"type": "string", "description": "recall: the natural-language query. update: also accepted as a selector when memory_id is unknown."},
+                        "memory_id": {"type": "string", "description": "expand / forget / update / feedback: target memory id."},
+                        "memory_type": {
+                            "type": "string",
+                            "enum": ["semantic","profile","procedural","working","episodic"],
+                            "description": "remember: memory category. Defaults to `semantic`."
+                        },
+                        "top_k": {"type": "integer", "description": "recall: max number of memories (default 10)."},
+                        "min_confidence": {"type": "number", "description": "recall: filter out memories below this confidence (0.0-1.0)."},
+                        "scope": {
+                            "type": "string",
+                            "enum": ["all","session"],
+                            "description": "recall: `session` restricts to current session; `all` includes cross-session (default `all`)."
+                        },
+                        "view": {
+                            "type": "string",
+                            "enum": ["compact","overview","full"],
+                            "description": "recall: response detail level. `compact` (default) returns abstracts; `overview` adds summaries; `full` adds linked memories."
+                        },
+                        "importance": {"type": "number", "description": "remember / update: importance score (0.0-1.0)."},
+                        "trust_tier": {"type": "string", "description": "remember / update: provenance trust tier."},
+                        "tags": {"type": "array", "items": {"type": "string"}, "description": "remember: tags to attach."},
+                        "tags_add": {"type": "array", "items": {"type": "string"}, "description": "update: tags to append."},
+                        "tags_remove": {"type": "array", "items": {"type": "string"}, "description": "update: tags to detach."},
+                        "visibility": {
+                            "type": "string",
+                            "enum": ["private","team"],
+                            "description": "remember: who else should see this memory. `private` (default) — only you on this account. `team` — shared with other agents that belong to the same team (`team_id` required). recall: when set to `team`, the retrieval union includes team-tagged memories in addition to your private ones."
+                        },
+                        "team_id": {
+                            "type": "string",
+                            "description": "remember with visibility=team: the team to tag (encoded as `astra:team:<id>` in the memory's tag set). recall with visibility=team: union with the given team's shared pool. Omit to fall back to the executor's default team from session context."
+                        },
+                        "reason": {"type": "string", "description": "forget / update: REQUIRED — non-empty explanation for the audit trail (why this memory is being changed). feedback: optional."},
+                        "level": {
+                            "type": "string",
+                            "enum": ["abstract","overview","detail","linked"],
+                            "description": "expand: how deep to unfold (`abstract` < `overview` < `detail` < `linked`)."
+                        },
+                        "focus_type": {
+                            "type": "string",
+                            "enum": ["topic","tag","memory_id","session"],
+                            "description": "focus: what kind of attention to boost."
+                        },
+                        "focus_value": {"type": "string", "description": "focus: the topic / tag / id / session to boost."},
+                        "boost": {"type": "number", "description": "focus: multiplier applied to matching memories (default 1.5)."},
+                        "ttl_secs": {"type": "integer", "description": "focus: how long the boost lasts (default 3600s)."},
+                        "signal": {
+                            "type": "string",
+                            "enum": ["useful","irrelevant","outdated","wrong"],
+                            "description": "feedback: quality signal for the recalled memory."
+                        },
+                        "context": {"type": "string", "description": "feedback: optional free-form context on why the signal was given."},
+                        "agent_type": {
+                            "type": "string",
+                            "enum": ["explore","code-review","task","general-purpose"],
+                            "description": "remember / recall: scope to a specific agent type. On remember it tags; on recall it filters to that type + unscoped globals."
+                        }
                     },
-                    "required": ["action"]
+                    "required": ["action"],
+                    "x-astra-per-action-required": {
+                        "remember": ["content"],
+                        "recall": ["query"],
+                        "expand": ["memory_id"],
+                        "forget": ["reason"],
+                        "update": ["reason"],
+                        "feedback": ["memory_id", "signal"]
+                    }
                 }
             }
         }),
@@ -561,7 +661,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "order": {"type": "string", "enum": ["asc","desc"], "description": "history_page output order. asc reads a recovered range chronologically; desc browses backward from newest."},
                         "role": {"type": "string", "enum": ["all","user","assistant","system"], "description": "Optional history role filter. Default all."}
                     },
-                    "required": ["action"]
+                    "required": ["action"],
+                    "x-astra-per-action-required": {
+                        "config": ["path", "value"],
+                        "prioritize": ["tool"],
+                        "deprioritize": ["tool"],
+                        "ask_user": ["question"]
+                    }
                 }
             }
         }),
@@ -577,7 +683,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "sql": {"type": "string", "description": "SQL to execute (for query)"},
                         "name": {"type": "string", "description": "Snapshot/branch name"}
                     },
-                    "required": ["action"]
+                    "required": ["action"],
+                    "x-astra-per-action-required": {
+                        "query": ["sql"],
+                        "snapshot": ["sub_action"],
+                        "branch": ["sub_action"]
+                    }
                 }
             }
         }),
@@ -598,7 +709,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "model": {"type": "string", "description": "Model override (spawn)"},
                         "background": {"type": "boolean", "description": "Return immediately with agent_id (spawn)"},
                         "name": {"type": "string", "description": "Addressable name (spawn)"},
-                        "max_turns": {"type": "integer", "description": "Max turns (spawn)"},
+                        "max_turns": {"type": "integer", "description": "Max turns (spawn). Explicit value wins over `complexity`."},
+                        "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity hint scaling the default budget when `max_turns` is absent. `light`≈10 turns, `normal`=agent default, `deep`=2× default. Use `deep` for review/refactor/multi-file tasks that routinely exhaust the default."},
                         "isolated": {"type": "boolean", "description": "Use isolated worktree (spawn)"},
                         "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
                         "agent_id": {"type": "string", "description": "Agent ID (get_result)"},
@@ -607,7 +719,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
                         "priority": {"type": "string", "enum": ["low","normal","high"]}
                     },
-                    "required": ["action"]
+                    "required": ["action"],
+                    "x-astra-per-action-required": {
+                        "spawn": ["description", "prompt"],
+                        "delegate": ["task"],
+                        "run_chain": ["steps"],
+                        "get_result": ["agent_id"],
+                        "send_message": ["to", "message"]
+                    }
                 }
             }
         }),
@@ -622,6 +741,35 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "subtopic": {"type": "string", "enum": ["session","cache","recent","volatile","stall","noise","all"], "description": "Which diagnostic to run (default: session). `noise`: per-channel freshness of runtime-injected prompt signals — flags channels re-rendered unchanged for many turns."},
                         "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Output detail level for the session topic (default: auto from budget). Ignored for other subtopics."}
                     }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "tool_search",
+                "description":
+                    "Search and activate deferred tools. Pass `query` to find tools by \
+                     keyword, OR pass `query=\"select:NAME\"` (or `select:NAME1,NAME2`) to \
+                     retrieve the full schema for one or more deferred tools listed in \
+                     `<deferred_tools>`. After calling with `select:`, you may invoke the \
+                     selected tool(s) directly on the next turn — runtime accepts calls \
+                     for any dispatchable name, not just names currently in `tools[]`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description":
+                                "Keyword query, or `select:NAME` / `select:NAME1,NAME2` for \
+                                 direct activation."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum results for keyword mode (default 5, max 20)."
+                        }
+                    },
+                    "required": ["query"]
                 }
             }
         }),
@@ -699,7 +847,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "reason": {"type": "string", "description": "(stop) Why the task is being stopped"},
                         "error_message": {"type": "string", "description": "(update) Reason for failure"}
                     },
-                    "required": ["action"]
+                    "required": ["action"],
+                    "x-astra-per-action-required": {
+                        "create": ["title"],
+                        "update": ["task_id"],
+                        "get": ["task_id"],
+                        "stop": ["task_id"]
+                    }
                 }
             }
         }),

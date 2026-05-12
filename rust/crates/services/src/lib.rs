@@ -5,6 +5,7 @@ pub mod agents;
 pub mod artifact_policy;
 pub mod auth;
 pub mod branches;
+pub mod config_version_cloud;
 pub mod context;
 pub mod context_manifest;
 pub mod contract_generator;
@@ -19,13 +20,11 @@ pub mod events;
 pub mod introspection;
 pub mod jobs;
 pub mod learning;
-pub mod learning_merge;
 pub mod llm_trusted_domains;
 pub mod marketplace;
 pub mod marketplace_stats;
 pub mod models;
 pub mod multi_agent;
-pub mod mutation_scoreboard;
 pub mod pagination;
 pub mod personal_skills;
 pub mod reflect;
@@ -124,14 +123,12 @@ pub use decisions::{
 };
 pub use durable_task::OutputSink;
 pub use durable_task::{
-    CloudLlmConfig, CloudLlmJudge, ContractAmendment, ContractStatus, CriterionLearningResult,
-    DiffSummary, DurableSubtask, DurableTaskLifecycle, LlmJudge, LocalDurableTaskLifecycle,
-    MatrixOneDurableTaskLifecycle, NoopBranchOps, NoopTaskLearningBridge, SubtaskDeliverySummary,
-    SubtaskExecutionContext, SubtaskOutcomeSignal, SubtaskStage, SubtaskVerificationReport,
-    TaskBranchService, TaskContract, TaskDeliveryReport, TaskLearningBridge, TaskOutcomeSignal,
-    TaskPatternStats, TaskResumeContext, TaskScope, UnconfiguredDurableTaskLifecycle,
-    VerificationCriterion, VerificationLearningSignal, VerificationResult, VerificationRunner,
-    VerifierKind, build_outcome_signal,
+    CloudLlmConfig, CloudLlmJudge, ContractAmendment, ContractStatus, DiffSummary, DurableSubtask,
+    DurableTaskLifecycle, LlmJudge, LocalDurableTaskLifecycle, MatrixOneDurableTaskLifecycle,
+    NoopBranchOps, SubtaskDeliverySummary, SubtaskExecutionContext, SubtaskStage,
+    SubtaskVerificationReport, TaskBranchService, TaskContract, TaskDeliveryReport,
+    TaskResumeContext, TaskScope, UnconfiguredDurableTaskLifecycle, VerificationCriterion,
+    VerificationResult, VerificationRunner, VerifierKind,
 };
 pub use edge_context::{EdgeContext, EdgeProfile, EdgeSkillRef};
 pub use evaluation::{DatabaseEvaluationService, EvaluationService, UnconfiguredEvaluationService};
@@ -172,12 +169,6 @@ pub use multi_agent::{
     DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeAgentRecord, EdgeRegistryService,
     LeaseClaimResult, TaskLeaseHoldCache, TaskLeaseService, TaskLeaseView, TasksPackPushResult,
     UnconfiguredEdgeRegistryService, UnconfiguredTaskLeaseService,
-};
-pub use mutation_scoreboard::{
-    MutationActionCategory, MutationCompensationPolicy, MutationJudgment, MutationObjectiveScore,
-    MutationPromotionEvaluationContext, MutationPromotionRecommendation, MutationPromotionVerdict,
-    MutationRetentionVerdict, MutationSafetyVerdict, MutationScoreboard, MutationVerifierSummary,
-    PersistedMutationDecision, StagedMutation, StagedMutationState,
 };
 pub use pagination::{
     MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET,

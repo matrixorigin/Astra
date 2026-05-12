@@ -1,7 +1,15 @@
 # Memory System — Implementation Status
 
-> **Last Updated**: 2026-03-15 (Memoria episodic integration plan)
-> **Design Doc**: [memory/README.md](../design/memory/README.md)
+> ⚠ **Historical — Python-era.** The current Rust runtime is documented in
+> [../design/memory-runtime.md](../design/memory-runtime.md). This file
+> describes the Python-era memory backend (`core/memory/tabular/`, Python
+> `GovernanceScheduler`, `SessionSummarizer`) that has been replaced by
+> Memoria HTTP + the runtime path in `rust/crates/runtime/src/turn/`. It is
+> retained for historical context only.
+
+> **Last Updated**: 2026-03-15 (Python-era, frozen)
+> **Current design**: [../design/memory-runtime.md](../design/memory-runtime.md)
+> **Legacy design**: [../design/memory/README.md](../design/memory/README.md)
 > **Phase 1 Plan**: [memory-system-refactoring-2026-02-27.md](../../plans/memory-system-refactoring-2026-02-27.md)
 > **Phase 2 Plan**: [memory-system-phase2-2026-02-27.md](../../plans/memory-system-phase2-2026-02-27.md)
 > **Phase 3 Plan**: [memory-system-phase3-2026-02-27.md](../../plans/memory-system-phase3-2026-02-27.md)

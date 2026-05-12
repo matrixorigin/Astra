@@ -1,7 +1,16 @@
 # Memory Governance Implementation
 
-> **Status**: Complete  
+> ⚠ **Historical — Python-era.** The current Rust runtime's governance
+> model is described in
+> [../design/memory-runtime.md §6 (Session lifecycle)](../design/memory-runtime.md#6-session-lifecycle)
+> (client-side debounce + `purge_working` + `store_episode` + reflect
+> forward-feed). This file describes the Python-era
+> `MemoryGovernanceScheduler` with `AsyncIOBackend`, Celery/Temporal
+> hooks, and distributed locking — retained for historical context only.
+
+> **Status**: Frozen (Python-era)
 > **Last Updated**: 2026-02-20
+> **Current design**: [../design/memory-runtime.md](../design/memory-runtime.md)
 
 ---
 

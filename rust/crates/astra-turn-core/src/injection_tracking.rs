@@ -34,6 +34,13 @@ use serde::{Deserialize, Serialize};
 /// Stable channel identifier. Add variants when new injection sources
 /// are tracked — every new variant MUST also be wired into the runtime
 /// observer and into `freshness_report` ordering.
+///
+/// Every variant corresponds to a `dynamic_sections.push(...)` call in
+/// `runtime::turn::bridge_inprocess::build_turn_payload` (or the
+/// equivalent CLI edge_profile write). Keep them in one-to-one
+/// correspondence — if a new section is added to the prompt without a
+/// matching variant here, `introspect subtopic=injection_freshness`
+/// goes blind to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum InjectionChannel {
     /// `SelfModel.recent_failing_tests` rendered as "Recent test failures: ..."
@@ -44,26 +51,94 @@ pub enum InjectionChannel {
     Lessons,
     /// `AgenticLoopState.volatile_pending` content joined into a single fingerprint.
     VolatilePending,
+    /// `edge_profile.memoria_insights_text` — per-turn cross-session recall digest.
+    MemoriaInsights,
+    /// `memoria_prefetch_section` — pre-loaded Memoria memories on session start / compaction.
+    MemoriaPrefetch,
+    /// `edge_profile.self_awareness_text` — rendered `SelfModel::to_system_prompt_section()`.
+    SelfAwareness,
+    /// `feedback_store::build_injection_filtered` — learned correction rules.
+    FeedbackRules,
+    /// Per-turn `detect_implicit_feedback_signal` output — correction / frustration nudges.
+    ImplicitFeedback,
+    /// `edge_profile.recent_arg_hints_text` — recently-used paths / commands.
+    RecentArgHints,
+    /// `edge_profile.skill_listing_text` — available skills surface.
+    SkillListing,
+    /// `tool_round_guidance` — turn-budget batching / retry nudges.
+    ToolRoundGuidance,
 }
 
 impl InjectionChannel {
     /// Short stable tag for rendering / serialization.
+    ///
+    /// **Stability contract**: these tags are persisted in
+    /// `workspace.yaml::last_context_trace` and surfaced via the
+    /// `introspect subtopic=injection_freshness` table. Renaming them
+    /// breaks cross-process fingerprint history and any external
+    /// dashboards that scrape introspect output.
     pub fn tag(&self) -> &'static str {
         match self {
             Self::RecentFailingTests => "recent_failing_tests",
             Self::OutcomeBias => "outcome_bias",
             Self::Lessons => "lessons",
             Self::VolatilePending => "volatile_pending",
+            Self::MemoriaInsights => "memoria_insights",
+            Self::MemoriaPrefetch => "memoria_prefetch",
+            Self::SelfAwareness => "self_awareness",
+            Self::FeedbackRules => "feedback_rules",
+            Self::ImplicitFeedback => "implicit_feedback",
+            Self::RecentArgHints => "recent_arg_hints",
+            Self::SkillListing => "skill_listing",
+            Self::ToolRoundGuidance => "tool_round_guidance",
+        }
+    }
+
+    /// Reverse of [`Self::tag`]: parse the stable tag back into its
+    /// enum variant. Returns `None` for unknown tags — callers
+    /// observing a bridge-supplied fingerprint stream should treat
+    /// unknown tags as "future variant this binary doesn't know" and
+    /// skip them rather than panic.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "recent_failing_tests" => Some(Self::RecentFailingTests),
+            "outcome_bias" => Some(Self::OutcomeBias),
+            "lessons" => Some(Self::Lessons),
+            "volatile_pending" => Some(Self::VolatilePending),
+            "memoria_insights" => Some(Self::MemoriaInsights),
+            "memoria_prefetch" => Some(Self::MemoriaPrefetch),
+            "self_awareness" => Some(Self::SelfAwareness),
+            "feedback_rules" => Some(Self::FeedbackRules),
+            "implicit_feedback" => Some(Self::ImplicitFeedback),
+            "recent_arg_hints" => Some(Self::RecentArgHints),
+            "skill_listing" => Some(Self::SkillListing),
+            "tool_round_guidance" => Some(Self::ToolRoundGuidance),
+            _ => None,
         }
     }
 
     /// Canonical ordering used when rendering the full report.
-    pub fn all() -> [Self; 4] {
+    ///
+    /// Ordering policy: self-* signals first (failing tests, bias,
+    /// lessons), then volatile/content-derived lanes (volatile pending,
+    /// memoria insights, memoria prefetch), then behavioural/meta-state
+    /// lanes (self-awareness, feedback rules, implicit feedback), then
+    /// operational hints (recent-arg, skill listing, tool-round
+    /// guidance). Introspect renders in this order for stable output.
+    pub fn all() -> [Self; 12] {
         [
             Self::RecentFailingTests,
             Self::OutcomeBias,
             Self::Lessons,
             Self::VolatilePending,
+            Self::MemoriaInsights,
+            Self::MemoriaPrefetch,
+            Self::SelfAwareness,
+            Self::FeedbackRules,
+            Self::ImplicitFeedback,
+            Self::RecentArgHints,
+            Self::SkillListing,
+            Self::ToolRoundGuidance,
         ]
     }
 }
@@ -357,9 +432,23 @@ mod tests {
     #[test]
     fn channel_all_returns_stable_ordering_of_every_variant() {
         let all = InjectionChannel::all();
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 12);
+        // Self-* ordering: failing tests → bias → lessons.
         assert_eq!(all[0], InjectionChannel::RecentFailingTests);
+        assert_eq!(all[1], InjectionChannel::OutcomeBias);
+        assert_eq!(all[2], InjectionChannel::Lessons);
+        // Volatile + content-derived block.
         assert_eq!(all[3], InjectionChannel::VolatilePending);
+        assert_eq!(all[4], InjectionChannel::MemoriaInsights);
+        assert_eq!(all[5], InjectionChannel::MemoriaPrefetch);
+        // Behavioural / meta-state block.
+        assert_eq!(all[6], InjectionChannel::SelfAwareness);
+        assert_eq!(all[7], InjectionChannel::FeedbackRules);
+        assert_eq!(all[8], InjectionChannel::ImplicitFeedback);
+        // Operational hints block.
+        assert_eq!(all[9], InjectionChannel::RecentArgHints);
+        assert_eq!(all[10], InjectionChannel::SkillListing);
+        assert_eq!(all[11], InjectionChannel::ToolRoundGuidance);
     }
 
     #[test]
@@ -524,7 +613,7 @@ mod tests {
     fn freshness_report_channel_never_observed_is_untracked() {
         let h = InjectionHistory::new();
         let report = freshness_report(&h, 10);
-        assert_eq!(report.len(), 4);
+        assert_eq!(report.len(), InjectionChannel::all().len());
         for entry in &report {
             assert!(matches!(entry.status, ChannelStatus::Untracked));
             assert!(entry.preview.is_empty());

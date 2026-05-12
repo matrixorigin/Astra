@@ -270,7 +270,6 @@ async fn initialize_repl_state_marks_workspace_session_as_pending_recovery() {
     ws.turn_count = 1;
     ws.total_tokens_in = 5;
     ws.total_tokens_out = 3;
-    ws.session_goal = Some("ship session restore".to_string());
     ws.pinned_skills = vec![
         "session-lifecycle".to_string(),
         "goal-driven-evolution".to_string(),
@@ -389,7 +388,6 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
         budget_remaining_rounds: 8,
         blocked_tools: Vec::new(),
         recent_tools: vec!["bash".to_string()],
-        learning_snapshot_id: None,
         memory_context: None,
         delegation_id: None,
         delegation_pattern: None,
@@ -399,7 +397,7 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
         consecutive_context_window_errors: 0,
         pipeline_state: None,
         compaction_state: None,
-        continuity_state: None,
+        config_version_id: None,
     };
     astra_pipeline::step_checkpoint::write_step_checkpoint(
         &sid,
@@ -408,13 +406,10 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
     )
     .unwrap();
 
-    let summary_path = astra_runtime::claude_code_session_memory_path(&current_cwd_str, &sid);
-    std::fs::create_dir_all(summary_path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &summary_path,
-        "# Session Memory\n\n## Errors & Corrections\n- Use apply_patch instead of python file rewrites.\n\n## Learnings\n- Keep diffs minimal and project-scoped.\n",
-    )
-    .unwrap();
+    // Session-memory file setup removed: `build_session_memory_resume_guidance`
+    // now retrieves the last L1 from Memoria, not from disk. This test
+    // asserts the resume replay path but not the memory-content injection.
+    let _ = astra_runtime::claude_code_session_memory_path(&current_cwd_str, &sid);
 
     let mut creds = CredentialsFile::default();
     creds.profiles.insert(
@@ -516,9 +511,13 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
         .expect("expected first recovered request to target stale session id");
     let resumed_text = resumed.to_string();
     assert!(resumed_text.contains("rate_limited"));
-    assert!(resumed_text.contains("Keep diffs minimal and project-scoped."));
-    assert!(resumed_text.contains("Use apply_patch instead of python file rewrites."));
     assert!(resumed_text.contains("继续"));
+    // Session-memory resume-guidance content is no longer tested here:
+    // after the unified Memoria-backed rewrite, resume guidance reads
+    // the last L1 from Memoria instead of a local markdown file, and
+    // this test uses an HTTP mock (no Memoria endpoint). See
+    // `session_memory::MemoryExtractionService` for the canonical
+    // integration tests around L1 content.
 
     let retried = requests.last().unwrap();
     assert_ne!(
@@ -529,7 +528,8 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
     );
     let retried_text = retried.to_string();
     assert!(retried_text.contains("rate_limited"));
-    assert!(retried_text.contains("Keep diffs minimal and project-scoped."));
+    // Memory-content injection assertion removed with the Memoria
+    // unification — see note at resumed_text assertions above.
     assert_eq!(state.pending_recovery, None);
     assert_eq!(
         state.session_id.as_deref(),
@@ -702,111 +702,7 @@ async fn crash_recovery_low_information_repair_followup_rebuilds_attachment() {
     );
 }
 
-// ── Learning snapshot restoration ────────────────────────────────────────
-
-#[tokio::test]
-async fn resume_restores_learning_snapshot() {
-    use astra_services::session_restore::RestoredSession;
-
-    // Create a mock RestoredSession with learning snapshot
-    let restored = RestoredSession {
-        session_id: "test-learning".into(),
-        turn_count: 5,
-        total_tokens_in: 1000,
-        total_tokens_out: 500,
-        recent_tools: vec!["grep".into()],
-        learning_snapshot_json: Some(
-            r#"{"entities":["Rust","MatrixOne"],"patterns":["*.rs"]}"#.into(),
-        ),
-        checkpoint_count: 1,
-        last_status: "active".into(),
-        git_branch: Some("main".into()),
-        model: Some("gpt-4o".into()),
-        title: Some("Test".into()),
-        restored_from_cloud: true, // Cloud restore has learning
-        ..Default::default()
-    };
-
-    // Verify the learning snapshot is present
-    assert!(restored.learning_snapshot_json.is_some());
-    let json = restored.learning_snapshot_json.as_ref().unwrap();
-    assert!(json.contains("Rust"));
-    assert!(json.contains("MatrixOne"));
-
-    // Simulate what handle_resume_command does
-    let learning_snapshot = if let Some(ref l) = restored.learning_snapshot_json {
-        if !l.is_empty() { Some(l.clone()) } else { None }
-    } else {
-        None
-    };
-
-    assert!(learning_snapshot.is_some());
-    assert_eq!(learning_snapshot.unwrap().as_str(), json);
-}
-
-#[tokio::test]
-async fn resume_local_restore_has_no_learning_snapshot() {
-    use astra_services::session_restore::RestoredSession;
-
-    // Local restore should not have learning snapshot
-    let restored = RestoredSession {
-        session_id: "test-local".into(),
-        turn_count: 3,
-        total_tokens_in: 500,
-        total_tokens_out: 200,
-        recent_tools: vec![],
-        learning_snapshot_json: None, // Local restore doesn't have this
-        checkpoint_count: 1,
-        last_status: "active".into(),
-        git_branch: None,
-        model: None,
-        title: None,
-        restored_from_cloud: false,
-        ..Default::default()
-    };
-
-    assert!(restored.learning_snapshot_json.is_none());
-}
-
 // ── Edge cases ───────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn resume_handles_empty_learning_snapshot() {
-    use astra_services::session_restore::RestoredSession;
-
-    // Empty string should be treated as None
-    let restored = RestoredSession {
-        learning_snapshot_json: Some("".into()),
-        ..Default::default()
-    };
-
-    // Simulate the logic in handle_resume_command
-    let learning_snapshot = if let Some(ref l) = restored.learning_snapshot_json {
-        if !l.is_empty() { Some(l.clone()) } else { None }
-    } else {
-        None
-    };
-
-    assert!(
-        learning_snapshot.is_none(),
-        "empty string should be ignored"
-    );
-}
-
-#[tokio::test]
-async fn resume_handles_invalid_learning_json() {
-    use astra_services::session_restore::RestoredSession;
-
-    // Invalid JSON should still be stored (will fail at merge time)
-    let restored = RestoredSession {
-        learning_snapshot_json: Some("not valid json {{{".into()),
-        ..Default::default()
-    };
-
-    assert!(restored.learning_snapshot_json.is_some());
-    let json = restored.learning_snapshot_json.as_ref().unwrap();
-    assert!(json.contains("{"));
-}
 
 #[tokio::test]
 async fn resume_handles_malformed_workspace_yaml() {
@@ -877,66 +773,6 @@ async fn resume_handles_missing_workspace() {
     assert!(!result.restored_from_cloud);
 }
 
-// ── Integration: full resume flow simulation ─────────────────────────────
-
-#[tokio::test]
-async fn resume_full_flow_cloud_restore() {
-    use astra_services::session_restore::RestoredSession;
-
-    // Simulate a complete cloud restore scenario
-    let restored = RestoredSession {
-        session_id: "cloud-sess-123".into(),
-        turn_count: 42,
-        total_tokens_in: 150_000,
-        total_tokens_out: 80_000,
-        recent_tools: vec!["git".into(), "bash".into(), "grep".into()],
-        learning_snapshot_json: Some(r#"{"entities":["Rust","SQL"],"patterns":["*.rs"]}"#.into()),
-        checkpoint_count: 5,
-        last_status: "active".into(),
-        git_branch: Some("feature/resume".into()),
-        model: Some("claude-3-opus".into()),
-        title: Some("Implement session resume".into()),
-        restored_from_cloud: true,
-        ..Default::default()
-    };
-    assert_eq!(restored.session_id, "cloud-sess-123");
-    assert_eq!(restored.turn_count, 42);
-    assert!(restored.restored_from_cloud);
-    assert!(restored.learning_snapshot_json.is_some());
-    assert_eq!(restored.recent_tools.len(), 3);
-
-    // Simulate state application
-    let mut state = super::ReplState::default();
-    #[allow(clippy::field_reassign_with_default)]
-    {
-        state.session_id = Some(restored.session_id.clone());
-        state.turn = restored.turn_count;
-        state.total_prompt_tokens = restored.total_tokens_in;
-        state.total_completion_tokens = restored.total_tokens_out;
-        state.recent_tools = restored.recent_tools.clone();
-        state.model = restored.model.clone();
-        if let Some(ref m) = state.model {
-            state.cached_pricing = slash_stats::fallback_pricing(m);
-        }
-    }
-
-    // Apply learning snapshot
-    if let Some(ref l) = restored.learning_snapshot_json
-        && !l.is_empty()
-    {
-        state.learning_snapshot = Some(l.clone());
-    }
-
-    // Verify state
-    assert_eq!(state.session_id, Some("cloud-sess-123".into()));
-    assert_eq!(state.turn, 42);
-    assert_eq!(state.total_prompt_tokens, 150_000);
-    assert_eq!(
-        state.learning_snapshot.unwrap(),
-        r#"{"entities":["Rust","SQL"],"patterns":["*.rs"]}"#
-    );
-}
-
 // ── Checkpoint listing ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -984,180 +820,5 @@ total_tokens_out: 500
     assert!(ckpts.is_empty(), "no checkpoints created yet");
 }
 
-// ── merge_learning_snapshot ───────────────────────────────────────────────
-
-#[test]
-fn merge_learning_valid_snapshot() {
-    use astra_pipeline::{calibration, entity, pattern};
-
-    let json = serde_json::json!({
-        "version": 1,
-        "entities": [{
-            "name": "rust",
-            "aliases": ["rs"],
-            "domain": null,
-            "associated_tools": ["cargo"],
-            "confidence": 0.8,
-            "observation_count": 5
-        }],
-        "patterns": [{
-            "signature": "cargo",
-            "tools": ["cargo"],
-            "task_type": "Code",
-            "domain": null,
-            "success_count": 3,
-            "failure_count": 0,
-            "quality_sum": 2.4
-        }],
-        "calibration": null
-    })
-    .to_string();
-
-    let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
-    let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
-    let cal = std::sync::Arc::new(std::sync::Mutex::new(
-        calibration::ProgressiveCalibrator::default(),
-    ));
-
-    merge_learning_snapshot(&json, &eg, &pl, &cal);
-
-    // Verify entity content, not just count
-    let entities = eg.lock().unwrap().export();
-    assert_eq!(entities.len(), 1);
-    let e = &entities[0];
-    assert_eq!(e.name, "rust");
-    assert_eq!(e.aliases, vec!["rs"]);
-    assert_eq!(e.associated_tools, vec!["cargo"]);
-    assert!((e.confidence - 0.8).abs() < 1e-6);
-    assert_eq!(e.observation_count, 5);
-
-    // Verify pattern content, not just count
-    let patterns = pl.lock().unwrap().export();
-    assert_eq!(patterns.len(), 1);
-    let p = &patterns[0];
-    assert_eq!(p.signature, "cargo");
-    assert_eq!(p.tools, vec!["cargo"]);
-    assert_eq!(p.success_count, 3);
-    assert_eq!(p.failure_count, 0);
-}
-
-#[test]
-fn merge_learning_invalid_json_does_not_panic() {
-    use astra_pipeline::{calibration, entity, pattern};
-
-    let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
-    let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
-    let cal = std::sync::Arc::new(std::sync::Mutex::new(
-        calibration::ProgressiveCalibrator::default(),
-    ));
-
-    // Invalid JSON — should not panic, just print warning
-    merge_learning_snapshot("not valid json", &eg, &pl, &cal);
-
-    // Modules should remain empty
-    assert!(eg.lock().unwrap().export().is_empty());
-    assert!(pl.lock().unwrap().export().is_empty());
-}
-
-#[test]
-fn merge_learning_empty_snapshot() {
-    use astra_pipeline::{calibration, entity, pattern};
-
-    let json = serde_json::json!({
-        "version": 1,
-        "entities": [],
-        "patterns": [],
-        "calibration": null
-    })
-    .to_string();
-
-    let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
-    let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
-    let cal = std::sync::Arc::new(std::sync::Mutex::new(
-        calibration::ProgressiveCalibrator::default(),
-    ));
-
-    merge_learning_snapshot(&json, &eg, &pl, &cal);
-
-    assert!(eg.lock().unwrap().export().is_empty());
-    assert!(pl.lock().unwrap().export().is_empty());
-}
-
-#[test]
-fn merge_learning_idempotent() {
-    use astra_pipeline::{calibration, entity, pattern};
-
-    let json = serde_json::json!({
-        "version": 1,
-        "entities": [{"name": "rust", "aliases": [], "domain": null,
-            "associated_tools": ["cargo"], "confidence": 0.8, "observation_count": 5}],
-        "patterns": [{"signature": "cargo", "tools": ["cargo"], "task_type": "Code",
-            "domain": null, "success_count": 3, "failure_count": 0, "quality_sum": 2.4}],
-        "calibration": null
-    })
-    .to_string();
-
-    let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
-    let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
-    let cal = std::sync::Arc::new(std::sync::Mutex::new(
-        calibration::ProgressiveCalibrator::default(),
-    ));
-
-    // Merge twice — should not duplicate
-    merge_learning_snapshot(&json, &eg, &pl, &cal);
-    merge_learning_snapshot(&json, &eg, &pl, &cal);
-
-    assert_eq!(
-        eg.lock().unwrap().export().len(),
-        1,
-        "entities should not duplicate"
-    );
-    assert_eq!(
-        pl.lock().unwrap().export().len(),
-        1,
-        "patterns should not duplicate"
-    );
-}
-
-#[test]
-fn merge_learning_multiple_entities_and_patterns() {
-    use astra_pipeline::{calibration, entity, pattern};
-
-    let json = serde_json::json!({
-        "version": 1,
-        "entities": [
-            {"name": "rust", "aliases": [], "domain": null,
-                "associated_tools": ["cargo"], "confidence": 0.9, "observation_count": 10},
-            {"name": "matrixone", "aliases": ["mo"], "domain": "Database",
-                "associated_tools": ["sql_query"], "confidence": 0.7, "observation_count": 3}
-        ],
-        "patterns": [
-            {"signature": "cargo|grep", "tools": ["cargo", "grep"], "task_type": "Code",
-                "domain": null, "success_count": 5, "failure_count": 1, "quality_sum": 4.0},
-            {"signature": "sql_query", "tools": ["sql_query"], "task_type": "Fetch",
-                "domain": "Database", "success_count": 2, "failure_count": 0, "quality_sum": 1.8}
-        ],
-        "calibration": null
-    })
-    .to_string();
-
-    let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
-    let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
-    let cal = std::sync::Arc::new(std::sync::Mutex::new(
-        calibration::ProgressiveCalibrator::default(),
-    ));
-
-    merge_learning_snapshot(&json, &eg, &pl, &cal);
-
-    let entities = eg.lock().unwrap().export();
-    assert_eq!(entities.len(), 2);
-    let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-    assert!(names.contains(&"rust"));
-    assert!(names.contains(&"matrixone"));
-
-    let patterns = pl.lock().unwrap().export();
-    assert_eq!(patterns.len(), 2);
-    let sigs: Vec<&str> = patterns.iter().map(|p| p.signature.as_str()).collect();
-    assert!(sigs.contains(&"cargo|grep"));
-    assert!(sigs.contains(&"sql_query"));
-}
+// merge_learning_snapshot tests removed: the entity/pattern/calibration
+// learning subsystem has been deleted.

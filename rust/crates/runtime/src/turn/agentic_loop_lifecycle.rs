@@ -93,6 +93,55 @@ fn used_budget_extensions(state: &AgenticLoopState) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 
+/// Inject a one-shot "you have N turns left — wrap up" nudge into
+/// the volatile lane when crossing budget thresholds (50 % and
+/// 20 % remaining). Purpose: let a spawned agent that can't see
+/// its own max_turns recognise when it's running short and start
+/// finalising output instead of falling off the turn cliff with
+/// nothing delivered. The signal piggybacks on
+/// [`VolatileKind::BudgetAdvisory`] — one volatile slot per round,
+/// drained by the bridge. Short, blunt wording so the model acts on
+/// it rather than treating it as flavor text.
+///
+/// Guard against repeated emission: we only fire exactly once per
+/// threshold crossing. The threshold watermarks live on the state
+/// (`turn_budget_hint_emitted_50`, `..._20`). A budget extension
+/// resets them so a freshly-extended budget gets the hints again
+/// at the new thresholds.
+fn maybe_emit_turn_budget_self_pacing_hint(state: &mut AgenticLoopState) {
+    // Budgets of 3 turns or fewer aren't worth pacing — the hint
+    // itself would be the largest part of the remaining work.
+    if state.max_turns < 4 {
+        return;
+    }
+    // `remaining_turns` was already decremented by the caller, so
+    // this is the TRUE number remaining for this round and later.
+    let remaining = state.remaining_turns;
+    let max = state.max_turns;
+    if max == 0 {
+        return;
+    }
+    let pct_remaining = remaining * 100 / max;
+
+    // 20 % crossing: hard nudge. 50 % crossing: soft nudge.
+    // Emit the highest-priority (lowest %) threshold that newly
+    // triggered, not both.
+    if pct_remaining <= 20 && !state.turn_budget_hint_emitted_20 {
+        state.turn_budget_hint_emitted_20 = true;
+        state.turn_budget_hint_emitted_50 = true; // hoist so we don't re-emit 50 later
+        let msg = format!(
+            "[turn-budget] {remaining}/{max} turns remaining (≤20%). Wrap up now: write your final answer or last tool call. Further discovery will be cut off."
+        );
+        state.push_volatile(super::agentic_loop_host::VolatileKind::BudgetAdvisory, msg);
+    } else if pct_remaining <= 50 && !state.turn_budget_hint_emitted_50 {
+        state.turn_budget_hint_emitted_50 = true;
+        let msg = format!(
+            "[turn-budget] {remaining}/{max} turns remaining (≤50%). Start converging: prioritise the deliverable over exploration."
+        );
+        state.push_volatile(super::agentic_loop_host::VolatileKind::BudgetAdvisory, msg);
+    }
+}
+
 pub(crate) fn extract_tool_args(args: Option<&str>) -> Option<Value> {
     let args = args?;
     serde_json::from_str::<Value>(args).ok()
@@ -272,6 +321,12 @@ fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
 
     state.max_turns += additional_turns;
     state.remaining_turns += additional_turns;
+    // Fresh budget → fresh self-pacing thresholds. Without this,
+    // a child that already emitted the 50 %/20 % hints at the
+    // original budget would be silent through the extension and
+    // crash off the new cliff with no warning.
+    state.turn_budget_hint_emitted_50 = false;
+    state.turn_budget_hint_emitted_20 = false;
     let review_message = format!(
         "[Budget review] Recent progress looks real for this {}task, so continuing with {} extra turn(s). Hard limit: {} total turns.",
         if state.task_profile.exploratory_task {
@@ -350,22 +405,14 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     }
 
     if let Some(resolver) = &state.skills.resolver {
-        let full = resolver.available_skills();
-        if !full.is_empty() {
-            let (visible, open_skill_name, _telemetry) =
-                crate::turn::skill_tool::visible_skills_for_host_turn(
-                    &full,
-                    state.message.as_str(),
-                    &state.skills.quality_tracker,
-                    &state.skills.pinned,
-                    &state.skills.discovered,
-                    &state.skills.invoked,
-                    &state.skills.search,
-                );
-            host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
-                &visible,
-                open_skill_name,
-            ));
+        // Phase-9: `skill_tool_schema_v2` is a byte-stable constant — it
+        // takes no skill list and advertises `skill_name` as an open
+        // string. The catalog is surfaced via `<available_skills>` in the
+        // session-cached prompt prefix (see `build_skill_listing_section`),
+        // so adding/removing a skill no longer perturbs the tool schema
+        // bytes.
+        if !resolver.available_skills().is_empty() {
+            host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
         }
     }
 
@@ -376,30 +423,6 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     // BEFORE the Session→None marker — now it participates in the cached
     // session prefix instead of being re-sent after the marker every turn.
     // See `context_pipeline_adapter::build_session_context` + `bind_project_context`.
-
-    if let Some(ref evo) = state.evolution_service {
-        let turn_id = state.current_run_id.as_deref().unwrap_or("unknown");
-        let prior_assistant = state
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-            .and_then(|m| m.get("content").and_then(|c| c.as_str()))
-            .map(String::from);
-        let active_skill: Option<String> = state
-            .skills
-            .invoked
-            .iter()
-            .max_by_key(|(_, v)| v.invoked_at_turn)
-            .map(|(name, _)| name.clone());
-        evo.on_user_message(
-            &state.message,
-            prior_assistant.as_deref(),
-            active_skill.as_deref(),
-            turn_id,
-        )
-        .await;
-    }
 }
 
 pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
@@ -576,6 +599,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
 
     state.remaining_turns = state.remaining_turns.saturating_sub(1);
+    maybe_emit_turn_budget_self_pacing_hint(state);
     state.step_recorder.begin_turn_with_context(
         session_turn_number(state).saturating_sub(1),
         turn_index as u32,
@@ -758,63 +782,59 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
 
     if let Some(resolver) = &state.skills.resolver {
+        // Phase-9: skill listing moves from per-turn volatile to
+        // session-stable. The full skill catalog is rendered via
+        // `build_skill_listing_section` (CacheScope::Session) and hosted
+        // inside the ProjectContext binding. No per-turn reranking:
+        // the model reads the list and picks.
+        //
+        // We still populate `listing_message` as a rendered `role: system`
+        // value for downstream adapters (introspect tooling, tests) so
+        // they don't need to know about the cache-scope plumbing.
         let full = resolver.available_skills();
         state.skills.listing_message = if full.is_empty() {
             None
         } else {
-            let (visible, open_skill_name, telemetry) =
-                crate::turn::skill_tool::visible_skills_for_host_turn(
-                    &full,
-                    state.message.as_str(),
-                    &state.skills.quality_tracker,
-                    &state.skills.pinned,
-                    &state.skills.discovered,
-                    &state.skills.invoked,
-                    &state.skills.search,
-                );
-            let shortlist = crate::turn::skill_tool::build_skill_selector_shortlist_trace(
-                &visible,
-                open_skill_name,
-                telemetry,
-            );
+            // Telemetry: record the shortlist once per session for
+            // observability. Marks every skill visible (no ranking).
             if state.telemetry.initial_skill_selector_shortlist.is_none() {
+                let shortlist = crate::turn::skill_tool::build_skill_selector_shortlist_trace(
+                    &full,
+                    /* open_skill_name */ true,
+                    Default::default(),
+                );
                 if let Some(ref collector) = state.telemetry.turn_trace_collector {
                     collector.record_skill_selector(shortlist.clone());
                 }
                 state.telemetry.initial_skill_selector_shortlist = Some(shortlist);
             }
-            Some(crate::turn::skill_tool::skill_listing_system_message(
-                &visible,
-                Some(&state.skills.quality_tracker),
-                Some(&state.skills.pinned),
-                open_skill_name,
-            ))
+            crate::prompts::build_skill_listing_section(&full).map(|section| {
+                serde_json::json!({
+                    "role": "system",
+                    "content": section.text,
+                })
+            })
         };
     }
 
     if turn_index > 0 {
-        // Working-set + inventory snapshots go through the structured
-        // volatile lane so they stay out of `state.messages[]` — the
-        // wire layer drains them into volatile_preamble for each LLM
-        // call. Previously these were pushed as trailing `role=system`
-        // messages and had to be re-deduped before every push, which
-        // still broke Anthropic/DeepSeek prefix caching (session
-        // 05e63cac / c0905eab). Legacy retains() stay for a grace
-        // period to scrub checkpoints restored from pre-migration
-        // sessions.
-        const WORKING_SET_HEADER: &str = "[working-set:v1]\n";
+        // Inventory snapshots go through the structured volatile lane so
+        // they stay out of `state.messages[]` — the wire layer drains
+        // them into volatile_preamble for each LLM call. Legacy
+        // retains() stay for a grace period to scrub checkpoints
+        // restored from pre-migration sessions (working-set / attention
+        // manifests were removed in wip-3).
+        const LEGACY_WORKING_SET_HEADER: &str = "[working-set:v1]\n";
+        const LEGACY_ATTENTION_HEADER: &str = "[attention:v1]\n";
         state.messages.retain(|m| {
-            m.get("role").and_then(Value::as_str) != Some("system")
-                || !m
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|c| c.starts_with(WORKING_SET_HEADER))
+            let role = m.get("role").and_then(Value::as_str);
+            let content = m.get("content").and_then(Value::as_str);
+            match (role, content) {
+                (Some("system"), Some(c)) if c.starts_with(LEGACY_WORKING_SET_HEADER) => false,
+                (Some("user"), Some(c)) if c.starts_with(LEGACY_ATTENTION_HEADER) => false,
+                _ => true,
+            }
         });
-        let working_set_text = state.session_facts.to_working_set_injection(&state.message);
-        state.push_volatile(
-            super::agentic_loop_host::VolatileKind::WorkingSet,
-            working_set_text,
-        );
 
         const INVENTORY_HEADER: &str = "## Already Fetched (do NOT re-read/re-grep these)\n";
         state.messages.retain(|m| {
@@ -1127,69 +1147,6 @@ mod tests {
             budget_entries, 1,
             "budget injection must be idempotent (singleton dedup); pending={:?}",
             state.volatile_pending,
-        );
-    }
-
-    #[tokio::test]
-    async fn prepare_turn_injects_single_canonical_working_set() {
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.message = "continue fixing context continuity".to_string();
-        state
-            .session_facts
-            .active_files
-            .push(astra_turn_types::session_facts::FileEntry {
-                path: "src/main.rs".to_string(),
-                last_action: "write".to_string(),
-                turn: 1,
-            });
-
-        let _ = prepare_turn_iteration(&mut host, &mut state, 1)
-            .await
-            .expect("prepare turn");
-        let _ = prepare_turn_iteration(&mut host, &mut state, 2)
-            .await
-            .expect("prepare next turn");
-
-        // Post-Task #45: working-set lives in the structured volatile lane,
-        // not in state.messages. The lane drains per LLM call so at
-        // prepare-turn time we see at most ONE pending entry (the
-        // current turn's snapshot) — second-call replace, not accumulate.
-        let working_sets: Vec<_> = state
-            .volatile_pending
-            .iter()
-            .filter(|inj| inj.content.starts_with("[working-set:v1]\n"))
-            .collect();
-        assert_eq!(
-            working_sets.len(),
-            1,
-            "working set lane must hold exactly one entry per prepare cycle, \
-             got {} in pending={:?} and messages={:?}",
-            working_sets.len(),
-            state.volatile_pending,
-            state.messages,
-        );
-        assert_eq!(
-            working_sets[0].kind,
-            super::super::agentic_loop_host::VolatileKind::WorkingSet,
-        );
-        assert!(
-            working_sets[0]
-                .content
-                .contains("goal: continue fixing context continuity")
-        );
-        assert!(working_sets[0].content.contains("- src/main.rs [write t1]"));
-        // And messages[] must stay clean of working-set content.
-        let msg_working_sets: Vec<_> = state
-            .messages
-            .iter()
-            .filter_map(|m| m.get("content").and_then(serde_json::Value::as_str))
-            .filter(|c| c.starts_with("[working-set:v1]\n"))
-            .collect();
-        assert!(
-            msg_working_sets.is_empty(),
-            "working-set must NEVER end up in state.messages (byte-stable \
-             history invariant); leaked into: {msg_working_sets:?}",
         );
     }
 

@@ -175,31 +175,6 @@ pub(super) fn detect_correction_signal(message: &str) -> bool {
     CORRECTION_PATTERNS.iter().any(|p| msg_lower.contains(p))
 }
 
-/// Emit an `EvolutionSignal::UserCorrection` (if evolution service is wired)
-/// from the current conversation context. Extracted from `run_chat_turn` for
-/// unit-testability; production code path is unchanged.
-async fn emit_user_correction_signal(state: &ReplState, correction_text: &str) {
-    let Some(evo) = state.evolution_service.as_ref() else {
-        return;
-    };
-    let prior_assistant_text = state
-        .history
-        .last()
-        .map(|(_u, a)| a.clone())
-        .unwrap_or_default();
-    let skill_context = state.recent_tools.last().cloned();
-    let turn_id = format!("turn-{}", state.turn);
-    evo.add_signal(
-        astra_runtime::evolution::types::EvolutionSignal::UserCorrection {
-            correction_text: correction_text.to_string(),
-            prior_assistant_text,
-            skill_context,
-            turn_id,
-        },
-    )
-    .await;
-}
-
 enum TurnAttempt {
     Completed(Box<Result<StreamResult, crate::TurnFailure>>),
     Interrupted,
@@ -494,17 +469,12 @@ pub(super) fn build_effective_line(
         .as_deref()
         .filter(|_| is_low_information_followup(line))
     {
-        let goal_line = state
-            .session_goal
-            .as_deref()
-            .map(|g| format!("Session goal: {g}\n"))
-            .unwrap_or_default();
         effective_line = format!(
             "[Active task attachment]\n\
 Resume the active task/thread below unless the user explicitly changes topic.\n\
 Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
 If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
-{goal_line}{anchor}\n\n[User follow-up]\n{effective_line}"
+{anchor}\n\n[User follow-up]\n{effective_line}"
         );
     }
 
@@ -741,37 +711,6 @@ fn is_greeting_like_message(line: &str) -> bool {
     ) || matches!(trimmed, "你好" | "您好" | "嗨" | "哈喽")
 }
 
-fn session_goal_candidate(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if trimmed.is_empty()
-        || is_greeting_like_message(trimmed)
-        || is_low_information_followup(trimmed)
-    {
-        return None;
-    }
-
-    Some(truncate_chars(trimmed, 220))
-}
-
-fn session_goal_is_placeholder(goal: &str) -> bool {
-    let trimmed = goal.trim();
-    trimmed.is_empty() || is_greeting_like_message(trimmed)
-}
-
-fn maybe_update_session_goal(state: &mut ReplState, line: &str) {
-    let Some(candidate) = session_goal_candidate(line) else {
-        return;
-    };
-
-    match state.session_goal.as_deref() {
-        None => state.session_goal = Some(candidate),
-        Some(existing) if session_goal_is_placeholder(existing) => {
-            state.session_goal = Some(candidate);
-        }
-        Some(_) => {}
-    }
-}
-
 fn summarize_assistant_for_anchor(full_text: &str) -> Option<String> {
     let mut lines = Vec::new();
     let mut total_chars = 0usize;
@@ -985,12 +924,6 @@ async fn run_chat_turn(
         let correction_turn = state.history.len() as u32;
         state.drift_user_corrections.push(correction_turn);
 
-        // Also emit an EvolutionSignal::UserCorrection so the evolution
-        // service / auto-reflection pipeline can learn from it. Previously
-        // only drift_user_corrections was recorded and no signal was ever
-        // produced for user corrections in the production path.
-        emit_user_correction_signal(state, message).await;
-
         // Incremental lesson checkpoint: user correction is a high-value
         // breakpoint — extract any new lessons NOW rather than waiting for
         // session end. Fire-and-forget: never blocks the user's turn.
@@ -1052,12 +985,11 @@ async fn run_chat_turn(
             git_worktree_journal: Some(state.git_worktree_journal.clone()),
             session_state_journal: Some(state.session_state_journal.clone()),
             task_manager: Some(state.task_manager.clone()),
-            runtime_continuity: state.runtime_continuity.as_ref(),
             turn_index: state.turn,
-            evolution_service: state.evolution_service.clone(),
             pipeline_state: None,
             pre_loaded_messages: None,
-                    append_system_prompt: None,
+            append_system_prompt: None,
+            session_memory_extractor: state.session_memory_extractor.clone(),
             #[cfg(feature = "harness")]
             harness_sink: Some(state.harness_sink.clone()),
             #[cfg(feature = "harness")]
@@ -1786,6 +1718,7 @@ async fn apply_turn_success_async(
 
     // Background memory extraction: analyze this turn for durable memories.
     let tools_used: Vec<String> = state.recent_tools.to_vec();
+    let recent_memory_actions: Vec<String> = state.recent_memory_actions.to_vec();
     let extraction_turn = state.turn;
 
     // Resolve fork prefix for extraction cache sharing: look up the
@@ -1810,6 +1743,7 @@ async fn apply_turn_success_async(
                 user_message: line,
                 assistant_response: state.last_response.as_deref().unwrap_or(""),
                 tools_used: &tools_used,
+                recent_memory_actions: &recent_memory_actions,
                 session_id: state.session_id.as_deref(),
                 existing_manifest: "",
                 fork_prefix,
@@ -1896,7 +1830,6 @@ fn apply_turn_success_sync(
                 let obs_session = hub.start_session(&user_id, session_id);
                 state.observability_session = Some(obs_session);
                 apply_pending_adaptive_state(state);
-                apply_pending_goal_progress_state(state);
             }
         }
     }
@@ -1916,7 +1849,6 @@ fn apply_turn_success_sync(
         &state.cached_pricing,
     );
     state.total_session_cost += turn_cost;
-    state.runtime_continuity = Some(result.runtime_continuity.clone());
     state.last_response = Some(result.full_text.clone());
     state.continuation_anchor = build_continuation_anchor(state, line, &result);
     state.pending_followup_suggestion =
@@ -1927,7 +1859,6 @@ fn apply_turn_success_sync(
         super::repl_ui::clear_followup_prompt_hint();
     }
 
-    maybe_update_session_goal(state, line);
     // New user input invalidates redo stack (history diverged)
     state.redo_stack.clear();
     state.history.push((
@@ -1935,6 +1866,8 @@ fn apply_turn_success_sync(
         build_history_text(&result.full_text, &result.tool_call_records),
     ));
     state.recent_tools = result.tools_used.clone();
+    state.recent_memory_actions =
+        super::memory_extraction::extract_memory_actions(&result.tool_call_records);
 
     // Persist tool health for cross-session error budgets
     if !result.tool_health_export.is_empty() {
@@ -2363,7 +2296,6 @@ fn build_full_session_state_compact(
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
     astra_turn_core::conversation_log::SessionStateCompact {
         recent_tools: state.recent_tools.clone(),
-        continuity: state.runtime_continuity.clone(),
         blocked_tools: cp
             .blocked_tools
             .unwrap_or_else(|| prev_state.blocked_tools.clone()),
@@ -2718,6 +2650,33 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
         let _ = journal.append(&start_event);
         // enqueue_ingestion skips if matrix_runtime is None
         enqueue_ingestion(state, &start_event);
+
+        // Resolve the content-addressed version of the config this
+        // session will run under and emit a paired `startup`
+        // ConfigChange event. If resolution fails (HOME unreadable,
+        // disk full), we degrade gracefully — state.config_version_id
+        // stays None and downstream checkpoints carry None.
+        use astra_config::config_versions::ConfigVersionStore;
+        if state.config_version_id.is_none()
+            && let Some(store) = astra_config::config_versions::LocalFileStore::at_default_root()
+        {
+            let meta = astra_config::config_versions::PutMetadata {
+                source_session: Some(session_id.to_string()),
+                parent: None,
+            };
+            if let Ok(id) = store.put(&state.runtime_config, meta) {
+                let ev = session_journal::JournalEvent::config_version_change(
+                    Some(session_id),
+                    state.turn,
+                    None,
+                    id.as_str(),
+                    "startup",
+                );
+                let _ = journal.append(&ev);
+                enqueue_ingestion(state, &ev);
+                state.config_version_id = Some(id.as_str().to_string());
+            }
+        }
     }
 
     // Keep workspace metadata in sync without resetting accumulated counters.
@@ -2759,7 +2718,6 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
             astra_runtime::observability_integration::ObservabilitySession::new_simple(session_id),
         )));
         apply_pending_adaptive_state(state);
-        apply_pending_goal_progress_state(state);
     }
 }
 
@@ -2881,27 +2839,12 @@ fn sync_session_state_to_workspace(
     state: &ReplState,
     ws: &mut astra_services::session_workspace::WorkspaceMetadata,
 ) {
-    ws.session_goal = state.session_goal.clone();
-    ws.goal_progress = None;
     ws.pinned_skills = state.pinned_skills.iter().cloned().collect();
     ws.discovered_skills = state.discovered_skills.iter().cloned().collect();
 
     // Persist adaptive engine state (anti-flap, experiment, tuned config)
     if let Some(obs) = &state.observability_session {
         if let Ok(guard) = obs.read() {
-            ws.goal_progress = guard.goal_progress_snapshot().filter(|progress| {
-                state
-                    .session_goal
-                    .as_deref()
-                    .map(|goal| goal == progress.goal.as_str())
-                    .unwrap_or(true)
-            });
-            if ws.session_goal.is_none() {
-                ws.session_goal = ws
-                    .goal_progress
-                    .as_ref()
-                    .map(|progress| progress.goal.clone());
-            }
             ws.last_scenario_change_turn = guard.last_scenario_change_turn;
             ws.last_token_budget_direction = guard.last_token_budget_direction;
             ws.last_token_budget_change_turn = guard.last_token_budget_change_turn;
@@ -2916,24 +2859,10 @@ pub(super) struct GoalSteeringChange {
 }
 
 pub(super) fn steer_observability_goal(
-    state: &mut ReplState,
-    goal: &str,
+    _state: &mut ReplState,
+    _goal: &str,
 ) -> Option<GoalSteeringChange> {
-    let session_turn = state.turn;
-    let obs = state.observability_session.as_ref()?;
-    let mut guard = obs.write().unwrap_or_else(|error| error.into_inner());
-    let previous_goal = guard
-        .goal_tracker
-        .as_ref()
-        .map(|tracker| tracker.goal().to_string())
-        .or_else(|| guard.original_query.clone());
-    if !guard.steer_goal(goal) {
-        return None;
-    }
-    Some(GoalSteeringChange {
-        previous_goal,
-        turn: session_turn,
-    })
+    None
 }
 
 /// Apply persisted adaptive engine state to a newly created ObservabilitySession.
@@ -2968,36 +2897,6 @@ pub(super) fn apply_pending_adaptive_state(state: &mut ReplState) {
         {
             let current = std::mem::take(&mut guard.config);
             guard.config = current.merge(saved_config);
-        }
-    }
-}
-
-pub(super) fn apply_pending_goal_progress_state(state: &mut ReplState) {
-    let goal_progress = match state.pending_goal_progress.take() {
-        Some(progress) => progress,
-        None => return,
-    };
-    if state
-        .session_goal
-        .as_deref()
-        .map(|goal| goal != goal_progress.goal.as_str())
-        .unwrap_or(false)
-    {
-        // Deliberately drop stale progress snapshots when the tracked goal no longer
-        // matches the current session goal.
-        return;
-    }
-    let obs = match &state.observability_session {
-        Some(session) => session,
-        None => {
-            state.pending_goal_progress = Some(goal_progress);
-            return;
-        }
-    };
-    match obs.write() {
-        Ok(mut guard) => guard.restore_goal_progress(goal_progress),
-        Err(_) => {
-            state.pending_goal_progress = Some(goal_progress);
         }
     }
 }
@@ -3074,7 +2973,6 @@ fn build_manual_heavy_step_checkpoint(
         budget_remaining_rounds: max_turns.saturating_sub(state.turn),
         blocked_tools: Vec::new(),
         recent_tools: state.recent_tools.clone(),
-        learning_snapshot_id: None,
         memory_context: None,
         delegation_id: None,
         delegation_pattern: None,
@@ -3084,7 +2982,10 @@ fn build_manual_heavy_step_checkpoint(
         consecutive_context_window_errors: 0,
         compaction_state: None,
         pipeline_state: None,
-        continuity_state: None,
+        // Step 2b: stamp the pointer from ReplState so this checkpoint
+        // records exactly which version of the runtime config the
+        // session ran under at the time it was written.
+        config_version_id: state.config_version_id.clone(),
     };
     StepCheckpoint::Heavy(Box::new(heavy))
 }
@@ -3438,9 +3339,23 @@ mod tests {
                 .count(),
             2,
         );
+        // initialize_journal emits SessionStart immediately followed
+        // by a ConfigChange (`source = "startup"`) recording the
+        // content-addressed version of the active RuntimeConfig. The
+        // most recent reopen must produce both events in that order.
+        let last_two: Vec<_> = events
+            .iter()
+            .rev()
+            .take(2)
+            .map(|e| e.event_type.clone())
+            .collect();
         assert_eq!(
-            events.last().map(|event| &event.event_type),
-            Some(&session_journal::JournalEventType::SessionStart)
+            last_two,
+            vec![
+                session_journal::JournalEventType::ConfigChange,
+                session_journal::JournalEventType::SessionStart,
+            ],
+            "reopen must produce SessionStart followed by a startup ConfigChange",
         );
 
         let restored_ws = astra_services::session_workspace::read_workspace(&sid).unwrap();
@@ -3479,9 +3394,6 @@ mod tests {
                 Some(&sid),
                 "default",
                 "repl_startup",
-                Some(3),
-                true,
-                2,
                 &["blocked_tools".to_string()],
                 false,
             ))
@@ -3525,80 +3437,6 @@ mod tests {
     }
 
     #[test]
-    fn sync_session_state_persists_goal_progress() {
-        let mut state = ReplState::default();
-        state.session_goal = Some("ship auth".to_string());
-        let mut obs =
-            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-goal");
-        obs.record_query("ship auth");
-        obs.record_tool_result(
-            "bash",
-            "test result: ok. 12 passed; 0 failed; 0 ignored",
-            Some(0),
-        );
-        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(obs)));
-
-        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new("sid-goal", "m");
-        sync_session_state_to_workspace(&state, &mut ws);
-
-        let progress = ws.goal_progress.expect("goal progress should persist");
-        assert_eq!(progress.goal, "ship auth");
-        assert_eq!(progress.milestone_count, 1);
-        assert!(progress.completion_score > 0.0);
-    }
-
-    #[test]
-    fn apply_pending_goal_progress_restores_observability_tracker() {
-        let mut source =
-            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-src");
-        source.record_query("ship auth");
-        source.record_tool_result("bash", "Finished `dev` profile", Some(0));
-        let snapshot = source
-            .goal_progress_snapshot()
-            .expect("goal progress snapshot");
-
-        let mut state = ReplState::default();
-        state.session_goal = Some(snapshot.goal.clone());
-        state.pending_goal_progress = Some(snapshot.clone());
-        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-dst"),
-        )));
-
-        apply_pending_goal_progress_state(&mut state);
-
-        let restored = state
-            .observability_session
-            .as_ref()
-            .unwrap()
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .goal_progress()
-            .expect("restored progress");
-        assert_eq!(restored.milestone_count, snapshot.milestone_count);
-        assert!(state.pending_goal_progress.is_none());
-    }
-
-    #[test]
-    fn apply_pending_goal_progress_requeues_when_lock_is_poisoned() {
-        let mut source =
-            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-src");
-        source.record_query("ship auth");
-        source.record_tool_result("bash", "Finished `dev` profile", Some(0));
-        let snapshot = source
-            .goal_progress_snapshot()
-            .expect("goal progress snapshot");
-
-        let mut state = ReplState::default();
-        state.session_goal = Some(snapshot.goal.clone());
-        state.pending_goal_progress = Some(snapshot.clone());
-        state.observability_session = Some(poisoned_observability_session("sid-poisoned"));
-
-        apply_pending_goal_progress_state(&mut state);
-
-        assert_eq!(state.pending_goal_progress, Some(snapshot));
-    }
-
-    #[test]
     fn apply_pending_adaptive_state_requeues_when_lock_is_poisoned() {
         let mut state = ReplState::default();
         state.pending_adaptive_state = Some(super::repl_state::PersistedAdaptiveState {
@@ -3619,53 +3457,6 @@ mod tests {
             .expect("adaptive state should remain pending");
         assert_eq!(adaptive.last_token_budget_direction, 1);
         assert_eq!(adaptive.active_experiment_id.as_deref(), Some("exp-1"));
-    }
-
-    #[test]
-    fn steer_observability_goal_updates_live_tracker() {
-        let mut state = ReplState::default();
-        let mut obs =
-            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-steer");
-        obs.record_query("finish auth flow");
-        obs.compressed_turns.push(2);
-        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(obs)));
-
-        steer_observability_goal(&mut state, "ship billing flow");
-
-        let guard = state
-            .observability_session
-            .as_ref()
-            .unwrap()
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(guard.original_query.as_deref(), Some("ship billing flow"));
-        assert_eq!(
-            guard.goal_tracker.as_ref().map(|tracker| tracker.goal()),
-            Some("ship billing flow")
-        );
-        assert_eq!(guard.recent_queries, vec!["ship billing flow".to_string()]);
-        assert!(guard.compressed_turns.is_empty());
-    }
-
-    #[test]
-    fn steer_observability_goal_reports_session_turn_not_internal_loop_turn() {
-        let mut state = ReplState {
-            turn: 3,
-            ..Default::default()
-        };
-        let mut obs =
-            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-steer");
-        obs.turn_number = 6;
-        obs.record_query("review session health");
-        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(obs)));
-
-        let change = steer_observability_goal(&mut state, "run plan execution").expect("change");
-
-        assert_eq!(change.turn, 3);
-        assert_eq!(
-            change.previous_goal.as_deref(),
-            Some("review session health")
-        );
     }
 
     #[test]
@@ -4038,71 +3829,6 @@ mod tests {
         );
         assert!(!effective.contains("[Active task attachment]"));
         assert_eq!(effective, "修一下输入法问题");
-    }
-
-    #[test]
-    fn build_effective_line_injects_session_goal_with_anchor() {
-        let state = ReplState {
-            continuation_anchor: Some(
-                "Latest user task: fix auth middleware\nLatest assistant direction: add JWT validation"
-                    .to_string(),
-            ),
-            session_goal: Some("build a REST API with axum".to_string()),
-            ..ReplState::default()
-        };
-
-        let effective = build_effective_line("ok", &state, &mut crate::ui_adapter::LineUiAdapter);
-        assert!(
-            effective.contains("[Active task attachment]"),
-            "anchor injected"
-        );
-        assert!(
-            effective.contains("Session goal: build a REST API with axum"),
-            "session goal present"
-        );
-        assert!(
-            effective.contains("fix auth middleware"),
-            "latest task present"
-        );
-
-        // Without session_goal
-        let state_no_goal = ReplState {
-            continuation_anchor: Some("Latest user task: fix auth".to_string()),
-            session_goal: None,
-            ..ReplState::default()
-        };
-        let effective_no_goal = build_effective_line(
-            "sure",
-            &state_no_goal,
-            &mut crate::ui_adapter::LineUiAdapter,
-        );
-        assert!(effective_no_goal.contains("[Active task attachment]"));
-        assert!(!effective_no_goal.contains("Session goal:"));
-    }
-
-    #[test]
-    fn maybe_update_session_goal_promotes_substantive_goal_after_greeting() {
-        let mut state = ReplState::default();
-
-        maybe_update_session_goal(&mut state, "hi");
-        assert!(state.session_goal.is_none());
-
-        maybe_update_session_goal(&mut state, "review local changes");
-        assert_eq!(state.session_goal.as_deref(), Some("review local changes"));
-    }
-
-    #[test]
-    fn maybe_update_session_goal_replaces_placeholder_but_preserves_real_goal() {
-        let mut state = ReplState {
-            session_goal: Some("hi".to_string()),
-            ..ReplState::default()
-        };
-
-        maybe_update_session_goal(&mut state, "review local changes");
-        assert_eq!(state.session_goal.as_deref(), Some("review local changes"));
-
-        maybe_update_session_goal(&mut state, "investigate auth refresh drift");
-        assert_eq!(state.session_goal.as_deref(), Some("review local changes"));
     }
 
     #[test]
@@ -4547,7 +4273,6 @@ mod tests {
             step_recorder_summary: None,
             tool_health_export: Vec::new(),
             last_heavy_checkpoint: None,
-            runtime_continuity: Default::default(),
             ttft_ms: None,
             context_ms: None,
             selector_strategy: None,
@@ -5253,57 +4978,6 @@ mod tests {
         let unchanged = std::fs::read_to_string(&skill_md).unwrap();
         assert_eq!(unchanged, original, "SKILL.md must not be modified");
         assert!(state.skill_improvement_tracker.pending_proposal.is_none());
-    }
-
-    // ─── E2E: user correction → EvolutionSignal::UserCorrection emission ───
-    #[tokio::test]
-    async fn emit_user_correction_pushes_signal_to_evolution_service() {
-        let evo = std::sync::Arc::new(astra_runtime::evolution::service::EvolutionService::new());
-        let state = ReplState {
-            evolution_service: Some(evo.clone()),
-            history: vec![(
-                "write a function".to_string(),
-                "here is the function".to_string(),
-            )],
-            recent_tools: vec!["filesystem".to_string()],
-            turn: 3,
-            ..Default::default()
-        };
-
-        emit_user_correction_signal(&state, "no, that's wrong, do it differently").await;
-
-        let (_fast, llm_routed) = evo.flush().await;
-        // UserCorrection is LLM-routed by needs_llm (contains skill_context).
-        let found = llm_routed.iter().any(|s| {
-            matches!(
-                s,
-                astra_runtime::evolution::types::EvolutionSignal::UserCorrection {
-                    skill_context: Some(sc),
-                    correction_text,
-                    prior_assistant_text,
-                    turn_id,
-                } if sc == "filesystem"
-                    && correction_text.starts_with("no, that's wrong")
-                    && prior_assistant_text == "here is the function"
-                    && turn_id == "turn-3"
-            )
-        });
-        assert!(
-            found,
-            "UserCorrection signal not found in flushed llm_routed: {:?}",
-            llm_routed
-        );
-    }
-
-    #[tokio::test]
-    async fn emit_user_correction_noop_without_evolution_service() {
-        let state = ReplState {
-            evolution_service: None,
-            history: vec![("u".to_string(), "a".to_string())],
-            ..Default::default()
-        };
-        // Must not panic.
-        emit_user_correction_signal(&state, "no, that's wrong").await;
     }
 
     // ─── E2E: LLM-driven skill improvement ───────────────────────────────

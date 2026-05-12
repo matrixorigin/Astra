@@ -91,6 +91,23 @@ pub struct SpawnAgentInput {
     /// before.
     #[serde(default, deserialize_with = "deserialize_inherit_prefix_lenient")]
     pub inherit_prefix: Option<InheritPrefixSpec>,
+
+    /// Optional task-complexity hint used to scale the default
+    /// turn budget when `max_turns` is not explicitly set. Accepted
+    /// values: `"light"` (≈10 turns, simple one-shot queries),
+    /// `"normal"` (agent-type default, the status quo), `"deep"`
+    /// (2× agent-type default, for reviewing diffs across many
+    /// files, multi-step refactors, or anything that would
+    /// routinely exhaust the default budget).
+    ///
+    /// `max_turns` always wins when both are set. `complexity`
+    /// exists so callers that don't want to guess a numeric budget
+    /// can still pick the right shape.
+    ///
+    /// APPENDED at the end of the struct: earlier fields are
+    /// load-bearing for schema cache; do NOT reorder.
+    #[serde(default)]
+    pub complexity: Option<String>,
 }
 
 /// Lenient deserializer for `inherit_prefix`: accepts a JSON object
@@ -171,7 +188,98 @@ impl Default for SpawnAgentInput {
             isolated: false,
             allowed_tools: None,
             inherit_prefix: None,
+            complexity: None,
         }
+    }
+}
+
+/// Resolve the effective turn budget given an explicit `max_turns`,
+/// an optional `complexity` hint, and the agent-type default. Rules:
+///
+///  * `max_turns=Some(n)` → always wins (explicit beats hint).
+///  * `complexity=Some("light")` → `max(10, default / 2)`.
+///  * `complexity=Some("normal")` / None → default.
+///  * `complexity=Some("deep")` / `"thorough"` → `2 × default`.
+///  * Unknown complexity strings fall back to default + a
+///    `tracing::debug!` so operators can spot typos.
+///
+/// Pure function — no side effects beyond the one debug log on
+/// unknown input. Callers: the spawner right after reading the
+/// agent_def.
+pub fn resolve_turn_budget(
+    explicit_max_turns: Option<u32>,
+    complexity: Option<&str>,
+    default_max_turns: u32,
+) -> u32 {
+    if let Some(n) = explicit_max_turns {
+        return n;
+    }
+    match complexity
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        // `light` caps at 10 turns but never raises a smaller
+        // agent-type default to 10 (i.e. min-of-two). Short tasks
+        // don't need more than ~10 even when the type's default is
+        // 30+.
+        Some("light") | Some("short") | Some("quick") => default_max_turns.min(10),
+        Some("normal") | Some("default") | None | Some("") => default_max_turns,
+        Some("deep") | Some("thorough") | Some("heavy") => default_max_turns.saturating_mul(2),
+        Some(other) => {
+            tracing::debug!(
+                target: "astra_turn_core::spawn",
+                complexity = other,
+                "unknown complexity hint — falling back to agent-type default"
+            );
+            default_max_turns
+        }
+    }
+}
+
+#[cfg(test)]
+mod budget_resolve_tests {
+    use super::resolve_turn_budget;
+
+    #[test]
+    fn explicit_max_turns_wins_over_complexity() {
+        assert_eq!(resolve_turn_budget(Some(7), Some("deep"), 20), 7);
+    }
+
+    #[test]
+    fn complexity_light_caps_to_10() {
+        // Default > 10: cap to 10.
+        assert_eq!(resolve_turn_budget(None, Some("light"), 20), 10);
+        assert_eq!(resolve_turn_budget(None, Some("light"), 60), 10);
+        // Default < 10: keep the lower default (a small agent type
+        // knows its own budget; light shouldn't inflate it).
+        assert_eq!(resolve_turn_budget(None, Some("light"), 4), 4);
+        assert_eq!(resolve_turn_budget(None, Some("light"), 8), 8);
+    }
+
+    #[test]
+    fn complexity_deep_doubles_default() {
+        assert_eq!(resolve_turn_budget(None, Some("deep"), 20), 40);
+        assert_eq!(resolve_turn_budget(None, Some("thorough"), 15), 30);
+    }
+
+    #[test]
+    fn complexity_normal_is_default() {
+        assert_eq!(resolve_turn_budget(None, Some("normal"), 20), 20);
+        assert_eq!(resolve_turn_budget(None, None, 20), 20);
+        assert_eq!(resolve_turn_budget(None, Some(""), 20), 20);
+    }
+
+    #[test]
+    fn unknown_complexity_falls_back_to_default() {
+        assert_eq!(resolve_turn_budget(None, Some("moderate"), 20), 20);
+        assert_eq!(resolve_turn_budget(None, Some("🙃"), 20), 20);
+    }
+
+    #[test]
+    fn complexity_is_case_insensitive() {
+        assert_eq!(resolve_turn_budget(None, Some("DEEP"), 20), 40);
+        assert_eq!(resolve_turn_budget(None, Some("Deep"), 20), 40);
     }
 }
 

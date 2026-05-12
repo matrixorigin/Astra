@@ -82,6 +82,7 @@ For each item, define:
 ### 1.2 Validate independence
 
 Check that no two items touch the same file. If they do:
+
 - If STRATEGY is `independent`: warn the user and suggest splitting differently
 - If STRATEGY is `sequential-merge`: order them so later items build on earlier
 - If STRATEGY is `fan-out-merge`: proceed but plan a manual merge step
@@ -123,6 +124,7 @@ git worktree list
 For each worker/task pair, execute the task in the worker's worktree directory.
 
 **Critical rules:**
+
 - Always `cd` into the worktree directory before any file operations
 - Use absolute paths when referencing worktree files
 - Each task should end with a commit in its worktree branch
@@ -153,6 +155,7 @@ git merge --no-ff batch/{item_id} -m "merge: batch/{item_id}"
 ```
 
 If merge conflicts occur:
+
 - For `independent` strategy: resolve automatically if possible, skip if not
 - For `fan-out-merge`: attempt resolution, report conflicts to user
 - Always report which items merged cleanly and which had issues
@@ -204,7 +207,18 @@ Produce a summary table:
 
 ## Error Handling
 
-- **Worktree creation fails**: Fall back to sequential execution in main branch
+- **Worktree creation fails**: Fall back to sequential execution in main branch.
+  **You MUST surface this degradation explicitly in the final report** — do not let
+  callers assume the batch ran in parallel. Include a line of the form:
+
+  > ⚠️ Parallelism degraded: git worktree unavailable (reason: `<stderr>`).
+  > Ran N tasks sequentially in the main branch. Expected wallclock cost: ~N×
+  > a single task instead of ~1×.
+
+  This rule exists because silent degradation has historically made "parallel review"
+  look successful while actually running serially. See: self-critique gate in
+  `review-changes` skill.
+
 - **Task execution fails**: Log error, mark as failed, continue others
 - **Merge conflict**: Report conflicting files, offer manual resolution or skip
 - **Build fails after merge**: Bisect to find which merge broke the build

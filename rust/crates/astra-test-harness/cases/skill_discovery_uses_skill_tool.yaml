@@ -1,25 +1,25 @@
 name: skill_discovery_uses_skill_tool
 description: |
-  **What**: Ask for a skill-relevant task and verify the agent uses the skill/discover_skills tool rather than improvising.
-  **Tests**: Dynamic skill tool injection — the runtime's lifecycle preamble must inject skill tools when a resolver is present.
-  **Why**: A regression in the injection path or selector surfacing would make skills silently uncallable, degrading the agent to brute-force approaches.
-  **Pass means**: The agent invoked skill or discover_skills and named a specific relevant skill, proving the injection and selector paths work.
-  **Fail means**: Skill tools were not injected (lifecycle preamble bug), not surfaced by the selector, or the agent guessed a skill name without using the discovery tool.
+  **What**: Ask the agent to actually execute a skill-backed workflow so it must invoke the `skill` tool to load the phased instructions.
+  **Tests**: Skill tool is present in `tools[]` and the runtime accepts a `skill` invocation end-to-end. A wire-level regression that disconnects the `skill` tool (schema drift, registry drop, routing bug) would make the invocation fail.
+  **Why**: Naming a skill is not proof the tool works — the `<available_skills>` listing already reveals skill names in the prompt, so the model can always guess. The only behavior that actually exercises the `skill` tool is requesting *execution*, which forces the model to invoke `skill` to get the phased instructions (returned as `<skill-loaded name="..."/>` + body).
+  **Pass means**: The agent invoked `skill` with a relevant skill name, and the tool returned the skill body without error.
+  **Fail means**: The agent responded without invoking `skill` (prompt-only answer), or the invocation errored (broken tool wiring).
 prompt: |
-  I want to analyze a past astra session to find token waste. There's
-  likely a skill for this. Use whichever tool discovers available
-  skills and tell me the name of the most relevant one. Do not try
-  to perform the analysis — I only want the skill's name.
+  Load the analyze-session skill via the skill tool so I can read
+  its phase 1 instructions. Do NOT start executing the skill or
+  running any other tools — I only want you to load the skill, then
+  paste the phase 1 instructions back to me verbatim and stop.
 timeout_seconds: 120
 criteria:
   - type: exit_code
     code: 0
+  - type: tool_called
+    name: skill
   - type: judger
     question: |
-      Did the agent invoke a tool named `skill` or `discover_skills`
-      (check tools_used list), and did its final answer name a
-      specific skill (e.g. "analyze_session" or "analyze-session")?
-      Score 1.0 for both. Score 0.4 for naming a skill but without
-      using the discovery tool (could be guessing). Score 0.0 if no
-      specific skill is named.
-    threshold: 0.6
+      Did the agent invoke the `skill` tool (check tools_used) with a
+      skill name (ideally `analyze-session` or `analyze_session`)?
+      Score 1.0 if `skill` appears in tools_used. Score 0.0 otherwise.
+      The final text answer does not matter — only the tool_use.
+    threshold: 0.9

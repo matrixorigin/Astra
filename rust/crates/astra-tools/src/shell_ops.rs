@@ -20,11 +20,275 @@ use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
 const GLOB_TIMEOUT: Duration = Duration::from_secs(15);
-/// Default `bash` timeout when the caller omits the `timeout` field.
+/// Fallback `bash` timeout when the caller omits `timeout` AND the classifier
+/// cannot confidently identify the command family. See [`classify_bash_command`]
+/// and [`default_bash_timeout_for`] — most real commands hit a classifier branch
+/// first and never use this value.
 pub(crate) const DEFAULT_BASH_TIMEOUT_SECS: f64 = 120.0;
 /// Clamp bounds for the user-supplied `bash.timeout`.
 pub(crate) const BASH_TIMEOUT_MIN_SECS: f64 = 0.1;
 pub(crate) const BASH_TIMEOUT_MAX_SECS: f64 = 600.0;
+
+/// Semantic classification of a shell command for adaptive timeout defaults.
+///
+/// The classifier is a pure function over the command string — zero runtime
+/// cost, no I/O, fully unit-testable. Its only job is to map a command to a
+/// sensible default timeout bucket so callers don't have to remember to pass
+/// `timeout: 600` for every `cargo test` invocation.
+///
+/// **Explicit `timeout` in the call args always wins**: the classifier is a
+/// default-provider, not a policy enforcer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BashCommandClass {
+    /// Trivial read-only ops: `ls`, `cat`, `git status`, `echo`, `pwd`, `which`.
+    Fast,
+    /// Type/syntax checks and formatters: `cargo check`, `cargo fmt`,
+    /// `tsc --noEmit`, `ruff`, `black`, `prettier --check`.
+    Build,
+    /// Linters with full type resolution: `cargo clippy`, `eslint`, `mypy`,
+    /// `golangci-lint`. Routinely 2–5× slower than Build on cold cache.
+    Lint,
+    /// Test runners: `cargo test`, `pytest`, `jest`, `go test`, `vitest`.
+    Test,
+    /// Full release/package builds and large installs: `cargo build --release`,
+    /// `npm ci`, `pnpm install`, `pip install -r`, `docker build`.
+    Package,
+    /// Unknown — falls back to [`DEFAULT_BASH_TIMEOUT_SECS`].
+    Unknown,
+}
+
+impl BashCommandClass {
+    /// Default timeout in seconds for this class.
+    ///
+    /// Values are chosen empirically from Rust workspace timings + typical
+    /// JS/Python project sizes. They're intentionally generous: a false-long
+    /// timeout wastes wall time only on genuinely-hung commands (rare), while
+    /// a false-short timeout corrupts every legitimate slow build.
+    pub(crate) const fn default_timeout_secs(self) -> f64 {
+        match self {
+            BashCommandClass::Fast => 15.0,
+            BashCommandClass::Build => 120.0,
+            BashCommandClass::Lint => 300.0,
+            BashCommandClass::Test => 600.0,
+            BashCommandClass::Package => 600.0,
+            BashCommandClass::Unknown => DEFAULT_BASH_TIMEOUT_SECS,
+        }
+    }
+}
+
+/// Classify a bash command string into a [`BashCommandClass`].
+///
+/// Heuristic: tokenize the command, skip leading env assignments (`FOO=bar`)
+/// and common prefixes (`cd /x &&`, `sudo`, `time`), then match on the first
+/// real program token + well-known subcommand keywords.
+///
+/// The classifier is conservative: when in doubt it returns `Unknown` rather
+/// than risk misclassifying a user's exotic invocation.
+pub(crate) fn classify_bash_command(command: &str) -> BashCommandClass {
+    // Flatten all pipeline segments so `cargo fmt && cargo clippy` picks the
+    // *slowest* class among its parts (Lint > Build). This matches user intent:
+    // the chain is only as fast as its slowest step.
+    let mut worst = BashCommandClass::Unknown;
+    for segment in split_command_segments(command) {
+        let class = classify_single_segment(segment);
+        worst = max_class(worst, class);
+    }
+    worst
+}
+
+/// Split on `&&`, `||`, `;`, and `|` — any control operator that sequences
+/// or pipes separate programs. We don't parse shell grammar fully; we just
+/// want tokens to feed the per-segment classifier.
+fn split_command_segments(command: &str) -> Vec<&str> {
+    // Keep it simple: split on the common operators. `|` inside quoted args
+    // (`grep 'a|b'`) would misclassify but wouldn't break: worst case a
+    // benign fragment gets classified as Unknown and is ignored.
+    command
+        .split(';')
+        .flat_map(|s| s.split("&&"))
+        .flat_map(|s| s.split("||"))
+        .flat_map(|s| s.split('|'))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn classify_single_segment(segment: &str) -> BashCommandClass {
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    // Skip env assignments (FOO=bar) and wrapper prefixes.
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = tokens[i];
+        if t.contains('=') && !t.starts_with('-') && t.split('=').next().is_some_and(is_env_name) {
+            i += 1;
+            continue;
+        }
+        if matches!(
+            t,
+            "sudo" | "time" | "nice" | "ionice" | "env" | "nohup" | "exec"
+        ) {
+            i += 1;
+            // Skip any flags that belong to the wrapper (e.g. `nice -n 10`,
+            // `ionice -c 2`). A flag is any token starting with `-`; if it
+            // takes a value that doesn't start with `-` and isn't an env
+            // assignment, skip that too.
+            while i < tokens.len() && tokens[i].starts_with('-') {
+                let takes_value = matches!(tokens[i], "-n" | "-c" | "-p" | "-u" | "-i");
+                i += 1;
+                if takes_value
+                    && i < tokens.len()
+                    && !tokens[i].starts_with('-')
+                    && !tokens[i].contains('=')
+                {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // `cd /x` — treat as fast and keep scanning in case it's chained,
+        // but a bare `cd` segment on its own is Fast.
+        if t == "cd" {
+            // If this is the entire segment ("cd /path"), it's Fast.
+            return BashCommandClass::Fast;
+        }
+        break;
+    }
+    if i >= tokens.len() {
+        return BashCommandClass::Unknown;
+    }
+    let prog = tokens[i];
+    let sub = tokens.get(i + 1).copied().unwrap_or("");
+    let rest = &tokens[i..];
+
+    match prog {
+        // ── Rust toolchain ────────────────────────────────────────────────
+        "cargo" => match sub {
+            "test" | "bench" | "nextest" => BashCommandClass::Test,
+            "clippy" => BashCommandClass::Lint,
+            "build" | "install" | "publish" | "package" => {
+                if rest.contains(&"--release") {
+                    BashCommandClass::Package
+                } else {
+                    BashCommandClass::Build
+                }
+            }
+            "check" | "fmt" | "fix" | "doc" | "tree" | "metadata" | "update" => {
+                BashCommandClass::Build
+            }
+            "run" => BashCommandClass::Build,
+            _ => BashCommandClass::Build,
+        },
+        "rustc" | "rustup" => BashCommandClass::Build,
+
+        // ── Node / JS ─────────────────────────────────────────────────────
+        "npm" | "pnpm" | "yarn" | "bun" => match sub {
+            "test" | "t" => BashCommandClass::Test,
+            "install" | "i" | "ci" | "add" | "remove" => BashCommandClass::Package,
+            "run" => {
+                let script = rest.get(2).copied().unwrap_or("");
+                classify_npm_script(script)
+            }
+            "lint" => BashCommandClass::Lint,
+            "build" => BashCommandClass::Package,
+            _ => BashCommandClass::Build,
+        },
+        "npx" | "tsc" => BashCommandClass::Build,
+        "eslint" | "biome" => BashCommandClass::Lint,
+        "prettier" => BashCommandClass::Build,
+        "vitest" | "jest" | "mocha" | "playwright" | "cypress" => BashCommandClass::Test,
+
+        // ── Python ────────────────────────────────────────────────────────
+        "python" | "python3" | "uv" | "poetry" | "pip" | "pip3" => match sub {
+            "install" | "sync" | "add" | "lock" => BashCommandClass::Package,
+            _ => BashCommandClass::Build,
+        },
+        "pytest" | "nose2" | "tox" => BashCommandClass::Test,
+        "mypy" | "pyright" | "pylint" => BashCommandClass::Lint,
+        "ruff" => match sub {
+            // `ruff check`, `ruff check --fix` → Lint.
+            // `ruff format`, `ruff format --check` → Build.
+            "check" => BashCommandClass::Lint,
+            "format" => BashCommandClass::Build,
+            // Legacy bare `ruff foo.py` behaved as `check`.
+            _ => BashCommandClass::Lint,
+        },
+        "black" | "isort" | "autopep8" => BashCommandClass::Build,
+
+        // ── Go ────────────────────────────────────────────────────────────
+        "go" => match sub {
+            "test" => BashCommandClass::Test,
+            "build" | "install" => BashCommandClass::Build,
+            "vet" => BashCommandClass::Lint,
+            "mod" => BashCommandClass::Build,
+            _ => BashCommandClass::Build,
+        },
+        "golangci-lint" => BashCommandClass::Lint,
+
+        // ── Build systems ─────────────────────────────────────────────────
+        "make" | "ninja" | "cmake" | "bazel" | "buck" | "meson" => BashCommandClass::Package,
+        "docker" | "podman" => match sub {
+            "build" | "buildx" => BashCommandClass::Package,
+            "run" | "exec" => BashCommandClass::Build,
+            "ps" | "images" | "logs" | "inspect" => BashCommandClass::Fast,
+            _ => BashCommandClass::Build,
+        },
+
+        // ── Fast ops ──────────────────────────────────────────────────────
+        "ls" | "cat" | "head" | "tail" | "pwd" | "echo" | "which" | "whoami" | "date"
+        | "printf" | "basename" | "dirname" | "realpath" | "readlink" | "stat" | "file" | "wc"
+        | "true" | "false" | "test" | "[" | "env" | "export" | "unset" => BashCommandClass::Fast,
+        "git" => match sub {
+            "status" | "log" | "diff" | "show" | "branch" | "remote" | "config" | "rev-parse"
+            | "rev-list" | "blame" | "ls-files" | "describe" | "tag" | "stash" => {
+                BashCommandClass::Fast
+            }
+            "clone" | "fetch" | "pull" | "push" => BashCommandClass::Build,
+            _ => BashCommandClass::Fast,
+        },
+        "grep" | "rg" | "ripgrep" | "ag" | "ack" | "find" | "fd" | "fdfind" | "sed" | "awk"
+        | "tr" | "cut" | "sort" | "uniq" | "xargs" => BashCommandClass::Fast,
+
+        _ => BashCommandClass::Unknown,
+    }
+}
+
+fn classify_npm_script(script: &str) -> BashCommandClass {
+    match script {
+        "test" | "test:unit" | "test:e2e" | "test:integration" => BashCommandClass::Test,
+        "build" | "dist" | "bundle" => BashCommandClass::Package,
+        "lint" | "typecheck" | "tsc" => BashCommandClass::Lint,
+        "fmt" | "format" | "check" => BashCommandClass::Build,
+        _ => BashCommandClass::Build,
+    }
+}
+
+fn is_env_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && s.chars().next().is_some_and(|c| !c.is_ascii_digit())
+}
+
+fn max_class(a: BashCommandClass, b: BashCommandClass) -> BashCommandClass {
+    // Order by worst-case duration: Package/Test > Lint > Build > Fast > Unknown.
+    // Unknown ranks below Fast so a classified segment always wins over noise.
+    fn rank(c: BashCommandClass) -> u8 {
+        match c {
+            BashCommandClass::Unknown => 0,
+            BashCommandClass::Fast => 1,
+            BashCommandClass::Build => 2,
+            BashCommandClass::Lint => 3,
+            BashCommandClass::Test => 4,
+            BashCommandClass::Package => 4,
+        }
+    }
+    if rank(a) >= rank(b) { a } else { b }
+}
+
+/// Lookup default timeout (seconds) for a raw command string.
+/// Convenience wrapper over [`classify_bash_command`].
+pub(crate) fn default_bash_timeout_for(command: &str) -> f64 {
+    classify_bash_command(command).default_timeout_secs()
+}
 const GREP_DEFAULT_HEAD_LIMIT: usize = 100;
 const GLOB_DEFAULT_HEAD_LIMIT: usize = 100;
 const RAW_GREP_OUTPUT_LIMIT: usize = 30_000;
@@ -245,6 +509,28 @@ struct GrepRequest<'a> {
 /// Parse the `timeout` field for `execute_bash`: f64 seconds, defaulting to
 /// [`DEFAULT_BASH_TIMEOUT_SECS`] when missing, clamped to
 /// `[BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS]`.
+/// Resolve the effective bash timeout.
+///
+/// Precedence:
+/// 1. Caller-supplied `args.timeout` (clamped to [`BASH_TIMEOUT_MIN_SECS`]..=[`BASH_TIMEOUT_MAX_SECS`]).
+/// 2. Semantic classifier default based on the command string
+///    (see [`classify_bash_command`]).
+/// 3. [`DEFAULT_BASH_TIMEOUT_SECS`] when the classifier returns `Unknown`.
+///
+/// This lets `cargo clippy` / `cargo test` run for minutes without every
+/// caller remembering to pass `timeout: 600`, while still refusing to exceed
+/// [`BASH_TIMEOUT_MAX_SECS`] for any single command.
+pub(crate) fn parse_bash_timeout_secs_for(args: &Value, command: &str) -> f64 {
+    if let Some(explicit) = args.get("timeout").and_then(Value::as_f64) {
+        return explicit.clamp(BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS);
+    }
+    default_bash_timeout_for(command).clamp(BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS)
+}
+
+/// Backwards-compatible wrapper: when the caller doesn't have the command
+/// string handy (e.g. tests constructed from only `args`), falls back to
+/// [`DEFAULT_BASH_TIMEOUT_SECS`] on the classifier-unknown path.
+#[cfg(test)]
 pub(crate) fn parse_bash_timeout_secs(args: &Value) -> f64 {
     args.get("timeout")
         .and_then(|v| v.as_f64())
@@ -259,7 +545,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         Some(c) => c,
         None => return ToolResult::error("Error: Missing 'command' parameter".into()),
     };
-    let timeout_secs = parse_bash_timeout_secs(args);
+    let timeout_secs = parse_bash_timeout_secs_for(args, command);
 
     if let Err(reason) = validate_execute_bash_command(command) {
         return ToolResult::error(reason);
@@ -3708,6 +3994,182 @@ printf 'probe.txt:1:needle\n'
     }
 
     // ── bash timeout defaults ────────────────────────────────────────────────
+
+    // ── BashCommandClass classifier ───────────────────────────────────────
+
+    #[test]
+    fn classify_cargo_commands() {
+        use super::BashCommandClass::*;
+        assert_eq!(classify_bash_command("cargo check"), Build);
+        assert_eq!(classify_bash_command("cargo check -p astra-runtime"), Build);
+        assert_eq!(classify_bash_command("cargo fmt --check"), Build);
+        assert_eq!(classify_bash_command("cargo clippy -- -D warnings"), Lint);
+        assert_eq!(
+            classify_bash_command(
+                "cargo clippy -p astra-runtime --lib --all-features -- -D warnings"
+            ),
+            Lint
+        );
+        assert_eq!(classify_bash_command("cargo test"), Test);
+        assert_eq!(classify_bash_command("cargo test -p foo --lib"), Test);
+        assert_eq!(classify_bash_command("cargo nextest run"), Test);
+        assert_eq!(classify_bash_command("cargo bench"), Test);
+        assert_eq!(classify_bash_command("cargo build"), Build);
+        assert_eq!(classify_bash_command("cargo build --release"), Package);
+        assert_eq!(classify_bash_command("cargo install ripgrep"), Build);
+        assert_eq!(
+            classify_bash_command("cargo install ripgrep --release"),
+            Package
+        );
+    }
+
+    #[test]
+    fn classify_skips_env_and_wrappers() {
+        use super::BashCommandClass::*;
+        assert_eq!(
+            classify_bash_command("RUST_LOG=debug CARGO_TERM_COLOR=always cargo test"),
+            Test
+        );
+        assert_eq!(classify_bash_command("sudo cargo build --release"), Package);
+        assert_eq!(classify_bash_command("time cargo clippy"), Lint);
+        assert_eq!(classify_bash_command("nice -n 10 cargo check"), Build);
+    }
+
+    #[test]
+    fn classify_chains_pick_slowest_segment() {
+        use super::BashCommandClass::*;
+        // cargo fmt (Build) && cargo clippy (Lint) → Lint
+        assert_eq!(
+            classify_bash_command("cargo fmt && cargo clippy -- -D warnings"),
+            Lint
+        );
+        // cargo check (Build) && cargo test (Test) → Test
+        assert_eq!(
+            classify_bash_command("cargo check && cargo test --lib"),
+            Test
+        );
+        // cd + git status (Fast) → Fast
+        assert_eq!(classify_bash_command("cd /tmp && git status"), Fast);
+        // Build pipeline: cargo build | grep error → Build dominates Fast
+        assert_eq!(
+            classify_bash_command("cargo build 2>&1 | grep error"),
+            Build
+        );
+    }
+
+    #[test]
+    fn classify_node_and_python() {
+        use super::BashCommandClass::*;
+        assert_eq!(classify_bash_command("npm test"), Test);
+        assert_eq!(classify_bash_command("npm run test"), Test);
+        assert_eq!(classify_bash_command("npm run build"), Package);
+        assert_eq!(classify_bash_command("npm run lint"), Lint);
+        assert_eq!(classify_bash_command("pnpm install"), Package);
+        assert_eq!(classify_bash_command("yarn add react"), Package);
+        assert_eq!(classify_bash_command("eslint src/"), Lint);
+        assert_eq!(classify_bash_command("tsc --noEmit"), Build);
+        assert_eq!(classify_bash_command("vitest run"), Test);
+        assert_eq!(classify_bash_command("pytest tests/"), Test);
+        assert_eq!(classify_bash_command("mypy src/"), Lint);
+        assert_eq!(classify_bash_command("ruff check ."), Lint);
+        assert_eq!(classify_bash_command("ruff format ."), Build);
+        assert_eq!(classify_bash_command("uv sync"), Package);
+        assert_eq!(
+            classify_bash_command("pip install -r requirements.txt"),
+            Package
+        );
+    }
+
+    #[test]
+    fn classify_go_and_build_systems() {
+        use super::BashCommandClass::*;
+        assert_eq!(classify_bash_command("go test ./..."), Test);
+        assert_eq!(classify_bash_command("go build"), Build);
+        assert_eq!(classify_bash_command("go vet ./..."), Lint);
+        assert_eq!(classify_bash_command("golangci-lint run"), Lint);
+        assert_eq!(classify_bash_command("make"), Package);
+        assert_eq!(classify_bash_command("docker build -t x ."), Package);
+        assert_eq!(classify_bash_command("docker ps"), Fast);
+    }
+
+    #[test]
+    fn classify_fast_read_only_ops() {
+        use super::BashCommandClass::*;
+        assert_eq!(classify_bash_command("ls -la"), Fast);
+        assert_eq!(classify_bash_command("git status"), Fast);
+        assert_eq!(classify_bash_command("git log --oneline -20"), Fast);
+        assert_eq!(classify_bash_command("grep -r foo src/"), Fast);
+        assert_eq!(classify_bash_command("rg --files"), Fast);
+        assert_eq!(classify_bash_command("find . -name '*.rs'"), Fast);
+        assert_eq!(classify_bash_command("echo hello"), Fast);
+        assert_eq!(classify_bash_command("pwd"), Fast);
+    }
+
+    #[test]
+    fn classify_unknown_falls_through() {
+        use super::BashCommandClass::*;
+        assert_eq!(classify_bash_command(""), Unknown);
+        assert_eq!(classify_bash_command("some_custom_script.sh"), Unknown);
+        assert_eq!(classify_bash_command("./run.sh"), Unknown);
+    }
+
+    #[test]
+    fn default_timeouts_are_sensible_and_monotonic() {
+        use super::BashCommandClass::*;
+        // Fast < Build < Lint <= Test, Package
+        assert!(Fast.default_timeout_secs() < Build.default_timeout_secs());
+        assert!(Build.default_timeout_secs() < Lint.default_timeout_secs());
+        assert!(Lint.default_timeout_secs() <= Test.default_timeout_secs());
+        assert!(Lint.default_timeout_secs() <= Package.default_timeout_secs());
+        // Unknown = DEFAULT_BASH_TIMEOUT_SECS (no regression from pre-classifier behaviour).
+        assert_eq!(Unknown.default_timeout_secs(), DEFAULT_BASH_TIMEOUT_SECS);
+        // Every class must fit in the clamp range.
+        for class in [Fast, Build, Lint, Test, Package, Unknown] {
+            let t = class.default_timeout_secs();
+            assert!((BASH_TIMEOUT_MIN_SECS..=BASH_TIMEOUT_MAX_SECS).contains(&t));
+        }
+    }
+
+    #[test]
+    fn parse_bash_timeout_for_uses_classifier_when_absent() {
+        let args = serde_json::json!({});
+        // Classifier sees cargo clippy → Lint (300s).
+        assert_eq!(
+            parse_bash_timeout_secs_for(&args, "cargo clippy -- -D warnings"),
+            300.0
+        );
+        // Classifier sees cargo test → Test (600s).
+        assert_eq!(
+            parse_bash_timeout_secs_for(&args, "cargo test --lib"),
+            600.0
+        );
+        // Fast ops get 15s.
+        assert_eq!(parse_bash_timeout_secs_for(&args, "ls -la"), 15.0);
+        // Unknown falls back to DEFAULT.
+        assert_eq!(
+            parse_bash_timeout_secs_for(&args, "./some_random.sh"),
+            DEFAULT_BASH_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn parse_bash_timeout_for_respects_explicit_override() {
+        // Explicit caller timeout always wins over classifier.
+        let args = serde_json::json!({"timeout": 45});
+        assert_eq!(parse_bash_timeout_secs_for(&args, "cargo test --lib"), 45.0);
+        // Explicit override still clamped to max.
+        let big = serde_json::json!({"timeout": 99999});
+        assert_eq!(
+            parse_bash_timeout_secs_for(&big, "cargo test"),
+            BASH_TIMEOUT_MAX_SECS
+        );
+        // Explicit 0 is clamped up to MIN (not classifier default).
+        let tiny = serde_json::json!({"timeout": 0});
+        assert_eq!(
+            parse_bash_timeout_secs_for(&tiny, "cargo clippy"),
+            BASH_TIMEOUT_MIN_SECS
+        );
+    }
 
     #[test]
     fn bash_default_timeout_is_120s() {

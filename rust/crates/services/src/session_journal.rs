@@ -848,12 +848,139 @@ pub enum JournalEventType {
     LlmResponseFull,
     /// Background memory extraction agent completed (extracted, skipped, or errored).
     MemoryExtraction,
+    /// Background session-memory (session-memory.md) extraction completed.
+    /// Distinct from `MemoryExtraction` (Memoria memories): this event
+    /// describes a single atomic rewrite of the session-memory L1
+    /// artifact, not a Memoria store.
+    SessionMemoryExtraction,
     /// Context pipeline per-turn feedback (cache ratio, tokens, tier).
     PipelineFeedback,
     /// Context pipeline trace alert fired (cache break, recovery loop, etc.).
     PipelineAlert,
     /// Context pipeline compaction audit (what was dropped/cleared, why).
     PipelineCompactionAudit,
+}
+
+/// Why the gate rejected a session-memory extraction attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMemoryExtractionSkipReason {
+    NoSessionId,
+    BelowInitGate,
+    NoGrowth,
+    InFlight,
+    SelectorCooldown,
+    /// Memoria endpoint tripped the circuit breaker after consecutive
+    /// failures. Emitted synchronously — no spawn, no retry attempted
+    /// until the cooldown TTL elapses.
+    MemoriaUnhealthy,
+}
+
+/// Why an attempt errored during the LLM/write phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMemoryExtractionErrorReason {
+    LlmTimeout,
+    LlmError,
+    EmptyResponse,
+    /// Pre-store purge of previous L1 failed after retries — aborting
+    /// the store avoids leaving two L1 rows in Memoria for one session,
+    /// which would make prefix-based retrieval non-deterministic.
+    PurgeFailed,
+    WriteFailed,
+}
+
+/// Which code path produced the written content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMemoryExtractionSource {
+    Llm,
+    RuleFallback,
+}
+
+/// Full outcome of a single extraction attempt. Serialized flat into the
+/// event metadata: `{"outcome": "extracted", "source": "llm",
+/// "bytes_written": 4021}` or `{"outcome": "skipped", "reason": "in_flight"}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionMemoryExtractionOutcome {
+    Extracted {
+        source: SessionMemoryExtractionSource,
+        bytes_written: u64,
+    },
+    Skipped {
+        reason: SessionMemoryExtractionSkipReason,
+    },
+    Errored {
+        reason: SessionMemoryExtractionErrorReason,
+    },
+}
+
+/// Operational breadcrumbs merged into the session-memory extraction
+/// event's metadata. None-valued fields are omitted from the JSON so
+/// skip events (which carry no LLM state) don't emit nonsense keys.
+///
+/// These fields exist for operator debugging (`SELECT ... FROM
+/// agent_events WHERE event_type='session_memory_extraction'` on a
+/// puzzling session) and must not drive any runtime behaviour — the
+/// logic-bearing fields are `outcome` / `reason` / `source`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionMemoryExtractionBreadcrumbs {
+    /// Number of messages fed into the extractor. Helps triage
+    /// "why does this session have no L1" (possibly 0 messages).
+    pub messages_count: Option<u32>,
+    /// Selector model that was actually used (or would have been, if
+    /// the call failed before dispatch). Absent on pure-gate skips
+    /// and on rule-based fallbacks.
+    pub selector_model: Option<String>,
+    /// Final attempt count (1 = succeeded first try, 2 = recovered
+    /// after one retry). Absent when no persist attempt occurred.
+    pub attempt: Option<u32>,
+}
+
+impl SessionMemoryExtractionOutcome {
+    /// Short tag matching the top-level `outcome` field. Cheap enough to
+    /// call from log lines and UX bridges that don't want to match the
+    /// full enum.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Extracted { .. } => "extracted",
+            Self::Skipped { .. } => "skipped",
+            Self::Errored { .. } => "errored",
+        }
+    }
+
+    fn to_json(&self, bc: &SessionMemoryExtractionBreadcrumbs) -> serde_json::Value {
+        let mut obj = match self {
+            Self::Extracted {
+                source,
+                bytes_written,
+            } => serde_json::json!({
+                "outcome": "extracted",
+                "source": source,
+                "bytes_written": bytes_written,
+            }),
+            Self::Skipped { reason } => serde_json::json!({
+                "outcome": "skipped",
+                "reason": reason,
+            }),
+            Self::Errored { reason } => serde_json::json!({
+                "outcome": "errored",
+                "reason": reason,
+            }),
+        };
+        if let Some(map) = obj.as_object_mut() {
+            if let Some(n) = bc.messages_count {
+                map.insert("messages_count".into(), serde_json::json!(n));
+            }
+            if let Some(ref m) = bc.selector_model {
+                map.insert("selector_model".into(), serde_json::json!(m));
+            }
+            if let Some(a) = bc.attempt {
+                map.insert("attempt".into(), serde_json::json!(a));
+            }
+        }
+        obj
+    }
 }
 
 /// Writer that appends events to a session journal file.
@@ -2263,24 +2390,19 @@ impl JournalEvent {
         evt
     }
 
-    /// After a successful MatrixOne pull of learning / preferences (startup or post-login audit).
+    /// After a successful MatrixOne pull of preferences (startup or post-login audit).
     ///
     /// Structured fields live under `metadata.cloud_pull` for analytics; `user_input` holds a short
     /// human-readable summary for export and grep.
-    #[allow(clippy::too_many_arguments)]
     pub fn cloud_pull_sync_marker(
         session_id: Option<&str>,
         profile: &str,
         source: &str,
-        learning_version: Option<i64>,
-        learning_snapshot_merged: bool,
-        tool_health_rows_from_cloud: usize,
         preference_keys_merged: &[String],
         reachable_empty_ack: bool,
     ) -> Self {
         let note = format!(
-            "cloud_pull {source} profile={profile} learning_v={:?} prefs={}{}",
-            learning_version,
+            "cloud_pull {source} profile={profile} prefs={}{}",
             preference_keys_merged.len(),
             if reachable_empty_ack {
                 " empty_ack"
@@ -2293,9 +2415,6 @@ impl JournalEvent {
             "cloud_pull": {
                 "profile": profile,
                 "source": source,
-                "learning_version": learning_version,
-                "learning_snapshot_merged": learning_snapshot_merged,
-                "tool_health_rows_from_cloud": tool_health_rows_from_cloud,
                 "preference_keys_merged": preference_keys_merged,
                 "reachable_empty_ack": reachable_empty_ack,
             }
@@ -2402,6 +2521,38 @@ impl JournalEvent {
         let mut evt = Self::base(JournalEventType::ConfigChange, session_id);
         evt.config_key = Some(key.to_string());
         evt.config_value = Some(value.to_string());
+        evt
+    }
+
+    /// Config-version transition event.
+    ///
+    /// Emitted when the active content-addressed config version changes
+    /// — either at session startup (`from = None`, `source = "startup"`),
+    /// after the user saves an edit via `/config` (`from = Some(prev_id)`,
+    /// `source = "slash_config_edit"`), or when the CLI `--settings`
+    /// overlay resolves to a new id (`source = "settings_overlay"`).
+    ///
+    /// Carries the ids in `metadata.config_version.{from, to, source}`
+    /// so downstream audit queries (`astra audit show <session>`,
+    /// `astra config version diff`) can reconstruct the sequence of
+    /// configs a session actually ran under without needing a separate
+    /// table join.
+    pub fn config_version_change(
+        session_id: Option<&str>,
+        turn: u32,
+        from: Option<&str>,
+        to: &str,
+        source: &str,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::ConfigChange, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(serde_json::json!({
+            "config_version": {
+                "from": from,
+                "to": to,
+                "source": source,
+            }
+        }));
         evt
     }
 
@@ -3289,6 +3440,25 @@ impl JournalEvent {
         evt
     }
 
+    /// Session-memory (session-memory.md) extraction outcome event.
+    ///
+    /// Distinct from [`JournalEvent::memory_extraction`] (Memoria memories).
+    /// Metadata is a flat, self-describing object driven by the
+    /// [`SessionMemoryExtractionOutcome`] enum.
+    pub fn session_memory_extraction(
+        session_id: Option<&str>,
+        turn: u32,
+        duration_ms: u64,
+        outcome: SessionMemoryExtractionOutcome,
+        breadcrumbs: &SessionMemoryExtractionBreadcrumbs,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::SessionMemoryExtraction, session_id);
+        evt.turn = Some(turn);
+        evt.duration_ms = Some(duration_ms);
+        evt.metadata = Some(outcome.to_json(breadcrumbs));
+        evt
+    }
+
     /// Context pipeline per-turn feedback event.
     pub fn pipeline_feedback(
         session_id: Option<&str>,
@@ -4121,9 +4291,6 @@ mod tests {
             Some("sid-1"),
             "work",
             "repl_startup",
-            Some(42),
-            true,
-            3,
             &keys,
             false,
         );
@@ -4139,19 +4306,6 @@ mod tests {
         assert_eq!(
             cp.get("source").and_then(|v| v.as_str()),
             Some("repl_startup")
-        );
-        assert_eq!(
-            cp.get("learning_version").and_then(|v| v.as_i64()),
-            Some(42)
-        );
-        assert_eq!(
-            cp.get("learning_snapshot_merged").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            cp.get("tool_health_rows_from_cloud")
-                .and_then(|v| v.as_u64()),
-            Some(3)
         );
         let pref = cp
             .get("preference_keys_merged")
@@ -4171,9 +4325,6 @@ mod tests {
             Some("s-empty"),
             "default",
             "post_login",
-            None,
-            false,
-            0,
             &[],
             true,
         );
@@ -4195,16 +4346,8 @@ mod tests {
     fn cloud_pull_sync_marker_append_to_journal_file() {
         let sid = format!("test-cloud-pull-{}", uuid::Uuid::new_v4());
         let writer = JournalWriter::new(&sid).unwrap();
-        let evt = JournalEvent::cloud_pull_sync_marker(
-            Some(&sid),
-            "default",
-            "post_login",
-            None,
-            false,
-            0,
-            &[],
-            true,
-        );
+        let evt =
+            JournalEvent::cloud_pull_sync_marker(Some(&sid), "default", "post_login", &[], true);
         writer.append(&evt).unwrap();
         let events = read_journal(&sid).unwrap();
         assert_eq!(events.len(), 1);
@@ -6258,10 +6401,12 @@ mod turn_event_buffer_tests {
         assert_eq!(events[0].tool_calls_returned, Some(0));
     }
 
-    /// Regression: auto-reflection LLM calls must record llm_round events
-    /// so turn.tokens_in breakdown is complete.
+    /// Regression: sub-call LLM rounds (e.g. headless/sub-run) must record
+    /// their finish_reason + source + run_id in the journal metadata so the
+    /// per-round token breakdown can be attributed back to the originating
+    /// sub-call.
     #[test]
-    fn auto_reflection_round_has_finish_reason() {
+    fn llm_round_preserves_finish_reason_and_source_metadata() {
         let mut buf = TurnEventBuffer::begin_turn(Some("sess-refl"), 2);
         // Normal round
         buf.record_llm_round(LlmRoundRecord {
@@ -6280,7 +6425,7 @@ mod turn_event_buffer_tests {
             tool_calls: None,
             ..Default::default()
         });
-        // Auto-reflection round
+        // Tagged sub-call round
         buf.record_llm_round(LlmRoundRecord {
             ttft_ms: None,
             duration_ms: 0,
@@ -6290,23 +6435,22 @@ mod turn_event_buffer_tests {
             cache_creation_tokens: 0,
             tool_calls_returned: 0,
             tool_call_names: vec![],
-            finish_reason: Some("auto_reflection".into()),
+            finish_reason: Some("sub_call".into()),
             agentic_step: None,
-            source: Some("auto_reflection".into()),
-            run_id: Some("run-reflect".into()),
+            source: Some("sub_call".into()),
+            run_id: Some("run-subcall".into()),
             tool_calls: None,
             ..Default::default()
         });
         assert_eq!(buf.current_round(), 2);
         let events = buf.drain();
         assert_eq!(events.len(), 2);
-        // Verify auto-reflection round has the finish_reason in metadata
         let refl = &events[1];
         assert_eq!(refl.round, Some(1));
         assert_eq!(refl.tokens_in, Some(54000));
         let refl_meta = refl.metadata.as_ref().unwrap();
-        assert_eq!(refl_meta["source"], "auto_reflection");
-        assert_eq!(refl_meta["run_id"], "run-reflect");
+        assert_eq!(refl_meta["source"], "sub_call");
+        assert_eq!(refl_meta["run_id"], "run-subcall");
     }
 
     /// Regression: rate-limited early exit must record an llm_round with

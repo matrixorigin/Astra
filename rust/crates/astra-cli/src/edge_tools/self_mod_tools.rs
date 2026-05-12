@@ -410,52 +410,6 @@ impl ToolExecutor {
         .to_string()
     }
 
-    pub(super) fn set_goal(&self, args: &Value) -> String {
-        let goal = match args.get("goal").and_then(Value::as_str) {
-            Some(g) if !g.trim().is_empty() => g.trim(),
-            _ => return json!({"error": "Missing required parameter: goal"}).to_string(),
-        };
-        let Some(obs) = self.observability_session.as_ref() else {
-            return json!({"error": "No observability session available"}).to_string();
-        };
-        let mut session = match obs.write() {
-            Ok(g) => g,
-            Err(_) => {
-                return json!({"error": "Failed to acquire observability session"}).to_string();
-            }
-        };
-        let session_snapshot = session.rollback_snapshot();
-        let previous_goal = session
-            .goal_tracker
-            .as_ref()
-            .map(|tracker| tracker.goal().to_string())
-            .or_else(|| session.original_query.clone());
-        if let Some(session_id) = self.active_session_id()
-            && let Err(error) = crate::self_command::persist_goal_override(&session_id, goal)
-        {
-            return json!({
-                "error": "failed_to_persist_goal",
-                "detail": error,
-                "goal": goal,
-            })
-            .to_string();
-        }
-
-        let goal_changed = session.steer_goal(goal);
-        if goal_changed {
-            self.record_goal_rollback(previous_goal.clone(), session_snapshot);
-        }
-
-        json!({
-            "status": "ok",
-            "previous_goal": previous_goal,
-            "goal": goal,
-            "goal_changed": goal_changed,
-            "turn": session.turn_number
-        })
-        .to_string()
-    }
-
     pub(super) fn compress_context(&self, args: &Value) -> String {
         let reason = args
             .get("reason")

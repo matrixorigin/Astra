@@ -50,7 +50,7 @@ pub fn capture_first_selection_report_if_empty(
     }
 }
 
-/// Add selector token accounting from one `select_with_learned_context` result.
+/// Accumulate selector token counts from one `ToolSelector::select` result.
 pub fn accumulate_selector_token_usage(
     total_in: &mut u64,
     total_out: &mut u64,

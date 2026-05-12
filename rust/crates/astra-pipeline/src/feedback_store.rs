@@ -12,10 +12,9 @@
 //! project-specific context (filenames, commands, identities). Persisting
 //! them would leak signal across unrelated sessions and risk re-injecting
 //! obsolete or private guidance into fresh conversations. Cross-session
-//! learning is expressed instead via aggregated, anonymised channels:
-//! `PatternLibrary`, `ProgressiveCalibrator`, `ToolHealthTracker`, and
-//! `ToolQualityTracker` — all of which are merged/sanitised before being
-//! written to the learning snapshot on disk.
+//! signal is expressed instead via `ToolHealthTracker` and
+//! `ToolQualityTracker` — aggregated, anonymised, and merged/sanitised
+//! before being written to the learning snapshot on disk.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;

@@ -13,7 +13,6 @@ pub mod file_store;
 pub mod manager;
 
 use astra_pipeline::step_protocol::DelegationSubRunSummary;
-use astra_turn_types::continuity::ContinuityState;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -68,8 +67,6 @@ impl CslEntry {
 /// Replaces the scattered fields in the old `HeavyCheckpoint`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionStateCompact {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continuity: Option<ContinuityState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -109,8 +106,6 @@ pub struct DelegationCompact {
 /// - `Some(Some(v))` = set to value `v`
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionStatePatch {
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
-    pub continuity: Option<Option<ContinuityState>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -173,9 +168,6 @@ mod nullable {
 impl SessionStateCompact {
     /// Apply an incremental patch, updating only the fields present in `patch`.
     pub fn apply_patch(&mut self, patch: &SessionStatePatch) {
-        if let Some(c) = &patch.continuity {
-            self.continuity = c.clone();
-        }
         if let Some(bt) = &patch.blocked_tools {
             self.blocked_tools = bt.clone();
         }
@@ -593,7 +585,6 @@ mod tests {
             state.approval_overrides,
             Some(json!({"tool": "bash", "approved": true}))
         );
-        assert!(state.continuity.is_none());
     }
 
     // ── Serde round-trip tests ──────────────────────────────────────────────
@@ -628,8 +619,7 @@ mod tests {
             },
         );
         let json = serde_json::to_string(&entry).unwrap();
-        // continuity, recent_tools, approval_overrides, interruption should be absent
-        assert!(!json.contains("continuity"));
+        // recent_tools, approval_overrides, interruption should be absent
         assert!(!json.contains("recent_tools"));
         assert!(!json.contains("approval_overrides"));
         assert!(!json.contains("interruption"));
@@ -700,24 +690,15 @@ mod tests {
     // ── apply_patch coverage for all fields ────────────────────────────────
 
     #[test]
-    fn patch_applies_continuity_and_interruption() {
+    fn patch_applies_interruption() {
         let mut state = SessionStateCompact::default();
-        let continuity = astra_turn_types::continuity::ContinuityState {
-            goal: Default::default(),
-            todos: Default::default(),
-            facts: Default::default(),
-            user_corrections: vec![],
-            verification: Default::default(),
-        };
         let patch = SessionStatePatch {
-            continuity: Some(Some(continuity.clone())),
             interruption: Some(Some(
                 json!({"kind": "budget_exhausted", "resume_action": "continue"}),
             )),
             ..Default::default()
         };
         state.apply_patch(&patch);
-        assert_eq!(state.continuity, Some(continuity));
         assert_eq!(
             state.interruption,
             Some(json!({"kind": "budget_exhausted", "resume_action": "continue"}))
@@ -736,7 +717,6 @@ mod tests {
             ..Default::default()
         };
         let patch = SessionStatePatch {
-            continuity: None,
             blocked_tools: Some(vec!["new".into()]),
             recent_tools: Some(vec!["new_tool".into()]),
             approval_overrides: Some(Some(json!({"new": true}))),
@@ -754,7 +734,6 @@ mod tests {
         assert_eq!(state.budget_remaining_tokens, 42_000);
         assert_eq!(state.budget_remaining_rounds, 3);
         assert_eq!(state.consecutive_ctx_errors, 5);
-        assert!(state.continuity.is_none());
     }
 
     // ── State patch round-trip via materialize ─────────────────────────────
@@ -794,7 +773,6 @@ mod tests {
     #[test]
     fn serde_snapshot_with_full_state_roundtrip() {
         let state = SessionStateCompact {
-            continuity: None,
             blocked_tools: vec!["bash".into()],
             recent_tools: vec!["read_file".into()],
             approval_overrides: Some(json!({"tool": "bash"})),
@@ -988,37 +966,9 @@ mod tests {
         assert!(json_str.contains("budget_remaining_tokens"));
         assert!(json_str.contains("budget_remaining_rounds"));
         assert!(json_str.contains("consecutive_ctx_errors"));
-        // Fields not set should be absent
-        assert!(!json_str.contains("continuity"));
     }
 
-    // ── Bug fix: apply_patch must be able to clear continuity/delegation ──
-
-    #[test]
-    fn patch_clears_continuity_via_explicit_none() {
-        let continuity = astra_turn_types::continuity::ContinuityState {
-            goal: Default::default(),
-            todos: Default::default(),
-            facts: Default::default(),
-            user_corrections: vec![],
-            verification: Default::default(),
-        };
-        let mut state = SessionStateCompact {
-            continuity: Some(continuity),
-            ..Default::default()
-        };
-
-        // A patch that explicitly says "clear continuity" must result in None.
-        let patch = SessionStatePatch {
-            continuity: Some(None),
-            ..Default::default()
-        };
-        state.apply_patch(&patch);
-        assert!(
-            state.continuity.is_none(),
-            "apply_patch should clear continuity when patch has Some(None)"
-        );
-    }
+    // ── Bug fix: apply_patch must be able to clear delegation ──
 
     #[test]
     fn patch_clears_delegation_via_explicit_none() {
@@ -1039,45 +989,6 @@ mod tests {
         assert!(
             state.delegation.is_none(),
             "apply_patch should clear delegation when patch has Some(None)"
-        );
-    }
-
-    #[test]
-    fn patch_none_continuity_leaves_existing_untouched() {
-        let continuity = astra_turn_types::continuity::ContinuityState {
-            goal: Default::default(),
-            todos: Default::default(),
-            facts: Default::default(),
-            user_corrections: vec![],
-            verification: Default::default(),
-        };
-        let mut state = SessionStateCompact {
-            continuity: Some(continuity.clone()),
-            ..Default::default()
-        };
-
-        // patch.continuity = None means "unchanged".
-        let patch = SessionStatePatch::default();
-        state.apply_patch(&patch);
-        assert_eq!(state.continuity, Some(continuity));
-    }
-
-    #[test]
-    fn serde_patch_continuity_clear_roundtrip() {
-        let patch = SessionStatePatch {
-            continuity: Some(None),
-            ..Default::default()
-        };
-        let json_str = serde_json::to_string(&patch).unwrap();
-        assert!(
-            json_str.contains("continuity"),
-            "Some(None) must serialize as null, not be omitted"
-        );
-        let deser: SessionStatePatch = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(
-            deser.continuity,
-            Some(None),
-            "JSON null must deserialize to Some(None)"
         );
     }
 

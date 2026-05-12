@@ -5,8 +5,8 @@
 //! references) via Memoria. Inspired by Claude Code's `extractMemories`.
 //!
 //! Key invariants:
-//! - **Mutual exclusion**: if the main model already called `memory_store`
-//!   this turn, extraction is skipped (no double-writes).
+//! - **Mutual exclusion**: if the main model already invoked the `memory`
+//!   tool this turn, extraction is skipped (no double-writes).
 //! - **Fire-and-forget**: never blocks the next user input.
 //! - **Single in-flight**: at most one extraction runs at a time.
 //! - **Quality gate**: extracted content must pass `is_high_quality_lesson`.
@@ -32,11 +32,27 @@ Types:
 - project: deadlines, decisions, incidents (\"merge freeze May 8\", \"auth rewrite for compliance\")
 - ref: external system pointers (\"bugs in Linear project INGEST\", \"dashboard at grafana.internal/d/api-latency\")
 
+Body structure for feedback and project types (REQUIRED — without these a future reader
+can't judge edge cases and the memory degrades into a slogan):
+  Lead with the rule or fact, then two lines:
+    **Why:** the reason the user gave — often a past incident or strong preference
+    **How to apply:** when/where the guidance should kick in
+
+  Good: \"Integration tests must hit a real database, not mocks.\\n**Why:** prior incident \
+where mock/prod divergence masked a broken migration.\\n**How to apply:** when touching \
+tests in services/**/tests/.\"
+  Bad: \"Use real DBs in tests.\"  (missing the why; future-you can't judge exceptions.)
+
 Do NOT extract:
 - Code patterns or architecture (derivable from the codebase)
 - Git history or file paths
 - Ephemeral debug context or temporary state
 - Things the user did NOT say (don't infer preferences from tool usage)
+
+These exclusions apply EVEN when the user explicitly asks you to save. If the user asks
+you to \"save this week's PR list\" or \"remember what I did today\", do NOT store the raw
+list — store only the one surprising / non-obvious part (e.g. \"user is reviewing PRs on \
+weekends this month — flag as pattern, not policy\"). Activity logs are noise.
 
 Return [] if nothing is worth remembering. Be selective — false negatives are better than noise.";
 
@@ -90,6 +106,9 @@ pub fn parse_extraction_response(response: &str) -> Vec<ExtractedMemory> {
             if content.is_empty() {
                 return None;
             }
+            if astra_tools::memoria::contains_sensitive_memory_content(&content) {
+                return None;
+            }
             let category = match type_str {
                 "user" => MemoryCategory::User,
                 "feedback" => MemoryCategory::Feedback,
@@ -102,9 +121,124 @@ pub fn parse_extraction_response(response: &str) -> Vec<ExtractedMemory> {
         .collect()
 }
 
-/// Check if the main model already wrote to memory this turn.
+fn write_decision_for_failed_conflict_probe() -> astra_tools::memoria::WriteDecision {
+    astra_tools::memoria::WriteDecision::Skip {
+        reason: "conflict pre-check failed; skipping extraction write to avoid duplicates".into(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExtractionWriteAccounting {
+    stored_or_updated: usize,
+    candidates: usize,
+    writes: usize,
+    updates: usize,
+    skipped: usize,
+    failures: usize,
+}
+
+fn extraction_write_accounting(
+    candidates: usize,
+    writes: usize,
+    updates: usize,
+    skipped: usize,
+    failures: usize,
+) -> ExtractionWriteAccounting {
+    ExtractionWriteAccounting {
+        stored_or_updated: writes + updates,
+        candidates,
+        writes,
+        updates,
+        skipped,
+        failures,
+    }
+}
+
+/// Check if the main model already **wrote** to memory this turn.
+///
+/// Write actions (`remember`, `forget`, `update`, `focus`, `reflect`,
+/// `feedback`) mean the agent is actively shaping durable state — the
+/// background extractor should stand down to avoid racing or
+/// double-writing. Read actions (`recall`, `expand`, `profile`) do not
+/// block extraction.
+///
+/// `actions` should list every `memory(action=…)` call made this turn,
+/// populated at the call site that has access to tool-call args.
+/// When the slice is empty the function treats the turn as
+/// "wrote nothing" — the conservative legacy name-only skip is
+/// handled by the caller via the secondary `tools_used` check
+/// (see [`MemoryExtractor::maybe_extract`]).
+pub fn main_model_wrote_memory_actions(actions: &[String]) -> bool {
+    actions.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "remember" | "forget" | "update" | "focus" | "reflect" | "feedback"
+        )
+    })
+}
+
+/// Legacy name-only check. Kept for callers that don't yet have
+/// per-action visibility (e.g. restored sessions where we only
+/// rehydrate tool names). Treats any `memory` call as a write —
+/// conservative but correctness-safe.
 pub fn main_model_wrote_memory(tools_used: &[String]) -> bool {
-    tools_used.iter().any(|t| t == "memory_store")
+    tools_used.iter().any(|t| t == "memory")
+}
+
+/// Extract the `action` field from every `memory(action=…)` tool call
+/// in a list of journal records. Returns actions in call order.
+///
+/// We scan `args_preview` (the already-truncated JSON-ish blob the
+/// journal stores) with a small, forgiving pattern: the preview is
+/// capped at ~80 chars but the `"action":"…"` entry sits at the front
+/// of the object in all dispatch paths, so it survives truncation.
+pub fn extract_memory_actions(
+    records: &[astra_services::session_journal::ToolCallRecord],
+) -> Vec<String> {
+    records
+        .iter()
+        .filter(|r| r.name == "memory")
+        .filter_map(|r| {
+            r.args_preview
+                .as_deref()
+                .and_then(parse_action_from_preview)
+        })
+        .collect()
+}
+
+/// Best-effort extraction of the `"action"` value from a truncated
+/// JSON-ish preview string. Accepts both double-quoted and single-
+/// quoted variants since different dispatch paths use slightly
+/// different preview formatters. Returns `None` when the field is
+/// absent or malformed.
+fn parse_action_from_preview(preview: &str) -> Option<String> {
+    for marker in [
+        "\"action\":\"",
+        "\"action\": \"",
+        "'action':'",
+        "'action': '",
+    ] {
+        if let Some(idx) = preview.find(marker) {
+            let rest = &preview[idx + marker.len()..];
+            let end = rest.find(['"', '\''])?;
+            let action = &rest[..end];
+            if !action.is_empty() {
+                return Some(action.to_string());
+            }
+        }
+    }
+    // Key=value fallback used by some test fixtures.
+    if let Some(idx) = preview.find("action=") {
+        let rest = &preview[idx + "action=".len()..];
+        let action: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if !action.is_empty() {
+            return Some(action);
+        }
+    }
+    None
 }
 
 /// Actual cache usage reported by the provider, when available.
@@ -237,7 +371,16 @@ pub struct ExtractionContext<'a> {
     pub selector_params: Option<&'a LlmConnParams>,
     pub user_message: &'a str,
     pub assistant_response: &'a str,
+    /// Tool *names* the main model invoked this turn (names only; no args).
+    /// Used for the legacy name-only skip heuristic when
+    /// `recent_memory_actions` is empty.
     pub tools_used: &'a [String],
+    /// `memory(action=…)` action strings observed on this turn, in
+    /// call order. When non-empty, the orchestrator uses these to
+    /// decide skip-on-write precisely (only actual write actions
+    /// block extraction). Empty means "no per-action info available";
+    /// the caller falls back to the conservative name-only heuristic.
+    pub recent_memory_actions: &'a [String],
     pub session_id: Option<&'a str>,
     pub existing_manifest: &'a str,
     /// Fork prefix captured from the parent turn. When available AND the
@@ -298,7 +441,16 @@ impl MemoryExtractor {
             );
             return ExtractionOutcome::SkippedBusy { prior_turn: prior };
         }
-        if main_model_wrote_memory(ctx.tools_used) {
+        // Skip extraction when the main model already *wrote* to memory
+        // this turn. Prefer the precise per-action signal when we have
+        // it; fall back to the conservative name-only heuristic only
+        // when actions weren't threaded through (legacy code paths).
+        let skip = if !ctx.recent_memory_actions.is_empty() {
+            main_model_wrote_memory_actions(ctx.recent_memory_actions)
+        } else {
+            main_model_wrote_memory(ctx.tools_used)
+        };
+        if skip {
             self.last_processed_turn = ctx.turn;
             return ExtractionOutcome::SkippedMainWrote;
         }
@@ -555,20 +707,6 @@ async fn run_extraction(
         .map(|m| format!("{:?}", m.category).to_lowercase())
         .collect();
 
-    let memories: Vec<serde_json::Value> = quality_filtered
-        .iter()
-        .map(|m| {
-            let encoded = astra_prompts::memory_types::encode(m.category, &m.content);
-            serde_json::json!({
-                "content": encoded,
-                "memory_type": m.category.memoria_type(),
-                "trust_tier": m.category.trust_tier(),
-                "session_id": session_id,
-                "source": {"agent": "extraction"},
-            })
-        })
-        .collect();
-
     let mem = astra_core::MemoriaSettings::from_env();
     let key = match mem.master_key {
         Some(k) => k,
@@ -583,36 +721,139 @@ async fn run_extraction(
         }
     };
 
-    match client
-        .post(format!("{}/v1/memories/batch", mem.base_url))
-        .header("Authorization", format!("Bearer {key}"))
-        .json(&serde_json::json!({ "memories": memories }))
-        .send()
-        .await
-    {
-        Ok(resp) if !resp.status().is_success() => {
-            eprintln!(
-                "  [memory-extraction] batch write failed ({})",
-                resp.status()
-            );
+    // Per-candidate conflict pre-check: route near-duplicates to
+    // `/correct` instead of batch-inserting a new row. The prior path
+    // POSTed every extracted item to `/v1/memories/batch`, creating
+    // duplicates whenever a refinement of an existing memory surfaced.
+    // Running the pre-checks in parallel keeps latency roughly equal
+    // to a single recall RTT; each candidate then independently POSTs
+    // either `/v1/memories` (new) or `/v1/memories/{id}/correct`
+    // (refinement).
+    let auth = format!("Bearer {key}");
+    let base = mem.base_url.clone();
+    let mut writes = 0usize;
+    let mut updates = 0usize;
+    let mut skipped = 0usize;
+    let mut skip_reasons: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for m in &quality_filtered {
+        let encoded = astra_prompts::memory_types::encode(m.category, &m.content);
+        // Step 1: top-3 recall with a 2-second timeout (same budget as
+        // the tool-side conflict pre-check).
+        let probe = client
+            .post(format!("{base}/v1/memories/retrieve"))
+            .header("Authorization", &auth)
+            .timeout(std::time::Duration::from_secs(2))
+            .json(&serde_json::json!({
+                "query": encoded,
+                "top_k": 3,
+                "session_id": session_id,
+            }))
+            .send()
+            .await;
+        let decision = match probe {
+            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(parsed) => {
+                        let arr = parsed
+                            .get("memories")
+                            .and_then(serde_json::Value::as_array)
+                            .cloned()
+                            .or_else(|| parsed.as_array().cloned())
+                            .unwrap_or_default();
+                        astra_tools::memoria::classify_write(&arr)
+                    }
+                    Err(_) => write_decision_for_failed_conflict_probe(),
+                },
+                Err(_) => write_decision_for_failed_conflict_probe(),
+            },
+            // Fail closed on probe/network failure. Writing a fresh row
+            // when duplicate detection is unavailable degrades memory
+            // quality; skipping one extraction is safer than storing noise.
+            _ => write_decision_for_failed_conflict_probe(),
+        };
+
+        // Step 2: dispatch.
+        let write_result = match &decision {
+            astra_tools::memoria::WriteDecision::Update { memory_id, .. } => {
+                updates += 1;
+                client
+                    .put(format!("{base}/v1/memories/{memory_id}/correct"))
+                    .header("Authorization", &auth)
+                    .json(&serde_json::json!({
+                        "new_content": encoded,
+                        "reason": "session-end extraction refinement",
+                    }))
+                    .send()
+                    .await
+            }
+            astra_tools::memoria::WriteDecision::Store => {
+                writes += 1;
+                client
+                    .post(format!("{base}/v1/memories"))
+                    .header("Authorization", &auth)
+                    .json(&serde_json::json!({
+                        "content": encoded,
+                        "memory_type": m.category.memoria_type(),
+                        "trust_tier": m.category.trust_tier(),
+                        "session_id": session_id,
+                        "source": {"agent": "extraction"},
+                    }))
+                    .send()
+                    .await
+            }
+            astra_tools::memoria::WriteDecision::Skip { reason } => {
+                skipped += 1;
+                skip_reasons.push(reason.clone());
+                continue;
+            }
+        };
+        match write_result {
+            Ok(resp) if !resp.status().is_success() => {
+                errors.push(format!("{:?} HTTP {}", decision, resp.status()));
+            }
+            Err(e) => errors.push(format!("{decision:?} network: {e}")),
+            _ => {}
         }
-        Err(e) => {
-            eprintln!("  [memory-extraction] batch write error: {e}");
-        }
-        _ => {}
+    }
+    if !skip_reasons.is_empty() {
+        eprintln!(
+            "  [memory-extraction] skipped candidates ({}): {}",
+            skipped,
+            skip_reasons.join("; ")
+        );
+    }
+    if !errors.is_empty() {
+        eprintln!(
+            "  [memory-extraction] write failures ({}): {}",
+            errors.len(),
+            errors.join("; ")
+        );
     }
 
     let duration_ms = start.elapsed().as_millis() as u64;
-    eprintln!(
-        "  [memory-extraction] turn: extracted {} memories ({}) in {:.1}s{}",
+    let accounting = extraction_write_accounting(
         quality_filtered.len(),
+        writes,
+        updates,
+        skipped,
+        errors.len(),
+    );
+    eprintln!(
+        "  [memory-extraction] turn: stored/updated {} memories from {} candidates ({} new, {} updated, {} skipped, {} failures) [{}] in {:.1}s{}",
+        accounting.stored_or_updated,
+        accounting.candidates,
+        accounting.writes,
+        accounting.updates,
+        accounting.skipped,
+        accounting.failures,
         categories.join(", "),
         duration_ms as f64 / 1000.0,
         if prefix_reused { " [cache-shared]" } else { "" },
     );
 
     ExtractionOutcome::Extracted {
-        count: quality_filtered.len(),
+        count: accounting.stored_or_updated,
         categories,
         duration_ms,
         prefix_reused,
@@ -754,6 +995,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_sensitive_content_skipped() {
+        let resp = r#"[{"type":"project","content":"deploy token: ghp_1234567890abcdef"},{"type":"user","content":"prefers concise answers with examples"}]"#;
+        let result = parse_extraction_response(resp);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].category, MemoryCategory::User);
+    }
+
+    #[test]
     fn parse_reference_alias() {
         let resp = r#"[{"type":"ref","content":"Linear INGEST"},{"type":"reference","content":"Grafana board"}]"#;
         let result = parse_extraction_response(resp);
@@ -765,15 +1014,12 @@ mod tests {
     // ── main_model_wrote_memory ──
 
     #[test]
-    fn detects_memory_store_in_tools() {
-        assert!(main_model_wrote_memory(&[
-            "bash".into(),
-            "memory_store".into()
-        ]));
+    fn detects_memory_use_in_tools() {
+        assert!(main_model_wrote_memory(&["bash".into(), "memory".into()]));
     }
 
     #[test]
-    fn no_memory_store() {
+    fn no_memory_use() {
         assert!(!main_model_wrote_memory(&[
             "bash".into(),
             "read_file".into()
@@ -834,6 +1080,28 @@ mod tests {
             user_message: "msg",
             assistant_response: "resp",
             tools_used: tools,
+            recent_memory_actions: &[],
+            session_id: None,
+            existing_manifest: "",
+            fork_prefix: None,
+        }
+    }
+
+    /// Variant that also carries `recent_memory_actions` so tests can
+    /// verify the action-aware skip path.
+    fn ctx_with_actions<'a>(
+        turn: u32,
+        params: Option<&'a LlmConnParams>,
+        tools: &'a [String],
+        actions: &'a [String],
+    ) -> ExtractionContext<'a> {
+        ExtractionContext {
+            turn,
+            selector_params: params,
+            user_message: "msg",
+            assistant_response: "resp",
+            tools_used: tools,
+            recent_memory_actions: actions,
             session_id: None,
             existing_manifest: "",
             fork_prefix: None,
@@ -849,9 +1117,134 @@ mod tests {
             model_name: "m".into(),
             provider: "openai".into(),
         };
-        let tools = vec!["memory_store".into()];
+        let tools = vec!["memory".into()];
         let outcome = ext.maybe_extract(ctx(1, Some(&params), &tools));
         assert_eq!(outcome.tag(), "skipped_main_wrote");
+    }
+
+    #[tokio::test]
+    async fn extractor_does_not_skip_when_only_memory_reads() {
+        // With per-action visibility, read-only `recall` / `expand` /
+        // `profile` calls no longer block extraction — only actual
+        // writes do.
+        let mut ext = MemoryExtractor::new();
+        let params = LlmConnParams {
+            base_url: "http://x".into(),
+            api_key: "k".into(),
+            model_name: "m".into(),
+            provider: "openai".into(),
+        };
+        let tools = vec!["memory".into(), "memory".into()];
+        let actions = vec!["recall".into(), "expand".into()];
+        let outcome = ext.maybe_extract(ctx_with_actions(1, Some(&params), &tools, &actions));
+        // The background worker may spawn; we just need to confirm the
+        // write-gate didn't pre-empt it.
+        assert_ne!(
+            outcome.tag(),
+            "skipped_main_wrote",
+            "read-only memory actions must not block extraction"
+        );
+    }
+
+    #[test]
+    fn extractor_skips_when_action_is_write() {
+        let mut ext = MemoryExtractor::new();
+        let params = LlmConnParams {
+            base_url: "http://x".into(),
+            api_key: "k".into(),
+            model_name: "m".into(),
+            provider: "openai".into(),
+        };
+        let tools = vec!["memory".into()];
+        // A single `remember` should trigger the skip.
+        let actions = vec!["remember".into()];
+        let outcome = ext.maybe_extract(ctx_with_actions(1, Some(&params), &tools, &actions));
+        assert_eq!(outcome.tag(), "skipped_main_wrote");
+    }
+
+    #[test]
+    fn extract_memory_actions_reads_double_quoted_action() {
+        let rec = |name: &str, preview: &str| astra_services::session_journal::ToolCallRecord {
+            name: name.into(),
+            ok: true,
+            args_preview: Some(preview.into()),
+            ..Default::default()
+        };
+        let records = vec![
+            rec("memory", r#"{"action":"recall","query":"auth"}"#),
+            rec("bash", r#"{"command":"ls"}"#),
+            rec("memory", r#"{"action":"remember","content":"prefer …"#),
+        ];
+        assert_eq!(
+            extract_memory_actions(&records),
+            vec!["recall".to_string(), "remember".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_memory_actions_survives_truncation() {
+        // Even if the preview is cut mid-content, the `"action":"…"`
+        // prefix sits at the front and remains recoverable.
+        let rec = astra_services::session_journal::ToolCallRecord {
+            name: "memory".into(),
+            ok: true,
+            args_preview: Some(r#"{"action":"forget","memory_id":"m1…"#.into()),
+            ..Default::default()
+        };
+        assert_eq!(extract_memory_actions(&[rec]), vec!["forget".to_string()]);
+    }
+
+    #[test]
+    fn extract_memory_actions_handles_key_value_style() {
+        let rec = astra_services::session_journal::ToolCallRecord {
+            name: "memory".into(),
+            ok: true,
+            args_preview: Some("action=recall query=auth".into()),
+            ..Default::default()
+        };
+        assert_eq!(extract_memory_actions(&[rec]), vec!["recall".to_string()]);
+    }
+
+    #[test]
+    fn extract_memory_actions_ignores_other_tools() {
+        let records = vec![astra_services::session_journal::ToolCallRecord {
+            name: "bash".into(),
+            args_preview: Some(r#"{"action":"not_memory"}"#.into()),
+            ..Default::default()
+        }];
+        assert!(extract_memory_actions(&records).is_empty());
+    }
+
+    #[test]
+    fn extract_memory_actions_returns_empty_when_args_missing() {
+        let records = vec![astra_services::session_journal::ToolCallRecord {
+            name: "memory".into(),
+            args_preview: None,
+            ..Default::default()
+        }];
+        assert!(extract_memory_actions(&records).is_empty());
+    }
+
+    #[test]
+    fn main_model_wrote_memory_actions_classifies_v2_verbs() {
+        // Writes
+        for w in [
+            "remember", "forget", "update", "focus", "reflect", "feedback",
+        ] {
+            assert!(
+                main_model_wrote_memory_actions(&[w.to_string()]),
+                "{w} should count as a write"
+            );
+        }
+        // Reads
+        for r in ["recall", "expand", "profile"] {
+            assert!(
+                !main_model_wrote_memory_actions(&[r.to_string()]),
+                "{r} should NOT count as a write"
+            );
+        }
+        // Empty list → not a write
+        assert!(!main_model_wrote_memory_actions(&[]));
     }
 
     #[test]
@@ -1267,6 +1660,23 @@ mod tests {
         assert!(parse_extraction_response(resp).is_empty());
     }
 
+    #[test]
+    fn conflict_probe_failure_does_not_store_duplicate() {
+        assert!(matches!(
+            write_decision_for_failed_conflict_probe(),
+            astra_tools::memoria::WriteDecision::Skip { .. }
+        ));
+    }
+
+    #[test]
+    fn skipped_extraction_candidates_do_not_count_as_stored() {
+        let accounting = extraction_write_accounting(3, 1, 1, 1, 0);
+
+        assert_eq!(accounting.candidates, 3);
+        assert_eq!(accounting.stored_or_updated, 2);
+        assert_eq!(accounting.skipped, 1);
+    }
+
     // ── Source metadata ──
 
     #[test]
@@ -1346,6 +1756,7 @@ mod tests {
             user_message: "hello",
             assistant_response: "world",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: None,
@@ -1381,6 +1792,7 @@ mod tests {
             user_message: "I prefer Rust",
             assistant_response: "Noted",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: None,
@@ -1418,6 +1830,7 @@ mod tests {
             user_message: "I prefer Rust",
             assistant_response: "Noted",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: None,
@@ -1452,6 +1865,7 @@ mod tests {
             user_message: "keep it concise",
             assistant_response: "ok",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: None,
@@ -1639,6 +2053,7 @@ mod tests {
             user_message: "set dark mode",
             assistant_response: "done",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: Some(prefix),
@@ -1684,6 +2099,7 @@ mod tests {
             user_message: "be verbose",
             assistant_response: "ok",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: None,
@@ -1791,6 +2207,7 @@ mod tests {
             user_message: "test",
             assistant_response: "ok",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: Some(prefix),
@@ -1920,6 +2337,7 @@ mod tests {
             user_message: "be concise",
             assistant_response: "ok",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: Some(prefix),
@@ -1957,6 +2375,7 @@ mod tests {
             user_message: "test",
             assistant_response: "ok",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: Some(prefix),
@@ -1998,6 +2417,7 @@ mod tests {
             user_message: "deadline is friday",
             assistant_response: "noted",
             tools_used: &[],
+            recent_memory_actions: &[],
             session_id: None,
             existing_manifest: "",
             fork_prefix: None,

@@ -722,11 +722,9 @@ impl ToolExecutor {
         let action = match args.get("action").and_then(Value::as_str) {
             Some(a) => a,
             None => {
-                return super::ToolExecutionOutcome {
-                    output: "Error: 'action' is required (enter, exit, add, list, remove)"
-                        .to_string(),
-                    tool_result_fields: None,
-                };
+                return super::ToolExecutionOutcome::error(
+                    "Error: 'action' is required (enter, exit, add, list, remove)".to_string(),
+                );
             }
         };
 
@@ -735,10 +733,9 @@ impl ToolExecutor {
                 let branch = match args.get("branch").and_then(Value::as_str) {
                     Some(b) if !b.is_empty() => b,
                     _ => {
-                        return super::ToolExecutionOutcome {
-                            output: "Error: 'branch' is required for enter".to_string(),
-                            tool_result_fields: None,
-                        };
+                        return super::ToolExecutionOutcome::error(
+                            "Error: 'branch' is required for enter".to_string(),
+                        );
                     }
                 };
                 match self.enter_worktree(branch) {
@@ -776,12 +773,10 @@ impl ToolExecutor {
                                 session.worktree_path.display()
                             ),
                             tool_result_fields: Some(tool_result_fields),
+                            is_error: false,
                         }
                     }
-                    Err(e) => super::ToolExecutionOutcome {
-                        output: format!("Error: {e}"),
-                        tool_result_fields: None,
-                    },
+                    Err(e) => super::ToolExecutionOutcome::error(format!("Error: {e}")),
                 }
             }
             "exit" => {
@@ -806,12 +801,10 @@ impl ToolExecutor {
                         super::ToolExecutionOutcome {
                             output: msg,
                             tool_result_fields: None,
+                            is_error: false,
                         }
                     }
-                    Err(e) => super::ToolExecutionOutcome {
-                        output: format!("Error: {e}"),
-                        tool_result_fields: None,
-                    },
+                    Err(e) => super::ToolExecutionOutcome::error(format!("Error: {e}")),
                 }
             }
             "add" | "create" => {
@@ -843,6 +836,7 @@ impl ToolExecutor {
             "list" | "ls" => super::ToolExecutionOutcome {
                 output: super::git_gix::worktree_list(&self.project_root),
                 tool_result_fields: None,
+                is_error: false,
             },
             "remove" | "rm" | "delete" => {
                 let normalized_path = args
@@ -850,9 +844,11 @@ impl ToolExecutor {
                     .and_then(Value::as_str)
                     .map(|path| self.normalize_worktree_path(Path::new(path)));
                 let mut output = super::git_gix::worktree_remove(&self.project_root, args);
-                if !output.starts_with("Error:")
-                    && let Some(worktree_path) = normalized_path.as_ref()
-                {
+                // `worktree_remove` returns an "Error:" prefixed string on failure and a
+                // plain success string otherwise. Capture the failure flag BEFORE we
+                // append session-restore text (which would break prefix inference).
+                let is_error = output.starts_with("Error:");
+                if !is_error && let Some(worktree_path) = normalized_path.as_ref() {
                     self.remove_git_worktree_rollback(worktree_path);
                     if let Some(original_root) =
                         self.maybe_restore_session_after_manual_worktree_removal(worktree_path)
@@ -863,14 +859,12 @@ impl ToolExecutor {
                 super::ToolExecutionOutcome {
                     output,
                     tool_result_fields: None,
+                    is_error,
                 }
             }
-            _ => super::ToolExecutionOutcome {
-                output: format!(
-                    "Error: unknown worktree action '{action}'. Use: enter, exit, add, list, remove"
-                ),
-                tool_result_fields: None,
-            },
+            _ => super::ToolExecutionOutcome::error(format!(
+                "Error: unknown worktree action '{action}'. Use: enter, exit, add, list, remove"
+            )),
         }
     }
 

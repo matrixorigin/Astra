@@ -149,6 +149,8 @@ pub(crate) fn assemble_system_message_via_pipeline(
         edge_profile_cwd,
         edge_profile_git_branch,
         None,
+        "",
+        "",
     );
     (
         outcome.primary_system,
@@ -194,6 +196,8 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     edge_profile_cwd: Option<&str>,
     edge_profile_git_branch: Option<&str>,
     project_context: Option<&str>,
+    deferred_tools_block: &str,
+    skill_listing_block: &str,
 ) -> BridgePipelineOutcome {
     use astra_turn_core::context_sources::{
         AgentContext, EdgeProfile, ExternalSources, SessionContext, TurnState,
@@ -282,6 +286,8 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
             ..Default::default()
         },
         self_model: None,
+        deferred_tools_block: deferred_tools_block.to_string(),
+        skill_listing_block: skill_listing_block.to_string(),
     };
 
     let agent = AgentContext {
@@ -801,6 +807,8 @@ mod tests {
             None,
             None,
             None,
+            "",
+            "",
         );
 
         // Low-pressure turn: planner stays at Normal, tool count preserved.
@@ -853,6 +861,8 @@ mod tests {
             None,
             None,
             None,
+            "",
+            "",
         );
 
         let dynamic_text = outcome
@@ -895,6 +905,8 @@ mod tests {
             Some("/tmp/proj"),
             None,
             None,
+            "",
+            "",
         );
 
         let primary_text = outcome

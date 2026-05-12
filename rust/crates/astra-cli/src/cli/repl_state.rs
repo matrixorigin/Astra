@@ -98,9 +98,6 @@ pub(crate) struct ReplState {
     /// Sticky task/thread summary used to anchor ultra-short follow-ups like
     /// "继续" even after history compaction prunes earlier turns.
     pub continuation_anchor: Option<String>,
-    /// Session-level goal derived from the first substantive user message.
-    /// Survives compaction and is injected alongside the continuation anchor.
-    pub session_goal: Option<String>,
     /// One-shot diagnostics context injected by `/ask`. Prepended to the next
     /// user message so the LLM sees runtime state alongside the question.
     /// Consumed (cleared) after one turn.
@@ -127,24 +124,37 @@ pub(crate) struct ReplState {
     pub active_system_skills: Vec<prompts::SystemSkill>,
     /// Runtime configuration loaded from config files + env vars (M3).
     pub runtime_config: astra_config::runtime_config::RuntimeConfig,
+    /// Content-addressed id of `runtime_config`. Set by
+    /// `RuntimeConfig::load_with_version` at startup and whenever
+    /// `/config` saves an edit. Threaded into HeavyCheckpoint writes
+    /// and ConfigChange journal events so post-hoc audit can answer
+    /// "what config did this session/turn run under".
+    ///
+    /// `None` only for legacy code paths that don't walk through the
+    /// version front door yet (covered by follow-up commits).
+    pub config_version_id: Option<String>,
     pub context_budget: prompts::ContextBudget,
     pub journal: Option<session_journal::JournalWriter>,
     /// Tools used in the last turn — fed into selection for recency boost.
     pub recent_tools: Vec<String>,
+    /// `memory(action=…)` action strings observed on this turn, in
+    /// call order. Emptied at the start of each turn and populated as
+    /// tool calls run. Used by the extraction gate to precisely skip
+    /// only when an actual write action fired — read actions
+    /// (`recall` / `expand` / `profile`) do not block extraction.
+    pub recent_memory_actions: Vec<String>,
     /// Session-persistent permission manager — "always"/"skip" survives across turns.
     pub perm_manager: PermissionManager,
     /// User ID for event ingestion attribution.
     pub ingestion_user_id: Option<String>,
     /// Matrix pool + journal ingestion + sync orchestrator (None if MatrixOne unavailable).
     pub matrix_runtime: Option<std::sync::Arc<astra_runtime::MatrixCloudRuntime>>,
-    /// Learning snapshot restored from cloud (to be merged into learning modules).
-    pub learning_snapshot: Option<String>,
     /// Local task service for /task commands.
     pub task_service: Option<std::sync::Arc<astra_services::LocalTaskService>>,
     /// Cross-session tool health data for error budget persistence.
-    pub tool_health_entries: Vec<astra_evolution::persistence::ToolHealthEntry>,
+    pub tool_health_entries: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     /// Last successfully synced tool health snapshot, used to compute deltas.
-    pub synced_tool_health_entries: Vec<astra_evolution::persistence::ToolHealthEntry>,
+    pub synced_tool_health_entries: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     /// Cross-session quality tracker shared with the tool selector so REPL
     /// save path can export cumulative per-tool selection/quality counters.
     pub tool_quality_tracker:
@@ -170,20 +180,8 @@ pub(crate) struct ReplState {
     pub current_plan_subtask_id: Option<String>,
     /// Whether the last chat turn was interrupted by Ctrl+C (used by plan auto-execution).
     pub last_turn_interrupted: bool,
-    /// Cloud learning snapshot version for optimistic locking.
-    /// Set by try_cloud_pull, used by try_cloud_push to prevent concurrent overwrites.
-    pub cloud_learning_version: Option<i64>,
     /// Last turn's journal event — for /turn command display.
     pub last_turn_event: Option<session_journal::JournalEvent>,
-    /// Shared pattern library reference for /learn command.
-    pub pattern_library:
-        Option<std::sync::Arc<std::sync::Mutex<astra_pipeline::pattern::PatternLibrary>>>,
-    /// Shared entity graph (learning feedback loop + post-login cloud pull).
-    pub entity_graph: Option<std::sync::Arc<std::sync::Mutex<astra_pipeline::entity::EntityGraph>>>,
-    /// Shared calibrator (learning feedback loop + post-login cloud pull).
-    pub calibrator: Option<
-        std::sync::Arc<std::sync::Mutex<astra_pipeline::calibration::ProgressiveCalibrator>>,
-    >,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// Session-scoped skill quality tracker for learning loop.
@@ -262,9 +260,6 @@ pub(crate) struct ReplState {
     /// Resume guidance message from a previously interrupted checkpoint.
     /// One-shot: consumed and cleared after the first turn that uses it.
     pub resume_guidance: Option<String>,
-    /// Runtime-owned continuity restored from checkpoint or updated by the last turn.
-    /// This is the live source for the next agentic loop, not just prompt guidance.
-    pub runtime_continuity: Option<astra_turn_types::continuity::ContinuityState>,
 
     /// Pre-computed plan-resume digest (P3.3).
     ///
@@ -301,6 +296,13 @@ pub(crate) struct ReplState {
     pub selector_model_params: Option<astra_runtime::memory_relevance::LlmConnParams>,
     /// Background memory extraction agent.
     pub memory_extractor: super::memory_extraction::MemoryExtractor,
+    /// Background session-memory.md extraction coordinator. Cloned
+    /// from `matrix_runtime` at REPL startup once the encryptor is
+    /// installed; `None` means no cloud runtime is attached (local-only
+    /// CLI paths) and extraction runs silently with no LLM and no
+    /// events.
+    pub session_memory_extractor:
+        Option<std::sync::Arc<astra_runtime::session_memory::MemoryExtractionService>>,
 
     /// P8: persistent auto-invoke handler. Owns the per-cause cooldowns
     /// across turns of this session. Created lazily on first turn so
@@ -341,8 +343,6 @@ pub(crate) struct ReplState {
     >,
     /// Adaptive state restored from workspace, applied when ObservabilitySession is created.
     pub pending_adaptive_state: Option<PersistedAdaptiveState>,
-    /// Persisted live goal-progress snapshot restored from workspace.
-    pub pending_goal_progress: Option<astra_services::session_workspace::GoalProgressSnapshot>,
 
     // ── User Profile (M5) ──
     /// User profile manager for preferences and scenario detection.
@@ -351,11 +351,6 @@ pub(crate) struct ReplState {
     // ── Auto-Tuning (M6) ──
     /// Auto-tuning engine for adaptive learning.
     pub auto_tuning_engine: std::sync::Arc<astra_learning::auto_tuning::AutoTuningEngine>,
-
-    // ── Evolution ──
-    /// Shared evolution service for multi-axis self-evolution.
-    pub evolution_service:
-        Option<std::sync::Arc<astra_runtime::evolution::service::EvolutionService>>,
 
     // ── Conversation State Log (CSL) ──
     /// Unified CSL manager for persisting/restoring conversation state.
@@ -414,7 +409,6 @@ impl Default for ReplState {
             )),
             task_manager: std::sync::Arc::new(crate::edge_tools::TaskManager::new()),
             continuation_anchor: None,
-            session_goal: None,
             diagnostics_context: None,
             queued_message: None,
             pending_followup_suggestion: None,
@@ -433,10 +427,17 @@ impl Default for ReplState {
             // Load RuntimeConfig from config files + env vars, then create
             // ContextBudget using the loaded config (M3 wiring).
             runtime_config: { astra_config::runtime_config::RuntimeConfig::load() },
+            // Startup id is resolved after ReplState is constructed so
+            // `adopt_session_id` can stamp the pointer with the actual
+            // session id as PutMetadata.source_session. See
+            // `repl_runtime::resolve_startup_config_version`. Until
+            // then, legacy code paths treat None as "unknown".
+            config_version_id: None,
             // Temporary: will be replaced with from_runtime_config when model is known
             context_budget: prompts::ContextBudget::default(),
             journal: None,
             recent_tools: Vec::new(),
+            recent_memory_actions: Vec::new(),
             perm_manager: PermissionManager::with_project(
                 std::env::var("ASTRA_CLI_AUTO_APPROVE")
                     .map(|v| v == "1")
@@ -445,7 +446,6 @@ impl Default for ReplState {
             ),
             ingestion_user_id: None,
             matrix_runtime: None,
-            learning_snapshot: None,
             task_service: None,
             tool_health_entries: Vec::new(),
             synced_tool_health_entries: Vec::new(),
@@ -459,11 +459,7 @@ impl Default for ReplState {
             plan_execution_rounds: 0,
             current_plan_subtask_id: None,
             last_turn_interrupted: false,
-            cloud_learning_version: None,
             last_turn_event: None,
-            pattern_library: None,
-            entity_graph: None,
-            calibrator: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
             skill_search: astra_core::SkillSearchSettings::default(),
@@ -500,7 +496,6 @@ impl Default for ReplState {
             pending_idle_agent_messages: Vec::new(),
             redo_stack: Vec::new(),
             resume_guidance: None,
-            runtime_continuity: None,
             pending_plan_resume_digest: None,
             drift_compressed_turns: Vec::new(),
             drift_user_corrections: Vec::new(),
@@ -510,6 +505,7 @@ impl Default for ReplState {
             lesson_checkpointer: astra_runtime::lesson_checkpoint::LessonCheckpointer::new(),
             selector_model_params: None,
             memory_extractor: super::memory_extraction::MemoryExtractor::new(),
+            session_memory_extractor: None,
             auto_invoke_handler: None,
             latest_skill_diagnosis: None,
             diagnosis_outcome_tracker:
@@ -520,7 +516,6 @@ impl Default for ReplState {
             observability_hub: None,
             observability_session: None,
             pending_adaptive_state: None,
-            pending_goal_progress: None,
             user_profile_manager: {
                 let store =
                     std::sync::Arc::new(astra_config::user_profile::UserProfileStore::new());
@@ -534,7 +529,6 @@ impl Default for ReplState {
                 }
                 std::sync::Arc::new(engine)
             },
-            evolution_service: None,
             csl_manager: None,
             tui_render_policy: None,
             tui_stream_event_tx: None,

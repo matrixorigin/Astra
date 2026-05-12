@@ -295,14 +295,25 @@ pub fn make_args_preview(tool_name: &str, args: &Value) -> Option<String> {
             .get("file")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        "memory_search" | "memory_retrieve" => args
-            .get("query")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        "memory_store" => args
-            .get("content")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        "memory" => {
+            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            match action {
+                "recall" => args
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                "remember" => args
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                "focus" => args
+                    .get("focus_value")
+                    .or_else(|| args.get("value"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                _ => None,
+            }
+        }
         "web_fetch" => args
             .get("url")
             .and_then(|v| v.as_str())

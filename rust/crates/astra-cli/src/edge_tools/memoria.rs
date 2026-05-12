@@ -207,75 +207,72 @@ mod build_direct_request_tests {
             "top_k": 5,
             "session_id": "sess-123",
         });
-        let (endpoint, pl, _) = build_direct_request("http://mem", "retrieve", &args);
+        let (endpoint, pl, _) = build_direct_request("http://mem", "recall", &args);
         assert_eq!(endpoint, "http://mem/v1/memories/retrieve");
         assert_eq!(pl["session_id"], "sess-123");
         assert_eq!(pl["query"], "test query");
     }
 
     #[test]
-    fn retrieve_forwards_filter_session_and_include_cross_session() {
-        let args = json!({
-            "query": "test query",
-            "top_k": 5,
-            "filter_session": true,
-            "include_cross_session": false,
-        });
-        let (endpoint, pl, _) = build_direct_request("http://mem", "retrieve", &args);
-        assert_eq!(endpoint, "http://mem/v1/memories/retrieve");
-        assert_eq!(pl["filter_session"], true);
-        assert_eq!(pl["include_cross_session"], false);
-    }
-
-    #[test]
-    fn retrieve_omits_filter_and_include_when_absent() {
-        let args = json!({"query": "test", "top_k": 5});
-        let (_, pl, _) = build_direct_request("http://mem", "retrieve", &args);
-        assert!(pl.get("filter_session").is_none());
-        assert!(pl.get("include_cross_session").is_none());
-    }
-
-    #[test]
-    fn search_routes_to_retrieve_endpoint() {
-        let args = json!({"query": "test", "top_k": 10});
-        let (endpoint, _, _) = build_direct_request("http://mem", "search", &args);
-        assert_eq!(
-            endpoint, "http://mem/v1/memories/retrieve",
-            "search must route to /retrieve (not /search) for session_id support"
+    fn recall_scope_session_requires_session_id() {
+        // v2 `scope="session"` → v1 `session_scope="only"`; must refuse
+        // when no session_id is available so the caller catches the bug
+        // instead of silently downgrading to unscoped retrieval.
+        let args = json!({"query": "test query", "top_k": 5, "scope": "session"});
+        let (endpoint, pl, _) = build_direct_request("http://mem", "recall", &args);
+        assert!(endpoint.is_empty(), "must short-circuit without session_id");
+        assert!(
+            pl.get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("session_id"),
+            "error must mention missing session_id"
         );
     }
 
     #[test]
-    fn search_forwards_session_id_and_filter_session() {
+    fn recall_scope_session_sets_session_scope_only() {
         let args = json!({
             "query": "test",
-            "top_k": 10,
+            "top_k": 5,
             "session_id": "sess-abc",
-            "filter_session": true,
+            "scope": "session",
         });
-        let (_, pl, _) = build_direct_request("http://mem", "search", &args);
+        let (endpoint, pl, _) = build_direct_request("http://mem", "recall", &args);
+        assert_eq!(endpoint, "http://mem/v1/memories/retrieve");
         assert_eq!(pl["session_id"], "sess-abc");
-        assert_eq!(pl["filter_session"], true);
+        assert_eq!(
+            pl["session_scope"], "only",
+            "v2 scope=session must map to v1 session_scope=only"
+        );
     }
 
     #[test]
-    fn search_forwards_include_cross_session() {
-        let args = json!({
-            "query": "test",
-            "top_k": 10,
-            "include_cross_session": false,
-        });
-        let (_, pl, _) = build_direct_request("http://mem", "search", &args);
-        assert_eq!(pl["include_cross_session"], false);
+    fn recall_scope_all_omits_session_scope() {
+        // `scope="all"` (or missing) → let v1 default ("prefer" when
+        // session_id is present; unscoped otherwise) apply. Must NOT
+        // emit a `session_scope` field.
+        let args = json!({"query": "test", "top_k": 10, "scope": "all"});
+        let (_, pl, _) = build_direct_request("http://mem", "recall", &args);
+        assert!(pl.get("session_scope").is_none());
     }
 
     #[test]
-    fn search_omits_session_fields_when_absent() {
+    fn recall_omits_session_fields_when_absent() {
         let args = json!({"query": "test", "top_k": 10});
-        let (_, pl, _) = build_direct_request("http://mem", "search", &args);
+        let (_, pl, _) = build_direct_request("http://mem", "recall", &args);
         assert!(pl.get("session_id").is_none());
-        assert!(pl.get("filter_session").is_none());
-        assert!(pl.get("include_cross_session").is_none());
+        assert!(pl.get("session_scope").is_none());
+    }
+
+    #[test]
+    fn recall_endpoint_is_v1_memories_retrieve() {
+        let args = json!({"query": "test", "top_k": 10});
+        let (endpoint, _, _) = build_direct_request("http://mem", "recall", &args);
+        assert_eq!(
+            endpoint, "http://mem/v1/memories/retrieve",
+            "recall must route to /v1/memories/retrieve (the hybrid path)"
+        );
     }
 
     #[test]
@@ -285,7 +282,7 @@ mod build_direct_request_tests {
             "session_id": "sess-42",
             "trust_tier": "T1",
         });
-        let (endpoint, pl, _) = build_direct_request("http://mem", "store", &args);
+        let (endpoint, pl, _) = build_direct_request("http://mem", "remember", &args);
         assert_eq!(endpoint, "http://mem/v1/memories");
         assert_eq!(pl["session_id"], "sess-42");
         assert_eq!(pl["trust_tier"], "T1");
@@ -294,7 +291,7 @@ mod build_direct_request_tests {
     #[test]
     fn store_maps_business_type_to_memoria_primitive() {
         let args = json!({"content": "preference", "memory_type": "feedback"});
-        let (_, pl, _) = build_direct_request("http://mem", "store", &args);
+        let (_, pl, _) = build_direct_request("http://mem", "remember", &args);
         assert_eq!(
             pl["memory_type"], "semantic",
             "business type 'feedback' must map to 'semantic'"
@@ -304,7 +301,7 @@ mod build_direct_request_tests {
     #[test]
     fn store_passes_through_valid_memoria_types() {
         let args = json!({"content": "test", "memory_type": "profile"});
-        let (_, pl, _) = build_direct_request("http://mem", "store", &args);
+        let (_, pl, _) = build_direct_request("http://mem", "remember", &args);
         assert_eq!(pl["memory_type"], "profile");
     }
 

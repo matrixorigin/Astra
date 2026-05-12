@@ -3,7 +3,6 @@
 //! This crate provides foundational types used during turn execution,
 //! extracted from the monolithic runtime crate for better modularity.
 
-pub mod continuity;
 mod implicit_feedback;
 mod memory_ranking;
 mod memory_structure;
@@ -18,8 +17,8 @@ pub use implicit_feedback::{
     implicit_feedback_context_injection, implicit_feedback_rating,
 };
 pub use memory_ranking::{
-    PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE, is_persistent_type, partition_by_scope,
-    sort_by_retrieval_score,
+    PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE, freshness_suffix_for,
+    is_persistent_type, partition_by_scope, sort_by_retrieval_score,
 };
 pub use memory_structure::{
     PERSISTENT_MEMORY_TYPES, PersistentStoreRejection, is_persistent_memory_type,

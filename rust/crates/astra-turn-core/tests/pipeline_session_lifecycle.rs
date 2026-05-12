@@ -40,6 +40,8 @@ fn make_session_context() -> SessionContext {
             edge_executor_id: Some("exec-1".into()),
         },
         self_model: Some("Good at coding, struggles with design.".into()),
+        deferred_tools_block: String::new(),
+        skill_listing_block: String::new(),
     }
 }
 

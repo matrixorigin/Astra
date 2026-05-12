@@ -291,6 +291,7 @@ pub(super) async fn handle_slash_command(
             }
 
             state.model = Some(arg.to_string());
+            slash_config::set_active_model_for_display(Some(arg.to_string()));
             let base_model = astra_turn_core::thinking_config::resolve_model_thinking(arg).0;
             state.cached_pricing = slash_stats::fallback_pricing(base_model);
             state.context_budget = prompts::ContextBudget::from_runtime_config(
@@ -614,10 +615,31 @@ pub(super) async fn handle_slash_command(
 }
 
 /// Fetch active model names from the API (for TUI inline selection).
-pub(super) async fn fetch_model_list(
+pub(crate) async fn fetch_model_list(
     api: &astra_thin_client::ThinClient,
     token: Option<&str>,
 ) -> Result<Vec<String>, String> {
+    let entries = fetch_model_list_raw(api, token).await?;
+    Ok(entries
+        .iter()
+        .filter_map(|m| {
+            let name = model_list_entry_name(m)?;
+            if !model_list_entry_is_active(m) {
+                return None;
+            }
+            Some(name.to_string())
+        })
+        .collect())
+}
+
+/// Fetch the full JSON catalog (used when the caller needs
+/// `thinking_capability` / `provider` / pricing alongside the
+/// name).  Returns only active entries so downstream lookups don't
+/// have to re-filter.
+pub(crate) async fn fetch_model_list_raw(
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+) -> Result<Vec<serde_json::Value>, String> {
     let tok = token.ok_or_else(|| "Not logged in".to_string())?;
     let body = api.get_models_text(tok).await.map_err(|e| format!("{e}"))?;
     let value: serde_json::Value = serde_json::from_str(&body)
@@ -628,15 +650,29 @@ pub(super) async fn fetch_model_list(
         .or_else(|| value.get("models").and_then(|v| v.as_array()).cloned())
         .unwrap_or_default();
     Ok(models
-        .iter()
-        .filter_map(|m| {
-            let name = model_list_entry_name(m)?;
-            if !model_list_entry_is_active(m) {
-                return None;
-            }
-            Some(name.to_string())
-        })
+        .into_iter()
+        .filter(model_list_entry_is_active)
         .collect())
+}
+
+/// Lookup a model entry by name in a raw list.
+pub(crate) fn find_model_entry_by_name<'a>(
+    models: &'a [serde_json::Value],
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    find_model_list_entry(models, name)
+}
+
+/// Public accessor for a model entry's `thinking_capability`
+/// field.  Used by the TUI to decide whether to show the
+/// thinking-mode picker after the main model picker.
+pub(crate) fn entry_thinking_capability(entry: &serde_json::Value) -> Option<&str> {
+    model_list_entry_thinking_capability(entry)
+}
+
+/// Public accessor for a model entry's `provider` field.
+pub(crate) fn entry_provider(entry: &serde_json::Value) -> Option<&str> {
+    model_list_entry_provider(entry)
 }
 
 #[cfg(test)]

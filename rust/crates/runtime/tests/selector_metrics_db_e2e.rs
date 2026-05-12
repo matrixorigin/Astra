@@ -442,7 +442,6 @@ async fn selector_metric_e2e_persists_and_summarizes_recent_turns() {
             std::sync::Arc::new(NoopReflectionStateStore),
             std::sync::Arc::new(NoopReflectionLessonWriter),
             std::sync::Arc::new(NoopObserverWorker),
-            None,
         );
     }
 
@@ -540,7 +539,6 @@ async fn selector_metric_e2e_excludes_text_only_turns_from_metrics() {
         std::sync::Arc::new(NoopReflectionStateStore),
         std::sync::Arc::new(NoopReflectionLessonWriter),
         std::sync::Arc::new(NoopObserverWorker),
-        None,
     );
 
     wait_for_decision_rows(&pool, &session_id, 1).await;
@@ -593,7 +591,6 @@ async fn selector_metric_e2e_handles_multiskill_alias_partial_recall() {
         std::sync::Arc::new(NoopReflectionStateStore),
         std::sync::Arc::new(NoopReflectionLessonWriter),
         std::sync::Arc::new(NoopObserverWorker),
-        None,
     );
 
     let rows = wait_for_metric_rows(&pool, &session_id, 1).await;

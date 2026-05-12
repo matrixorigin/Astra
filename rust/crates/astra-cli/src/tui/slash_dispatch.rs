@@ -101,40 +101,34 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
-        // ── Model selector ──────────────────────────────────────────
+        // ── Model ───────────────────────────────────────────────────
+        //
+        // Forms:
+        //   /model                   → open the picker (legacy default)
+        //   /model list              → explicit alias for the picker
+        //   /model info              → details panel for current model
+        //   /model clear             → reset to API default
+        //   /model <name>            → direct switch to <name>
+        //
+        // There is intentionally no `/model set <name>` — the
+        // direct-name form is already the shortest path, and
+        // having `set` as a second way to express the same thing
+        // just clutters the subcommand popup.
         "/model" => {
-            if !args.is_empty() {
-                // /model <name> — set directly
-                ctx.state.model = Some(args.to_string());
-                ctx.bottom_pane.footer.model = Some(args.to_string());
-                ctx.show_response(format!("Set model to {args}"));
-                return SlashResult::Handled;
+            let trimmed = args.trim();
+            if trimmed.is_empty() || trimmed == "list" {
+                return open_model_picker(ctx).await;
             }
-            let token = crate::repl_runtime::current_access_token(ctx.profile);
-            match crate::slash_router::fetch_model_list(ctx.api, token.as_deref()).await {
-                Ok(models) => {
-                    let current = ctx.state.model.clone().unwrap_or_default();
-                    let items: Vec<SelectionItem> = models
-                        .into_iter()
-                        .map(|m| {
-                            let is_current = m == current;
-                            SelectionItem {
-                                name: m,
-                                description: None,
-                                is_current,
-                            }
-                        })
-                        .collect();
-                    if items.is_empty() {
-                        ctx.show_info("No models available".into());
-                    } else {
-                        let view = ListSelectionView::new(items, Some("Select model:".into()));
-                        ctx.bottom_pane.push_view(Box::new(view));
-                    }
+            let (sub, rest) = split_sub(trimmed);
+            match sub {
+                "info" => handle_model_info(ctx, rest).await,
+                "clear" => handle_model_clear(ctx).await,
+                // Everything else is the `/model <name>` shorthand.
+                _ => {
+                    handle_model_set(ctx, trimmed);
+                    SlashResult::Handled
                 }
-                Err(e) => ctx.show_error(format!("Failed to fetch models: {e}")),
             }
-            SlashResult::Handled
         }
 
         // ── Stats ───────────────────────────────────────────────────
@@ -293,21 +287,101 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Context panel (TUI-native) ──────────────────────────────
         //
-        // `/context` with no args pops a live breakdown view built from
-        // the most recent turn's `TokenBudgetTrace`. Subcommands
-        // (`breakdown`, `explain`, `cognition`) fall through to the
-        // existing rustyline-style printer via Fallback.
+        // Only two forms are supported:
+        //   `/context`            → open the TUI panel
+        //   `/context dump [path]` → write a JSON snapshot to disk
+        //
+        // Earlier iterations fell through to a rustyline-style
+        // `breakdown`/`explain`/`cognition` printer, but those just
+        // duplicate what the panel shows.  Anything else now gets
+        // a short error that points the user at the two valid forms.
         "/context" => {
-            if !args.is_empty() {
-                return SlashResult::Fallback;
+            let args_trim = args.trim();
+            if let Some(rest) = args_trim.strip_prefix("dump") {
+                return handle_context_dump(rest.trim(), ctx);
+            }
+            if !args_trim.is_empty() {
+                use crate::tui::history_cell::system::SystemCell;
+                ctx.chat_widget.commit_system(SystemCell::info(
+                    "Usage: /context          — open the context panel\n       \
+                     /context dump [path] — write a JSON snapshot",
+                ));
+                return SlashResult::Handled;
             }
             use crate::tui::bottom_pane::context_panel_view::ContextPanelView;
-            use crate::tui::context_panel::ContextBreakdown;
+            use crate::tui::context_panel::model::{ActiveSkill, SessionSummary};
+            use crate::tui::context_panel::{ContextBreakdown, ContextSnapshot};
+
+            // Collect human-readable previews the trace doesn't
+            // carry: per-turn transcript snippets (from the chat
+            // widget's history) and process-state bits for the
+            // System-prompt sub-rows (model id, cwd, git branch,
+            // user-rules path).  The panel renders these under the
+            // count rows when the user expands a section.
+            let mut snap = ContextSnapshot::default();
+            snap.model = ctx.state.model.as_deref();
+            if let Ok(cwd) = std::env::current_dir() {
+                snap.cwd = Some(display_path(&cwd));
+            }
+            snap.git_branch = detect_git_branch();
+            snap.user_rules_path = find_user_rules_path();
+
+            // Loaded system skills.  Surfaced as a Skills-section
+            // fallback when the trace is silent (common for CLI
+            // sessions where edge_profile.active_skills isn't set).
+            snap.active_skills = ctx
+                .state
+                .active_system_skills
+                .iter()
+                .map(|s| ActiveSkill {
+                    name: s.name.clone(),
+                    description: s.description.clone(),
+                })
+                .collect();
+
+            // Build the Session / Budget summary from ReplState.
+            // All fields are cheap reads — no I/O, no extra locks.
+            snap.session = Some(SessionSummary {
+                session_id: ctx.state.session_id.clone().unwrap_or_default(),
+                turn: ctx.state.turn,
+                model: ctx.state.model.clone(),
+                total_cost: ctx.state.total_session_cost,
+                max_budget: ctx.state.max_budget_limit,
+                prompt_tokens: ctx.state.total_prompt_tokens,
+                completion_tokens: ctx.state.total_completion_tokens,
+                cache_read_tokens: ctx.state.total_cache_read_tokens,
+                cache_creation_tokens: ctx.state.total_cache_creation_tokens,
+                continuation_anchor: ctx.state.continuation_anchor.clone(),
+                queued_message: ctx.state.queued_message.clone(),
+                diagnostics_context: ctx.state.diagnostics_context.clone(),
+            });
+
+            // Walk the committed history cells and pair them with
+            // the trace's turn indices.  We use the cell ordering
+            // (user/assistant pairs) as a rough proxy — the trace
+            // doesn't emit a stable cell→turn_index mapping today,
+            // so we populate by position.  Each turn contributes a
+            // one-line preview for the collapsed view plus the
+            // full body text for the drill-in view.
+            let (previews, bodies) = collect_history_text(ctx.chat_widget);
+            snap.history_previews = previews;
+            snap.history_bodies = bodies;
+
             let breakdown = match ctx.state.observability_session.as_ref() {
                 Some(session) => {
                     let guard = session.read().unwrap_or_else(|e| e.into_inner());
+                    // Pull session-level compaction history into the
+                    // snapshot so the Compaction section can show all
+                    // past events, not just the last-turn trace.
+                    snap.compressed_turns = guard.compressed_turns.clone();
                     match guard.context_traces.last() {
-                        Some(trace) => ContextBreakdown::from_trace(&trace.token_budget),
+                        // Use the full assembly trace so the panel
+                        // can render the nested tool / memory /
+                        // skill / section rows under the top-level
+                        // category bar. Old code only passed the
+                        // scalar TokenBudgetTrace which lost that
+                        // detail.
+                        Some(trace) => ContextBreakdown::from_trace_with(trace, &snap),
                         None => ContextBreakdown::empty(),
                     }
                 }
@@ -315,6 +389,26 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             };
             ctx.bottom_pane
                 .push_view(Box::new(ContextPanelView::new(breakdown)));
+            SlashResult::Handled
+        }
+
+        // ── /config (TUI-native, matches the reference CLI) ──────────
+        //
+        // `/config` with no args opens the interactive panel directly —
+        // this is the user's primary entry point, same as the reference
+        // implementation's `/config` (aliased `/settings`).
+        //
+        // `/config edit` is kept as an alias for muscle memory / docs.
+        //
+        // Subcommands that only print static text (`show`, `paths`,
+        // `diff`, `sources`, `export`) fall back to the line-mode
+        // printer via `with_restored`. Those briefly tear down the TUI
+        // which is acceptable for a print-and-done flow.
+        "/config" if args.trim().is_empty() || args.trim() == "edit" => {
+            use crate::tui::bottom_pane::config_edit_view::ConfigEditView;
+            let cfg = astra_config::runtime_config::RuntimeConfig::load();
+            ctx.bottom_pane
+                .push_view(Box::new(ConfigEditView::new(cfg)));
             SlashResult::Handled
         }
 
@@ -459,6 +553,39 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             ctx.bottom_pane
                 .push_view(Box::new(SessionPickerView::new(disco)));
             SlashResult::Handled
+        }
+
+        // ── Session ─────────────────────────────────────────────────
+        //
+        // Five subcommands + the default hub cover the overwhelming
+        // majority of interactive usage.  Diagnostic subs (cleanup /
+        // drift / errors / trace / verify / adaptive / switch) used
+        // to live here too, but they duplicate functionality that
+        // already exists elsewhere (diag tooling, /resume for
+        // switch) and their output is text-only, so they fall
+        // through to the line-mode printer instead.
+        //
+        //   /session                 → session hub (current overview)
+        //   /session list            → session picker
+        //   /session history [id]    → conversation history
+        //   /session fork            → interactive fork flow
+        //   /session analyze [id]    → counter-only diagnostics
+        //   /session export [id]     → write markdown, echo path
+        //   everything else          → line-mode fallback
+        "/session" => {
+            let trimmed = args.trim();
+            if trimmed.is_empty() {
+                return handle_session_hub(ctx);
+            }
+            let (sub, rest) = split_sub(trimmed);
+            match sub {
+                "list" => handle_session_list_view(ctx),
+                "history" => handle_session_history_view(ctx, rest),
+                "fork" => handle_session_fork_view(ctx),
+                "analyze" | "diag" => handle_session_analyze_view(ctx, rest),
+                "export" => handle_session_export_view(ctx, rest),
+                _ => SlashResult::Fallback,
+            }
         }
 
         // ── Copy last response ──────────────────────────────────────
@@ -696,6 +823,11 @@ pub(crate) fn build_panels_cheat_sheet_lines() -> Vec<String> {
             "↑↓ navigate · q / Esc close",
         ),
         (
+            "/config",
+            "interactive panel — search, pick, and edit runtime config",
+            "↑↓ navigate · Enter edit · type to search · Esc save/close",
+        ),
+        (
             "/help",
             "list every slash command grouped by category",
             "↑↓ browse · Esc close",
@@ -854,6 +986,7 @@ pub(crate) fn handle_view_result(
 
     // Model name → apply
     state.model = Some(name.to_string());
+    crate::slash_config::set_active_model_for_display(Some(name.to_string()));
     bottom_pane.footer.model = Some(name.to_string());
     chat_widget.commit_system(SystemCell::response(format!("Set model to {name}")));
 }
@@ -1081,16 +1214,8 @@ fn show_stats_view(sub: &str, state: &ReplState, bottom_pane: &mut BottomPane) {
 
         "learn" => {
             let mut pairs: Vec<(&str, String)> = Vec::new();
-            if let Some(ref eg) = state.entity_graph {
-                if let Ok(g) = eg.lock() {
-                    pairs.push(("entities", g.len().to_string()));
-                }
-            }
-            if let Some(ref pl) = state.pattern_library {
-                if let Ok(p) = pl.lock() {
-                    pairs.push(("patterns", p.len().to_string()));
-                }
-            }
+            // Entity graph + pattern library panes removed along with the
+            // self-evolution subsystem. Skill quality + drift metrics remain.
             pairs.push((
                 "skills tracked",
                 state.skill_quality_tracker.all_entries().len().to_string(),
@@ -1162,12 +1287,763 @@ fn show_stats_view(sub: &str, state: &ReplState, bottom_pane: &mut BottomPane) {
     }
 }
 
+/// Split `"sub rest of args"` → `("sub", "rest of args")`.  Trims
+/// both halves.  Used by slash commands that want a clean
+/// `match sub { … }` without re-parsing with `split_whitespace`
+/// everywhere.
+fn split_sub(text: &str) -> (&str, &str) {
+    let t = text.trim();
+    match t.find(char::is_whitespace) {
+        Some(pos) => (&t[..pos], t[pos..].trim()),
+        None => (t, ""),
+    }
+}
+
+// ── /model subcommand helpers ───────────────────────────────────
+
+/// Sentinel prefix used by the `/session fork` picker to hand the
+/// chosen parent session id back to the main input loop.  The
+/// outer loop strips this prefix and runs `fork_local_session`
+/// with the remainder.  Lives here (co-located with the dispatcher
+/// that emits it) so `tui/mod.rs` can import it instead of
+/// duplicating the literal and silently drifting.
+pub(crate) const FORK_PICK_SENTINEL: &str = "__fork__\n";
+
+/// Sentinel prefix emitted by the model-name picker.  The outer
+/// loop (in `tui/mod.rs`) strips the prefix and decides whether to
+/// commit immediately or push a second picker for the model's
+/// thinking modes.  Kept public(crate) so the mod.rs arm can
+/// strip it symmetrically with the other sentinels.
+pub(crate) const MODEL_PICK_SENTINEL: &str = "__model_pick__\n";
+/// Sentinel prefix for the thinking-mode picker. Payload format is
+/// `__model_thinking__\n<base_model>\n<thinking_label>`.  The
+/// handler composes `base + thinking_suffix_for(label)` and sets
+/// `state.model`.
+pub(crate) const MODEL_THINKING_SENTINEL: &str = "__model_thinking__\n";
+
+/// `/model` with no args (or `list`) — fetch the catalog and push
+/// the picker.  The picker emits `MODEL_PICK_SENTINEL + <name>`; the
+/// outer loop then checks the model's `thinking_capability` and
+/// either commits or pushes a thinking-mode picker.
+async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
+    let token = crate::repl_runtime::current_access_token(ctx.profile);
+    match crate::slash_router::fetch_model_list(ctx.api, token.as_deref()).await {
+        Ok(models) => {
+            // Strip any `-thinking:*` suffix from the cached model
+            // when highlighting the current row — the picker shows
+            // base names only, and the suffix is re-applied by the
+            // thinking stage.
+            let current_raw = ctx.state.model.clone().unwrap_or_default();
+            let current_base = current_raw
+                .split_once("-thinking:")
+                .map(|(b, _)| b.to_string())
+                .unwrap_or(current_raw);
+            let items: Vec<SelectionItem> = models
+                .into_iter()
+                .map(|m| {
+                    let is_current = m == current_base;
+                    SelectionItem {
+                        name: m,
+                        description: None,
+                        is_current,
+                    }
+                })
+                .collect();
+            if items.is_empty() {
+                ctx.show_info("No models available".into());
+            } else {
+                let view = ListSelectionView::new(items, Some("Select model:".into()))
+                    .with_result_prefix(MODEL_PICK_SENTINEL);
+                ctx.bottom_pane.push_view(Box::new(view));
+            }
+        }
+        Err(e) => ctx.show_error(format!("Failed to fetch models: {e}")),
+    }
+    SlashResult::Handled
+}
+
+/// `/model set <name>` — apply immediately.  Also used as the
+/// fallback for `/model <name>` shorthand.
+fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        ctx.show_error("Model name cannot be empty — try `/model list`.".into());
+        return;
+    }
+    ctx.state.model = Some(name.to_string());
+    crate::slash_config::set_active_model_for_display(Some(name.to_string()));
+    ctx.bottom_pane.footer.model = Some(name.to_string());
+    ctx.show_response(format!("Set model to {name}"));
+}
+
+/// `/model clear` — unset the session override so the edge's
+/// default model applies.  Reports the change to scrollback so
+/// the user sees the footer switch.
+async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
+    ctx.state.model = None;
+    crate::slash_config::set_active_model_for_display(None);
+    ctx.bottom_pane.footer.model = None;
+    ctx.show_response("Model override cleared — using API default.".into());
+    SlashResult::Handled
+}
+
+/// `/model info [name]` — push a read-only [`InfoView`] with the
+/// model's metadata.  Without an explicit name, uses the
+/// currently-selected model.
+async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
+    use crate::tui::bottom_pane::info_view::InfoView;
+
+    let target = if arg.is_empty() {
+        ctx.state.model.clone()
+    } else {
+        Some(arg.trim().to_string())
+    };
+    let Some(name) = target else {
+        ctx.show_error("No active model — try `/model set <name>` or `/model list`.".into());
+        return SlashResult::Handled;
+    };
+
+    // Prefer the cached pricing the session already carries so
+    // `/model info` is instant — live refetch happens via
+    // `/model list` when the user explicitly asks.
+    let pricing = &ctx.state.cached_pricing;
+    let prompt_usd = if pricing.prompt > 0.0 {
+        format!("${:.3} / 1M tokens", pricing.prompt * 1_000_000.0)
+    } else {
+        "— (not cached)".into()
+    };
+    let completion_usd = if pricing.completion > 0.0 {
+        format!("${:.3} / 1M tokens", pricing.completion * 1_000_000.0)
+    } else {
+        "— (not cached)".into()
+    };
+    let cache_read = pricing
+        .cache_read
+        .map(|v| format!("${:.3} / 1M", v * 1_000_000.0))
+        .unwrap_or_else(|| "—".into());
+    let cache_write = pricing
+        .cache_write
+        .map(|v| format!("${:.3} / 1M", v * 1_000_000.0))
+        .unwrap_or_else(|| "—".into());
+
+    let cumulative_tokens = ctx
+        .state
+        .total_prompt_tokens
+        .saturating_add(ctx.state.total_completion_tokens);
+    let mut pairs: Vec<(&str, String)> = vec![
+        ("model", name.clone()),
+        (
+            "current",
+            if ctx.state.model.as_deref() == Some(name.as_str()) {
+                "yes".into()
+            } else {
+                "no (info for override target)".into()
+            },
+        ),
+        ("prompt cost", prompt_usd),
+        ("completion cost", completion_usd),
+        ("cache read", cache_read),
+        ("cache write", cache_write),
+        (
+            "session prompt tokens",
+            fmt_tokens(ctx.state.total_prompt_tokens),
+        ),
+        (
+            "session completion tokens",
+            fmt_tokens(ctx.state.total_completion_tokens),
+        ),
+        (
+            "session cache-read tokens",
+            fmt_tokens(ctx.state.total_cache_read_tokens),
+        ),
+        (
+            "session cache-creation tokens",
+            fmt_tokens(ctx.state.total_cache_creation_tokens),
+        ),
+        ("session total tokens", fmt_tokens(cumulative_tokens)),
+        (
+            "session cost",
+            format!("${:.4}", ctx.state.total_session_cost),
+        ),
+    ];
+    if ctx.state.max_budget_limit > 0.0 {
+        pairs.push((
+            "budget limit",
+            format!("${:.2}", ctx.state.max_budget_limit),
+        ));
+    }
+
+    ctx.bottom_pane.push_view(Box::new(InfoView::from_key_value(
+        &format!("Model · {name}"),
+        pairs,
+    )));
+    SlashResult::Handled
+}
+
+fn fmt_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 999_950 {
+        // Cut over to the "M" scale slightly before exactly 1_000_000
+        // so boundary values (999_999) don't render as "1000.0k" —
+        // the "1000.0k" suffix is wider than the 6-char column the
+        // InfoView reserves and visually jarring next to "1.0M".
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
+// ── /session subcommand helpers ─────────────────────────────────
+
+/// `/session` with no args — push the session hub with a
+/// snapshot of the current session's vital stats and shortcut
+/// hints for the common flows (list / history / context /
+/// fork / export).
+fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
+    use crate::tui::bottom_pane::info_view::InfoView;
+
+    let sid = ctx.state.session_id.clone().unwrap_or_default();
+    let sid_short = if sid.len() > 8 {
+        &sid[..8]
+    } else {
+        sid.as_str()
+    };
+    let model = ctx.state.model.clone().unwrap_or_else(|| "—".into());
+    let cumulative_tokens = ctx
+        .state
+        .total_prompt_tokens
+        .saturating_add(ctx.state.total_completion_tokens);
+
+    let mut pairs: Vec<(&str, String)> = vec![
+        (
+            "session id",
+            if sid.is_empty() {
+                "— (no active session)".into()
+            } else {
+                sid.clone()
+            },
+        ),
+        (
+            "short id",
+            if sid.is_empty() {
+                "—".into()
+            } else {
+                sid_short.to_string()
+            },
+        ),
+        ("turn", ctx.state.turn.to_string()),
+        ("model", model),
+        ("cost", format!("${:.4}", ctx.state.total_session_cost)),
+    ];
+    if ctx.state.max_budget_limit > 0.0 {
+        pairs.push(("budget", format!("${:.2}", ctx.state.max_budget_limit)));
+    }
+    pairs.push(("prompt tokens", fmt_tokens(ctx.state.total_prompt_tokens)));
+    pairs.push((
+        "completion tokens",
+        fmt_tokens(ctx.state.total_completion_tokens),
+    ));
+    pairs.push((
+        "cache-read tokens",
+        fmt_tokens(ctx.state.total_cache_read_tokens),
+    ));
+    pairs.push((
+        "cache-creation tokens",
+        fmt_tokens(ctx.state.total_cache_creation_tokens),
+    ));
+    pairs.push(("total tokens", fmt_tokens(cumulative_tokens)));
+
+    // Compaction + drift counters from the observability session
+    // when it's available.  Best-effort — a missing session just
+    // means the counters stay off the hub.
+    if let Some(obs) = ctx.state.observability_session.as_ref() {
+        let guard = obs.read().unwrap_or_else(|e| e.into_inner());
+        pairs.push(("compactions", guard.compressed_turns.len().to_string()));
+        pairs.push(("context traces", guard.context_traces.len().to_string()));
+    }
+
+    // Action cheatsheet, rendered as value-less rows so the user
+    // sees what every subcommand does without leaving the panel.
+    pairs.push(("", String::new()));
+    pairs.push(("/session list", "pick a session to resume".into()));
+    pairs.push((
+        "/session history",
+        "scroll this session's transcript".into(),
+    ));
+    pairs.push(("/context", "context panel for this session".into()));
+    pairs.push(("/session fork", "branch a parallel session".into()));
+    pairs.push(("/session analyze", "run session diagnostics".into()));
+    pairs.push(("/session export", "write markdown transcript".into()));
+
+    let title = if sid.is_empty() {
+        "Session · no active session".to_string()
+    } else {
+        format!("Session · {sid_short}")
+    };
+    ctx.bottom_pane
+        .push_view(Box::new(InfoView::from_key_value(&title, pairs)));
+    SlashResult::Handled
+}
+
+/// `/session list` — same picker as `/resume`, but reached via
+/// the session namespace so the registry reads naturally.  Empty
+/// store → info message instead of a blank picker.
+fn handle_session_list_view(ctx: &mut DispatchContext<'_>) -> SlashResult {
+    use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
+    use crate::tui::session_picker::{FsSessionSource, SessionDiscovery};
+    let disco = SessionDiscovery::new(FsSessionSource::new(), 50);
+    if disco.total() == 0 {
+        ctx.show_info("No previous sessions found.".into());
+        return SlashResult::Handled;
+    }
+    ctx.bottom_pane
+        .push_view(Box::new(SessionPickerView::new(disco)));
+    SlashResult::Handled
+}
+
+fn handle_session_history_view(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
+    let sid = resolve_session_arg(ctx, arg);
+    let Some(sid) = sid else {
+        return SlashResult::Handled;
+    };
+    let events = astra_services::session_journal::read_journal(&sid).unwrap_or_default();
+    if events.is_empty() {
+        ctx.show_info(format!("No journal events for session {sid}."));
+        return SlashResult::Handled;
+    }
+    push_history_info(ctx, &sid, &events);
+    SlashResult::Handled
+}
+
+/// `/session fork` — interactive parent picker.  On Enter the
+/// picker emits `"__fork__\n<sid>"`; the outer loop recognises the
+/// sentinel and runs `fork_local_session`.  No args short-circuits
+/// through the picker; `/session fork <sid>` falls back to the
+/// line-mode handler (covers scripted use).
+fn handle_session_fork_view(ctx: &mut DispatchContext<'_>) -> SlashResult {
+    use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
+    use crate::tui::session_picker::{FsSessionSource, SessionDiscovery};
+    let disco = SessionDiscovery::new(FsSessionSource::new(), 50);
+    if disco.total() == 0 {
+        ctx.show_info("No previous sessions to fork from.".into());
+        return SlashResult::Handled;
+    }
+    ctx.bottom_pane.push_view(Box::new(
+        SessionPickerView::new(disco).with_result_prefix(FORK_PICK_SENTINEL),
+    ));
+    SlashResult::Handled
+}
+
+fn handle_session_analyze_view(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
+    // TUI-side analyze is a *summary* — counters only.  The full
+    // textual diagnostic (latency spikes, per-turn token shape,
+    // issue detection bullets) still lives in the line-mode
+    // printer.  Users who want the full thing get it via
+    // `/session analyze deep [id]` falling back through
+    // `SlashResult::Fallback`; we propagate the optional session
+    // id (`rest`) so the downstream handler can see
+    // `/session analyze deep <id>` verbatim.
+    let (flag, rest) = split_sub(arg);
+    if flag == "deep" {
+        // Expose the trailing id (if any) through a thread-local so
+        // the line-mode analyzer can recover the user's original
+        // intent without re-parsing the slash string.
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            crate::slash_config::set_deep_analyze_arg(Some(rest.to_string()));
+        } else {
+            crate::slash_config::set_deep_analyze_arg(None);
+        }
+        return SlashResult::Fallback;
+    }
+    let Some(sid) = resolve_session_arg(ctx, arg) else {
+        return SlashResult::Handled;
+    };
+    push_analyze_summary(ctx, &sid);
+    SlashResult::Handled
+}
+
+/// Counter-only summary of a session journal — fast to compute
+/// (no workspace reads, no per-event allocation) so the InfoView
+/// renders instantly.  Users who want the deep report still get
+/// it via `/session analyze deep [id]`.
+fn push_analyze_summary(ctx: &mut DispatchContext<'_>, sid: &str) {
+    use crate::tui::bottom_pane::info_view::InfoView;
+    use astra_services::session_journal::JournalEventType;
+
+    let events = match astra_services::session_journal::read_journal(sid) {
+        Ok(e) => e,
+        Err(e) => {
+            ctx.show_error(format!("Failed to read journal: {e}"));
+            return;
+        }
+    };
+    if events.is_empty() {
+        ctx.show_info(format!("Session {sid} has no journal events."));
+        return;
+    }
+
+    let mut turns = 0u32;
+    let mut errors = 0u32;
+    let mut stalls = 0u32;
+    let mut checkpoints = 0u32;
+    let mut compactions = 0u32;
+    let mut prompt_tokens = 0u64;
+    let mut completion_tokens = 0u64;
+    let mut cache_read_tokens = 0u64;
+    let mut cache_creation_tokens = 0u64;
+    let mut first_ts: Option<String> = None;
+    let mut last_ts: Option<String> = None;
+    for ev in &events {
+        if first_ts.is_none() {
+            first_ts = Some(ev.ts.clone());
+        }
+        last_ts = Some(ev.ts.clone());
+        match ev.event_type {
+            JournalEventType::Turn => turns += 1,
+            JournalEventType::TurnError | JournalEventType::Error => errors += 1,
+            JournalEventType::StallDetected => stalls += 1,
+            JournalEventType::Checkpoint => checkpoints += 1,
+            JournalEventType::Compact => compactions += 1,
+            _ => {}
+        }
+        if let Some(t) = ev.tokens_in {
+            prompt_tokens = prompt_tokens.saturating_add(t);
+        }
+        if let Some(t) = ev.tokens_out {
+            completion_tokens = completion_tokens.saturating_add(t);
+        }
+        if let Some(t) = ev.cache_read_tokens {
+            cache_read_tokens = cache_read_tokens.saturating_add(t);
+        }
+        if let Some(t) = ev.cache_creation_tokens {
+            cache_creation_tokens = cache_creation_tokens.saturating_add(t);
+        }
+    }
+    let total_tokens = prompt_tokens.saturating_add(completion_tokens);
+
+    let mut pairs: Vec<(&str, String)> = Vec::new();
+    pairs.push(("session id", sid.to_string()));
+    if let Some(ts) = first_ts {
+        pairs.push(("started", ts));
+    }
+    if let Some(ts) = last_ts {
+        pairs.push(("last event", ts));
+    }
+    pairs.push(("", String::new()));
+    pairs.push(("turns", turns.to_string()));
+    pairs.push(("errors", errors.to_string()));
+    pairs.push(("stalls detected", stalls.to_string()));
+    pairs.push(("checkpoints", checkpoints.to_string()));
+    pairs.push(("compactions", compactions.to_string()));
+    pairs.push(("", String::new()));
+    pairs.push(("prompt tokens", fmt_tokens(prompt_tokens)));
+    pairs.push(("completion tokens", fmt_tokens(completion_tokens)));
+    pairs.push(("cache-read tokens", fmt_tokens(cache_read_tokens)));
+    pairs.push(("cache-creation tokens", fmt_tokens(cache_creation_tokens)));
+    pairs.push(("total tokens", fmt_tokens(total_tokens)));
+    pairs.push(("", String::new()));
+    pairs.push((
+        "deep report",
+        "`/session analyze deep <id>` prints the full diagnostic".into(),
+    ));
+
+    let sid_short = if sid.len() > 8 { &sid[..8] } else { sid };
+    ctx.bottom_pane.push_view(Box::new(InfoView::from_key_value(
+        &format!("Session analyze · {sid_short}"),
+        pairs,
+    )));
+}
+
+fn handle_session_export_view(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
+    let Some(sid) = resolve_session_arg(ctx, arg) else {
+        return SlashResult::Handled;
+    };
+    let events = match astra_services::session_journal::read_journal(&sid) {
+        Ok(events) => events,
+        Err(e) => {
+            ctx.show_error(format!("Failed to read journal: {e}"));
+            return SlashResult::Handled;
+        }
+    };
+    if events.is_empty() {
+        ctx.show_info(format!("Session {sid} has no journal events to export."));
+        return SlashResult::Handled;
+    }
+    let md = crate::slash_session::build_export_markdown(&sid, &events);
+    let now = chrono::Local::now();
+    // Default path mirrors the legacy line-mode exporter so users
+    // with scripts expecting that filename shape keep working.
+    let path = format!("astra-session-{}.md", now.format("%Y%m%d-%H%M"));
+    match std::fs::write(&path, &md) {
+        Ok(_) => ctx.show_response(format!("Exported {sid} → {path}")),
+        Err(e) => ctx.show_error(format!("Failed to write {path}: {e}")),
+    }
+    SlashResult::Handled
+}
+
+/// Resolve a user-supplied session id (or default-to-current)
+/// and surface a helpful error on the common failure modes.
+fn resolve_session_arg(ctx: &mut DispatchContext<'_>, arg: &str) -> Option<String> {
+    if arg.is_empty() {
+        match ctx.state.session_id.clone() {
+            Some(id) if !id.is_empty() => Some(id),
+            _ => {
+                ctx.show_error("No active session — try `/session list` first.".into());
+                None
+            }
+        }
+    } else {
+        Some(arg.trim().to_string())
+    }
+}
+
+/// Render a session's conversation history into an InfoView.
+/// Keeps the logic tight: titles, user → assistant pairing,
+/// truncated previews.  Heavier browsing (drill, scroll) can be
+/// added later with a dedicated view.
+fn push_history_info(
+    ctx: &mut DispatchContext<'_>,
+    sid: &str,
+    events: &[astra_services::session_journal::JournalEvent],
+) {
+    use crate::tui::bottom_pane::info_view::InfoView;
+    use astra_services::session_journal::JournalEventType;
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let role_user = Style::default().fg(Color::Cyan);
+    let role_assistant = Style::default().fg(Color::Green);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for ev in events {
+        match ev.event_type {
+            JournalEventType::Turn => {
+                if let Some(user) = &ev.user_input {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  #{turn} ", turn = ev.turn.unwrap_or(0)), dim),
+                        Span::styled("user", role_user),
+                    ]));
+                    for row in truncate_rows(user, 3) {
+                        lines.push(Line::from(Span::styled(format!("    {row}"), bold)));
+                    }
+                }
+                if let Some(out) = &ev.assistant_output {
+                    lines.push(Line::from(Span::styled("       assistant", role_assistant)));
+                    for row in truncate_rows(out, 3) {
+                        lines.push(Line::from(Span::raw(format!("    {row}"))));
+                    }
+                }
+                lines.push(Line::default());
+            }
+            JournalEventType::Compact => {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⚠ compaction at turn {}", ev.turn.unwrap_or(0)),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            _ => {}
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no user/assistant turns recorded in this journal)",
+            dim,
+        )));
+    }
+    let sid_short = if sid.len() > 8 { &sid[..8] } else { sid };
+    ctx.bottom_pane.push_view(Box::new(InfoView::new(
+        format!("Session history · {sid_short}"),
+        lines,
+    )));
+}
+
+/// Split `text` into `max` short rows. Trims whitespace, drops
+/// empty lines, caps each row at 76 chars.  Keeps the InfoView
+/// dense without wrapping surprises.
+fn truncate_rows(text: &str, max: usize) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    if max == 0 {
+        return rows;
+    }
+    let total_non_blank = text.lines().filter(|l| !l.trim().is_empty()).count();
+    let mut seen = 0usize;
+    for logical in text.lines() {
+        let trimmed = logical.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        seen += 1;
+        // Reserve the last slot for an overflow marker only when
+        // there is still *further* non-blank content after the
+        // current line.  `seen` counts lines already processed
+        // (including this one) so `total_non_blank - seen` is the
+        // true remainder.  This keeps the final allowed row when
+        // the source has exactly `max` non-blank lines instead of
+        // prematurely ellipsing it.
+        let remaining_after = total_non_blank.saturating_sub(seen);
+        if rows.len() + 1 >= max && remaining_after > 0 {
+            rows.push("…".into());
+            break;
+        }
+        if trimmed.chars().count() > 76 {
+            let short: String = trimmed.chars().take(75).collect();
+            rows.push(format!("{short}…"));
+        } else {
+            rows.push(trimmed.to_string());
+        }
+    }
+    rows
+}
+
 fn parse_slash(text: &str) -> (&str, &str) {
     let text = text.trim();
     match text.find(' ') {
         Some(pos) => (&text[..pos], text[pos..].trim()),
         None => (text, ""),
     }
+}
+
+/// Render a filesystem path for the `/context` Environment row.
+/// Replaces `$HOME` with `~` so absolute paths stay short.
+fn display_path(path: &std::path::Path) -> String {
+    let s = path.display().to_string();
+    if let Ok(home) = std::env::var("HOME") {
+        if let Some(rest) = s.strip_prefix(&home) {
+            return format!("~{rest}");
+        }
+    }
+    s
+}
+
+/// Detect current git branch via `gix`. Returns `None` when the cwd
+/// isn't a git repo, in detached HEAD, or on any I/O error — in any
+/// of those cases the Environment row falls back to just the cwd.
+fn detect_git_branch() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let repo = gix::discover(cwd).ok()?;
+    let head = repo.head().ok()?;
+    let name = head.referent_name()?;
+    Some(name.shorten().to_string())
+}
+
+/// Locate the user-rules directory under `~/.astra/rules/`, if
+/// present.  Returns the home-shortened path via `display_path`
+/// so the snapshot already reads like `~/.astra/rules`.  `None`
+/// when the directory doesn't exist.
+fn find_user_rules_path() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let p = std::path::PathBuf::from(&home).join(".astra/rules");
+    if p.exists() {
+        return Some(display_path(&p));
+    }
+    None
+}
+
+/// Build a `turn_index → one-line preview` map from the chat
+/// widget's committed scrollback.  Turn indices come from the
+/// trace side of the API, but the trace doesn't store text — we
+/// use the cell position within each user-turn as the index.
+///
+/// The mapping is heuristic (cells don't carry a turn id) but
+/// matches the common case: each user/assistant pair is one turn.
+fn collect_history_text(
+    chat: &crate::tui::chat_widget::ChatWidget,
+) -> (
+    std::collections::HashMap<u32, String>,
+    std::collections::HashMap<u32, String>,
+) {
+    use crate::tui::history_cell::{
+        assistant::AssistantCell, reasoning::ReasoningCell, user::UserCell,
+    };
+    let mut previews: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    let mut bodies: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    // Walk history cells; each user cell advances the turn index.
+    // For both preview (one-line) and body (full text) we follow
+    // the same priority: user message wins; otherwise assistant
+    // reply for that turn; otherwise reasoning text as last resort.
+    let mut turn_idx: u32 = 0;
+    let record = |idx: u32,
+                  text: &str,
+                  previews: &mut std::collections::HashMap<u32, String>,
+                  bodies: &mut std::collections::HashMap<u32, String>,
+                  force: bool| {
+        if text.trim().is_empty() {
+            return;
+        }
+        if force || !previews.contains_key(&idx) {
+            let p = one_line_preview(text);
+            if !p.is_empty() {
+                previews.insert(idx, p);
+            }
+        }
+        if force || !bodies.contains_key(&idx) {
+            bodies.insert(idx, text.to_string());
+        }
+    };
+    for cell in chat.history() {
+        let any = cell.as_any_ref();
+        if let Some(u) = any.downcast_ref::<UserCell>() {
+            record(turn_idx, u.text(), &mut previews, &mut bodies, true);
+            turn_idx = turn_idx.saturating_add(1);
+        } else if let Some(a) = any.downcast_ref::<AssistantCell>() {
+            if turn_idx == 0 {
+                continue;
+            }
+            let slot = turn_idx.saturating_sub(1);
+            record(slot, a.source(), &mut previews, &mut bodies, false);
+        } else if let Some(r) = any.downcast_ref::<ReasoningCell>() {
+            if turn_idx == 0 {
+                continue;
+            }
+            let slot = turn_idx.saturating_sub(1);
+            record(slot, r.text(), &mut previews, &mut bodies, false);
+        }
+    }
+    (previews, bodies)
+}
+
+fn one_line_preview(text: &str) -> String {
+    text.lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(200)
+        .collect()
+}
+
+/// `/context dump [path]` — write a full JSON snapshot of the
+/// context-panel state (trace + chat history + environment) to
+/// disk for sharing or forensic replay.  When `path` is empty,
+/// writes to `~/.astra/context-dumps/<session>-<turn>-<ts>.json`.
+///
+/// Kept inline so the user sees the output path as a normal
+/// scrollback cell instead of tearing down the TUI like the
+/// fallback printer would.
+fn handle_context_dump(arg: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
+    use crate::tui::history_cell::system::SystemCell;
+    let chat_history = crate::tui::collect_chat_turns_for_dump(ctx.chat_widget);
+    let path = match crate::context_dump::write_dump_for_repl(
+        ctx.state,
+        chat_history,
+        if arg.is_empty() { None } else { Some(arg) },
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            ctx.chat_widget
+                .commit_system(SystemCell::error(format!("/context dump failed: {e}")));
+            return SlashResult::Handled;
+        }
+    };
+    ctx.chat_widget.commit_system(SystemCell::info(format!(
+        "Context snapshot written to {}",
+        path.display()
+    )));
+    SlashResult::Handled
 }
 
 #[cfg(test)]
@@ -1194,6 +2070,85 @@ mod panels_tests {
         insta::assert_snapshot!(
             "panels_cheat_sheet",
             build_panels_cheat_sheet_lines().join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod context_history_tests {
+    use super::{collect_history_text, one_line_preview};
+    use crate::tui::chat_widget::ChatWidget;
+    use crate::tui::turn_event::{SystemLevel, TurnEvent};
+
+    #[test]
+    fn one_line_preview_skips_leading_blanks_crlf_and_truncates() {
+        assert_eq!(one_line_preview("\n\n  first line  \nsecond"), "first line");
+        assert_eq!(one_line_preview("\r\nCRLF line\r\n"), "CRLF line");
+
+        let long = "a".repeat(240);
+        let preview = one_line_preview(&long);
+        assert_eq!(preview.chars().count(), 200);
+        assert!(preview.chars().all(|ch| ch == 'a'));
+    }
+
+    #[test]
+    fn collect_history_text_ignores_assistant_without_user_anchor() {
+        let mut chat = ChatWidget::new("");
+        chat.replay(vec![
+            TurnEvent::Assistant {
+                ts: None,
+                markdown: "orphan assistant should not attach to turn zero".into(),
+            },
+            TurnEvent::Thinking {
+                ts: None,
+                text: "orphan reasoning should not attach to turn zero".into(),
+                duration_ms: None,
+            },
+        ]);
+
+        let (previews, bodies) = collect_history_text(&chat);
+
+        assert!(
+            previews.is_empty() && bodies.is_empty(),
+            "assistant/reasoning cells before the first user turn must not create a fake turn 0"
+        );
+    }
+
+    #[test]
+    fn collect_history_text_skips_system_cells_and_keeps_turn_indices_aligned() {
+        let mut chat = ChatWidget::new("");
+        chat.replay(vec![
+            TurnEvent::User {
+                ts: None,
+                text: "first user".into(),
+            },
+            TurnEvent::System {
+                ts: None,
+                level: SystemLevel::Info,
+                text: "system note should not appear in context history".into(),
+            },
+            TurnEvent::Assistant {
+                ts: None,
+                markdown: "assistant answer".into(),
+            },
+            TurnEvent::User {
+                ts: None,
+                text: "second user".into(),
+            },
+        ]);
+
+        let (previews, bodies) = collect_history_text(&chat);
+
+        assert_eq!(previews.get(&0).map(String::as_str), Some("first user"));
+        assert_eq!(bodies.get(&0).map(String::as_str), Some("first user"));
+        assert_eq!(previews.get(&1).map(String::as_str), Some("second user"));
+        assert_eq!(bodies.get(&1).map(String::as_str), Some("second user"));
+        assert!(
+            previews
+                .values()
+                .chain(bodies.values())
+                .all(|text| !text.contains("system note")),
+            "system cells should not pollute turn previews or bodies"
         );
     }
 }
@@ -1285,5 +2240,87 @@ mod view_result_tests {
             last_system_message(&chat_widget).as_deref(),
             Some("Set model to claude-sonnet-4.6")
         );
+    }
+}
+
+#[cfg(test)]
+mod split_sub_tests {
+    use super::split_sub;
+
+    #[test]
+    fn split_sub_no_whitespace_returns_empty_rest() {
+        assert_eq!(split_sub("info"), ("info", ""));
+    }
+
+    #[test]
+    fn split_sub_single_space() {
+        assert_eq!(split_sub("set gpt-4"), ("set", "gpt-4"));
+    }
+
+    #[test]
+    fn split_sub_trims_both_halves() {
+        assert_eq!(split_sub("  set   gpt-4  "), ("set", "gpt-4"));
+    }
+
+    #[test]
+    fn split_sub_empty_input() {
+        assert_eq!(split_sub(""), ("", ""));
+    }
+
+    #[test]
+    fn split_sub_preserves_multi_word_rest() {
+        assert_eq!(
+            split_sub("analyze deep abc-123"),
+            ("analyze", "deep abc-123")
+        );
+    }
+}
+
+#[cfg(test)]
+mod fmt_tokens_tests {
+    use super::fmt_tokens;
+
+    #[test]
+    fn fmt_tokens_handles_all_magnitudes() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(42), "42");
+        assert_eq!(fmt_tokens(1_200), "1.2k");
+        assert_eq!(fmt_tokens(999_999), "1.0M");
+        assert_eq!(fmt_tokens(1_500_000), "1.5M");
+    }
+}
+
+#[cfg(test)]
+mod truncate_rows_tests {
+    use super::truncate_rows;
+
+    #[test]
+    fn truncate_rows_drops_blank_lines() {
+        let rows = truncate_rows("\n\nfirst\n\nsecond\n", 3);
+        assert_eq!(rows, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
+    fn truncate_rows_adds_ellipsis_when_truncating() {
+        let input = "a\nb\nc\nd\ne";
+        let rows = truncate_rows(input, 3);
+        assert_eq!(
+            rows,
+            vec!["a".to_string(), "b".to_string(), "…".to_string()]
+        );
+    }
+
+    #[test]
+    fn truncate_rows_caps_long_single_line_at_76() {
+        let long = "x".repeat(100);
+        let rows = truncate_rows(&long, 2);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].ends_with('…'));
+        assert_eq!(rows[0].chars().count(), 76);
+    }
+
+    #[test]
+    fn truncate_rows_empty_input_produces_empty_output() {
+        assert!(truncate_rows("", 5).is_empty());
     }
 }

@@ -107,7 +107,7 @@ pub enum VolatilePlacement {
     /// and MiniMax's cache sees that as a total miss. The only way
     /// to keep history byte-stable for strict-history providers is
     /// to never inject volatile at all on this path. The agent
-    /// loses Self-Awareness / session-anchor signals in exchange for
+    /// loses Self-Awareness signals in exchange for
     /// usable cache — observed collapse was 100% of cache reads for
     /// six consecutive tool-loop rounds in session 986a553e.
     ///

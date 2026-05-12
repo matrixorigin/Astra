@@ -9,34 +9,42 @@ fn items() -> Vec<SlashItem> {
         SlashItem {
             name: "/help",
             description: "show help",
+            subcommands: &[],
         },
         SlashItem {
             name: "/model",
             description: "pick a model",
+            subcommands: &[],
         },
         SlashItem {
             name: "/history",
             description: "browse history",
+            subcommands: &[],
         },
         SlashItem {
             name: "/agent-create",
             description: "create a new agent",
+            subcommands: &[],
         },
         SlashItem {
             name: "/resume",
             description: "resume a session",
+            subcommands: &[],
         },
         SlashItem {
             name: "/review",
             description: "review changes",
+            subcommands: &[],
         },
         SlashItem {
             name: "/allow",
             description: "allow tool",
+            subcommands: &[],
         },
         SlashItem {
             name: "/yolo",
             description: "bypass prompts",
+            subcommands: &[],
         },
     ]
 }
@@ -225,4 +233,100 @@ fn empty_menu_ignores_navigation() {
     menu.move_down();
     menu.move_up();
     assert_eq!(menu.selected(), None);
+}
+
+// ─── Subcommand completion ────────────────────────────────────────
+
+fn items_with_subs() -> Vec<SlashItem> {
+    vec![
+        SlashItem {
+            name: "/context",
+            description: "context panel",
+            subcommands: &[("dump", "Write a JSON snapshot to disk")],
+        },
+        SlashItem {
+            name: "/skill",
+            description: "skills",
+            subcommands: &[
+                ("browse", "Browse marketplace"),
+                ("install", "Install from marketplace"),
+                ("list", "List skills"),
+            ],
+        },
+        SlashItem::simple("/help", "show help"),
+    ]
+}
+
+#[test]
+fn space_after_command_switches_to_subcommand_mode() {
+    let mut menu = SlashMenu::new(items_with_subs());
+    menu.set_filter("/context ");
+    assert!(menu.is_subcommand_mode());
+    let names: Vec<&str> = menu.matches().iter().map(|it| it.name).collect();
+    assert_eq!(names, vec!["/context dump"]);
+    // Description tracks the subcommand row, not the parent.
+    assert_eq!(
+        menu.matches()[0].description,
+        "Write a JSON snapshot to disk"
+    );
+}
+
+#[test]
+fn partial_subcommand_token_narrows_matches() {
+    let mut menu = SlashMenu::new(items_with_subs());
+    menu.set_filter("/skill br");
+    assert!(menu.is_subcommand_mode());
+    let names: Vec<&str> = menu.matches().iter().map(|it| it.name).collect();
+    assert_eq!(names, vec!["/skill browse"]);
+}
+
+#[test]
+fn empty_subcommand_token_lists_all_subs() {
+    let mut menu = SlashMenu::new(items_with_subs());
+    menu.set_filter("/skill ");
+    let names: Vec<&str> = menu.matches().iter().map(|it| it.name).collect();
+    assert_eq!(
+        names,
+        vec!["/skill browse", "/skill install", "/skill list"]
+    );
+}
+
+#[test]
+fn selection_resets_on_command_to_subcommand_transition() {
+    // A user scrolls down the top-level menu, then types a space.
+    // The subcommand list must NOT inherit the stale index —
+    // otherwise they might land past the end of the sub list.
+    let mut menu = SlashMenu::new(items_with_subs());
+    menu.set_filter("/skill");
+    menu.move_down(); // selected = 1 if more than one command matches
+    menu.move_down();
+    menu.set_filter("/skill ");
+    assert_eq!(menu.selected(), Some(0), "new mode starts at top");
+}
+
+#[test]
+fn command_without_subs_keeps_command_mode_after_space() {
+    // `/help` has no subcommands. Typing `/help foo` should NOT
+    // silently lose the menu; it stays in command-mode filtering.
+    let mut menu = SlashMenu::new(items_with_subs());
+    menu.set_filter("/help foo");
+    assert!(!menu.is_subcommand_mode());
+    // `/help` still scores against the `help` token.
+    assert!(
+        menu.matches().iter().any(|it| it.name == "/help"),
+        "`/help` should still match in command mode"
+    );
+}
+
+#[test]
+fn selected_item_in_subcommand_mode_returns_full_cmd_sub_name() {
+    // Downstream Tab/Enter handlers write `selected_item().name` into
+    // the composer; it must already be the `/cmd sub` form so the
+    // user doesn't have to retype the parent.
+    let mut menu = SlashMenu::new(items_with_subs());
+    menu.set_filter("/context ");
+    assert_eq!(
+        menu.selected_item().map(|it| it.name),
+        Some("/context dump")
+    );
 }

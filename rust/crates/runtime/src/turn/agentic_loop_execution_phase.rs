@@ -105,34 +105,6 @@ pub(crate) enum TurnExecutionControl {
     Return(AgenticLoopOutcome),
 }
 
-fn inject_runtime_attention_manifest(state: &mut AgenticLoopState) {
-    let current_goal = state.message.clone();
-    state.continuity.ensure_goal(current_goal.clone());
-    state.continuity.ensure_tracked_goal(current_goal);
-    state.continuity.sync_facts(state.session_facts.clone());
-    state.session_facts = state.continuity.facts.clone();
-
-    // Always strip any legacy attention-manifest messages from
-    // `state.messages` — older code paths (and checkpoints restored
-    // from before this refactor) may still push one into history. The
-    // attention manifest now rides the volatile system-prompt lane
-    // exclusively, so the message tail must stay clean for prefix
-    // caching.
-    astra_turn_types::continuity::strip_attention_manifest_messages(&mut state.messages);
-
-    let carries_signal = state.continuity.todos.has_items()
-        || !state.continuity.facts.active_files.is_empty()
-        || state.continuity.facts.error_state.total_errors > 0
-        || !state.continuity.user_corrections.is_empty()
-        || state.continuity.verification.last_status.is_some();
-
-    state.attention_manifest_text = if carries_signal {
-        astra_turn_types::continuity::build_attention_manifest_text(&state.continuity, 4_000)
-    } else {
-        None
-    };
-}
-
 fn estimate_json_tokens(value: &serde_json::Value) -> u32 {
     (value.to_string().len() as u32 / 4).saturating_add(1)
 }
@@ -382,8 +354,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if let Some(ref emitter) = state.messaging.progress_emitter {
         emitter.llm_call_started(turn_index as u32);
     }
-
-    inject_runtime_attention_manifest(state);
 
     // ── Nudge suppression gate ──────────────────────────────────────────
     // In PermissionMode::Auto the user has explicitly asked to let the
@@ -1124,61 +1094,85 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     sess.recovery.record_ptl_error();
                 }
 
-                if let Some(result) = super::compaction_replay::try_compact_for_retry_tiered(
+                let outcome = super::compaction_replay::try_compact_for_retry_checked(
                     &mut state.messages,
+                    &mut state.compaction_effectiveness,
                     state.last_measured_prompt_tokens,
                     state.max_turn_input_tokens,
                     state.consecutive_context_window_errors,
-                ) {
-                    let tier_label = result.tier.label();
-                    state
-                        .compaction_effectiveness
-                        .record_compaction(result.tokens_freed);
-                    // Feed compaction stats into pipeline for reserve estimation.
-                    if let Some(ref mut sess) = state.pipeline_session {
-                        sess.recovery.record_reactive_compact();
-                        sess.stats.record_compaction(result.tokens_freed);
-                    }
-                    let summary = super::compaction_replay::compaction_summary(&result);
-                    if !prep.quiet {
-                        host.emit_headless_line(
-                            HeadlessStderrStyle::Yellow,
-                            format!(
-                                "♻ Context overflow — {} pipeline: {}; retrying turn…",
-                                tier_label, summary,
-                            ),
-                        );
-                    }
+                );
+                match outcome {
+                    super::compaction_replay::CompactionReplayOutcome::Compacted(result) => {
+                        let tier_label = result.tier.label();
+                        // Feed compaction stats into pipeline for reserve estimation.
+                        if let Some(ref mut sess) = state.pipeline_session {
+                            sess.recovery.record_reactive_compact();
+                            sess.stats.record_compaction(result.tokens_freed);
+                        }
+                        let summary = super::compaction_replay::compaction_summary(&result);
+                        if !prep.quiet {
+                            host.emit_headless_line(
+                                HeadlessStderrStyle::Yellow,
+                                format!(
+                                    "♻ Context overflow — {} pipeline: {}; retrying turn…",
+                                    tier_label, summary,
+                                ),
+                            );
+                        }
 
-                    // Emit structured compaction telemetry for observability.
-                    if let Some(sid) = state.current_session_id.as_deref() {
-                        let tokens_freed = result.pipeline_outcome.total_tokens_freed;
-                        let budget_likely_satisfied = result.budget_likely_satisfied;
-                        let layers: Vec<(String, u64)> = result
-                            .pipeline_outcome
-                            .layer_results
-                            .iter()
-                            .map(|(name, cr)| (name.clone(), cr.estimated_tokens_freed))
-                            .collect();
-                        let evt = astra_services::session_journal::JournalEvent::compaction_retry(
-                            Some(sid),
-                            session_turn_number(state),
-                            tier_label,
-                            tokens_freed,
-                            budget_likely_satisfied,
-                            state.consecutive_context_window_errors,
-                            layers,
-                            state.consecutive_context_window_errors,
-                        )
-                        .with_agentic_step(Some(current_agentic_step(state)));
-                        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid)
-                        {
-                            let _ = writer.append(&evt);
+                        // Emit structured compaction telemetry for observability.
+                        if let Some(sid) = state.current_session_id.as_deref() {
+                            let tokens_freed = result.pipeline_outcome.total_tokens_freed;
+                            let budget_likely_satisfied = result.budget_likely_satisfied;
+                            let layers: Vec<(String, u64)> = result
+                                .pipeline_outcome
+                                .layer_results
+                                .iter()
+                                .map(|(name, cr)| (name.clone(), cr.estimated_tokens_freed))
+                                .collect();
+                            let evt =
+                                astra_services::session_journal::JournalEvent::compaction_retry(
+                                    Some(sid),
+                                    session_turn_number(state),
+                                    tier_label,
+                                    tokens_freed,
+                                    budget_likely_satisfied,
+                                    state.consecutive_context_window_errors,
+                                    layers,
+                                    state.consecutive_context_window_errors,
+                                )
+                                .with_agentic_step(Some(current_agentic_step(state)));
+                            if let Ok(writer) =
+                                astra_services::session_journal::JournalWriter::new(sid)
+                            {
+                                let _ = writer.append(&evt);
+                            }
+                        }
+
+                        try_write_heavy_checkpoint(state);
+                        return Ok(TurnExecutionControl::ContinueLoop);
+                    }
+                    super::compaction_replay::CompactionReplayOutcome::CircuitOpen => {
+                        // Session has burned enough futile attempts; don't
+                        // run the pipeline again. Fall through to the
+                        // ContextOverflow interruption path below so the
+                        // caller can resume from checkpoint.
+                        if !prep.quiet {
+                            host.emit_headless_line(
+                                HeadlessStderrStyle::Yellow,
+                                format!(
+                                    "♻ Context overflow — compaction circuit open after {} \
+                                     futile attempts; giving up for this session.",
+                                    state.compaction_effectiveness.consecutive_futile_attempts,
+                                ),
+                            );
                         }
                     }
-
-                    try_write_heavy_checkpoint(state);
-                    return Ok(TurnExecutionControl::ContinueLoop);
+                    super::compaction_replay::CompactionReplayOutcome::Futile => {
+                        // Single futile attempt — counter advanced by the
+                        // checked helper. Next turn's check may trip the
+                        // breaker. Fall through to interruption.
+                    }
                 }
             }
             // If we reach here with a context overflow that couldn't be
@@ -2598,14 +2592,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
             // test locks the contract.
             state.push_volatile(
                 super::agentic_loop_host::VolatileKind::CompactResume,
-                "Context compacted: the runtime just compressed your older \
-                 conversation history to reduce token pressure. Your \
-                 original task and the most recent tool activity are \
-                 still above — CONTINUE the task where you left off. \
-                 Do NOT summarize progress or ask the user to restate \
-                 the goal. If the previous attempt left a failing test \
-                 or an error, FIX IT next. Treat this compaction as a \
-                 transparent runtime event, not an instruction to stop.",
+                super::budget_messaging::COMPACT_RESUME_DIRECTIVE,
             );
             state.budget_wrapup_injected = true;
             try_write_heavy_checkpoint(state);
@@ -2626,10 +2613,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
     }
     state.push_volatile(
         super::agentic_loop_host::VolatileKind::BudgetAdvisory,
-        "You have reached the token budget limit for this turn. \
-         Do NOT call any more tools. Summarize your progress so far and \
-         present your results to the user. If you have partial work, \
-         explain what remains to be done.",
+        super::budget_messaging::BUDGET_REACHED_ADVISORY,
     );
     try_write_heavy_checkpoint(state);
     Some(TurnExecutionControl::ContinueLoop)
@@ -2833,195 +2817,6 @@ mod tests {
         let guard = session.read().unwrap();
         assert_eq!(guard.turn_timings.len(), 1);
         assert_eq!(guard.turn_timings[0].turn, 6);
-    }
-
-    // ── Attention manifest lives in state.attention_manifest_text,
-    //    NOT in state.messages ────────────────────────────────────────
-    // Regression guard for the prefix-cache drift fix. Previously the
-    // manifest was pushed as a `role:user` message in history, which
-    // broke byte-prefix caching every turn because the manifest
-    // content drifts (todo status flips, active_files grows). It now
-    // rides the volatile system-prompt lane — the host reads
-    // `state.attention_manifest_text` when building the payload.
-    //
-    // Regression coverage requires both halves:
-    // 1. The text IS populated on state (so downstream can surface it)
-    // 2. `state.messages` has ZERO `[attention:v1]` entries (so prefix
-    //    cache stays stable).
-
-    #[test]
-    fn runtime_attention_manifest_populates_state_not_messages() {
-        let mut state = make_state();
-        state.message =
-            "Implement runtime continuity and validate that active todo survives compaction".into();
-        let original_msg_count = state.messages.len();
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": state.message,
-        }));
-        let msg_count_before_inject = state.messages.len();
-
-        inject_runtime_attention_manifest(&mut state);
-
-        // 1. Continuity state carries the todo correctly.
-        assert_eq!(state.continuity.todos.items.len(), 1);
-        assert_eq!(state.continuity.todos.items[0].id, "runtime-goal");
-
-        // 2. Manifest text is on state, reflects the todo.
-        let text = state
-            .attention_manifest_text
-            .as_ref()
-            .expect("manifest must be set when todos present");
-        assert!(text.starts_with("[attention:v1]\n"));
-        assert!(text.contains("current_todo: runtime-goal [pending]"));
-
-        // 3. CRITICAL: no attention-manifest message leaked into history.
-        let manifest_msgs = state
-            .messages
-            .iter()
-            .filter(|m| {
-                m.get("content")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|s| s.starts_with("[attention:v1]"))
-            })
-            .count();
-        assert_eq!(
-            manifest_msgs, 0,
-            "attention manifest must NOT appear in state.messages — prefix cache depends on stable history"
-        );
-
-        // 4. messages length didn't grow from injection (only the user
-        //    message we pushed ourselves is present).
-        assert_eq!(
-            state.messages.len(),
-            msg_count_before_inject,
-            "inject_runtime_attention_manifest must not push to messages; original={original_msg_count}"
-        );
-    }
-
-    #[test]
-    fn runtime_attention_manifest_strips_legacy_manifest_from_messages() {
-        // Older code paths / restored checkpoints may still carry a
-        // manifest message in history. The inject step must always
-        // strip it so prefix cache stays clean going forward.
-        let mut state = make_state();
-        state.message = "Fix the runtime continuity bug and add tests".into();
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": "[attention:v1]\ngoal: stale",
-        }));
-        state
-            .session_facts
-            .active_files
-            .push(astra_turn_types::session_facts::FileEntry {
-                path: "rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs".to_string(),
-                last_action: "write".to_string(),
-                turn: 2,
-            });
-
-        inject_runtime_attention_manifest(&mut state);
-        inject_runtime_attention_manifest(&mut state);
-
-        // Legacy manifest messages must be gone.
-        let manifest_msgs = state
-            .messages
-            .iter()
-            .filter(|m| {
-                m.get("content")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|s| s.starts_with("[attention:v1]"))
-            })
-            .count();
-        assert_eq!(manifest_msgs, 0, "legacy manifest msg must be stripped");
-
-        // The fresh manifest on state reflects the active files, not
-        // the stale placeholder content.
-        let text = state
-            .attention_manifest_text
-            .as_ref()
-            .expect("non-trivial state must produce manifest");
-        assert!(text.contains(
-            "active_files:\n- rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs"
-        ));
-        assert!(!text.contains("stale"));
-    }
-
-    #[test]
-    fn runtime_attention_manifest_is_none_for_trivial_state() {
-        // Turn 1 of a plain "hi" session: no todos, no active files,
-        // no errors, no corrections, no verifications. State should
-        // report None so the volatile block emits nothing.
-        let mut state = make_state();
-        state.message = "hi".into();
-
-        inject_runtime_attention_manifest(&mut state);
-
-        assert!(
-            state.attention_manifest_text.is_none(),
-            "trivial state must not produce manifest text, got: {:?}",
-            state.attention_manifest_text
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_turn_strips_legacy_manifest_and_populates_state_text() {
-        // Post-refactor: the attention manifest MUST NOT appear in
-        // messages executed against the host. Instead, the fresh
-        // manifest text is on `state.attention_manifest_text` for the
-        // host's payload builder to route into the volatile lane.
-        let mut state = make_state();
-        state.message = "Continue the checkpoint restore refactor and add tests".into();
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": "[attention:v1]\ngoal: stale compacted summary\ncurrent_todo: stale"
-        }));
-        state
-            .session_facts
-            .active_files
-            .push(astra_turn_types::session_facts::FileEntry {
-                path: "rust/crates/astra-pipeline/src/step_restore.rs".to_string(),
-                last_action: "edit".to_string(),
-                turn: 4,
-            });
-        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))]);
-
-        let _ = execute_turn_and_ingest_phase(
-            &mut host,
-            &mut state,
-            0,
-            TurnIterationPrep {
-                quiet: true,
-                turn_start_time: Instant::now(),
-            },
-        )
-        .await
-        .unwrap();
-
-        // No manifest message reached the host.
-        let captured = host.executed_messages.first().expect("host was called");
-        let manifest_msgs = captured
-            .iter()
-            .filter(|message| {
-                message
-                    .get("content")
-                    .and_then(|content| content.as_str())
-                    .is_some_and(|s| s.starts_with("[attention:v1]"))
-            })
-            .count();
-        assert_eq!(
-            manifest_msgs, 0,
-            "post-refactor: no attention manifest in history — it rides state.attention_manifest_text instead"
-        );
-
-        // The fresh manifest text is on state with the new file info,
-        // and does NOT carry the stale compacted summary wording.
-        let text = state
-            .attention_manifest_text
-            .as_ref()
-            .expect("non-trivial state must carry manifest");
-        assert!(text.contains("checkpoint restore refactor"));
-        assert!(text.contains("rust/crates/astra-pipeline/src/step_restore.rs"));
-        assert!(!text.contains("stale compacted summary"));
     }
 
     // PR 5a: the turn loop must invoke host.on_turn_completed

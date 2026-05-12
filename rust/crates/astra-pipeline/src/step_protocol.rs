@@ -260,38 +260,6 @@ impl std::fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
-/// Schema-level validation errors raised by `HeavyCheckpoint::validate_with`.
-///
-/// Distinct from `ProtocolError` because schema drift of embedded serialized
-/// payloads (e.g. `continuity_state`) is an application-level concern the
-/// runtime injects as a validator closure — pipeline does not own that schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ValidationError {
-    /// Base protocol validation failed (delegated from `validate()`).
-    Protocol(String),
-    /// Embedded `continuity_state` blob failed injected schema validator.
-    ContinuityStateSchema(String),
-}
-
-impl std::fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Protocol(msg) => write!(f, "Protocol validation failed: {msg}"),
-            Self::ContinuityStateSchema(msg) => {
-                write!(f, "continuity_state schema validation failed: {msg}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ValidationError {}
-
-impl From<ProtocolError> for ValidationError {
-    fn from(e: ProtocolError) -> Self {
-        Self::Protocol(e.to_string())
-    }
-}
-
 // ─── Step: Layered Structure ─────────────────────────────────────────────────
 
 /// Scheduling contract — immutable policy governing a step's execution.
@@ -812,8 +780,6 @@ pub struct HeavyCheckpoint {
     /// Session state
     pub blocked_tools: Vec<String>,
     pub recent_tools: Vec<String>,
-    /// Learning state reference
-    pub learning_snapshot_id: Option<String>,
     /// Memory context snapshot (for auditing)
     pub memory_context: Option<MemoryContext>,
     /// Active delegation ID (if running inside a delegation)
@@ -850,11 +816,16 @@ pub struct HeavyCheckpoint {
     /// last_was_insufficient — enabling enriched resume guidance and tier selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_state: Option<serde_json::Value>,
-    /// Serialized runtime-owned continuity state (goal/todo/facts/attention).
-    /// Restored before the next model call so "continue" does not depend on
-    /// LLM narrative memory or explicit task-tool usage.
+    /// Pointer to the `astra-config` version store: which `RuntimeConfig`
+    /// this session ran under. `None` on legacy checkpoints from before
+    /// Step 2a of the config-versions rollout; consumers treat that as
+    /// "unknown / fall back to `RuntimeConfig::load()` at resume time".
+    ///
+    /// Opaque `String` here (not a `VersionId`) so astra-pipeline does
+    /// not have to pull in astra-config just to serialize this field —
+    /// the id is content-addressed hex, `cfg_<16-hex>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continuity_state: Option<serde_json::Value>,
+    pub config_version_id: Option<String>,
 }
 /// Summary of a completed delegation sub-run, stored in HeavyCheckpoint for recovery.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -871,10 +842,6 @@ pub struct DelegationSubRunSummary {
 
 /// A named breakpoint — an addressable point in the execution timeline.
 /// Wraps a `HeavyCheckpoint` with additional metadata for resume/fork.
-///
-/// The optional `composite_snapshot` replaces the old flat fields with a
-/// unified bag-of-references model. When present, `tool_health_entries`,
-/// `learning_snapshot_epoch` etc. are still populated for backward compat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BreakpointInfo {
     /// Unique identifier for this breakpoint.
@@ -893,11 +860,7 @@ pub struct BreakpointInfo {
     pub tool_health_entries: Vec<crate::ToolHealthEntry>,
     /// Correction history from TurnGuard at this point.
     pub correction_history_json: Option<String>,
-    /// Learning snapshot identifier (profile name + epoch).
-    pub learning_snapshot_epoch: Option<u64>,
     /// Composite snapshot — unified bag-of-references across state dimensions.
-    /// When present, this is the canonical source; the flat fields above are kept
-    /// for backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composite_snapshot: Option<astra_core::composite_snapshot::CompositeSnapshot>,
 }
@@ -964,7 +927,6 @@ impl StepCheckpoint {
             budget_remaining_rounds: 0,
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
-            learning_snapshot_id: None,
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -974,7 +936,7 @@ impl StepCheckpoint {
             consecutive_context_window_errors: 0,
             pipeline_state: None,
             compaction_state: None,
-            continuity_state: None,
+            config_version_id: None,
         }))
     }
 
@@ -1056,60 +1018,6 @@ impl StepCheckpoint {
     /// Is this a heavy (full recovery) checkpoint?
     pub fn is_heavy(&self) -> bool {
         matches!(self, Self::Heavy(_))
-    }
-
-    /// Extended validation with an injected schema validator for the
-    /// embedded `continuity_state` blob.
-    ///
-    /// The validator closure is **only** invoked when:
-    ///   - `self` is a `Heavy` checkpoint, AND
-    ///   - `continuity_state` is `Some(_)`.
-    ///
-    /// Light checkpoints do not carry embedded continuity state; for `Light`
-    /// variants this method still runs base protocol validation, then treats the
-    /// injected schema validator as a no-op.
-    ///
-    /// This keeps `astra-pipeline` free of any knowledge about the continuity
-    /// schema (which lives in `astra-turn-types`), while still giving restore
-    /// paths a single choke-point to reject malformed blobs at checkpoint
-    /// validation time rather than discovering drift later during use.
-    pub fn validate_with<F>(&self, validator: F) -> Result<(), ValidationError>
-    where
-        F: FnOnce(&serde_json::Value) -> Result<(), String>,
-    {
-        self.validate()?;
-        if let Self::Heavy(h) = self {
-            h.validate_continuity_with(validator)?;
-        }
-        Ok(())
-    }
-}
-
-impl HeavyCheckpoint {
-    /// Schema-level validator for `HeavyCheckpoint` that invokes the provided
-    /// closure on `continuity_state` when present.
-    ///
-    /// The validator closure is **only** invoked when `continuity_state` is
-    /// `Some(_)`. This keeps `astra-pipeline` free of any knowledge about the
-    /// continuity schema (which lives in `astra-turn-types`), while still giving
-    /// restore paths a single choke-point to reject malformed blobs at
-    /// checkpoint validation time rather than discovering drift later during
-    /// use.
-    pub fn validate_with<F>(&self, validator: F) -> Result<(), ValidationError>
-    where
-        F: FnOnce(&serde_json::Value) -> Result<(), String>,
-    {
-        self.validate_continuity_with(validator)
-    }
-
-    fn validate_continuity_with<F>(&self, validator: F) -> Result<(), ValidationError>
-    where
-        F: FnOnce(&serde_json::Value) -> Result<(), String>,
-    {
-        if let Some(cs) = &self.continuity_state {
-            validator(cs).map_err(ValidationError::ContinuityStateSchema)?;
-        }
-        Ok(())
     }
 }
 
@@ -1304,8 +1212,11 @@ impl ToolRetryPolicy {
 }
 
 /// Get tool-level retry policy based on idempotency classification.
-pub fn tool_retry_policy(tool_name: &str) -> ToolRetryPolicy {
-    match classify_tool_idempotency(tool_name) {
+///
+/// `args` is optional because most tools dispatch on name alone; action-sensitive
+/// tools (e.g. `memory`) inspect `args["action"]` to distinguish read vs write.
+pub fn tool_retry_policy(tool_name: &str, args: Option<&serde_json::Value>) -> ToolRetryPolicy {
+    match classify_tool_idempotency(tool_name, args) {
         // Pure reads: retry aggressively (no side effects)
         ToolIdempotency::PureRead => ToolRetryPolicy {
             max_attempts: 3,
@@ -2164,7 +2075,7 @@ mod tests {
     #[test]
     fn idempotency_key_context_memory_snapshot() {
         let args = serde_json::json!({});
-        let key = IdempotencyKey::semantic("memory_search", &args).with_context(ContextSignature {
+        let key = IdempotencyKey::semantic("memory", &args).with_context(ContextSignature {
             workspace_version: None,
             memory_snapshot_id: Some("snap-20250101".into()),
         });
@@ -2233,36 +2144,50 @@ mod tests {
             "github_list_prs",
             "github_ci_status",
             "mo_query",
-            "memory_search",
         ] {
             assert_eq!(
-                classify_tool_idempotency(tool),
+                classify_tool_idempotency(tool, None),
                 ToolIdempotency::PureRead,
                 "Expected PureRead for {tool}"
             );
         }
+        // memory is action-sensitive; see dedicated test below.
+    }
+
+    #[test]
+    fn tool_classification_memory_actions() {
+        use serde_json::json;
+        assert_eq!(
+            classify_tool_idempotency("memory", Some(&json!({"action": "recall"}))),
+            ToolIdempotency::PureRead,
+        );
+        assert_eq!(
+            classify_tool_idempotency("memory", Some(&json!({"action": "expand"}))),
+            ToolIdempotency::PureRead,
+        );
+        assert_eq!(
+            classify_tool_idempotency("memory", Some(&json!({"action": "remember"}))),
+            ToolIdempotency::NonIdempotent,
+        );
+        assert_eq!(
+            classify_tool_idempotency("memory", Some(&json!({"action": "forget"}))),
+            ToolIdempotency::NonIdempotent,
+        );
     }
 
     #[test]
     fn tool_classification_idempotent_write() {
         assert_eq!(
-            classify_tool_idempotency("write_file"),
+            classify_tool_idempotency("write_file", None),
             ToolIdempotency::IdempotentWrite
         );
     }
 
     #[test]
     fn tool_classification_non_idempotent() {
-        for tool in [
-            "bash",
-            "str_replace",
-            "github_create_issue",
-            "memory_store",
-            "memory_purge",
-            "mo_snapshot",
-        ] {
+        for tool in ["bash", "str_replace", "github_create_issue", "mo_snapshot"] {
             assert_eq!(
-                classify_tool_idempotency(tool),
+                classify_tool_idempotency(tool, None),
                 ToolIdempotency::NonIdempotent,
                 "Expected NonIdempotent for {tool}"
             );
@@ -2272,7 +2197,7 @@ mod tests {
     #[test]
     fn unknown_tool_defaults_to_non_idempotent() {
         assert_eq!(
-            classify_tool_idempotency("some_future_tool"),
+            classify_tool_idempotency("some_future_tool", None),
             ToolIdempotency::NonIdempotent
         );
     }
@@ -2322,21 +2247,21 @@ mod tests {
 
     #[test]
     fn tool_retry_policy_pure_read() {
-        let policy = tool_retry_policy("grep");
+        let policy = tool_retry_policy("grep", None);
         assert_eq!(policy.max_attempts, 3);
         assert_eq!(policy.backoff_base_ms, 200);
     }
 
     #[test]
     fn tool_retry_policy_idempotent_write() {
-        let policy = tool_retry_policy("write_file");
+        let policy = tool_retry_policy("write_file", None);
         assert_eq!(policy.max_attempts, 2);
         assert_eq!(policy.backoff_base_ms, 500);
     }
 
     #[test]
     fn tool_retry_policy_non_idempotent() {
-        let policy = tool_retry_policy("bash");
+        let policy = tool_retry_policy("bash", None);
         assert_eq!(policy.max_attempts, 1);
     }
 
@@ -3036,7 +2961,6 @@ mod tests {
             budget_remaining_rounds: 5,
             blocked_tools: vec![],
             recent_tools: vec![],
-            learning_snapshot_id: None,
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -3046,7 +2970,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             compaction_state: None,
             pipeline_state: None,
-            continuity_state: None,
+            config_version_id: None,
         }));
         let err = cp.validate().unwrap_err();
         assert!(matches!(err, ProtocolError::CheckpointCorrupt(_)));
@@ -3072,7 +2996,6 @@ mod tests {
             budget_remaining_rounds: 10,
             blocked_tools: vec![],
             recent_tools: vec![],
-            learning_snapshot_id: None,
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -3082,7 +3005,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             compaction_state: None,
             pipeline_state: None,
-            continuity_state: None,
+            config_version_id: None,
         }));
         assert!(cp.validate().is_ok());
     }
@@ -3158,7 +3081,6 @@ mod tests {
             h.messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
             h.budget_remaining_tokens = 2000;
             h.blocked_tools = vec!["bash".into()];
-            h.learning_snapshot_id = Some("snap-001".into());
         }
         let json = serde_json::to_string(&cp).unwrap();
         let restored: StepCheckpoint = serde_json::from_str(&json).unwrap();
@@ -3167,7 +3089,6 @@ mod tests {
             assert_eq!(h.messages.len(), 1);
             assert_eq!(h.budget_remaining_tokens, 2000);
             assert_eq!(h.blocked_tools, vec!["bash"]);
-            assert_eq!(h.learning_snapshot_id.as_deref(), Some("snap-001"));
         }
     }
 
@@ -3375,70 +3296,5 @@ mod tests {
         )
         .with_timeout_ms(120_000);
         assert_eq!(step.descriptor.scheduling.timeout_ms, 120_000);
-    }
-
-    fn make_heavy_with_continuity(cs: Option<serde_json::Value>) -> HeavyCheckpoint {
-        HeavyCheckpoint {
-            light: LightCheckpoint {
-                protocol_version: PROTOCOL_VERSION,
-                cursor: ExecutionCursor::default(),
-                step_id: "s".into(),
-                task_id: "t".into(),
-                agent_id: "a".into(),
-                progress: 0.0,
-                total_tokens: 0,
-                created_at: 0,
-            },
-            messages: vec![],
-            budget_remaining_tokens: 0,
-            budget_remaining_rounds: 0,
-            blocked_tools: vec![],
-            recent_tools: vec![],
-            learning_snapshot_id: None,
-            memory_context: None,
-            delegation_id: None,
-            delegation_pattern: None,
-            delegation_sub_run_summaries: vec![],
-            interruption: None,
-            approval_overrides: None,
-            consecutive_context_window_errors: 0,
-            compaction_state: None,
-            pipeline_state: None,
-            continuity_state: cs,
-        }
-    }
-
-    #[test]
-    fn heavy_checkpoint_rejects_malformed_continuity_state_via_validator() {
-        let cp = make_heavy_with_continuity(Some(serde_json::json!({"todos": "not-an-object"})));
-        let result = cp.validate_with(|v| {
-            v.get("todos")
-                .and_then(|t| t.as_object())
-                .ok_or_else(|| "todos must be object".to_string())?;
-            Ok(())
-        });
-        assert!(matches!(
-            result,
-            Err(ValidationError::ContinuityStateSchema(_))
-        ));
-    }
-
-    #[test]
-    fn heavy_checkpoint_accepts_valid_continuity_state_via_validator() {
-        let cp = make_heavy_with_continuity(Some(serde_json::json!({"todos": {}})));
-        let result = cp.validate_with(|v| {
-            v.get("todos")
-                .and_then(|t| t.as_object())
-                .ok_or_else(|| "todos must be object".to_string())?;
-            Ok(())
-        });
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn heavy_checkpoint_validate_with_passes_when_no_continuity_state() {
-        let cp = make_heavy_with_continuity(None);
-        let result = cp.validate_with(|_| Err("should not be called".to_string()));
-        assert!(result.is_ok());
     }
 }

@@ -484,12 +484,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         &boost_terms,
     );
 
-    let learned_context = ctx
-        .selector
-        .learned_context(semantic_query_str, ctx.recent_tools);
-    let learned_context_hint = learned_context.prompt_fragment();
-    let learned_task_type = learned_context.task_archetype_payload_token();
-
     // Skill activation is handled exclusively by the `skill` tool in the agentic loop
     // (see turn/skill_tool.rs + partition_and_execute_skills). The model decides when
     // to invoke skills by calling the tool, rather than having skills pre-injected by
@@ -522,10 +516,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             ctx.previous_confidence_fallback.clone(),
         );
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Thinking…");
-        let sel_result = ctx
-            .selector
-            .select_with_learned_context(&sel_ctx, &learned_context)
-            .await;
+        let sel_result = ctx.selector.select(&sel_ctx).await;
         let sel_latency_ms = sel_start.elapsed().as_millis() as u64;
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Loading schemas…");
         record_first_selector_latency_and_strategy(
@@ -547,10 +538,16 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         );
 
         let conf = sel_result.confidence;
-        let (schemas, report) = tool_selector::resolve_schemas_with_pressure(
+        // Phase-8: honour `runtime.tool_surface.pinned_tools` from the user's
+        // TOML so `tools[]` reflects their config rather than baked defaults.
+        let surface_cfg = astra_config::runtime_config::RuntimeConfig::cached()
+            .tool_surface
+            .clone();
+        let (schemas, report) = tool_selector::resolve_schemas_with_surface(
             ctx.registry,
             &sel_result.tool_names,
             budget_pressure,
+            &surface_cfg,
         );
         (
             schemas,
@@ -580,10 +577,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         );
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Thinking…");
         let sel_start = Instant::now();
-        let sel_result = ctx
-            .selector
-            .select_with_learned_context(&sel_ctx, &learned_context)
-            .await;
+        let sel_result = ctx.selector.select(&sel_ctx).await;
         let sel_latency_ms = sel_start.elapsed().as_millis() as u64;
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Loading schemas…");
         accumulate_selector_token_usage(
@@ -593,10 +587,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             sel_result.selector_tokens_out,
         );
         let conf = sel_result.confidence;
-        let (mut selected, mut report) = tool_selector::resolve_schemas_with_pressure(
+        let surface_cfg = astra_config::runtime_config::RuntimeConfig::cached()
+            .tool_surface
+            .clone();
+        let (mut selected, mut report) = tool_selector::resolve_schemas_with_surface(
             ctx.registry,
             &sel_result.tool_names,
             budget_pressure,
+            &surface_cfg,
         );
         pin_invoked_tool_schemas(
             &mut selected,
@@ -660,8 +658,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         ctx.restricted_tools,
         ctx.telem.first_selection_report.as_ref(),
         selection_confidence,
-        learned_context_hint.as_str(),
-        learned_task_type.as_deref(),
+        None,
     );
     *ctx.turn_policy = turn_policy_from_payload_edge_tools(&payload, ctx.interaction_mode);
     log_chat_turn_timing_phase(timing, "skill_merge_attach_edge_tools", &mut mark);
@@ -726,12 +723,15 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     // cumulative signals back to the agent.
     {
         let (current, max_total) = ctx.denial_pressure;
-        let bias: std::collections::BTreeMap<String, f64> = ctx
+        let bias: std::collections::BTreeMap<
+            String,
+            astra_turn_core::tool_health::OutcomeBiasEntry,
+        > = ctx
             .turn_guard
             .health
             .outcome_bias_by_tool(3600)
             .into_iter()
-            .filter(|(_, v)| v.abs() >= 0.005)
+            .filter(|(_, e)| e.score.abs() >= 0.005)
             .collect();
         if let Some(session_lock) = &ctx.executor.observability_session
             && let Ok(mut session) = session_lock.write()
@@ -767,30 +767,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                 .unwrap_or_default();
             session.ingest_self_model_inputs(skills, tool_health_entries, scenario, recent_signals);
 
-            // Observe the prompt-injection lessons channel for this
-            // round so `introspect subtopic=noise` can report whether
-            // lessons have been re-rendered unchanged for many turns
-            // (the f85a02bb stale-signal case). Lessons are owned by
-            // the executor and reachable here.
-            //
-            // NOTE: the per-turn volatile lane is NOT observed from
-            // this CLI path — it is injected further downstream and
-            // is not visible here. Observing it with an empty string
-            // would falsely report `Empty` for every round and mask
-            // genuine staleness. The volatile-aware observation point
-            // lives in runtime/observability_integration.rs.
-            //
-            // Fingerprint uses `LessonKind::as_str()` (stable snake_case
-            // DB tag), NOT `Debug`, so enum-variant renames do not flip
-            // every channel from Stale→Fresh for one round.
-            let lessons_text = ctx
-                .executor
-                .session_lessons_snapshot()
-                .iter()
-                .map(|l| format!("{}:{}:{}", l.kind.as_str(), l.trigger_signal, l.action))
-                .collect::<Vec<_>>()
-                .join("|");
-            session.observe_lessons_only(&lessons_text);
+            // Injection-freshness observation is deferred to after the
+            // turn's SSE stream finishes (see `post_turn_observe_bridge_injections`
+            // in `cli_loop_host.rs`). Observing here would fire before
+            // the bridge has actually composed its 5 bridge-generated
+            // channels (implicit_feedback, feedback_rules,
+            // memoria_prefetch, tool_round_guidance, volatile) and leave
+            // them permanently `Untracked` in introspect's freshness
+            // report.
         }
     }
     if let Some(self_model) = ctx.executor.build_self_model_snapshot() {
@@ -839,6 +823,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         }
     }
     log_chat_turn_timing_phase(timing, "self_awareness_inject", &mut mark);
+
+    // Injection-freshness observation happens AFTER the bridge's SSE
+    // stream completes (see `post_turn_observe_bridge_injections` in
+    // `cli_loop_host.rs`), so we can merge the 5 bridge-generated
+    // channels (captured via the `injection_freshness` SSE event into
+    // `ChatTurnSseAccum.bridge_injection_texts`) with the CLI-owned
+    // `lessons` snapshot.
 
     // ─── Record token budget estimate to trace collector (M1 observability) ───
     if let Some(collector) = ctx.telem.trace_collector {

@@ -529,16 +529,8 @@ pub(super) fn build_router(state: AppState) -> Router {
             get(audit_handlers::audit_errors_handler),
         )
         .route(
-            "/sessions/{session_id}/audit/mutations",
-            get(audit_handlers::audit_mutations_handler),
-        )
-        .route(
             "/sessions/{session_id}/audit/promotions",
             get(audit_handlers::audit_runtime_promotions_handler),
-        )
-        .route(
-            "/sessions/{session_id}/audit/mutations/{mutation_id}/state",
-            post(audit_handlers::audit_mutation_state_handler),
         )
         // Cross-session Analytics
         .route(
@@ -552,10 +544,6 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route(
             "/audit/tools",
             get(audit_handlers::cross_session_tools_handler),
-        )
-        .route(
-            "/audit/mutations",
-            get(audit_handlers::cross_session_mutations_handler),
         )
         .route(
             "/audit/promotions",

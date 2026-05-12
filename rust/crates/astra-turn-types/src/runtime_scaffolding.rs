@@ -2,10 +2,10 @@
 //!
 //! The astra runtime synthesizes several kinds of *scaffolding* messages into
 //! the LLM message stream: parallel-batching nudges, execution-escalation
-//! corrections, attention manifests, verification directives, error-budget
-//! notices, self-check injections, tool-call rollups. These are
-//! **ephemeral** — they steer a single turn's behavior — and should never be
-//! treated as conversational content.
+//! corrections, verification directives, error-budget notices, self-check
+//! injections, tool-call rollups. These are **ephemeral** — they steer a
+//! single turn's behavior — and should never be treated as conversational
+//! content.
 //!
 //! When scaffolding leaks into persistent stores (Memoria working-memory,
 //! session journals, conversation compaction), it creates feedback loops:
@@ -21,8 +21,6 @@
 
 use serde_json::Value;
 
-use crate::continuity::ATTENTION_PREFIX;
-
 /// Prefixes that mark a message body as runtime-injected scaffolding.
 ///
 /// Any message whose trimmed content starts with one of these strings is
@@ -34,7 +32,7 @@ use crate::continuity::ATTENTION_PREFIX;
 pub const SCAFFOLDING_BODY_PREFIXES: &[&str] = &[
     // Rollups
     "Tools used:",
-    // Attention / task-focus manifests
+    // Task-focus manifests
     "[Active task attachment]",
     "[Self-check",
     // Batching / parallel feedback
@@ -55,10 +53,7 @@ pub const SCAFFOLDING_BODY_PREFIXES: &[&str] = &[
 ///
 /// 1. `role == "system"` messages with no content → runtime-injected nudge
 ///    (the runtime never emits user-typed system turns mid-conversation).
-/// 2. `role == "user"` messages whose content begins with the attention
-///    manifest prefix (`[attention:v1]\n`) — these are synthetic user
-///    messages carrying turn-state continuity.
-/// 3. Any message whose trimmed `content` starts with one of
+/// 2. Any message whose trimmed `content` starts with one of
 ///    [`SCAFFOLDING_BODY_PREFIXES`] (applies across all roles — assistant
 ///    messages can carry runtime-stamped directives too).
 ///
@@ -81,10 +76,6 @@ pub fn is_runtime_scaffolding_message(message: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or_default();
     let trimmed = content.trim_start();
-
-    if role == Some("user") && trimmed.starts_with(ATTENTION_PREFIX) {
-        return true;
-    }
 
     for prefix in SCAFFOLDING_BODY_PREFIXES {
         if trimmed.starts_with(prefix) {
@@ -117,12 +108,6 @@ mod tests {
     #[test]
     fn system_role_empty_content_is_scaffolding() {
         assert!(is_runtime_scaffolding_message(&json!({"role": "system"})));
-    }
-
-    #[test]
-    fn attention_manifest_user_message_is_scaffolding() {
-        let content = format!("{ATTENTION_PREFIX}\nGoal: fix bug");
-        assert!(is_runtime_scaffolding_message(&msg("user", &content)));
     }
 
     #[test]
@@ -250,14 +235,6 @@ mod tests {
             "assistant",
             "In that session, Tools used: by the agent included bash."
         )));
-    }
-
-    #[test]
-    fn user_message_with_attention_prefix_not_at_start_is_not_scaffolding() {
-        // The attention check requires the prefix to start the content —
-        // embedded mentions in natural user text are not scaffolding.
-        let content = format!("I saw the tag {ATTENTION_PREFIX} earlier, what is it?");
-        assert!(!is_runtime_scaffolding_message(&msg("user", &content)));
     }
 
     #[test]

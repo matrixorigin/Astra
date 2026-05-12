@@ -1,23 +1,79 @@
 //! `/config` slash command — view and manage runtime configuration.
 //!
-//! Commands:
-//! - `/config` — Show current configuration
-//! - `/config show` — Show current configuration (same as `/config`)
+//! Primary entry point (matches the reference implementation):
+//! - `/config` — Open the interactive panel (search, pick, edit).
+//!
+//! Sub-commands (unchanged, used by scripts / for introspection):
+//! - `/config show` — Print current configuration
 //! - `/config paths` — Show configuration file paths
 //! - `/config export [path]` — Export configuration to file
 //! - `/config diff` — Show difference from defaults
+//! - `/config edit` — Alias for `/config` (kept for muscle memory)
 
 use astra_config::runtime_config::RuntimeConfig;
 use crossterm::style::Stylize;
 use std::path::PathBuf;
+use std::sync::{OnceLock, RwLock};
+
+static ACTIVE_MODEL_FOR_DISPLAY: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+pub(crate) fn set_active_model_for_display(model: Option<String>) {
+    let lock = ACTIVE_MODEL_FOR_DISPLAY.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = model;
+    }
+}
+
+/// Resolve the active model for "effective budget" display. Returns
+/// `None` when no model is pinned (legacy sub-runs, tests, etc.).
+fn active_model_for_display() -> Option<String> {
+    ACTIVE_MODEL_FOR_DISPLAY
+        .get()
+        .and_then(|lock| lock.read().ok().and_then(|guard| guard.clone()))
+}
+
+// ── `/session analyze deep <id>` TUI→line-mode hand-off ─────────
+//
+// The TUI-side `/session analyze` hands off to the line-mode deep
+// analyzer via `SlashResult::Fallback`. Because the fallback only
+// sees the bare command string we stash any user-supplied session
+// id in this slot so the line-mode handler can pick it up instead
+// of silently dropping it (the pre-fix behaviour).
+static DEEP_ANALYZE_ARG: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+/// Store (or clear) the session id the user passed to
+/// `/session analyze deep <id>`. `None` means "use the current
+/// session".
+pub(crate) fn set_deep_analyze_arg(arg: Option<String>) {
+    let lock = DEEP_ANALYZE_ARG.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = arg;
+    }
+}
+
+/// Consume the stashed `/session analyze deep` argument. Returns
+/// `None` when the caller didn't supply a session id (the
+/// line-mode analyzer should then default to the current session).
+#[allow(dead_code)]
+pub(crate) fn take_deep_analyze_arg() -> Option<String> {
+    DEEP_ANALYZE_ARG
+        .get()
+        .and_then(|lock| lock.write().ok().and_then(|mut g| g.take()))
+}
 
 /// Handle /config command.
+///
+/// Primary dispatch matches the reference CLI: bare `/config` opens the
+/// interactive panel. The explicit `show` sub-command is retained for
+/// scripts / introspection that want the static print.
 pub fn handle_config_command(arg: &str) {
     let parts: Vec<&str> = arg.split_whitespace().collect();
-    let subcommand = parts.first().copied().unwrap_or("show");
+    // Empty arg → open interactive panel. `edit` is an alias.
+    let subcommand = parts.first().copied().unwrap_or("");
 
     match subcommand {
-        "show" | "" => show_config(),
+        "" | "edit" => run_config_edit(),
+        "show" => show_config(),
         "paths" => show_paths(),
         "sources" => show_sources(),
         "export" => {
@@ -104,25 +160,6 @@ fn show_config() {
             .yellow()
     );
 
-    // Learning settings
-    println!("\n{}", "📈 Learning".bold());
-    println!(
-        "  enabled: {}",
-        config.learning.enabled.to_string().yellow()
-    );
-    println!(
-        "  entity_decay_half_life_days: {}",
-        config
-            .learning
-            .entity_decay_half_life_days
-            .to_string()
-            .yellow()
-    );
-    println!(
-        "  exploration_rate: {}",
-        format!("{:.2}", config.learning.exploration_rate).yellow()
-    );
-
     // Token budget settings
     println!("\n{}", "🎯 Token Budget".bold());
     println!(
@@ -133,6 +170,40 @@ fn show_config() {
             .to_string()
             .yellow()
     );
+    // Effective-for-model line. The configured value above is one number;
+    // the actual budget a turn sees is model-dependent because 1M-window
+    // models (Sonnet 4.6 / Opus 4.6) read 80% of their window directly,
+    // bypassing the configured default. Surface both so operators stop
+    // assuming their Sonnet 4.6 is stuck at 200k.
+    let effective_model = active_model_for_display();
+    let effective_budget = astra_config::config_overlay::effective_budget_for_model(
+        &config,
+        effective_model.as_deref(),
+    );
+    match effective_model.as_deref() {
+        Some(model) if effective_budget != config.token_budget.max_turn_input_tokens as u64 => {
+            println!(
+                "  effective_for_{}: {} {}",
+                model,
+                effective_budget.to_string().cyan(),
+                "(from model context window)".dim()
+            );
+        }
+        Some(model) => {
+            println!(
+                "  effective_for_{}: {} {}",
+                model,
+                effective_budget.to_string().cyan(),
+                "(same as configured)".dim()
+            );
+        }
+        None => {
+            println!(
+                "  {}",
+                "(no active model known; effective budget = configured)".dim()
+            );
+        }
+    }
     println!(
         "  system_prompt_reserve: {}",
         config
@@ -485,8 +556,9 @@ fn print_help() {
 {title}
 
 {usage}
-  /config               Show current configuration
-  /config show          Show current configuration  
+  /config               Open the interactive panel (search, pick, edit)
+  /config edit          Alias for /config
+  /config show          Print current configuration (non-interactive)
   /config paths         Show configuration file paths
   /config sources       Show where each non-default value came from
   /config export [path] Export configuration to file (or stdout)
@@ -515,4 +587,218 @@ fn print_help() {
         examples = "Examples:".bold(),
         env = "Environment Variables:".bold(),
     );
+}
+
+// ─── /config edit ─────────────────────────────────────────────────────────
+
+/// Interactive edit loop modelled after the reference implementation's
+/// Config.tsx state machine:
+///
+///   (search) → pick item → dispatch by kind → write back → persist →
+///   (search) …
+///
+/// Differences from the TSX original (by necessity, not by choice):
+///   * No Pane/Tabs chrome — line-mode inquire::Select is our selector.
+///   * No ThemePicker/ModelPicker submenu — we lean on the catalog's
+///     `SettingKind::Enum` options instead of specialised components.
+///   * Persistence writes to the user-level TOML at ~/.astra/config/runtime.toml,
+///     matching what `/config paths` labels as the durable home for
+///     user-initiated edits. Project-level writes are a follow-up.
+///
+/// Returning from this function ends the /config edit session. Ctrl+C /
+/// Esc from inquire is surfaced as a graceful cancel.
+fn run_config_edit() {
+    use astra_config::config_overlay::{
+        SettingItem, apply_edit, build_settings_catalog, filter_settings,
+    };
+
+    let config = RuntimeConfig::load();
+    let catalog = build_settings_catalog(&config);
+
+    // Outer search + select loop. Each pass asks for an optional query,
+    // then lets the user pick from the filtered list. Enter on an item
+    // opens the per-kind editor; a special "(done — save and exit)"
+    // sentinel exits.
+    let mut working = config;
+    let mut dirty = false;
+
+    loop {
+        let query = match inquire::Text::new("Search setting (blank = all, Esc to finish):")
+            .with_help_message("Type a keyword; matches id or label. Empty shows all.")
+            .prompt_skippable()
+        {
+            Ok(Some(q)) => q,
+            Ok(None) | Err(_) => break, // Esc / Ctrl+C
+        };
+        let filtered = filter_settings(&catalog_with_values(&catalog, &working), &query);
+        if filtered.is_empty() {
+            println!("{}", format!("No settings match `{query}`.").dim());
+            continue;
+        }
+
+        let labels: Vec<String> = filtered
+            .iter()
+            .map(|i| format!("{}  [{}]  = {}", i.label, i.id, render_value(&i.value)))
+            .collect();
+
+        let picked = match inquire::Select::new("Pick a setting to edit (Esc to return):", labels)
+            .with_page_size(15)
+            .prompt_skippable()
+        {
+            Ok(Some(lbl)) => lbl,
+            Ok(None) | Err(_) => continue,
+        };
+        let idx = match filtered.iter().position(|i| {
+            format!("{}  [{}]  = {}", i.label, i.id, render_value(&i.value)) == picked
+        }) {
+            Some(n) => n,
+            None => continue,
+        };
+        let item: &SettingItem = &filtered[idx];
+
+        let new_value = match prompt_new_value(item) {
+            Some(v) => v,
+            None => continue, // user cancelled the per-kind editor
+        };
+        match apply_edit(working.clone(), &item.id, new_value.clone()) {
+            Ok(next) => {
+                working = next;
+                dirty = true;
+                println!(
+                    "  {} {} = {}",
+                    "✓".green(),
+                    item.id.clone().cyan(),
+                    render_value(&new_value).yellow()
+                );
+            }
+            Err(err) => {
+                eprintln!("  {} {}", "✗".red(), err.to_string().red());
+            }
+        }
+    }
+
+    if !dirty {
+        println!("{}", "No changes made.".dim());
+        return;
+    }
+
+    // Confirm-then-save. Writing to user-level is the safer default;
+    // project-level overrides would silently affect collaborators.
+    let save = inquire::Confirm::new("Save changes to ~/.astra/config/runtime.toml?")
+        .with_default(true)
+        .prompt_skippable()
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if !save {
+        println!("{}", "Discarded — no files written.".dim());
+        return;
+    }
+    match write_user_runtime_toml(&working) {
+        Ok(path) => {
+            println!(
+                "  {} {}",
+                "✓".green(),
+                format!("Saved to {}", path.display()).cyan()
+            );
+            // Content-addressed put so the saved config lands in the
+            // version store and shows up in `astra config version list`.
+            // Best-effort: no session / journal context in line mode;
+            // the next session startup will write a `startup` journal
+            // event with the new id.
+            use astra_config::config_versions::ConfigVersionStore;
+            if let Some(store) = astra_config::config_versions::LocalFileStore::at_default_root() {
+                let meta = astra_config::config_versions::PutMetadata {
+                    source_session: None,
+                    parent: None,
+                };
+                if let Ok(id) = store.put(&working, meta) {
+                    println!("  {}  config version: {}", "·".dim(), id.to_string().cyan());
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("  {} Failed to save: {}", "✗".red(), err.to_string().red());
+        }
+    }
+}
+
+/// The catalog built by `build_settings_catalog(&config)` is a snapshot of
+/// values at the time it was built. As the user edits, we need the list
+/// to reflect the in-progress config — so rebuild from the working copy
+/// every iteration. Cheap: the catalog has ~15 entries.
+fn catalog_with_values(
+    _stale: &[astra_config::config_overlay::SettingItem],
+    working: &RuntimeConfig,
+) -> Vec<astra_config::config_overlay::SettingItem> {
+    astra_config::config_overlay::build_settings_catalog(working)
+}
+
+fn render_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Per-kind editor. Returns `None` if the user cancels mid-edit.
+fn prompt_new_value(item: &astra_config::config_overlay::SettingItem) -> Option<serde_json::Value> {
+    use astra_config::config_overlay::SettingKind;
+    match &item.kind {
+        SettingKind::Bool => {
+            let current = item.value_as_bool().unwrap_or(false);
+            inquire::Confirm::new(&format!("{} →", item.label))
+                .with_default(!current)
+                .prompt_skippable()
+                .ok()
+                .flatten()
+                .map(serde_json::Value::from)
+        }
+        SettingKind::Number { min, max, .. } => {
+            let current = item
+                .value_as_number()
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            let range_hint = format!("range {}..={}", min, max);
+            let text = inquire::Text::new(&format!("{} →", item.label))
+                .with_initial_value(&current)
+                .with_help_message(&range_hint)
+                .prompt_skippable()
+                .ok()
+                .flatten()?;
+            // Accept either integer or float — serde_json::Value carries
+            // both; apply_edit's as_u32 helper will coerce integer-valued
+            // floats correctly.
+            match text.parse::<f64>() {
+                Ok(n) if n.is_finite() => Some(serde_json::json!(n)),
+                _ => {
+                    eprintln!("  {}", format!("Invalid number: {}", text).red());
+                    None
+                }
+            }
+        }
+        SettingKind::Enum { options } => {
+            inquire::Select::new(&format!("{} →", item.label), options.clone())
+                .prompt_skippable()
+                .ok()
+                .flatten()
+                .map(serde_json::Value::from)
+        }
+    }
+}
+
+/// Write `config` as TOML to `~/.astra/config/runtime.toml`, creating the
+/// directory if missing. Returns the path on success.
+fn write_user_runtime_toml(config: &RuntimeConfig) -> std::io::Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| std::io::Error::other("home directory not found"))?;
+    let dir = home.join(".astra/config");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("runtime.toml");
+    let toml_str = toml::to_string_pretty(config)
+        .map_err(|e| std::io::Error::other(format!("TOML serialise failed: {e}")))?;
+    std::fs::write(&path, toml_str)?;
+    Ok(path)
 }

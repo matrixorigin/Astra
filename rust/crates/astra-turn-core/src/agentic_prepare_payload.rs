@@ -17,14 +17,12 @@ pub fn apply_selector_hints_then_attach_filtered_edge_tools(
     restricted_tools: &HashSet<String>,
     first_selection_report: Option<&SelectionReport>,
     selection_confidence: f64,
-    learned_context_hint: &str,
     learned_task_type: Option<&str>,
 ) {
     tool_registry::apply_selector_hints_to_edge_profile(
         &mut payload["edge_profile"],
         first_selection_report,
         ConfidenceInterval::exact(selection_confidence),
-        learned_context_hint,
         learned_task_type,
     );
     attach_filtered_edge_tools(payload, turn_schemas, restricted_tools);
@@ -54,7 +52,6 @@ mod tests {
             &restricted,
             Some(&report),
             0.9,
-            "hint",
             Some("code"),
         );
         assert!(payload["edge_profile"]["recommended_tools"].is_array());

@@ -18,7 +18,7 @@ pub(crate) struct PartialTurnData {
     pub completion_tokens: u64,
     pub tool_calls_count: u32,
     #[allow(dead_code)]
-    pub tool_health_export: Vec<astra_evolution::persistence::ToolHealthEntry>,
+    pub tool_health_export: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     pub session_id: Option<String>,
     pub last_heavy_checkpoint: Option<astra_pipeline::step_protocol::StepCheckpoint>,
     /// Partial text the model generated before the turn was interrupted.
@@ -91,12 +91,9 @@ pub(crate) struct StreamResult {
     /// Step Protocol recorder summary for debugging and audit.
     pub(crate) step_recorder_summary: Option<astra_pipeline::step_recorder::RecorderSummary>,
     /// Exported tool health entries from this turn's TurnGuard (for cross-session persistence).
-    pub(crate) tool_health_export: Vec<astra_evolution::persistence::ToolHealthEntry>,
+    pub(crate) tool_health_export: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     /// Last heavy checkpoint built during the agentic loop (for cloud persistence).
     pub(crate) last_heavy_checkpoint: Option<astra_pipeline::step_protocol::StepCheckpoint>,
-    /// Live runtime-owned continuity after the turn. Saved back into REPL state
-    /// so multi-turn sessions do not fall back to prompt-only continuity.
-    pub(crate) runtime_continuity: astra_turn_types::continuity::ContinuityState,
     /// Time to first token in milliseconds.
     pub(crate) ttft_ms: Option<u64>,
     /// Context assembly time in milliseconds.

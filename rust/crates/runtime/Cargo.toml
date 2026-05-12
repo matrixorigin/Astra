@@ -38,7 +38,6 @@ fastrand = "2"
 percent-encoding = "2.3"
 astra-logging.workspace = true
 astra-config.workspace = true
-astra-evolution.workspace = true
 astra-core.workspace = true
 astra-learning.workspace = true
 astra-messaging.workspace = true
@@ -49,7 +48,6 @@ astra-prompts.workspace = true
 astra-sandbox.workspace = true
 astra-server-types = { workspace = true, features = ["server"] }
 astra-skills.workspace = true
-astra-sync-adapters.workspace = true
 astra-turn-core = { workspace = true, features = ["db-store"] }
 astra-turn-types.workspace = true
 astra-services.workspace = true

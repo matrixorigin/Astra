@@ -50,6 +50,12 @@ pub(crate) struct ToolCell {
     pub output_summary: Option<String>,
     pub output: Option<String>,
     pub ts: Option<String>,
+    /// Cumulative lines observed in the tool's stdout stream (bash
+    /// only today — other tools don't emit `ToolOutput` events so
+    /// these stay at 0 and the cell renders an indeterminate
+    /// breathing animation instead of a line counter).
+    pub progress_lines: u64,
+    pub progress_bytes: u64,
 }
 
 impl ToolCell {
@@ -63,6 +69,21 @@ impl ToolCell {
             output_summary: None,
             output: None,
             ts: None,
+            progress_lines: 0,
+            progress_bytes: 0,
+        }
+    }
+
+    /// Update mid-flight progress counters from a `ToolOutput`
+    /// event. Monotonic by contract — callers pass cumulative
+    /// values, so we clamp against regressions that could otherwise
+    /// reset the on-screen display (e.g. out-of-order delivery).
+    pub fn set_progress(&mut self, lines: u64, bytes: u64) {
+        if lines >= self.progress_lines {
+            self.progress_lines = lines;
+        }
+        if bytes >= self.progress_bytes {
+            self.progress_bytes = bytes;
         }
     }
 
@@ -131,6 +152,8 @@ impl ToolCell {
             output_summary,
             output,
             ts,
+            progress_lines: 0,
+            progress_bytes: 0,
         })
     }
 
@@ -169,37 +192,94 @@ impl ToolCell {
         }
     }
 
-    /// One-row progress line (Braille spinner + log-scaled bar)
-    /// rendered under the header for tools running > 3 s. Keeps
-    /// the user reassured even when the underlying work has no
-    /// real progress metric.
+    /// Sub-line rendered under the header for tools that are still
+    /// running past the 3 s grace window.
+    ///
+    /// Two shapes:
+    /// - **Signal mode** (any `progress_lines` / `progress_bytes`
+    ///   arrived) — a Braille spinner + `"streaming · N lines · K KB"`
+    ///   counter. Honest, monotonic, no fake percentages.
+    /// - **Indeterminate mode** (no progress signal ever arrived —
+    ///   non-streaming tools like `read_file`, `git_log`, skill
+    ///   dispatch) — a breathing bar with a small block sliding back
+    ///   and forth. Purely time-based; makes "still working" visible
+    ///   without pretending to track progress.
     fn progress_line(&self, width: usize, elapsed_ms: u64) -> Line<'static> {
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame_idx = ((elapsed_ms / 80) % FRAMES.len() as u64) as usize;
         let theme = crate::tui::theme::current();
         let dim = Style::default().fg(Color::DarkGray);
-
-        let raw = 1.0 - (-(elapsed_ms as f32 / 15_000.0)).exp();
-        let progress = raw.min(0.99);
-        let bar_max = width.saturating_sub(14).clamp(10, 40);
-        let filled = ((bar_max as f32) * progress).floor() as usize;
-        let filled = filled.min(bar_max.saturating_sub(1));
-        let bar = format!(
-            "{}{}",
-            "█".repeat(filled),
-            "░".repeat(bar_max.saturating_sub(filled))
+        let spinner = Span::styled(
+            FRAMES[frame_idx].to_string(),
+            Style::default().fg(theme.accent),
         );
+
+        // Signal mode: show real counters when the tool actually
+        // streamed something.
+        if self.progress_lines > 0 || self.progress_bytes > 0 {
+            let body = format!(
+                " streaming · {} {} · {}",
+                self.progress_lines,
+                if self.progress_lines == 1 {
+                    "line"
+                } else {
+                    "lines"
+                },
+                format_bytes(self.progress_bytes),
+            );
+            return Line::from(vec![
+                Span::styled("    ", dim),
+                spinner,
+                Span::styled(body, dim),
+            ]);
+        }
+
+        // Indeterminate mode: breathing block slides across a
+        // fixed-width track. Position is `t = elapsed_ms / 1400`,
+        // normalised to [0, 1] via a triangle wave so the block
+        // bounces off the ends rather than wrapping.
+        let bar_max = width.saturating_sub(12).clamp(10, 28);
+        let block_len = (bar_max / 4).max(2);
+        let travel = bar_max.saturating_sub(block_len);
+        let pos = if travel == 0 {
+            0
+        } else {
+            let t = (elapsed_ms as f32 / 1400.0).fract();
+            let tri = if t < 0.5 { t * 2.0 } else { (1.0 - t) * 2.0 };
+            (tri * travel as f32).round() as usize
+        };
+        let mut bar = String::with_capacity(bar_max);
+        for i in 0..bar_max {
+            if i >= pos && i < pos + block_len {
+                bar.push('▓');
+            } else {
+                bar.push('░');
+            }
+        }
 
         Line::from(vec![
             Span::styled("    ", dim),
-            Span::styled(
-                FRAMES[frame_idx].to_string(),
-                Style::default().fg(theme.accent),
-            ),
+            spinner,
             Span::raw(" "),
             Span::styled(bar, Style::default().fg(theme.accent)),
-            Span::styled(format!(" {:.0}%", progress * 100.0), dim),
         ])
+    }
+}
+
+/// Human-readable byte count (1024-base). Three significant digits
+/// up through GB — matches what `ls -h` feels like.
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else if bytes < GB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
     }
 }
 
@@ -483,6 +563,31 @@ mod tests {
         assert!(out.contains("file-5"));
         assert!(!out.contains("file-6"), "row 6 should have been trimmed");
         assert!(out.contains("… +3 lines"));
+    }
+
+    // ── Progress signals ─────────────────────────────────────────
+
+    #[test]
+    fn set_progress_is_monotonic() {
+        let mut t = ToolCell::new_running("bash", "long");
+        t.set_progress(10, 512);
+        t.set_progress(25, 2_048);
+        assert_eq!(t.progress_lines, 25);
+        assert_eq!(t.progress_bytes, 2_048);
+
+        // A regression (out-of-order or clobbering update) must not
+        // roll counters back.
+        t.set_progress(5, 100);
+        assert_eq!(t.progress_lines, 25);
+        assert_eq!(t.progress_bytes, 2_048);
+    }
+
+    #[test]
+    fn format_bytes_picks_compact_unit() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2_048), "2.0 KB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
     }
 
     // ── Snapshots ────────────────────────────────────────────────

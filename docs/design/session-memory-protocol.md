@@ -5,6 +5,17 @@
 **Date**: 2026-04-16
 **References**: Claude Code compaction system analysis, Memoria API
 
+> **Scope**: this doc covers **in-session** memory — the L0/L1/L2 anchor +
+> facts + narrative pyramid that protects context across compaction. For
+> **cross-session** memory — Memoria storage, the `memory(action=...)`
+> tool, session prewarm, episode + scene forward-feeding, session-end
+> governance — see [memory-runtime.md](memory-runtime.md).
+>
+> Relationship: the in-session pyramid (this doc) is the *upstream*
+> context layer; at session termination, the Memoria runtime
+> ([memory-runtime.md](memory-runtime.md)) decides what becomes durable
+> (episode, scene) and what to purge (working memory).
+
 ## 1. Problem Statement
 
 Two problems:

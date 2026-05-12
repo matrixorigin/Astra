@@ -1,0 +1,32 @@
+---
+source: crates/astra-cli/src/tui/context_panel/view.rs
+expression: "render_panel(&b, 80, 28)"
+---
+┌ Context window (34% · low) ──────────────────────────────────────────────────┐
+│  34.5k / 102.4k tokens  (33.7%)                                              │
+│  Tab focus · Enter close · j/k scroll · Esc close                            │
+│                                                                              │
+│  ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁   ⛁ System prompt     6.0k  ( 5.9%)                     │
+│  ⛁ ⛁ ⛁ ⛁ ⛁ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Tools             6.3k  ( 6.2%)                     │
+│  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ History          22.0k  (21.5%)                     │
+│  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Current turn       227  ( 0.2%)                     │
+│  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛶ Free space       67.9k  (66.3%)                     │
+│                                                                              │
+│   Tools · /tool                                                              │
+│    └ bash   189 tokens                                                       │
+│    └ read_file   152 tokens                                                  │
+│                                                                              │
+│   Skills · /skills (shortlist)                                               │
+│    └ review_changes                                                          │
+│    └ verify_task                                                             │
+│                                                                              │
+│   History · conversation turns                                               │
+│    └ 8 turns  (1 retained · 1 compressed · 2 dropped)                        │
+│    └ 32.0k → 22.0k tokens  (−31%)                                            │
+│                                                                              │
+│   Compaction · context trimming                                              │
+│    └ not triggered this turn                                                 │
+│    └ 32.0k → 22.0k tokens  (saved 10.0k, −31%)                               │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘

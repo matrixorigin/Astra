@@ -161,7 +161,7 @@ fn tool_search_quality_two_phase_not_worse_than_baseline() {
         },
         Case {
             query: "我之前记住的偏好是什么？",
-            used: &["memory_search"],
+            used: &["memory"],
         },
         Case {
             query: "create a new issue for this bug",

@@ -5,7 +5,7 @@
 //!
 //! - **Session state**: heavy checkpoint (conversation, tools, budget)
 //! - **Data snapshot**: MatrixOne snapshot/branch (git4data)
-//! - **Memory snapshot**: learning state (PatternLibrary, EntityGraph, calibration)
+//! - **Memory snapshot**: learning state (tool health + tool quality persistence)
 //! - **Git commit**: workspace code version
 //! - **Workspace state**: session workspace metadata
 //!
@@ -45,7 +45,7 @@ pub enum SnapshotRef {
     /// MatrixOne data snapshot (for git4data rollback/branch).
     DataSnapshot(DataSnapshotRef),
 
-    /// Learning/memory state (PatternLibrary, EntityGraph, calibration).
+    /// Learning/memory state (tool health + tool quality persistence).
     MemorySnapshot(MemorySnapshotRef),
 
     /// Git commit for the workspace code at this point.

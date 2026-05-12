@@ -1,5 +1,4 @@
 pub mod agentic_adaptive_tuning;
-pub mod agentic_auto_reflection;
 pub mod agentic_delegate_interception;
 pub mod agentic_headless_round;
 pub mod agentic_loop_execution_phase;
@@ -14,6 +13,7 @@ pub mod bridge_inprocess;
 pub mod bridge_llm_stream;
 pub mod bridge_observability;
 pub mod bridge_sse_helpers;
+pub mod budget_messaging;
 pub mod chat_turn_budget_pressure;
 pub mod chat_turn_selection_context;
 pub mod cloud;
@@ -35,6 +35,7 @@ pub mod loop_dispatcher;
 pub mod memory_prefetch;
 pub mod permission_gate;
 pub mod prompt_cache;
+pub mod session_end_debounce;
 /// Re-exported from astra-turn-types
 pub mod result_quality {
     pub use astra_turn_types::{ResultQuality, classify_result, quality_feedback};

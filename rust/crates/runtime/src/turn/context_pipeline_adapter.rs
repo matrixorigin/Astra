@@ -91,20 +91,6 @@ pub(crate) fn build_external_sources(
         if hint.is_empty() { None } else { Some(hint) }
     };
 
-    // 5. Learned context — routed to volatile lane because the quality
-    //    tracker's EMA updates every turn, producing byte-level drift that
-    //    would break the Session-scope cached prefix if placed in stable.
-    let learned_context_section = edge_profile
-        .get("learned_context_hint")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            crate::prompts::PromptSection::dynamic(
-                format!("\n\n## Learned Runtime Context\n{s}"),
-                crate::prompts::PromptTokenBucket::Environment,
-            )
-        });
-
     // 6. System override (delegation)
     let system_override = edge_profile
         .get("system_prompt_override")
@@ -168,23 +154,20 @@ pub(crate) fn build_external_sources(
                     as std::sync::Arc<dyn astra_turn_core::spill_backend::SpillBackend>
             });
 
-    // Skill listing — per-turn ranked shortlist of available skills, based
-    // on the current user message. Previously injected post-pipeline as a
-    // `role: system` message and folded into `body.system[]` via
-    // `consolidate_system_messages`. Routing it through the pipeline's
-    // volatile lane keeps the same cache behaviour (it lands in
-    // RuntimeVolatile / None scope) but makes the pipeline the single
-    // owner of system-block content — simpler to reason about where each
-    // byte of the system prompt comes from.
+    // Phase-9: skill listing moved from volatile to session-stable.
+    // `state.skills.listing_message` now holds the `<available_skills>`
+    // block produced by `build_skill_listing_section` (CacheScope::Session).
+    // We push it into `extra_stable_sections` so it rides the cached
+    // prefix. No per-turn reranking.
     let skill_listing_extra = state.skills.listing_message.as_ref().and_then(|listing| {
         listing
             .get("content")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(|s| {
-                crate::prompts::PromptSection::dynamic(
+                crate::prompts::PromptSection::stable(
                     s.to_string(),
-                    crate::prompts::PromptTokenBucket::Environment,
+                    crate::prompts::CacheScope::Session,
                 )
             })
     });
@@ -207,15 +190,11 @@ pub(crate) fn build_external_sources(
         ));
     }
 
-    // Attention manifest — replaces the legacy `role:user` history
-    // injection. Lives in the volatile lane (None scope) so it rides
-    // the post-cache segment; history stays byte-stable for prefix
-    // cache. See `inject_runtime_attention_manifest`.
-    if let Some(text) = state.attention_manifest_text.as_ref() {
-        extra_dynamic_sections.push(crate::prompts::PromptSection::dynamic(
-            format!("\n\n{text}"),
-            crate::prompts::PromptTokenBucket::Environment,
-        ));
+    // Phase-9: promote skill listing into the stable lane so it joins the
+    // session-cached prefix.
+    let mut extra_stable_sections = extra_stable_sections;
+    if let Some(section) = skill_listing_extra {
+        extra_stable_sections.push(section);
     }
 
     ExternalSources {
@@ -224,22 +203,15 @@ pub(crate) fn build_external_sources(
         spill_backend,
 
         effort_hint,
-        // learned_context intentionally flows through extra_dynamic_sections
-        // (volatile lane) rather than ExternalSources.
         system_override,
         plan_context,
         tool_guidance,
-        // Adapter path (ServerAgenticLoopHost) puts environment_static
-        // here so it lands in the cached Session prefix.
+        // Stable lane: environment_static + skill listing (Session scope).
         extra_stable_sections,
-        // Volatile lane: environment_volatile (git state), learned
-        // context, skill listing. None-scope so churn doesn't invalidate
-        // the cached prefix.
-        extra_dynamic_sections: {
-            extra_dynamic_sections.extend(learned_context_section);
-            extra_dynamic_sections.extend(skill_listing_extra);
-            extra_dynamic_sections
-        },
+        // Volatile lane: environment_volatile (git state). None-scope so
+        // churn doesn't invalidate the cached prefix. Skill listing used
+        // to ride this lane too; moved to stable in Phase-9.
+        extra_dynamic_sections,
     }
 }
 
@@ -391,6 +363,8 @@ pub(crate) fn build_session_context(
             ..Default::default()
         },
         self_model: None,
+        deferred_tools_block: String::new(),
+        skill_listing_block: String::new(),
     }
 }
 
@@ -652,52 +626,6 @@ mod tests {
         let state = make_state();
         let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
         assert!(sources.memory_entries.is_empty());
-    }
-
-    // ── Attention manifest routes through volatile lane ────────────────
-    // Post-refactor (replaces the legacy history push): the manifest
-    // text sits on `state.attention_manifest_text` and must land in
-    // `extra_dynamic_sections` alongside other per-turn content. The
-    // binder downstream routes it into the None-scope volatile block
-    // so prefix cache stays byte-stable.
-
-    #[test]
-    fn external_sources_routes_attention_manifest_into_dynamic_sections() {
-        let ep = serde_json::Map::new();
-        let mut state = make_state();
-        state.attention_manifest_text =
-            Some("[attention:v1]\ngoal: fix timeout\ncurrent_todo: wire retry".to_string());
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
-
-        let found = sources.extra_dynamic_sections.iter().any(|s| {
-            s.text.contains("[attention:v1]") && s.text.contains("current_todo: wire retry")
-        });
-        assert!(
-            found,
-            "attention_manifest_text must be emitted into extra_dynamic_sections, got: {:?}",
-            sources
-                .extra_dynamic_sections
-                .iter()
-                .map(|s| s.text.chars().take(60).collect::<String>())
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn external_sources_omits_attention_manifest_when_state_text_is_none() {
-        let ep = serde_json::Map::new();
-        let state = make_state(); // default: attention_manifest_text = None
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
-
-        let leaks = sources
-            .extra_dynamic_sections
-            .iter()
-            .filter(|s| s.text.contains("[attention:v1]"))
-            .count();
-        assert_eq!(
-            leaks, 0,
-            "None attention_manifest_text must not produce an empty manifest section"
-        );
     }
 
     // ── Composite integration tests ─────────────────────────────────────

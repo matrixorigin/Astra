@@ -1266,12 +1266,11 @@ pub(super) async fn handle_info_command(
                 git_worktree_journal: None,
                 session_state_journal: None,
                 task_manager: None,
-                runtime_continuity: None,
                 turn_index: 0,
-                evolution_service: state.evolution_service.clone(),
                 pipeline_state: None,
                 pre_loaded_messages: None,
                 append_system_prompt: None,
+                session_memory_extractor: None,
                 #[cfg(feature = "harness")]
                 harness_sink: Some(state.harness_sink.clone()),
                 #[cfg(feature = "harness")]
@@ -1292,6 +1291,8 @@ pub(super) async fn handle_info_command(
             state.total_prompt_tokens += sr.prompt_tokens;
             state.total_completion_tokens += sr.completion_tokens;
             state.recent_tools = sr.tools_used.clone();
+            state.recent_memory_actions =
+                super::memory_extraction::extract_memory_actions(&sr.tool_call_records);
 
             // Write turn event to journal (same as normal chat turns).
             if let Some(journal) = state.journal.as_ref() {
@@ -1717,10 +1718,6 @@ pub(super) async fn handle_info_command(
                     );
                 }
             }
-            if let Some(ref goal) = state.session_goal {
-                eprintln!("  {:<12}  {}", "goal".cyan(), truncate_str(goal, 80).dim());
-            }
-
             eprintln!("  {}", "─".repeat(56).cyan().dim());
 
             // Inline last turn's actual component breakdown if available
@@ -2375,7 +2372,6 @@ pub(super) fn render_whoami(state: &ReplState) -> String {
     let _ = writeln!(out, "  turn           : {}", state.turn);
     let _ = writeln!(out, "  exchanges      : {}", state.history.len());
     let _ = writeln!(out, "  skills_loaded  : {skills}");
-    let _ = writeln!(out, "  auto_reflection: on");
     match pending {
         Some(name) => {
             let _ = writeln!(out, "  pending_improve: {name}");
@@ -2669,7 +2665,6 @@ mod tests {
         assert!(out.contains("turn           : 3"), "got: {out}");
         assert!(out.contains("exchanges      : 1"), "got: {out}");
         assert!(out.contains("skills_loaded"), "got: {out}");
-        assert!(out.contains("auto_reflection: on"), "got: {out}");
         assert!(out.contains("pending_improve: <none>"), "got: {out}");
     }
 

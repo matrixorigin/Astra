@@ -5,8 +5,10 @@
 //! (e.g., `ServerToolExecutor` adds resource governance and process isolation,
 //! `CliToolExecutor` adds terminal UI and MCP dispatch).
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -29,11 +31,10 @@ fn string_to_result(output: String) -> ToolResult {
 }
 
 fn outcome_to_result(outcome: crate::git_gix::ToolExecutionOutcome) -> ToolResult {
-    let is_error = outcome.output.starts_with("Error");
     ToolResult {
         output: outcome.output,
         metadata: outcome.tool_result_fields,
-        is_error,
+        is_error: outcome.is_error,
     }
 }
 
@@ -58,7 +59,52 @@ pub struct DefaultToolExecutor {
     progress_callback: Option<Arc<dyn ToolProgressCallback>>,
     github_client: Option<GitHubClient>,
     task_manager: Arc<TaskManager>,
+    bash_cache: Arc<Mutex<HashMap<BashCacheKey, BashCacheEntry>>>,
+    workspace_generation: Arc<AtomicU64>,
+    bash_cache_ttl: std::time::Duration,
 }
+
+/// Key for the per-session bash dedup cache. Bumping ANY of these
+/// fields must invalidate prior entries — otherwise we'd return a
+/// result computed under a different precondition and the model would
+/// act on stale state.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BashCacheKey {
+    workspace_root: String,
+    /// Monotonic counter bumped whenever a mutation tool succeeds. A
+    /// newly-created key after `write_file` will miss the cache, so
+    /// prior `ls` / `grep` results don't leak across edits made
+    /// through the tool pipeline.
+    workspace_generation: u64,
+    command: String,
+    /// Fingerprint of env vars that meaningfully change command
+    /// output (`PATH`, `HOME`, `LANG`, locale vars, `TZ`). We hash
+    /// them rather than storing raw — the classifier already filters
+    /// the command set down to read-only tools, but their output can
+    /// still depend on locale / user home.
+    env_fingerprint: u64,
+    /// Hash of `args.stdin` when present. A `cat` invocation whose
+    /// stdin differs between calls must NOT share a cache entry.
+    stdin_hash: u64,
+}
+
+/// Cache entry with insertion timestamp. We use a TTL on top of
+/// `workspace_generation` because non-tool filesystem mutations
+/// (user's editor, git pull, external script) don't bump the
+/// generation — so `git status` / `ls` results could otherwise go
+/// stale indefinitely. The TTL is a coarse-grained safety net; tests
+/// can swap it via `with_bash_cache_ttl`.
+#[derive(Debug, Clone)]
+struct BashCacheEntry {
+    result: ToolResult,
+    inserted_at: std::time::Instant,
+}
+
+/// Default: cached bash output goes stale after 30 seconds of
+/// wall-clock time. Long enough that a tight `ls`/`ls`/`ls` loop
+/// benefits; short enough that an external `git pull` becomes
+/// visible on the next read-only probe.
+pub const DEFAULT_BASH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl DefaultToolExecutor {
     pub fn new(ctx: ToolContext) -> Self {
@@ -68,7 +114,18 @@ impl DefaultToolExecutor {
             progress_callback: None,
             github_client: None,
             task_manager: Arc::new(TaskManager::new()),
+            bash_cache: Arc::new(Mutex::new(HashMap::new())),
+            workspace_generation: Arc::new(AtomicU64::new(0)),
+            bash_cache_ttl: DEFAULT_BASH_CACHE_TTL,
         }
+    }
+
+    /// Override the bash cache TTL. Intended for tests; production
+    /// code uses [`DEFAULT_BASH_CACHE_TTL`].
+    #[cfg(test)]
+    pub(crate) fn with_bash_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.bash_cache_ttl = ttl;
+        self
     }
 
     /// Build a ready-to-use executor from workspace parameters.
@@ -173,6 +230,43 @@ impl ToolExecutor for DefaultToolExecutor {
             return ToolResult::error(format!("Tool '{name}' not executed: run was cancelled"));
         }
 
+        if name == "bash"
+            && !args.get("force").and_then(Value::as_bool).unwrap_or(false)
+            && let Some(key) = self.bash_cache_key(args)
+            && let Some(mut cached) = {
+                // Lookup + TTL check + stale eviction under one
+                // critical section. We clone the `ToolResult` out
+                // before returning so the lock is released before
+                // the progress callback runs.
+                let mut map = self
+                    .bash_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let now = std::time::Instant::now();
+                let ttl = self.bash_cache_ttl;
+                match map.get(&key) {
+                    Some(entry) if now.duration_since(entry.inserted_at) < ttl => {
+                        Some(entry.result.clone())
+                    }
+                    Some(_) => {
+                        // Stale — evict so future lookups don't keep
+                        // re-hitting a dead entry and so the next
+                        // real execution gets cached fresh.
+                        map.remove(&key);
+                        None
+                    }
+                    None => None,
+                }
+            }
+        {
+            mark_result_cached(&mut cached);
+            if let Some(cb) = &self.progress_callback {
+                cb.tool_completed(&call_id, &cached.output, !cached.is_error)
+                    .await;
+            }
+            return cached;
+        }
+
         let result = match tokio::time::timeout(TOOL_TIMEOUT, self.dispatch(name, args)).await {
             Ok(r) => r,
             Err(_) => ToolResult::error(format!(
@@ -196,6 +290,25 @@ impl ToolExecutor for DefaultToolExecutor {
             result
         };
 
+        if name == "bash"
+            && !result.is_error
+            && let Some(key) = self.bash_cache_key(args)
+        {
+            self.bash_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    key,
+                    BashCacheEntry {
+                        result: result.clone(),
+                        inserted_at: std::time::Instant::now(),
+                    },
+                );
+        }
+        if is_workspace_mutation_tool(name, args) && !result.is_error {
+            self.workspace_generation.fetch_add(1, Ordering::Relaxed);
+        }
+
         if let Some(cb) = &self.progress_callback {
             cb.tool_completed(&call_id, &result.output, !result.is_error)
                 .await;
@@ -216,6 +329,65 @@ impl ToolExecutor for DefaultToolExecutor {
 // ─── Dispatch ───────────────────────────────────────────────────────────────
 
 impl DefaultToolExecutor {
+    fn bash_cache_key(&self, args: &Value) -> Option<BashCacheKey> {
+        use crate::bash_cache_safety::bash_command_is_cache_safe;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let command = args.get("command")?.as_str()?.to_string();
+
+        // Readonly classifier: only commands whose output depends
+        // solely on fs + env may hit the cache. Anything with side
+        // effects (rm, cargo build, git commit, curl, …) or shell
+        // compound markers is rejected — returning None disables
+        // caching for this call entirely. See
+        // `bash_cache_safety.rs` for the full taxonomy.
+        if !bash_command_is_cache_safe(&command) {
+            return None;
+        }
+
+        // Env fingerprint: a subset of env vars meaningfully
+        // influences output of read-only tools. We hash rather than
+        // store to keep the key bounded. Absent vars hash as empty.
+        let env_fingerprint = {
+            const KEYS: &[&str] = &[
+                "PATH",
+                "HOME",
+                "LANG",
+                "LC_ALL",
+                "LC_CTYPE",
+                "LC_MESSAGES",
+                "TZ",
+            ];
+            let mut h = DefaultHasher::new();
+            for k in KEYS {
+                k.hash(&mut h);
+                std::env::var(k).unwrap_or_default().hash(&mut h);
+            }
+            h.finish()
+        };
+
+        // Stdin hash: `cat`, `grep`, etc. can be fed via stdin —
+        // same command string + different stdin must not collide.
+        let stdin_hash = {
+            let mut h = DefaultHasher::new();
+            let stdin = args
+                .get("stdin")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            stdin.hash(&mut h);
+            h.finish()
+        };
+
+        Some(BashCacheKey {
+            workspace_root: self.ctx.workspace_root.display().to_string(),
+            workspace_generation: self.workspace_generation.load(Ordering::Relaxed),
+            command,
+            env_fingerprint,
+            stdin_hash,
+        })
+    }
+
     async fn dispatch(&self, name: &str, args: &Value) -> ToolResult {
         let ws = &self.ctx.workspace_root;
         let pr = &self.ctx.project_root;
@@ -351,14 +523,6 @@ impl DefaultToolExecutor {
                      Use ServerToolExecutor or CliToolExecutor instead of DefaultToolExecutor."
                 ))
             }
-            // Legacy aliases
-            "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
-            | "memory_correct" | "memory_profile" | "memory_feedback" => {
-                ToolResult::error(format!(
-                    "Error: Memory tool '{name}' requires a configured memoria endpoint. \
-                     Use ServerToolExecutor or CliToolExecutor instead of DefaultToolExecutor."
-                ))
-            }
 
             // ── run_script (programmatic tool calling via Python + UDS RPC) ──
             "run_script" => {
@@ -447,6 +611,41 @@ impl DefaultToolExecutor {
             ToolResult::text(outline)
         }
     }
+}
+
+fn mark_result_cached(result: &mut ToolResult) {
+    let metadata = result.metadata.get_or_insert_with(serde_json::Map::new);
+    metadata.insert("cached".to_string(), Value::Bool(true));
+}
+
+fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
+    match name {
+        "write_file" | "str_replace" | "multi_edit" | "delete_file" | "git_commit"
+        | "git_revert_commit" => true,
+        "git_stash" => args
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(git_stash_action_mutates_workspace),
+        "git" => args
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|action| match action {
+                "commit" | "revert_commit" => true,
+                "stash" => args
+                    .get("sub_action")
+                    .and_then(Value::as_str)
+                    .is_some_and(git_stash_action_mutates_workspace),
+                _ => false,
+            }),
+        _ => false,
+    }
+}
+
+fn git_stash_action_mutates_workspace(action: &str) -> bool {
+    matches!(
+        action,
+        "push" | "save" | "apply" | "pop" | "drop" | "branch"
+    )
 }
 
 #[cfg(test)]
@@ -572,6 +771,457 @@ mod tests {
         assert!(result.output.contains("hello"));
     }
 
+    #[test]
+    fn outcome_to_result_uses_explicit_error_flag_not_output_prefix() {
+        let outcome = crate::git_gix::ToolExecutionOutcome::error("fatal: git failed".to_string());
+
+        let result = outcome_to_result(outcome);
+
+        assert!(
+            result.is_error,
+            "non-Error-prefixed git outcome errors must stay errors"
+        );
+        assert_eq!(result.output, "fatal: git failed");
+    }
+
+    #[test]
+    fn ok_outcome_with_error_prefixed_output_is_not_misclassified() {
+        // Regression: a successful tool result whose output happens to begin
+        // with the literal text "Error" (e.g. log lines, diff hunks quoting a
+        // compiler error, or a benign status like "Error code 0 (no change)")
+        // MUST NOT be flagged as a failure. The error bit is load-bearing for
+        // retry logic, hallucination detection, and UI badging.
+        let outcome = crate::git_gix::ToolExecutionOutcome::ok(
+            "Error code 0 (no change)\nAll fine.".to_string(),
+        );
+
+        let result = outcome_to_result(outcome);
+
+        assert!(
+            !result.is_error,
+            "ok() outcomes must stay successful even when output starts with 'Error'"
+        );
+        assert!(result.output.starts_with("Error code 0"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_reuses_identical_readonly_result() {
+        // Cache-safe command: `pwd` — pure readonly, output depends
+        // only on cwd. The classifier admits it; second call must
+        // short-circuit to cache.
+        let (_tmp, exec) = test_executor();
+        let args = serde_json::json!({ "command": "pwd" });
+
+        let first = exec.execute("bash", &args).await;
+        let second = exec.execute("bash", &args).await;
+
+        assert!(!first.is_error, "first failed: {}", first.output);
+        assert!(!second.is_error, "second failed: {}", second.output);
+        assert_eq!(first.output, second.output);
+        assert_eq!(
+            second
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "second call must be served from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_does_not_cache_unsafe_commands() {
+        // Compound command: cache MUST NOT fire. The classifier
+        // refuses any command containing shell metacharacters, so
+        // both calls re-execute.
+        let (_tmp, exec) = test_executor();
+        let args = serde_json::json!({
+            "command": "n=$(cat dedup-count 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > dedup-count; cat dedup-count"
+        });
+
+        let first = exec.execute("bash", &args).await;
+        let second = exec.execute("bash", &args).await;
+
+        assert!(!first.is_error, "first failed: {}", first.output);
+        assert!(!second.is_error, "second failed: {}", second.output);
+        // Counter file went to 2 — proof that the second call really
+        // re-executed. Before the classifier, the cache would return
+        // the first call's output and the file would stay at 1.
+        assert_eq!(
+            std::fs::read_to_string(_tmp.path().join("dedup-count")).unwrap(),
+            "2\n",
+            "compound command must re-execute both times — never cache shell pipelines"
+        );
+        assert_ne!(
+            second
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "second call must NOT be marked cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_does_not_cache_mutating_commands() {
+        // Even a single-token mutating command must bypass the cache
+        // — rm / mv / curl / cargo build / git commit / etc.
+        // Regression guard for the 🔴 critical bug: without the
+        // classifier, a second `rm foo` would return the first call's
+        // "file removed" success while the real filesystem has moved
+        // on and the file no longer exists.
+        let (tmp, exec) = test_executor();
+        std::fs::write(tmp.path().join("victim"), "x").unwrap();
+        let args = serde_json::json!({ "command": "rm victim" });
+
+        let first = exec.execute("bash", &args).await;
+        assert!(!first.is_error, "first rm failed: {}", first.output);
+        // File gone. Second invocation MUST re-run and therefore
+        // fail (no such file), not succeed-from-cache.
+        let second = exec.execute("bash", &args).await;
+        assert!(
+            second.is_error,
+            "second rm must re-execute and fail (file already gone); got output={}",
+            second.output
+        );
+        assert_ne!(
+            second
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "rm must never be marked cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_cache_expires_after_ttl() {
+        // External-mutation backstop: a cached readonly result must
+        // be evicted when older than the TTL so e.g. `ls` reflects
+        // files created by a user's editor (not bumping
+        // `workspace_generation`).
+        let dir = tempfile::tempdir().unwrap();
+        let exec = DefaultToolExecutor::new(ToolContext {
+            project_root: dir.path().to_path_buf(),
+            workspace_root: dir.path().to_path_buf(),
+            user_id: String::new(),
+            session_id: String::new(),
+            sandbox: crate::SandboxConfig::standard(dir.path()),
+            http_client: None,
+            logger: std::sync::Arc::new(crate::TracingLogger),
+            cancel_token: None,
+        })
+        .with_bash_cache_ttl(std::time::Duration::from_millis(30));
+
+        let args = serde_json::json!({ "command": "ls" });
+        let _first = exec.execute("bash", &args).await;
+
+        // Simulated external mutation: drop a file without touching
+        // the workspace_generation counter.
+        std::fs::write(dir.path().join("external.txt"), "hi").unwrap();
+
+        // Within TTL → still cached (shows the stale listing).
+        let cached = exec.execute("bash", &args).await;
+        assert_eq!(
+            cached
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "within TTL, cache should still hit"
+        );
+
+        // Sleep past TTL, try again — must re-execute and show the
+        // new file.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let fresh = exec.execute("bash", &args).await;
+        assert_ne!(
+            fresh
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "after TTL, cache must be evicted and re-executed"
+        );
+        assert!(
+            fresh.output.contains("external.txt"),
+            "fresh re-execution must see the new file: {}",
+            fresh.output
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_cache_key_includes_stdin_hash() {
+        // Same command text, different stdin → must hit different
+        // cache slots. A `cat` invocation fed two different stdins
+        // must never share a result.
+        let (_tmp, exec) = test_executor();
+
+        let args_a = serde_json::json!({
+            "command": "cat",
+            "stdin": "alpha",
+        });
+        let args_b = serde_json::json!({
+            "command": "cat",
+            "stdin": "beta",
+        });
+
+        let ra = exec.execute("bash", &args_a).await;
+        let rb = exec.execute("bash", &args_b).await;
+        // We don't assert on the actual shell output (cat behaviour
+        // with stdin depends on how the bash tool plumbs it). We
+        // only require that B did not serve A's cached result —
+        // the cached flag on B must not be set.
+        assert_ne!(
+            rb.metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "different stdin must not collide with a previous cache entry; ra={} rb={}",
+            ra.output,
+            rb.output
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_force_bypasses_dedup_cache() {
+        // Use a classifier-admitted readonly command so the cache
+        // WOULD hit without `force`. Then `force=true` proves it's
+        // actually bypassing the hit (cached flag not set), rather
+        // than the classifier just never letting it hit in the
+        // first place.
+        let (tmp, exec) = test_executor();
+        // `ls` is cache-safe; first call sees the workspace empty.
+        let args = serde_json::json!({ "command": "ls" });
+        let first = exec.execute("bash", &args).await;
+        assert!(!first.is_error);
+
+        // Normal second call — expected to hit the cache.
+        let cached = exec.execute("bash", &args).await;
+        assert_eq!(
+            cached
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "sanity: second ls must hit cache"
+        );
+
+        // External file appears — classifier doesn't see it (no
+        // mutation tool call) so the cache would still hit.
+        std::fs::write(tmp.path().join("appeared.txt"), "x").unwrap();
+
+        // Forced call must bypass cache AND see the fresh file.
+        let forced = exec
+            .execute("bash", &serde_json::json!({"command": "ls", "force": true}))
+            .await;
+        assert_ne!(
+            forced
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "force=true must not return cached result"
+        );
+        assert!(
+            forced.output.contains("appeared.txt"),
+            "forced call must re-execute and see the fresh file: {}",
+            forced.output
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_cache_invalidates_after_file_mutation() {
+        let (tmp, exec) = test_executor();
+        std::fs::write(tmp.path().join("watched.txt"), "one\n").unwrap();
+        let args = serde_json::json!({"command": "cat watched.txt"});
+
+        let first = exec.execute("bash", &args).await;
+        let write = exec
+            .execute(
+                "write_file",
+                &serde_json::json!({"path": "watched.txt", "content": "two"}),
+            )
+            .await;
+        let second = exec.execute("bash", &args).await;
+
+        assert!(!first.is_error, "first failed: {}", first.output);
+        assert!(!write.is_error, "write failed: {}", write.output);
+        assert!(!second.is_error, "second failed: {}", second.output);
+        assert_eq!(first.output, "one\n");
+        assert_eq!(second.output, "two\n");
+        assert_ne!(
+            second
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_cache_invalidates_after_git_commit() {
+        let (tmp, exec) = test_executor();
+        init_git_repo(tmp.path());
+
+        let tracked = tmp.path().join("tracked.txt");
+        std::fs::write(&tracked, "initial\n").unwrap();
+        let initial = exec
+            .execute("git_commit", &serde_json::json!({"message": "initial"}))
+            .await;
+        assert!(
+            !initial.is_error,
+            "initial commit failed: {}",
+            initial.output
+        );
+
+        let args = serde_json::json!({"command": "git log --oneline -1"});
+        let first = exec.execute("bash", &args).await;
+        assert!(!first.is_error, "first log failed: {}", first.output);
+        assert!(first.output.contains("initial"), "got: {}", first.output);
+
+        std::fs::write(&tracked, "changed\n").unwrap();
+        let change = exec
+            .execute(
+                "git_commit",
+                &serde_json::json!({"message": "change tracked"}),
+            )
+            .await;
+        assert!(!change.is_error, "change commit failed: {}", change.output);
+
+        let second = exec.execute("bash", &args).await;
+        assert!(!second.is_error, "second log failed: {}", second.output);
+        assert!(
+            second.output.contains("change tracked"),
+            "git_commit must invalidate cached git log output: {}",
+            second.output
+        );
+        assert_ne!(
+            second
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_cache_invalidates_after_git_stash_drop() {
+        let (tmp, exec) = test_executor();
+        init_git_repo(tmp.path());
+
+        let tracked = tmp.path().join("tracked.txt");
+        std::fs::write(&tracked, "initial\n").unwrap();
+        let initial = exec
+            .execute("git_commit", &serde_json::json!({"message": "initial"}))
+            .await;
+        assert!(
+            !initial.is_error,
+            "initial commit failed: {}",
+            initial.output
+        );
+
+        std::fs::write(&tracked, "stashed\n").unwrap();
+        let push = exec
+            .execute(
+                "git_stash",
+                &serde_json::json!({"action": "push", "message": "save tracked"}),
+            )
+            .await;
+        assert!(!push.is_error, "stash push failed: {}", push.output);
+
+        let args = serde_json::json!({"command": "git stash list"});
+        let cached_source = exec.execute("bash", &args).await;
+        assert!(
+            cached_source.output.contains("save tracked"),
+            "expected stash list to include pushed stash: {}",
+            cached_source.output
+        );
+
+        let drop = exec
+            .execute("git_stash", &serde_json::json!({"action": "drop"}))
+            .await;
+        assert!(!drop.is_error, "stash drop failed: {}", drop.output);
+
+        let after_drop = exec.execute("bash", &args).await;
+        assert_ne!(
+            after_drop
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "git_stash drop changes refs/stash, so cached git stash list must be invalidated"
+        );
+        assert!(
+            !after_drop.output.contains("save tracked"),
+            "fresh stash list should not include dropped stash: {}",
+            after_drop.output
+        );
+    }
+
+    /// Regression guard: a failed bash run (non-zero exit, sandbox
+    /// block, permission denied, timeout, cancellation) MUST NOT be
+    /// cached — otherwise after the user fixes the underlying
+    /// condition (chmod, install, whatever) the next call returns
+    /// the stale error for up to the TTL window.
+    ///
+    /// This covers the user-reported worry that "bash dedup caches
+    /// failures" — the insert path is guarded by `!result.is_error`
+    /// (see dispatch around line 295) and this test locks the
+    /// invariant in.
+    #[tokio::test]
+    async fn dispatch_bash_does_not_cache_failed_results() {
+        let (tmp, exec) = test_executor();
+        // Use a readonly command (`cat`) so it WOULD be classifier-
+        // admitted. First call reads a non-existent path → cat
+        // exits 1 → is_error=true. Second call targets the same
+        // path but the file now exists → must re-execute, not
+        // replay the "No such file" error.
+        let args = serde_json::json!({ "command": "cat missing.txt" });
+        let first = exec.execute("bash", &args).await;
+        assert!(
+            first.is_error,
+            "first call must surface the cat error: {}",
+            first.output
+        );
+
+        // Fix the condition: create the file.
+        std::fs::write(tmp.path().join("missing.txt"), "hello\n").unwrap();
+
+        // Second call — must re-execute and succeed, not return the
+        // cached error.
+        let second = exec.execute("bash", &args).await;
+        assert!(
+            !second.is_error,
+            "second call must not replay cached error (got: {})",
+            second.output
+        );
+        assert_ne!(
+            second
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "second call must not be served from cache"
+        );
+        assert!(
+            second.output.contains("hello"),
+            "second call must show the real file content: {}",
+            second.output
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_bash_non_zero_is_error() {
         let (_tmp, exec) = test_executor();
@@ -630,7 +1280,7 @@ mod tests {
             .await;
         assert!(!result.is_error);
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
-        assert_eq!(content, "new text here");
+        assert_eq!(content, "new text here\n");
     }
 
     #[tokio::test]
@@ -710,7 +1360,10 @@ mod tests {
     async fn dispatch_memory_without_endpoint() {
         let (_tmp, exec) = test_executor();
         let result = exec
-            .execute("memory_store", &serde_json::json!({"content": "test"}))
+            .execute(
+                "memory",
+                &serde_json::json!({"action": "remember", "content": "test"}),
+            )
             .await;
         assert!(result.is_error);
         assert!(
@@ -791,7 +1444,7 @@ mod tests {
             .await;
         assert!(!result.is_error);
         let content = std::fs::read_to_string(tmp.path().join("m.txt")).unwrap();
-        assert_eq!(content, "AAA bbb CCC");
+        assert_eq!(content, "AAA bbb CCC\n");
     }
 
     #[tokio::test]

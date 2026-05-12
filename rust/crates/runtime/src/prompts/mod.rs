@@ -23,14 +23,15 @@ pub use system::{
     AgentRuntimeContext, CacheScope, LOW_CONFIDENCE_THRESHOLD, PARALLEL_BATCHING_NUDGE_THRESHOLD,
     PromptOverrides, PromptSection, PromptTokenBucket, ROUND_BUDGET_HARD_LIMIT,
     ROUND_BUDGET_THRESHOLD, STALL_NUDGE, SYSTEM_PROMPT_BASE, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
-    SystemPromptBuilder, apply_overrides, build_main_system_prompt,
+    SystemPromptBuilder, apply_overrides, build_deferred_tools_section, build_main_system_prompt,
     build_main_system_prompt_with_style, build_pipeline_static_sections,
-    build_system_prompt_sections, build_system_prompt_sections_with_style,
-    build_system_prompt_trace, default_overrides_dir, detect_task_type, load_overrides,
-    parallel_batching_nudge_directive, parallel_execution_feedback, round_budget_directive,
-    round_budget_directive_with, sections_to_string, self_awareness_prompt_section,
-    synthesize_or_batch_directive, tool_round_guidance, tool_round_guidance_trace_with,
-    tool_round_guidance_with, trailing_single_tool_round_streak,
+    build_skill_listing_section, build_system_prompt_sections,
+    build_system_prompt_sections_with_style, build_system_prompt_trace, default_overrides_dir,
+    detect_task_type, load_overrides, parallel_batching_nudge_directive,
+    parallel_execution_feedback, round_budget_directive, round_budget_directive_with,
+    sections_to_string, self_awareness_prompt_section, synthesize_or_batch_directive,
+    tool_round_guidance, tool_round_guidance_trace_with, tool_round_guidance_with,
+    trailing_single_tool_round_streak,
 };
 pub(crate) use system::{
     low_confidence_tool_selection_section, self_model_section, tool_conditional_section,
@@ -155,8 +156,8 @@ mod tests {
     fn no_memory_tools_omits_memory_section() {
         let p = build_main_system_prompt(&["bash", "read_file"], "", 1.0, None);
         assert!(
-            !p.contains("memory_store"),
-            "should NOT mention memory_store when no memory tools selected"
+            !p.contains("`memory(action="),
+            "should NOT mention the memory tool when no memory tools selected"
         );
         assert!(
             !p.contains("Memory rules"),
@@ -170,7 +171,7 @@ mod tests {
     /// When no GitHub tools are selected, GitHub-specific rules must be omitted.
     #[test]
     fn no_github_tools_omits_github_rules() {
-        let p = build_main_system_prompt(&["bash", "memory_store"], "", 1.0, None);
+        let p = build_main_system_prompt(&["bash", "memory"], "", 1.0, None);
         assert!(
             !p.contains("github_list_prs"),
             "should NOT mention github_list_prs when no GitHub tools selected"
@@ -200,13 +201,7 @@ mod tests {
     #[test]
     fn compressed_prompt_under_token_budget() {
         let p = build_main_system_prompt(
-            &[
-                "read_file",
-                "bash",
-                "memory_store",
-                "github_list_prs",
-                "git_diff",
-            ],
+            &["read_file", "bash", "memory", "github_list_prs", "git_diff"],
             "",
             1.0,
             None,

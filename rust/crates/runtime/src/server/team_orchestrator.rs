@@ -17,7 +17,6 @@ use tokio::sync::RwLock;
 use astra_services::coordination::{
     AgentProfile, AgentProfileRegistry, AgentTier, DelegationResult,
 };
-use astra_services::learning_merge::MergedLearning;
 use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode, resolve_team};
 
 use astra_server_types::team_orchestrator_traits::{
@@ -25,8 +24,7 @@ use astra_server_types::team_orchestrator_traits::{
 };
 pub use astra_server_types::team_orchestrator_types::{
     ExecutionPhase, OrchestratorConfig, ProgressCallback, TeamExecutionStatus,
-    append_merge_conflict_summary, derive_team_status, extract_learning_from_result,
-    merge_team_learnings, sum_usage, summarize_failed_agents,
+    append_merge_conflict_summary, derive_team_status, sum_usage, summarize_failed_agents,
 };
 use astra_server_types::warn_persist;
 
@@ -45,7 +43,6 @@ pub struct TeamExecutionReport {
     pub parent_run_id: String,
     pub delegation_result: Option<DelegationResult>,
     pub merge_result: Option<MergeResult>,
-    pub merged_learning: Option<MergedLearning>,
     pub status: TeamExecutionStatus,
     pub error: Option<String>,
 }
@@ -537,9 +534,6 @@ impl TeamExecutionOrchestrator {
             None
         };
 
-        // Aggregate learnings from agent results
-        let merged_learning = aggregate_learnings(&delegation_result);
-
         // ── Phase 4: Report ─────────────────────────────────────────────
         let conflict_count = merge_result
             .as_ref()
@@ -586,7 +580,6 @@ impl TeamExecutionOrchestrator {
             "total_completion_tokens": total_completion,
             "total_tool_calls": total_tools,
             "has_conflicts": has_conflicts,
-            "merged_learning_patterns": merged_learning.as_ref().map(|l| l.consensus_patterns.len()).unwrap_or(0),
         });
         warn_persist!(
             self.team_store
@@ -636,7 +629,6 @@ impl TeamExecutionOrchestrator {
             parent_run_id,
             delegation_result: Some(delegation_result),
             merge_result,
-            merged_learning,
             status,
             error,
         }
@@ -682,7 +674,6 @@ impl TeamExecutionOrchestrator {
             parent_run_id: parent_run_id.to_string(),
             delegation_result: None,
             merge_result: None,
-            merged_learning: None,
             status: TeamExecutionStatus::Failed,
             error: Some(error),
         }
@@ -691,11 +682,6 @@ impl TeamExecutionOrchestrator {
 
 // Helper functions (sum_usage, summarize_failed_agents, derive_team_status, etc.)
 // are re-exported from astra_server_types::team_orchestrator_types via `pub use` above.
-
-/// Aggregate learnings from delegation agent results.
-fn aggregate_learnings(delegation_result: &DelegationResult) -> Option<MergedLearning> {
-    merge_team_learnings(&delegation_result.agent_results)
-}
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -784,24 +770,6 @@ mod tests {
             .execute_team("review", "review auth module", None)
             .await;
         assert_eq!(report.status, TeamExecutionStatus::Completed);
-    }
-
-    #[tokio::test]
-    async fn learning_extracted_from_results() {
-        let result = AgentResult {
-            agent_id: "coder".to_string(),
-            run_id: "run-1".to_string(),
-            status: "completed".to_string(),
-            output: Some("done".to_string()),
-            error: None,
-            prompt_tokens: 100,
-            completion_tokens: 50,
-            tool_calls: 3,
-        };
-        let learning = extract_learning_from_result(&result);
-        assert_eq!(learning.agent_id, "coder");
-        assert_eq!(learning.version.get("coder"), 1);
-        assert_eq!(learning.quality_score, 0.8);
     }
 
     #[test]

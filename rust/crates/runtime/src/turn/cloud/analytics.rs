@@ -842,13 +842,7 @@ mod tests {
 
     #[test]
     fn collect_tool_results_excludes_non_clearable_tools() {
-        let non_clearable = [
-            "think",
-            "memory_store",
-            "memory_search",
-            "ask_user",
-            "TodoRead",
-        ];
+        let non_clearable = ["think", "memory", "ask_user", "TodoRead"];
         for name in non_clearable {
             let messages = vec![
                 json!({

@@ -7,16 +7,4 @@
 mod memory_lesson_e2e {
     #[path = "memory_types_e2e.rs"]
     mod memory_types;
-
-    #[path = "lesson_l3_integration.rs"]
-    mod lesson_l3;
-
-    #[path = "memory_prompt_assembly_e2e.rs"]
-    mod memory_prompt;
-
-    #[path = "self_model_lessons.rs"]
-    mod self_model_lessons;
-
-    #[path = "self_model_skill_diagnosis.rs"]
-    mod self_model_diagnosis;
 }

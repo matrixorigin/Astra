@@ -172,12 +172,22 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
                 .unwrap_or(".");
             Some(format!("{}:{}", tool_name, normalize_path(file)))
         }
-        // Memory tools: key on query
-        "memory_search" => {
-            let query = arg_str(args, "query").unwrap_or("");
-            Some(format!("memory_search:{}", query.to_lowercase()))
+        // Memory tool is action-aware; dedup keys depend on the action.
+        // Only pure-read / idempotent actions should dedupe — write verbs
+        // (remember, forget, update, focus, reflect, feedback) must not be
+        // merged across duplicate calls.
+        "memory" => {
+            let action = arg_str(args, "action").unwrap_or("");
+            match action {
+                "recall" => {
+                    let query = arg_str(args, "query").unwrap_or("");
+                    Some(format!("memory_recall:{}", query.to_lowercase()))
+                }
+                "profile" => Some("memory_profile".to_string()),
+                "expand" => arg_str(args, "memory_id").map(|id| format!("memory_expand:{id}")),
+                _ => None,
+            }
         }
-        "memory_profile" => Some("memory_profile".to_string()),
         _ => None,
     }
 }
@@ -750,6 +760,41 @@ mod tests {
         let k1 = semantic_call_key("github_get_pr", &json!({"repo": "Org/Repo", "number": 42}));
         let k2 = semantic_call_key("github_get_pr", &json!({"repo": "org/repo", "number": 42}));
         assert_eq!(k1, k2, "same PR on same repo should match");
+    }
+
+    #[test]
+    fn memory_read_actions_are_action_aware() {
+        assert_eq!(
+            semantic_call_key(
+                "memory",
+                &json!({"action": "recall", "query": "Rust Memory"})
+            ),
+            Some("memory_recall:rust memory".to_string())
+        );
+        assert_eq!(
+            semantic_call_key("memory", &json!({"action": "profile"})),
+            Some("memory_profile".to_string())
+        );
+        assert_eq!(
+            semantic_call_key("memory", &json!({"action": "expand", "memory_id": "m1"})),
+            Some("memory_expand:m1".to_string())
+        );
+    }
+
+    #[test]
+    fn memory_write_actions_do_not_dedupe() {
+        for action in [
+            "remember", "forget", "update", "focus", "reflect", "feedback",
+        ] {
+            assert!(
+                semantic_call_key(
+                    "memory",
+                    &json!({"action": action, "query": "x", "content": "x", "memory_id": "m"})
+                )
+                .is_none(),
+                "{action} must not be semantically deduped"
+            );
+        }
     }
 
     #[test]

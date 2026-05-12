@@ -3,8 +3,8 @@
 
 .astra/
 
-# Kiro local settings (MCP config has local paths/credentials)
-.kiro/settings/
+# Kiro local state (MCP config + per-machine permission cache)
+.kiro/
 
 # Docker volumes (local data)
 deployment/all-in-one/data/
@@ -52,7 +52,6 @@ rust/target/
 
 # Agent tool configs (track project rules, ignore user-local extras)
 .cursor/plans/
-.kiro/settings/
 
 # IDE / OS
 .idea/

@@ -4,7 +4,6 @@
 //! markdown file (edge) and Memoria working memory (cloud), triggered by
 //! dual thresholds: token growth AND tool call count.
 
-use std::path::Path;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +44,20 @@ pub struct SessionMemoryState {
     pub tokens_at_last_extraction: usize,
     pub tool_calls_at_last_extraction: usize,
     pub last_extraction_time: Option<Instant>,
+}
+
+impl SessionMemoryState {
+    /// Advance state after a successful extraction (LLM or rule-based
+    /// fallback produced content that was written to disk). Call this
+    /// *only* when a write actually landed — otherwise the next
+    /// `should_extract` check will be debounced against a point that
+    /// never ran, and the session will look "caught up" when it isn't.
+    pub fn mark_extracted(&mut self, tokens: usize, tool_calls: usize) {
+        self.initialized = true;
+        self.tokens_at_last_extraction = tokens;
+        self.tool_calls_at_last_extraction = tool_calls;
+        self.last_extraction_time = Some(Instant::now());
+    }
 }
 
 /// Check whether extraction should run based on dual thresholds.
@@ -306,21 +319,6 @@ pub fn parse_learnings_response(response: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// File I/O
-// ---------------------------------------------------------------------------
-
-/// Atomic write: write to `.tmp` then rename.
-pub fn write_session_memory_file(path: &Path, content: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension("md.tmp");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -438,17 +436,6 @@ mod tests {
         let user_content = result[1]["content"].as_str().unwrap();
         assert!(user_content.contains("## Session Title"));
         assert!(user_content.contains("Test"));
-    }
-
-    #[test]
-    fn write_session_memory_file_atomic() {
-        let dir = std::env::temp_dir().join("sm_test_atomic");
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("summary.md");
-        write_session_memory_file(&path, "# Test\ncontent").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Test\ncontent");
-        assert!(!path.with_extension("md.tmp").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -592,5 +579,50 @@ mod tests {
         let result = parse_learnings_response(resp).unwrap();
         assert!(result.contains("Insight one"));
         assert!(result.contains("Insight two"));
+    }
+
+    // ── SessionMemoryState advancement ──────────────────────────────────
+    //
+    // These guard the contract that a caller must honour: advance state
+    // ONLY after a successful write landed, never before. The gate
+    // debouncing logic (`should_extract`) reads these fields directly,
+    // so a caller that forgets this will spam extraction every turn.
+
+    #[test]
+    fn mark_extracted_sets_initialized_and_advances_counters() {
+        let mut state = SessionMemoryState::default();
+        assert!(!state.initialized);
+        state.mark_extracted(12_345, 7);
+        assert!(state.initialized);
+        assert_eq!(state.tokens_at_last_extraction, 12_345);
+        assert_eq!(state.tool_calls_at_last_extraction, 7);
+        assert!(state.last_extraction_time.is_some());
+    }
+
+    #[test]
+    fn mark_extracted_debounces_next_extraction() {
+        let mut state = SessionMemoryState::default();
+        let config = SessionMemoryExtractConfig::default();
+        // First hit past init gate → should extract.
+        assert!(should_extract(&state, 12_000, 0, &config));
+        state.mark_extracted(12_000, 0);
+        // Same counters → must NOT re-extract.
+        assert!(!should_extract(&state, 12_000, 0, &config));
+        // Token growth alone (+5K) but no tool-call growth → still debounced.
+        assert!(!should_extract(&state, 17_000, 0, &config));
+        // Token growth + tool-call growth ≥ 3 → fires again.
+        assert!(should_extract(&state, 17_000, 3, &config));
+    }
+
+    #[test]
+    fn state_unchanged_allows_retry_on_next_turn() {
+        // Contract: if the runner fails (LLM error, file write failure)
+        // it must NOT call mark_extracted. Next turn should see the
+        // same state and be eligible to try again.
+        let state = SessionMemoryState::default();
+        let config = SessionMemoryExtractConfig::default();
+        assert!(should_extract(&state, 12_000, 0, &config));
+        assert!(should_extract(&state, 12_000, 0, &config));
+        assert!(should_extract(&state, 18_000, 5, &config));
     }
 }

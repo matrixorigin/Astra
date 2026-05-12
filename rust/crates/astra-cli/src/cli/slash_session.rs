@@ -2055,6 +2055,32 @@ pub(super) async fn handle_session_command(
                                     },
                                 );
                             }
+                            session_journal::JournalEventType::SessionMemoryExtraction => {
+                                let meta = evt.metadata.as_ref();
+                                let outcome = meta
+                                    .and_then(|m| m.get("outcome"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let detail = meta
+                                    .and_then(|m| {
+                                        m.get("source")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string())
+                                            .or_else(|| {
+                                                m.get("reason")
+                                                    .and_then(|v| v.as_str())
+                                                    .map(|s| s.to_string())
+                                            })
+                                    })
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "  {} 📝 T{} session memory: {} ({})",
+                                    ts_short.dim(),
+                                    evt.turn.unwrap_or(0),
+                                    outcome,
+                                    detail,
+                                );
+                            }
                             session_journal::JournalEventType::PipelineFeedback
                             | session_journal::JournalEventType::PipelineAlert
                             | session_journal::JournalEventType::PipelineCompactionAudit => {
@@ -2700,7 +2726,10 @@ fn format_tool_calls_md(calls: &[session_journal::ToolCallRecord]) -> String {
 }
 
 /// Build a markdown export from journal events.
-fn build_export_markdown(session_id: &str, events: &[session_journal::JournalEvent]) -> String {
+pub(crate) fn build_export_markdown(
+    session_id: &str,
+    events: &[session_journal::JournalEvent],
+) -> String {
     let mut md = format!("# Session: {session_id}\n\n");
     for evt in events {
         let ts_short = evt.ts.get(..19).unwrap_or(&evt.ts);
@@ -3605,32 +3634,6 @@ fn handle_session_drift(arg: &str, state: &ReplState) {
         }
     }
 
-    // Show goal progress if available
-    if let Some(ref obs_lock) = state.observability_session {
-        if let Ok(obs) = obs_lock.read() {
-            if let Some(progress) = obs.goal_progress() {
-                eprintln!(
-                    "\n{}",
-                    "─── Goal Progress ────────────────────────────────"
-                        .bold()
-                        .cyan()
-                );
-                let pct = format!("{:.0}%", progress.completion_score * 100.0);
-                let momentum_str = if progress.momentum > 0.3 {
-                    "↑ positive".green().to_string()
-                } else if progress.momentum < -0.3 {
-                    "↓ struggling".red().to_string()
-                } else {
-                    "→ steady".dim().to_string()
-                };
-                eprintln!("  Completion: {}", pct.cyan().bold());
-                eprintln!("  Momentum:   {momentum_str}");
-                eprintln!("  Milestones: {}", progress.milestone_count);
-                eprintln!("  {}", progress.summary.dim());
-            }
-        }
-    }
-
     eprintln!();
 }
 
@@ -3646,8 +3649,31 @@ fn handle_session_drift(arg: &str, state: &ReplState) {
 /// - Issue detection: blocked tools, stalls, errors, latency spikes,
 ///   recording gaps, duplicate checkpoints
 fn handle_session_analyze(arg: &str, state: &ReplState) {
+    // When the TUI dispatcher handed off via `/session analyze deep
+    // <id>` it stashed the optional id in `slash_config` — recover
+    // it here so it isn't silently dropped.  A direct line-mode
+    // invocation passes the id through `arg` as usual.
+    //
+    // We *always* consume the stashed value (even when `arg` is
+    // non-empty) so a previously-stashed id from a cancelled or
+    // errored picker flow cannot leak into a later invocation and
+    // silently analyze the wrong session.  When `arg` is supplied
+    // the caller's value wins.
+    let stashed = crate::slash_config::take_deep_analyze_arg();
+    let arg_owned: String;
+    let effective_arg: &str = if arg.trim().is_empty() {
+        match stashed {
+            Some(v) => {
+                arg_owned = v;
+                arg_owned.as_str()
+            }
+            None => arg,
+        }
+    } else {
+        arg
+    };
     let (target_sid, resolved_prefix) = match resolve_journal_target_session(
-        arg,
+        effective_arg,
         state,
         "  No active session. Use /session analyze <session_id>.",
     ) {
@@ -3657,11 +3683,11 @@ fn handle_session_analyze(arg: &str, state: &ReplState) {
             return;
         }
     };
-    if resolved_prefix && !arg.is_empty() {
+    if resolved_prefix && !effective_arg.is_empty() {
         eprintln!(
             "  {} Resolved {} → {}",
             theme::icon_ok(),
-            arg.cyan(),
+            effective_arg.cyan(),
             target_sid.as_str().cyan()
         );
     }
@@ -3753,12 +3779,7 @@ fn handle_session_analyze(arg: &str, state: &ReplState) {
         total_tools.to_string().cyan(),
         total_ms as f64 / 1000.0,
     );
-    if let Some(ref w) = ws {
-        if let Some(ref goal) = w.session_goal {
-            let g: String = goal.chars().take(60).collect();
-            eprintln!("  {:<16} {}", "goal:".dim(), g);
-        }
-    }
+    let _ = ws;
 
     // ── Turn Timeline ───────────────────────────────────────────────────────
     eprintln!(
@@ -4582,14 +4603,12 @@ fn reset_state_for_session_restore(state: &mut ReplState) {
     state.turn = 0;
     state.last_response = None;
     state.continuation_anchor = None;
-    state.session_goal = None;
     state.pending_followup_suggestion = None;
     state.history.clear();
     state.total_prompt_tokens = 0;
     state.total_completion_tokens = 0;
     state.total_cache_read_tokens = 0;
     state.total_cache_creation_tokens = 0;
-    state.learning_snapshot = None;
     state.plan_mode = None;
     state.executing_plan = None;
     state.plan_execution_config = None;
@@ -4607,8 +4626,6 @@ fn reset_state_for_session_restore(state: &mut ReplState) {
     state.last_delivery_report = None;
     state.redo_stack.clear();
     state.resume_guidance = None;
-    state.runtime_continuity = None;
-    state.pending_goal_progress = None;
     state.pending_adaptive_state = None;
     state.pinned_skills.clear();
     state.discovered_skills.clear();
@@ -4617,8 +4634,6 @@ fn reset_state_for_session_restore(state: &mut ReplState) {
 fn apply_restored_workspace_state(state: &mut ReplState, session_id: &str) {
     match session_workspace::read_workspace(session_id) {
         Ok(ws) => {
-            state.session_goal = ws.session_goal.clone();
-            state.pending_goal_progress = ws.goal_progress.clone();
             state.pinned_skills = ws.pinned_skills.into_iter().collect();
             state.discovered_skills = ws.discovered_skills.into_iter().collect();
 
@@ -4642,54 +4657,7 @@ fn apply_restored_workspace_state(state: &mut ReplState, session_id: &str) {
         }
     }
 
-    if let Some(goal) = state.session_goal.clone() {
-        repl_turn::steer_observability_goal(state, &goal);
-    }
     repl_turn::apply_pending_adaptive_state(state);
-    repl_turn::apply_pending_goal_progress_state(state);
-}
-
-fn build_session_memory_resume_guidance(session_id: &str) -> Option<String> {
-    let workspace = session_workspace::read_workspace(session_id).ok()?;
-    let path = astra_runtime::resolve_resume_session_memory_file(
-        session_id,
-        Some(workspace.cwd.as_str()),
-    )?;
-    let memory_md = astra_runtime::read_session_memory_file(&path)?;
-    let sections = astra_runtime::extract_learnings_for_backflow(&memory_md);
-    if sections.is_empty() {
-        return None;
-    }
-
-    let mut blocks = Vec::new();
-    for (kind, content) in sections {
-        let title = match kind.as_str() {
-            "learnings" => "Learnings",
-            "error-corrections" => "Errors & Corrections",
-            _ => continue,
-        };
-        blocks.push(format!("## {title}\n{content}"));
-    }
-    if blocks.is_empty() {
-        return None;
-    }
-
-    Some(format!(
-        "[Recovered session memory]\nUse the persisted notes below when continuing the interrupted work.\n\n{}",
-        blocks.join("\n\n")
-    ))
-}
-
-fn combine_resume_guidance(
-    step_guidance: Option<String>,
-    session_memory_guidance: Option<String>,
-) -> Option<String> {
-    match (step_guidance, session_memory_guidance) {
-        (Some(step), Some(memory)) => Some(format!("{step}\n\n{memory}")),
-        (Some(step), None) => Some(step),
-        (None, Some(memory)) => Some(memory),
-        (None, None) => None,
-    }
 }
 
 fn build_step_resume_guidance(
@@ -4721,26 +4689,6 @@ fn build_step_resume_guidance(
     })
 }
 
-fn build_continuity_resume_guidance_from_state(
-    continuity: &astra_turn_types::continuity::ContinuityState,
-) -> String {
-    let manifest = astra_turn_types::continuity::AttentionManifest::from_state(&continuity, 4_000);
-    format!(
-        "[Recovered runtime continuity]\nRestore this runtime-owned attention state before continuing. It is ground truth over narrative summaries.\n\n{}",
-        manifest.as_str()
-    )
-}
-
-fn restore_runtime_continuity_guidance(
-    state: &mut ReplState,
-    continuity_state: Option<&astra_turn_types::continuity::ContinuityState>,
-) -> Option<String> {
-    let continuity = continuity_state?.clone();
-    let guidance = build_continuity_resume_guidance_from_state(&continuity);
-    state.runtime_continuity = Some(continuity);
-    Some(guidance)
-}
-
 fn history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     let mut last_user = String::new();
@@ -4761,8 +4709,10 @@ fn history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(String, S
 
 /// Baseline row for a blocked tool when we have no persisted health metrics yet (same defaults as
 /// cloud preference seeding in `cloud_sync.rs`).
-fn blocked_tool_health_entry(name: String) -> astra_evolution::persistence::ToolHealthEntry {
-    astra_evolution::persistence::ToolHealthEntry {
+fn blocked_tool_health_entry(
+    name: String,
+) -> astra_turn_core::tool_health_persistence::ToolHealthEntry {
+    astra_turn_core::tool_health_persistence::ToolHealthEntry {
         name,
         total_calls: 0,
         total_failures: 0,
@@ -4935,30 +4885,22 @@ async fn apply_restored_session(
 
     apply_restored_workspace_state(state, &restored.session_id);
 
-    let step_restored =
-        match astra_pipeline::step_restore::restore_session_with_continuity_validator(
-            &restored.session_id,
-            |value| {
-                astra_turn_types::continuity::try_from_checkpoint_value(value)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            },
-        ) {
-            Ok(restored) => restored,
-            Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
-                return Err(format!(
-                    "Failed to read local step checkpoint for {}: {}",
-                    restored.session_id, error
-                ));
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "skipping invalid local step checkpoint during resume"
-                );
-                None
-            }
-        };
+    let step_restored = match astra_pipeline::step_restore::restore_session(&restored.session_id) {
+        Ok(restored) => restored,
+        Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
+            return Err(format!(
+                "Failed to read local step checkpoint for {}: {}",
+                restored.session_id, error
+            ));
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "skipping invalid local step checkpoint during resume"
+            );
+            None
+        }
+    };
     if let Some(step_restored) = step_restored {
         let summary = astra_pipeline::step_restore::restore_summary(&step_restored);
         for tool in &step_restored.blocked_tools {
@@ -4971,17 +4913,9 @@ async fn apply_restored_session(
         if state.recent_tools.is_empty() {
             state.recent_tools = step_restored.recent_tools;
         }
-        let step_guidance = build_step_resume_guidance(
+        state.resume_guidance = build_step_resume_guidance(
             step_restored.interruption.as_ref(),
             step_restored.compaction_state.as_ref(),
-        );
-        let step_guidance = combine_resume_guidance(
-            step_guidance,
-            restore_runtime_continuity_guidance(state, step_restored.continuity_state.as_ref()),
-        );
-        state.resume_guidance = combine_resume_guidance(
-            step_guidance,
-            build_session_memory_resume_guidance(&restored.session_id),
         );
         if let Some(ref ao_json) = step_restored.approval_overrides {
             state.perm_manager.merge_restored_overrides(ao_json);
@@ -4991,45 +4925,20 @@ async fn apply_restored_session(
         astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&restored.session_id)
     {
         apply_heavy_checkpoint_fallback(state, &heavy);
-        let heavy_continuity = heavy.continuity_state.as_ref().and_then(|v| {
-            astra_turn_types::continuity::try_from_checkpoint_value(v)
-                .inspect_err(|error| {
-                    tracing::warn!(
-                        error = %error,
-                        "heavy checkpoint continuity_state parse failed"
-                    );
-                })
-                .ok()
-        });
-        let step_guidance = combine_resume_guidance(
-            build_step_resume_guidance(
-                heavy.interruption.as_ref(),
-                heavy.compaction_state.as_ref(),
-            ),
-            restore_runtime_continuity_guidance(state, heavy_continuity.as_ref()),
-        );
-        state.resume_guidance = combine_resume_guidance(
-            step_guidance,
-            build_session_memory_resume_guidance(&restored.session_id),
+        state.resume_guidance = build_step_resume_guidance(
+            heavy.interruption.as_ref(),
+            heavy.compaction_state.as_ref(),
         );
     } else if !restored.conversation_messages.is_empty()
         || !restored.blocked_tools.is_empty()
         || restored.approval_overrides.is_some()
         || restored.interruption.is_some()
         || restored.compaction_state.is_some()
-        || restored.continuity_state.is_some()
     {
         apply_restored_cloud_heavy_state(state, &restored);
-        let step_guidance = combine_resume_guidance(
-            build_step_resume_guidance(
-                restored.interruption.as_ref(),
-                restored.compaction_state.as_ref(),
-            ),
-            restore_runtime_continuity_guidance(state, restored.continuity_state.as_ref()),
-        );
-        state.resume_guidance = combine_resume_guidance(
-            step_guidance,
-            build_session_memory_resume_guidance(&restored.session_id),
+        state.resume_guidance = build_step_resume_guidance(
+            restored.interruption.as_ref(),
+            restored.compaction_state.as_ref(),
         );
         eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());
     } else if let Some(ref mc) = state.matrix_runtime {
@@ -5052,19 +4961,9 @@ async fn apply_restored_session(
                             &heavy.messages,
                             heavy.approval_overrides.as_ref(),
                         );
-                        let step_guidance = combine_resume_guidance(
-                            build_step_resume_guidance(
-                                heavy.interruption.as_ref(),
-                                heavy.compaction_state.as_ref(),
-                            ),
-                            restore_runtime_continuity_guidance(
-                                state,
-                                heavy.continuity_state.as_ref(),
-                            ),
-                        );
-                        state.resume_guidance = combine_resume_guidance(
-                            step_guidance,
-                            build_session_memory_resume_guidance(&restored.session_id),
+                        state.resume_guidance = build_step_resume_guidance(
+                            heavy.interruption.as_ref(),
+                            heavy.compaction_state.as_ref(),
                         );
                         eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());
                     }
@@ -5077,31 +4976,17 @@ async fn apply_restored_session(
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            "skipping cloud step checkpoint with invalid continuity_state"
+                            "skipping cloud step checkpoint"
                         );
                     }
                 }
             }
-            Ok(None) => {
-                state.resume_guidance = combine_resume_guidance(
-                    None,
-                    build_session_memory_resume_guidance(&restored.session_id),
-                );
-            }
+            Ok(None) => {}
             Err(e) => {
                 eprintln!("  {} Cloud checkpoint unavailable", theme::icon_warn());
                 eprintln!("{}", format!("     ({e})").dim());
-                state.resume_guidance = combine_resume_guidance(
-                    None,
-                    build_session_memory_resume_guidance(&restored.session_id),
-                );
             }
         }
-    } else {
-        state.resume_guidance = combine_resume_guidance(
-            None,
-            build_session_memory_resume_guidance(&restored.session_id),
-        );
     }
 
     if let Some(ref m) = restored.model {
@@ -5110,12 +4995,6 @@ async fn apply_restored_session(
         state.cached_pricing = slash_stats::fallback_pricing(base);
         state.context_budget =
             prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(base));
-    }
-
-    if let Some(ref learning_json) = restored.learning_snapshot_json
-        && !learning_json.is_empty()
-    {
-        state.learning_snapshot = Some(learning_json.clone());
     }
 
     restore_journal_history_if_available(state, &restored.session_id).await;
@@ -5135,8 +5014,6 @@ async fn apply_restored_session(
     if let Some(ref goal) = restored.plan_goal {
         state.executing_plan_goal = Some(goal.clone());
         repl_turn::steer_observability_goal(state, goal);
-    } else if let Some(goal) = state.session_goal.clone() {
-        repl_turn::steer_observability_goal(state, &goal);
     }
     if let Some(ref json) = restored.plan_config_json {
         state.plan_execution_config = serde_json::from_str(json).ok();
@@ -5163,7 +5040,6 @@ async fn apply_restored_session(
                 )),
                 Err(_) => None,
             };
-        let learning = build_learning_bridge(state);
 
         let lifecycle = if let Some(pool) = state
             .matrix_runtime
@@ -5177,7 +5053,6 @@ async fn apply_restored_session(
                 Some(&restored.session_id),
                 state.ingestion_user_id.as_deref(),
                 cloud_judge,
-                learning,
                 server_proxy_judge,
             )
         } else {
@@ -5190,7 +5065,6 @@ async fn apply_restored_session(
                 Some(&restored.session_id),
                 state.ingestion_user_id.as_deref(),
                 cloud_judge,
-                learning,
                 server_proxy_judge,
             )
         };
@@ -5715,33 +5589,6 @@ mod resume_tests {
         std::fs::create_dir_all(&sessions).unwrap();
         let guard = JournalDirGuard::new(&sessions);
         (tmp, guard)
-    }
-
-    #[test]
-    fn restore_runtime_continuity_guidance_sets_repl_state() {
-        let mut continuity = astra_turn_types::continuity::ContinuityState::default();
-        continuity.ensure_tracked_goal("continue the checkpoint restore implementation");
-        let value = serde_json::to_value(&continuity).unwrap();
-        let mut state = ReplState::default();
-
-        let cs = astra_turn_types::continuity::try_from_checkpoint_value(&value).unwrap();
-        let guidance =
-            restore_runtime_continuity_guidance(&mut state, Some(&cs)).expect("guidance");
-
-        assert!(guidance.contains("[Recovered runtime continuity]"));
-        assert_eq!(state.runtime_continuity, Some(continuity));
-    }
-
-    #[test]
-    fn restore_runtime_continuity_guidance_soft_drops_invalid_state() {
-        let mut state = ReplState::default();
-        let invalid = serde_json::json!({});
-
-        let cs = astra_turn_types::continuity::try_from_checkpoint_value(&invalid).ok();
-        let guidance = restore_runtime_continuity_guidance(&mut state, cs.as_ref());
-
-        assert!(guidance.is_none());
-        assert!(state.runtime_continuity.is_none());
     }
 
     fn write_local_resumable_session(session_id: &str, turn_count: u32) {

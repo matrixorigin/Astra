@@ -565,6 +565,8 @@ mod tests {
             project_context: "test project".into(),
             edge_profile: EdgeProfile::default(),
             self_model: None,
+            deferred_tools_block: String::new(),
+            skill_listing_block: String::new(),
         };
         let turn = TurnState {
             messages: vec![],

@@ -77,6 +77,143 @@ pub use astra_turn_core::section_types::{CacheScope, PromptSection, PromptTokenB
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str =
     "\n<!-- astra:system-prompt:dynamic-boundary -->\n";
 
+/// Escape XML metacharacters for embedding inside **element text
+/// content** of `<deferred_tools>` / `<available_skills>` blocks.
+///
+/// # Scope — element text only
+///
+/// This helper is safe for element content between open/close tags:
+/// ```xml
+/// <name>{{escape_here}}</name>
+/// <description>{{escape_here}}</description>
+/// ```
+/// It does NOT escape `"` or `'`. **Do not use this function for
+/// attribute values.** If the block shape ever changes from
+/// `<tool><name>X</name></tool>` to `<tool name="X">`, this function
+/// becomes insufficient — a description containing `"` could then
+/// break out of the attribute and inject siblings. Write a separate
+/// `xml_escape_attr` (escaping additionally `"` + `'`) and audit the
+/// call sites before the shape change lands.
+///
+/// Without this escape, a description like
+/// `</description><name>bash</name>` could inject a fake entry into
+/// the system prompt — prompt-injection vector.
+///
+/// Zero-alloc fast path: if the input contains none of `<`, `>`, `&`,
+/// the borrowed input is returned unchanged. The vast majority of tool
+/// and skill descriptions fall into this fast path.
+fn xml_escape_text(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains(['<', '>', '&']) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    for ch in s.chars() {
+        match ch {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Render the `<deferred_tools>` section of the system prompt.
+///
+/// The deferred block tells the LLM which tools exist outside the pinned
+/// `tools[]` array — without paying their full schema cost every turn.
+/// The model activates one by calling `tool_search(query="select:NAME")`
+/// which returns the schema as a tool_result.
+///
+/// Returns `None` when the surface has no deferred entries (no point
+/// emitting an empty block). The returned section carries
+/// [`CacheScope::Session`] so it joins the cached session prefix.
+///
+/// The rendered format mirrors the shape used by `<available_skills>`:
+///
+/// ```text
+/// <deferred_tools>
+///   <tool>
+///     <name>mcp__weather</name>
+///     <description>Get weather for a city</description>
+///   </tool>
+///   ...
+/// </deferred_tools>
+/// ```
+///
+/// Followed by a single nudge line so weak models know how to pull a
+/// schema in when they need one.
+/// Render the `<available_skills>` section of the system prompt.
+///
+/// Mirrors [`build_deferred_tools_section`] for skills: name + description
+/// per entry, wrapped in `<available_skills>…</available_skills>`, plus a
+/// short nudge so the model calls the `skill` tool instead of guessing.
+///
+/// Returns `None` when there are no skills (don't emit a ghost block).
+/// The section is [`CacheScope::Session`] so the listing joins the cached
+/// prefix — adding a skill causes one flip and then stability.
+///
+/// Sorts internally by skill name so a provider that emits skills in
+/// unpredictable order still produces byte-stable output across sessions.
+pub fn build_skill_listing_section(
+    skills: &[astra_skills::traits::SkillToolInfo],
+) -> Option<PromptSection> {
+    if skills.is_empty() {
+        return None;
+    }
+
+    // Sort for cache stability — provider iteration order is not a contract.
+    let mut sorted: Vec<&astra_skills::traits::SkillToolInfo> = skills.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut body = String::with_capacity(skills.len() * 120 + 256);
+    body.push_str("<available_skills>\n");
+    for s in &sorted {
+        body.push_str("  <skill>\n    <name>");
+        body.push_str(&xml_escape_text(&s.name));
+        body.push_str("</name>\n    <description>");
+        body.push_str(&xml_escape_text(&s.description));
+        body.push_str("</description>\n  </skill>\n");
+    }
+    body.push_str("</available_skills>\n\n");
+    body.push_str(
+        "When a user request matches a skill above, call the `skill` tool \
+         with that skill's name FIRST (before any other tool). On seeing \
+         `<skill-loaded name=\"...\"/>` in a tool result, follow that skill's \
+         instructions — do not re-invoke it.",
+    );
+
+    Some(PromptSection::stable(body, CacheScope::Session))
+}
+
+pub fn build_deferred_tools_section(
+    surface: &crate::tool_registry::surface::ToolSurface,
+) -> Option<PromptSection> {
+    let entries = surface.deferred();
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut body = String::with_capacity(entries.len() * 80 + 256);
+    body.push_str("<deferred_tools>\n");
+    for entry in entries {
+        body.push_str("  <tool>\n    <name>");
+        body.push_str(&xml_escape_text(&entry.name));
+        body.push_str("</name>\n    <description>");
+        body.push_str(&xml_escape_text(&entry.short_desc));
+        body.push_str("</description>\n  </tool>\n");
+    }
+    body.push_str("</deferred_tools>\n\n");
+    body.push_str(
+        "If a tool in `<deferred_tools>` fits your next step, call \
+         `tool_search(query=\"select:NAME\")` first — the tool_result will contain the \
+         full schema so you can invoke it on the next turn. Never guess at a tool that is \
+         not in `tools[]` without doing this.",
+    );
+
+    Some(PromptSection::stable(body, CacheScope::Session))
+}
+
 /// Builder that enforces the **static-before-dynamic** invariant at the API
 /// level, so callers cannot silently push a volatile section into the cached
 /// prefix (the class of regression fixed by commit `b64223c9`).
@@ -392,7 +529,7 @@ fn tool_error_recovery_section() -> &'static str {
      - Fix: ask the user to re-authenticate, or try a path you have access to.\n\
      \n\
      ### Non-errors (do not treat as failures)\n\
-     - `memory_retrieve` returns empty → normal for new users/topics; proceed without memory.\n\
+     - a memory read returns empty → normal for new users/topics; proceed without memory.\n\
      - `grep` / `glob` returns zero matches → valid answer; report it, don't keep searching blindly.\n\
      \n\
      ### Unknown tool name\n\
@@ -884,10 +1021,6 @@ pub fn build_system_prompt_trace(
         total_tokens += tokens;
         context_signals.active_output_skills |=
             section.trace_signals.context_signals.active_output_skills;
-        context_signals.learned_runtime_context |= section
-            .trace_signals
-            .context_signals
-            .learned_runtime_context;
         context_signals.memory_signal_detected |=
             section.trace_signals.context_signals.memory_signal_detected;
         context_signals.system_prompt_override |=
@@ -899,7 +1032,6 @@ pub fn build_system_prompt_trace(
             section.trace_signals.context_signals.implicit_feedback;
         context_signals.learned_feedback_rules |=
             section.trace_signals.context_signals.learned_feedback_rules;
-        context_signals.session_anchor |= section.trace_signals.context_signals.session_anchor;
         context_signals.memoria_insights |= section.trace_signals.context_signals.memoria_insights;
         guidance_signals.round_budget_warning |=
             section.trace_signals.guidance_signals.round_budget_warning;
@@ -1241,8 +1373,6 @@ pub fn parallel_batching_nudge_directive(messages: &[serde_json::Value]) -> Stri
 ///     (nudges, feedback, guidance). If that invariant ever changes, this
 ///     branch must be tightened with a content marker analogous to the one
 ///     used for `user` below.
-///   * `role == "user"` with content matching [`is_attention_manifest_content`] —
-///     the `[attention:v1]` manifest we inject as a user-role message.
 fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool {
     let role = message.get("role").and_then(|r| r.as_str());
     if role == Some("system") {
@@ -1254,10 +1384,6 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
     let Some(content) = message.get("content").and_then(|c| c.as_str()) else {
         return false;
     };
-    // Attention manifests carry the `[attention:v1]\n...` prefix.
-    if is_attention_manifest_content(content) {
-        return true;
-    }
     // Session 8d9e5903 regression: every outbound request ends with a
     // role=user `<system-reminder>` wrapper produced by the volatile
     // lane (wire_assembly / bridge_inprocess / server_loop_host). This
@@ -1265,7 +1391,13 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
     // round-cadence detection — otherwise the single-tool-streak
     // counter always returns 0 on live sessions and the
     // parallel-batching force never fires.
-    content.starts_with(SYSTEM_REMINDER_WRAPPER_PREFIX)
+    if content.starts_with(SYSTEM_REMINDER_WRAPPER_PREFIX) {
+        return true;
+    }
+    // Legacy attention manifest carried as a `role:user` scaffolding
+    // message. Emission was dropped in wip-3; this check remains so
+    // restored checkpoints from older versions still route around it.
+    content.starts_with("[attention:v1]\n")
 }
 
 /// Wrapper tag applied by the volatile lane to mark runtime-injected
@@ -1273,14 +1405,6 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
 /// awareness / volatile nudges). See `wire_assembly`, `bridge_inprocess`,
 /// and `server_loop_host` for producers.
 const SYSTEM_REMINDER_WRAPPER_PREFIX: &str = "<system-reminder>";
-
-/// Returns true when `content` begins with the attention-manifest prefix
-/// followed by a newline. Allocation-free — safe to call in hot loops over
-/// full message history.
-fn is_attention_manifest_content(content: &str) -> bool {
-    let prefix = astra_turn_types::continuity::ATTENTION_PREFIX;
-    content.starts_with(prefix) && content.as_bytes().get(prefix.len()) == Some(&b'\n')
-}
 
 fn trailing_tool_result_count(messages: &[serde_json::Value]) -> usize {
     messages
@@ -1419,28 +1543,6 @@ pub const STALL_NUDGE: &str = "You appear to be repeating the same tool calls. \
 #[allow(deprecated)]
 mod tests {
     use super::*;
-
-    // ── is_attention_manifest_content ─────────────────────────────
-
-    #[test]
-    fn attention_manifest_content_requires_prefix_and_newline() {
-        let prefix = astra_turn_types::continuity::ATTENTION_PREFIX;
-        // Exact prefix without newline — not a manifest (truncated / malformed).
-        assert!(!is_attention_manifest_content(prefix));
-        // Prefix followed by newline and body — valid manifest.
-        assert!(is_attention_manifest_content(&format!("{}\nfoo", prefix)));
-        // Prefix followed by newline only — still a valid manifest shell.
-        assert!(is_attention_manifest_content(&format!("{}\n", prefix)));
-        // Empty content — not a manifest.
-        assert!(!is_attention_manifest_content(""));
-        // Prefix followed by a non-newline byte — not a manifest (guards
-        // against accidental matches like `[attention:v1]extra`).
-        assert!(!is_attention_manifest_content(&format!("{}X", prefix)));
-        // Random user content that merely mentions the marker — not a manifest.
-        assert!(!is_attention_manifest_content(
-            "what does [attention:v1] mean?"
-        ));
-    }
 
     // ── detect_task_type ──────────────────────────────────────────
 
@@ -1650,7 +1752,7 @@ mod tests {
     }
 
     // Tests for `## Self-Model\nTools: ...` list, `## Memory Rules` /
-    // `<types>` taxonomy, and `GitHub data` / `memory_store` guidance
+    // `<types>` taxonomy, and `GitHub data` / `memory` guidance
     // were deleted: those Markdown sections were emitted by
     // `self_model_section` / `tool_conditional_section`, which are now
     // no-ops (commit a1187f76 — the tools array schema already carries
@@ -1809,7 +1911,7 @@ mod tests {
         assert!(p.contains("Unknown tool name"));
         // Key anti-patterns preserved
         assert!(p.contains("Anti-pattern"));
-        assert!(p.contains("memory_retrieve"));
+        assert!(p.contains("memory read returns empty"));
     }
 
     #[test]
@@ -2662,14 +2764,12 @@ mod tests {
             .with_trace_signals(PromptTraceSignals {
                 context_signals: PromptContextSignals {
                     active_output_skills: true,
-                    learned_runtime_context: true,
                     memory_signal_detected: true,
                     effort_hint: true,
                     agent_type_hint: true,
                     self_awareness: true,
                     implicit_feedback: true,
                     learned_feedback_rules: true,
-                    session_anchor: true,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -2678,7 +2778,6 @@ mod tests {
 
         let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
         assert!(breakdown.context_signals.active_output_skills);
-        assert!(breakdown.context_signals.learned_runtime_context);
         assert!(breakdown.context_signals.memory_signal_detected);
         assert!(!breakdown.context_signals.system_prompt_override);
         assert!(breakdown.context_signals.effort_hint);
@@ -2686,7 +2785,6 @@ mod tests {
         assert!(breakdown.context_signals.self_awareness);
         assert!(breakdown.context_signals.implicit_feedback);
         assert!(breakdown.context_signals.learned_feedback_rules);
-        assert!(breakdown.context_signals.session_anchor);
     }
 
     #[test]

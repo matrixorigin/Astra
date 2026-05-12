@@ -1,5 +1,14 @@
 # Tool Architecture Consolidation
 
+> ⚠ **Partially landed.** The `memory_*` family (`memory_store`,
+> `memory_search`, `memory_retrieve`, `memory_correct`, etc.) has been
+> collapsed into a single `memory(action=...)` tool with nine cognitive
+> verbs. See [memory-runtime.md §3](memory-runtime.md#3-the-memory-tool)
+> for the current shape. The Phase 2 unified `MemoriaClient` has also
+> landed (see `rust/crates/astra-tools/src/memoria.rs`). The broader
+> `ToolHandler` trait (Phase 3) remains future work. This doc is kept
+> as the original motivation document.
+
 ## Problem
 
 Adding or modifying a tool requires synchronized changes across 5-7 files in 4 crates.

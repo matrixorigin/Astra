@@ -36,10 +36,6 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub tool_selection: ToolSelectionConfig,
 
-    /// Learning/adaptation configuration.
-    #[serde(default)]
-    pub learning: LearningConfig,
-
     /// Telemetry configuration.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
@@ -79,6 +75,12 @@ pub struct RuntimeConfig {
     /// opt in explicitly.
     #[serde(default)]
     pub fork_prefix: ForkPrefixConfig,
+
+    /// Tool surface configuration — which tools are pinned into the
+    /// LLM `tools[]` array vs. exposed through the deferred
+    /// system-reminder listing. See [`ToolSurfaceConfig`].
+    #[serde(default)]
+    pub tool_surface: ToolSurfaceConfig,
 }
 
 // ─── Fork-Prefix Configuration ───────────────────────────────────────────────
@@ -229,7 +231,6 @@ impl Default for RuntimeConfig {
             compression: CompressionConfig::default(),
             memory: MemoryConfig::default(),
             tool_selection: ToolSelectionConfig::default(),
-            learning: LearningConfig::default(),
             telemetry: TelemetryConfig::default(),
             token_budget: TokenBudgetConfig::default(),
             verification: VerificationConfig::default(),
@@ -238,8 +239,54 @@ impl Default for RuntimeConfig {
             adaptive_tuning: AdaptiveTuningConfig::default(),
             safety: SafetyConfig::default(),
             fork_prefix: ForkPrefixConfig::default(),
+            tool_surface: ToolSurfaceConfig::default(),
         }
     }
+}
+
+// ─── Tool Surface Configuration ──────────────────────────────────────────────
+
+/// User-editable tool surfacing policy.
+///
+/// The runtime exposes tools to the LLM in two tiers:
+///
+/// - **Pinned** — schemas live in the request `tools[]` array on every turn.
+///   Small set, byte-stable across a session so the Anthropic prompt cache
+///   hits. Default = 11 coding-core tools (see runtime `DEFAULT_PINNED`).
+/// - **Deferred** — every other tool appears as `name + short_desc` in a
+///   system-reminder block. The model calls `tool_search(query="select:X")`
+///   to pull a schema into context when it needs X.
+///
+/// # `pinned_tools` semantics
+///
+/// **Within a single config file** (e.g. one `runtime.toml`), entries
+/// apply additively to the built-in [`DEFAULT_PINNED`](runtime crate) set:
+/// - A plain name (e.g. `"github"`) *adds* that tool to the pinned set.
+/// - A name prefixed with `-` (e.g. `"-grep"`) *removes* a default from
+///   the pinned set (it lands in deferred instead).
+/// - Unknown names, whitespace-only, bare `-`, or `--foo` are silently
+///   ignored (see `ToolSurface::build`).
+///
+/// **Across config layers** (user `~/.astra/config/runtime.toml` vs.
+/// project `.astra/config/runtime.toml`), the merge is **atomic, not
+/// additive**: a project-level `pinned_tools` list fully replaces the
+/// user-level one. This is intentional — a project should own its tool
+/// surface without silently inheriting a user's personal pins. If you
+/// want user-level pins in a project session, copy them into the project
+/// file. See `merge()` at the bottom of this file for the precise rule.
+///
+/// Example `runtime.toml`:
+/// ```toml
+/// [tool_surface]
+/// pinned_tools = ["github", "memory", "-grep"]
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolSurfaceConfig {
+    /// Tools to pin into the LLM `tools[]` array. See struct-level
+    /// doc for within-file (additive) vs cross-file (atomic replace)
+    /// semantics.
+    #[serde(default)]
+    pub pinned_tools: Vec<String>,
 }
 
 // ─── Compression Configuration ───────────────────────────────────────────────
@@ -445,10 +492,6 @@ pub struct ToolSelectionConfig {
     /// Boost factor for recently used tools.
     #[serde(default = "default_recent_tool_boost")]
     pub recent_tool_boost: f64,
-
-    /// Whether to use learned patterns for tool selection.
-    #[serde(default = "default_true")]
-    pub use_learned_patterns: bool,
 
     /// Maximum tokens for tool schemas.
     #[serde(default = "default_max_tool_schema_tokens")]
@@ -965,7 +1008,6 @@ impl Default for ToolSelectionConfig {
             confidence_threshold: default_tool_confidence_threshold(),
             prefer_recent_tools: default_true(),
             recent_tool_boost: default_recent_tool_boost(),
-            use_learned_patterns: default_true(),
             max_tool_schema_tokens: default_max_tool_schema_tokens(),
             tool_budget_tokens: 0,
             max_identical_tool_calls: 0,
@@ -987,62 +1029,6 @@ impl Default for ToolSelectionConfig {
             cache_waste_midloop_threshold: 0,
             exploration_family_churn_midloop_threshold: 0,
             model_profiles: Vec::new(),
-        }
-    }
-}
-
-// ─── Learning Configuration ──────────────────────────────────────────────────
-
-/// Configuration for learning and adaptation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LearningConfig {
-    /// Whether learning is enabled.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-
-    /// Entity decay half-life in days.
-    #[serde(default = "default_entity_decay_half_life")]
-    pub entity_decay_half_life_days: u32,
-
-    /// Pattern decay half-life in days.
-    #[serde(default = "default_pattern_decay_half_life")]
-    pub pattern_decay_half_life_days: u32,
-
-    /// Minimum samples before calibration is applied.
-    #[serde(default = "default_min_calibration_samples")]
-    pub min_calibration_samples: u32,
-
-    /// Exploration rate for tool chain patterns (epsilon-greedy).
-    #[serde(default = "default_exploration_rate")]
-    pub exploration_rate: f64,
-
-    /// Whether to apply progressive calibration.
-    #[serde(default = "default_true")]
-    pub progressive_calibration: bool,
-}
-
-fn default_entity_decay_half_life() -> u32 {
-    60
-}
-fn default_pattern_decay_half_life() -> u32 {
-    30
-}
-fn default_min_calibration_samples() -> u32 {
-    5
-}
-fn default_exploration_rate() -> f64 {
-    0.1
-}
-
-impl Default for LearningConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            entity_decay_half_life_days: default_entity_decay_half_life(),
-            pattern_decay_half_life_days: default_pattern_decay_half_life(),
-            min_calibration_samples: default_min_calibration_samples(),
-            exploration_rate: default_exploration_rate(),
-            progressive_calibration: true,
         }
     }
 }
@@ -1275,6 +1261,21 @@ pub struct ContextWindowConfig {
     /// Tokens reserved for error recovery retries.
     #[serde(default = "default_error_recovery_reserve")]
     pub error_recovery_reserve: u32,
+
+    /// Enables the "at 85% usage, lower `max_turn_input_tokens` by ~10%"
+    /// path in `agentic_adaptive_tuning`. Default: OFF.
+    ///
+    /// Why off by default: the logic is a self-defeating shrink spiral. At
+    /// high pressure it LOWERS the ceiling the next turn must fit under,
+    /// which raises the probability of another high-pressure event, which
+    /// lowers the ceiling again. Session 0e37eb46 hit 36968 tokens via this
+    /// path and the model gave up with a progress summary. The compaction
+    /// pipeline is the right tool for pressure; the budget should stay put.
+    ///
+    /// Leave reachable via config for environments that explicitly want
+    /// quota-style protection over per-turn headroom.
+    #[serde(default)]
+    pub adaptive_budget_reduction: bool,
 }
 
 fn default_compression_threshold_min() -> f64 {
@@ -1299,6 +1300,7 @@ impl Default for ContextWindowConfig {
             compression_threshold_max: default_compression_threshold_max(),
             remaining_turn_factor: default_remaining_turn_factor(),
             error_recovery_reserve: default_error_recovery_reserve(),
+            adaptive_budget_reduction: false,
         }
     }
 }
@@ -1347,39 +1349,109 @@ fn merge_if_non_default<T: PartialEq>(slot: &mut T, incoming: T, default: T) {
     }
 }
 
+// ─── CLI `--settings` overlay ────────────────────────────────────────────────
+
+/// Process-wide overlay installed by the CLI front door from `--settings`.
+/// `RuntimeConfig::load()` reads this after env overrides and merges it with
+/// non-default-wins semantics, so a `--settings` override beats both env and
+/// on-disk config for one invocation. `None` = no overlay, normal load.
+///
+/// Stored as the already-parsed `RuntimeConfig` rather than raw JSON so the
+/// CLI boundary is the only place that can fail on malformed input — every
+/// `load()` call thereafter is infallible.
+static CLI_OVERLAY: std::sync::OnceLock<std::sync::RwLock<Option<RuntimeConfig>>> =
+    std::sync::OnceLock::new();
+
+fn cli_overlay_cell() -> &'static std::sync::RwLock<Option<RuntimeConfig>> {
+    CLI_OVERLAY.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Install a process-wide config overlay. Subsequent `RuntimeConfig::load()`
+/// calls merge `overlay` on top of the resolved config. Pass `None` to clear.
+///
+/// Intended for CLI `--settings`: call once at startup after arg parsing.
+/// Safe to call multiple times; the last call wins.
+pub fn set_cli_overlay(overlay: Option<RuntimeConfig>) {
+    if let Ok(mut slot) = cli_overlay_cell().write() {
+        *slot = overlay;
+    }
+}
+
+fn cli_overlay_snapshot() -> Option<RuntimeConfig> {
+    cli_overlay_cell().read().ok().and_then(|s| s.clone())
+}
+
 // ─── Configuration Loading ───────────────────────────────────────────────────
 
 impl RuntimeConfig {
     /// Load configuration from default paths.
     ///
     /// Loads in order (later overrides earlier):
+    /// Return a process-wide cached `RuntimeConfig`.
+    ///
+    /// Use this for hot-path reads (per turn / per tool call). `load()`
+    /// does sync filesystem I/O and TOML parsing — cheap once, wasteful
+    /// repeated. Config is effectively static for the process lifetime;
+    /// a restart picks up file edits.
+    ///
+    /// Use `load()` only at session/process boundary or in tests that
+    /// deliberately want a fresh parse.
+    pub fn cached() -> &'static Self {
+        static CACHED: std::sync::OnceLock<RuntimeConfig> = std::sync::OnceLock::new();
+        CACHED.get_or_init(Self::load)
+    }
+
     /// 1. Built-in defaults
     /// 2. ~/.astra/config/runtime.toml
     /// 3. .astra/config/runtime.toml
     /// 4. Environment variables
+    /// 5. CLI `--settings` overlay (see [`set_cli_overlay`])
     pub fn load() -> Self {
         let mut config = Self::default();
 
         // User-level config
         if let Some(home) = dirs::home_dir() {
             let user_config = home.join(".astra/config/runtime.toml");
-            if let Ok(content) = std::fs::read_to_string(&user_config)
-                && let Ok(user) = toml::from_str::<RuntimeConfig>(&content)
-            {
-                config = config.merge(user);
+            if let Ok(content) = std::fs::read_to_string(&user_config) {
+                match toml::from_str::<RuntimeConfig>(&content) {
+                    Ok(user) => config = config.merge(user),
+                    Err(err) => {
+                        // Malformed TOML silently falling back to defaults
+                        // was the #1 footgun in the P1 review — now logged.
+                        tracing::warn!(
+                            path = %user_config.display(),
+                            error = %err,
+                            "invalid runtime.toml at user config path; falling back to defaults"
+                        );
+                    }
+                }
             }
         }
 
         // Project-level config
         let project_config = PathBuf::from(".astra/config/runtime.toml");
-        if let Ok(content) = std::fs::read_to_string(&project_config)
-            && let Ok(project) = toml::from_str::<RuntimeConfig>(&content)
-        {
-            config = config.merge(project);
+        if let Ok(content) = std::fs::read_to_string(&project_config) {
+            match toml::from_str::<RuntimeConfig>(&content) {
+                Ok(project) => config = config.merge(project),
+                Err(err) => {
+                    tracing::warn!(
+                        path = %project_config.display(),
+                        error = %err,
+                        "invalid runtime.toml at project config path; falling back to defaults"
+                    );
+                }
+            }
         }
 
         // Environment overrides
         config.apply_env_overrides();
+
+        // CLI --settings overlay (process-wide, highest precedence).
+        // Applied after env so an operator who wants to undo an env-set
+        // knob for one invocation can do so without unsetting the env.
+        if let Some(overlay) = cli_overlay_snapshot() {
+            config = config.merge(overlay);
+        }
 
         // Apply strategy presets
         if config.compression.strategy != CompressionStrategy::Custom {
@@ -1390,6 +1462,26 @@ impl RuntimeConfig {
         config
     }
 
+    /// Load the resolved config and simultaneously record it in a
+    /// content-addressed version store. Returns `(config, version_id)`.
+    ///
+    /// This is the "front door" every session should walk through at
+    /// startup. The returned id is the single small value that flows
+    /// into checkpoints, journals, and (later) cloud mirrors as the
+    /// canonical reference to "what config this session ran under".
+    ///
+    /// The store is taken by reference so callers can choose between
+    /// the default `~/.astra/config/versions/` `LocalFileStore` and a
+    /// tempdir store (tests, ephemeral CLI modes).
+    pub fn load_with_version(
+        store: &dyn crate::config_versions::ConfigVersionStore,
+        meta: crate::config_versions::PutMetadata,
+    ) -> Result<(Self, crate::config_versions::VersionId), crate::config_versions::StoreError> {
+        let config = Self::load();
+        let id = store.put(&config, meta)?;
+        Ok((config, id))
+    }
+
     /// Merge another config into this one (other takes precedence).
     pub fn merge(mut self, other: RuntimeConfig) -> Self {
         let RuntimeConfig {
@@ -1397,7 +1489,6 @@ impl RuntimeConfig {
             compression,
             memory,
             tool_selection,
-            learning,
             telemetry,
             token_budget,
             verification,
@@ -1406,6 +1497,7 @@ impl RuntimeConfig {
             adaptive_tuning,
             safety,
             fork_prefix,
+            tool_surface,
         } = other;
 
         merge_if_non_default(&mut self.version, version, default_config_version());
@@ -1499,7 +1591,6 @@ impl RuntimeConfig {
             confidence_threshold,
             prefer_recent_tools,
             recent_tool_boost,
-            use_learned_patterns,
             max_tool_schema_tokens,
             tool_budget_tokens,
             max_identical_tool_calls,
@@ -1541,11 +1632,6 @@ impl RuntimeConfig {
             &mut self.tool_selection.recent_tool_boost,
             recent_tool_boost,
             default_recent_tool_boost(),
-        );
-        merge_if_non_default(
-            &mut self.tool_selection.use_learned_patterns,
-            use_learned_patterns,
-            default_true(),
         );
         merge_if_non_default(
             &mut self.tool_selection.max_tool_schema_tokens,
@@ -1658,41 +1744,6 @@ impl RuntimeConfig {
         if !model_profiles.is_empty() {
             self.tool_selection.model_profiles = model_profiles;
         }
-
-        let LearningConfig {
-            enabled,
-            entity_decay_half_life_days,
-            pattern_decay_half_life_days,
-            min_calibration_samples,
-            exploration_rate,
-            progressive_calibration,
-        } = learning;
-        merge_if_non_default(&mut self.learning.enabled, enabled, default_true());
-        merge_if_non_default(
-            &mut self.learning.entity_decay_half_life_days,
-            entity_decay_half_life_days,
-            default_entity_decay_half_life(),
-        );
-        merge_if_non_default(
-            &mut self.learning.pattern_decay_half_life_days,
-            pattern_decay_half_life_days,
-            default_pattern_decay_half_life(),
-        );
-        merge_if_non_default(
-            &mut self.learning.min_calibration_samples,
-            min_calibration_samples,
-            default_min_calibration_samples(),
-        );
-        merge_if_non_default(
-            &mut self.learning.exploration_rate,
-            exploration_rate,
-            default_exploration_rate(),
-        );
-        merge_if_non_default(
-            &mut self.learning.progressive_calibration,
-            progressive_calibration,
-            default_true(),
-        );
 
         let TelemetryConfig {
             capture_context_traces,
@@ -1831,6 +1882,7 @@ impl RuntimeConfig {
             compression_threshold_max,
             remaining_turn_factor,
             error_recovery_reserve,
+            adaptive_budget_reduction,
         } = context_window;
         merge_if_non_default(&mut self.context_window.adaptive, adaptive, default_true());
         merge_if_non_default(
@@ -1857,6 +1909,11 @@ impl RuntimeConfig {
             &mut self.context_window.error_recovery_reserve,
             error_recovery_reserve,
             default_error_recovery_reserve(),
+        );
+        merge_if_non_default(
+            &mut self.context_window.adaptive_budget_reduction,
+            adaptive_budget_reduction,
+            false,
         );
 
         // ── Adaptive Tuning ──
@@ -1896,6 +1953,15 @@ impl RuntimeConfig {
         // a specific sink / thresholds, or off).
         if fork_prefix != ForkPrefixConfig::default() {
             self.fork_prefix = fork_prefix;
+        }
+
+        // ToolSurfaceConfig: whole-struct replacement when `other` is
+        // non-empty. `pinned_tools` is a user-expressed override list —
+        // additive merge would let a project config silently inherit a
+        // user's pins, which is surprising. Treat it atomically: if the
+        // project (or env) file sets it, it wins outright.
+        if !tool_surface.pinned_tools.is_empty() {
+            self.tool_surface = tool_surface;
         }
 
         self
@@ -2116,7 +2182,6 @@ mod tests {
                 confidence_threshold: 0.7,
                 prefer_recent_tools: false,
                 recent_tool_boost: 0.4,
-                use_learned_patterns: false,
                 max_tool_schema_tokens: 22000,
                 tool_budget_tokens: 0,
                 max_identical_tool_calls: 0,
@@ -2138,14 +2203,6 @@ mod tests {
                 cache_waste_midloop_threshold: 0,
                 exploration_family_churn_midloop_threshold: 0,
                 model_profiles: Vec::new(),
-            },
-            learning: LearningConfig {
-                enabled: false,
-                entity_decay_half_life_days: 10,
-                pattern_decay_half_life_days: 20,
-                min_calibration_samples: 8,
-                exploration_rate: 0.25,
-                progressive_calibration: false,
             },
             telemetry: TelemetryConfig {
                 capture_context_traces: false,
@@ -2183,6 +2240,7 @@ mod tests {
                 compression_threshold_max: 0.98,
                 remaining_turn_factor: 0.5,
                 error_recovery_reserve: 12000,
+                adaptive_budget_reduction: true,
             },
             adaptive_tuning: AdaptiveTuningConfig {
                 scenario_cooldown_turns: 10,
@@ -2191,6 +2249,7 @@ mod tests {
             },
             safety: SafetyConfig::default(),
             fork_prefix: ForkPrefixConfig::default(),
+            tool_surface: ToolSurfaceConfig::default(),
         });
 
         assert_eq!(merged.version, "2.0");
@@ -2213,15 +2272,7 @@ mod tests {
         assert!((merged.tool_selection.confidence_threshold - 0.7).abs() < 0.001);
         assert!(!merged.tool_selection.prefer_recent_tools);
         assert!((merged.tool_selection.recent_tool_boost - 0.4).abs() < 0.001);
-        assert!(!merged.tool_selection.use_learned_patterns);
         assert_eq!(merged.tool_selection.max_tool_schema_tokens, 22000);
-
-        assert!(!merged.learning.enabled);
-        assert_eq!(merged.learning.entity_decay_half_life_days, 10);
-        assert_eq!(merged.learning.pattern_decay_half_life_days, 20);
-        assert_eq!(merged.learning.min_calibration_samples, 8);
-        assert!((merged.learning.exploration_rate - 0.25).abs() < 0.001);
-        assert!(!merged.learning.progressive_calibration);
 
         assert!(!merged.telemetry.capture_context_traces);
         assert!(!merged.telemetry.capture_tool_traces);

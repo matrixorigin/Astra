@@ -640,10 +640,6 @@ enum SessionStateRollbackAction {
         old_value: Value,
         snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
     },
-    GoalOverride {
-        previous_goal: Option<String>,
-        snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
-    },
     Compression {
         turn: u32,
         snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
@@ -723,7 +719,6 @@ fn action_kind(action: &SessionStateRollbackAction) -> &'static str {
     match action {
         SessionStateRollbackAction::ToolPreferences { .. } => "tool_preferences",
         SessionStateRollbackAction::ConfigOverride { .. } => "config_override",
-        SessionStateRollbackAction::GoalOverride { .. } => "goal_override",
         SessionStateRollbackAction::Compression { .. } => "compression",
         SessionStateRollbackAction::TaskState { .. } => "task_state",
     }
@@ -837,50 +832,6 @@ fn persist_config_override(
         Some(old_value),
         source,
     )
-}
-
-fn persist_goal_override(session_id: &str, goal: &str, source: &str) -> Result<(), String> {
-    let mut workspace =
-        astra_services::session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
-    let previous_goal = workspace.session_goal.clone();
-    workspace.session_goal = Some(goal.to_string());
-    workspace.goal_progress = None;
-    workspace.updated_at = chrono::Utc::now().to_rfc3339();
-    astra_services::session_workspace::write_workspace(&workspace).map_err(|e| e.to_string())?;
-    append_config_change_event(
-        session_id,
-        workspace.turn_count,
-        "session_goal",
-        &Value::String(goal.to_string()),
-        previous_goal.clone().map(Value::String),
-        source,
-    )?;
-    if previous_goal.as_deref() != Some(goal) {
-        let writer = astra_services::session_journal::JournalWriter::new(session_id)
-            .map_err(|e| e.to_string())?;
-        writer
-            .append(
-                &astra_services::session_journal::JournalEvent::goal_steered(
-                    Some(session_id),
-                    workspace.turn_count,
-                    source,
-                    previous_goal.as_deref(),
-                    goal,
-                    None,
-                ),
-            )
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-fn clear_persisted_goal_override(session_id: &str) -> Result<(), String> {
-    let mut workspace =
-        astra_services::session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
-    workspace.session_goal = None;
-    workspace.goal_progress = None;
-    workspace.updated_at = chrono::Utc::now().to_rfc3339();
-    astra_services::session_workspace::write_workspace(&workspace).map_err(|e| e.to_string())
 }
 
 fn persist_tool_preferences(
@@ -1289,6 +1240,11 @@ pub struct ServerToolExecutor {
     /// plan-mode state write through this so the next turn's system prompt
     /// reflects current state instead of the loop-start snapshot.
     plan_resume_hint_handle: Option<Arc<std::sync::RwLock<Option<String>>>>,
+    /// Plugin-registered tool schemas (e.g. MCP servers). Joined with the
+    /// server-side allowlist when `tool_search(select:NAME)` runs so
+    /// deferred activation reaches plugin tools. Populated by the server
+    /// loop host once MCP servers have been refreshed.
+    plugin_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
 }
 
 /// Snapshot used by the plan-mode write guard and the system-prompt
@@ -1367,7 +1323,26 @@ impl ServerToolExecutor {
             plan_repo: None,
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
+            plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
+    }
+
+    /// Install plugin-registered schemas (MCP, etc.) so
+    /// `tool_search(select:NAME)` can resolve them for deferred activation.
+    /// Called by the server loop host after MCP manager refresh.
+    ///
+    /// Poison handling: recovers via `into_inner()` so a prior panic
+    /// doesn't permanently disable plugin lookup server-side. Logs a
+    /// warning so operators can trace the underlying panic.
+    pub fn set_plugin_schemas(&self, schemas: Vec<Value>) {
+        let mut guard = self.plugin_schemas.write().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                "server plugin_schemas RwLock was poisoned; recovering inner. \
+                 A prior panic held the write lock — investigate that panic first."
+            );
+            poisoned.into_inner()
+        });
+        *guard = schemas;
     }
 
     /// Inject the plan repository so plan-mode tools and the write-tool guard
@@ -2044,17 +2019,11 @@ impl ServerToolExecutor {
             "memory" => {
                 let op = match args.get("action").and_then(|v| v.as_str()) {
                     Some(a) => a,
-                    None => return tool_result_from_output("Error: missing required parameter 'action'. Use: store, retrieve, purge, correct, profile, search, feedback".to_string()),
+                    None => return tool_result_from_output(
+                        "Error: missing required parameter `action`. \
+                         Use one of: remember, recall, expand, forget, update, focus, reflect, profile, feedback".to_string()),
                 };
-                let mut isolated_args = args.clone();
-                if let Some(obj) = isolated_args.as_object_mut() {
-                    obj.remove("action"); // Memoria API doesn't expect this field
-                    obj.insert(
-                        "session_id".to_string(),
-                        Value::String(self.user_id.clone()),
-                    );
-                    obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
-                }
+                let isolated_args = self.memory_args_with_context(args);
                 let output = self.memoria_client.call(op, &isolated_args).await;
                 if output.starts_with("Error") {
                     astra_tools::ToolResult::error(output)
@@ -2062,25 +2031,23 @@ impl ServerToolExecutor {
                     astra_tools::ToolResult::text(output)
                 }
             }
-            // Legacy aliases
-            "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
-            | "memory_correct" | "memory_profile" => {
-                let op = name.strip_prefix("memory_").unwrap_or(name);
-                let mut isolated_args = args.clone();
-                if let Some(obj) = isolated_args.as_object_mut() {
-                    obj.remove("action"); // defensive: strip if present
-                    obj.insert(
-                        "session_id".to_string(),
-                        Value::String(self.user_id.clone()),
-                    );
-                    obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
-                }
-                let output = self.memoria_client.call(op, &isolated_args).await;
-                if output.starts_with("Error") {
-                    astra_tools::ToolResult::error(output)
-                } else {
-                    astra_tools::ToolResult::text(output)
-                }
+            // ── Tool search (first-class activation primitive) ─────────
+            //
+            // Lets the LLM look up schemas for deferred tools listed in
+            // `<deferred_tools>` via `tool_search(query="select:NAME")`.
+            // Schema pool = static server allowlist + plugin schemas
+            // installed via `set_plugin_schemas`. Without the union,
+            // MCP/skill-backed tools would never resolve.
+            "tool_search" => {
+                let mut pool = astra_tools::schemas::server_executor_tool_schemas();
+                // Poison recovery: recover inner so deferred activation
+                // survives a prior panic. See set_plugin_schemas doc.
+                let guard = self.plugin_schemas.read().unwrap_or_else(|poisoned| {
+                    tracing::warn!("server plugin_schemas RwLock poisoned on read; recovering.");
+                    poisoned.into_inner()
+                });
+                pool.extend(guard.iter().cloned());
+                tool_result_from_output(astra_tools::tool_search::tool_search(&pool, args))
             }
             // ── Web search (standalone function) ───────────────────────
             "web_search" => {
@@ -2127,7 +2094,6 @@ impl ServerToolExecutor {
                     "config" => tool_result_from_output(self.adjust_config(args)),
                     "prioritize" => tool_result_from_output(self.prioritize_tool(args)),
                     "deprioritize" => tool_result_from_output(self.deprioritize_tool(args)),
-                    "set_goal" => tool_result_from_output(self.set_goal(args)),
                     "compact" => tool_result_from_output(self.compress_context(args)),
                     "enter_plan" => {
                         astra_tools::ToolResult::text(self.tool_enter_plan_mode(args).await)
@@ -2152,7 +2118,6 @@ impl ServerToolExecutor {
             "prioritize_tool" => tool_result_from_output(self.prioritize_tool(args)),
             "deprioritize_tool" => tool_result_from_output(self.deprioritize_tool(args)),
             "introspect" => tool_result_from_output(self.handle_introspect(args)),
-            "set_goal" => tool_result_from_output(self.set_goal(args)),
             "compress_context" => tool_result_from_output(self.compress_context(args)),
             "rollback_session_state" => tool_result_from_output(self.rollback_session_state(args)),
             "task_create" => tool_result_from_output(self.task_create(args)),
@@ -2301,7 +2266,7 @@ impl ServerToolExecutor {
                 astra_tools::ToolResult::error(format!(
                     "Error: Tool '{name}' is not available in server-side execution mode. \
                      Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
-                     multi_edit, list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
+                     multi_edit, list_dir, adjust_config, prioritize_tool, deprioritize_tool, compress_context, \
                      rollback_session_state, task_*, sleep, tool_search, mo_query, rollback_database_snapshots, \
                      grep, glob, git_status, git_diff, git_log, git_file_history, git_contributors, git_log_search, \
                      git_show, git_blame, symbols, git_commit, git_stash, git_revert_commit, github_list_prs, github_get_pr, \
@@ -2318,6 +2283,30 @@ impl ServerToolExecutor {
             .aggregate_output_bytes
             .fetch_add(result.output.len(), Ordering::Relaxed);
         result.output = astra_tools::maybe_persist_large_output(result.output, agg, name);
+
+        if name != "memory" && !result.is_error {
+            let session_id = self.session_id.clone();
+            let ctx = format!("server-tool:{name}");
+            let client = astra_tools::memoria::MemoriaClient::new(
+                self.memoria_client.cloud_base.clone(),
+                self.memoria_client.cloud_token.clone(),
+            );
+            tokio::spawn(async move {
+                let report = client
+                    .feedback_pending_recalls(&session_id, "useful", &ctx)
+                    .await;
+                if report.attempted > 0 {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        context = %ctx,
+                        attempted = report.attempted,
+                        succeeded = report.succeeded,
+                        failed = report.failed,
+                        "closed recall feedback after successful tool"
+                    );
+                }
+            });
+        }
 
         // ── Progress: tool completed ─────────────────────────────────
         if let Some(cb) = &self.progress_callback {
@@ -2373,6 +2362,25 @@ impl ServerToolExecutor {
     /// Set the current turn index for journal entries.
     pub fn set_turn_index(&self, idx: u32) {
         self.journal_turn_index.store(idx, Ordering::Relaxed);
+    }
+
+    fn memory_args_with_context(&self, args: &Value) -> Value {
+        let mut isolated_args = args.clone();
+        if let Some(obj) = isolated_args.as_object_mut() {
+            obj.remove("action"); // the verb is routed via `op`, not sent to Memoria
+            obj.insert(
+                "session_id".to_string(),
+                Value::String(self.session_id.clone()),
+            );
+            obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
+            obj.insert(
+                "turn".to_string(),
+                Value::Number(serde_json::Number::from(
+                    self.journal_turn_index.load(Ordering::Relaxed),
+                )),
+            );
+        }
+        isolated_args
     }
 
     /// Reset aggregate output counter at the start of a new turn.
@@ -2780,20 +2788,6 @@ impl ServerToolExecutor {
         );
     }
 
-    fn record_goal_rollback(
-        &self,
-        previous_goal: Option<String>,
-        snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
-    ) {
-        self.record_session_state_rollback(
-            "session".to_string(),
-            SessionStateRollbackAction::GoalOverride {
-                previous_goal,
-                snapshot,
-            },
-        );
-    }
-
     fn record_compression_rollback(
         &self,
         turn: u32,
@@ -2895,15 +2889,6 @@ impl ServerToolExecutor {
             SessionStateRollbackAction::ConfigOverride { path, .. } => {
                 value.insert("path".to_string(), Value::String(path.clone()));
             }
-            SessionStateRollbackAction::GoalOverride { previous_goal, .. } => {
-                value.insert(
-                    "previous_goal".to_string(),
-                    previous_goal
-                        .clone()
-                        .map(Value::String)
-                        .unwrap_or(Value::Null),
-                );
-            }
             SessionStateRollbackAction::Compression { turn, .. } => {
                 value.insert(
                     "turn".to_string(),
@@ -2966,24 +2951,6 @@ impl ServerToolExecutor {
                 .map_err(|error| {
                     format!("failed to persist restored config override for {path}: {error}")
                 })
-            }
-            SessionStateRollbackAction::GoalOverride {
-                previous_goal,
-                snapshot,
-            } => {
-                self.restore_observability_snapshot(snapshot)?;
-                match previous_goal.as_deref() {
-                    Some(goal) => persist_goal_override(
-                        &self.session_id,
-                        goal,
-                        "server_tool_executor:rollback_session_state",
-                    )
-                    .map_err(|error| {
-                        format!("failed to persist restored goal override: {error}")
-                    })?,
-                    None => clear_persisted_goal_override(&self.session_id)?,
-                }
-                Ok(())
             }
             SessionStateRollbackAction::Compression { snapshot, .. } => {
                 self.restore_observability_snapshot(snapshot)
@@ -3569,61 +3536,6 @@ impl ServerToolExecutor {
             Some(snap) => astra_turn_core::introspect::render_introspect(&snap, detail),
             None => "No introspection data available yet (first turn).".to_string(),
         }
-    }
-
-    fn set_goal(&self, args: &Value) -> String {
-        let goal = match args.get("goal").and_then(Value::as_str) {
-            Some(goal) if !goal.trim().is_empty() => goal.trim(),
-            _ => return json!({"error": "Missing required parameter: goal"}).to_string(),
-        };
-        let Some(observability_session) = self.observability_session.as_ref() else {
-            return json!({"error": "No observability session available"}).to_string();
-        };
-        let mut session = match observability_session.write() {
-            Ok(guard) => guard,
-            Err(_) => {
-                return json!({"error": "Failed to acquire observability session"}).to_string();
-            }
-        };
-        let session_snapshot = session.rollback_snapshot();
-        let previous_goal = session
-            .goal_tracker
-            .as_ref()
-            .map(|tracker| tracker.goal().to_string())
-            .or_else(|| session.original_query.clone());
-
-        if let Err(error) =
-            persist_goal_override(&self.session_id, goal, "server_tool_executor:set_goal")
-        {
-            return json!({
-                "error": "failed_to_persist_goal",
-                "detail": error,
-                "goal": goal,
-            })
-            .to_string();
-        }
-        if let Err(error) = self.publish_current_workspace("server_tool_executor:set_goal") {
-            return json!({
-                "error": "failed_to_publish_workspace_artifact",
-                "detail": error,
-                "goal": goal,
-            })
-            .to_string();
-        }
-
-        let goal_changed = session.steer_goal(goal);
-        if goal_changed {
-            self.record_goal_rollback(previous_goal.clone(), session_snapshot);
-        }
-
-        json!({
-            "status": "ok",
-            "previous_goal": previous_goal,
-            "goal": goal,
-            "goal_changed": goal_changed,
-            "turn": session.turn_number,
-        })
-        .to_string()
     }
 
     fn compress_context(&self, args: &Value) -> String {
@@ -4828,10 +4740,6 @@ esac
             "deprioritize_tool should publish remote workspace artifacts"
         );
         assert!(
-            source.contains("publish_current_workspace(\"server_tool_executor:set_goal\")"),
-            "set_goal should publish remote workspace artifacts"
-        );
-        assert!(
             source.contains(
                 "publish_current_workspace(\"server_tool_executor:rollback_session_state\")"
             ),
@@ -4870,6 +4778,56 @@ esac
     }
 
     // ── Path traversal security ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn server_tool_search_finds_catalog_tool() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:github"}))
+            .await;
+        assert!(
+            !result.is_error,
+            "tool_search must succeed for select:github"
+        );
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "select:github must resolve on server path; got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_resolves_plugin_after_install() {
+        let (exec, _dir) = test_executor();
+        let plugin = json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expr": {"type": "string"}},
+                    "required": ["expr"]
+                }
+            }
+        });
+        exec.set_plugin_schemas(vec![plugin]);
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "plugin must resolve after set_plugin_schemas on server path; got: {}",
+            result.output
+        );
+        assert_eq!(
+            parsed["matches"][0]["name"].as_str(),
+            Some("mcp__calculator")
+        );
+    }
 
     #[tokio::test]
     async fn ask_user_returns_structured_response_from_gate() {
@@ -5085,7 +5043,10 @@ esac
             .await;
         assert!(result.contains("Successfully wrote"));
         let content = std::fs::read_to_string(dir.path().join("out.txt")).unwrap();
-        assert_eq!(content, "hello world");
+        // .txt is in TEXT_TRAILING_NEWLINE_EXTS — write pipeline adds a
+        // POSIX trailing newline automatically. Matches what an editor
+        // would save.
+        assert_eq!(content, "hello world\n");
     }
 
     #[tokio::test]
@@ -5135,7 +5096,8 @@ esac
             .await;
         assert!(result.contains("Successfully replaced"));
         let content = std::fs::read_to_string(dir.path().join("code.rs")).unwrap();
-        assert_eq!(content, "fn new_name() {}");
+        // .rs writes gain a trailing newline via normalize_content_before_write.
+        assert_eq!(content, "fn new_name() {}\n");
     }
 
     #[tokio::test]
@@ -5250,7 +5212,8 @@ esac
             )
             .await;
         assert!(edited.contains("Successfully applied"));
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "AAA bbb CCC");
+        // target is .txt → trailing newline added by write pipeline.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "AAA bbb CCC\n");
 
         let rollback = exec
             .execute(
@@ -5549,7 +5512,7 @@ esac
         assert!(result.contains("Successfully applied"), "{result}");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("edit.txt")).unwrap(),
-            "FOO bar BAZ"
+            "FOO bar BAZ\n"
         );
         assert!(!result.contains("not available in server-side execution mode"));
     }
@@ -5773,10 +5736,26 @@ esac
         // We can't actually call Memoria, but we can verify the execute path
         // doesn't panic and returns a reasonable error (no MEMORIA_BASE_URL set).
         let result = exec
-            .execute("memory_store", &json!({"content": "test"}))
+            .execute("memory", &json!({"action": "remember", "content": "test"}))
             .await;
         // Should attempt the call (may fail due to no server, but shouldn't crash)
         assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn memory_tool_args_include_session_user_and_turn() {
+        let (exec, _dir) = test_executor();
+        exec.set_turn_index(12);
+
+        let args = exec.memory_args_with_context(&json!({
+            "action": "recall",
+            "query": "closed loop",
+        }));
+
+        assert!(args.get("action").is_none());
+        assert_eq!(args["session_id"].as_str(), Some(exec.session_id.as_str()));
+        assert_eq!(args["user_id"].as_str(), Some(exec.user_id.as_str()));
+        assert_eq!(args["turn"].as_u64(), Some(12));
     }
 
     #[tokio::test]

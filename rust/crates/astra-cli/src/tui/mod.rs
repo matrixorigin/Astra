@@ -6,6 +6,7 @@ mod tests;
 mod app_event;
 mod approval;
 mod bottom_pane;
+mod config_edit_router;
 mod context_panel;
 // Core (post-refactor): HistoryCell trait + TurnEvent schema +
 // single ChatWidget router + on-disk JSONL transcript. See
@@ -80,6 +81,12 @@ pub(crate) enum ActiveView {
     Active {
         kind: ActiveKind,
         lines: Vec<ratatui::text::Line<'static>>,
+        /// `true` while the cell is still streaming — enables the
+        /// flowing-gradient border animation. `false` for rare cases
+        /// where a finalized cell lingers in the active slot (never
+        /// happens in practice, but the flag keeps the render path
+        /// honest).
+        live: bool,
     },
 }
 
@@ -127,7 +134,8 @@ fn active_viewport(
         let lines = cell.display_lines(inner_w);
         if !lines.is_empty() {
             let kind = classify_active(cell).unwrap_or(ActiveKind::Assistant);
-            return ActiveView::Active { kind, lines };
+            let live = cell.is_live();
+            return ActiveView::Active { kind, lines, live };
         }
     }
     if let Some(line) = status.render() {
@@ -246,6 +254,44 @@ fn detect_git_branch() -> Option<String> {
     Some(name.shorten().to_string())
 }
 
+/// Walk the chat widget's committed history and emit role/text
+/// pairs for the `/context dump` JSON file.  Kept here (rather
+/// than in `cli::context_dump`) because `history_cell` is a
+/// private TUI module — only this crate's TUI layer should
+/// downcast cells to concrete types.
+pub(crate) fn collect_chat_turns_for_dump(
+    chat: &chat_widget::ChatWidget,
+) -> Vec<crate::context_dump::ChatTurnDump> {
+    use crate::context_dump::ChatTurnDump;
+    use history_cell::{
+        assistant::AssistantCell, reasoning::ReasoningCell, system::SystemCell, user::UserCell,
+    };
+    let mut out = Vec::new();
+    for cell in chat.history() {
+        let any = cell.as_any_ref();
+        if let Some(u) = any.downcast_ref::<UserCell>() {
+            out.push(ChatTurnDump {
+                role: "user".into(),
+                text: u.text().to_string(),
+            });
+        } else if let Some(a) = any.downcast_ref::<AssistantCell>() {
+            out.push(ChatTurnDump {
+                role: "assistant".into(),
+                text: a.source().to_string(),
+            });
+        } else if let Some(r) = any.downcast_ref::<ReasoningCell>() {
+            out.push(ChatTurnDump {
+                role: "reasoning".into(),
+                text: r.text().to_string(),
+            });
+        } else if any.downcast_ref::<SystemCell>().is_some() {
+            // System cells are UI chrome — skip to keep the dump
+            // focused on what the LLM actually consumed.
+        }
+    }
+    out
+}
+
 /// Check if the terminal supports TUI mode.
 pub(crate) fn can_run_tui() -> bool {
     use std::io::IsTerminal;
@@ -342,6 +388,7 @@ pub(crate) async fn run_tui_repl(
             .map(|m| slash_menu::SlashItem {
                 name: m.name,
                 description: m.description,
+                subcommands: m.subcommands,
             })
             .collect();
         bottom_pane.set_slash_items(slash_items);
@@ -559,8 +606,17 @@ pub(crate) async fn run_tui_repl(
                                                             // During turn: composer stays usable.
                                                             // Enter queues message (shown as preview, not in scrollback).
                                                             // Up edits last queued. Ctrl+C interrupts.
-                                                            // Up arrow with queued messages → edit last
+                                                            //
+                                                            // Exception: if an approval is pending, Up
+                                                            // belongs to the approval button row — the
+                                                            // user is trying to pick a button, not edit
+                                                            // a queued message. Without this guard, the
+                                                            // queued-message edit path swallows arrow
+                                                            // keys while the approval cell is focused
+                                                            // and the user ends up stuck on the first
+                                                            // button (Accept).
                                                             if k.code == crossterm::event::KeyCode::Up
+                                                                && !bottom_pane.has_pending_approvals()
                                                                 && !bottom_pane.queued_messages.is_empty()
                                                                 && bottom_pane.composer.is_empty()
                                                             {
@@ -827,6 +883,321 @@ pub(crate) async fn run_tui_repl(
                                         frame_requester.schedule_frame();
                                         continue;
                                     }
+                                    // /config edit completion. Token format:
+                                    //   __config_edit__\n<action>\n<toml-body>
+                                    // Actions: save_user | save_project | discard | cancel.
+                                    // save_* writes the TOML to the target scope
+                                    // AND refreshes the process-wide overlay so
+                                    // the new values take effect for the next turn.
+                                    if let Some(rest) = name.strip_prefix("__config_edit__\n") {
+                                        let mut parts = rest.splitn(2, '\n');
+                                        let action = parts.next().unwrap_or("").to_string();
+                                        let toml_body = parts.next().unwrap_or("").to_string();
+                                        let result = crate::tui::config_edit_router::finalize(
+                                            &action,
+                                            &toml_body,
+                                        );
+                                        let msg = match result {
+                                            Ok(outcome) => {
+                                                // If the save produced a new version id,
+                                                // emit a ConfigChange journal event
+                                                // recording the transition and update
+                                                // ReplState so subsequent HeavyCheckpoints
+                                                // carry the new pointer.
+                                                if let Some(save) = outcome.save.as_ref() {
+                                                    let prev = state.config_version_id.clone();
+                                                    if let (Some(ref j), Some(ref sid)) = (
+                                                        state.journal.as_ref(),
+                                                        state.session_id.as_ref(),
+                                                    ) {
+                                                        let ev = astra_services::session_journal::JournalEvent::config_version_change(
+                                                            Some(sid.as_str()),
+                                                            state.turn,
+                                                            prev.as_deref(),
+                                                            &save.new_version_id,
+                                                            save.source,
+                                                        );
+                                                        let _ = j.append(&ev);
+                                                    }
+                                                    state.config_version_id =
+                                                        Some(save.new_version_id.clone());
+
+                                                    // Step 4b: cloud push. Best-effort
+                                                    // — if matrix_runtime is None (no
+                                                    // cloud configured) or the
+                                                    // ingestion worker is gone, we
+                                                    // degrade to local-only. The
+                                                    // version will sync next time the
+                                                    // CLI runs with cloud available,
+                                                    // via the same content-addressed
+                                                    // id.
+                                                    if let Some(ref mc) =
+                                                        state.matrix_runtime
+                                                    {
+                                                        let user_id = state
+                                                            .ingestion_user_id
+                                                            .clone()
+                                                            .unwrap_or_else(|| {
+                                                                "anonymous".to_string()
+                                                            });
+                                                        let row = astra_services::config_version_cloud::ConfigVersionRow {
+                                                            version_id: save.new_version_id.clone(),
+                                                            user_id,
+                                                            toml_body: save.toml_body.clone(),
+                                                            created_at_ms: chrono::Utc::now().timestamp_millis(),
+                                                            first_seen_session: state.session_id.clone(),
+                                                        };
+                                                        mc.enqueue_config_version_push(&row);
+                                                    }
+                                                }
+                                                history_cell::system::SystemCell::response(
+                                                    outcome.message,
+                                                )
+                                            }
+                                            Err(e) => history_cell::system::SystemCell::error(e),
+                                        };
+                                        chat_widget.commit_system(msg);
+                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
+                                    // `/model` picker accepted a model name.
+                                    // If the model advertises a thinking
+                                    // capability, push the second-level
+                                    // thinking-mode picker; otherwise commit
+                                    // the base name as-is.
+                                    if let Some(base_model) =
+                                        name.strip_prefix(slash_dispatch::MODEL_PICK_SENTINEL)
+                                    {
+                                        let base_model = base_model.to_string();
+                                        let token = crate::repl_runtime::current_access_token(profile);
+                                        let raw = crate::slash_router::fetch_model_list_raw(
+                                            api,
+                                            token.as_deref(),
+                                        )
+                                        .await
+                                        .unwrap_or_default();
+                                        let entry = crate::slash_router::find_model_entry_by_name(
+                                            &raw,
+                                            &base_model,
+                                        );
+                                        let thinking_cap = entry
+                                            .and_then(crate::slash_router::entry_thinking_capability);
+                                        let provider =
+                                            entry.and_then(crate::slash_router::entry_provider);
+                                        let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
+                                            &base_model,
+                                            provider,
+                                            thinking_cap,
+                                        );
+                                        if opts.is_empty() {
+                                            // Model doesn't think — commit
+                                            // the base name directly.
+                                            state.model = Some(base_model.clone());
+                                            crate::slash_config::set_active_model_for_display(
+                                                Some(base_model.clone()),
+                                            );
+                                            bottom_pane.footer.model = Some(base_model.clone());
+                                            chat_widget.commit_system(
+                                                history_cell::system::SystemCell::response(
+                                                    format!("Set model to {base_model}"),
+                                                ),
+                                            );
+                                        } else {
+                                            use crate::tui::bottom_pane::list_selection_view::{
+                                                ListSelectionView, SelectionItem,
+                                            };
+                                            let items: Vec<SelectionItem> = opts
+                                                .iter()
+                                                .map(|o| SelectionItem {
+                                                    name: o.label.to_string(),
+                                                    description: None,
+                                                    is_current: o.is_default,
+                                                })
+                                                .collect();
+                                            let prefix = format!(
+                                                "{}{}\n",
+                                                slash_dispatch::MODEL_THINKING_SENTINEL,
+                                                base_model,
+                                            );
+                                            let view = ListSelectionView::new(
+                                                items,
+                                                Some(format!(
+                                                    "Select thinking mode for {base_model}:",
+                                                )),
+                                            )
+                                            .with_result_prefix(prefix);
+                                            bottom_pane.push_view(Box::new(view));
+                                        }
+                                        let w = guard
+                                            .terminal
+                                            .size()
+                                            .map(|s| s.width)
+                                            .unwrap_or(80);
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
+
+                                    // `/model` thinking-mode picker accepted a
+                                    // label. Compose the final model id with
+                                    // the appropriate suffix and commit.
+                                    if let Some(rest) =
+                                        name.strip_prefix(slash_dispatch::MODEL_THINKING_SENTINEL)
+                                    {
+                                        let mut parts = rest.splitn(2, '\n');
+                                        let base_model =
+                                            parts.next().unwrap_or("").to_string();
+                                        let label = parts.next().unwrap_or("").to_string();
+                                        let token = crate::repl_runtime::current_access_token(profile);
+                                        let raw = crate::slash_router::fetch_model_list_raw(
+                                            api,
+                                            token.as_deref(),
+                                        )
+                                        .await
+                                        .unwrap_or_default();
+                                        let entry = crate::slash_router::find_model_entry_by_name(
+                                            &raw,
+                                            &base_model,
+                                        );
+                                        let provider =
+                                            entry.and_then(crate::slash_router::entry_provider);
+                                        let thinking_cap = entry
+                                            .and_then(crate::slash_router::entry_thinking_capability);
+                                        let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
+                                            &base_model,
+                                            provider,
+                                            thinking_cap,
+                                        );
+                                        let suffix_opt = opts
+                                            .iter()
+                                            .find(|o| o.label == label)
+                                            .map(|o| astra_turn_core::thinking_config::thinking_suffix_for(&o.config));
+                                        let suffix = match suffix_opt {
+                                            Some(s) => s,
+                                            None => {
+                                                // Model catalog shifted between the
+                                                // picker's two `fetch_model_list_raw`
+                                                // calls (or the server returned fewer
+                                                // thinking options) — the chosen label
+                                                // no longer maps to a suffix.  Warn
+                                                // instead of silently committing the
+                                                // bare model name, which would leave
+                                                // the user on a different thinking mode
+                                                // than they selected.
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::error(format!(
+                                                        "Thinking mode `{label}` is no longer available for {base_model}; model unchanged. Re-open the picker with `/model`."
+                                                    )),
+                                                );
+                                                let w = guard
+                                                    .terminal
+                                                    .size()
+                                                    .map(|s| s.width)
+                                                    .unwrap_or(80);
+                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                bottom_pane.sync_popups();
+                                                frame_requester.schedule_frame();
+                                                continue;
+                                            }
+                                        };
+                                        let composed = format!("{base_model}{suffix}");
+                                        state.model = Some(composed.clone());
+                                        crate::slash_config::set_active_model_for_display(
+                                            Some(composed.clone()),
+                                        );
+                                        bottom_pane.footer.model = Some(composed.clone());
+                                        chat_widget.commit_system(
+                                            history_cell::system::SystemCell::response(format!(
+                                                "Set model to {composed}"
+                                            )),
+                                        );
+                                        let w = guard
+                                            .terminal
+                                            .size()
+                                            .map(|s| s.width)
+                                            .unwrap_or(80);
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
+
+                                    // `/session fork` picker → hand off to
+                                    // the line-mode `/session fork <parent>`
+                                    // pipeline. Calling `fork_local_session`
+                                    // inline here used to leave ReplState in
+                                    // a half-done state (session_id /
+                                    // journal / CSL all still pointed at the
+                                    // parent); the fallback path is the same
+                                    // code the line-mode handler runs
+                                    // through, so it does the full restore.
+                                    if let Some(parent_sid) = name.strip_prefix(slash_dispatch::FORK_PICK_SENTINEL) {
+                                        let slash_text = format!("/session fork {parent_sid}");
+                                        let slash_result = guard
+                                            .with_restored(|| async {
+                                                let tok = crate::repl_runtime::current_access_token(
+                                                    profile,
+                                                );
+                                                crate::slash_router::handle_slash_command(
+                                                    &slash_text,
+                                                    api,
+                                                    profile,
+                                                    &mut state,
+                                                    tok.as_deref(),
+                                                    &*startup.selector,
+                                                )
+                                                .await
+                                            })
+                                            .await;
+                                        match slash_result {
+                                            Ok(Ok(true)) => {
+                                                break 'main Ok(());
+                                            }
+                                            Ok(Ok(false)) => {}
+                                            Ok(Err(e)) => {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::error(e),
+                                                );
+                                            }
+                                            Err(e) => {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::error(
+                                                        format!("Terminal restore failed: {e}"),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        // Post-fork: the line handler may have
+                                        // swapped `state.session_id`; refresh
+                                        // the footer + ChatWidget replay so
+                                        // the user lands on the child session.
+                                        bottom_pane.footer.session_id = state
+                                            .session_id
+                                            .as_ref()
+                                            .map(|s| s[..8.min(s.len())].to_string());
+                                        let w = guard
+                                            .terminal
+                                            .size()
+                                            .map(|s| s.width)
+                                            .unwrap_or(80);
+                                        if let Some(ref new_sid) = state.session_id
+                                            && !new_sid.is_empty()
+                                        {
+                                            chat_widget = replay_session_into_widget(
+                                                &mut guard,
+                                                new_sid,
+                                                w,
+                                            );
+                                        }
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
                                     // Session picker result → run the async
                                     // `/resume <id>` pipeline via the usual
                                     // slash fallback path. This is the same
@@ -955,6 +1326,17 @@ pub(crate) async fn run_tui_repl(
                 // next event edge.
                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                 flush_chat_widget(&mut guard, &mut chat_widget, w);
+                // If a cell is streaming, request a redraw so the
+                // gradient-border animation on `LiveFramedCell` keeps
+                // flowing. Without this the frame only redraws on
+                // incoming delta/state events and freezes visually
+                // between them.
+                if chat_widget
+                    .active_cell()
+                    .is_some_and(|c| c.is_live())
+                {
+                    frame_requester.schedule_frame();
+                }
             }
         }
     };
@@ -962,12 +1344,152 @@ pub(crate) async fn run_tui_repl(
     result
 }
 
+/// A rounded-frame renderable whose border characters carry a
+/// time-varying gradient — one colour per cell, sweeping around the
+/// perimeter. Used in place of a plain `Block`-wrapped paragraph while
+/// the active cell is still streaming, so the user sees the frame
+/// "breathing" and immediately knows output isn't frozen.
+///
+/// On freeze (`live == false`) the border collapses to a solid colour
+/// chosen by the cell kind — matches the pre-animation behaviour. The
+/// static pink `┃ ` gutter used in scrollback is unrelated to this
+/// frame; it's painted by `render_body_with_gutter` only after the
+/// cell leaves the active slot.
+struct LiveFramedCell {
+    lines: Vec<ratatui::text::Line<'static>>,
+    title: &'static str,
+    /// Border colour when NOT live (or fallback for non-truecolor
+    /// terminals).
+    solid_color: ratatui::style::Color,
+    live: bool,
+}
+
+impl render::renderable::Renderable for LiveFramedCell {
+    fn render(&self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
+        use ratatui::style::{Modifier, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Paragraph, Widget};
+
+        if area.width < 2 || area.height < 2 {
+            return;
+        }
+
+        // Inner paragraph area (leave 1 cell on each side for border).
+        let inner = ratatui::layout::Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+
+        // Paint inner content first (border is drawn over edge cells
+        // below, which the paragraph never touches).
+        let para = Paragraph::new(ratatui::text::Text::from(self.lines.clone()));
+        Widget::render(para, inner, buf);
+
+        // Draw the rounded border character by character, assigning
+        // each cell a gradient colour when live.
+        let x0 = area.x;
+        let y0 = area.y;
+        let x1 = area.x + area.width - 1;
+        let y1 = area.y + area.height - 1;
+
+        let perimeter = 2 * (area.width as usize + area.height as usize - 2);
+        // Sweep once around the perimeter every N seconds. Slow enough
+        // that the eye reads "flowing", fast enough that it isn't stuck.
+        let period = 3.0_f32;
+
+        let color_at = |idx: usize| -> ratatui::style::Color {
+            if !self.live {
+                return self.solid_color;
+            }
+            let (r, g, b) = shimmer::gradient_color_at(idx, perimeter, period);
+            ratatui::style::Color::Rgb(r, g, b)
+        };
+
+        let mut idx: usize = 0;
+        // Top edge: ╭ ── ╮
+        set_char(buf, x0, y0, '╭', color_at(idx));
+        idx += 1;
+        for x in (x0 + 1)..x1 {
+            set_char(buf, x, y0, '─', color_at(idx));
+            idx += 1;
+        }
+        set_char(buf, x1, y0, '╮', color_at(idx));
+        idx += 1;
+        // Right edge
+        for y in (y0 + 1)..y1 {
+            set_char(buf, x1, y, '│', color_at(idx));
+            idx += 1;
+        }
+        // Bottom edge: ╰ ── ╯ (traverse right-to-left to keep the
+        // gradient continuous around the perimeter)
+        set_char(buf, x1, y1, '╯', color_at(idx));
+        idx += 1;
+        for x in ((x0 + 1)..x1).rev() {
+            set_char(buf, x, y1, '─', color_at(idx));
+            idx += 1;
+        }
+        set_char(buf, x0, y1, '╰', color_at(idx));
+        idx += 1;
+        // Left edge (bottom → top)
+        for y in ((y0 + 1)..y1).rev() {
+            set_char(buf, x0, y, '│', color_at(idx));
+            idx += 1;
+        }
+        let _ = idx;
+
+        // Title overlay (dim, on top border). Uses the solid colour so
+        // the label stays legible against the animated border.
+        let title = format!(" {} ", self.title.trim());
+        let title_span = Span::styled(
+            title.clone(),
+            Style::default()
+                .fg(self.solid_color)
+                .add_modifier(Modifier::DIM),
+        );
+        // Anchor title at x0 + 2 so it doesn't overlap the corner.
+        let title_x = x0 + 2;
+        if title_x + title.chars().count() as u16 <= x1 {
+            let line_widget = Line::from(title_span);
+            let line_area = ratatui::layout::Rect {
+                x: title_x,
+                y: y0,
+                width: title.chars().count() as u16,
+                height: 1,
+            };
+            ratatui::widgets::WidgetRef::render_ref(&line_widget, line_area, buf);
+        }
+    }
+
+    fn desired_height(&self, _width: u16) -> u16 {
+        // border(2) + content lines
+        (self.lines.len() as u16).saturating_add(2)
+    }
+}
+
+/// Write a single character cell into the buffer with the given fg.
+fn set_char(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    ch: char,
+    fg: ratatui::style::Color,
+) {
+    if x >= buf.area.x + buf.area.width || y >= buf.area.y + buf.area.height {
+        return;
+    }
+    let cell = &mut buf[(x, y)];
+    cell.set_char(ch);
+    cell.set_style(ratatui::style::Style::default().fg(fg));
+}
+
 pub(super) fn do_draw(
     guard: &mut TerminalGuard,
     active: ActiveView,
     bottom_pane: &mut BottomPane,
 ) -> Result<(), String> {
-    use ratatui::widgets::{Block, Borders, Paragraph};
+    use ratatui::widgets::Paragraph;
     use render::renderable::{FlexRenderable, Renderable, RenderableItem};
 
     bottom_pane.pre_draw_tick(std::time::Instant::now());
@@ -986,26 +1508,23 @@ pub(super) fn do_draw(
         // Active cell gets a rounded bordered box in a colour that
         // matches the cell kind, so the user sees "this is the live
         // thing" at a glance — as opposed to the flat scrollback
-        // above. Cursor/Kiro style.
-        ActiveView::Active { kind, lines } => {
+        // above. While `live` (still streaming), the frame pulses
+        // through a flowing gradient; once finalized the border
+        // collapses to a solid colour. Cursor/Kiro style.
+        ActiveView::Active { kind, lines, live } => {
             let theme = crate::tui::theme::current();
-            let (border_color, title) = match kind {
-                ActiveKind::Tool => (theme.accent, " tool "),
-                ActiveKind::Assistant => (theme.gutter, " assistant "),
-                ActiveKind::Reasoning => (theme.dim, " thinking "),
+            let (solid_color, title) = match kind {
+                ActiveKind::Tool => (theme.accent, "tool"),
+                ActiveKind::Assistant => (theme.gutter, "assistant"),
+                ActiveKind::Reasoning => (theme.dim, "thinking"),
             };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(ratatui::widgets::BorderType::Rounded)
-                .border_style(ratatui::style::Style::default().fg(border_color))
-                .title(ratatui::text::Span::styled(
-                    title.to_string(),
-                    ratatui::style::Style::default()
-                        .fg(border_color)
-                        .add_modifier(ratatui::style::Modifier::DIM),
-                ));
-            let para = Paragraph::new(ratatui::text::Text::from(lines)).block(block);
-            RenderableItem::Owned(Box::new(para))
+            let framed = LiveFramedCell {
+                lines,
+                title,
+                solid_color,
+                live,
+            };
+            RenderableItem::Owned(Box::new(framed))
         }
     };
 
@@ -1101,6 +1620,11 @@ fn handle_app_event(
             // tool cell in its own event handler.
             status_indicator
                 .set_state(status_indicator::IndicatorState::Thinking { started_at: now });
+        }
+        TuiAppEvent::ToolOutput { .. } => {
+            // Progress ticks are handled by the ChatWidget path
+            // (updates active ToolCell counters). No bottom-pane or
+            // indicator state change.
         }
         TuiAppEvent::StatusLine(_) => {}
         TuiAppEvent::TurnComplete | TuiAppEvent::TurnError(_) => {

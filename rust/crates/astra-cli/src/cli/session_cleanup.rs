@@ -10,7 +10,6 @@
 //! Lessons are extracted from the L1b narrative and tool signals, then
 //! stored in Memoria as L3 durable memory (Session Memory Protocol §6.2).
 
-use astra_services::session_artifact_store::SessionArtifactStore;
 use astra_services::session_journal;
 use std::time::Duration;
 
@@ -21,6 +20,30 @@ use super::session_guard::clear_panic_guard;
 
 /// Finalize a REPL session: journal end event, persist state, extract learnings.
 pub(super) async fn finalize_session(state: &mut ReplState) {
+    // 0. Drain any background session-memory extraction worker still in
+    //    flight from the final turn, then forget per-session debounce
+    //    state so the service doesn't leak it. Without the drain, the
+    //    tokio::spawn() task gets killed when the CLI process exits:
+    //    the gate said Run, but Memoria never receives the L1 write
+    //    and the `session_memory_extraction` event never fires. 10s is
+    //    generous — the worker's internal LLM_TIMEOUT is 30s but real
+    //    selector calls return in well under 5s.
+    if let Some(svc) = state.session_memory_extractor.as_ref() {
+        let leftover = svc
+            .wait_for_pending(std::time::Duration::from_secs(10))
+            .await;
+        if leftover > 0 {
+            tracing::warn!(
+                target: "session_cleanup",
+                leftover,
+                "session-memory extraction still in flight after 10s — forcing shutdown"
+            );
+        }
+        if let Some(sid) = state.session_id.as_deref() {
+            svc.forget_session(sid);
+        }
+    }
+
     // 1. Journal: session end event (idempotent — panic hook may have already written it)
     if let Some(ref j) = state.journal {
         let wrote =
@@ -40,35 +63,9 @@ pub(super) async fn finalize_session(state: &mut ReplState) {
     // 3. Trigger Memoria governance + consolidation (best-effort with timeout)
     let gov_handle = tokio::spawn(edge_tools::memoria::memoria_governance_fire_and_forget());
     let con_handle = tokio::spawn(edge_tools::memoria::memoria_consolidate_fire_and_forget());
-    // 3c. L3 knowledge backflow (Session Memory Protocol §6.2).
-    //     Three sources merged into one batch Memoria write:
-    //     (a) L1b narrative Learnings + User Corrections → semantic T2/T3
-    //     (b) Checkpointer final flush (tool failures, stalls) → semantic T3
-    //     (c) Episodic session summary → episodic T3
+    // 3c. L3 knowledge backflow: promote tool/stall signal lessons to
+    //     semantic T3 (mid-session copies were working T4).
     if state.turn > 0 {
-        let narrative = state.session_id.as_deref().and_then(|sid| {
-            let raw = astra_services::local_session_artifact_store()
-                .session_path(sid, "session-memory.md")
-                .ok()
-                .and_then(|p| astra_runtime::read_session_memory_file(&p))
-                .or_else(|| {
-                    let cwd = std::env::current_dir().ok()?;
-                    let path = astra_runtime::resolve_resume_session_memory_file(
-                        sid,
-                        Some(cwd.to_str()?),
-                    )?;
-                    astra_runtime::read_session_memory_file(&path)
-                })?;
-            astra_runtime::turn::cloud::session_memory_protocol::SessionMemory::parse(&raw)
-        });
-
-        // (a) L1b narrative extraction
-        let mut all_lessons =
-            astra_runtime::lesson_synthesizer::extract_learnings_for_backflow(narrative.as_ref());
-
-        // (b) Final tool/stall lessons — extract directly from signals and
-        //     promote to semantic T3 (mid-session copies were working T4).
-        //     Quality gate applied to filter out generic template content.
         let summary = match state
             .observability_session
             .as_ref()
@@ -89,9 +86,8 @@ pub(super) async fn finalize_session(state: &mut ReplState) {
             "generic",
             None,
         );
+        let mut all_lessons: Vec<astra_runtime::lesson_synthesizer::ExtractedLesson> = Vec::new();
         for cl in signal_lessons {
-            // Template-generated lessons use the basic gate (hedging + length).
-            // The template blocklist is only for LLM-synthesized content.
             if astra_runtime::lesson_synthesizer::is_synthesized_lesson_acceptable(&cl.action) {
                 all_lessons.push(astra_runtime::lesson_synthesizer::ExtractedLesson {
                     memory_type: "semantic",
@@ -99,15 +95,6 @@ pub(super) async fn finalize_session(state: &mut ReplState) {
                     trust_tier: "T3",
                 });
             }
-        }
-
-        // (c) Episodic summary
-        if let Some(episodic) = astra_runtime::lesson_synthesizer::build_episodic_summary(
-            state.session_id.as_deref().unwrap_or("unknown"),
-            state.turn,
-            narrative.as_ref(),
-        ) {
-            all_lessons.push(episodic);
         }
 
         if !all_lessons.is_empty() {
@@ -191,6 +178,9 @@ pub(super) async fn finalize_session(state: &mut ReplState) {
         let _ = con_handle.await;
     })
     .await;
+    if let Some(sid) = state.session_id.as_deref() {
+        astra_tools::memoria::MemoriaClient::reset_session_process_state(sid);
+    }
     // 6. Clear panic guard
     clear_panic_guard();
 }

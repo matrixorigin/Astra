@@ -499,7 +499,6 @@ mod tests {
             budget_remaining_rounds: 8,
             blocked_tools: vec!["bash".to_string()],
             recent_tools: vec!["grep".to_string(), "read_file".to_string()],
-            learning_snapshot_id: None,
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -509,7 +508,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             compaction_state: None,
             pipeline_state: None,
-            continuity_state: None,
+            config_version_id: None,
         }
     }
 

@@ -329,6 +329,104 @@ struct TurnRollbackFired {
 const EXECUTION_BOUNDARY_KIND_TOOL_BATCH: &str = "tool_batch";
 const EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK: &str = "turn_rollback";
 
+/// RAII guard: installs a `ToolProgressSink` on the edge
+/// `ToolExecutor`, spawns a ticker task that polls the sink every
+/// ~200ms and emits `StreamEvent::ToolOutput`, and on drop aborts
+/// the ticker + clears the sink. Scoped to a single `execute_tool`
+/// call so back-to-back bash invocations each get a fresh sink
+/// (counters restart from zero).
+struct BashProgressGuard {
+    executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
+    ticker: Option<tokio::task::JoinHandle<()>>,
+    /// Cloned observer tx so the `Drop` impl can emit one last
+    /// `ToolOutput` snapshot after the pipe's final drain ran.
+    /// Populated only when an observer was present at install time.
+    final_event_tx: Option<super::chat_stream::StreamEventTx>,
+    /// Tool name for the final `ToolOutput` snapshot.
+    tool_name: String,
+}
+
+impl BashProgressGuard {
+    fn install(
+        executor: &std::sync::Arc<crate::edge_tools::ToolExecutor>,
+        tool_name: &str,
+        stream_event_tx: Option<&super::chat_stream::StreamEventTx>,
+    ) -> Self {
+        let sink = std::sync::Arc::new(super::chat_stream::ToolProgressSink::new());
+        executor.set_bash_progress_sink(Some(sink.clone()));
+
+        // Spawn the ticker only when there's an observer listening —
+        // otherwise we'd do ~5 sink reads/sec for nothing.
+        let ticker = stream_event_tx.cloned().map(|tx| {
+            let sink = sink.clone();
+            let name = tool_name.to_string();
+            tokio::spawn(async move {
+                let mut last = (0u64, 0u64);
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+                // Skip the first tick — it fires immediately and
+                // would emit a 0/0 snapshot before the tool has
+                // written anything.
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let (lines, bytes) = sink.snapshot();
+                    if (lines, bytes) == last {
+                        continue;
+                    }
+                    last = (lines, bytes);
+                    if tx
+                        .send(super::chat_stream::StreamEvent::ToolOutput {
+                            name: name.clone(),
+                            lines,
+                            bytes,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        });
+
+        Self {
+            executor: executor.clone(),
+            ticker,
+            final_event_tx: stream_event_tx.cloned(),
+            tool_name: tool_name.to_string(),
+        }
+    }
+}
+
+impl Drop for BashProgressGuard {
+    fn drop(&mut self) {
+        // Emit one last ToolOutput snapshot so the TUI counter
+        // reflects the final drain bytes.  `shell.rs::final_drain_*`
+        // already calls `sink.record_chunk` on every post-exit byte
+        // before returning, so by the time we get here the counters
+        // are authoritative.  The ticker fires at ~200 ms cadence
+        // and we abort it immediately after this snapshot, so
+        // without this emit the displayed "N lines / K KB" can
+        // undershoot by up to one tick.  Reading the sink is two
+        // atomic loads and sending is best-effort (we swallow
+        // closed-channel errors exactly like the ticker loop).
+        if let (Some(sink), Some(tx)) = (
+            self.executor.current_bash_progress_sink(),
+            self.final_event_tx.as_ref(),
+        ) {
+            let (lines, bytes) = sink.snapshot();
+            let _ = tx.send(super::chat_stream::StreamEvent::ToolOutput {
+                name: self.tool_name.clone(),
+                lines,
+                bytes,
+            });
+        }
+        if let Some(h) = self.ticker.take() {
+            h.abort();
+        }
+        self.executor.set_bash_progress_sink(None);
+    }
+}
+
 impl<'a> CliSseStreamHost<'a> {
     fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize, render_md: bool) -> Self {
         Self::from_edge_ctx_with_auth(ctx, term_width, render_md, None)
@@ -777,7 +875,7 @@ impl<'a> CliSseStreamHost<'a> {
                 .map(str::trim)
                 .is_some_and(astra_turn_core::cloud_approval_policy::bash_command_is_read_only);
         }
-        is_tool_concurrency_safe(tool)
+        is_tool_concurrency_safe(tool, Some(args))
             || matches!(
                 tool,
                 "write_file"
@@ -1709,6 +1807,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             });
         }
 
+        // Install a bash progress sink + 200ms ticker for the TUI's
+        // live "streaming · N lines · K KB" counter. Bash is the
+        // only tool that streams stdout incrementally today — other
+        // tools are atomic and never emit progress. Cleanup (abort
+        // ticker, clear sink) happens unconditionally at the bottom
+        // of `execute_tool` via `_progress_guard`.
+        let _progress_guard = (tool == "bash").then(|| {
+            BashProgressGuard::install(&self.executor, tool, self.stream_event_tx.as_ref())
+        });
+
         // Clear text that was rendered or buffered BEFORE the first tool call
         // (intermediate draft). After first tool, keep buffering new text.
         if !self.tool_work_detected {
@@ -2466,7 +2574,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // Classify by concurrency safety.
         let conc_flags: Vec<bool> = requests
             .iter()
-            .map(|req| is_tool_concurrency_safe(&req.tool))
+            .map(|req| is_tool_concurrency_safe(&req.tool, Some(&req.args)))
             .collect();
         let conc_count = conc_flags.iter().filter(|&&f| f).count();
 
@@ -2654,6 +2762,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 crate::edge_tools::ToolExecutionOutcome {
                                     output,
                                     tool_result_fields: None,
+                                    is_error: false,
                                 },
                                 0u64,
                             );
@@ -2685,6 +2794,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                                 "Tool blocked by hook '{hook_id}': {reason}"
                                             ),
                                             tool_result_fields: None,
+                                            is_error: true,
                                         },
                                         0u64,
                                     );
@@ -2714,6 +2824,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     crate::edge_tools::ToolExecutionOutcome {
                                         output: post.final_output,
                                         tool_result_fields: outcome.tool_result_fields,
+                                        is_error: outcome.is_error,
                                     },
                                     dur,
                                 );
@@ -3583,25 +3694,60 @@ impl StreamRenderState {
             "memory" => {
                 let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                 match action {
-                    "retrieve" => {
+                    "recall" => {
                         let query = args.get("query").and_then(Value::as_str).unwrap_or("");
                         format!("Recalling: \"{}\"", truncate_line(query, path_budget(13)))
                     }
-                    "store" => {
+                    "remember" => {
                         let content = args.get("content").and_then(Value::as_str).unwrap_or("");
-                        format!("Storing: \"{}\"", truncate_line(content, path_budget(11)))
-                    }
-                    "search" => {
-                        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
                         format!(
-                            "Searching memory: \"{}\"",
-                            truncate_line(query, path_budget(20))
+                            "Remembering: \"{}\"",
+                            truncate_line(content, path_budget(13))
                         )
                     }
-                    "purge" => "Purging memory".to_string(),
-                    "correct" => "Correcting memory".to_string(),
+                    "expand" => match args.get("memory_id").and_then(Value::as_str) {
+                        Some(mid) => {
+                            format!("Expanding memory: {}", truncate_line(mid, path_budget(18)))
+                        }
+                        None => "Expanding memory".to_string(),
+                    },
+                    "forget" => {
+                        match args
+                            .get("memory_id")
+                            .and_then(Value::as_str)
+                            .or_else(|| args.get("topic").and_then(Value::as_str))
+                        {
+                            Some(target) => format!(
+                                "Forgetting: \"{}\"",
+                                truncate_line(target, path_budget(18))
+                            ),
+                            None => "Forgetting".to_string(),
+                        }
+                    }
+                    "update" => match args.get("memory_id").and_then(Value::as_str) {
+                        Some(mid) => {
+                            format!("Updating memory: {}", truncate_line(mid, path_budget(18)))
+                        }
+                        None => "Updating memory".to_string(),
+                    },
+                    "focus" => {
+                        let value = args
+                            .get("focus_value")
+                            .or_else(|| args.get("value"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        format!("Focus on: \"{}\"", truncate_line(value, path_budget(16)))
+                    }
+                    "reflect" => "Reflecting on memories".to_string(),
                     "profile" => "Checking profile".to_string(),
-                    "feedback" => "Memory feedback".to_string(),
+                    "feedback" => {
+                        let signal = args.get("signal").and_then(Value::as_str).unwrap_or("");
+                        if signal.is_empty() {
+                            "Memory feedback".to_string()
+                        } else {
+                            format!("Memory feedback: {signal}")
+                        }
+                    }
                     _ => format!("Memory: {action}"),
                 }
             }
@@ -4400,43 +4546,6 @@ impl StreamRenderState {
                     ),
                 }
             }
-            // Memory tools with natural verbs
-            "memory_retrieve" => {
-                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                format!("Recalling: \"{}\"", truncate_line(query, path_budget(13)))
-            }
-            "memory_store" => {
-                let content = args.get("content").and_then(Value::as_str).unwrap_or("");
-                format!("Storing: \"{}\"", truncate_line(content, path_budget(11)))
-            }
-            "memory_search" => {
-                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                format!(
-                    "Searching memory: \"{}\"",
-                    truncate_line(query, path_budget(20))
-                )
-            }
-            "memory_purge" => {
-                let topic = args.get("topic").and_then(Value::as_str);
-                match topic {
-                    Some(topic) => format!(
-                        "Purging memory: \"{}\"",
-                        truncate_line(topic, path_budget(18))
-                    ),
-                    None => "Purging memory".to_string(),
-                }
-            }
-            "memory_correct" => {
-                let memory_id = args.get("memory_id").and_then(Value::as_str);
-                match memory_id {
-                    Some(memory_id) => format!(
-                        "Correcting memory: {}",
-                        truncate_line(memory_id, path_budget(20))
-                    ),
-                    None => "Correcting memory".to_string(),
-                }
-            }
-            "memory_profile" => "Checking profile".to_string(),
             // Skill tool — show specific skill name or discover query
             "skill" => {
                 let action = args.get("action").and_then(Value::as_str).unwrap_or("run");
@@ -5086,22 +5195,34 @@ impl StreamRenderState {
                     _ => None,
                 }
             }
-            "memory_retrieve" | "memory_search" => args
-                .get("query")
-                .and_then(Value::as_str)
-                .map(|q| truncate_line(q, 50)),
-            "memory_store" => args
-                .get("content")
-                .and_then(Value::as_str)
-                .map(|c| truncate_line(c, 50)),
-            "memory_purge" => args
-                .get("topic")
-                .and_then(Value::as_str)
-                .map(|topic| truncate_line(topic, 40)),
-            "memory_correct" => args
-                .get("memory_id")
-                .and_then(Value::as_str)
-                .map(|memory_id| truncate_line(memory_id, 40)),
+            "memory" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                match action {
+                    "recall" => args
+                        .get("query")
+                        .and_then(Value::as_str)
+                        .map(|q| truncate_line(q, 50)),
+                    "remember" => args
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(|c| truncate_line(c, 50)),
+                    "forget" => args
+                        .get("memory_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| args.get("topic").and_then(Value::as_str))
+                        .map(|t| truncate_line(t, 40)),
+                    "update" | "expand" | "feedback" => args
+                        .get("memory_id")
+                        .and_then(Value::as_str)
+                        .map(|memory_id| truncate_line(memory_id, 40)),
+                    "focus" => args
+                        .get("focus_value")
+                        .or_else(|| args.get("value"))
+                        .and_then(Value::as_str)
+                        .map(|v| truncate_line(v, 40)),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -6073,6 +6194,7 @@ where
                     panic_payload_summary(payload.as_ref())
                 ),
                 tool_result_fields: None,
+                is_error: true,
             },
             t0.elapsed().as_millis() as u64,
         ),
@@ -6128,7 +6250,6 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "web_fetch" => format!("Fetching: {preview}"),
         "web_search" => format!("Searching web: \"{preview}\""),
         "github" => format!("GitHub: {preview}"),
-        "memory" => format!("Memory: {preview}"),
         "session" => format!("Session: {preview}"),
         "mo" => format!("MO: {preview}"),
         "agent" => format!("Agent: {preview}"),
@@ -6183,12 +6304,17 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "mo_query" => format!("MatrixOne query: \"{preview}\""),
         "mo_snapshot" => format!("MatrixOne snapshot: {preview}"),
         "mo_branch" => format!("MatrixOne branch: {preview}"),
-        "memory_retrieve" => format!("Recalling: \"{preview}\""),
-        "memory_store" => format!("Storing: \"{preview}\""),
-        "memory_search" => format!("Searching memory: \"{preview}\""),
-        "memory_purge" => format!("Purging memory: \"{preview}\""),
-        "memory_correct" => format!("Correcting memory: {preview}"),
-        "memory_profile" => "Checking profile".to_string(),
+        // `memory` is action-aware; when we only have the preview string (not the
+        // parsed args), surface it generically. Callers that have the full args
+        // object should use the richer `format_tool_description_with_output`
+        // path which dispatches on `action`.
+        "memory" => {
+            if preview.is_empty() {
+                "Memory".to_string()
+            } else {
+                format!("Memory: {preview}")
+            }
+        }
         "skill" => format!("Running skill: {preview}"),
         "discover_skills" => format!("Discovering skills: \"{preview}\""),
         other if other.starts_with("mcp_") => {
@@ -7236,35 +7362,38 @@ mod tests {
     #[test]
     fn format_memory_maintenance_descriptions() {
         let r = StreamRenderState::new();
-        let purge = r.format_tool_description(
-            "memory_purge",
-            &serde_json::json!({"topic": "renderer drift"}),
+        let forget = r.format_tool_description(
+            "memory",
+            &serde_json::json!({"action": "forget", "topic": "renderer drift"}),
         );
-        let correct = r.format_tool_description(
-            "memory_correct",
-            &serde_json::json!({"memory_id": "mem-123"}),
+        let update = r.format_tool_description(
+            "memory",
+            &serde_json::json!({"action": "update", "memory_id": "mem-123"}),
         );
-        let profile = r.format_tool_description("memory_profile", &serde_json::json!({}));
+        let profile =
+            r.format_tool_description("memory", &serde_json::json!({"action": "profile"}));
+        let focus = r.format_tool_description(
+            "memory",
+            &serde_json::json!({"action": "focus", "focus_value": "oauth"}),
+        );
+        let reflect =
+            r.format_tool_description("memory", &serde_json::json!({"action": "reflect"}));
 
-        assert_eq!(purge, "Purging memory: \"renderer drift\"");
-        assert_eq!(correct, "Correcting memory: mem-123");
+        assert_eq!(forget, "Forgetting: \"renderer drift\"");
+        assert_eq!(update, "Updating memory: mem-123");
         assert_eq!(profile, "Checking profile");
+        assert_eq!(focus, "Focus on: \"oauth\"");
+        assert_eq!(reflect, "Reflecting on memories");
     }
 
     #[test]
-    fn format_memory_maintenance_preview_display_names() {
+    fn format_memory_preview_display_names() {
+        // Preview-only path can't know the action; it surfaces the raw preview.
         assert_eq!(
-            format_tool_display_from_preview("memory_purge", Some("renderer drift")),
-            "Purging memory: \"renderer drift\""
+            format_tool_display_from_preview("memory", Some("action=purge topic=...")),
+            "Memory: action=purge topic=..."
         );
-        assert_eq!(
-            format_tool_display_from_preview("memory_correct", Some("mem-123")),
-            "Correcting memory: mem-123"
-        );
-        assert_eq!(
-            format_tool_display_from_preview("memory_profile", None),
-            "Checking profile"
-        );
+        assert_eq!(format_tool_display_from_preview("memory", None), "Memory");
     }
 
     #[test]

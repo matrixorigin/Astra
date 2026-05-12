@@ -167,17 +167,10 @@ pub const DISCOVER_SKILLS_TOOL_NAME: &str = "discover_skills";
 /// Max skills returned from a single `discover_skills` call.
 const DISCOVER_SKILLS_MAX_RESULTS: usize = 8;
 
-/// Character budget for the skill listing section.
-///
-/// The listing rides the volatile `<system-reminder>` every turn, so
-/// tokens here are paid per-turn (not once-per-session like the cached
-/// system prefix). 2,500c fits ~15 compact entries at the 120-char cap
-/// below; anything more is noise — the LLM picks relevant skills from
-/// the shortlist, full details come from `skill`/`discover_skills`.
-///
-/// Trimmed from 8,000 (observed 2.3K-char skill blocks in production
-/// consuming ~575 tokens/turn on default skill sets).
-const DEFAULT_SKILL_LISTING_BUDGET: usize = 2_500;
+// `DEFAULT_SKILL_LISTING_BUDGET` was removed — its only consumer,
+// `format_skills_within_budget`, is now test-only scaffolding that no
+// longer relies on a shared budget constant. Current production uses
+// `build_skill_listing_section` which doesn't truncate.
 
 /// Per-entry description cap. Listing is for discovery only — the full content
 /// is loaded when a skill is actually invoked. Trimmed from 250 to 120:
@@ -212,12 +205,15 @@ fn format_skill_description(s: &SkillToolInfo) -> String {
     }
 }
 
-/// Format a skill list with token budget. Bundled skills always keep full
-/// descriptions; other skills get truncated or reduced to names-only when
-/// the budget is tight.
-///
-/// Returns `(entries, all_names)` where `entries` are "- name: desc" lines
-/// and `all_names` are all skill names (including those reduced to name-only).
+// Production no longer calls `format_skills_within_budget` — it was the
+// budget-aware formatter for `skill_listing_system_message`, both gone.
+// Retained under `#[cfg(test)]` because a body of tests exercises its
+// budget-pressure edge cases (truncation thresholds, bundled priority,
+// pinned-skills policy). Those tests guard logic invariants that might
+// be resurrected if a future iteration needs budget-shaped listings; the
+// current `build_skill_listing_section` renderer trusts upstream callers
+// to keep the list bounded and doesn't truncate in-renderer.
+#[cfg(test)]
 fn format_skills_within_budget(
     skills: &[SkillToolInfo],
     budget: usize,
@@ -231,7 +227,6 @@ fn format_skills_within_budget(
     let mut seen: std::collections::HashSet<&str> =
         skills.iter().map(|s| s.name.as_str()).collect();
     let mut all_names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
-    // Include aliases so the LLM can invoke skills by alternative names
     for s in skills {
         for alias in &s.aliases {
             if seen.insert(alias.as_str()) {
@@ -240,22 +235,19 @@ fn format_skills_within_budget(
         }
     }
 
-    // Try full descriptions first
     let full_entries: Vec<String> = skills
         .iter()
         .map(|s| format!("- **{}**: {}", s.name, format_skill_description(s)))
         .collect();
     let total: usize = full_entries.iter().map(|e| e.len() + 1).sum();
-
     if total <= budget {
         return (full_entries, all_names);
     }
 
-    // Partition into priority (bundled + pinned, never truncated) and rest
     let mut bundled_entries = Vec::new();
     let mut rest_skills: Vec<&SkillToolInfo> = Vec::new();
     for (i, s) in skills.iter().enumerate() {
-        let is_pinned = pinned_skills.map_or(false, |p| p.contains(&s.name));
+        let is_pinned = pinned_skills.is_some_and(|p| p.contains(&s.name));
         if s.source == SkillSourceKind::Bundled || is_pinned {
             bundled_entries.push(full_entries[i].clone());
         } else {
@@ -263,7 +255,6 @@ fn format_skills_within_budget(
         }
     }
 
-    // Sort non-bundled by quality boost (highest first) for priority in budget
     if let Some(tracker) = quality_tracker {
         rest_skills.sort_by(|a, b| {
             tracker
@@ -275,22 +266,16 @@ fn format_skills_within_budget(
 
     let bundled_chars: usize = bundled_entries.iter().map(|e| e.len() + 1).sum();
     let remaining_budget = budget.saturating_sub(bundled_chars);
-
     if rest_skills.is_empty() {
         return (bundled_entries, all_names);
     }
 
-    // Calculate max per-entry description length for non-bundled
-    let name_overhead: usize = rest_skills
-        .iter()
-        .map(|s| s.name.len() + 6) // "- **name**: " + newline
-        .sum();
+    let name_overhead: usize = rest_skills.iter().map(|s| s.name.len() + 6).sum();
     let avail = remaining_budget.saturating_sub(name_overhead);
     let max_desc = avail / rest_skills.len();
 
     let mut entries = bundled_entries;
     if max_desc < 20 {
-        // Extreme pressure: non-bundled go names-only
         for s in &rest_skills {
             entries.push(format!("- {}", s.name));
         }
@@ -577,6 +562,7 @@ pub fn execute_discover_skills(
     )
 }
 
+#[cfg(test)]
 fn skill_enum_names(skills: &[SkillToolInfo]) -> Vec<String> {
     // Sort for deterministic ordering — the skill cache is a HashMap, so the
     // incoming `skills` slice has non-deterministic iteration order. Any byte
@@ -594,150 +580,49 @@ fn skill_enum_names(skills: &[SkillToolInfo]) -> Vec<String> {
     names
 }
 
-/// Generate the OpenAI-compatible tool schema for the `skill` tool.
+/// Generate the `skill` tool schema — cache-stable, list-free.
 ///
-/// When `open_skill_name` is true (dynamic surfacing), `skill_name` is a free string
-/// (no JSON `enum`) so the catalog can grow mid-session via `discover_skills` without
-/// re-injecting schemas. Otherwise an enum lists all callable aliases.
-///
-/// The catalog itself is injected by `skill_listing_system_message`; keep this
-/// schema description short so we don't duplicate the same list in tool JSON.
-pub fn skill_tool_schema(skills: &[SkillToolInfo], open_skill_name: bool) -> Value {
-    let mut skill_name_prop = serde_json::json!({
-        "type": "string",
-        "description": "The name of the skill to execute (canonical name or alias)."
-    });
-    if !open_skill_name {
-        let skill_names = skill_enum_names(skills)
-            .into_iter()
-            .map(Value::String)
-            .collect();
-        if let Some(obj) = skill_name_prop.as_object_mut() {
-            obj.insert("enum".to_string(), Value::Array(skill_names));
-        }
-    }
-
-    let dynamic_note = if open_skill_name {
-        " If no visible skill applies, use action 'discover' or call `discover_skills` before improvising."
-    } else {
-        ""
-    };
-
-    let description = format!(
-        "Skill operations. Actions: run (default), discover. Use a skill from the \
-         <available_skills> system listing or a skill returned by discover. Invoke \
-         before other tools when the user's request matches a skill; optionally include \
-         task for extra context. Do not re-invoke after a <skill-loaded/> result.{}",
-        dynamic_note
-    );
-
+/// The schema takes `skill_name` as an open string and carries no enum.
+/// The catalog is surfaced through [`crate::prompts::build_skill_listing_section`]
+/// which lives in the cacheable prefix, so adding a skill no longer perturbs
+/// the tool schema bytes. This is the Phase-3 replacement for the earlier
+/// [`skill_tool_schema`], which is kept for the transition period until all
+/// call sites flip to v2.
+pub fn skill_tool_schema_v2() -> Value {
     serde_json::json!({
         "type": "function",
         "function": {
             "name": SKILL_TOOL_NAME,
-            "description": description,
+            "description":
+                "Execute a skill from the <available_skills> system listing. \
+                 `skill_name` is the canonical name or alias. `task` is optional \
+                 extra context; omit to use the current conversation. On seeing \
+                 `<skill-loaded name=\"...\"/>` in a tool result, follow that \
+                 skill's instructions — do not re-invoke it.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {
+                    "skill_name": {
                         "type": "string",
-                        "enum": ["run", "discover"],
-                        "description": "Skill operation: run (execute a skill, default) or discover (search the full catalog)."
+                        "description":
+                            "Canonical name or alias of the skill to run."
                     },
-                    "skill_name": skill_name_prop,
                     "task": {
                         "type": "string",
-                        "description": "Optional task description or additional context for the skill. If omitted, the skill uses the current conversation context."
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Search query for discover action. Describe what you are trying to do next."
+                        "description":
+                            "Optional task description or extra context for the skill."
                     }
-                }
+                },
+                "required": ["skill_name"]
             }
         }
     })
 }
 
-/// Build a system-reminder message listing available skills.
-///
-/// Injected into the conversation so the LLM is aware skills exist even
-/// before inspecting tool schemas. This is the single place where the visible
-/// skill catalog is listed; the `skill` tool schema only references it.
-pub fn skill_listing_system_message(
-    skills: &[SkillToolInfo],
-    quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
-    pinned_skills: Option<&std::collections::HashSet<String>>,
-    append_discover_hint: bool,
-) -> Value {
-    let (entries, _) = format_skills_within_budget(
-        skills,
-        DEFAULT_SKILL_LISTING_BUDGET,
-        quality_tracker,
-        pinned_skills,
-    );
-
-    // Build a name→category lookup for skills that have categories
-    let category_by_name: std::collections::HashMap<&str, &str> = skills
-        .iter()
-        .filter_map(|s| s.category.as_ref().map(|c| (s.name.as_str(), c.as_str())))
-        .collect();
-
-    let mut lines = Vec::with_capacity(entries.len() + 4);
-    lines.push("<available_skills>".to_string());
-    for entry in &entries {
-        // Convert "- **name**: desc" to XML format with optional category
-        let trimmed = entry.trim_start_matches("- ");
-        if let Some(colon_pos) = trimmed.find(": ") {
-            let name = trimmed[..colon_pos].trim_matches('*');
-            let desc = &trimmed[colon_pos + 2..];
-            let category_line = category_by_name
-                .get(name)
-                .map(|c| format!("\n  <category>{c}</category>"))
-                .unwrap_or_default();
-            lines.push(format!(
-                "<skill>\n  <name>{name}</name>{category_line}\n  <description>{desc}</description>\n</skill>"
-            ));
-        } else {
-            // Names-only fallback
-            let name = trimmed.trim_matches('*');
-            let category_line = category_by_name
-                .get(name)
-                .map(|c| format!("\n  <category>{c}</category>"))
-                .unwrap_or_default();
-            lines.push(format!(
-                "<skill>\n  <name>{name}</name>{category_line}\n</skill>"
-            ));
-        }
-    }
-    lines.push("</available_skills>".to_string());
-
-    let discover_note = if append_discover_hint {
-        "\n\nRelevant skills are surfaced each turn. If you are pivoting or none of the above \
-         fit your next step, call `discover_skills` with a specific description before improvising."
-    } else {
-        ""
-    };
-
-    // Compact preamble: the verbose "BLOCKING REQUIREMENT" variant rode
-    // the volatile `<system-reminder>` every turn at ~700c / ~175 tok.
-    // The two essentials are (1) when a skill matches, call `skill` first
-    // (not other tools); (2) `<skill-loaded>` in a tool result means
-    // follow its instructions directly. Everything else (reasons,
-    // re-invocation warnings) is derivable from tool descriptions.
-    let content = format!(
-        "When a user request matches an available skill, call the `skill` tool FIRST \
-         (before any other tool). On seeing `<skill-loaded name=\"...\"/>` in a tool \
-         result, follow that skill's instructions — do not re-invoke it.\n\n{}{}",
-        lines.join("\n"),
-        discover_note
-    );
-
-    serde_json::json!({
-        "role": "system",
-        "content": content
-    })
-}
+// Legacy `skill_tool_schema(skills, open_skill_name)` and
+// `skill_listing_system_message(...)` were deleted in the P2 cleanup.
+// Production uses `skill_tool_schema_v2` (byte-stable, no enum) and
+// `build_skill_listing_section` (CacheScope::Session) in prompts/system.rs.
 
 /// Check if a tool call is a skill invocation.
 pub fn is_skill_call(tool_call: &Value) -> bool {
@@ -859,7 +744,6 @@ pub struct SkillActivation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SkillVerificationOutcome {
     pub all_required_passed: bool,
-    pub summary: Option<astra_services::MutationVerifierSummary>,
 }
 
 /// Result of a single skill execution.
@@ -881,7 +765,6 @@ pub struct InterceptedToolResult {
     pub tool_call_id: String,
     pub tool_name: String,
     pub result: String,
-    pub verification_summary: Option<astra_services::MutationVerifierSummary>,
 }
 
 /// Handle `discover_skills` then `skill` tool calls in one batch (discover runs first).
@@ -967,7 +850,6 @@ pub async fn partition_discover_and_execute_skills(
                 .unwrap_or_default()
                 .to_string(),
             result,
-            verification_summary: None,
         });
     }
 
@@ -1109,14 +991,12 @@ pub async fn partition_and_execute_skills(
                     tool_call_id: call_id,
                     tool_name,
                     result,
-                    verification_summary: skill_verification.and_then(|v| v.summary),
                 }
             }
             None => InterceptedToolResult {
                 tool_call_id: call_id,
                 tool_name,
                 result: "Invalid skill arguments: expected object or JSON string".to_string(),
-                verification_summary: None,
             },
         };
 
@@ -1286,7 +1166,6 @@ async fn execute_pipeline(
                 activation: last_activation,
                 verification: Some(SkillVerificationOutcome {
                     all_required_passed: false,
-                    summary: None,
                 }),
             };
         }
@@ -1312,7 +1191,6 @@ async fn execute_pipeline(
         activation: last_activation,
         verification: Some(SkillVerificationOutcome {
             all_required_passed: all_passed,
-            summary: None,
         }),
     }
 }
@@ -1669,7 +1547,6 @@ fn validate_skill_output_schema(
             output_text,
             Some(SkillVerificationOutcome {
                 all_required_passed: true,
-                summary: None,
             }),
         );
     }
@@ -1692,7 +1569,6 @@ fn validate_skill_output_schema(
         warning,
         Some(SkillVerificationOutcome {
             all_required_passed: false,
-            summary: None,
         }),
     )
 }
@@ -2012,12 +1888,6 @@ fn execute_skill<'a>(
                                         output,
                                         Some(SkillVerificationOutcome {
                                             all_required_passed: all_passed,
-                                            summary: Some(
-                                                astra_services::MutationVerifierSummary::from_results(
-                                                    all_passed,
-                                                    &results,
-                                                ),
-                                            ),
                                         }),
                                     )
                                 } else {
@@ -2230,27 +2100,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn schema_has_correct_structure() {
-        let resolver = stub_resolver();
-        let skills = resolver.available_skills();
-        let schema = skill_tool_schema(&skills, false);
-
-        assert_eq!(schema["function"]["name"], SKILL_TOOL_NAME);
-        let params = &schema["function"]["parameters"];
-        assert_eq!(params["type"], "object");
-
-        let skill_enum = &params["properties"]["skill_name"]["enum"];
-        assert!(skill_enum.is_array());
-        let names: Vec<String> = skill_enum
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
-        let expected = skill_enum_names(&skills);
-        assert_eq!(names, expected);
-    }
+    // Legacy `schema_has_correct_structure` tested `skill_tool_schema`'s
+    // enum — deleted along with that function. `skill_tool_schema_v2`
+    // coverage lives in skill_surfacing_contract integration tests.
 
     #[test]
     fn skill_enum_names_include_unique_aliases() {
@@ -2302,36 +2154,10 @@ mod tests {
         assert_eq!(order1, order3);
     }
 
-    #[test]
-    fn schema_description_does_not_duplicate_skill_listing() {
-        let resolver = stub_resolver();
-        let skills = resolver.available_skills();
-        let schema = skill_tool_schema(&skills, false);
-        let desc = schema["function"]["description"].as_str().unwrap();
-
-        assert!(!desc.contains("code-review"), "{desc}");
-        assert!(!desc.contains("Available skills:"), "{desc}");
-
-        let listing = skill_listing_system_message(&skills, None, None, false);
-        let content = listing["content"].as_str().unwrap();
-        assert!(content.contains("code-review"), "{content}");
-        assert!(content.contains("<available_skills>"), "{content}");
-    }
-
-    #[test]
-    fn schema_open_skill_name_has_no_enum() {
-        let skills = vec![SkillToolInfo {
-            name: "only-one".into(),
-            description: "test".into(),
-            ..Default::default()
-        }];
-        let schema = skill_tool_schema(&skills, true);
-        assert!(
-            schema["function"]["parameters"]["properties"]["skill_name"]
-                .get("enum")
-                .is_none()
-        );
-    }
+    // Removed tests exercised the legacy `skill_tool_schema` +
+    // `skill_listing_system_message` pair. Replaced by
+    // `skill_surfacing_contract.rs` (no-enum invariant) and
+    // `skill_listing_session_scope_e2e.rs` (byte-stability).
 
     #[test]
     fn visible_skills_omit_already_invoked_entries() {
@@ -2501,12 +2327,7 @@ mod tests {
         assert_eq!(remaining[0]["function"]["name"], "bash");
     }
 
-    #[test]
-    fn schema_empty_when_no_skills() {
-        let schema = skill_tool_schema(&[], false);
-        let skill_enum = &schema["function"]["parameters"]["properties"]["skill_name"]["enum"];
-        assert_eq!(skill_enum.as_array().unwrap().len(), 0);
-    }
+    // `schema_empty_when_no_skills` removed — v2 schema has no enum.
 
     #[test]
     fn is_skill_call_detects_skill_tool() {
@@ -3396,7 +3217,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_skill_fork_returns_verification_summary() {
+    async fn execute_skill_fork_returns_verification_outcome() {
         use async_trait::async_trait;
 
         struct ForkResolver {
@@ -3492,10 +3313,6 @@ mod tests {
         assert!(r.activation.is_some());
         let verification = r.verification.expect("expected verification outcome");
         assert!(verification.all_required_passed);
-        let summary = verification.summary.expect("expected verifier summary");
-        assert_eq!(summary.criteria_total, 1);
-        assert_eq!(summary.criteria_passed, 1);
-        assert!(summary.failing_criteria.is_empty());
     }
 
     #[test]
@@ -3661,12 +3478,10 @@ mod tests {
         assert_eq!(skill_results[0].tool_call_id, "call_1");
         assert_eq!(skill_results[0].tool_name, "skill");
         assert!(skill_results[0].result.contains("code-review"));
-        assert!(skill_results[0].verification_summary.is_none());
 
         assert_eq!(skill_results[1].tool_call_id, "call_3");
         assert_eq!(skill_results[1].tool_name, "skill");
         assert!(skill_results[1].result.contains("test-writer"));
-        assert!(skill_results[1].verification_summary.is_none());
 
         assert_eq!(remaining[0]["function"]["name"], "bash");
     }
@@ -3696,22 +3511,10 @@ mod tests {
         assert_eq!(remaining.len(), 0);
     }
 
-    #[test]
-    fn system_listing_includes_when_to_use() {
-        let skills = vec![SkillToolInfo {
-            name: "deployer".into(),
-            description: "Deploy services".into(),
-            when_to_use: Some("when user asks to deploy".into()),
-            source: SkillSourceKind::Local,
-            aliases: Vec::new(),
-            category: None,
-            tags: Vec::new(),
-            triggers: Vec::new(),
-        }];
-        let listing = skill_listing_system_message(&skills, None, None, false);
-        let content = listing["content"].as_str().unwrap();
-        assert!(content.contains("when user asks to deploy"));
-    }
+    // `system_listing_includes_when_to_use` removed.
+    // `build_skill_listing_section` currently renders name + description only;
+    // `when_to_use` folding into the block is a future enhancement tracked in
+    // P2 follow-up.
 
     #[test]
     fn budget_full_descriptions_fit() {
@@ -3999,44 +3802,9 @@ mod tests {
         assert!(desc.ends_with('…'));
     }
 
-    #[test]
-    fn skill_listing_includes_category_in_xml() {
-        let skills = vec![
-            SkillToolInfo {
-                name: "code-review".into(),
-                description: "Reviews code changes".into(),
-                when_to_use: None,
-                source: SkillSourceKind::Local,
-                aliases: Vec::new(),
-                category: Some("review".into()),
-                tags: Vec::new(),
-                triggers: Vec::new(),
-            },
-            SkillToolInfo {
-                name: "deploy".into(),
-                description: "Deploys to production".into(),
-                when_to_use: None,
-                source: SkillSourceKind::Local,
-                aliases: Vec::new(),
-                category: None, // no category
-                tags: Vec::new(),
-                triggers: Vec::new(),
-            },
-        ];
-        let msg = skill_listing_system_message(&skills, None, None, false);
-        let content = msg["content"].as_str().unwrap();
-        // code-review should have <category>review</category>
-        assert!(content.contains("<name>code-review</name>"));
-        assert!(content.contains("<category>review</category>"));
-        // deploy should NOT have a category tag
-        assert!(content.contains("<name>deploy</name>"));
-        // But the overall content shouldn't have category for deploy
-        let deploy_section = content
-            .split("<skill>")
-            .find(|s| s.contains("deploy"))
-            .unwrap();
-        assert!(!deploy_section.contains("<category>"));
-    }
+    // `skill_listing_includes_category_in_xml` removed; category rendering
+    // is a legacy skill_listing_system_message feature not yet migrated to
+    // `build_skill_listing_section`. Tracked as P2 follow-up.
 
     #[tokio::test]
     async fn execute_skill_returns_activation_with_allowed_tools() {

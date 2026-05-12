@@ -277,6 +277,25 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         scope: Scope::Local,
         schema_tokens: 20,
     },
+    ToolMeta {
+        name: "tool_search",
+        description: "Search and activate deferred tools. `select:NAME` returns the full schema \
+             for a deferred tool so the LLM can invoke it on the next turn.",
+        triggers: &[
+            "tool_search",
+            "find tool",
+            "which tool",
+            "available tools",
+            "搜工具",
+            "查工具",
+        ],
+        // Pinned: activation primitive for the deferred tool layer. Must always
+        // be in tools[] so the model can reach any deferred tool.
+        pinned: true,
+        intents: &[IntentType::CodeRead],
+        scope: Scope::Local,
+        schema_tokens: 25,
+    },
     // ── Dynamic tools (selected per-request) ────────────────────────
     ToolMeta {
         name: "lsp",

@@ -112,20 +112,41 @@ fn bind_self_model(sources: &ContextSources<'_>) -> String {
     sources.session.self_model.clone().unwrap_or_default()
 }
 
-/// Bind project context from session — cross-session project context summaries
-/// (prior sessions on the same repo). Wrapped in a stable header so the
-/// wire byte-matches the legacy runtime-injected version that used to go
-/// through `agentic_loop_lifecycle.rs`.
+/// Bind project-level session context — cross-session project summaries,
+/// plus (Phase-6) the session-stable `<deferred_tools>` and
+/// `<available_skills>` blocks that let the LLM discover non-pinned
+/// capabilities without busting the cache prefix.
+///
+/// All three blocks are session-scope: stable across a session, cached as
+/// part of the provider prefix. A change to any one flips the cache once
+/// (on registration / skill reload), then stability resumes.
 fn bind_project_context(sources: &ContextSources<'_>) -> String {
     let ctx = &sources.session.project_context;
-    if ctx.is_empty() {
-        return String::new();
+    let deferred = &sources.session.deferred_tools_block;
+    let skills = &sources.session.skill_listing_block;
+
+    let mut out = String::new();
+    if !ctx.is_empty() {
+        out.push_str(
+            "## Cross-Session Project Context\n\
+             Below are summaries of recent sessions in this project. \
+             Use them for continuity — avoid re-asking questions already answered.\n\n",
+        );
+        out.push_str(ctx);
     }
-    format!(
-        "## Cross-Session Project Context\n\
-         Below are summaries of recent sessions in this project. \
-         Use them for continuity — avoid re-asking questions already answered.\n\n{ctx}"
-    )
+    if !deferred.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(deferred);
+    }
+    if !skills.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(skills);
+    }
+    out
 }
 
 /// Bind active skills.
@@ -220,7 +241,7 @@ fn bind_working_memory(sources: &ContextSources<'_>) -> String {
 /// change at session boundaries: `system_override` and opt-in
 /// `extra_stable_sections` (environment_static from the bridge / adapter
 /// edge_profile, output style, etc.). Turn-volatile content —
-/// learned_context, self-awareness, tool-dependent guidance — routes
+/// self-awareness, tool-dependent guidance, memoria insights — routes
 /// through `RuntimeVolatile` (`bind_runtime_volatile`) so it sits after
 /// the Session→None cache marker and doesn't invalidate the prefix.
 /// These stable pieces sit in `CacheScope::Session` so Anthropic's
@@ -411,6 +432,8 @@ mod tests {
                     ..Default::default()
                 },
                 self_model: Some("Expert coder.".into()),
+                deferred_tools_block: String::new(),
+                skill_listing_block: String::new(),
             },
             turn: TurnState {
                 messages: vec![serde_json::json!({"role": "user", "content": "hello"})],
@@ -486,6 +509,61 @@ mod tests {
         assert!(
             content.is_empty(),
             "empty project_context must NOT render a bare header: {content}"
+        );
+    }
+
+    #[test]
+    fn bind_project_context_emits_deferred_tools_block() {
+        // Phase-6: when a deferred-tools listing is present, it rides the
+        // ProjectContext section (session-scope) so the LLM can discover
+        // non-pinned tools via tool_search(select:NAME).
+        let mut fixture = test_sources();
+        fixture.session.project_context = String::new();
+        fixture.session.deferred_tools_block =
+            "<deferred_tools>\n  <tool>\n    <name>web_fetch</name>\n    <description>fetch web content</description>\n  </tool>\n</deferred_tools>".to_string();
+        let sources = fixture.context();
+        let content = bind_project_context(&sources);
+
+        assert!(
+            content.contains("<deferred_tools>"),
+            "deferred_tools block must appear in ProjectContext output; got:\n{content}"
+        );
+        assert!(
+            content.contains("<name>web_fetch</name>"),
+            "entries from the block must be preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn bind_project_context_emits_skill_listing_block() {
+        let mut fixture = test_sources();
+        fixture.session.project_context = String::new();
+        fixture.session.skill_listing_block =
+            "<available_skills>\n  <skill>\n    <name>markdown</name>\n    <description>Output Format</description>\n  </skill>\n</available_skills>".to_string();
+        let sources = fixture.context();
+        let content = bind_project_context(&sources);
+
+        assert!(
+            content.contains("<available_skills>"),
+            "skill listing must appear in ProjectContext; got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn bind_project_context_combines_all_three_blocks_in_order() {
+        let mut fixture = test_sources();
+        fixture.session.project_context = "prior-session-summary-stub".to_string();
+        fixture.session.deferred_tools_block = "<deferred_tools>x</deferred_tools>".to_string();
+        fixture.session.skill_listing_block = "<available_skills>y</available_skills>".to_string();
+        let sources = fixture.context();
+        let content = bind_project_context(&sources);
+
+        let i_ctx = content.find("prior-session-summary-stub").unwrap();
+        let i_def = content.find("<deferred_tools>").unwrap();
+        let i_sk = content.find("<available_skills>").unwrap();
+        assert!(
+            i_ctx < i_def && i_def < i_sk,
+            "expected order: project_context < deferred_tools < skills; got {content}"
         );
     }
 

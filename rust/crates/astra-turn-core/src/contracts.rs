@@ -1,4 +1,3 @@
-use astra_services::MutationObjectiveScore;
 use async_trait::async_trait;
 
 use crate::activity::SessionActivityUpdatePlan;
@@ -216,63 +215,6 @@ pub struct TurnAuxiliaryEventRecord {
     pub reasoning_content: Option<String>,
 }
 
-// ─── Pipeline Learning ──────────────────────────────────────────────────────────
-
-/// Outcome of a completed turn, used to update pipeline learning modules
-/// (EntityGraph, PatternLibrary, ProgressiveCalibrator).
-#[derive(Clone, Debug)]
-pub struct TurnLearningOutcome {
-    /// The user's query text for this turn.
-    pub query: String,
-    /// Tool names that were selected for the LLM.
-    pub tools_selected: Vec<String>,
-    /// Tool names actually invoked by the LLM.
-    pub tools_used: Vec<String>,
-    /// Whether the turn completed successfully (no errors, tools ran).
-    pub success: bool,
-    /// Aggregate quality score (0.0–1.0), derived from tool quality assessments.
-    pub quality: f64,
-    /// Whether the user corrected the agent's behavior in a follow-up.
-    pub was_corrected: bool,
-    /// Routing metadata: task_type label from RoutingDecision.
-    pub task_type_label: Option<String>,
-    /// Routing metadata: domain_hint label from RoutingDecision.
-    pub domain_hint_label: Option<String>,
-    /// User feedback score (0-100), pulled from skill_selection_events.
-    /// Used to close the feedback loop: low scores indicate user dissatisfaction
-    /// even if the turn technically succeeded.
-    pub user_feedback_score: Option<i64>,
-    /// Risk that the turn's apparent success came from repetitive cheap actions
-    /// rather than genuine progress.
-    pub reward_hacking_risk: f64,
-    /// Human-readable reasons for the reward-hacking risk score.
-    pub reward_hacking_flags: Vec<String>,
-    /// Confidence that the turn has corroborating causal support from tool
-    /// evidence rather than a spurious success correlation.
-    pub causal_support_score: f64,
-    /// Human-readable reasons for weakened causal support.
-    pub causal_support_flags: Vec<String>,
-}
-
-impl TurnLearningOutcome {
-    pub fn mutation_objective_score(&self) -> MutationObjectiveScore {
-        MutationObjectiveScore::from_learning_signal(
-            self.quality,
-            self.user_feedback_score,
-            self.reward_hacking_risk,
-            self.causal_support_score,
-            self.was_corrected,
-        )
-    }
-}
-
-/// Trait for recording turn outcomes into pipeline learning modules.
-/// Implementations update EntityGraph, PatternLibrary, and ProgressiveCalibrator.
-#[async_trait]
-pub trait TurnLearningWriter: Send + Sync {
-    async fn record_outcome(&self, outcome: TurnLearningOutcome) -> Result<(), String>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,31 +317,5 @@ mod tests {
             reasoning_content: None,
         };
         assert_eq!(record.agent_id.as_deref(), Some("astra-cli"));
-    }
-
-    #[test]
-    fn turn_learning_outcome_exposes_mutation_objective_score() {
-        let outcome = TurnLearningOutcome {
-            query: "update the migration note".into(),
-            tools_selected: vec!["write_file".into()],
-            tools_used: vec!["write_file".into()],
-            success: true,
-            quality: 0.82,
-            was_corrected: false,
-            task_type_label: Some("mutate".into()),
-            domain_hint_label: Some("code".into()),
-            user_feedback_score: Some(90),
-            reward_hacking_risk: 0.15,
-            reward_hacking_flags: Vec::new(),
-            causal_support_score: 0.78,
-            causal_support_flags: Vec::new(),
-        };
-
-        let scoreboard = outcome.mutation_objective_score();
-        assert_eq!(scoreboard.quality.point, 0.82);
-        assert_eq!(scoreboard.user_feedback.map(|value| value.point), Some(0.9));
-        assert_eq!(scoreboard.reward_hacking_risk.point, 0.15);
-        assert_eq!(scoreboard.causal_support.point, 0.78);
-        assert!(!scoreboard.was_corrected);
     }
 }

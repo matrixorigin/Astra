@@ -1329,61 +1329,6 @@ pub(super) async fn handle_team_command(
                 }
             }
 
-            // Learning summary
-            if let Some(ref learning) = report.merged_learning {
-                let has_patterns = !learning.consensus_patterns.is_empty();
-                let has_facts = !learning.facts.is_empty();
-                let has_caution = !learning.cautionary_patterns.is_empty();
-                if has_patterns || has_facts || has_caution {
-                    eprintln!(
-                        "\n  🧠 Learning from {} agent{}:",
-                        learning.agent_count,
-                        if learning.agent_count == 1 { "" } else { "s" }
-                    );
-                    if has_patterns {
-                        eprintln!(
-                            "    {} {} consensus pattern{}",
-                            "•".dim(),
-                            learning.consensus_patterns.len(),
-                            if learning.consensus_patterns.len() == 1 {
-                                ""
-                            } else {
-                                "s"
-                            }
-                        );
-                    }
-                    if has_facts {
-                        eprintln!(
-                            "    {} {} discovered fact{}",
-                            "•".dim(),
-                            learning.facts.len(),
-                            if learning.facts.len() == 1 { "" } else { "s" }
-                        );
-                        for fact in learning.facts.iter().take(3) {
-                            eprintln!("      {} {}", "→".dim(), truncate_str(fact, 70).dim());
-                        }
-                        if learning.facts.len() > 3 {
-                            eprintln!(
-                                "      {} ...and {} more",
-                                "→".dim(),
-                                learning.facts.len() - 3
-                            );
-                        }
-                    }
-                    if has_caution {
-                        eprintln!(
-                            "    {} {} cautionary pattern{}",
-                            "⚡".dim(),
-                            learning.cautionary_patterns.len(),
-                            if learning.cautionary_patterns.len() == 1 {
-                                ""
-                            } else {
-                                "s"
-                            }
-                        );
-                    }
-                }
-            }
             eprintln!();
 
             // Record this execution in history (in-memory + persistence service)

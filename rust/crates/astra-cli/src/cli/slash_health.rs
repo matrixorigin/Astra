@@ -172,30 +172,12 @@ pub(super) fn display_sync_status(status: &astra_services::SyncStatus) {
         "⚠ Error".yellow().to_string()
     } else if status.pending_pushes > 0 {
         "● Pending".yellow().to_string()
-    } else if status.learning_last_push.is_some() || status.learning_last_pull.is_some() {
+    } else if status.preferences_last_sync.is_some() {
         "✓ Connected".green().to_string()
     } else {
         "○ No sync history".to_string()
     };
     eprintln!("  Status: {overall}");
-
-    // Last push
-    match &status.learning_last_push {
-        Some(ts) => {
-            let age = format_sync_age(ts);
-            eprintln!("  Last push:  {} ({})", ts.as_str().cyan(), age);
-        }
-        None => eprintln!("  Last push:  {}", "never".dim()),
-    }
-
-    // Last pull
-    match &status.learning_last_pull {
-        Some(ts) => {
-            let age = format_sync_age(ts);
-            eprintln!("  Last pull:  {} ({})", ts.as_str().cyan(), age);
-        }
-        None => eprintln!("  Last pull:  {}", "never".dim()),
-    }
 
     // Preferences
     if let Some(ts) = &status.preferences_last_sync {

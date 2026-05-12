@@ -239,7 +239,6 @@ impl SessionStatePatch {
     /// Every field is explicitly set — no diffing.
     pub fn from_full(state: &SessionStateCompact) -> Self {
         Self {
-            continuity: Some(state.continuity.clone()),
             blocked_tools: Some(state.blocked_tools.clone()),
             recent_tools: Some(state.recent_tools.clone()),
             approval_overrides: Some(state.approval_overrides.clone()),
@@ -566,7 +565,6 @@ mod tests {
     #[tokio::test]
     async fn session_state_patch_from_full_covers_all_fields() {
         let state = SessionStateCompact {
-            continuity: None,
             blocked_tools: vec!["bash".into()],
             recent_tools: vec!["read".into()],
             approval_overrides: Some(json!({"x": 1})),
@@ -583,8 +581,6 @@ mod tests {
         };
 
         let patch = SessionStatePatch::from_full(&state);
-        // continuity: None in compact → Some(None) in patch = "clear it"
-        assert_eq!(patch.continuity, Some(None));
         assert_eq!(patch.blocked_tools, Some(vec!["bash".into()]));
         assert_eq!(patch.recent_tools, Some(vec!["read".into()]));
         assert_eq!(patch.approval_overrides, Some(Some(json!({"x": 1}))));
@@ -761,60 +757,6 @@ mod tests {
             remaining.is_empty(),
             "store should be empty after reset, but has {} entries",
             remaining.len()
-        );
-    }
-
-    // ── Bug #2: from_full must express "clear continuity" ──
-
-    #[tokio::test]
-    async fn from_full_clears_continuity_when_compact_has_none() {
-        let tmp = TempDir::new().unwrap();
-        let store = make_store(&tmp);
-        let mut mgr = CslManager::new(
-            Arc::clone(&store),
-            "test-clear-cont".into(),
-            CslManagerConfig::default(),
-        )
-        .unwrap();
-
-        // Turn 1: state WITH continuity set.
-        let continuity = astra_turn_types::continuity::ContinuityState {
-            goal: Default::default(),
-            todos: Default::default(),
-            facts: Default::default(),
-            user_corrections: vec![],
-            verification: Default::default(),
-        };
-        let state1 = SessionStateCompact {
-            continuity: Some(continuity),
-            ..Default::default()
-        };
-        mgr.persist_turn(1, &[user_msg("t1")], &state1)
-            .await
-            .unwrap();
-
-        // Turn 2: state WITHOUT continuity (cleared).
-        let state2 = SessionStateCompact {
-            continuity: None,
-            ..Default::default()
-        };
-        mgr.mark_turn_start(1);
-        mgr.persist_turn(2, &[user_msg("t1"), user_msg("t2")], &state2)
-            .await
-            .unwrap();
-
-        // Reload: continuity must be None (cleared), not carried over from turn 1.
-        let mut mgr2 = CslManager::new(
-            Arc::clone(&store),
-            "test-clear-cont".into(),
-            CslManagerConfig::default(),
-        )
-        .unwrap();
-        let mat = mgr2.load().await.unwrap().unwrap();
-        assert!(
-            mat.session_state.continuity.is_none(),
-            "continuity should be cleared but was: {:?}",
-            mat.session_state.continuity
         );
     }
 

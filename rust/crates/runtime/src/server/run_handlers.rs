@@ -75,6 +75,15 @@ pub(super) fn transform_stream_run_events_for_client_with_pending(
         }
 
         let mut transformed = transform_run_event_for_client(event);
+        // wip-7 allowlist: the transform returns `Value::Null` for
+        // events outside the external client allowlist (e.g.
+        // `injection_freshness`). Skip them entirely rather than
+        // pushing a bare `null` into the SSE stream — that would
+        // either serialize as `data: null` (confusing) or need
+        // downstream null-skipping everywhere.
+        if transformed.is_null() {
+            continue;
+        }
         if matches!(
             event_type.as_str(),
             "run_started" | "run_paused" | "run_resumed" | "run_finished"

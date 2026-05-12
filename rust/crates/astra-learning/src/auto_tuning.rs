@@ -232,8 +232,6 @@ pub enum EvolutionTrigger {
     },
     /// Consistent negative feedback.
     NegativeFeedbackStreak { count: u32 },
-    /// Pattern confidence drop.
-    PatternDrift { confidence_drop: f64 },
     /// Custom signal accumulation.
     SignalAccumulation {
         signal_type: String,
@@ -825,15 +823,6 @@ impl AutoTuningEngine {
 
     /// Evaluate all rules and return triggered actions.
     pub fn evaluate(&self, config: &RuntimeConfig) -> Vec<(EvolutionRule, EvolutionAction)> {
-        self.evaluate_with_patterns(config, None)
-    }
-
-    /// Evaluate rules with optional pattern library for drift detection.
-    pub fn evaluate_with_patterns(
-        &self,
-        config: &RuntimeConfig,
-        drift_source: Option<&dyn crate::DriftSource>,
-    ) -> Vec<(EvolutionRule, EvolutionAction)> {
         if !*self.enabled.read_or_recover() {
             return Vec::new();
         }
@@ -862,7 +851,7 @@ impl AutoTuningEngine {
             }
 
             // Evaluate trigger
-            if self.evaluate_trigger(&rule.trigger, &aggregator, config, drift_source) {
+            if self.evaluate_trigger(&rule.trigger, &aggregator, config) {
                 triggered.push((rule.clone(), rule.action.clone()));
             }
         }
@@ -927,16 +916,6 @@ impl AutoTuningEngine {
         self.execute_actions(config, actions)
     }
 
-    /// Run one evaluation cycle with pattern drift detection.
-    pub fn run_cycle_with_patterns(
-        &self,
-        config: &mut RuntimeConfig,
-        drift_source: Option<&dyn crate::DriftSource>,
-    ) -> Vec<RuleExecution> {
-        let actions = self.evaluate_with_patterns(config, drift_source);
-        self.execute_actions(config, actions)
-    }
-
     /// Check if any rollback conditions are met and perform rollbacks.
     pub fn check_rollbacks(&self, config: &mut RuntimeConfig) -> Vec<String> {
         let mut rolled_back = Vec::new();
@@ -996,7 +975,6 @@ impl AutoTuningEngine {
         trigger: &EvolutionTrigger,
         aggregator: &FeedbackAggregator,
         _config: &RuntimeConfig,
-        drift_source: Option<&dyn crate::DriftSource>,
     ) -> bool {
         match trigger {
             EvolutionTrigger::LowSuccessRate {
@@ -1049,16 +1027,6 @@ impl AutoTuningEngine {
 
             EvolutionTrigger::NegativeFeedbackStreak { count } => {
                 aggregator.negative_streak() >= *count
-            }
-
-            EvolutionTrigger::PatternDrift { confidence_drop } => {
-                // Check if any pattern has drifted by the threshold amount
-                let Some(lib) = drift_source else {
-                    return false;
-                };
-                // Find maximum drift score across all patterns
-                let max_drift = lib.max_drift_score();
-                max_drift >= *confidence_drop
             }
 
             EvolutionTrigger::SignalAccumulation {
@@ -1555,20 +1523,6 @@ pub fn default_rules() -> Vec<EvolutionRule> {
         )
         .with_name("Expand memory on long pauses")
         .with_cooldown(Duration::from_secs(600)),
-        // ── Pattern drift surface ──
-        // Pattern confidence drop → alert + expand exploration
-        EvolutionRule::new(
-            "pattern-drift-alert",
-            EvolutionTrigger::PatternDrift {
-                confidence_drop: 0.3,
-            },
-            EvolutionAction::Alert {
-                message: "Pattern confidence drift detected (>0.3 drop)".to_string(),
-                severity: AlertSeverity::Warning,
-            },
-        )
-        .with_name("Alert on pattern drift")
-        .with_cooldown(Duration::from_secs(1800)),
     ]
 }
 
@@ -1940,7 +1894,7 @@ mod tests {
     #[test]
     fn test_default_rules() {
         let rules = default_rules();
-        assert_eq!(rules.len(), 10);
+        assert_eq!(rules.len(), 9);
         assert!(rules.iter().any(|r| r.id == "low-success-boost-confidence"));
         assert!(rules.iter().any(|r| r.id == "correction-raise-strictness"));
         assert!(rules.iter().any(|r| r.id == "churn-expand-memory"));
@@ -1948,7 +1902,6 @@ mod tests {
         assert!(rules.iter().any(|r| r.id == "high-tokens-compress-earlier"));
         assert!(rules.iter().any(|r| r.id == "quick-followup-trim-history"));
         assert!(rules.iter().any(|r| r.id == "long-pause-expand-memory"));
-        assert!(rules.iter().any(|r| r.id == "pattern-drift-alert"));
     }
 
     #[test]

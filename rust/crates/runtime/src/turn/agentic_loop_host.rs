@@ -93,28 +93,6 @@ pub use astra_turn_core::interaction_types::{
     interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence,
 };
 
-/// Request for a hidden host-executed reflection subcall.
-pub struct HostReflectionRequest<'a> {
-    /// Structured runtime context that motivated the reflection.
-    pub context: &'a crate::liquid::reflection::ReflectionContext,
-    /// System prompt for the reflection subcall.
-    pub system_prompt: &'a str,
-    /// User prompt for the reflection subcall.
-    pub user_prompt: &'a str,
-    /// Optional output cap for the reflection response.
-    pub max_output_tokens: Option<usize>,
-}
-
-/// Result from a hidden host-executed reflection subcall.
-pub struct HostReflectionResult {
-    pub full_text: String,
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub has_usage: bool,
-}
-
 // ─── Host trait ──────────────────────────────────────────────────────────────
 
 /// Abstraction for host-specific agentic loop behavior.
@@ -144,27 +122,11 @@ pub trait AgenticLoopHost: Send {
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, astra_core::ClassifiedError>;
 
-    /// Whether the host can execute a hidden reflection-only LLM subcall.
-    fn supports_auto_reflection(&self) -> bool {
-        false
-    }
-
     /// Whether the host already injects round budget guidance into the system
     /// prompt during `execute_turn`.  When true, the agentic loop skips its
     /// own user-message guidance injection to avoid double injection.
     fn injects_round_guidance(&self) -> bool {
         false
-    }
-
-    /// Execute a hidden reflection-only LLM subcall and return the raw text.
-    ///
-    /// Hosts that do not support this can keep the default implementation.
-    async fn execute_reflection(
-        &mut self,
-        _state: &mut AgenticLoopState,
-        _request: HostReflectionRequest<'_>,
-    ) -> Result<Option<HostReflectionResult>, astra_core::ClassifiedError> {
-        Ok(None)
     }
 
     /// Headless round terminal output.
@@ -825,16 +787,6 @@ pub struct AgenticLoopState {
     /// Current nested agent/sub-run depth. Root loops start at 0.
     pub recursion_depth: u8,
 
-    /// Current turn's attention manifest text (`[attention:v1]\n…`), when
-    /// non-trivial. Populated by `inject_runtime_attention_manifest` and
-    /// routed into the **volatile system-prompt lane** by the host's
-    /// payload builder. Must NOT be pushed into `messages[]` — the
-    /// manifest drifts every turn and doing so breaks prefix cache.
-    ///
-    /// `None` when the continuity state is the trivial "nothing to
-    /// report" shape — the volatile block emits nothing in that case.
-    pub attention_manifest_text: Option<String>,
-
     // ── Accumulated output ──
     pub final_text: String,
     /// True once the current `final_text` has already been sent to the user.
@@ -859,6 +811,13 @@ pub struct AgenticLoopState {
     // ── Turn management ──
     pub max_turns: usize,
     pub remaining_turns: usize,
+    /// Latches for the per-budget self-pacing hints emitted at
+    /// 50 % / 20 % remaining. Reset when a budget extension
+    /// lands so the newly-extended budget gets the hint sequence
+    /// at the new threshold crossings. See
+    /// `maybe_emit_turn_budget_self_pacing_hint`.
+    pub turn_budget_hint_emitted_50: bool,
+    pub turn_budget_hint_emitted_20: bool,
     pub agentic_turn_budget: astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
     /// Current agentic loop turn index (0-based, updated each iteration).
     /// Used by the CLI to inject `round_index` into the bridge payload so the
@@ -1030,11 +989,6 @@ pub struct AgenticLoopState {
     /// When the gate returns `false`, the loop aborts with `Cancelled`.
     pub checkpoint_gate: Option<Arc<dyn crate::server::delegation_engine::CheckpointGate>>,
 
-    // ── Evolution ──
-    /// Optional evolution service for multi-axis self-evolution.
-    /// When set, tool results and user messages feed into signal collection.
-    pub evolution_service: Option<Arc<crate::evolution::service::EvolutionService>>,
-
     // ── Rate Limit Cooldown ──
     /// Cross-turn rate-limit cooldown tracker.  When the loop detects a
     /// rate-limit error (429 / TPM / RPM), it records it here so subsequent
@@ -1055,13 +1009,7 @@ pub struct AgenticLoopState {
     /// Set by `apply_adaptive_execution_profile` from `config.tool_selection.tool_budget_tokens`.
     pub tool_budget_override: Option<u32>,
 
-    // ── Auto-reflection ──
-    /// Accumulated LLM-routed evolution signals awaiting reflection.
-    /// Filled during tuning cycles; drained when threshold is met and
-    /// reflection prompt is injected.
-    pub pending_reflection_signals: Vec<astra_evolution::types::EvolutionSignal>,
-    /// Recent tactical adaptations applied while the current reflection window
-    /// was accumulating. Drained into the next auto-reflection context.
+    /// Recent tactical adaptations applied while liquid tactical tuning runs.
     pub recent_tactical_actions: Vec<String>,
 
     // ── Server-side tool execution ──
@@ -1080,10 +1028,22 @@ pub struct AgenticLoopState {
     /// Used for facts-first anchor, injection, compaction, and microcompact pin list.
     pub session_facts: astra_turn_types::session_facts::SessionFacts,
 
-    // ── Runtime-owned continuity (goal/todo/attention) ──
-    /// Deterministic continuity state used to reconstruct attention every LLM round
-    /// without relying on model-invoked task tools.
-    pub continuity: astra_turn_types::continuity::ContinuityState,
+    // ── Session-memory extraction (LLM-backed L1) ──
+    /// Coordinator for background session-memory extraction. When `Some`,
+    /// `finalize_and_render` calls `svc.maybe_spawn(req)` after each
+    /// turn; the service owns LLM selector resolution, selector
+    /// cooldown, in-flight dedup, the event stream, the UX broker,
+    /// AND the per-session debounce state. When `None` (tests, sub-runs
+    /// that opt out), no extraction happens and no events are emitted.
+    /// Cloned from the host service at state-build time.
+    ///
+    /// Per-session debounce state (`initialized`, `tokens_at_last_extraction`,
+    /// …) deliberately lives *inside* the service — not here — because
+    /// `AgenticLoopState` is rebuilt every turn and would lose the
+    /// debounce across turns, making the "growth delta" branch of the
+    /// gate structurally unreachable.
+    pub memory_extraction_service:
+        Option<std::sync::Arc<crate::session_memory::MemoryExtractionService>>,
 
     /// Provider-aware compaction strategy for microcompact placeholders.
     pub compact_strategy: astra_turn_core::microcompact::CompactStrategy,
@@ -1305,8 +1265,7 @@ pub(crate) const MAX_TRACKED_FILE_READS: usize = 20;
 pub(crate) use super::agentic_adaptive_tuning::{
     DEFAULT_TUNING_CYCLE_INTERVAL, apply_adaptive_execution_profile, apply_per_turn_adaptation,
     apply_tactical_actions, maybe_run_tuning_cycle, record_loop_completion_feedback,
-    record_new_evolution_promotion_events, should_emit_adaptive_scenario_event,
-    snapshot_evolution_promotion_ids,
+    should_emit_adaptive_scenario_event,
 };
 pub use super::agentic_loop_tool_support::delegate_tool_schema;
 #[allow(unused_imports)]
@@ -1345,11 +1304,6 @@ pub(crate) use super::agentic_delegate_interception::{
     tool_call_arguments_value, tool_call_name,
 };
 
-#[allow(unused_imports)]
-// threshold const is test-only; re-exported here so tests can reach it
-pub(crate) use super::agentic_auto_reflection::{
-    AUTO_REFLECTION_SIGNAL_THRESHOLD, maybe_trigger_auto_reflection,
-};
 #[allow(unused_imports)]
 pub(crate) use super::agentic_loop_execution_phase::{
     TurnExecutionControl, TurnExecutionPhase, execute_turn_and_ingest_phase,
@@ -1596,12 +1550,6 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             }
         }
 
-        // Drain evolution signals / trigger auto-reflection on the production
-        // agentic loop path. Previously this was only reached via tests, which
-        // caused `reflect` / auto-tuning capabilities to appear regressed at
-        // runtime.
-        maybe_trigger_auto_reflection(host, state).await;
-
         // ── Harness: PostTurn — Block/Pause halts session ──
         #[cfg(feature = "harness")]
         match harness_at!(&state.harness, astra_harness::HookPoint::PostTurn, state) {
@@ -1773,7 +1721,6 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         context_manifest_user_id: None,
         context_manifest_model_name: None,
         recursion_depth: 0,
-        attention_manifest_text: None,
         final_text: String::new(),
         final_text_streamed: false,
         total_prompt: 0,
@@ -1785,6 +1732,8 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         has_any_usage: false,
         max_turns: 10,
         remaining_turns: 10,
+        turn_budget_hint_emitted_50: false,
+        turn_budget_hint_emitted_20: false,
         agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
         current_round_index: 0,
         llm_rounds_completed: 0,
@@ -1824,7 +1773,6 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         delegations_this_turn: 0,
         project_context: None,
         checkpoint_gate: None,
-        evolution_service: None,
         rate_limit_cooldown: Default::default(),
         data_snapshot_provider: None,
         last_composite_snapshot: None,
@@ -1845,12 +1793,11 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         tactical_adapter: None,
         step_signal_collector: None,
         tool_budget_override: None,
-        pending_reflection_signals: Vec::new(),
         recent_tactical_actions: Vec::new(),
         server_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
-        continuity: Default::default(),
+        memory_extraction_service: None,
         compact_strategy: Default::default(),
         approval_overrides: None,
         confidence_trend: Default::default(),
@@ -1892,9 +1839,6 @@ pub(crate) mod tests {
         quiet: bool,
         interaction_mode: TurnInteractionMode,
         pub(crate) injected_schemas: Vec<Value>,
-        reflection_text: Option<String>,
-        reflection_error: Option<String>,
-        pub(crate) last_reflection_prompt: Option<String>,
         pub(crate) rendered_final_text: Vec<String>,
         pub(crate) executed_messages: Vec<Vec<Value>>,
         /// PR 5a test observer: number of times the turn loop has
@@ -1915,9 +1859,6 @@ pub(crate) mod tests {
                 quiet: true,
                 interaction_mode: TurnInteractionMode::NonInteractive,
                 injected_schemas: Vec::new(),
-                reflection_text: None,
-                reflection_error: None,
-                last_reflection_prompt: None,
                 rendered_final_text: Vec::new(),
                 executed_messages: Vec::new(),
                 turn_completed_run_ids: Vec::new(),
@@ -1937,16 +1878,6 @@ pub(crate) mod tests {
         pub(crate) fn turn_count(&self) -> usize {
             self.current_turn
         }
-
-        pub(crate) fn with_reflection_text(mut self, text: &str) -> Self {
-            self.reflection_text = Some(text.to_string());
-            self
-        }
-
-        fn with_reflection_error(mut self, error: &str) -> Self {
-            self.reflection_error = Some(error.to_string());
-            self
-        }
     }
 
     #[async_trait]
@@ -1965,32 +1896,6 @@ pub(crate) mod tests {
             let result = self.turn_results.remove(0);
             self.current_turn += 1;
             Ok(result)
-        }
-
-        fn supports_auto_reflection(&self) -> bool {
-            self.reflection_text.is_some() || self.reflection_error.is_some()
-        }
-
-        async fn execute_reflection(
-            &mut self,
-            _state: &mut AgenticLoopState,
-            request: HostReflectionRequest<'_>,
-        ) -> Result<Option<HostReflectionResult>, astra_core::ClassifiedError> {
-            self.last_reflection_prompt = Some(request.user_prompt.to_string());
-            if let Some(error) = self.reflection_error.take() {
-                return Err(error.into());
-            }
-            let Some(text) = self.reflection_text.take() else {
-                return Ok(None);
-            };
-            Ok(Some(HostReflectionResult {
-                full_text: text,
-                prompt_tokens: 91,
-                completion_tokens: 37,
-                cache_read_tokens: 0,
-                cache_creation_tokens: 0,
-                has_usage: true,
-            }))
         }
 
         fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
@@ -2143,18 +2048,6 @@ pub(crate) mod tests {
         }
     }
 
-    fn make_edge_tool_with_status(name: &str, status: &str, output: &str) -> EdgeToolExecResult {
-        EdgeToolExecResult {
-            request_id: format!("req-{name}"),
-            tool: name.to_string(),
-            args: json!({}),
-            output: output.to_string(),
-            tool_result_fields: None,
-            status: status.to_string(),
-            duration_ms: 10,
-        }
-    }
-
     // ── State builder ───────────────────────────────────────────────────────
 
     pub(crate) fn make_state() -> AgenticLoopState {
@@ -2169,7 +2062,6 @@ pub(crate) mod tests {
             context_manifest_user_id: None,
             context_manifest_model_name: None,
             recursion_depth: 0,
-            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -2181,6 +2073,8 @@ pub(crate) mod tests {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            turn_budget_hint_emitted_50: false,
+            turn_budget_hint_emitted_20: false,
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
@@ -2222,7 +2116,6 @@ pub(crate) mod tests {
             delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
-            evolution_service: None,
             rate_limit_cooldown: Default::default(),
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -2243,12 +2136,11 @@ pub(crate) mod tests {
             tactical_adapter: None,
             step_signal_collector: None,
             tool_budget_override: None,
-            pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
-            continuity: Default::default(),
+            memory_extraction_service: None,
             compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),
@@ -2305,33 +2197,6 @@ pub(crate) mod tests {
         assert!(!should_emit_adaptive_scenario_event(false, false, true));
         assert!(!should_emit_adaptive_scenario_event(true, true, true));
         assert!(!should_emit_adaptive_scenario_event(false, true, false));
-    }
-
-    #[test]
-    fn edge_tool_observability_records_goal_tracker_without_hub() {
-        let mut state = make_state();
-        let session = std::sync::Arc::new(std::sync::RwLock::new(
-            crate::observability_integration::ObservabilitySession::new_simple("sess-1"),
-        ));
-        {
-            let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
-            guard.turn_number = 1;
-            guard.record_query("run tests for authentication flow");
-        }
-        state.telemetry.observability_session = Some(session.clone());
-
-        let edge_tools = vec![
-            make_edge_tool_with_status("bash", "ok", "test result: ok. 24 passed; 0 failed"),
-            make_edge_tool_with_status("bash", "error", "test result: FAILED. 1 passed; 2 failed"),
-        ];
-        record_edge_tool_observability(&mut state, &edge_tools);
-
-        let progress = session
-            .read()
-            .unwrap()
-            .goal_progress()
-            .expect("goal progress");
-        assert_eq!(progress.milestone_count, 2);
     }
 
     #[tokio::test]
@@ -4242,66 +4107,37 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn skill_listing_system_message_format() {
-        use crate::skills::manifest::SkillSourceKind;
-        use crate::turn::skill_tool::{SkillToolInfo, skill_listing_system_message};
+    fn skill_listing_section_format() {
+        use crate::prompts::build_skill_listing_section;
+        use crate::turn::skill_tool::SkillToolInfo;
 
         let skills = vec![
             SkillToolInfo {
                 name: "review".into(),
                 description: "Code review".into(),
-                when_to_use: None,
-                source: SkillSourceKind::Bundled,
-                aliases: vec![],
-                category: None,
-                tags: vec![],
-                triggers: vec![],
+                ..Default::default()
             },
             SkillToolInfo {
                 name: "debug".into(),
                 description: "Debug issues".into(),
-                when_to_use: None,
-                source: SkillSourceKind::Bundled,
-                aliases: vec![],
-                category: None,
-                tags: vec![],
-                triggers: vec![],
+                ..Default::default()
             },
         ];
 
-        let msg = skill_listing_system_message(&skills, None, None, false);
-        let content = msg["content"].as_str().unwrap();
-
-        // Must contain skill names in XML format
-        assert!(
-            content.contains("<name>review</name>"),
-            "missing review skill"
-        );
-        assert!(
-            content.contains("<name>debug</name>"),
-            "missing debug skill"
-        );
-        assert!(
-            content.contains("<available_skills>"),
-            "missing opening tag"
-        );
-        assert!(
-            content.contains("</available_skills>"),
-            "missing closing tag"
-        );
-        // Must be a system message
-        assert_eq!(msg["role"], "system");
+        let section = build_skill_listing_section(&skills).expect("non-empty");
+        assert!(section.text.contains("<name>review</name>"));
+        assert!(section.text.contains("<name>debug</name>"));
+        assert!(section.text.contains("<available_skills>"));
+        assert!(section.text.contains("</available_skills>"));
     }
 
     #[test]
-    fn skill_listing_empty_skills_produces_no_message() {
-        use crate::turn::skill_tool::skill_listing_system_message;
-        // With empty skills, the function still returns a message but with no skill entries
-        let msg = skill_listing_system_message(&[], None, None, false);
-        let content = msg["content"].as_str().unwrap();
-        // Should have the wrapper but no <skill> entries
-        assert!(content.contains("<available_skills>"));
-        assert!(!content.contains("<name>"));
+    fn skill_listing_empty_skills_produces_no_section() {
+        use crate::prompts::build_skill_listing_section;
+        assert!(
+            build_skill_listing_section(&[]).is_none(),
+            "empty skill list must produce no section"
+        );
     }
 
     #[tokio::test]
@@ -4331,64 +4167,51 @@ pub(crate) mod tests {
 
     #[test]
     fn skill_listing_refresh_updates_field() {
-        use crate::skills::manifest::SkillSourceKind;
-        use crate::turn::skill_tool::{SkillToolInfo, skill_listing_system_message};
+        use crate::prompts::build_skill_listing_section;
+        use crate::turn::skill_tool::SkillToolInfo;
 
         let mut state = make_state();
-
-        // Initial: no listing
         assert!(state.skills.listing_message.is_none());
 
-        // Simulate first refresh with 1 skill
         let skills_v1 = vec![SkillToolInfo {
             name: "review".into(),
             description: "v1".into(),
-            when_to_use: None,
-            source: SkillSourceKind::Bundled,
-            aliases: vec![],
-            category: None,
-            tags: vec![],
-            triggers: vec![],
+            ..Default::default()
         }];
-        state.skills.listing_message =
-            Some(skill_listing_system_message(&skills_v1, None, None, false));
-        let v1_content = state.skills.listing_message.as_ref().unwrap()["content"]
+        let section_v1 = build_skill_listing_section(&skills_v1).unwrap();
+        state.skills.listing_message = Some(json!({
+            "role": "system",
+            "content": section_v1.text,
+        }));
+        let v1 = state.skills.listing_message.as_ref().unwrap()["content"]
             .as_str()
             .unwrap()
             .to_string();
-        assert!(v1_content.contains("review"));
+        assert!(v1.contains("review"));
 
-        // Simulate second refresh with 2 skills (hot-reload added one)
         let skills_v2 = vec![
             SkillToolInfo {
                 name: "review".into(),
                 description: "v2".into(),
-                when_to_use: None,
-                source: SkillSourceKind::Bundled,
-                aliases: vec![],
-                category: None,
-                tags: vec![],
-                triggers: vec![],
+                ..Default::default()
             },
             SkillToolInfo {
                 name: "debug".into(),
                 description: "new".into(),
-                when_to_use: None,
-                source: SkillSourceKind::Bundled,
-                aliases: vec![],
-                category: None,
-                tags: vec![],
-                triggers: vec![],
+                ..Default::default()
             },
         ];
-        state.skills.listing_message =
-            Some(skill_listing_system_message(&skills_v2, None, None, false));
-        let v2_content = state.skills.listing_message.as_ref().unwrap()["content"]
+        let section_v2 = build_skill_listing_section(&skills_v2).unwrap();
+        state.skills.listing_message = Some(json!({
+            "role": "system",
+            "content": section_v2.text,
+        }));
+        let v2 = state.skills.listing_message.as_ref().unwrap()["content"]
             .as_str()
             .unwrap()
             .to_string();
         assert!(
-            v2_content.contains("debug"),
+            v2.contains("debug"),
             "new skill should appear after refresh"
         );
     }
@@ -6483,6 +6306,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
             let mut guard = session.write().unwrap();
             guard.config.token_budget.max_turn_input_tokens = 80_000;
             guard.config.context_window.adaptive = true;
+            // Opt in to the (off-by-default) shrink path.
+            guard.config.context_window.adaptive_budget_reduction = true;
         }
         state.max_turn_input_tokens = 80_000;
 
@@ -6502,6 +6327,32 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert_eq!(
             state.max_turn_input_tokens, guard.config.token_budget.max_turn_input_tokens as u64,
             "loop state should stay in sync"
+        );
+    }
+
+    #[test]
+    fn per_turn_adaptation_does_not_shrink_by_default() {
+        // Regression guard: adaptive_budget_reduction is OFF by default.
+        // Session 0e37eb46 shrank its own ceiling under pressure, produced
+        // a progress summary, and gave up. The shrink path must be opt-in.
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_session = Some(session.clone());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.token_budget.max_turn_input_tokens = 80_000;
+            guard.config.context_window.adaptive = true;
+            // adaptive_budget_reduction stays at default (false).
+        }
+        state.max_turn_input_tokens = 80_000;
+
+        apply_per_turn_adaptation(&mut state, 72_000);
+
+        let guard = session.read().unwrap();
+        assert_eq!(
+            guard.config.token_budget.max_turn_input_tokens, 80_000,
+            "budget must be unchanged when adaptive_budget_reduction is off"
         );
     }
 
@@ -6808,6 +6659,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             let mut guard = session.write().unwrap();
             guard.config.token_budget.max_turn_input_tokens = 80_000;
             guard.config.context_window.adaptive = true;
+            guard.config.context_window.adaptive_budget_reduction = true;
             guard.turn_number = 10;
             // Previous increase was at turn 2 — well past cooldown
             guard.last_token_budget_direction = 1;
@@ -6839,6 +6691,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             let mut guard = session.write().unwrap();
             guard.config.token_budget.max_turn_input_tokens = 80_000;
             guard.config.context_window.adaptive = true;
+            guard.config.context_window.adaptive_budget_reduction = true;
             guard.turn_number = 5;
             // Previous change was also a decrease
             guard.last_token_budget_direction = -1;
@@ -6900,6 +6753,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             let mut guard = session.write().unwrap();
             guard.config.token_budget.max_turn_input_tokens = 80_000;
             guard.config.context_window.adaptive = true;
+            guard.config.context_window.adaptive_budget_reduction = true;
             guard.turn_number = 1;
         }
         state.max_turn_input_tokens = 80_000;
@@ -7891,741 +7745,6 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let should_enter =
             state.step_signal_collector.is_some() || state.tactical_adapter.is_some();
         assert!(!should_enter, "Neither field set — block should be skipped");
-    }
-
-    // ── L2.5 Auto-reflection tests ──────────────────────────────────────────
-
-    #[tokio::test]
-    async fn auto_reflection_skips_without_evolution_service() {
-        let mut host = MockHost::new(vec![]);
-        let mut state = make_state();
-        assert!(state.evolution_service.is_none());
-        assert!(state.pending_reflection_signals.is_empty());
-
-        // Should be a no-op — no panic, no messages added.
-        let msg_count = state.messages.len();
-        maybe_trigger_auto_reflection(&mut host, &mut state).await;
-        assert_eq!(state.messages.len(), msg_count);
-        assert!(state.pending_reflection_signals.is_empty());
-    }
-
-    #[tokio::test]
-    async fn auto_reflection_accumulates_below_threshold() {
-        let mut host = MockHost::new(vec![]);
-        let mut state = make_state();
-
-        // Add fewer signals than threshold.
-        state.pending_reflection_signals.push(
-            astra_evolution::types::EvolutionSignal::RepeatedStall {
-                tool_chain: vec!["test".into()],
-                stall_count: 5,
-                turn_id: "t1".into(),
-            },
-        );
-        assert_eq!(state.pending_reflection_signals.len(), 1);
-
-        // Without evolution service, signals stay.
-        let msg_count = state.messages.len();
-        maybe_trigger_auto_reflection(&mut host, &mut state).await;
-        assert_eq!(state.messages.len(), msg_count);
-        // Signals are NOT drained (no evo service to flush).
-        assert_eq!(state.pending_reflection_signals.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn auto_reflection_triggers_at_threshold() {
-        let reflection_response = r#"{
-            "proposals": [
-                {
-                    "axis": "pattern",
-                    "description": "Demote failing chain",
-                    "confidence": 0.8,
-                    "details": { "signature": "tool_0", "action": "demote" }
-                }
-            ],
-            "summary": "One issue found."
-        }"#;
-        let mut host = MockHost::new(vec![]).with_reflection_text(reflection_response);
-        let mut state = make_state();
-
-        // Create an evolution service.
-        let evo = std::sync::Arc::new(crate::evolution::service::EvolutionService::new());
-        state.evolution_service = Some(evo.clone());
-
-        // Pre-load signals at threshold.
-        for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
-            state.pending_reflection_signals.push(
-                astra_evolution::types::EvolutionSignal::RepeatedStall {
-                    tool_chain: vec![format!("tool_{i}")],
-                    stall_count: 3,
-                    turn_id: format!("t{i}"),
-                },
-            );
-        }
-        assert_eq!(
-            state.pending_reflection_signals.len(),
-            AUTO_REFLECTION_SIGNAL_THRESHOLD
-        );
-
-        let msg_count = state.messages.len();
-        maybe_trigger_auto_reflection(&mut host, &mut state).await;
-
-        // Signals should be drained.
-        assert!(
-            state.pending_reflection_signals.is_empty(),
-            "Signals should be drained after reflection"
-        );
-        assert_eq!(state.messages.len(), msg_count);
-        assert_eq!(evo.pending().await.len(), 1);
-        assert_eq!(state.total_prompt, 91);
-        assert_eq!(state.total_completion, 37);
-        assert!(host.emitted_lines.iter().any(|line| {
-            line.contains("processed 1 proposal(s): 0 auto-applied, 0 canary-started, 1 queued")
-        }));
-    }
-
-    #[tokio::test]
-    async fn auto_reflection_injects_pipeline_diagnosis_into_prompt() {
-        // Seed runtime signals that the pipeline stage bridge recognises as a
-        // `ToolFailures` category, and assert the structured diagnosis is
-        // wired into the LLM reflection prompt via `recent_tactical_actions`.
-        let reflection_response = r#"{"proposals": [], "summary": "noop"}"#;
-        let mut host = MockHost::new(vec![]).with_reflection_text(reflection_response);
-        let mut state = make_state();
-
-        let evo = std::sync::Arc::new(crate::evolution::service::EvolutionService::new());
-        state.evolution_service = Some(evo.clone());
-
-        // Attach an observability session so the auto-reflection bridge can
-        // publish last_strategy_application → surfaced by SelfModel rendering.
-        let obs_session = std::sync::Arc::new(std::sync::RwLock::new(
-            crate::observability_integration::ObservabilitySession::new_simple("sess-e2e"),
-        ));
-        state.telemetry.observability_session = Some(obs_session.clone());
-
-        // Repeated failures on the same tool → FailureCategory::ToolFailures.
-        let fail_rec = |err: &str| ToolCallRecord {
-            name: "flaky_http".into(),
-            ok: false,
-            ms: 1,
-            error: Some(err.into()),
-            ..Default::default()
-        };
-        state.stall.tool_call_records = vec![fail_rec("500"), fail_rec("500"), fail_rec("timeout")];
-
-        for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
-            state.pending_reflection_signals.push(
-                astra_evolution::types::EvolutionSignal::RepeatedStall {
-                    tool_chain: vec![format!("tool_{i}")],
-                    stall_count: 3,
-                    turn_id: format!("t{i}"),
-                },
-            );
-        }
-
-        maybe_trigger_auto_reflection(&mut host, &mut state).await;
-
-        let prompt = host
-            .last_reflection_prompt
-            .as_deref()
-            .expect("reflection prompt captured");
-        assert!(
-            prompt.contains("pipeline-diagnose"),
-            "expected pipeline-diagnose label in reflection prompt, got: {}",
-            prompt
-        );
-        assert!(
-            prompt.contains("ToolFailures"),
-            "expected ToolFailures category in prompt, got: {}",
-            prompt
-        );
-        assert!(
-            prompt.contains("flaky_http"),
-            "expected failing tool name in prompt, got: {}",
-            prompt
-        );
-        // Strategy delta should have been applied to runtime state too.
-        assert!(
-            state.restricted_tools.contains("flaky_http"),
-            "expected flaky_http in restricted_tools, got: {:?}",
-            state.restricted_tools
-        );
-        assert!(
-            host.emitted_lines
-                .iter()
-                .any(|line| line.contains("Pipeline strategy applied")
-                    && line.contains("flaky_http")),
-            "expected strategy-applied log line, got lines: {:?}",
-            host.emitted_lines
-        );
-        // ToolFailures diagnosis also sets widen_selection → the one-shot flag
-        // should be pending until the next visible_turn_tools call consumes it.
-        assert!(
-            state.widen_selection_pending,
-            "expected widen_selection_pending = true after bridge applied strategy"
-        );
-        // Passive self-awareness loop: the bridge publishes StrategyApplication
-        // onto the observability session, and SelfModel rendering surfaces it
-        // to the agent on the next turn.
-        let obs_guard = obs_session.read().expect("obs session read");
-        let applied = obs_guard
-            .last_strategy_application
-            .as_ref()
-            .expect("expected last_strategy_application published on obs session");
-        assert!(applied.widen_requested, "widen should be recorded");
-        assert!(
-            applied.newly_blocked.iter().any(|t| t == "flaky_http"),
-            "flaky_http should be recorded as newly_blocked"
-        );
-        let self_model = crate::self_model::SelfModel::snapshot_with_strategy(
-            &["bash", "read_file"],
-            &[],
-            &[],
-            &[],
-            None,
-            state.max_turns.saturating_sub(state.remaining_turns) as u32,
-            None,
-            None,
-            None,
-            0,
-            0,
-            0,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &obs_guard.config,
-            Some(applied),
-        );
-        let rendered = self_model.to_system_prompt_section();
-        assert!(
-            rendered.contains("widened for next turn"),
-            "expected widen signal in self-awareness section, got: {rendered}"
-        );
-        // P3.1: structured skill-diff carries before/after snapshots, is
-        // published on StrategyApplication, and is surfaced verbatim in the
-        // self-awareness section so the agent can audit its own tuning.
-        let diff = applied
-            .diff_entry
-            .as_ref()
-            .expect("expected SkillDiffEntry populated after non-noop apply");
-        assert_eq!(diff.skill, "pipeline.tool_selection");
-        assert_eq!(diff.reason, "auto-reflection");
-        assert!(
-            !diff
-                .before
-                .blocked_tools
-                .contains(&"flaky_http".to_string()),
-            "before snapshot must predate the block, got: {:?}",
-            diff.before.blocked_tools
-        );
-        assert!(
-            diff.after.blocked_tools.contains(&"flaky_http".to_string()),
-            "after snapshot must contain the newly-blocked tool, got: {:?}",
-            diff.after.blocked_tools
-        );
-        assert!(!diff.before.widen_pending && diff.after.widen_pending);
-        assert!(
-            rendered.contains("Strategy diff:"),
-            "expected `Strategy diff:` line, got: {rendered}"
-        );
-        assert!(
-            rendered.contains("flaky_http"),
-            "expected blocked tool name in strategy diff, got: {rendered}"
-        );
-        assert!(
-            self_model.skill_diff.is_some(),
-            "expected SelfModel.skill_diff populated from applied.diff_entry"
-        );
-    }
-
-    #[tokio::test]
-    async fn auto_reflection_flushes_evo_signals() {
-        let reflection_response = r#"{
-            "proposals": [
-                {
-                    "axis": "skill",
-                    "description": "Add retry hint",
-                    "confidence": 0.6,
-                    "details": { "skill_name": "ops", "section": "troubleshooting", "content": "retry" }
-                }
-            ],
-            "summary": "Retry needed."
-        }"#;
-        let mut host = MockHost::new(vec![]).with_reflection_text(reflection_response);
-        let mut state = make_state();
-        let evo = std::sync::Arc::new(crate::evolution::service::EvolutionService::new());
-        state.evolution_service = Some(evo.clone());
-
-        // Feed a signal that passes needs_llm (ToolFailure with skill_context).
-        evo.add_signal(astra_evolution::types::EvolutionSignal::ToolFailure {
-            tool_name: "bash".into(),
-            error_snippet: "permission denied".into(),
-            failure_category: None,
-            skill_context: Some("deploy_script".into()),
-            turn_id: "t0".into(),
-        })
-        .await;
-
-        // Pre-load enough on state so that pre-loaded + flushed >= threshold.
-        for i in 0..(AUTO_REFLECTION_SIGNAL_THRESHOLD - 1) {
-            state.pending_reflection_signals.push(
-                astra_evolution::types::EvolutionSignal::ToolFailure {
-                    tool_name: format!("tool_{i}"),
-                    error_snippet: "err".into(),
-                    failure_category: None,
-                    skill_context: Some("sk".into()),
-                    turn_id: format!("t{}", i + 1),
-                },
-            );
-        }
-
-        let msg_count = state.messages.len();
-        maybe_trigger_auto_reflection(&mut host, &mut state).await;
-
-        // Should have triggered: pre-loaded + flushed >= threshold.
-        assert!(
-            state.pending_reflection_signals.is_empty(),
-            "All signals drained"
-        );
-        assert_eq!(state.messages.len(), msg_count);
-        // 1 skill proposal from reflection + 1 calibration proposal from ToolFailure fast-path
-        assert_eq!(evo.pending().await.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn auto_reflection_parse_failure_retains_signals() {
-        let mut host = MockHost::new(vec![]).with_reflection_text("not json");
-        let mut state = make_state();
-        state.evolution_service = Some(std::sync::Arc::new(
-            crate::evolution::service::EvolutionService::new(),
-        ));
-
-        for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
-            state.pending_reflection_signals.push(
-                astra_evolution::types::EvolutionSignal::RepeatedStall {
-                    tool_chain: vec![format!("tool_{i}")],
-                    stall_count: 3,
-                    turn_id: format!("t{i}"),
-                },
-            );
-        }
-
-        maybe_trigger_auto_reflection(&mut host, &mut state).await;
-
-        assert_eq!(
-            state.pending_reflection_signals.len(),
-            AUTO_REFLECTION_SIGNAL_THRESHOLD
-        );
-        assert!(
-            host.emitted_lines
-                .iter()
-                .any(|line| line.contains("parse failed"))
-        );
-    }
-
-    #[tokio::test]
-    async fn auto_reflection_host_error_retains_signals() {
-        let mut host = MockHost::new(vec![]).with_reflection_error("network unavailable");
-        let mut state = make_state();
-        state.evolution_service = Some(std::sync::Arc::new(
-            crate::evolution::service::EvolutionService::new(),
-        ));
-
-        for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
-            state.pending_reflection_signals.push(
-                astra_evolution::types::EvolutionSignal::RepeatedStall {
-                    tool_chain: vec![format!("tool_{i}")],
-                    stall_count: 3,
-                    turn_id: format!("t{i}"),
-                },
-            );
-        }
-
-        maybe_trigger_auto_reflection(&mut host, &mut state).await;
-
-        assert_eq!(
-            state.pending_reflection_signals.len(),
-            AUTO_REFLECTION_SIGNAL_THRESHOLD
-        );
-        assert!(
-            host.emitted_lines
-                .iter()
-                .any(|line| line.contains("skipped:") && line.contains("network unavailable"))
-        );
-    }
-
-    #[tokio::test]
-    async fn auto_reflection_summarizes_recent_tools_and_tactical_actions() {
-        let temp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
-        let reflection_response = r#"{
-            "proposals": [
-                {
-                    "axis": "pattern",
-                    "description": "Demote bash chain",
-                    "confidence": 0.8,
-                    "details": { "signature": "bash", "action": "demote" }
-                }
-            ],
-            "summary": "Tool issues found."
-        }"#;
-        let mut host = MockHost::new(vec![]).with_reflection_text(reflection_response);
-        let mut state = make_state();
-        state.current_session_id = Some("sess-reflect".into());
-        let mut workspace = astra_services::session_workspace::WorkspaceMetadata::with_context(
-            "sess-reflect",
-            "gpt-5.4",
-            "/repo",
-            Some("main"),
-        );
-        workspace.session_goal = Some("ship self surface".into());
-        workspace.plan_goal = Some("stabilize reflection loop".into());
-        workspace.deprioritized_tools = vec!["bash".into()];
-        workspace.goal_progress = Some(astra_services::session_workspace::GoalProgressSnapshot {
-            goal: "ship self surface".into(),
-            completion_score: 0.5,
-            momentum: 0.2,
-            milestone_count: 2,
-            summary: "2/4 milestones complete".into(),
-            weighted_progress: 0.5,
-            negative_signals: 0.0,
-            milestones: Vec::new(),
-        });
-        workspace.contract_json = Some(
-            serde_json::to_string(&astra_services::TaskContract {
-                contract_id: "contract-1".into(),
-                task_id: "task-1".into(),
-                goal: "stabilize reflection loop".into(),
-                scope: astra_services::TaskScope::default(),
-                subtasks: vec![astra_services::DurableSubtask {
-                    id: "subtask-1".into(),
-                    title: "wire reflection evidence".into(),
-                    stage: astra_services::SubtaskStage::Pending,
-                    criteria: vec![astra_services::VerificationCriterion {
-                        id: "criterion-1".into(),
-                        description: "reflection prompt includes goal + verify".into(),
-                        verifier: astra_services::VerifierKind::BuildPass {
-                            cmd: "cargo test".into(),
-                        },
-                        required: true,
-                        timeout_sec: 120,
-                        global_only: false,
-                    }],
-                    ..Default::default()
-                }],
-                global_verification: Vec::new(),
-                version: 1,
-                status: astra_services::ContractStatus::Active,
-                created_at: chrono::Utc::now().to_rfc3339(),
-                updated_at: chrono::Utc::now().to_rfc3339(),
-                domain_hint: None,
-                task_type: None,
-                last_global_results: Vec::new(),
-            })
-            .unwrap(),
-        );
-        astra_services::session_workspace::write_workspace(&workspace).unwrap();
-        astra_services::session_journal::JournalWriter::new("sess-reflect")
-            .unwrap()
-            .append(&astra_services::session_journal::JournalEvent::turn(
-                Some("sess-reflect"),
-                1,
-                Some("gpt-5.4"),
-                "improve reflection",
-                "working on it",
-                0,
-                10,
-                20,
-                30,
-            ))
-            .unwrap();
-        for (turn, bash_ok, bash_ms, rg_ms) in [
-            (1, true, 60_u64, 25_u64),
-            (2, true, 70, 30),
-            (4, false, 220, 300),
-        ] {
-            let mut event = astra_services::session_journal::JournalEvent::turn(
-                Some("sess-reflect"),
-                turn,
-                Some("gpt-5.4"),
-                "inspect tool health",
-                "record tool outcome",
-                2,
-                12,
-                24,
-                bash_ms.max(rg_ms),
-            );
-            event.tools_selected = Some(vec!["bash".to_string(), "rg".to_string()]);
-            event.tools_used = Some(vec!["bash".to_string(), "rg".to_string()]);
-            event.tool_calls = Some(vec![
-                ToolCallRecord {
-                    name: "bash".to_string(),
-                    ok: bash_ok,
-                    ms: bash_ms,
-                    error: (!bash_ok).then(|| "bash regression".to_string()),
-                    input_bytes: None,
-                    output_bytes: None,
-                    args_preview: None,
-                    result_preview: None,
-                    file_path: None,
-                    surgically_removed: None,
-                    original_tool_name: None,
-                    ..Default::default()
-                },
-                ToolCallRecord {
-                    name: "rg".to_string(),
-                    ok: true,
-                    ms: rg_ms,
-                    error: None,
-                    input_bytes: None,
-                    output_bytes: None,
-                    args_preview: None,
-                    result_preview: None,
-                    file_path: None,
-                    surgically_removed: None,
-                    original_tool_name: None,
-                    ..Default::default()
-                },
-            ]);
-            if !bash_ok {
-                event.error = Some("bash regression".to_string());
-            }
-            astra_services::session_journal::JournalWriter::new("sess-reflect")
-                .unwrap()
-                .append(&event)
-                .unwrap();
-        }
-        astra_services::session_journal::JournalWriter::new("sess-reflect")
-            .unwrap()
-            .append(
-                &astra_services::session_journal::JournalEvent::goal_steered(
-                    Some("sess-reflect"),
-                    2,
-                    "plan_execution_start",
-                    Some("ship self surface"),
-                    "stabilize reflection loop",
-                    None,
-                ),
-            )
-            .unwrap();
-        astra_services::session_journal::JournalWriter::new("sess-reflect")
-            .unwrap()
-            .append(&astra_services::session_journal::JournalEvent {
-                event_type: astra_services::session_journal::JournalEventType::TurnError,
-                ts: chrono::Utc::now().to_rfc3339(),
-                session_id: Some("sess-reflect".to_string()),
-                turn: Some(3),
-                agentic_step: None,
-                model: Some("gpt-5.4".to_string()),
-                user_input: Some("debug bash timeout".to_string()),
-                assistant_output: None,
-                tool_count: Some(1),
-                tokens_in: Some(10),
-                tokens_out: Some(0),
-                duration_ms: Some(120),
-                error: Some("timed out waiting for test".to_string()),
-                config_key: None,
-                config_value: None,
-                turns_compacted: None,
-                facts_stored: None,
-                tools_selected: Some(vec!["bash".to_string()]),
-                selected_skills: None,
-                tools_used: Some(vec!["bash".to_string()]),
-                tool_calls: Some(vec![ToolCallRecord {
-                    name: "bash".to_string(),
-                    ok: false,
-                    ms: 120,
-                    error: Some("timed out waiting for test".to_string()),
-                    input_bytes: None,
-                    output_bytes: None,
-                    args_preview: None,
-                    result_preview: None,
-                    file_path: None,
-                    surgically_removed: None,
-                    original_tool_name: None,
-                    ..Default::default()
-                }]),
-                budget_used: None,
-                budget_pressure: None,
-                stall_type: None,
-                metadata: None,
-                plan_subtask_id: None,
-                ttft_ms: None,
-                context_ms: None,
-                selector_strategy: None,
-                selector_ms: None,
-                selector_tokens_in: None,
-                selector_tokens_out: None,
-                cache_read_tokens: None,
-                cache_creation_tokens: None,
-                memoria_ms: None,
-                session_lineage: None,
-                coordination: None,
-                edge_policy: None,
-                selection_trace: None,
-                context_assembly_trace: None,
-                selector_confidence: None,
-                routing_domain_hint: None,
-                entity_learn_skipped_no_domain: false,
-                round: None,
-                tool_calls_returned: None,
-                offset_ms: None,
-                llm_rounds: None,
-                total_llm_ms: None,
-                total_tool_ms: None,
-                parent_event_id: None,
-                git_head: None,
-                git_branch: None,
-            })
-            .unwrap();
-        astra_services::session_journal::JournalWriter::new("sess-reflect")
-            .unwrap()
-            .append(
-                &astra_services::session_journal::JournalEvent::verification_completed(
-                    Some("sess-reflect"),
-                    3,
-                    "subtask-1",
-                    "global",
-                    true,
-                    &serde_json::json!([{"check":"unit-tests","passed":true}]),
-                ),
-            )
-            .unwrap();
-        astra_services::session_journal::JournalWriter::new("sess-reflect")
-            .unwrap()
-            .append(
-                &astra_services::session_journal::JournalEvent::adaptive_per_turn_applied(
-                    Some("sess-reflect"),
-                    4,
-                    vec![("verification.strictness".into(), "0.6".into(), "0.7".into())],
-                    vec!["high token pressure".into()],
-                ),
-            )
-            .unwrap();
-        astra_services::session_journal::JournalWriter::new("sess-reflect")
-            .unwrap()
-            .append(
-                &astra_services::session_journal::JournalEvent::verification_completed(
-                    Some("sess-reflect"),
-                    5,
-                    "subtask-1",
-                    "global",
-                    false,
-                    &serde_json::json!([{"check":"integration-tests","passed":false}]),
-                ),
-            )
-            .unwrap();
-        state.evolution_service = Some(std::sync::Arc::new(
-            crate::evolution::service::EvolutionService::new(),
-        ));
-
-        for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
-            state.pending_reflection_signals.push(
-                astra_evolution::types::EvolutionSignal::RepeatedStall {
-                    tool_chain: vec![format!("tool_{i}")],
-                    stall_count: 3,
-                    turn_id: format!("t{i}"),
-                },
-            );
-        }
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "bash".into(),
-                ok: false,
-                ms: 200,
-                error: Some("permission denied".into()),
-                input_bytes: Some(12),
-                output_bytes: Some(0),
-                args_preview: None,
-                result_preview: None,
-                file_path: None,
-                surgically_removed: None,
-                original_tool_name: None,
-                ..Default::default()
-            },
-            ToolCallRecord {
-                name: "bash".into(),
-                ok: true,
-                ms: 100,
-                error: None,
-                input_bytes: Some(8),
-                output_bytes: Some(20),
-                args_preview: None,
-                result_preview: None,
-                file_path: None,
-                surgically_removed: None,
-                original_tool_name: None,
-                ..Default::default()
-            },
-            ToolCallRecord {
-                name: "web_fetch".into(),
-                ok: true,
-                ms: 40,
-                error: None,
-                input_bytes: Some(5),
-                output_bytes: Some(50),
-                args_preview: None,
-                result_preview: None,
-                file_path: None,
-                surgically_removed: None,
-                original_tool_name: None,
-                ..Default::default()
-            },
-        ];
-        state.recent_tactical_actions = vec![
-            "⚠️ verify outputs more strictly".into(),
-            "📊 Token usage high".into(),
-        ];
-
-        let session = std::sync::Arc::new(std::sync::RwLock::new(
-            crate::observability_integration::ObservabilitySession::new_simple("sess-reflect"),
-        ));
-        {
-            let mut guard = session.write().unwrap();
-            guard.turn_number = 4;
-        }
-        state.telemetry.observability_session = Some(session);
-        state
-            .evolution_service
-            .as_ref()
-            .unwrap()
-            .add_signal(astra_evolution::types::EvolutionSignal::ToolFailure {
-                tool_name: "bash".into(),
-                error_snippet: "Permission denied".into(),
-                failure_category: None,
-                skill_context: Some("ops".into()),
-                turn_id: "t-reflect".into(),
-            })
-            .await;
-
-        maybe_trigger_auto_reflection(&mut host, &mut state).await;
-
-        let prompt = host.last_reflection_prompt.as_deref().unwrap();
-        assert!(prompt.contains("Effective goal: stabilize reflection loop"));
-        assert!(prompt.contains("Goal progress: 2/4 milestones complete"));
-        assert!(prompt.contains("Verification summary:"));
-        assert!(prompt.contains("Tool health:"));
-        assert!(prompt.contains("Blocked tools: bash"));
-        assert!(prompt.contains("Recent performance deltas:"));
-        assert!(prompt.contains("[Regressed]"));
-        assert!(prompt.contains("Recent evaluation events:"));
-        assert!(prompt.contains("[GoalSteered]"));
-        assert!(prompt.contains("[Verification]"));
-        assert!(prompt.contains("Recent adaptations:"));
-        assert!(prompt.contains("[Adaptation]"));
-        assert!(prompt.contains("Recent adaptation outcomes:"));
-        assert!(prompt.contains("[Verification] after Adaptation turn 4"));
-        assert!(prompt.contains("Recent adaptation impacts:"));
-        assert!(prompt.contains("Recent adaptation verification impacts:"));
-        assert!(prompt.contains("Tool statistics:"));
-        assert!(prompt.contains("bash — calls=2, failures=1, avg_ms=150"));
-        assert!(prompt.contains("Recent tactical actions:"));
-        assert!(prompt.contains("verify outputs more strictly"));
-        assert!(prompt.contains("[ToolFailure] bash: Permission denied"));
-        assert!(state.recent_tactical_actions.is_empty());
     }
 
     // ── Skill deferral behavior tests ─────────────────────────────────────

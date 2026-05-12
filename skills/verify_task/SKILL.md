@@ -16,6 +16,7 @@ allowed_tools:
   - grep
   - glob
 ---
+
 # Verify Task
 
 Verify that a completed task actually works by running astra's verification framework.
@@ -35,11 +36,11 @@ $ARGUMENTS
 
 ### 1.1 Resolve TASK
 
-| TASK type | Action |
-|-----------|--------|
+| TASK type           | Action                                                 |
+| ------------------- | ------------------------------------------------------ |
 | `"last"` or omitted | Find most recent task from journal PlanProgress events |
-| Task/contract ID | Look up in journal or cloud task_contracts table |
-| Natural language | Infer what should work from the description |
+| Task/contract ID    | Look up in journal or cloud task_contracts table       |
+| Natural language    | Infer what should work from the description            |
 
 ```bash
 # Find recent plan execution in journal
@@ -70,10 +71,12 @@ git --no-pager diff HEAD~5 --name-only | sort -u
 ### 1.3 Find or Generate Acceptance Criteria
 
 **If task contract exists** (from durable task system):
+
 - Load `VerificationCriterion` list from contract
 - Each has: id, description, verifier kind, required flag, timeout
 
 **If no contract** (ad-hoc task):
+
 - Generate criteria from context using the rules below
 
 ---
@@ -81,11 +84,36 @@ git --no-pager diff HEAD~5 --name-only | sort -u
 ## Phase 2: Generate Verification Criteria
 
 When no formal contract exists, generate criteria based on what changed.
-Use astra's 8 `VerifierKind` types:
+Use astra's 8 `VerifierKind` types.
+
+### 2.0 Tailor gates to the actual diff (run this FIRST)
+
+Before emitting any gate below, read the list of modified file extensions
+from `git --no-pager diff --name-only HEAD~N` (N chosen in Phase 1.2). Only
+emit gates whose language/toolchain matches at least one changed file.
+
+```
+ext_set = { extension(f) for f in changed_files }
+
+emit BuildPass(cargo) / TestPass(cargo) / clippy     iff  .rs ∈ ext_set
+emit BuildPass(npm)   / TestPass(npm)                iff  .ts/.tsx/.js/.jsx/.mjs ∈ ext_set
+emit BuildPass(python)/ TestPass(pytest)             iff  .py ∈ ext_set
+emit BuildPass(go)    / TestPass(go)                 iff  .go ∈ ext_set
+emit docs-valid (cargo doc)                          iff  .rs ∈ ext_set AND doc comments touched
+emit FileExists gates                                iff  new files were added (status A)
+emit no-op (skip Phase 2 entirely, report "no build
+    gates needed — diff is docs/config only")        iff  ext_set ⊆ { .md, .txt, .json, .yaml, .toml }
+                                                         AND no schema files
+```
+
+**Rationale**: a pure doc/SKILL.md change does not need `cargo build --workspace`.
+Historically the generic reminder has fired on zero-code turns and wasted a
+full build. Empty diff → empty gate list is a valid outcome; say so in the
+report instead of running global checks "just in case".
 
 ### 2.1 Always-Run Checks (Global)
 
-These run for every task, regardless of scope:
+These run for every task **whose diff survived the Phase 2.0 filter**:
 
 ```yaml
 - id: global-build
@@ -103,6 +131,7 @@ These run for every task, regardless of scope:
 ```
 
 **Build command detection** (check in order):
+
 ```bash
 # Rust
 [ -f Cargo.toml ] && echo "cargo build --workspace"
@@ -122,6 +151,7 @@ These run for every task, regardless of scope:
 ```
 
 **Test command detection:**
+
 ```bash
 # Rust
 [ -f Cargo.toml ] && echo "cargo test --workspace"
@@ -141,6 +171,7 @@ These run for every task, regardless of scope:
 Based on what files changed, generate targeted checks:
 
 **New files created:**
+
 ```yaml
 - id: file-exists-{name}
   description: "New file {path} exists"
@@ -150,23 +181,25 @@ Based on what files changed, generate targeted checks:
 ```
 
 **Rust code changes:**
+
 ```yaml
 - id: lint-clean
   description: "No new clippy warnings"
   verifier: Command
   cmd: "cargo clippy --workspace -- -D warnings"
   expected_exit: 0
-  required: false  # Warning, not blocking
+  required: false # Warning, not blocking
 
 - id: no-unsafe
   description: "No new unsafe blocks without safety comments"
   verifier: GrepCheck
   file: "{changed_file}"
   pattern: "unsafe {"
-  should_match: false  # Only if file didn't have unsafe before
+  should_match: false # Only if file didn't have unsafe before
 ```
 
 **Test files changed:**
+
 ```yaml
 - id: new-tests-pass
   description: "New/modified tests pass"
@@ -177,6 +210,7 @@ Based on what files changed, generate targeted checks:
 ```
 
 **API/interface changes:**
+
 ```yaml
 - id: api-compat
   description: "Existing callers still compile"
@@ -186,6 +220,7 @@ Based on what files changed, generate targeted checks:
 ```
 
 **Documentation changes:**
+
 ```yaml
 - id: docs-valid
   description: "Documentation builds without errors"
@@ -229,6 +264,7 @@ For changes to the astra codebase itself:
 ### 3.1 Run Each Criterion
 
 Execute verifications in dependency order:
+
 1. **Build checks first** (if build fails, skip downstream)
 2. **Test checks second** (run test suite)
 3. **File/grep checks** (structural verification)
@@ -264,6 +300,7 @@ done
 ### 3.2 Record Results
 
 For each criterion, record:
+
 ```
 {
   "criterion_id": "...",
@@ -278,6 +315,7 @@ For each criterion, record:
 ### 3.3 Handle Failures
 
 When a criterion fails:
+
 1. **Capture full output** (stdout + stderr) as evidence
 2. **Analyze failure** — is it a real issue or test flake?
 3. **Check if pre-existing** — did this test fail before the change?
@@ -325,16 +363,17 @@ git stash && {test_cmd} 2>&1 | tail -5; git stash pop
 
 ### 4.2 Verdict Logic
 
-| Condition | Verdict |
-|-----------|---------|
-| All required criteria pass | ✅ **Verified** |
-| All required pass, some optional fail | ⚠️ **Verified with warnings** |
-| Any required criterion fails | ❌ **Verification failed** |
-| Verification itself errors (timeout, crash) | ⚠️ **Inconclusive** |
+| Condition                                   | Verdict                       |
+| ------------------------------------------- | ----------------------------- |
+| All required criteria pass                  | ✅ **Verified**               |
+| All required pass, some optional fail       | ⚠️ **Verified with warnings** |
+| Any required criterion fails                | ❌ **Verification failed**    |
+| Verification itself errors (timeout, crash) | ⚠️ **Inconclusive**           |
 
 ### 4.3 Failure Triage
 
 For each failed criterion, provide:
+
 1. **What failed**: Criterion description + verifier type
 2. **Evidence**: Actual output vs expected
 3. **Root cause**: Quick analysis of why it failed
@@ -348,6 +387,7 @@ For each failed criterion, provide:
 ### Quick Mode (`SCOPE=quick`)
 
 Only run:
+
 - `global-build` (project compiles)
 - `global-test` (test suite passes)
 
@@ -356,6 +396,7 @@ Use for rapid iteration — verify basics before deep review.
 ### Full Mode (`SCOPE=full`, default)
 
 Run all generated criteria:
+
 - Build + test + lint
 - File existence checks
 - Grep/pattern checks
@@ -373,26 +414,26 @@ Use this when the standard checks don't cover the task's acceptance criteria.
 
 The verification framework lives in `durable_task.rs` and supports:
 
-| VerifierKind | What It Does | When to Use |
-|-------------|-------------|-------------|
-| `Command` | Run cmd, check exit code | Build, lint, any CLI tool |
-| `CommandOutput` | Run cmd, check stdout contains/not-contains | Output validation |
-| `FileExists` | Check file paths exist | New file creation tasks |
-| `GrepCheck` | Grep pattern in file | Code pattern verification |
-| `BuildPass` | Build command (exit 0) | Always-run global check |
-| `TestPass` | Test command with pass rate | Always-run global check |
-| `LlmJudge` | LLM semantic evaluation | Subjective quality checks |
-| `Composite` | AND/OR of sub-criteria | Complex acceptance |
+| VerifierKind    | What It Does                                | When to Use               |
+| --------------- | ------------------------------------------- | ------------------------- |
+| `Command`       | Run cmd, check exit code                    | Build, lint, any CLI tool |
+| `CommandOutput` | Run cmd, check stdout contains/not-contains | Output validation         |
+| `FileExists`    | Check file paths exist                      | New file creation tasks   |
+| `GrepCheck`     | Grep pattern in file                        | Code pattern verification |
+| `BuildPass`     | Build command (exit 0)                      | Always-run global check   |
+| `TestPass`      | Test command with pass rate                 | Always-run global check   |
+| `LlmJudge`      | LLM semantic evaluation                     | Subjective quality checks |
+| `Composite`     | AND/OR of sub-criteria                      | Complex acceptance        |
 
 ---
 
 ## Reference: Key Source Files
 
-| Component | File |
-|-----------|------|
-| VerificationRunner | `rust/crates/services/src/durable_task.rs` |
-| VerifierKind enum | `rust/crates/services/src/durable_task.rs` |
+| Component               | File                                              |
+| ----------------------- | ------------------------------------------------- |
+| VerificationRunner      | `rust/crates/services/src/durable_task.rs`        |
+| VerifierKind enum       | `rust/crates/services/src/durable_task.rs`        |
 | Delivery report display | `rust/crates/astra-cli/src/cli/durable_bridge.rs` |
-| Plan executor | `rust/crates/astra-cli/src/cli/plan_executor.rs` |
-| Build/test detection | `rust/crates/astra-cli/src/edge_tools.rs` |
-| Session journal | `rust/crates/services/src/session_journal.rs` |
+| Plan executor           | `rust/crates/astra-cli/src/cli/plan_executor.rs`  |
+| Build/test detection    | `rust/crates/astra-cli/src/edge_tools.rs`         |
+| Session journal         | `rust/crates/services/src/session_journal.rs`     |

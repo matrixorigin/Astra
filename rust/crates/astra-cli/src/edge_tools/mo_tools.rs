@@ -417,7 +417,7 @@ impl ToolExecutor {
         let sql = match args.get("sql").and_then(Value::as_str) {
             Some(s) if !s.trim().is_empty() => s,
             _ => {
-                return ToolExecutionOutcome::text(
+                return ToolExecutionOutcome::error(
                     "Error: missing or empty 'sql' parameter".to_string(),
                 );
             }
@@ -429,7 +429,7 @@ impl ToolExecutor {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if !allow_destructive && let Some(kind) = check_sql_safety(sql) {
-            return ToolExecutionOutcome::text(format!(
+            return ToolExecutionOutcome::error(format!(
                 "Error: {kind} statements are blocked by default. \
                      Pass \"allow_destructive\": true to confirm execution."
             ));
@@ -444,7 +444,7 @@ impl ToolExecutor {
                 mo_execute_sql(&mo_create_snapshot_sql(&snapshot_id, database), None)
                     .unwrap_or_else(|e| e);
             if is_mo_error(&snapshot_output) {
-                return ToolExecutionOutcome::text(format!(
+                return ToolExecutionOutcome::error(format!(
                     "Error: failed to capture pre-state snapshot `{snapshot_id}` before executing query.\n{snapshot_output}"
                 ));
             }
@@ -464,9 +464,12 @@ impl ToolExecutor {
             ]));
         }
 
+        let output = mo_execute_sql(sql, database).unwrap_or_else(|e| e);
+        let is_error = is_mo_error(&output);
         ToolExecutionOutcome {
-            output: mo_execute_sql(sql, database).unwrap_or_else(|e| e),
+            output,
             tool_result_fields,
+            is_error,
         }
     }
 

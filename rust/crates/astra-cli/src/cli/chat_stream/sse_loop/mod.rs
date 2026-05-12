@@ -45,7 +45,7 @@ use agentic_sse_loop::{
     resolved_tool_metrics,
 };
 use cli_loop_host::CliAgenticLoopHost;
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// Map `ToolSelectionConfig` (from `astra-config`) to `BreakerConfig` (from
 /// `astra-turn-core`).
@@ -133,19 +133,12 @@ async fn finalize_root_mailbox(
 }
 
 fn extend_restricted_with_blocked_tools(
-    restricted: &mut HashSet<String>,
-    observability_hub: Option<&Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    _restricted: &mut HashSet<String>,
+    _observability_hub: Option<&Arc<astra_runtime::observability_integration::ObservabilityHub>>,
 ) {
-    if let Some(hub) = observability_hub
-        && let Some(pattern_library) = hub.pattern_library()
-        && let Ok(lib) = pattern_library.lock()
-    {
-        for name in lib.blocked_tool_names() {
-            if !astra_turn_core::tool_registry_meta::is_pinned_tool(&name) {
-                restricted.insert(name);
-            }
-        }
-    }
+    // Pattern-library / evolution-driven tool blocking was removed along with
+    // the self-evolution subsystem. The function is retained as a no-op so
+    // callers don't need signature changes; add future block sources here.
 }
 
 pub(crate) async fn stream_chat_sse(
@@ -153,6 +146,16 @@ pub(crate) async fn stream_chat_sse(
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
     let root_agent_id = p.root_agent_id.unwrap_or("main");
+
+    // UX bridge: subscribe to the session-memory broker for this turn
+    // and forward qualifying events to the CLI stream as `StatusLine`
+    // so long-running LLM extraction gets a subtle visual cue. Runs
+    // for the duration of the turn; dropped when `_session_memory_ux`
+    // goes out of scope.
+    let _session_memory_ux = crate::chat_stream::session_memory_ux::SessionMemoryUxBridge::spawn(
+        p.session_memory_extractor.as_ref(),
+        p.stream_event_tx.clone(),
+    );
     // Stable run_id for this turn — shared by:
     //   1. state.current_run_id (so on_turn_completed captures the
     //      parent prefix keyed on this id)
@@ -301,7 +304,10 @@ pub(crate) async fn stream_chat_sse(
     let mut messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message);
 
     // ─── Context pre-fetch (disabled) ─────────────────────────────────────
-    let all_schemas = if p.plan_only_chat {
+    // Returns (all_schemas, mcp_plugin_schemas) so the edge executor can
+    // install MCP tools for `tool_search(select:)` resolution while the
+    // registry gets the capability-filtered list.
+    let all_schemas: (Vec<Value>, Vec<Value>) = if p.plan_only_chat {
         messages.insert(
             0,
             json!({
@@ -309,7 +315,7 @@ pub(crate) async fn stream_chat_sse(
                 "content": CHAT_PLAN_ONLY_SYSTEM,
             }),
         );
-        Vec::new()
+        (Vec::new(), Vec::new())
     } else {
         // Refresh any MCP servers that received tool-list-changed notifications
         if let Some(ref mgr) = p.mcp_manager {
@@ -318,17 +324,29 @@ pub(crate) async fn stream_chat_sse(
             m.consume_prompt_changes();
             m.consume_resource_changes();
         }
+        // Inject MCP tool schemas from connected servers.
+        // Tracked separately from the static catalog so the edge
+        // `ToolExecutor` can install them via `set_plugin_schemas` for
+        // `tool_search(select:mcp__X)` resolution.
         let mcp_schemas = if let Some(ref mgr) = p.mcp_manager {
             let m = mgr.read().await;
             m.all_tool_schemas()
         } else {
             Vec::new()
         };
-        astra_runtime::capabilities::cli_local_tool_schemas(
+        let schemas = astra_runtime::capabilities::cli_local_tool_schemas(
             edge_tools::all_tool_schemas(),
-            mcp_schemas,
-        )
+            mcp_schemas.clone(),
+        );
+        (schemas, mcp_schemas)
     };
+    let mcp_plugin_schemas = all_schemas.1.clone();
+    let all_schemas = all_schemas.0;
+    // Install MCP schemas on the edge executor so `tool_search(select:NAME)`
+    // can resolve plugin tools for deferred activation. Without this, the
+    // LLM sees MCP tools in `<deferred_tools>` but cannot pull their
+    // schemas.
+    executor.set_plugin_schemas(mcp_plugin_schemas);
     let mut registry = ToolRegistry::new(all_schemas.clone());
     // G3: when a DynamicAgentSpawner is wired, force-pin spawn_agent's
     // schema so the tfidf selector always surfaces it. Without this,
@@ -578,7 +596,6 @@ pub(crate) async fn stream_chat_sse(
         context_manifest_user_id: None,
         context_manifest_model_name: None,
         recursion_depth: 0,
-        attention_manifest_text: None,
         final_text: String::new(),
         final_text_streamed: false,
         total_prompt: 0,
@@ -590,6 +607,8 @@ pub(crate) async fn stream_chat_sse(
         has_any_usage: false,
         max_turns,
         remaining_turns: max_turns,
+        turn_budget_hint_emitted_50: false,
+        turn_budget_hint_emitted_20: false,
         agentic_turn_budget: task_profile.agentic_turn_budget,
         current_round_index: 0,
         llm_rounds_completed: 0,
@@ -725,7 +744,6 @@ pub(crate) async fn stream_chat_sse(
         delegations_this_turn: 0,
         project_context,
         checkpoint_gate: None,
-        evolution_service: p.evolution_service.clone(),
         rate_limit_cooldown: Default::default(),
         data_snapshot_provider: None,
         last_composite_snapshot: None,
@@ -746,12 +764,11 @@ pub(crate) async fn stream_chat_sse(
         tactical_adapter: None,
         step_signal_collector: None,
         tool_budget_override: None,
-        pending_reflection_signals: Vec::new(),
         recent_tactical_actions: Vec::new(),
         server_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
-        continuity: p.runtime_continuity.cloned().unwrap_or_default(),
+        memory_extraction_service: p.session_memory_extractor.clone(),
         compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_and_model(
             p.provider, p.model,
         ),
@@ -885,7 +902,6 @@ pub(crate) async fn stream_chat_sse(
         step_recorder: &state.step_recorder,
         turn_guard: &state.turn_guard,
         last_heavy_checkpoint: state.stall.last_heavy_checkpoint,
-        runtime_continuity: state.continuity,
         ttft_ms: state.telemetry.first_ttft_ms,
         context_ms: state.telemetry.first_context_assembly_ms,
         selector_strategy: state.telemetry.first_selector_strategy,
@@ -943,14 +959,11 @@ mod tests {
     use super::circuit_breaker_config_from_tool_selection;
     use super::detect_turn_hook_sets;
     use super::extend_restricted_with_blocked_tools;
-    use astra_pipeline::pattern::PatternLibrary;
-    use astra_runtime::evolution::types::PatternAction;
     use astra_runtime::observability_integration::ObservabilityHub;
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
-    use astra_turn_core::routing_engine::TaskType;
     use std::collections::HashSet;
     use std::path::Path;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
@@ -1125,25 +1138,13 @@ hooks:
 
     #[test]
     fn blocked_patterns_do_not_restrict_pinned_tools() {
-        // All tools are pinned after consolidation, so pattern-library
-        // blocks have no effect on tool restrictions. Only non-pinned
-        // (dynamic) tools can be blocked.
-        let pattern_library = Arc::new(Mutex::new(PatternLibrary::new()));
-        {
-            let mut lib = pattern_library.lock().unwrap();
-            let tools = vec!["grep".to_string()];
-            lib.record_outcome(&tools, TaskType::Code, None, true, 0.8, None);
-            lib.apply_evolution_action("grep", PatternAction::Block);
-        }
-
+        // After the pattern-library subsystem was removed, the blocked-tools
+        // set is always empty — verify `extend_restricted_with_blocked_tools`
+        // is a safe no-op on an ObservabilityHub without any evolution inputs.
         let hub = Arc::new(ObservabilityHub::new());
-        hub.attach_pattern_library(pattern_library);
-
         let mut restricted = HashSet::new();
         extend_restricted_with_blocked_tools(&mut restricted, Some(&hub));
-
-        // grep is pinned → not restricted even when blocked
-        assert!(!restricted.contains("grep"));
+        assert!(restricted.is_empty());
     }
 
     // ── G3: spawn_agent visibility gate ──

@@ -187,3 +187,241 @@ fn git_schema_has_stash_action() {
         "git schema should have revert_commit action"
     );
 }
+
+// ── Conditional required (allOf/if-then) regression guards ──────────────
+//
+// Session 19ad8393 broke on `agent spawn` because the schema only
+// declared `required: ["action"]` — the model omitted `description`
+// (which the backend required) and all 4 calls failed. These tests
+// verify the `allOf` blocks are present for every consolidated
+// multi-action tool so we never regress to flat required again.
+
+fn tool_schema<'a>(schemas: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
+    schemas
+        .iter()
+        .find(|s| s["function"]["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("missing schema: {name}"))
+}
+
+/// Returns the list of field names that are required when `action ==
+/// target_action`, by inspecting the
+/// `parameters["x-astra-per-action-required"]` extension map. This
+/// replaces the previous `allOf` block — Anthropic/Bedrock reject
+/// `allOf` at the top level of `input_schema`, so per-action
+/// required fields live in a vendor-prefixed extension that
+/// providers ignore but our prune code honours.
+fn conditional_required_for(schema: &serde_json::Value, target_action: &str) -> Vec<String> {
+    schema["function"]["parameters"]["x-astra-per-action-required"][target_action]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect()
+}
+
+/// Anthropic/Bedrock Messages API rejects `tools[].input_schema`
+/// that contains `allOf`, `oneOf`, or `anyOf` at the top level
+/// (HTTP 400: "input_schema does not support oneOf, allOf, or anyOf
+/// at the top level"). Regression guard: every tool schema's
+/// `parameters` object must be free of these three keys.
+#[test]
+fn no_schema_uses_top_level_composition_keywords() {
+    for schema in all_tool_schemas() {
+        let name = schema["function"]["name"].as_str().unwrap_or("<unnamed>");
+        let params = &schema["function"]["parameters"];
+        for banned in &["allOf", "oneOf", "anyOf"] {
+            assert!(
+                params.get(*banned).is_none(),
+                "tool `{name}` parameters contain top-level `{banned}`, which \
+                 Anthropic/Bedrock reject with HTTP 400. Encode per-action required \
+                 fields via the `x-astra-per-action-required` extension + description \
+                 prose instead."
+            );
+        }
+    }
+}
+
+#[test]
+fn agent_spawn_schema_requires_description_and_prompt() {
+    let schemas = all_tool_schemas();
+    let req = conditional_required_for(tool_schema(&schemas, "agent"), "spawn");
+    assert!(
+        req.contains(&"description".to_string()),
+        "agent.spawn must require `description`: {req:?}"
+    );
+    assert!(
+        req.contains(&"prompt".to_string()),
+        "agent.spawn must require `prompt`: {req:?}"
+    );
+}
+
+#[test]
+fn agent_other_actions_have_conditional_required() {
+    let schemas = all_tool_schemas();
+    let agent = tool_schema(&schemas, "agent");
+    assert_eq!(
+        conditional_required_for(agent, "delegate"),
+        vec!["task".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(agent, "run_chain"),
+        vec!["steps".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(agent, "get_result"),
+        vec!["agent_id".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(agent, "send_message"),
+        vec!["to".to_string(), "message".to_string()]
+    );
+}
+
+#[test]
+fn git_commit_and_revert_actions_declare_required_fields() {
+    let schemas = all_tool_schemas();
+    let git = tool_schema(&schemas, "git");
+    assert_eq!(
+        conditional_required_for(git, "commit"),
+        vec!["message".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(git, "revert_commit"),
+        vec!["commit_sha".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(git, "file_history"),
+        vec!["file".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(git, "log_search"),
+        vec!["query".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(git, "checkout_file"),
+        vec!["path".to_string(), "ref".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(git, "stash"),
+        vec!["sub_action".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(git, "worktree"),
+        vec!["sub_action".to_string()]
+    );
+}
+
+#[test]
+fn github_schema_requires_pr_issue_numbers_and_title() {
+    let schemas = all_tool_schemas();
+    let gh = tool_schema(&schemas, "github");
+    assert_eq!(
+        conditional_required_for(gh, "get_pr"),
+        vec!["pr_number".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(gh, "ci_status"),
+        vec!["pr_number".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(gh, "get_issue"),
+        vec!["issue_number".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(gh, "create_issue"),
+        vec!["title".to_string()]
+    );
+}
+
+#[test]
+fn memory_schema_requires_content_query_new_content_signal() {
+    let schemas = all_tool_schemas();
+    let mem = tool_schema(&schemas, "memory");
+    assert_eq!(
+        conditional_required_for(mem, "remember"),
+        vec!["content".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(mem, "recall"),
+        vec!["query".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(mem, "expand"),
+        vec!["memory_id".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(mem, "forget"),
+        vec!["reason".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(mem, "update"),
+        vec!["reason".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(mem, "feedback"),
+        vec!["memory_id".to_string(), "signal".to_string()]
+    );
+}
+
+#[test]
+fn session_schema_requires_path_value_tool_question_query() {
+    let schemas = all_tool_schemas();
+    let sess = tool_schema(&schemas, "session");
+    assert_eq!(
+        conditional_required_for(sess, "config"),
+        vec!["path".to_string(), "value".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(sess, "prioritize"),
+        vec!["tool".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(sess, "deprioritize"),
+        vec!["tool".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(sess, "ask_user"),
+        vec!["question".to_string()]
+    );
+}
+
+#[test]
+fn mo_schema_requires_sql_and_sub_action() {
+    let schemas = all_tool_schemas();
+    let mo = tool_schema(&schemas, "mo");
+    assert_eq!(
+        conditional_required_for(mo, "query"),
+        vec!["sql".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(mo, "snapshot"),
+        vec!["sub_action".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(mo, "branch"),
+        vec!["sub_action".to_string()]
+    );
+}
+
+#[test]
+fn task_schema_requires_title_and_task_id() {
+    let schemas = all_tool_schemas();
+    let task = tool_schema(&schemas, "task");
+    assert_eq!(
+        conditional_required_for(task, "create"),
+        vec!["title".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(task, "update"),
+        vec!["task_id".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(task, "get"),
+        vec!["task_id".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(task, "stop"),
+        vec!["task_id".to_string()]
+    );
+}

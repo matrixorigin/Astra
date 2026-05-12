@@ -15,7 +15,11 @@ pub use astra_turn_core::tool_registry_meta::{IntentType, Scope, TOOL_CATALOG, T
 
 mod registry;
 pub mod scoring;
+pub mod surface;
 pub mod tool_pool;
+
+#[cfg(test)]
+mod surface_tests;
 
 pub use astra_turn_core::tool_registry_chain::{ChainContext, ChainStep, ToolChain};
 pub use astra_turn_core::tool_registry_report::{
@@ -69,12 +73,12 @@ mod tests {
 
     #[test]
     fn catalog_has_expected_tools() {
-        assert_eq!(TOOL_CATALOG.len(), 19);
+        assert_eq!(TOOL_CATALOG.len(), 20);
     }
 
     #[test]
     fn all_tools_are_pinned() {
-        assert_eq!(ToolRegistry::pinned_count(), 19);
+        assert_eq!(ToolRegistry::pinned_count(), 20);
     }
 
     #[test]

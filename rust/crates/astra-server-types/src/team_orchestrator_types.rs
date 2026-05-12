@@ -7,9 +7,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use astra_services::coordination::{AgentResult, DelegationResult};
-use astra_services::learning_merge::{
-    AgentLearning, MergedLearning, VersionVector, merge_agent_learnings,
-};
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -178,36 +175,6 @@ pub fn derive_team_status(
                 conflict_count,
             )),
         ),
-    }
-}
-
-/// Extract a synthetic AgentLearning from an agent result.
-pub fn extract_learning_from_result(result: &AgentResult) -> AgentLearning {
-    let mut version = VersionVector::new();
-    version.increment(&result.agent_id);
-
-    AgentLearning {
-        agent_id: result.agent_id.clone(),
-        session_id: result.run_id.clone(),
-        version,
-        successful_patterns: vec![],
-        failed_patterns: vec![],
-        discovered_facts: vec![],
-        quality_score: if result.is_success() { 0.8 } else { 0.2 },
-    }
-}
-
-/// Aggregate learnings from all successful agents in a delegation result.
-pub fn merge_team_learnings(agent_results: &[AgentResult]) -> Option<MergedLearning> {
-    let learnings: Vec<AgentLearning> = agent_results
-        .iter()
-        .filter(|r| r.is_success())
-        .map(extract_learning_from_result)
-        .collect();
-    if learnings.is_empty() {
-        None
-    } else {
-        Some(merge_agent_learnings(&learnings))
     }
 }
 

@@ -52,6 +52,8 @@ fn build_sources() -> (
                 ..Default::default()
             },
             self_model: Some("Expert Rust engineer.".into()),
+            deferred_tools_block: String::new(),
+            skill_listing_block: String::new(),
         },
         TurnState {
             messages: vec![

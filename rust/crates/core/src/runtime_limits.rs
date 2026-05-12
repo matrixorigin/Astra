@@ -112,13 +112,24 @@ impl RuntimeLimits {
     }
 
     /// Resolve the effective max_turn_input_tokens for a given model.
-    /// If the model has a known context window, use it (minus a reserve
-    /// for output). Otherwise fall back to the configured default.
+    ///
+    /// When the model has a known context window, the budget IS derived
+    /// from it (roughly 80% — the remaining ~20% covers output tokens and
+    /// protocol overhead). The configured `max_turn_input_tokens` is a
+    /// fallback for UNKNOWN models only, not a cap on known ones. Past
+    /// behaviour `effective.min(self.max_turn_input_tokens)` meant a
+    /// 1M-window Sonnet 4.6 was clamped to 200K — 80% of the real window
+    /// thrown away; on the other hand, letting the config be a floor would
+    /// cause a 128K-window GPT-4o to be pushed up to 200K when its real
+    /// ceiling is 128K. Neither direction of clamp is correct; the
+    /// model's window should win outright.
+    ///
+    /// Callers that need to override a known model (lower the budget for
+    /// cost reasons, for example) should set `max_turn_input_tokens` on
+    /// the per-session `RuntimeConfig`, not via this global helper.
     pub fn effective_max_turn_input_tokens(&self, model: Option<&str>) -> u64 {
         if let Some(window) = model.and_then(context_window_for_model) {
-            // Reserve ~20% for output tokens + overhead
-            let effective = (window as f64 * 0.80) as u64;
-            effective.min(self.max_turn_input_tokens)
+            (window as f64 * 0.80) as u64
         } else {
             self.max_turn_input_tokens
         }
@@ -133,7 +144,19 @@ impl RuntimeLimits {
 /// apply a reserve (e.g., 80% for input, 20% for output).
 pub fn context_window_for_model(model: &str) -> Option<u64> {
     let lower = model.to_lowercase();
-    // Anthropic models
+    // Anthropic 4.6+ generation: 1M context window.
+    // The 4.6 generation (Opus 4.6, Sonnet 4.6, Haiku 4.6) advertises a 1M
+    // token context. Earlier 4.x (4.0/4.1/4.5) stays at 200K. Match the
+    // specific suffix first so legacy members still get the 200K window.
+    if lower.contains("opus-4-6")
+        || lower.contains("sonnet-4-6")
+        || lower.contains("haiku-4-6")
+        || lower.contains("opus-4-7")
+        || lower.contains("sonnet-4-7")
+        || lower.contains("haiku-4-7")
+    {
+        return Some(1_000_000);
+    }
     if lower.contains("opus-4") || lower.contains("claude-opus") {
         return Some(200_000);
     }

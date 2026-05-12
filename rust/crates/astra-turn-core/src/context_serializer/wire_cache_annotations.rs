@@ -187,7 +187,7 @@ fn find_cache_breakpoint_targets(messages: &[Value]) -> Vec<usize> {
         && messages.len() > last_user + 1
     {
         // Walk back through any trailing `role=system` msgs. The runtime
-        // appends `[working-set:v1]`, `Already Fetched`, stall nudges etc.
+        // appends `Already Fetched`, stall nudges etc.
         // as `role=system` entries at the end of `state.messages`
         // (agentic_loop_lifecycle.rs:787). Their content changes every
         // round, so putting a cache_control marker on one of them creates
@@ -197,7 +197,7 @@ fn find_cache_breakpoint_targets(messages: &[Value]) -> Vec<usize> {
         // invalidates every round.
         //
         // Session c0905eab t5 observed cached stuck at 2432 (system[0..2]
-        // only) because the trailing working-set block carried cc and
+        // only) because the trailing volatile block carried cc and
         // overrode the stable system+tools cache. Controlled probe
         // recovered 7936 cached (31x) by skipping this marker. See
         // `tests/fixtures/deepseek_anthropic_cache_probe.py` callers.
@@ -657,8 +657,8 @@ mod tests {
         assert_eq!(msgs[0]["content"], "sys");
     }
 
-    /// Session c0905eab regression: runtime appends `[working-set:v1]`
-    /// (and similar volatile signals — inventory, stall nudges) as
+    /// Session c0905eab regression: runtime appends volatile signals
+    /// (inventory, stall nudges) as
     /// `role=system` messages at the end of `state.messages`. Anthropic's
     /// wire converter merges these into the top-level `system[]` array.
     /// If `annotate_last_message_cache_breakpoint` lands its marker on
@@ -674,8 +674,8 @@ mod tests {
     #[test]
     fn cache_breakpoint_tool_loop_skips_trailing_system_msgs() {
         // Shape after 2 tool rounds inside a user turn, THEN a trailing
-        // working-set system msg appended by agentic_loop_lifecycle:
-        //   [user, a(tc), tool, a(tc), tool, system(working-set)]
+        // volatile system msg appended by agentic_loop_lifecycle:
+        //   [user, a(tc), tool, a(tc), tool, system(volatile)]
         let mut msgs = vec![
             json!({"role": "user", "content": "q1"}),
             json!({"role": "assistant", "content": null,
@@ -684,7 +684,7 @@ mod tests {
             json!({"role": "assistant", "content": null,
                    "tool_calls": [{"id": "c2", "function": {"name": "bash"}}]}),
             json!({"role": "tool", "tool_call_id": "c2", "content": "r2"}),
-            json!({"role": "system", "content": "[working-set:v1]\n..."}),
+            json!({"role": "system", "content": "## Already Fetched\n..."}),
         ];
         annotate_last_message_cache_breakpoint(&mut msgs);
         let marks = marker_indices(&msgs);
@@ -701,7 +701,7 @@ mod tests {
         );
     }
 
-    /// Two trailing system msgs in a row (e.g. working-set + inventory).
+    /// Two trailing system msgs in a row (e.g. inventory + stall nudge).
     /// The walker should skip both and land on the last non-system msg.
     #[test]
     fn cache_breakpoint_tool_loop_skips_multiple_trailing_system_msgs() {
@@ -710,7 +710,7 @@ mod tests {
             json!({"role": "assistant", "content": null,
                    "tool_calls": [{"id": "c1", "function": {"name": "bash"}}]}),
             json!({"role": "tool", "tool_call_id": "c1", "content": "r1"}),
-            json!({"role": "system", "content": "[working-set:v1]\n..."}),
+            json!({"role": "system", "content": "⚠ stall nudge\n..."}),
             json!({"role": "system", "content": "## Already Fetched\n..."}),
         ];
         annotate_last_message_cache_breakpoint(&mut msgs);
@@ -762,7 +762,7 @@ mod tests {
             json!({"role": "user", "content": "q1"}),
             json!({"role": "assistant", "content": "a1"}),
             json!({"role": "user", "content": "q2"}),
-            json!({"role": "system", "content": "[working-set:v1]\n..."}),
+            json!({"role": "system", "content": "## Already Fetched\n..."}),
         ];
         annotate_last_message_cache_breakpoint(&mut msgs);
         let marks = marker_indices(&msgs);

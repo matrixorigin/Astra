@@ -173,14 +173,17 @@ mod tests {
             SlashItem {
                 name: "/help",
                 description: "show help",
+                subcommands: &[],
             },
             SlashItem {
                 name: "/history",
                 description: "browse session history",
+                subcommands: &[],
             },
             SlashItem {
                 name: "/model",
                 description: "pick a model",
+                subcommands: &[],
             },
         ])
     }
@@ -242,6 +245,7 @@ mod tests {
                 SlashItem {
                     name,
                     description: desc,
+                    subcommands: &[],
                 }
             })
             .collect();
@@ -262,6 +266,7 @@ mod tests {
                 SlashItem {
                     name,
                     description: "",
+                    subcommands: &[],
                 }
             })
             .collect();
