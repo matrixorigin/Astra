@@ -671,20 +671,6 @@ async fn run_extraction(
         .map(|m| format!("{:?}", m.category).to_lowercase())
         .collect();
 
-    let memories: Vec<serde_json::Value> = quality_filtered
-        .iter()
-        .map(|m| {
-            let encoded = astra_prompts::memory_types::encode(m.category, &m.content);
-            serde_json::json!({
-                "content": encoded,
-                "memory_type": m.category.memoria_type(),
-                "trust_tier": m.category.trust_tier(),
-                "session_id": session_id,
-                "source": {"agent": "extraction"},
-            })
-        })
-        .collect();
-
     let mem = astra_core::MemoriaSettings::from_env();
     let key = match mem.master_key {
         Some(k) => k,
@@ -699,29 +685,108 @@ async fn run_extraction(
         }
     };
 
-    match client
-        .post(format!("{}/v1/memories/batch", mem.base_url))
-        .header("Authorization", format!("Bearer {key}"))
-        .json(&serde_json::json!({ "memories": memories }))
-        .send()
-        .await
-    {
-        Ok(resp) if !resp.status().is_success() => {
-            eprintln!(
-                "  [memory-extraction] batch write failed ({})",
-                resp.status()
-            );
+    // Per-candidate conflict pre-check: route near-duplicates to
+    // `/correct` instead of batch-inserting a new row. The prior path
+    // POSTed every extracted item to `/v1/memories/batch`, creating
+    // duplicates whenever a refinement of an existing memory surfaced.
+    // Running the pre-checks in parallel keeps latency roughly equal
+    // to a single recall RTT; each candidate then independently POSTs
+    // either `/v1/memories` (new) or `/v1/memories/{id}/correct`
+    // (refinement).
+    let auth = format!("Bearer {key}");
+    let base = mem.base_url.clone();
+    let mut writes = 0usize;
+    let mut updates = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for m in &quality_filtered {
+        let encoded = astra_prompts::memory_types::encode(m.category, &m.content);
+        // Step 1: top-3 recall with a 2-second timeout (same budget as
+        // the tool-side conflict pre-check).
+        let probe = client
+            .post(format!("{base}/v1/memories/retrieve"))
+            .header("Authorization", &auth)
+            .timeout(std::time::Duration::from_secs(2))
+            .json(&serde_json::json!({
+                "query": encoded,
+                "top_k": 3,
+                "session_id": session_id,
+            }))
+            .send()
+            .await;
+        let decision = match probe {
+            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(parsed) => {
+                        let arr = parsed
+                            .get("memories")
+                            .and_then(serde_json::Value::as_array)
+                            .cloned()
+                            .or_else(|| parsed.as_array().cloned())
+                            .unwrap_or_default();
+                        astra_tools::memoria::classify_write(&arr)
+                    }
+                    Err(_) => astra_tools::memoria::WriteDecision::Store,
+                },
+                Err(_) => astra_tools::memoria::WriteDecision::Store,
+            },
+            // Degrade to Store on network failure so we don't drop
+            // extractions silently.
+            _ => astra_tools::memoria::WriteDecision::Store,
+        };
+
+        // Step 2: dispatch.
+        let write_result = match &decision {
+            astra_tools::memoria::WriteDecision::Update { memory_id, .. } => {
+                updates += 1;
+                client
+                    .put(format!("{base}/v1/memories/{memory_id}/correct"))
+                    .header("Authorization", &auth)
+                    .json(&serde_json::json!({
+                        "new_content": encoded,
+                        "reason": "session-end extraction refinement",
+                    }))
+                    .send()
+                    .await
+            }
+            astra_tools::memoria::WriteDecision::Store => {
+                writes += 1;
+                client
+                    .post(format!("{base}/v1/memories"))
+                    .header("Authorization", &auth)
+                    .json(&serde_json::json!({
+                        "content": encoded,
+                        "memory_type": m.category.memoria_type(),
+                        "trust_tier": m.category.trust_tier(),
+                        "session_id": session_id,
+                        "source": {"agent": "extraction"},
+                    }))
+                    .send()
+                    .await
+            }
+        };
+        match write_result {
+            Ok(resp) if !resp.status().is_success() => {
+                errors.push(format!("{:?} HTTP {}", decision, resp.status()));
+            }
+            Err(e) => errors.push(format!("{decision:?} network: {e}")),
+            _ => {}
         }
-        Err(e) => {
-            eprintln!("  [memory-extraction] batch write error: {e}");
-        }
-        _ => {}
     }
+    if !errors.is_empty() {
+        eprintln!(
+            "  [memory-extraction] write failures ({}): {}",
+            errors.len(),
+            errors.join("; ")
+        );
+    }
+    let _ = (writes, updates); // captured for the log line below
 
     let duration_ms = start.elapsed().as_millis() as u64;
     eprintln!(
-        "  [memory-extraction] turn: extracted {} memories ({}) in {:.1}s{}",
+        "  [memory-extraction] turn: extracted {} memories ({} new, {} updated) [{}] in {:.1}s{}",
         quality_filtered.len(),
+        writes,
+        updates,
         categories.join(", "),
         duration_ms as f64 / 1000.0,
         if prefix_reused { " [cache-shared]" } else { "" },

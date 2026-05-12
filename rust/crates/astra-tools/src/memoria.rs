@@ -442,7 +442,7 @@ impl MemoriaClient {
     /// new `remember` call as a likely duplicate. Tuned empirically:
     /// vector+keyword hybrid scores above ~0.85 on a short phrase
     /// match are near-synonyms in practice.
-    const CONFLICT_SIMILARITY_FLOOR: f64 = 0.85;
+    pub const CONFLICT_SIMILARITY_FLOOR: f64 = 0.85;
 
     /// Client-side conflict pre-check for `remember`. Issues a cheap
     /// top-3 recall with a 2-second timeout; if any existing memory
@@ -1114,6 +1114,54 @@ impl MemoriaClient {
                 HttpMethod::Post,
             ),
         }
+    }
+}
+
+/// Classification of a memoria write candidate against an existing
+/// corpus: either the content is truly new (→ `Store`) or it duplicates
+/// an existing memory whose id is known (→ `Update`). Used by the
+/// session-end extraction path so refinements route to `update` rather
+/// than creating duplicate rows.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WriteDecision {
+    /// No near-duplicate found. POST /v1/memories to create a new row.
+    Store,
+    /// A near-duplicate exists at this memory_id; caller should
+    /// POST /v1/memories/{id}/correct to refine in place.
+    Update { memory_id: String, score: f64 },
+}
+
+/// Given the `memories` array from a Memoria retrieve response, decide
+/// whether the write should become a new row (`Store`) or an in-place
+/// correction (`Update`) of the top hit.
+///
+/// Pure. Uses [`MemoriaClient::CONFLICT_SIMILARITY_FLOOR`] as the
+/// threshold; entries missing `retrieval_score` or `memory_id` are
+/// ignored. Highest-score hit wins.
+pub fn classify_write(candidates: &[Value]) -> WriteDecision {
+    let mut best: Option<(f64, String)> = None;
+    for entry in candidates {
+        let Some(score) = entry.get("retrieval_score").and_then(Value::as_f64) else {
+            continue;
+        };
+        if score < MemoriaClient::CONFLICT_SIMILARITY_FLOOR {
+            continue;
+        }
+        let Some(id) = entry.get("memory_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        match best {
+            None => best = Some((score, id.to_string())),
+            Some((s, _)) if score > s => best = Some((score, id.to_string())),
+            _ => {}
+        }
+    }
+    match best {
+        Some((score, memory_id)) => WriteDecision::Update { memory_id, score },
+        None => WriteDecision::Store,
     }
 }
 
@@ -1967,6 +2015,73 @@ mod memoria_http_client_tests {
         let arr: Vec<Value> = serde_json::from_str(&out).unwrap();
         assert!(arr.is_empty());
         assert!(newly.is_empty());
+    }
+
+    // ── P4: classify_write (extraction conflict gate) ──────────────────
+
+    #[test]
+    fn classify_write_returns_store_when_no_hits_above_floor() {
+        use super::*;
+        let candidates = vec![
+            serde_json::json!({"memory_id": "m1", "retrieval_score": 0.70}),
+            serde_json::json!({"memory_id": "m2", "retrieval_score": 0.40}),
+        ];
+        assert_eq!(classify_write(&candidates), WriteDecision::Store);
+    }
+
+    #[test]
+    fn classify_write_returns_update_on_duplicate() {
+        use super::*;
+        let candidates = vec![
+            serde_json::json!({"memory_id": "m-dup", "retrieval_score": 0.92}),
+            serde_json::json!({"memory_id": "m-low", "retrieval_score": 0.50}),
+        ];
+        match classify_write(&candidates) {
+            WriteDecision::Update { memory_id, score } => {
+                assert_eq!(memory_id, "m-dup");
+                assert!((score - 0.92).abs() < 1e-6);
+            }
+            d => panic!("expected Update, got {d:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_write_picks_highest_scoring_duplicate() {
+        use super::*;
+        let candidates = vec![
+            serde_json::json!({"memory_id": "m-a", "retrieval_score": 0.86}),
+            serde_json::json!({"memory_id": "m-b", "retrieval_score": 0.95}),
+            serde_json::json!({"memory_id": "m-c", "retrieval_score": 0.88}),
+        ];
+        match classify_write(&candidates) {
+            WriteDecision::Update { memory_id, .. } => assert_eq!(memory_id, "m-b"),
+            d => panic!("expected Update, got {d:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_write_skips_entries_missing_id_or_score() {
+        use super::*;
+        let candidates = vec![
+            serde_json::json!({"retrieval_score": 0.99}), // no id
+            serde_json::json!({"memory_id": "m", "retrieval_score": 0.92}),
+            serde_json::json!({"memory_id": ""}), // no score + empty id
+        ];
+        match classify_write(&candidates) {
+            WriteDecision::Update { memory_id, .. } => assert_eq!(memory_id, "m"),
+            d => panic!("expected Update, got {d:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_write_floor_is_exactly_0_85() {
+        use super::*;
+        // just below floor → Store
+        let below = vec![serde_json::json!({"memory_id": "m", "retrieval_score": 0.84})];
+        assert_eq!(classify_write(&below), WriteDecision::Store);
+        // exactly at floor → Update (tie-goes-to-dup)
+        let at = vec![serde_json::json!({"memory_id": "m", "retrieval_score": 0.85})];
+        assert!(matches!(classify_write(&at), WriteDecision::Update { .. }));
     }
 
     #[test]
