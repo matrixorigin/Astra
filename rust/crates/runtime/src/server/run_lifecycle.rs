@@ -195,6 +195,7 @@ async fn post_loop_memory_cleanup(
     // the bridge-side content-dedup keys and the tool-side
     // memory_id dedup entries. One reset covers both.
     astra_tools::memoria::MemoriaClient::reset_seen(session_id);
+    astra_tools::memoria::MemoriaClient::reset_focus(session_id);
     // And ensure the recall ledger is clean even if governance didn't
     // run (e.g. no memoria client configured, or drain was conditional
     // on an episode being written).

@@ -106,6 +106,9 @@ pub fn parse_extraction_response(response: &str) -> Vec<ExtractedMemory> {
             if content.is_empty() {
                 return None;
             }
+            if astra_tools::memoria::contains_sensitive_memory_content(&content) {
+                return None;
+            }
             let category = match type_str {
                 "user" => MemoryCategory::User,
                 "feedback" => MemoryCategory::Feedback,
@@ -116,6 +119,12 @@ pub fn parse_extraction_response(response: &str) -> Vec<ExtractedMemory> {
             Some(ExtractedMemory { category, content })
         })
         .collect()
+}
+
+fn write_decision_for_failed_conflict_probe() -> astra_tools::memoria::WriteDecision {
+    astra_tools::memoria::WriteDecision::Skip {
+        reason: "conflict pre-check failed; skipping extraction write to avoid duplicates".into(),
+    }
 }
 
 /// Check if the main model already **wrote** to memory this turn.
@@ -725,13 +734,14 @@ async fn run_extraction(
                             .unwrap_or_default();
                         astra_tools::memoria::classify_write(&arr)
                     }
-                    Err(_) => astra_tools::memoria::WriteDecision::Store,
+                    Err(_) => write_decision_for_failed_conflict_probe(),
                 },
-                Err(_) => astra_tools::memoria::WriteDecision::Store,
+                Err(_) => write_decision_for_failed_conflict_probe(),
             },
-            // Degrade to Store on network failure so we don't drop
-            // extractions silently.
-            _ => astra_tools::memoria::WriteDecision::Store,
+            // Fail closed on probe/network failure. Writing a fresh row
+            // when duplicate detection is unavailable degrades memory
+            // quality; skipping one extraction is safer than storing noise.
+            _ => write_decision_for_failed_conflict_probe(),
         };
 
         // Step 2: dispatch.
@@ -762,6 +772,10 @@ async fn run_extraction(
                     }))
                     .send()
                     .await
+            }
+            astra_tools::memoria::WriteDecision::Skip { reason } => {
+                errors.push(reason.clone());
+                continue;
             }
         };
         match write_result {
@@ -932,6 +946,14 @@ mod tests {
         let resp = r#"[{"type":"user","content":""},{"type":"user","content":"valid"}]"#;
         let result = parse_extraction_response(resp);
         assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn parse_sensitive_content_skipped() {
+        let resp = r#"[{"type":"project","content":"deploy token: ghp_1234567890abcdef"},{"type":"user","content":"prefers concise answers with examples"}]"#;
+        let result = parse_extraction_response(resp);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].category, MemoryCategory::User);
     }
 
     #[test]
@@ -1590,6 +1612,14 @@ mod tests {
     fn parse_truncated_json_returns_empty() {
         let resp = r#"[{"type":"user","content":"text"},{"type":"brok"#;
         assert!(parse_extraction_response(resp).is_empty());
+    }
+
+    #[test]
+    fn conflict_probe_failure_does_not_store_duplicate() {
+        assert!(matches!(
+            write_decision_for_failed_conflict_probe(),
+            astra_tools::memoria::WriteDecision::Skip { .. }
+        ));
     }
 
     // ── Source metadata ──

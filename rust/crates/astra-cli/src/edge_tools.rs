@@ -2179,6 +2179,21 @@ impl ToolExecutor {
         };
         // Normalize empty output, then apply global safety net
         let output = self.finalize_tool_output(output, name);
+        if name != "memory"
+            && !output.starts_with("Error")
+            && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
+        {
+            let client = astra_tools::memoria::MemoriaClient::new(
+                self.cloud_base.clone(),
+                self.cloud_token(),
+            );
+            let ctx = format!("cli-tool:{name}");
+            tokio::spawn(async move {
+                client
+                    .feedback_pending_recalls(&session_id, "useful", &ctx)
+                    .await;
+            });
+        }
         self.record_output_size(output.len());
         output
     }

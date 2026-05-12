@@ -763,6 +763,41 @@ mod tests {
     }
 
     #[test]
+    fn memory_read_actions_are_action_aware() {
+        assert_eq!(
+            semantic_call_key(
+                "memory",
+                &json!({"action": "recall", "query": "Rust Memory"})
+            ),
+            Some("memory_recall:rust memory".to_string())
+        );
+        assert_eq!(
+            semantic_call_key("memory", &json!({"action": "profile"})),
+            Some("memory_profile".to_string())
+        );
+        assert_eq!(
+            semantic_call_key("memory", &json!({"action": "expand", "memory_id": "m1"})),
+            Some("memory_expand:m1".to_string())
+        );
+    }
+
+    #[test]
+    fn memory_write_actions_do_not_dedupe() {
+        for action in [
+            "remember", "forget", "update", "focus", "reflect", "feedback",
+        ] {
+            assert!(
+                semantic_call_key(
+                    "memory",
+                    &json!({"action": action, "query": "x", "content": "x", "memory_id": "m"})
+                )
+                .is_none(),
+                "{action} must not be semantically deduped"
+            );
+        }
+    }
+
+    #[test]
     fn git_log_search_case_insensitive() {
         let k1 = semantic_call_key("git_log_search", &json!({"query": "Fix Bug"}));
         let k2 = semantic_call_key("git_log_search", &json!({"query": "fix bug"}));

@@ -1498,6 +1498,28 @@ impl ServerToolExecutor {
             .fetch_add(result.output.len(), Ordering::Relaxed);
         result.output = astra_tools::maybe_persist_large_output(result.output, agg, name);
 
+        if name != "memory" && !result.is_error {
+            let session_id = self.session_id.clone();
+            let ctx = format!("server-tool:{name}");
+            let client = astra_tools::memoria::MemoriaClient::new(
+                self.memoria_client.cloud_base.clone(),
+                self.memoria_client.cloud_token.clone(),
+            );
+            tokio::spawn(async move {
+                let pushed = client
+                    .feedback_pending_recalls(&session_id, "useful", &ctx)
+                    .await;
+                if pushed > 0 {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        context = %ctx,
+                        memories = pushed,
+                        "closed recall feedback after successful tool"
+                    );
+                }
+            });
+        }
+
         // ── Progress: tool completed ─────────────────────────────────
         if let Some(cb) = &self.progress_callback {
             cb.tool_completed(&call_id, &result.output, !result.is_error)

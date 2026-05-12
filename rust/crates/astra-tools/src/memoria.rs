@@ -7,8 +7,8 @@
 //! calls to the Memoria service.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -92,6 +92,49 @@ pub fn parse_memory_search_hits(raw: &str) -> Vec<BoostSearchHit> {
         .collect()
 }
 
+/// Return true when text appears to contain credentials or similarly
+/// sensitive material that must never become durable memory.
+pub fn contains_sensitive_memory_content(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    const NEEDLES: &[&str] = &[
+        "password:",
+        "password=",
+        "passwd:",
+        "passwd=",
+        "api_key:",
+        "api_key=",
+        "apikey:",
+        "apikey=",
+        "access_token:",
+        "access_token=",
+        "refresh_token:",
+        "refresh_token=",
+        "secret_key:",
+        "secret_key=",
+        "client_secret:",
+        "client_secret=",
+        "authorization:",
+        "beginprivatekey",
+        "beginrsaprivatekey",
+        "beginopensshprivatekey",
+    ];
+    if NEEDLES.iter().any(|needle| compact.contains(needle)) {
+        return true;
+    }
+    if lower.contains("bearer ") {
+        return true;
+    }
+    let raw = text.trim();
+    raw.contains("ghp_")
+        || raw.contains("github_pat_")
+        || raw.contains("sk-live-")
+        || raw.contains("sk_test_")
+        || raw.contains("xoxb-")
+        || raw.contains("xoxp-")
+        || raw.contains("AKIA")
+}
+
 /// A single `focus` hint: a session-scoped attention boost with TTL.
 ///
 /// Stored in-process by [`MemoriaClient`]. On each `recall` call the
@@ -125,9 +168,18 @@ pub struct MemoriaClient {
     pub cloud_token: Option<String>,
     /// Circuit breaker: skip after consecutive failures.
     fail_count: AtomicU32,
-    /// Session-scoped attention boosts. Keyed by `session_id`. Each entry
-    /// is consulted on `recall` and auto-expired by `Instant`.
-    focus_store: RwLock<HashMap<String, Vec<FocusHint>>>,
+}
+
+/// Process-global focus hints, keyed by session_id.
+///
+/// Tool executors construct `MemoriaClient` per tool call in several
+/// production paths. Keeping focus hints on the client instance made
+/// `memory(action=focus)` evaporate before the next `recall`. This store
+/// is the session-lifetime state for those hints.
+static FOCUS_STORE: OnceLock<RwLock<HashMap<String, Vec<FocusHint>>>> = OnceLock::new();
+
+fn focus_store() -> &'static RwLock<HashMap<String, Vec<FocusHint>>> {
+    FOCUS_STORE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// Process-global "already surfaced" set for memory entries, keyed by
@@ -186,7 +238,6 @@ impl MemoriaClient {
             cloud_base,
             cloud_token,
             fail_count: AtomicU32::new(0),
-            focus_store: RwLock::new(HashMap::new()),
         }
     }
 
@@ -231,7 +282,7 @@ impl MemoriaClient {
             boost,
             expires_at,
         };
-        if let Ok(mut store) = self.focus_store.write() {
+        if let Ok(mut store) = focus_store().write() {
             let sid_key = if session_id.is_empty() {
                 "_global".to_string()
             } else {
@@ -262,7 +313,7 @@ impl MemoriaClient {
         } else {
             session_id.to_string()
         };
-        if let Ok(mut store) = self.focus_store.write()
+        if let Ok(mut store) = focus_store().write()
             && let Some(bucket) = store.get_mut(&sid_key)
         {
             bucket.retain(|h| h.expires_at > now);
@@ -315,6 +366,17 @@ impl MemoriaClient {
             return;
         }
         if let Ok(mut g) = seen_store().write() {
+            g.remove(session_id);
+        }
+    }
+
+    /// Clear focus hints for a session. Called at session-end cleanup so
+    /// long-lived processes do not carry stale attention boosts forever.
+    pub fn reset_focus(session_id: &str) {
+        if session_id.is_empty() {
+            return;
+        }
+        if let Ok(mut g) = focus_store().write() {
             g.remove(session_id);
         }
     }
@@ -387,6 +449,51 @@ impl MemoriaClient {
         if let Ok(mut g) = recall_ledger().write() {
             g.remove(session_id);
         }
+    }
+
+    /// Drain pending recalls and push one feedback signal for every
+    /// surfaced memory id. Intended for tool-result lifecycle hooks:
+    /// when a non-memory tool succeeds after a recall, the recall gets
+    /// prompt feedback immediately instead of waiting for session-end.
+    ///
+    /// Best-effort: individual feedback failures are ignored after being
+    /// attempted; the recall ledger is consumed exactly once.
+    pub async fn feedback_pending_recalls(
+        &self,
+        session_id: &str,
+        signal: &str,
+        context_prefix: &str,
+    ) -> usize {
+        if session_id.is_empty() || signal.is_empty() {
+            return 0;
+        }
+        let snapshots = Self::drain_recalls(session_id, None);
+        let mut attempted = 0usize;
+        for snap in snapshots {
+            for id in snap.memory_ids {
+                if id.is_empty() {
+                    continue;
+                }
+                attempted += 1;
+                let context = if context_prefix.is_empty() {
+                    format!("auto: turn {} outcome", snap.turn)
+                } else {
+                    format!("{context_prefix}: turn {} outcome", snap.turn)
+                };
+                let _ = self
+                    .call_with_timeout(
+                        "feedback",
+                        &json!({
+                            "memory_id": id,
+                            "signal": signal,
+                            "context": context,
+                        }),
+                        Duration::from_secs(3),
+                    )
+                    .await;
+            }
+        }
+        attempted
     }
 
     /// Inject focus hints into a `recall` payload. Called by the
@@ -613,6 +720,10 @@ impl MemoriaClient {
 
         if self.is_circuit_open() {
             return json!({"error": "Memory service unavailable (circuit open)"}).to_string();
+        }
+
+        if let Some(validation_error) = Self::validate_before_side_effects(op, args) {
+            return validation_error.to_string();
         }
 
         // `remember`: run a client-side conflict pre-check so the LLM
@@ -853,6 +964,14 @@ impl MemoriaClient {
                     return (
                         String::new(),
                         json!({"error": "memory(action=remember) requires `content`"}),
+                        HttpMethod::Post,
+                    );
+                }
+                if contains_sensitive_memory_content(content) {
+                    return (
+                        String::new(),
+                        json!({"error":
+                            "memory(action=remember) refused sensitive-looking content; do not store secrets, credentials, or tokens"}),
                         HttpMethod::Post,
                     );
                 }
@@ -1284,6 +1403,79 @@ impl MemoriaClient {
             ),
         }
     }
+
+    fn validate_before_side_effects(op: &str, args: &Value) -> Option<Value> {
+        match op {
+            "remember" => {
+                let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+                if content.trim().is_empty() {
+                    return Some(json!({"error": "memory(action=remember) requires `content`"}));
+                }
+                if contains_sensitive_memory_content(content) {
+                    return Some(json!({"error":
+                        "memory(action=remember) refused sensitive-looking content; do not store secrets, credentials, or tokens"}));
+                }
+                None
+            }
+            "forget" => {
+                let reason = args
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                if reason.is_none() {
+                    return Some(json!({"error":
+                        "memory(action=forget) requires a non-empty `reason` (audit trail)"}));
+                }
+                if args
+                    .get("memory_ids")
+                    .or_else(|| args.get("memory_id"))
+                    .is_none()
+                    && args.get("topic").and_then(Value::as_str).is_none()
+                {
+                    return Some(
+                        json!({"error": "memory(action=forget) requires `memory_id` or `topic`"}),
+                    );
+                }
+                None
+            }
+            "update" => {
+                let reason = args
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                if reason.is_none() {
+                    return Some(json!({"error":
+                        "memory(action=update) requires a non-empty `reason` (audit trail)"}));
+                }
+                let has_id = args
+                    .get("memory_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty());
+                let has_query = args
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty());
+                if !has_id && !has_query {
+                    return Some(
+                        json!({"error": "memory(action=update) requires `memory_id` or `query`"}),
+                    );
+                }
+                if let Some(content) = args
+                    .get("content")
+                    .or_else(|| args.get("new_content"))
+                    .and_then(Value::as_str)
+                    && contains_sensitive_memory_content(content)
+                {
+                    return Some(json!({"error":
+                        "memory(action=update) refused sensitive-looking content; do not store secrets, credentials, or tokens"}));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Classification of a memoria write candidate against an existing
@@ -1298,6 +1490,9 @@ pub enum WriteDecision {
     /// A near-duplicate exists at this memory_id; caller should
     /// POST /v1/memories/{id}/correct to refine in place.
     Update { memory_id: String, score: f64 },
+    /// Conflict check failed, so the safe choice is to skip rather than
+    /// fail-open into a duplicate write.
+    Skip { reason: String },
 }
 
 /// Given the `memories` array from a Memoria retrieve response, decide
@@ -2395,6 +2590,65 @@ mod memoria_http_client_tests {
         assert!(MemoriaClient::seen_snapshot("p6-reset-sess").is_empty());
     }
 
+    #[test]
+    fn focus_hints_survive_new_client_instances() {
+        use super::*;
+        let session_id = "p6-focus-global";
+        MemoriaClient::reset_focus(session_id);
+        let c1 = MemoriaClient::new(None, None);
+        let c2 = MemoriaClient::new(None, None);
+        let response = c1.focus_set(
+            session_id,
+            &json!({
+                "focus_type": "topic",
+                "focus_value": "memory-runtime",
+                "boost": 2.0,
+            }),
+        );
+        assert!(response.contains("\"status\":\"ok\""));
+
+        let mut payload = json!({"query": "review", "top_k": 5});
+        c2.apply_focus_hints(session_id, &mut payload);
+        assert_eq!(payload["boost_topics"][0]["value"], "memory-runtime");
+        assert_eq!(payload["boost_topics"][0]["boost"], 2.0);
+        MemoriaClient::reset_focus(session_id);
+    }
+
+    #[test]
+    fn remember_rejects_sensitive_secret_content() {
+        use super::*;
+        let args = json!({
+            "content": "production api_key: sk-live-1234567890abcdef",
+            "memory_type": "semantic",
+        });
+        let (endpoint, payload, _) =
+            MemoriaClient::build_direct_request("http://mem", "remember", &args);
+        assert!(
+            endpoint.is_empty(),
+            "secret-bearing memory must not be sent"
+        );
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sensitive")
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_path_validates_destructive_args_before_network() {
+        use super::*;
+        let client = MemoriaClient::new(Some("http://127.0.0.1:9".into()), Some("token".into()));
+        let out = client
+            .call_with_timeout(
+                "forget",
+                &json!({"memory_id": "m1"}),
+                Duration::from_millis(1),
+            )
+            .await;
+        assert!(out.contains("requires a non-empty `reason`"));
+    }
+
     // ── R5: recall ledger (process-global, for feedback loop) ─────────
 
     #[test]
@@ -2470,5 +2724,23 @@ mod memoria_http_client_tests {
         MemoriaClient::record_recall("r5-reset", 1, vec!["m1".into()]);
         MemoriaClient::reset_recall_ledger("r5-reset");
         assert_eq!(MemoriaClient::pending_recall_count("r5-reset"), 0);
+    }
+
+    #[tokio::test]
+    async fn feedback_pending_recalls_drains_queue_once() {
+        use super::*;
+        let session_id = "r5-feedback-drain";
+        MemoriaClient::reset_recall_ledger(session_id);
+        MemoriaClient::record_recall(session_id, 7, vec!["m1".into(), "m2".into()]);
+        let client = MemoriaClient::new(None, None);
+        let attempted = client
+            .feedback_pending_recalls(session_id, "useful", "unit-test")
+            .await;
+        assert_eq!(attempted, 2);
+        assert_eq!(MemoriaClient::pending_recall_count(session_id), 0);
+        let attempted_again = client
+            .feedback_pending_recalls(session_id, "useful", "unit-test")
+            .await;
+        assert_eq!(attempted_again, 0);
     }
 }

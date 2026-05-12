@@ -3,9 +3,13 @@
 //! The LLM sees `memory(action=...)` as a tool; the runtime has its own
 //! independent need to consult / write memory around the session
 //! lifecycle (pre-warm context, persist episodes, trigger reflection,
-//! nudge attention on topic shifts). Centralising that logic here
-//! avoids scattering v1 HTTP calls across server_loop_host, bridge,
-//! session_end, and the prefetch path.
+//! nudge attention on topic shifts).
+//!
+//! Production hot paths still use the lower-level `memory_prefetch` and
+//! `astra_tools::memoria::MemoriaClient` helpers directly where crate
+//! boundaries require it (CLI/tool execution cannot depend on runtime).
+//! Keep this orchestrator as a facade over those canonical helpers, not
+//! as a second source of state or policy.
 //!
 //! Design:
 //! - **Stateless at construction**; all state is held either on the

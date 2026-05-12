@@ -134,6 +134,21 @@ fn eprint_plan_json_parse_failed(full_text: &str, err: &str) {
     );
 }
 
+fn parse_memory_forget_args(input: &str) -> Result<(String, String), String> {
+    let mut parts = input.splitn(2, "--reason");
+    let memory_id = parts.next().unwrap_or("").trim().to_string();
+    if memory_id.is_empty() {
+        return Err("usage: /memory forget <memory_id> --reason TEXT".to_string());
+    }
+    let reason = parts
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "Error: /memory forget requires --reason for audit trail".to_string())?;
+    Ok((memory_id, reason))
+}
+
 pub(super) async fn handle_memory_domain_command(
     cmd: &str,
     arg: &str,
@@ -356,17 +371,14 @@ pub(super) async fn handle_memory_domain_command(
                 }
                 // ─── Hard-delete one memory by id ──────────────────
                 "forget" if !sub_arg.is_empty() => {
-                    // Grammar: "forget <id> [--reason TEXT]"
-                    let mut parts = sub_arg.splitn(2, "--reason");
-                    let memory_id = parts.next().unwrap_or("").trim().to_string();
-                    let reason = parts.next().map(|s| s.trim().to_string());
-                    if memory_id.is_empty() {
-                        eprintln!(
-                            "  {}",
-                            "usage: /memory forget <memory_id> [--reason TEXT]".yellow()
-                        );
-                        return Ok(());
-                    }
+                    // Grammar: "forget <id> --reason TEXT"
+                    let (memory_id, reason) = match parse_memory_forget_args(sub_arg) {
+                        Ok(parsed) => parsed,
+                        Err(msg) => {
+                            eprintln!("  {}", msg.yellow());
+                            return Ok(());
+                        }
+                    };
                     let mem = astra_core::MemoriaSettings::from_env();
                     let Some(bearer) = mem.bearer_token() else {
                         eprintln!(
@@ -377,10 +389,8 @@ pub(super) async fn handle_memory_domain_command(
                     };
                     // v1 /v1/memories/purge with memory_ids=[id], reason.
                     let url = format!("{}/v1/memories/purge", mem.base_url);
-                    let mut body = serde_json::json!({"memory_ids": [memory_id.clone()]});
-                    if let Some(r) = reason {
-                        body["reason"] = serde_json::Value::String(r);
-                    }
+                    let body =
+                        serde_json::json!({"memory_ids": [memory_id.clone()], "reason": reason});
                     match reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(5))
                         .no_proxy()
@@ -2043,6 +2053,15 @@ mod tests {
                 "/memory usage text missing {cmd}"
             );
         }
+    }
+
+    #[test]
+    fn memory_forget_requires_non_empty_reason() {
+        assert!(parse_memory_forget_args("mem-1").is_err());
+        assert!(parse_memory_forget_args("mem-1 --reason   ").is_err());
+        let parsed = parse_memory_forget_args("mem-1 --reason duplicate stale memory").unwrap();
+        assert_eq!(parsed.0, "mem-1");
+        assert_eq!(parsed.1, "duplicate stale memory");
     }
 
     // --- Empty / whitespace-only input ---
