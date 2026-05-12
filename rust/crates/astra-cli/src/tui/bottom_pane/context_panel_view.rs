@@ -404,6 +404,9 @@ impl BottomPaneView for ContextPanelView {
                 } else if self.focus.is_some() {
                     self.toggle_expand();
                     self.scroll_to_focus();
+                    if self.selectable_count() > 0 {
+                        self.scroll_to_selected_item();
+                    }
                 } else {
                     self.completed = true;
                 }

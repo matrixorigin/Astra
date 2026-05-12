@@ -343,7 +343,7 @@ pub(super) async fn handle_slash_command(
         }
 
         "/history" | "/grep" | "/review" | "/copy" | "/diagnostics" | "/lsp" | "/context"
-        | "/version" | "/whoami" | "/rewind" | "/turn" | "/report" => {
+        | "/version" | "/whoami" | "/rewind" | "/report" => {
             handle_info_command(cmd, arg, api, state, profile, token).await?;
         }
 
@@ -508,7 +508,7 @@ pub(super) async fn handle_slash_command(
             }
         },
 
-        "/clear" | "/explain" | "/verbose" | "/compact" | "/reflect" | "/undo" | "/redo" => {
+        "/clear" | "/explain" | "/compact" | "/reflect" | "/undo" | "/redo" => {
             handle_state_command(
                 cmd,
                 arg,

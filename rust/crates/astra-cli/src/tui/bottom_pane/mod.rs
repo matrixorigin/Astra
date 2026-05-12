@@ -205,6 +205,17 @@ impl BottomPane {
     pub fn sync_popups(&mut self) {
         let text = self.composer.text();
 
+        // Suppress all popups while the user is browsing history with
+        // Up/Down — otherwise a history entry starting with '/' or '@'
+        // opens a menu that captures arrow keys and blocks further
+        // history traversal.
+        if self.composer.is_browsing_history() {
+            self.slash_menu = None;
+            self.close_mention();
+            self.skill_popup = None;
+            return;
+        }
+
         // Slash menu: open whenever the first line starts with '/'. Empty
         // matches still keep the menu open so users see a "no matches"
         // message rather than silent closure.

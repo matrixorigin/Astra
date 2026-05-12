@@ -246,17 +246,9 @@ const DIFF_SUBCOMMANDS: &[(&str, &str)] = &[
     ("unstaged", "Unstaged only"),
 ];
 
-const TURN_SUBCOMMANDS: &[(&str, &str)] = &[("list", "List all journal turns")];
+// TURN_SUBCOMMANDS removed — /turn merged into /timeline
 
-const EXPERIMENT_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("analyze", "Analyze experiment results"),
-    ("create", "Create new experiment"),
-    ("list", "List all experiments"),
-    ("show", "Show experiment details"),
-    ("start", "Start an experiment"),
-    ("status", "Show active experiment"),
-    ("stop", "Stop an experiment"),
-];
+// EXPERIMENT_SUBCOMMANDS removed — /experiment is dead code
 
 const STYLE_SUBCOMMANDS: &[(&str, &str)] = &[
     ("colorful", "Colorful theme"),
@@ -315,12 +307,7 @@ const COMPACT_SUBCOMMANDS: &[(&str, &str)] = &[
     ("summary-only", "Summarize without trimming"),
 ];
 
-const TUNING_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("config", "Show tuning configuration"),
-    ("history", "Show tuning history"),
-    ("reset", "Reset tuning state"),
-    ("status", "Show tuning status (default)"),
-];
+// TUNING_SUBCOMMANDS removed — evolution subsystem deleted
 
 const CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[
     ("diff", "Show differences from defaults"),
@@ -544,9 +531,10 @@ pub static COMMANDS: &[CommandMeta] = &[
     ),
     CommandMeta::new(
         "/verbose",
-        "Verbose streaming on",
+        "(removed — use /stats)",
         CommandGroup::Observability,
-    ),
+    )
+    .alias(),
     CommandMeta::new(
         "/compact",
         "Summarize & trim history (quick | no-memoria, …)",
@@ -561,10 +549,10 @@ pub static COMMANDS: &[CommandMeta] = &[
     ),
     CommandMeta::new(
         "/turn",
-        "Turn trace: /turn | list | N | seq:N | #N | id:N | @N | -1",
+        "(removed — use /timeline, Enter to drill into a turn)",
         CommandGroup::Observability,
     )
-    .with_subcommands(TURN_SUBCOMMANDS),
+    .alias(),
     CommandMeta::new(
         "/debug",
         "Interactive session inspector (messages, tools, injections)",
@@ -596,11 +584,10 @@ pub static COMMANDS: &[CommandMeta] = &[
     ),
     CommandMeta::new(
         "/tuning",
-        "Auto-tuning: status, history, config, reset",
+        "(removed — evolution subsystem deleted)",
         CommandGroup::Observability,
     )
-    .with_subcommands(TUNING_SUBCOMMANDS)
-    .with_arg_hint("[status|history|config|reset]"),
+    .alias(),
     CommandMeta::new(
         "/config",
         "Runtime config: show|paths|sources|diff|export [path]",
@@ -636,11 +623,10 @@ pub static COMMANDS: &[CommandMeta] = &[
     ),
     CommandMeta::new(
         "/experiment",
-        "A/B testing: list, start, stop, analyze experiments",
+        "(removed — use /profile experiments)",
         CommandGroup::Observability,
     )
-    .with_subcommands(EXPERIMENT_SUBCOMMANDS)
-    .with_arg_hint("[list|create|show|start|stop|status|analyze] [name]"),
+    .alias(),
     // ── Skills ────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/skill",

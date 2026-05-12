@@ -33,10 +33,15 @@ impl BottomPaneView for TimelineView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.completed = true;
+        if self.timeline.is_drilled() {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                self.timeline.exit_drill();
             }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.completed = true,
+            KeyCode::Enter => self.timeline.enter_drill(),
             KeyCode::Up => self.timeline.move_up(),
             KeyCode::Down => self.timeline.move_down(),
             KeyCode::PageUp => {
@@ -82,7 +87,11 @@ impl BottomPaneView for TimelineView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        Some("↑↓ navigate · PgUp/PgDn page · q / Esc close".into())
+        if self.timeline.is_drilled() {
+            Some("Esc back".into())
+        } else {
+            Some("↑↓ navigate · Enter trace · PgUp/PgDn page · Esc close".into())
+        }
     }
 
     fn reserve_status_footer(&self) -> bool {
@@ -115,6 +124,20 @@ mod tests {
                 error: None,
                 cumulative_tokens_in: 0,
                 cumulative_tokens_out: 0,
+                ttft_ms: None,
+                context_ms: None,
+                selector_ms: None,
+                selector_strategy: None,
+                memoria_ms: None,
+                llm_rounds: None,
+                selected_skills: None,
+                total_tool_ms: None,
+                total_llm_ms: None,
+                tool_calls: Vec::new(),
+                user_input: None,
+                assistant_output: None,
+                selector_tokens_in: None,
+                selector_tokens_out: None,
             },
             TimelineTurn {
                 turn: 2,
@@ -129,6 +152,20 @@ mod tests {
                 error: None,
                 cumulative_tokens_in: 0,
                 cumulative_tokens_out: 0,
+                ttft_ms: None,
+                context_ms: None,
+                selector_ms: None,
+                selector_strategy: None,
+                memoria_ms: None,
+                llm_rounds: None,
+                selected_skills: None,
+                total_tool_ms: None,
+                total_llm_ms: None,
+                tool_calls: Vec::new(),
+                user_input: None,
+                assistant_output: None,
+                selector_tokens_in: None,
+                selector_tokens_out: None,
             },
         ]);
         TimelineView::new(Timeline::new(src, "sess_test"))

@@ -280,8 +280,7 @@ pub(super) async fn handle_state_command(
         }
 
         "/verbose" => {
-            state.verbose_mode = true;
-            eprintln!("  Verbose mode on");
+            eprintln!("  /verbose has been removed. Use /stats for per-turn metrics.");
         }
 
         "/compact" => {

@@ -1403,6 +1403,7 @@ impl render::renderable::Renderable for LiveFramedCell {
         let y1 = area.y + area.height - 1;
 
         let perimeter = 2 * (area.width as usize + area.height as usize - 2);
+        let left_height = area.height.saturating_sub(2) as usize;
         // Sweep once around the perimeter every N seconds. Slow enough
         // that the eye reads "flowing", fast enough that it isn't stuck.
         let period = 3.0_f32;
@@ -1415,9 +1416,22 @@ impl render::renderable::Renderable for LiveFramedCell {
             ratatui::style::Color::Rgb(r, g, b)
         };
 
+        // Left edge uses a dedicated top-to-bottom gradient sweep:
+        // position along the left bar drives hue, time adds a
+        // downward-flowing phase. Gives a "color falling down the
+        // gutter" effect while running.
+        let left_color_at = |row: usize| -> ratatui::style::Color {
+            if !self.live {
+                return self.solid_color;
+            }
+            let len = left_height.max(1);
+            let (r, g, b) = shimmer::gradient_color_at(row, len, period);
+            ratatui::style::Color::Rgb(r, g, b)
+        };
+
         let mut idx: usize = 0;
         // Top edge: ╭ ── ╮
-        set_char(buf, x0, y0, '╭', color_at(idx));
+        set_char(buf, x0, y0, '╭', left_color_at(0));
         idx += 1;
         for x in (x0 + 1)..x1 {
             set_char(buf, x, y0, '─', color_at(idx));
@@ -1438,13 +1452,19 @@ impl render::renderable::Renderable for LiveFramedCell {
             set_char(buf, x, y1, '─', color_at(idx));
             idx += 1;
         }
-        set_char(buf, x0, y1, '╰', color_at(idx));
+        set_char(
+            buf,
+            x0,
+            y1,
+            '╰',
+            left_color_at(left_height.saturating_sub(1)),
+        );
         idx += 1;
-        // Left edge (bottom → top)
-        for y in ((y0 + 1)..y1).rev() {
-            set_char(buf, x0, y, '│', color_at(idx));
-            idx += 1;
+        // Left edge (top → bottom) with vertical gradient
+        for (row, y) in ((y0 + 1)..y1).enumerate() {
+            set_char(buf, x0, y, '│', left_color_at(row));
         }
+        idx += left_height;
         let _ = idx;
 
         // Title overlay (dim, on top border). Uses the solid colour so

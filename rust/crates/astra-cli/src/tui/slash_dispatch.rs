@@ -281,7 +281,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         }
 
         // ── State commands → with_restored (share full logic with non-TUI) ──
-        "/clear" | "/undo" | "/redo" | "/compact" | "/explain" | "/verbose" | "/reflect" => {
+        "/clear" | "/undo" | "/redo" | "/compact" | "/explain" | "/reflect" => {
             SlashResult::Fallback
         }
 
@@ -536,6 +536,16 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
+        // Deprecated commands — graceful hints
+        "/turn" => {
+            ctx.show_info("Use /timeline (Enter to drill into a turn).".into());
+            SlashResult::Handled
+        }
+        "/verbose" | "/tuning" | "/experiment" => {
+            ctx.show_info("Removed. Use /stats for metrics, /timeline for turn traces.".into());
+            SlashResult::Handled
+        }
+
         // ── Resume picker (TUI-native) ──────────────────────────────
         "/resume" => {
             if !args.is_empty() {
@@ -612,56 +622,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
-        // ── Whoami — matches render_whoami() from slash_info.rs ─────
-        "/whoami" => {
-            use crate::tui::bottom_pane::info_view::InfoView;
-            let recent_tools = if ctx.state.recent_tools.is_empty() {
-                "<none>".to_string()
-            } else {
-                ctx.state
-                    .recent_tools
-                    .iter()
-                    .take(8)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let pending = ctx
-                .state
-                .skill_improvement_tracker
-                .pending_proposal
-                .as_ref()
-                .map(|p| p.skill_name.clone())
-                .unwrap_or_else(|| "<none>".into());
-            let pairs: Vec<(&str, String)> = vec![
-                ("version", format!("astra v{}", env!("CARGO_PKG_VERSION"))),
-                (
-                    "model",
-                    ctx.state.model.clone().unwrap_or_else(|| "<unset>".into()),
-                ),
-                (
-                    "session",
-                    ctx.state
-                        .session_id
-                        .clone()
-                        .unwrap_or_else(|| "<none>".into()),
-                ),
-                ("turn", ctx.state.turn.to_string()),
-                ("exchanges", ctx.state.history.len().to_string()),
-                ("skills", ctx.state.unified_skill_registry.len().to_string()),
-                ("pending improve", pending),
-                ("recent tools", recent_tools),
-                ("permission", format!("{}", ctx.state.perm_manager.mode())),
-                ("explain", format!("{}", ctx.state.explain)),
-                (
-                    "verbose",
-                    if ctx.state.verbose_mode { "on" } else { "off" }.into(),
-                ),
-            ];
-            ctx.bottom_pane
-                .push_view(Box::new(InfoView::from_key_value("whoami", pairs)));
-            SlashResult::Handled
-        }
+        // /whoami is now folded into /session — redirect for muscle memory
+        "/whoami" => handle_session_hub(ctx),
 
         // ── History — interactive search view ────────────────────────
         "/history" => {
@@ -1502,6 +1464,7 @@ fn fmt_tokens(n: u64) -> String {
 /// fork / export).
 fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
     use crate::tui::bottom_pane::info_view::InfoView;
+    use astra_services::session_workspace;
 
     let sid = ctx.state.session_id.clone().unwrap_or_default();
     let sid_short = if sid.len() > 8 {
@@ -1524,18 +1487,39 @@ fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
                 sid.clone()
             },
         ),
-        (
-            "short id",
-            if sid.is_empty() {
-                "—".into()
-            } else {
-                sid_short.to_string()
-            },
-        ),
         ("turn", ctx.state.turn.to_string()),
         ("model", model),
-        ("cost", format!("${:.4}", ctx.state.total_session_cost)),
     ];
+
+    // Workspace info (cwd, git, timestamps)
+    let ws = (!sid.is_empty())
+        .then(|| session_workspace::read_workspace(&sid).ok())
+        .flatten();
+    if let Some(ref ws) = ws {
+        pairs.push(("cwd", tilde_session_path(&ws.cwd)));
+        let git_line = match (&ws.git_branch, &ws.git_head) {
+            (Some(b), Some(h)) => format!("{b} @ {}", &h[..h.len().min(8)]),
+            (Some(b), None) => b.clone(),
+            (None, Some(h)) => format!("@ {}", &h[..h.len().min(8)]),
+            (None, None) => "—".into(),
+        };
+        pairs.push(("git", git_line));
+        let started = ws.created_at.get(..19).unwrap_or(&ws.created_at);
+        pairs.push(("started", started.to_string()));
+        let saved = ws.updated_at.get(..19).unwrap_or(&ws.updated_at);
+        pairs.push(("last saved", saved.to_string()));
+        if ws.status != "active" {
+            pairs.push(("status", ws.status.clone()));
+        }
+    } else {
+        let cwd = std::env::current_dir()
+            .map(|p| tilde_session_path(&p.to_string_lossy()))
+            .unwrap_or_else(|_| "?".into());
+        pairs.push(("cwd", cwd));
+    }
+
+    // Live state
+    pairs.push(("cost", format!("${:.4}", ctx.state.total_session_cost)));
     if ctx.state.max_budget_limit > 0.0 {
         pairs.push(("budget", format!("${:.2}", ctx.state.max_budget_limit)));
     }
@@ -1548,32 +1532,48 @@ fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
         "cache-read tokens",
         fmt_tokens(ctx.state.total_cache_read_tokens),
     ));
-    pairs.push((
-        "cache-creation tokens",
-        fmt_tokens(ctx.state.total_cache_creation_tokens),
-    ));
     pairs.push(("total tokens", fmt_tokens(cumulative_tokens)));
 
-    // Compaction + drift counters from the observability session
-    // when it's available.  Best-effort — a missing session just
-    // means the counters stay off the hub.
-    if let Some(obs) = ctx.state.observability_session.as_ref() {
-        let guard = obs.read().unwrap_or_else(|e| e.into_inner());
-        pairs.push(("compactions", guard.compressed_turns.len().to_string()));
-        pairs.push(("context traces", guard.context_traces.len().to_string()));
+    // Agent identity (from former /whoami)
+    pairs.push(("permission", format!("{}", ctx.state.perm_manager.mode())));
+    pairs.push(("explain", format!("{}", ctx.state.explain)));
+    pairs.push(("skills", ctx.state.unified_skill_registry.len().to_string()));
+    if !ctx.state.recent_tools.is_empty() {
+        let tools: String = ctx
+            .state
+            .recent_tools
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        pairs.push(("recent tools", tools));
+    }
+    if let Some(ref rid) = ctx.state.run_id {
+        pairs.push(("run_id", rid.clone()));
     }
 
-    // Action cheatsheet, rendered as value-less rows so the user
-    // sees what every subcommand does without leaving the panel.
+    // Compaction + drift counters
+    if let Some(obs) = ctx.state.observability_session.as_ref() {
+        let guard = obs.read().unwrap_or_else(|e| e.into_inner());
+        if !guard.compressed_turns.is_empty() {
+            pairs.push(("compactions", guard.compressed_turns.len().to_string()));
+        }
+    }
+
+    // Journal path
+    if let Some(ref j) = ctx.state.journal {
+        let jp = j.path().display().to_string();
+        pairs.push(("journal", tilde_session_path(&jp)));
+    }
+
+    // Action cheatsheet
     pairs.push(("", String::new()));
     pairs.push(("/session list", "pick a session to resume".into()));
-    pairs.push((
-        "/session history",
-        "scroll this session's transcript".into(),
-    ));
-    pairs.push(("/context", "context panel for this session".into()));
+    pairs.push(("/session history", "scroll transcript".into()));
+    pairs.push(("/timeline", "per-turn trace timeline".into()));
+    pairs.push(("/context", "context panel".into()));
     pairs.push(("/session fork", "branch a parallel session".into()));
-    pairs.push(("/session analyze", "run session diagnostics".into()));
     pairs.push(("/session export", "write markdown transcript".into()));
 
     let title = if sid.is_empty() {
@@ -1584,6 +1584,22 @@ fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
     ctx.bottom_pane
         .push_view(Box::new(InfoView::from_key_value(&title, pairs)));
     SlashResult::Handled
+}
+
+fn tilde_session_path(abs: &str) -> String {
+    let Some(home) = dirs::home_dir() else {
+        return abs.to_string();
+    };
+    let home = home.to_string_lossy();
+    let home = home.trim_end_matches('/');
+    if abs == home {
+        return "~".to_string();
+    }
+    let prefix = format!("{home}/");
+    if let Some(rest) = abs.strip_prefix(&prefix) {
+        return format!("~/{rest}");
+    }
+    abs.to_string()
 }
 
 /// `/session list` — same picker as `/resume`, but reached via
