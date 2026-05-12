@@ -382,12 +382,16 @@ async fn try_refresh_token(
     let new_refresh = value.get("refresh_token").and_then(|v| v.as_str()).ok_or(
         SilentRefreshError::BadResponse("refresh response: missing refresh_token"),
     )?;
-    let mut creds = load_credentials();
-    let name = profile_name(profile, &creds);
-    let entry = creds.profiles.entry(name).or_default();
-    entry.access_token = Some(new_access.to_string());
-    entry.refresh_token = Some(new_refresh.to_string());
-    save_credentials(&creds).map_err(SilentRefreshError::SaveFailed)?;
+    let new_access = new_access.to_string();
+    let new_refresh = new_refresh.to_string();
+    credential_store()
+        .mutate(|creds| {
+            let name = profile_name(profile, creds);
+            let entry = creds.profiles.entry(name).or_default();
+            entry.access_token = Some(new_access.clone());
+            entry.refresh_token = Some(new_refresh.clone());
+        })
+        .map_err(|e| SilentRefreshError::SaveFailed(e.to_string()))?;
     Ok(())
 }
 
@@ -1783,18 +1787,19 @@ mod tests {
         // Make sure ASTRA_ACCESS_TOKEN is not set (empty = ignored)
         let _env_clear = EnvGuard::set("ASTRA_ACCESS_TOKEN", "");
         // Write a credentials file to the isolated path
-        let creds = CredentialsFile {
-            current_profile: Some("default".into()),
-            profiles: std::collections::HashMap::from([(
-                "default".to_string(),
-                Profile {
-                    username: Some("user".into()),
-                    access_token: Some("file-token-abc".into()),
-                    refresh_token: None,
-                    ..Default::default()
-                },
-            )]),
+        let mut creds = CredentialsFile {
+            current_profile: Some("default".to_string()),
+            ..Default::default()
         };
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                username: Some("user".into()),
+                access_token: Some("file-token-abc".into()),
+                refresh_token: None,
+                ..Default::default()
+            },
+        );
         let path = crate::cli_utils::credentials_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);

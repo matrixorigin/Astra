@@ -76,6 +76,116 @@ async fn do_login_preserves_existing_memoria_api_key() {
 }
 
 #[tokio::test]
+async fn do_login_preserves_last_session_for_same_username() {
+    let _creds_dir = isolate_credentials();
+    let mut creds = CredentialsFile::default();
+    creds.profiles.insert(
+        "test-profile".to_string(),
+        Profile {
+            username: Some("user1".to_string()),
+            last_session_id: Some("sess-123".to_string()),
+            ..Default::default()
+        },
+    );
+    save_credentials(&creds).unwrap();
+
+    let app = Router::new().route(
+        "/auth/login",
+        post(|| async {
+            axum::Json(serde_json::json!({
+                "access_token": "tok-new",
+                "refresh_token": "ref-new"
+            }))
+        }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+
+    do_login(&api, Some("test-profile"), "user1", "pass1")
+        .await
+        .unwrap();
+
+    let creds = load_credentials();
+    assert_eq!(
+        creds.profiles["test-profile"].last_session_id.as_deref(),
+        Some("sess-123")
+    );
+}
+
+#[tokio::test]
+async fn do_login_clears_last_session_for_different_username() {
+    let _creds_dir = isolate_credentials();
+    let mut creds = CredentialsFile::default();
+    creds.profiles.insert(
+        "test-profile".to_string(),
+        Profile {
+            username: Some("user1".to_string()),
+            last_session_id: Some("sess-123".to_string()),
+            memoria_api_key: Some("mem-key".to_string()),
+            ..Default::default()
+        },
+    );
+    save_credentials(&creds).unwrap();
+
+    let app = Router::new().route(
+        "/auth/login",
+        post(|| async {
+            axum::Json(serde_json::json!({
+                "access_token": "tok-new",
+                "refresh_token": "ref-new"
+            }))
+        }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+
+    do_login(&api, Some("test-profile"), "user2", "pass1")
+        .await
+        .unwrap();
+
+    let creds = load_credentials();
+    let profile = &creds.profiles["test-profile"];
+    assert_eq!(profile.last_session_id, None);
+    assert_eq!(profile.memoria_api_key.as_deref(), Some("mem-key"));
+}
+
+#[tokio::test]
+async fn do_login_uses_astra_profile_when_cli_profile_absent() {
+    let _creds_dir = isolate_credentials();
+    // Use a manual guard because this async test must keep ASTRA_PROFILE set
+    // across awaits while the credentials env mutex serializes related tests.
+    struct ProfileEnvGuard(Option<String>);
+    impl Drop for ProfileEnvGuard {
+        fn drop(&mut self) {
+            match self.0.as_deref() {
+                Some(value) => unsafe { std::env::set_var("ASTRA_PROFILE", value) },
+                None => unsafe { std::env::remove_var("ASTRA_PROFILE") },
+            }
+        }
+    }
+    let _profile_env = ProfileEnvGuard(std::env::var("ASTRA_PROFILE").ok());
+    unsafe { std::env::set_var("ASTRA_PROFILE", "from-env") };
+
+    let app = Router::new().route(
+        "/auth/login",
+        post(|| async {
+            axum::Json(serde_json::json!({
+                "access_token": "tok-env",
+                "refresh_token": "ref-env"
+            }))
+        }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+
+    do_login(&api, None, "user1", "pass1").await.unwrap();
+
+    let creds = load_credentials();
+    assert!(creds.profiles.contains_key("from-env"));
+    assert_eq!(creds.current_profile.as_deref(), Some("from-env"));
+}
+
+#[tokio::test]
 async fn do_register_success() {
     let _creds_dir = isolate_credentials();
     let app = Router::new().route(

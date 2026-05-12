@@ -13,7 +13,7 @@ use rustyline::{
     validate::{ValidationContext, ValidationResult, Validator},
 };
 
-use super::credentials::{load_credentials, profile_name, save_credentials};
+use super::credentials::{load_credentials, profile_name, store};
 use super::http_helpers::{get_profile_and_token, map_thin_err, print_json_or_raw};
 
 const ADMIN_COMMANDS: &[(&str, &str)] = &[
@@ -197,7 +197,7 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
             print_json_or_raw(&body);
             Ok(())
         } else if line.eq("refresh") {
-            let mut creds = load_credentials();
+            let creds = load_credentials();
             let name = profile_name(profile, &creds);
             let saved = creds
                 .profiles
@@ -216,19 +216,25 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
             let new_access = value
                 .get("access_token")
                 .and_then(serde_json::Value::as_str)
-                .ok_or("missing access_token")?;
+                .ok_or("missing access_token")?
+                .to_string();
             let new_refresh = value
                 .get("refresh_token")
                 .and_then(serde_json::Value::as_str)
-                .ok_or("missing refresh_token")?;
-            let entry = creds.profiles.entry(name).or_default();
-            entry.access_token = Some(new_access.to_string());
-            entry.refresh_token = Some(new_refresh.to_string());
-            save_credentials(&creds)?;
+                .ok_or("missing refresh_token")?
+                .to_string();
+            store()
+                .mutate(|creds| {
+                    let name = profile_name(profile, creds);
+                    let entry = creds.profiles.entry(name).or_default();
+                    entry.access_token = Some(new_access.clone());
+                    entry.refresh_token = Some(new_refresh.clone());
+                })
+                .map_err(|e| e.to_string())?;
             eprintln!("{}", "✓ Token refreshed".green());
             Ok(())
         } else if line.eq("logout") {
-            let mut creds = load_credentials();
+            let creds = load_credentials();
             let name = profile_name(profile, &creds);
             let saved = creds
                 .profiles
@@ -241,11 +247,15 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
             let _ = api
                 .post_auth_logout_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await;
-            if let Some(entry) = creds.profiles.get_mut(&name) {
-                entry.access_token = None;
-                entry.refresh_token = None;
-            }
-            save_credentials(&creds)?;
+            store()
+                .mutate(|creds| {
+                    let name = profile_name(profile, creds);
+                    if let Some(entry) = creds.profiles.get_mut(&name) {
+                        entry.access_token = None;
+                        entry.refresh_token = None;
+                    }
+                })
+                .map_err(|e| e.to_string())?;
             eprintln!("{}", "✓ Logged out".green());
             Ok(())
         } else if line.starts_with("audit") {

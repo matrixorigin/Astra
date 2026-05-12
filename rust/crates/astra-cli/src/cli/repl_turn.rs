@@ -2586,11 +2586,7 @@ pub(super) fn initialize_journal_pub(state: &mut ReplState, session_id: &str) {
 }
 
 pub(super) fn persist_last_session_id(profile: Option<&str>, session_id: &str) {
-    let mut creds = load_credentials();
-    let name = profile_name(profile, &creds);
-    let entry = creds.profiles.entry(name).or_default();
-    entry.last_session_id = Some(session_id.to_string());
-    let _ = save_credentials(&creds);
+    let _ = persist_profile_last_session(profile, session_id);
 }
 
 fn initialize_journal(state: &mut ReplState, session_id: &str) {

@@ -525,7 +525,7 @@ pub(super) async fn execute_cli_command(
         Some(Command::Message(words)) => {
             let raw_message = words.join(" ");
             let message = apply_system_prompt(&raw_message, system_prompt.as_deref());
-            let (mut creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let session_id = validated_resumable_last_session_id(api, profile.as_deref()).await;
             let mut continuation_messages = session_id
                 .as_deref()
@@ -611,9 +611,7 @@ pub(super) async fn execute_cli_command(
                 Err(e) => return Err(e.error),
             };
             if let Some(ref sid) = sr.session_id {
-                let p = creds.profiles.entry(name).or_default();
-                p.last_session_id = Some(sid.clone());
-                save_credentials(&creds)?;
+                persist_profile_last_session(profile.as_deref(), sid)?;
             }
             Ok(compute_exit_code(&sr))
         }
@@ -670,14 +668,14 @@ pub(super) async fn execute_cli_command(
         }
 
         Some(Command::Refresh) => {
-            let mut creds = load_credentials();
+            let creds = load_credentials();
             let name = profile_name(profile.as_deref(), &creds);
-            let profile = creds
+            let saved_profile = creds
                 .profiles
                 .get(&name)
                 .cloned()
                 .ok_or_else(|| format!("no profile '{name}'"))?;
-            let refresh_token = profile
+            let refresh_token = saved_profile
                 .refresh_token
                 .ok_or_else(|| format!("profile '{name}' has no refresh token"))?;
             let body = api
@@ -689,40 +687,46 @@ pub(super) async fn execute_cli_command(
             let new_access = value
                 .get("access_token")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing access_token".to_string())?;
+                .ok_or_else(|| "missing access_token".to_string())?
+                .to_string();
             let new_refresh = value
                 .get("refresh_token")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing refresh_token".to_string())?;
-            let entry = creds.profiles.entry(name).or_default();
-            entry.access_token = Some(new_access.to_string());
-            entry.refresh_token = Some(new_refresh.to_string());
-            save_credentials(&creds)?;
+                .ok_or_else(|| "missing refresh_token".to_string())?
+                .to_string();
+            mutate_credentials(|creds| {
+                let name = profile_name(profile.as_deref(), creds);
+                let entry = creds.profiles.entry(name).or_default();
+                entry.access_token = Some(new_access.clone());
+                entry.refresh_token = Some(new_refresh.clone());
+            })?;
             println!("  {} {}", theme::icon_ok(), "Token refreshed".green());
             Ok(ExitCode::Success)
         }
 
         Some(Command::Logout) => {
-            let mut creds = load_credentials();
+            let creds = load_credentials();
             let name = profile_name(profile.as_deref(), &creds);
-            let profile = creds
+            let saved_profile = creds
                 .profiles
                 .get(&name)
                 .cloned()
                 .ok_or_else(|| format!("no profile '{name}'"))?;
-            let refresh_token = profile
+            let refresh_token = saved_profile
                 .refresh_token
                 .ok_or_else(|| format!("profile '{name}' has no refresh token"))?;
             let body = api
                 .post_auth_logout_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await
                 .map_err(map_thin_err)?;
-            if let Some(entry) = creds.profiles.get_mut(&name) {
-                entry.access_token = None;
-                entry.refresh_token = None;
-                entry.last_session_id = None;
-            }
-            save_credentials(&creds)?;
+            mutate_credentials(|creds| {
+                let name = profile_name(profile.as_deref(), creds);
+                if let Some(entry) = creds.profiles.get_mut(&name) {
+                    entry.access_token = None;
+                    entry.refresh_token = None;
+                    entry.last_session_id = None;
+                }
+            })?;
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
@@ -976,7 +980,7 @@ pub(super) async fn execute_cli_command(
                 return Ok(ExitCode::Success);
             };
 
-            let (mut creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let session_id = match args.session_id {
                 Some(session_id) => Some(session_id),
                 None => validated_resumable_last_session_id(api, profile.as_deref()).await,
@@ -1110,9 +1114,7 @@ pub(super) async fn execute_cli_command(
 
             // Save session for resumption
             if let Some(sid) = &sr.session_id {
-                let p = creds.profiles.entry(name).or_default();
-                p.last_session_id = Some(sid.clone());
-                save_credentials(&creds)?;
+                persist_profile_last_session(profile.as_deref(), sid)?;
             }
 
             // Drain any background-spawned child agents before
@@ -1806,7 +1808,7 @@ pub(super) async fn run_print_mode(
     };
     let message = apply_system_prompt(&raw_message, system_prompt);
 
-    let (mut creds, name, _, token) = get_profile_and_token(profile)?;
+    let (_, _, _, token) = get_profile_and_token(profile)?;
     let session_id = validated_resumable_last_session_id(api, profile).await;
     let mut continuation_messages = session_id
         .as_deref()
@@ -1870,9 +1872,7 @@ pub(super) async fn run_print_mode(
 
     // Save session for resumption
     if let Some(sid) = &sr.session_id {
-        let p = creds.profiles.entry(name).or_default();
-        p.last_session_id = Some(sid.clone());
-        save_credentials(&creds)?;
+        persist_profile_last_session(profile, sid)?;
     }
 
     let exit_code = compute_exit_code(&sr);
