@@ -664,7 +664,16 @@ fn coerce_tool_result_content(content: Option<&Value>) -> String {
                 .collect::<Vec<_>>()
                 .join("");
             if joined.is_empty() {
-                Value::Array(parts.clone()).to_string()
+                // No joinable text parts (e.g. image-only array). Returning the
+                // raw JSON-stringified array would leak structural noise to the
+                // model; prefer empty string + a warn so the degradation is
+                // observable without polluting the prompt.
+                tracing::warn!(
+                    target: "astra::tool_result",
+                    parts = parts.len(),
+                    "tool_result content array had no text parts; coercing to empty string"
+                );
+                String::new()
             } else {
                 joined
             }
@@ -678,6 +687,17 @@ fn normalize_openai_tool_message_content(messages: &[Value]) -> Vec<Value> {
         .iter()
         .map(|message| {
             if message.get("role").and_then(Value::as_str) != Some("tool") {
+                return message.clone();
+            }
+            // Only rewrite content that OpenAI would reject or misread:
+            // bare objects (most notably the empty `{}` placeholder) and nulls.
+            // Leave well-formed String and Array content untouched so future
+            // multi-part tool messages pass through intact.
+            let needs_rewrite = matches!(
+                message.get("content"),
+                Some(Value::Object(_)) | Some(Value::Null) | None
+            );
+            if !needs_rewrite {
                 return message.clone();
             }
             let mut normalized = message.clone();
