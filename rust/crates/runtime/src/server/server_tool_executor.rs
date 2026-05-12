@@ -965,7 +965,7 @@ fn session_history_match_score(query: &str, content: &str) -> i32 {
         }
     }
 
-    if score == 0 && query.chars().any(|ch| !ch.is_ascii()) {
+    if score == 0 && !query.is_ascii() {
         let mut seen = std::collections::HashSet::new();
         let mut char_hits = 0;
         for ch in query.chars().filter(|ch| !ch.is_whitespace()) {
