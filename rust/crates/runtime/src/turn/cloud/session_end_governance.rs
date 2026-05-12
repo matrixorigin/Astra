@@ -167,11 +167,33 @@ pub async fn run_session_end_governance(
         }
     }
 
-    // ── 3. Reflect (cooldown-respecting — the backend enforces it) ─
+    // ── 3. Reflect + forward-feed scene candidates ─────────────────
+    //
+    // Reflect in `candidates` mode returns a list of scene clusters the
+    // backend has grouped but not synthesized into scene nodes (the v1
+    // LLM path requires a backend-side LLM_API_KEY that often isn't
+    // configured). We forward-feed those clusters as `astra:scene`-
+    // tagged semantic memories ourselves so the next session's prewarm
+    // surfaces them alongside episodes. Without this step `reflect`
+    // runs, produces output, and the output is silently discarded.
     match client.reflect_session(session_id, false).await {
         Ok(summary) => {
             report.reflect_candidates = summary.candidates;
             report.reflect_synthesized = summary.synthesized;
+            for cand in &summary.candidate_payloads {
+                match client
+                    .store_scene(session_id, &cand.signal, &cand.summary)
+                    .await
+                {
+                    Ok(memory_id) if !memory_id.is_empty() => {
+                        report.scenes_stored += 1;
+                    }
+                    Ok(_) => report.scenes_stored += 1,
+                    Err(e) => {
+                        eprintln!("[session-end] store_scene failed: {e}");
+                    }
+                }
+            }
         }
         Err(e) => {
             // Cooldown rejection is expected under hot activity; log at
@@ -196,6 +218,10 @@ pub struct SessionEndReport {
     pub reflect_candidates: u64,
     /// Whether reflect synthesized new scene nodes (v2 only).
     pub reflect_synthesized: bool,
+    /// Number of `astra:scene`-tagged semantic memories the client
+    /// forward-fed from reflect candidates into the store for
+    /// next-session prewarm.
+    pub scenes_stored: usize,
 }
 
 #[cfg(test)]
@@ -299,5 +325,124 @@ mod tests {
         let overview = build_episode_overview(&facts).expect("non-trivial session");
         // 120-char cap on error snippet.
         assert!(!overview.contains(&"x".repeat(121)));
+    }
+
+    // ── P7: reflect candidates forward-fed as scene memories ───────────
+
+    use super::super::memoria_compact::{
+        MemoriaClient, MemoriaMemory, ReflectCandidate, ReflectSummary,
+    };
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct SceneCaptureClient {
+        scenes: Mutex<Vec<(String, String, String)>>, // session, signal, summary
+        episodes: Mutex<Vec<String>>,
+        reflect_response: Mutex<ReflectSummary>,
+    }
+
+    #[async_trait::async_trait]
+    impl MemoriaClient for SceneCaptureClient {
+        async fn retrieve_ext(
+            &self,
+            _q: &str,
+            _sid: Option<&str>,
+            _k: usize,
+            _fs: bool,
+        ) -> Result<Vec<MemoriaMemory>, String> {
+            Ok(Vec::new())
+        }
+        async fn store(
+            &self,
+            _c: &str,
+            _t: &str,
+            _s: Option<&str>,
+            _tier: Option<&str>,
+        ) -> Result<String, String> {
+            Ok("m".into())
+        }
+        async fn purge_working(&self, _s: &str) -> Result<u64, String> {
+            Ok(0)
+        }
+        async fn store_episode(&self, sid: &str, overview: &str) -> Result<String, String> {
+            self.episodes
+                .lock()
+                .unwrap()
+                .push(format!("{sid}:{overview}"));
+            Ok("ep_1".into())
+        }
+        async fn reflect_session(
+            &self,
+            _sid: &str,
+            _force: bool,
+        ) -> Result<ReflectSummary, String> {
+            Ok(self.reflect_response.lock().unwrap().clone())
+        }
+        async fn store_scene(
+            &self,
+            sid: &str,
+            signal: &str,
+            summary: &str,
+        ) -> Result<String, String> {
+            self.scenes.lock().unwrap().push((
+                sid.to_string(),
+                signal.to_string(),
+                summary.to_string(),
+            ));
+            Ok("scene_1".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn governance_forward_feeds_reflect_candidates_as_scenes() {
+        let client = Arc::new(SceneCaptureClient::default());
+        *client.reflect_response.lock().unwrap() = ReflectSummary {
+            synthesized: false,
+            candidates: 2,
+            candidate_payloads: vec![
+                ReflectCandidate {
+                    signal: "auth".into(),
+                    importance: 0.8,
+                    summary: "- fixed OAuth redirect\n- added MFA".into(),
+                },
+                ReflectCandidate {
+                    signal: "tests".into(),
+                    importance: 0.5,
+                    summary: "- flaky integration suite".into(),
+                },
+            ],
+            diagnostics: String::new(),
+        };
+        let facts = SessionFacts {
+            turn: 2,
+            estimated_tokens: 1_000,
+            ..Default::default()
+        };
+        let report = run_session_end_governance(&facts, "sess-p7", client.as_ref())
+            .await
+            .expect("governance ok");
+        assert_eq!(report.scenes_stored, 2);
+        let scenes = client.scenes.lock().unwrap().clone();
+        assert_eq!(scenes.len(), 2);
+        assert_eq!(scenes[0].0, "sess-p7");
+        assert_eq!(scenes[0].1, "auth");
+        assert!(scenes[0].2.contains("OAuth redirect"));
+        assert_eq!(scenes[1].1, "tests");
+    }
+
+    #[tokio::test]
+    async fn governance_skips_scene_store_when_reflect_has_no_candidates() {
+        let client = Arc::new(SceneCaptureClient::default());
+        // Default = empty candidate_payloads
+        let facts = SessionFacts {
+            turn: 2,
+            estimated_tokens: 500,
+            ..Default::default()
+        };
+        let report = run_session_end_governance(&facts, "sess-p7-empty", client.as_ref())
+            .await
+            .expect("governance ok");
+        assert_eq!(report.scenes_stored, 0);
+        assert!(client.scenes.lock().unwrap().is_empty());
     }
 }

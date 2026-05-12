@@ -115,6 +115,7 @@ async fn post_loop_memory_cleanup(
                     if wrote_episode
                         || report.working_purged > 0
                         || report.reflect_candidates > 0
+                        || report.scenes_stored > 0
                     {
                         tracing::info!(
                             session_id = %session_id,
@@ -123,6 +124,7 @@ async fn post_loop_memory_cleanup(
                             episode_chars = report.episode_chars,
                             reflect_candidates = report.reflect_candidates,
                             reflect_synthesized = report.reflect_synthesized,
+                            scenes_stored = report.scenes_stored,
                             "session-end governance complete"
                         );
                     }

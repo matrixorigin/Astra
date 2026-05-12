@@ -105,6 +105,11 @@ pub struct SessionStartPrefetchResult {
     pub profile: Vec<RankableMemory>,
     /// Most recent cross-session episodes (`memory_type=episodic`).
     pub recent_episodes: Vec<RankableMemory>,
+    /// Reflect-produced scene abstractions (`astra:scene`-tagged
+    /// `semantic` memories) — higher-level than a single episode,
+    /// lower-level than a profile fact. Surfaces "what themes have
+    /// recurred across sessions".
+    pub recent_scenes: Vec<RankableMemory>,
     /// How long the prefetch took.
     pub fetch_ms: i64,
 }
@@ -127,14 +132,18 @@ pub async fn prefetch_session_start_memories(
     }
     let started = Instant::now();
 
-    // Two queries in parallel:
+    // Three queries in parallel:
     //   1. `profile` — broad query to surface user-identity memories.
     //      Filtered client-side on `memory_type == "profile"`.
     //   2. `episodic` — query biased toward recent session summaries.
     //      Filtered on `memory_type == "episodic"`.
+    //   3. `scenes` — reflect-produced `astra:scene`-tagged semantic
+    //      memories. Content starts with `[scene…]`, filtered client-
+    //      side so the bucket stays pure.
     const PROFILE_TOP_K: u32 = 5;
     const EPISODE_TOP_K: u32 = 6;
-    let (profile_raw, episode_raw) = tokio::join!(
+    const SCENE_TOP_K: u32 = 5;
+    let (profile_raw, episode_raw, scene_raw) = tokio::join!(
         fetch_memories_structured(
             mem_url,
             mem_key,
@@ -148,7 +157,14 @@ pub async fn prefetch_session_start_memories(
             "recent session episode summary",
             user_id,
             EPISODE_TOP_K,
-        )
+        ),
+        fetch_memories_structured(
+            mem_url,
+            mem_key,
+            "recurring scene pattern insight",
+            user_id,
+            SCENE_TOP_K,
+        ),
     );
 
     let mut profile: Vec<RankableMemory> = profile_raw
@@ -159,18 +175,25 @@ pub async fn prefetch_session_start_memories(
         .into_iter()
         .filter(|m| m.memory_type == "episodic")
         .collect();
+    let mut recent_scenes: Vec<RankableMemory> = scene_raw
+        .into_iter()
+        .filter(|m| m.memory_type == "semantic" && m.content.starts_with("[scene"))
+        .collect();
 
     // Sort each bucket by server-side retrieval score and cap.
     astra_turn_types::sort_by_retrieval_score(&mut profile);
     astra_turn_types::sort_by_retrieval_score(&mut recent_episodes);
+    astra_turn_types::sort_by_retrieval_score(&mut recent_scenes);
     profile.truncate(3);
     recent_episodes.truncate(3);
+    recent_scenes.truncate(3);
 
-    let section = build_session_start_block(&profile, &recent_episodes);
+    let section = build_session_start_block(&profile, &recent_episodes, &recent_scenes);
     SessionStartPrefetchResult {
         section,
         profile,
         recent_episodes,
+        recent_scenes,
         fetch_ms: started.elapsed().as_millis() as i64,
     }
 }
@@ -277,7 +300,12 @@ pub fn session_start_exposed_ids(
     result: &SessionStartPrefetchResult,
 ) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
-    for m in result.profile.iter().chain(result.recent_episodes.iter()) {
+    for m in result
+        .profile
+        .iter()
+        .chain(result.recent_episodes.iter())
+        .chain(result.recent_scenes.iter())
+    {
         if !m.memory_id.is_empty() {
             set.insert(m.memory_id.clone());
         }
@@ -325,8 +353,9 @@ pub fn collect_seen_contents(entries: &[ContextMemoryEntry]) -> std::collections
 fn build_session_start_block(
     profile: &[RankableMemory],
     episodes: &[RankableMemory],
+    scenes: &[RankableMemory],
 ) -> Option<String> {
-    if profile.is_empty() && episodes.is_empty() {
+    if profile.is_empty() && episodes.is_empty() && scenes.is_empty() {
         return None;
     }
     let mut s = String::with_capacity(512);
@@ -343,6 +372,15 @@ fn build_session_start_block(
     if !episodes.is_empty() {
         s.push_str("### Recent sessions\n");
         for m in episodes {
+            s.push_str("- ");
+            s.push_str(&session_start_line(&m.content, 200));
+            s.push_str(&m.freshness_suffix());
+            s.push('\n');
+        }
+    }
+    if !scenes.is_empty() {
+        s.push_str("### Recurring scenes\n");
+        for m in scenes {
             s.push_str("- ");
             s.push_str(&session_start_line(&m.content, 200));
             s.push_str(&m.freshness_suffix());
@@ -1402,12 +1440,12 @@ mod tests {
 
     #[test]
     fn session_start_block_none_when_empty() {
-        let out = build_session_start_block(&[], &[]);
+        let out = build_session_start_block(&[], &[], &[]);
         assert!(out.is_none());
     }
 
     #[test]
-    fn session_start_block_emits_both_sections_when_populated() {
+    fn session_start_block_emits_all_sections_when_populated() {
         fn mem(id: &str, ty: &str, c: &str) -> RankableMemory {
             RankableMemory {
                 memory_id: id.into(),
@@ -1424,13 +1462,20 @@ mod tests {
             "episodic",
             "[episode] turn=5, finished auth refactor",
         )];
-        let out = build_session_start_block(&profile, &episodes).expect("non-empty");
+        let scenes = vec![mem(
+            "s1",
+            "semantic",
+            "[scene:auth] recurring scope of OAuth fixes",
+        )];
+        let out = build_session_start_block(&profile, &episodes, &scenes).expect("non-empty");
         assert!(out.starts_with("<session_memory>"));
         assert!(out.ends_with("</session_memory>"));
         assert!(out.contains("### User profile"));
         assert!(out.contains("### Recent sessions"));
+        assert!(out.contains("### Recurring scenes"));
         assert!(out.contains("prefers Rust"));
         assert!(out.contains("auth refactor"));
+        assert!(out.contains("OAuth fixes"));
     }
 
     #[test]
@@ -1527,18 +1572,20 @@ mod tests {
     }
 
     #[test]
-    fn session_start_exposed_ids_collects_profile_plus_episodes() {
+    fn session_start_exposed_ids_collects_profile_episodes_and_scenes() {
         let result = SessionStartPrefetchResult {
             section: None,
             profile: vec![ri("p1", "profile", "p"), ri("p2", "profile", "q")],
             recent_episodes: vec![ri("e1", "episodic", "e")],
+            recent_scenes: vec![ri("s1", "semantic", "[scene] x")],
             fetch_ms: 0,
         };
         let ids = session_start_exposed_ids(&result);
-        assert_eq!(ids.len(), 3);
+        assert_eq!(ids.len(), 4);
         assert!(ids.contains("p1"));
         assert!(ids.contains("p2"));
         assert!(ids.contains("e1"));
+        assert!(ids.contains("s1"));
     }
 
     #[test]

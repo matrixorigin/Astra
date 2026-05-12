@@ -228,6 +228,18 @@ pub trait MemoriaClient: Send + Sync {
         Ok(String::new())
     }
 
+    /// Persist a reflect scene candidate as a cross-session `semantic`
+    /// memory tagged `astra:scene` so next-session prewarm picks it up.
+    /// Default: no-op. Real clients emit a POST /v1/memories.
+    async fn store_scene(
+        &self,
+        _session_id: &str,
+        _signal: &str,
+        _summary: &str,
+    ) -> Result<String, String> {
+        Ok(String::new())
+    }
+
     /// Trigger Memoria's cross-memory reflection for the given session.
     /// The backend respects a cooldown (≥1h v1 default); callers that
     /// want to bypass it should pass `force=true`.
@@ -275,8 +287,78 @@ pub struct ReflectSummary {
     pub synthesized: bool,
     /// Number of scene / cluster candidates produced.
     pub candidates: u64,
+    /// Candidate scene summaries the client can forward-feed (store as
+    /// `astra:scene`-tagged memories for next-session prewarm). Empty
+    /// when the backend ran in `internal` mode (LLM synthesis already
+    /// stored scenes server-side) or when no clusters were found.
+    pub candidate_payloads: Vec<ReflectCandidate>,
     /// Raw v1 response body for diagnostics (first 200 chars).
     pub diagnostics: String,
+}
+
+/// A single cluster-level scene candidate returned by Memoria's reflect
+/// endpoint in `mode=candidates`. Contents are compact enough to bake
+/// into one `astra:scene` memory so the next session's prewarm picks
+/// it up via the episode + scene query.
+#[derive(Debug, Clone, Default)]
+pub struct ReflectCandidate {
+    /// Signal / label the backend attached to the cluster.
+    pub signal: String,
+    /// Importance score (arbitrary units, backend-defined).
+    pub importance: f64,
+    /// Compact summary of the cluster's contributing memories, joined
+    /// by newlines. Suitable for direct inclusion in a stored memory's
+    /// `content` field.
+    pub summary: String,
+}
+
+/// Parse `{"candidates": [...]}` from Memoria's reflect response into
+/// the strongly-typed list. Each entry in the backend's payload has
+/// `{signal, importance, memories: [{memory_id, content}]}`; we flatten
+/// `memories[*].content` into a single newline-joined `summary` so it
+/// slots directly into one Memoria memory's `content`.
+///
+/// Pure — tested in isolation.
+pub fn parse_reflect_candidates(data: &Value) -> Vec<ReflectCandidate> {
+    let Some(arr) = data.get("candidates").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let signal = entry
+            .get("signal")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let importance = entry
+            .get("importance")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let memories = entry
+            .get("memories")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut lines = Vec::with_capacity(memories.len());
+        for m in memories {
+            if let Some(c) = m.get("content").and_then(Value::as_str) {
+                let t = c.trim();
+                if !t.is_empty() {
+                    lines.push(format!("- {t}"));
+                }
+            }
+        }
+        let summary = lines.join("\n");
+        if summary.is_empty() && signal.is_empty() {
+            continue;
+        }
+        out.push(ReflectCandidate {
+            signal,
+            importance,
+            summary,
+        });
+    }
+    out
 }
 
 /// A memory record from Memoria.
@@ -678,13 +760,70 @@ impl MemoriaClient for HttpMemoriaClient {
             .unwrap_or_default())
     }
 
+    /// Persist a reflect scene candidate as a `semantic` memory tagged
+    /// `astra:scene`. Forward-feeds reflection output into the next
+    /// session's prewarm via the `astra:scene` tag — see
+    /// `session_end_governance` for the call site.
+    async fn store_scene(
+        &self,
+        session_id: &str,
+        signal: &str,
+        summary: &str,
+    ) -> Result<String, String> {
+        if summary.trim().is_empty() {
+            return Err("store_scene: empty summary".into());
+        }
+        let url = format!("{}/v1/memories", self.base_url.trim_end_matches('/'));
+        let content = if signal.trim().is_empty() {
+            format!("[scene] {summary}")
+        } else {
+            format!("[scene:{}] {summary}", signal.trim())
+        };
+        let mut body = json!({
+            "content": content,
+            "memory_type": "semantic",
+            "trust_tier": "T4",
+            "source": {"agent": "session_end_reflect"},
+            "tags": ["astra:scene"],
+        });
+        if !session_id.is_empty() {
+            body["session_id"] = json!(session_id);
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Memoria store_scene failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("Memoria store_scene HTTP {}", resp.status()));
+        }
+        let data: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Memoria store_scene parse failed: {e}"))?;
+        Ok(data
+            .get("memory_id")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_default())
+    }
+
     async fn reflect_session(
         &self,
         session_id: &str,
         force: bool,
     ) -> Result<ReflectSummary, String> {
         let url = format!("{}/v1/reflect", self.base_url.trim_end_matches('/'));
-        let mut body = json!({"force": force});
+        // Use `candidates` mode so we always get the raw cluster list
+        // back. Memoria's `internal` mode synthesizes scenes server-side
+        // via its own LLM, but that requires LLM_API_KEY on the server —
+        // in the common case the backend is LLM-less. `candidates` works
+        // regardless and lets the client forward-feed the clusters as
+        // `astra:scene`-tagged memories so next-session prewarm sees them.
+        let mut body = json!({"force": force, "mode": "candidates"});
         if !session_id.is_empty() {
             body["session_id"] = json!(session_id);
         }
@@ -705,17 +844,19 @@ impl MemoriaClient for HttpMemoriaClient {
             ));
         }
         let data: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let candidate_payloads = parse_reflect_candidates(&data);
+        let candidate_count = candidate_payloads.len() as u64;
         Ok(ReflectSummary {
             synthesized: data
                 .get("synthesized")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            candidates: data
-                .get("candidates")
-                .and_then(|c| c.as_array())
-                .map(|a| a.len() as u64)
-                .or_else(|| data.get("scenes_created").and_then(Value::as_u64))
-                .unwrap_or(0),
+            candidates: candidate_count.max(
+                data.get("scenes_created")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            ),
+            candidate_payloads,
             diagnostics: text.chars().take(200).collect(),
         })
     }
@@ -2659,6 +2800,79 @@ mod tests {
             HttpMemoriaClient::new("http://127.0.0.1:1".into(), "key".into());
         let err = client.purge_working("").await.unwrap_err();
         assert!(err.contains("non-empty"), "expected validation error: {err}");
+    }
+
+    // ── P7: parse_reflect_candidates ──────────────────────────────────
+
+    #[test]
+    fn parse_reflect_candidates_returns_empty_when_no_field() {
+        let data = serde_json::json!({"scenes_created": 0});
+        assert!(parse_reflect_candidates(&data).is_empty());
+    }
+
+    #[test]
+    fn parse_reflect_candidates_flattens_memories_into_summary() {
+        let data = serde_json::json!({
+            "candidates": [
+                {
+                    "signal": "auth-redirect",
+                    "importance": 0.9,
+                    "memories": [
+                        {"memory_id": "m1", "content": "fixed OAuth callback"},
+                        {"memory_id": "m2", "content": "added state param"},
+                    ]
+                },
+                {
+                    "signal": "test-flake",
+                    "importance": 0.4,
+                    "memories": [
+                        {"memory_id": "m3", "content": "integration suite timeout"},
+                    ]
+                }
+            ]
+        });
+        let parsed = parse_reflect_candidates(&data);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].signal, "auth-redirect");
+        assert!((parsed[0].importance - 0.9).abs() < 1e-6);
+        assert_eq!(
+            parsed[0].summary,
+            "- fixed OAuth callback\n- added state param"
+        );
+        assert_eq!(parsed[1].signal, "test-flake");
+        assert_eq!(parsed[1].summary, "- integration suite timeout");
+    }
+
+    #[test]
+    fn parse_reflect_candidates_skips_empty_entries() {
+        let data = serde_json::json!({
+            "candidates": [
+                {"signal": "", "memories": []},
+                {"signal": "useful", "memories": [{"content": "x"}]},
+            ]
+        });
+        let parsed = parse_reflect_candidates(&data);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].signal, "useful");
+    }
+
+    #[test]
+    fn parse_reflect_candidates_trims_and_skips_empty_content() {
+        let data = serde_json::json!({
+            "candidates": [
+                {
+                    "signal": "x",
+                    "memories": [
+                        {"content": "   "},
+                        {"content": "real body"},
+                        {"content": ""},
+                    ]
+                }
+            ]
+        });
+        let parsed = parse_reflect_candidates(&data);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].summary, "- real body");
     }
 
     /// audit-A3: HttpMemoriaClient must have connect_timeout and timeout so a
