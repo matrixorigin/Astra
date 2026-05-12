@@ -36,7 +36,8 @@ cross-session memory).
  │                     freshness)                                    │
  │          │  pushed into stable_sections (CacheScope::Session)     │
  │          ▼                                                        │
- │  seen_ledger records every surfaced memory_id (memory_seen_ledger)│
+ │  canonical SEEN_STORE (astra-tools) records every surfaced        │
+ │  content-key and memory_id (one store for both paths)             │
  └───────────────────┬───────────────────────────────────────────────┘
                      │
  ┌── every turn ─────┴───────────────────────────────────────────────┐
@@ -45,16 +46,18 @@ cross-session memory).
  │    ├─ entity-token query  │  merge + sort by retrieval_score      │
  │    └─ cap at top_k × 2    │                                       │
  │                                                                   │
- │  filter_entries_already_surfaced → drop memory_ids in seen_ledger │
+ │  filter_entries_already_surfaced → drop contents in SEEN_STORE   │
  │                                                                   │
  │  pushed into dynamic_sections (volatile lane) as "## User Memories"│
  │                                                                   │
  │  ── LLM-driven memory(action=...) ──                              │
  │  • recall  → decorate_recall_response adds freshness suffix       │
  │              + filters against process-global SEEN_STORE          │
+ │              + pushes memory_ids onto RECALL_LEDGER for feedback  │
  │  • remember → detect_remember_conflict redirects duplicates       │
  │              to update before writing                             │
- │  • update/forget → REQUIRE reason + auto-snapshot before dispatch │
+ │  • update/forget → REQUIRE reason + auto-snapshot (AFTER param    │
+ │                    validation so rejects don't leave orphans)    │
  └───────────────────┬───────────────────────────────────────────────┘
                      │
  ┌── session end (debounced 15 min) ─────────────────────────────────┐
@@ -64,11 +67,13 @@ cross-session memory).
  │      │        1. purge_working  ← session_id + memory_types filter│
  │      │        2. store_episode  ← deterministic SessionFacts      │
  │      │        3. reflect (mode=candidates) + store_scene for each │
+ │      │      drain RECALL_LEDGER → `feedback(id, "useful")` per id │
+ │      │      IFF episode was written (productive session)          │
  │      │      debouncer.record(session_id)                          │
  │      └─ No:  skip — next terminal run will try again              │
  │    Always:                                                        │
- │      • memory_seen_ledger.reset_session                           │
- │      • MemoriaClient::reset_seen                                  │
+ │      • MemoriaClient::reset_seen (canonical seen-store)           │
+ │      • MemoriaClient::reset_recall_ledger                         │
  │      • MemoryExtractionService::forget_session                    │
  └───────────────────┬───────────────────────────────────────────────┘
                      │
@@ -267,8 +272,9 @@ in parallel, merges by memory_id, sorts by retrieval_score, caps at
 - `is_memory_worthy` — rejects known noise shapes (session-replay
   echoes, L1 protocol markers, runtime scaffolding prefixes)
 - `memory_dedup_key` — case-fold + trailing-punctuation strip
-- `filter_entries_already_surfaced` — drops memory_ids in the
-  session's `memory_seen_ledger`
+- `filter_entries_already_surfaced` — drops contents the canonical
+  `SEEN_STORE` (see §7) already surfaced via `<session_memory>` or a
+  prior recall
 
 ### 5.4 LLM-driven `recall`
 
@@ -280,8 +286,10 @@ in parallel, merges by memory_id, sorts by retrieval_score, caps at
 3. For each survivor: computes `days_since(observed_at || updated_at)`,
    appends `freshness_suffix_for(days, trust_tier)` to the `content`
    field.
-4. Records surviving ids in the process-global `SEEN_STORE` so the
-   next recall in the same session filters them out.
+4. Records surviving ids in the canonical `SEEN_STORE` so the next
+   recall in the same session filters them out.
+5. **Pushes surviving ids onto the RECALL_LEDGER** so session-end can
+   attribute a `useful` feedback signal if the session is productive.
 
 ---
 
@@ -306,13 +314,16 @@ in parallel, merges by memory_id, sorts by retrieval_score, caps at
                        │      │    1. purge_working (session_id filter)
                        │      │    2. store_episode
                        │      │    3. reflect → store_scene per candidate
+                       │      │    4. drain RECALL_LEDGER → feedback(
+                       │      │       id, "useful") per memory_id
+                       │      │       (conditional on episode_was_written)
                        │      │    debouncer.record(session_id)
                        │      │
                        │      └── Skip (recent governance run):
                        │           log at debug, no-op
                        │
-                       ├── memory_seen_ledger.reset_session
-                       ├── MemoriaClient::reset_seen
+                       ├── MemoriaClient::reset_seen (canonical)
+                       ├── MemoriaClient::reset_recall_ledger
                        └── MemoryExtractionService::forget_session
 ```
 
@@ -337,20 +348,26 @@ the cleanup into a helper both paths call after their event-tx drop.
 
 ---
 
-## 7. The seen-ledger (prevents re-injection)
+## 7. Process-global session-state stores
 
-Two companion ledgers, process-global, keyed by `session_id`:
-
-| Ledger | Where | Tracks |
-|---|---|---|
-| `memory_seen_ledger` | `astra-runtime/turn/memory_seen_ledger.rs` | Content dedup keys (normalized) for entries shown in `<memory_index>`, `<session_memory>`, and the per-turn `## User Memories` block. |
-| `SEEN_STORE` (static) | `astra-tools/memoria.rs` | `memory_id` set for LLM-driven `recall` responses. |
-
-Both are cleared by `post_loop_memory_cleanup` at session end so a
-long-lived server doesn't accumulate per-session state forever. Both
-survive the per-call `MemoriaClient` / `HttpMemoriaClient` instance
-lifetime (Memoria clients are constructed per-tool-call in
+Two canonical process-global stores live in `astra-tools::memoria`.
+Both are keyed by `session_id` and both are cleared by
+`post_loop_memory_cleanup` at session end so a long-lived server
+doesn't accumulate per-session state forever. Both survive the
+per-call `MemoriaClient` / `HttpMemoriaClient` instance lifetime
+(Memoria clients are constructed per-tool-call in
 `server_tool_executor.rs` and `edge_tools/memoria.rs`).
+
+| Store | API | Tracks | Used by |
+|---|---|---|---|
+| `SEEN_STORE` | `MemoriaClient::{record_seen, seen_snapshot, reset_seen}` | Union of (a) content dedup keys for entries already shown in `<session_memory>` / `## User Memories`, (b) memory_ids returned by LLM-driven `memory(action=recall)`. | Bridge prefetch + `decorate_recall_response` + `MemoryOrchestrator` (as delegating facade) |
+| `RECALL_LEDGER` | `MemoriaClient::{record_recall, drain_recalls, pending_recall_count, reset_recall_ledger}` | FIFO queue of `RecallSnapshot` (session_id, memory_ids, turn, at) per session, soft-capped at 16. | `decorate_recall_response` pushes; `post_loop_memory_cleanup` drains at session-end and routes `useful` feedback if episode was written. |
+
+The runtime-side `MemoryOrchestrator` (`turn/cloud/memory_orchestrator.rs`)
+is a thin delegating facade over the same stores — its
+`mark_surfaced` / `filter_already_surfaced` / `reset_session_surface`
+methods call through to `MemoriaClient::{record_seen, seen_snapshot,
+reset_seen}`. No parallel state lives in the orchestrator.
 
 ---
 
@@ -425,7 +442,40 @@ awareness of what it could recall.
 
 ---
 
-## 11. Pointers to source
+## 11. Review-driven design choices
+
+Lessons from multi-agent reviews on the `enhance_tool` branch that
+shaped the current design:
+
+- **One canonical dedup store, not three.** An earlier iteration had
+  parallel "already surfaced" sets in the orchestrator, a runtime
+  `memory_seen_ledger` module, and a tool-side `SEEN_STORE`. Every
+  new site had to reset all three. Collapsed to one store in
+  `astra-tools::memoria` that both the bridge (content keys) and the
+  tool decorator (memory_ids) write to. The orchestrator is a
+  delegating facade over that single store — no private state.
+- **Auto-snapshot happens AFTER parameter validation.** A rejected
+  `forget`/`update` no longer produces orphan `pre_<op>_*`
+  snapshots that poll the snapshot service.
+- **Episode truncation is loud, not silent.** When the files/tools
+  list exceeds the cap, the rendered overview appends `(+N more)` so
+  a reader can tell the summary is abbreviated.
+- **Recall ledger is FIFO, not last-only.** The LLM may probe
+  multiple times in a single turn before acting; every probe goes on
+  the queue and all are scored at session-end. Soft-capped at 16 so
+  the queue doesn't grow unbounded on sessions that never close the
+  loop.
+- **Feedback loop closes at session-end, conservatively.** The
+  canonical RECALL_LEDGER is drained when `post_loop_memory_cleanup`
+  runs. If the session produced an episode (substantive work
+  happened) every recalled memory_id gets a `useful` feedback
+  signal. Trivial sessions drop the snapshots without scoring to
+  avoid false positives. A richer per-tool-outcome attribution is
+  future work — this is the minimum viable loop-closure.
+
+---
+
+## 12. Pointers to source
 
 | Concern | File |
 |---|---|
@@ -433,7 +483,7 @@ awareness of what it could recall.
 | v2→v1 verb translation, conflict gate, decorator | `rust/crates/astra-tools/src/memoria.rs` |
 | Bridge-side prefetch + cache lanes | `rust/crates/runtime/src/turn/bridge_inprocess.rs` |
 | Pure prefetch helpers | `rust/crates/runtime/src/turn/memory_prefetch.rs` |
-| Seen ledger | `rust/crates/runtime/src/turn/memory_seen_ledger.rs` |
+| Canonical session stores (SEEN_STORE + RECALL_LEDGER) | `rust/crates/astra-tools/src/memoria.rs` (`record_seen`, `seen_snapshot`, `reset_seen`, `record_recall`, `drain_recalls`, `reset_recall_ledger`) |
 | Session-end governance + store_scene | `rust/crates/runtime/src/turn/cloud/session_end_governance.rs` |
 | HTTP client + store_scene + purge_working + freshness | `rust/crates/runtime/src/turn/cloud/memoria_compact.rs` |
 | Per-session debouncer | `rust/crates/runtime/src/turn/session_end_debounce.rs` |
