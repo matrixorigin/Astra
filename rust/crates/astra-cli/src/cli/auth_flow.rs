@@ -1,4 +1,4 @@
-use super::cli_utils::{credential_store, CredentialStore, Profile};
+use super::cli_utils::{CredentialStore, Profile, credential_store};
 use super::*;
 
 pub(super) fn clear_profile_last_session(profile: Option<&str>) -> Result<(), String> {
