@@ -527,6 +527,28 @@ impl MemoriaClient {
             }
         }
 
+        // Auto-snapshot before destructive ops so `memory_rollback` is a
+        // real recovery path. Best-effort: a snapshot failure (cloud
+        // down, Memoria misconfigured) logs and continues — we'd rather
+        // the op proceed than block on an unreachable snapshot service.
+        // Name is deterministic so callers can find the snapshot without
+        // listing: `pre_<op>_<ts_ms>`.
+        if matches!(op, "forget" | "update") {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let name = pre_op_snapshot_name(op, ts);
+            if let Err(e) = memoria_snapshot_create(&name).await {
+                tracing::warn!(
+                    target: "astra::memory::auto_snapshot",
+                    op = %op,
+                    error = %e,
+                    "pre-op auto-snapshot failed; continuing without safety net"
+                );
+            }
+        }
+
         // The v2→v1 translation — including business-category expansion
         // into (content-prefix + trust_tier + tag) — now happens inside
         // `build_direct_request` for the `remember` branch. No
@@ -1356,6 +1378,12 @@ pub async fn memoria_cloud_request(
     }
 }
 
+/// Build the deterministic snapshot name used by the auto-snapshot
+/// that brackets `forget` / `update`. Pure; returns `pre_<op>_<ms>`.
+pub fn pre_op_snapshot_name(op: &str, ts_ms: u128) -> String {
+    format!("pre_{op}_{ts_ms}")
+}
+
 pub async fn memoria_snapshot_create(name: &str) -> Result<String, String> {
     memoria_cloud_request(
         HttpMethod::Post,
@@ -1863,6 +1891,15 @@ mod tests {
         let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
         let ids = pl["memory_ids"].as_array().expect("should be array");
         assert_eq!(ids.len(), 2);
+    }
+
+    // ── P9: auto-snapshot naming helper (pure) ────────────────────────
+
+    #[test]
+    fn pre_op_snapshot_name_format() {
+        use super::*;
+        assert_eq!(pre_op_snapshot_name("forget", 1_700_000_000_000), "pre_forget_1700000000000");
+        assert_eq!(pre_op_snapshot_name("update", 42), "pre_update_42");
     }
 
     // ── P8: reason required on forget / update ────────────────────────
