@@ -2085,12 +2085,20 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     if let Some(exec) = self.streaming_tool_exec.clone() {
                         exec.discard(request_id).await;
                     }
-                    astra_runtime::turn::skill_tool::execute_skill_inline(
+                    let raw = astra_runtime::turn::skill_tool::execute_skill_inline(
                         resolver.as_ref(),
                         tool,
                         args,
                     )
-                    .await
+                    .await;
+                    // Append `<skill-loaded name="..."/>` so the LLM sees
+                    // the "do not re-invoke" signal. Without this, the
+                    // system-prompt rule "On seeing <skill-loaded/>, follow
+                    // instructions — do not re-invoke" never triggers on the
+                    // CLI edge path, and the LLM loads a second skill
+                    // (session 11825116 regression). Server-side path does
+                    // this in partition_discover_and_execute_skills:1098.
+                    append_skill_loaded_marker(&raw, &dedup_key)
                 } else {
                     "Error: skill resolver not available".to_string()
                 }
@@ -6519,6 +6527,31 @@ pub(super) fn dispatch_turn_event_block(
     apply_sse_render_effects(effects, render, policy);
 }
 
+/// Append `<skill-loaded name="..."/>` to a successful skill result.
+///
+/// The system prompt tells the LLM: "On seeing `<skill-loaded name="..."/>` in
+/// a tool result, follow that skill's instructions — do not re-invoke it."
+/// Without this marker, the LLM doesn't know the skill loaded and may
+/// invoke discover_skills + a second skill in the same turn.
+///
+/// Error results (starting with "Error:") are returned unchanged — the LLM
+/// should be free to retry or switch strategies on failures.
+///
+/// Mirrors the server-side logic in
+/// `runtime::turn::skill_tool::partition_discover_and_execute_skills` (line ~1098).
+fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
+    if result.starts_with("Error:") || result.starts_with("error:") || result.trim().is_empty() {
+        return result.to_string();
+    }
+    let safe_name = skill_name
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;");
+    format!("{result}\n\n<skill-loaded name=\"{safe_name}\"/>")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8114,6 +8147,53 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
         assert!(msg.contains("code-review"));
         assert!(msg.contains("already loaded"));
+    }
+
+    // ── CLI skill-loaded marker tests ──────────────────────────────────
+
+    #[test]
+    fn skill_loaded_marker_appended_to_successful_result() {
+        // Regression (session 11825116): the CLI edge path used
+        // `execute_skill_inline` which returned raw skill content
+        // WITHOUT appending `<skill-loaded name="..."/>`. The
+        // system prompt tells the LLM "On seeing <skill-loaded/>,
+        // do not re-invoke" — without the marker, the LLM loaded
+        // a second skill (review-code) after already loading
+        // review-changes, wasting context and confusing itself.
+        //
+        // Fix: `append_skill_loaded_marker` adds the tag to
+        // successful (non-error) results.
+        let raw = "# Skill: review-changes\n\nYou are now executing...";
+        let result = append_skill_loaded_marker(raw, "review-changes");
+        assert!(
+            result.contains("<skill-loaded name=\"review-changes\"/>"),
+            "successful skill result must carry the marker: {result}"
+        );
+        assert!(
+            result.ends_with("<skill-loaded name=\"review-changes\"/>"),
+            "marker must be at the very end so LLM sees it last: {result}"
+        );
+    }
+
+    #[test]
+    fn skill_loaded_marker_not_appended_to_error_result() {
+        // Error results must NOT carry the tag — the LLM should be
+        // free to retry or switch to another skill.
+        let raw = "Error: skill resolver not available";
+        let result = append_skill_loaded_marker(raw, "broken-skill");
+        assert!(
+            !result.contains("<skill-loaded"),
+            "error results must not carry the marker: {result}"
+        );
+    }
+
+    #[test]
+    fn skill_loaded_marker_escapes_xml_special_chars() {
+        let result = append_skill_loaded_marker("ok", "a<b>&c\"d");
+        assert!(
+            result.contains("a&lt;b&gt;&amp;c&quot;d"),
+            "XML special chars must be escaped: {result}"
+        );
     }
 
     // ── EdgeToolCache unit tests ─────────────────────────────────────────
