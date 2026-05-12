@@ -264,10 +264,15 @@ fn build_bridge_tool_call_records(
             Value::String(s) => s.clone(),
             Value::Null => String::new(),
             Value::Object(map) if map.is_empty() => {
+                // Tagged with the shared sentinel so log pipelines / metrics
+                // can count this specific degraded path and measure whether
+                // the upstream serialization bug is decreasing over time.
+                // See `astra_turn_core::history::DEGRADED_EMPTY_OBJECT_TAG`.
                 astra_core::agent_warn!(
                     "bridge",
-                    "tool_result.output is an empty object (not String); degrading to empty string. request_id={}",
-                    request_id
+                    "tool_result.output is an empty object (not String); degrading to empty string. request_id={} tag={}",
+                    request_id,
+                    astra_turn_core::history::DEGRADED_EMPTY_OBJECT_TAG
                 );
                 String::new()
             }

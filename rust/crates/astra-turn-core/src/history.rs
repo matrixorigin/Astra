@@ -1,10 +1,21 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
-const DEGRADED_EMPTY_OBJECT_TOOL_RESULT: &str =
-    "[degraded: historical tool result content was an empty JSON object placeholder]";
+/// Shared sentinel tag identifying tool results whose original content was
+/// recovered as an empty JSON object placeholder (the upstream serialization
+/// bug that motivated the `coerce_tool_result_content` path in
+/// `runtime::turn::llm_client`). Downstream detectors (dashboards, metrics,
+/// log filters, compaction gates) should match on this exact token.
+///
+/// Single source of truth for both the `history.rs` replay path and the
+/// `headless_tool_assembly::idempotency_cache_hit_message` cache-hit path.
+/// If you change the tag, audit every `contains`/`starts_with` match in
+/// `astra-turn-core`, `runtime`, and any downstream consumers.
+pub const DEGRADED_EMPTY_OBJECT_TAG: &str = "degraded_empty_object_tool_result";
+
+const DEGRADED_EMPTY_OBJECT_TOOL_RESULT: &str = "[degraded: historical tool result content was an empty JSON object placeholder] [tag=degraded_empty_object_tool_result]";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecoveredEventRow {
@@ -620,24 +631,20 @@ mod tests {
         assert!(consumed.is_empty());
         // Healing should add placeholder for missing c1
         assert_eq!(history.len(), original_len + 1);
-        assert!(
-            history[2]["content"]
-                .as_str()
-                .unwrap()
-                .contains("not executed")
-        );
+        assert!(history[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("not executed"));
 
         // Empty slice case
         let mut history2 = vec![user_msg("q"), assistant_with_tool_calls(&["c1"])];
         let consumed2 = merge_tool_results_into_history(&mut history2, Some(&[]));
         assert!(consumed2.is_empty());
         // Healing again
-        assert!(
-            history2[2]["content"]
-                .as_str()
-                .unwrap()
-                .contains("not executed")
-        );
+        assert!(history2[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("not executed"));
     }
 
     #[test]

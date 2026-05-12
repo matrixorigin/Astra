@@ -830,6 +830,11 @@ fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -
                     // booleans, and null must use the `text` branch — or
                     // Bedrock rejects with "messages.N.content.M.toolResult
                     // .content.0.json is invalid — provide a json object".
+                    //
+                    // Empty content uses `{"text": ""}` (not `{"json": {}}`)
+                    // because Bedrock accepts an empty string here but rejects
+                    // an empty JSON object as "invalid". Do not switch to
+                    // `{"json": {}}` — it will 400 at the provider.
                     let result_block = if content.is_empty() {
                         json!({"text": ""})
                     } else {

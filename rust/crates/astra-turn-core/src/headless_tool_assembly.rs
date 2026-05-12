@@ -208,7 +208,10 @@ pub fn idempotency_cache_hit_message(cached_output: &str) -> String {
         return "(cached — identical call already executed; original output was empty)".to_string();
     }
     if trimmed == "{}" {
-        return "(cached — identical call already executed; degraded historical tool output was an empty JSON object placeholder)".to_string();
+        return format!(
+            "(cached — identical call already executed; degraded historical tool output was an empty JSON object placeholder) [tag={}]",
+            crate::history::DEGRADED_EMPTY_OBJECT_TAG
+        );
     }
     if trimmed.len() <= IDEMPOTENCY_INLINE_MAX_BYTES {
         // If the cached output itself already starts with the sentinel
