@@ -306,7 +306,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         slot.name.clone(),
                         body.len() as u32,
                         args_preview,
-                        Some(body.clone()),
+                        Some(&body),
                     ));
                 return HeadlessPipelineStage::ShortCircuit;
             }
@@ -359,7 +359,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     slot.name.clone(),
                     cached.output.len() as u32,
                     args_preview,
-                    Some(cached.output.clone()),
+                    Some(&cached.output),
                 ));
             return HeadlessPipelineStage::ShortCircuit;
         }
@@ -416,7 +416,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     slot.name.clone(),
                     cached_output.len() as u32,
                     args_preview,
-                    Some(cached_output.clone()),
+                    Some(&cached_output),
                 ));
             agent_warn!(
                 "dedup",

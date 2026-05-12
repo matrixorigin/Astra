@@ -28,7 +28,30 @@ pub fn journal_record_duplicate_within_turn(
 /// forensics useful (you can see *what* was reused) without
 /// blowing up the journal with duplicate content — the full body
 /// is already in the earlier turn the cache hit refers to.
+/// Byte ceiling for the cached-body snippet appended to a cross-turn cache
+/// hit's `result_preview`. We truncate on a UTF-8 char boundary at or below
+/// this many bytes so the snippet stays bounded regardless of how wide the
+/// source encoding is, and never panics on multi-byte input.
 const CACHE_HIT_PREVIEW_SNIPPET_BYTES: usize = 400;
+
+/// Return the longest prefix of `s` whose byte length is `≤ max_bytes` that
+/// still ends on a UTF-8 char boundary, together with a flag indicating
+/// whether any content was dropped.
+fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> (&str, bool) {
+    if s.len() <= max_bytes {
+        return (s, false);
+    }
+    // Walk char boundaries and keep the largest one that fits.
+    let mut end = 0;
+    for (idx, ch) in s.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    (&s[..end], true)
+}
 
 /// Record a cross-turn cache hit.
 ///
@@ -49,9 +72,9 @@ pub fn journal_record_cross_turn_cache_hit(
     name: String,
     output_len: u32,
     args_preview: Option<String>,
-    cached_body: Option<String>,
+    cached_body: Option<&str>,
 ) -> ToolCallRecord {
-    let preview = format_cross_turn_cache_hit_preview(output_len, cached_body.as_deref());
+    let preview = format_cross_turn_cache_hit_preview(output_len, cached_body);
     ToolCallRecord {
         name,
         ok: true,
@@ -75,12 +98,9 @@ fn format_cross_turn_cache_hit_preview(output_len: u32, cached_body: Option<&str
             // Truncate at a char boundary to avoid splitting UTF-8
             // codepoints. The tag stays first so scanners keying on
             // the prefix don't have to strip a snippet header.
-            let snippet: String = body.chars().take(CACHE_HIT_PREVIEW_SNIPPET_BYTES).collect();
-            let ellipsis = if body.len() > snippet.len() {
-                "…"
-            } else {
-                ""
-            };
+            let (snippet, truncated) =
+                truncate_on_char_boundary(body, CACHE_HIT_PREVIEW_SNIPPET_BYTES);
+            let ellipsis = if truncated { "…" } else { "" };
             format!("{tag}\n{snippet}{ellipsis}")
         }
         _ => tag,
@@ -215,7 +235,7 @@ mod tests {
             "read_file".into(),
             2000,
             Some("src/lib.rs".into()),
-            Some("fn main() {\n    println!(\"hi\");\n}\n// ... many more lines ...".to_string()),
+            Some("fn main() {\n    println!(\"hi\");\n}\n// ... many more lines ..."),
         );
         let preview = r.result_preview.expect("cache-hit must carry a preview");
         assert!(
@@ -230,6 +250,111 @@ mod tests {
             preview.contains("fn main"),
             "preview should include a snippet of the cached content for forensics: {preview:?}"
         );
+    }
+
+    #[test]
+    fn cache_hit_preview_keeps_short_multibyte_body_intact() {
+        // 100 Han characters = 300 bytes — safely under the 400-byte
+        // snippet ceiling. Every glyph must survive the preview
+        // intact (no panic, no truncation, no replacement char).
+        let body: String = "中".repeat(100);
+        assert_eq!(body.len(), 300, "setup: 100 Han chars must be 300 bytes");
+        let r = journal_record_cross_turn_cache_hit(
+            "read_file".into(),
+            body.len() as u32,
+            None,
+            Some(&body),
+        );
+        let preview = r.result_preview.expect("must carry preview");
+        // All 100 input glyphs are preserved in the preview body.
+        assert_eq!(preview.matches('中').count(), 100);
+        // No ellipsis because body fit under the ceiling.
+        assert!(
+            !preview.ends_with('…'),
+            "no ellipsis expected when body fits: {preview:?}"
+        );
+        assert!(
+            !preview.contains('\u{FFFD}'),
+            "no U+FFFD replacement char allowed: {preview:?}"
+        );
+    }
+
+    #[test]
+    fn cache_hit_preview_truncates_cjk_on_char_boundary_not_mid_codepoint() {
+        // 200 Han characters = 600 bytes — exceeds the 400-byte
+        // snippet ceiling. Must truncate on a char boundary; the
+        // naive `&s[..400]` would panic (400 is mid-codepoint for
+        // 3-byte UTF-8 runs: 400 % 3 != 0).
+        let body: String = "中".repeat(200);
+        assert_eq!(body.len(), 600, "setup: 200 Han chars must be 600 bytes");
+
+        let r = journal_record_cross_turn_cache_hit(
+            "read_file".into(),
+            body.len() as u32,
+            None,
+            Some(&body),
+        );
+        let preview = r.result_preview.expect("must carry preview");
+        assert!(
+            preview.ends_with('…'),
+            "truncation should append an ellipsis: {preview:?}"
+        );
+
+        // Extract the snippet between the tag line and the trailing
+        // ellipsis.  The prefix is fixed per
+        // format_cross_turn_cache_hit_preview.
+        let tag_line = "[cached_cross_turn: reused 600 bytes from earlier turn]\n";
+        let snippet = preview
+            .strip_prefix(tag_line)
+            .expect("preview must start with tag line")
+            .trim_end_matches('…');
+
+        // Every surviving char is still `中` — none was sliced mid-codepoint.
+        assert!(
+            snippet.chars().all(|c| c == '中'),
+            "all chars should be intact 中, got {snippet:?}"
+        );
+        assert!(
+            !snippet.contains('\u{FFFD}'),
+            "no U+FFFD replacement char allowed"
+        );
+
+        // Snippet bytes must be ≤ 400 (strictly under because 400 is
+        // not on a Han char boundary — largest fit is 399 bytes = 133 chars).
+        assert!(
+            snippet.len() <= 400,
+            "snippet length must respect the byte ceiling: got {}",
+            snippet.len()
+        );
+        assert_eq!(
+            snippet.chars().count(),
+            133,
+            "largest intact Han-char run fitting 400 bytes is 133 × 3 = 399 bytes"
+        );
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_handles_exact_fit() {
+        // When the body length exactly equals the ceiling we must
+        // NOT flag it as truncated (no ellipsis) — the body fits.
+        let body: String = "中".repeat(100); // 300 bytes
+        let (out, truncated) = truncate_on_char_boundary(&body, 300);
+        assert_eq!(out, body.as_str());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_rejects_mixed_ascii_and_emoji() {
+        // ASCII + 4-byte emoji: make sure the helper prefers the
+        // largest char boundary ≤ the ceiling and never produces an
+        // invalid slice.
+        let body = "abc🎉🎉🎉"; // 3 ASCII + 3 × 4-byte emoji = 15 bytes
+        // Ceiling = 10: fits "abc" (3) + 1 emoji (4) = 7 bytes.
+        // Adding the next emoji would take us to 11 bytes > 10.
+        let (out, truncated) = truncate_on_char_boundary(body, 10);
+        assert!(truncated);
+        assert_eq!(out, "abc🎉");
+        assert_eq!(out.len(), 7);
     }
 
     #[test]
