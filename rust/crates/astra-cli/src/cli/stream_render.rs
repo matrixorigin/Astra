@@ -6549,6 +6549,10 @@ fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
     // (U+2028 / U+2029, which `is_control` does NOT catch) to
     // impersonate a different skill in LLM-visible output. Anything
     // outside the allowlist is replaced with `_`.
+    // The allowlist already rejects every XML-special character
+    // (`<`, `>`, `&`, `"`, `'`) by replacing it with `_`, so no
+    // subsequent XML-escape pass is needed — and adding one would be
+    // dead code that falsely suggests the allowlist is permissive.
     let safe_name: String = skill_name
         .chars()
         .map(|c| {
@@ -6558,12 +6562,17 @@ fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
                 '_'
             }
         })
-        .collect::<String>()
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;");
+        .collect();
+    // Belt-and-suspenders: make the allowlist's XML-safety guarantee
+    // a runtime invariant, so any future relaxation of the allowlist
+    // that lets an XML-special char slip through trips tests
+    // immediately instead of silently enabling tag breakout.
+    debug_assert!(
+        !safe_name
+            .chars()
+            .any(|c| matches!(c, '<' | '>' | '&' | '"' | '\'')),
+        "allowlist must reject every XML-special character; got {safe_name:?}"
+    );
     format!("{result}\n\n<skill-loaded name=\"{safe_name}\"/>")
 }
 
@@ -8203,11 +8212,19 @@ diff --git a/src/a.rs b/src/a.rs\n\
     }
 
     #[test]
-    fn skill_loaded_marker_escapes_xml_special_chars() {
+    fn skill_loaded_marker_sanitizes_xml_special_chars() {
+        // XML-special characters (`<`, `>`, `&`, `"`, `'`) are outside
+        // the filename-safe allowlist, so they are replaced with `_`.
+        // This prevents a malicious skill name from breaking out of
+        // the `<skill-loaded name="..."/>` tag entirely.
         let result = append_skill_loaded_marker("ok", "a<b>&c\"d");
         assert!(
-            result.contains("a&lt;b&gt;&amp;c&quot;d"),
-            "XML special chars must be escaped: {result}"
+            result.contains("a_b__c_d"),
+            "XML special chars must be replaced with `_`: {result}"
+        );
+        assert!(
+            !result.contains('<') || result.matches('<').count() == 1,
+            "only the opening `<skill-loaded` angle bracket may remain: {result}"
         );
     }
 
