@@ -139,9 +139,8 @@ pub struct MemoriaClient {
 /// real session-lifetime dedup. Paired with the runtime-side
 /// `memory_seen_ledger` which covers the prefetch path; both are
 /// cleared on session-end cleanup.
-static SEEN_STORE: std::sync::OnceLock<
-    RwLock<HashMap<String, std::collections::HashSet<String>>>,
-> = std::sync::OnceLock::new();
+static SEEN_STORE: std::sync::OnceLock<RwLock<HashMap<String, std::collections::HashSet<String>>>> =
+    std::sync::OnceLock::new();
 
 fn seen_store() -> &'static RwLock<HashMap<String, std::collections::HashSet<String>>> {
     SEEN_STORE.get_or_init(|| RwLock::new(HashMap::new()))
@@ -640,8 +639,7 @@ impl MemoriaClient {
             let session_id = args.get("session_id").and_then(Value::as_str).unwrap_or("");
             let seen = Self::seen_snapshot(session_id);
             let mut newly_surfaced = Vec::new();
-            let decorated =
-                Self::decorate_recall_response(&raw_text, &seen, &mut newly_surfaced);
+            let decorated = Self::decorate_recall_response(&raw_text, &seen, &mut newly_surfaced);
             if !newly_surfaced.is_empty() {
                 Self::record_seen(session_id, newly_surfaced);
             }
@@ -1898,7 +1896,10 @@ mod tests {
     #[test]
     fn pre_op_snapshot_name_format() {
         use super::*;
-        assert_eq!(pre_op_snapshot_name("forget", 1_700_000_000_000), "pre_forget_1700000000000");
+        assert_eq!(
+            pre_op_snapshot_name("forget", 1_700_000_000_000),
+            "pre_forget_1700000000000"
+        );
         assert_eq!(pre_op_snapshot_name("update", 42), "pre_update_42");
     }
 
@@ -1961,7 +1962,10 @@ mod tests {
         });
         let (ep, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
         assert!(ep.ends_with("/v1/memories/purge"));
-        assert_eq!(pl["reason"].as_str(), Some("memory is stale; user confirmed"));
+        assert_eq!(
+            pl["reason"].as_str(),
+            Some("memory is stale; user confirmed")
+        );
     }
 }
 

@@ -1526,7 +1526,10 @@ mod tests {
         let mut excl = std::collections::HashSet::new();
         excl.insert("m2".to_string());
         let block = build_memory_index_block(&items, &excl).expect("non-empty");
-        assert!(!block.contains("m2"), "excluded id must not appear: {block}");
+        assert!(
+            !block.contains("m2"),
+            "excluded id must not appear: {block}"
+        );
         assert!(block.contains("m1"));
         assert!(block.contains("m3"));
     }

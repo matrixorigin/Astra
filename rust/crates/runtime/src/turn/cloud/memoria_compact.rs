@@ -2732,9 +2732,7 @@ mod tests {
                     break;
                 }
                 buf.extend_from_slice(&tmp[..n]);
-                if let Some(idx) =
-                    buf.windows(4).position(|w| w == b"\r\n\r\n")
-                {
+                if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                     let headers = std::str::from_utf8(&buf[..idx]).unwrap_or("");
                     let cl: usize = headers
                         .lines()
@@ -2763,10 +2761,7 @@ mod tests {
             let _ = sock.shutdown().await;
         });
 
-        let client = HttpMemoriaClient::new(
-            format!("http://{addr}"),
-            "test-key".to_string(),
-        );
+        let client = HttpMemoriaClient::new(format!("http://{addr}"), "test-key".to_string());
         let purged = client
             .purge_working("8ae95566-f123-4abc-9def-0123456789ab")
             .await
@@ -2796,10 +2791,12 @@ mod tests {
 
     #[tokio::test]
     async fn purge_working_rejects_empty_session_id() {
-        let client =
-            HttpMemoriaClient::new("http://127.0.0.1:1".into(), "key".into());
+        let client = HttpMemoriaClient::new("http://127.0.0.1:1".into(), "key".into());
         let err = client.purge_working("").await.unwrap_err();
-        assert!(err.contains("non-empty"), "expected validation error: {err}");
+        assert!(
+            err.contains("non-empty"),
+            "expected validation error: {err}"
+        );
     }
 
     // ── P7: parse_reflect_candidates ──────────────────────────────────
