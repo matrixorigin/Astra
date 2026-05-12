@@ -980,8 +980,28 @@ impl MemoriaClient {
                 ),
             },
             // ── forget → v1 purge (`POST /v1/memories/purge`) ────────────
+            //
+            // `reason` is REQUIRED at the runtime boundary. Destructive
+            // ops without a stated reason rot the audit trail — the LLM
+            // must declare *why* it's purging so a future inspector can
+            // understand how the state evolved. (The schema also marks
+            // it required for this action; the runtime is the second
+            // line of defense.)
             "forget" => {
-                let mut pl = json!({});
+                let reason = args
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let Some(reason) = reason else {
+                    return (
+                        String::new(),
+                        json!({"error":
+                            "memory(action=forget) requires a non-empty `reason` (audit trail)"}),
+                        HttpMethod::Post,
+                    );
+                };
+                let mut pl = json!({"reason": reason});
                 if let Some(ids) = args.get("memory_ids").or_else(|| args.get("memory_id")) {
                     pl["memory_ids"] = if ids.is_array() {
                         ids.clone()
@@ -992,9 +1012,6 @@ impl MemoriaClient {
                     };
                 } else if let Some(topic) = args.get("topic").and_then(Value::as_str) {
                     pl["topic"] = json!(topic);
-                }
-                if let Some(reason) = args.get("reason").and_then(Value::as_str) {
-                    pl["reason"] = json!(reason);
                 }
                 let has_filter = pl
                     .as_object()
@@ -1014,6 +1031,9 @@ impl MemoriaClient {
             // v2's richer update (tags_add / tags_remove / importance) is
             // flattened into v1's single `new_content` + `reason` shape;
             // tag and importance fields are dropped until v1 grows support.
+            //
+            // `reason` is REQUIRED at the runtime boundary so corrections
+            // carry their motivation for the audit trail.
             "update" => {
                 let new_content = args
                     .get("content")
@@ -1023,7 +1043,16 @@ impl MemoriaClient {
                 let reason = args
                     .get("reason")
                     .and_then(Value::as_str)
-                    .unwrap_or("update");
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let Some(reason) = reason else {
+                    return (
+                        String::new(),
+                        json!({"error":
+                            "memory(action=update) requires a non-empty `reason` (audit trail)"}),
+                        HttpMethod::Post,
+                    );
+                };
                 if let Some(mid) = args
                     .get("memory_id")
                     .and_then(Value::as_str)
@@ -1542,8 +1571,10 @@ mod tests {
 
         // purge — Memoria requires ONLY ONE of memory_ids, topic, session_id.
         // inject_identity is NOT called (would add session_id alongside topic → 422).
+        // `reason` is REQUIRED at the runtime boundary (P8).
         let purge_args = json!({
             "topic": "old",
+            "reason": "user asked to forget",
             "session_id": "user-42",
             "user_id": "user-42"
         });
@@ -1554,10 +1585,11 @@ mod tests {
             "purge must not send both topic AND session_id"
         );
 
-        // correct
+        // correct — `reason` is REQUIRED at the runtime boundary (P8).
         let correct_args = json!({
             "memory_id": "m1",
             "new_content": "fixed",
+            "reason": "refined after user clarification",
             "session_id": "user-42",
             "user_id": "user-42"
         });
@@ -1804,7 +1836,11 @@ mod tests {
 
     #[test]
     fn purge_with_topic_does_not_include_session_id() {
-        let args = json!({"topic": "NEPTUNE", "session_id": "sess-42"});
+        let args = json!({
+            "topic": "NEPTUNE",
+            "reason": "obsolete project",
+            "session_id": "sess-42"
+        });
         let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
         assert_eq!(pl["topic"], "NEPTUNE");
         assert!(
@@ -1815,7 +1851,7 @@ mod tests {
 
     #[test]
     fn purge_with_memory_ids() {
-        let args = json!({"memory_ids": ["id1", "id2"]});
+        let args = json!({"memory_ids": ["id1", "id2"], "reason": "user cleanup"});
         let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
         assert!(pl["memory_ids"].is_array());
         assert!(pl.get("topic").is_none());
@@ -1823,10 +1859,72 @@ mod tests {
 
     #[test]
     fn purge_with_memory_id_string_becomes_array() {
-        let args = json!({"memory_id": "id1,id2"});
+        let args = json!({"memory_id": "id1,id2", "reason": "batch cleanup"});
         let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
         let ids = pl["memory_ids"].as_array().expect("should be array");
         assert_eq!(ids.len(), 2);
+    }
+
+    // ── P8: reason required on forget / update ────────────────────────
+
+    #[test]
+    fn forget_without_reason_rejected_loudly() {
+        let args = json!({"memory_id": "m1"});
+        let (ep, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
+        assert!(ep.is_empty(), "no endpoint → runtime short-circuits");
+        let err = pl["error"].as_str().unwrap();
+        assert!(err.contains("reason"), "error mentions reason: {err}");
+        assert!(err.contains("audit"), "error mentions audit: {err}");
+    }
+
+    #[test]
+    fn forget_with_empty_reason_rejected() {
+        let args = json!({"memory_id": "m1", "reason": "   "});
+        let (ep, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
+        assert!(ep.is_empty(), "whitespace-only reason is empty");
+        assert!(pl["error"].as_str().unwrap().contains("reason"));
+    }
+
+    #[test]
+    fn update_without_reason_rejected_loudly() {
+        let args = json!({"memory_id": "m1", "new_content": "fixed"});
+        let (ep, pl, _) = MemoriaClient::build_direct_request("http://mem", "update", &args);
+        assert!(ep.is_empty());
+        assert!(pl["error"].as_str().unwrap().contains("reason"));
+    }
+
+    #[test]
+    fn update_with_empty_reason_rejected() {
+        let args = json!({"memory_id": "m1", "new_content": "fixed", "reason": ""});
+        let (ep, pl, _) = MemoriaClient::build_direct_request("http://mem", "update", &args);
+        assert!(ep.is_empty());
+        assert!(pl["error"].as_str().unwrap().contains("reason"));
+    }
+
+    #[test]
+    fn update_with_valid_reason_builds_correct_endpoint() {
+        let args = json!({
+            "memory_id": "m1",
+            "new_content": "fixed",
+            "reason": "user said the tool name changed last week"
+        });
+        let (ep, pl, _) = MemoriaClient::build_direct_request("http://mem", "update", &args);
+        assert!(ep.ends_with("/v1/memories/m1/correct"));
+        assert_eq!(
+            pl["reason"].as_str(),
+            Some("user said the tool name changed last week")
+        );
+    }
+
+    #[test]
+    fn forget_with_valid_reason_builds_purge_endpoint() {
+        let args = json!({
+            "memory_id": "m1",
+            "reason": "memory is stale; user confirmed"
+        });
+        let (ep, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
+        assert!(ep.ends_with("/v1/memories/purge"));
+        assert_eq!(pl["reason"].as_str(), Some("memory is stale; user confirmed"));
     }
 }
 
@@ -1862,7 +1960,7 @@ mod memoria_http_client_tests {
 
     #[test]
     fn purge_topic_returns_topic_filter() {
-        let args = json!({"topic": "NEPTUNE"});
+        let args = json!({"topic": "NEPTUNE", "reason": "obsolete project"});
         let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
         assert_eq!(pl["topic"], "NEPTUNE");
         assert!(pl.get("session_id").is_none());
@@ -1871,7 +1969,7 @@ mod memoria_http_client_tests {
 
     #[test]
     fn purge_responses_are_not_empty() {
-        let args = json!({"topic": "NEPTUNE"});
+        let args = json!({"topic": "NEPTUNE", "reason": "project wound down"});
         let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
         assert!(
             pl.is_object() && !pl.as_object().unwrap().contains_key("error"),

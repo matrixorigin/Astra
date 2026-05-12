@@ -516,7 +516,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "type": "string",
                             "description": "remember with visibility=team: the team to tag (encoded as `astra:team:<id>` in the memory's tag set). recall with visibility=team: union with the given team's shared pool. Omit to fall back to the executor's default team from session context."
                         },
-                        "reason": {"type": "string", "description": "forget / update / feedback: short explanation for audit trail."},
+                        "reason": {"type": "string", "description": "forget / update: REQUIRED — non-empty explanation for the audit trail (why this memory is being changed). feedback: optional."},
                         "level": {
                             "type": "string",
                             "enum": ["abstract","overview","detail","linked"],
@@ -542,7 +542,17 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "description": "remember / recall: scope to a specific agent type. On remember it tags; on recall it filters to that type + unscoped globals."
                         }
                     },
-                    "required": ["action"]
+                    "required": ["action"],
+                    "allOf": [
+                        {
+                            "if": {"properties": {"action": {"const": "forget"}}, "required": ["action"]},
+                            "then": {"required": ["reason"], "properties": {"reason": {"minLength": 1}}}
+                        },
+                        {
+                            "if": {"properties": {"action": {"const": "update"}}, "required": ["action"]},
+                            "then": {"required": ["reason"], "properties": {"reason": {"minLength": 1}}}
+                        }
+                    ]
                 }
             }
         }),
