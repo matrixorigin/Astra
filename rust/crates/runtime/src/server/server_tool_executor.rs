@@ -1266,15 +1266,7 @@ impl ServerToolExecutor {
                         "Error: missing required parameter `action`. \
                          Use one of: remember, recall, expand, forget, update, focus, reflect, profile, feedback".to_string()),
                 };
-                let mut isolated_args = args.clone();
-                if let Some(obj) = isolated_args.as_object_mut() {
-                    obj.remove("action"); // the verb is routed via `op`, not sent to Memoria
-                    obj.insert(
-                        "session_id".to_string(),
-                        Value::String(self.session_id.clone()),
-                    );
-                    obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
-                }
+                let isolated_args = self.memory_args_with_context(args);
                 let output = self.memoria_client.call(op, &isolated_args).await;
                 if output.starts_with("Error") {
                     astra_tools::ToolResult::error(output)
@@ -1506,14 +1498,16 @@ impl ServerToolExecutor {
                 self.memoria_client.cloud_token.clone(),
             );
             tokio::spawn(async move {
-                let pushed = client
+                let report = client
                     .feedback_pending_recalls(&session_id, "useful", &ctx)
                     .await;
-                if pushed > 0 {
+                if report.attempted > 0 {
                     tracing::debug!(
                         session_id = %session_id,
                         context = %ctx,
-                        memories = pushed,
+                        attempted = report.attempted,
+                        succeeded = report.succeeded,
+                        failed = report.failed,
                         "closed recall feedback after successful tool"
                     );
                 }
@@ -1574,6 +1568,25 @@ impl ServerToolExecutor {
     /// Set the current turn index for journal entries.
     pub fn set_turn_index(&self, idx: u32) {
         self.journal_turn_index.store(idx, Ordering::Relaxed);
+    }
+
+    fn memory_args_with_context(&self, args: &Value) -> Value {
+        let mut isolated_args = args.clone();
+        if let Some(obj) = isolated_args.as_object_mut() {
+            obj.remove("action"); // the verb is routed via `op`, not sent to Memoria
+            obj.insert(
+                "session_id".to_string(),
+                Value::String(self.session_id.clone()),
+            );
+            obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
+            obj.insert(
+                "turn".to_string(),
+                Value::Number(serde_json::Number::from(
+                    self.journal_turn_index.load(Ordering::Relaxed),
+                )),
+            );
+        }
+        isolated_args
     }
 
     /// Reset aggregate output counter at the start of a new turn.
@@ -4810,6 +4823,22 @@ esac
             .await;
         // Should attempt the call (may fail due to no server, but shouldn't crash)
         assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn memory_tool_args_include_session_user_and_turn() {
+        let (exec, _dir) = test_executor();
+        exec.set_turn_index(12);
+
+        let args = exec.memory_args_with_context(&json!({
+            "action": "recall",
+            "query": "closed loop",
+        }));
+
+        assert!(args.get("action").is_none());
+        assert_eq!(args["session_id"].as_str(), Some(exec.session_id.as_str()));
+        assert_eq!(args["user_id"].as_str(), Some(exec.user_id.as_str()));
+        assert_eq!(args["turn"].as_u64(), Some(12));
     }
 
     #[tokio::test]

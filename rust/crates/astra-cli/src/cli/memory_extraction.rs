@@ -127,6 +127,33 @@ fn write_decision_for_failed_conflict_probe() -> astra_tools::memoria::WriteDeci
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExtractionWriteAccounting {
+    stored_or_updated: usize,
+    candidates: usize,
+    writes: usize,
+    updates: usize,
+    skipped: usize,
+    failures: usize,
+}
+
+fn extraction_write_accounting(
+    candidates: usize,
+    writes: usize,
+    updates: usize,
+    skipped: usize,
+    failures: usize,
+) -> ExtractionWriteAccounting {
+    ExtractionWriteAccounting {
+        stored_or_updated: writes + updates,
+        candidates,
+        writes,
+        updates,
+        skipped,
+        failures,
+    }
+}
+
 /// Check if the main model already **wrote** to memory this turn.
 ///
 /// Write actions (`remember`, `forget`, `update`, `focus`, `reflect`,
@@ -706,6 +733,8 @@ async fn run_extraction(
     let base = mem.base_url.clone();
     let mut writes = 0usize;
     let mut updates = 0usize;
+    let mut skipped = 0usize;
+    let mut skip_reasons: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for m in &quality_filtered {
         let encoded = astra_prompts::memory_types::encode(m.category, &m.content);
@@ -774,7 +803,8 @@ async fn run_extraction(
                     .await
             }
             astra_tools::memoria::WriteDecision::Skip { reason } => {
-                errors.push(reason.clone());
+                skipped += 1;
+                skip_reasons.push(reason.clone());
                 continue;
             }
         };
@@ -786,6 +816,13 @@ async fn run_extraction(
             _ => {}
         }
     }
+    if !skip_reasons.is_empty() {
+        eprintln!(
+            "  [memory-extraction] skipped candidates ({}): {}",
+            skipped,
+            skip_reasons.join("; ")
+        );
+    }
     if !errors.is_empty() {
         eprintln!(
             "  [memory-extraction] write failures ({}): {}",
@@ -793,21 +830,30 @@ async fn run_extraction(
             errors.join("; ")
         );
     }
-    let _ = (writes, updates); // captured for the log line below
 
     let duration_ms = start.elapsed().as_millis() as u64;
-    eprintln!(
-        "  [memory-extraction] turn: extracted {} memories ({} new, {} updated) [{}] in {:.1}s{}",
+    let accounting = extraction_write_accounting(
         quality_filtered.len(),
         writes,
         updates,
+        skipped,
+        errors.len(),
+    );
+    eprintln!(
+        "  [memory-extraction] turn: stored/updated {} memories from {} candidates ({} new, {} updated, {} skipped, {} failures) [{}] in {:.1}s{}",
+        accounting.stored_or_updated,
+        accounting.candidates,
+        accounting.writes,
+        accounting.updates,
+        accounting.skipped,
+        accounting.failures,
         categories.join(", "),
         duration_ms as f64 / 1000.0,
         if prefix_reused { " [cache-shared]" } else { "" },
     );
 
     ExtractionOutcome::Extracted {
-        count: quality_filtered.len(),
+        count: accounting.stored_or_updated,
         categories,
         duration_ms,
         prefix_reused,
@@ -1620,6 +1666,15 @@ mod tests {
             write_decision_for_failed_conflict_probe(),
             astra_tools::memoria::WriteDecision::Skip { .. }
         ));
+    }
+
+    #[test]
+    fn skipped_extraction_candidates_do_not_count_as_stored() {
+        let accounting = extraction_write_accounting(3, 1, 1, 1, 0);
+
+        assert_eq!(accounting.candidates, 3);
+        assert_eq!(accounting.stored_or_updated, 2);
+        assert_eq!(accounting.skipped, 1);
     }
 
     // ── Source metadata ──

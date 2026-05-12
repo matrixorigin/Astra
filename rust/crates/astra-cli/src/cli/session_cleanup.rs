@@ -178,6 +178,9 @@ pub(super) async fn finalize_session(state: &mut ReplState) {
         let _ = con_handle.await;
     })
     .await;
+    if let Some(sid) = state.session_id.as_deref() {
+        astra_tools::memoria::MemoriaClient::reset_session_process_state(sid);
+    }
     // 6. Clear panic guard
     clear_panic_guard();
 }

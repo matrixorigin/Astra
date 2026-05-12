@@ -812,6 +812,27 @@ impl ToolExecutor {
         self.active_session_id.lock().ok().and_then(|g| g.clone())
     }
 
+    fn memory_args_with_context(&self, args: &Value) -> Value {
+        let mut clean_args = args.clone();
+        if let Some(obj) = clean_args.as_object_mut() {
+            obj.remove("action");
+            // Inject the active session id so focus hints and session-scoped
+            // recalls work. CLI does not own a user_id — leave it to the
+            // cloud proxy / Memoria server to fill in via the bearer token.
+            if let Some(sid) = self.active_session_id().filter(|sid| !sid.is_empty()) {
+                obj.insert("session_id".to_string(), serde_json::Value::String(sid));
+            }
+            let turn = self
+                .journal_turn_index
+                .load(std::sync::atomic::Ordering::Acquire);
+            obj.insert(
+                "turn".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(turn)),
+            );
+        }
+        clean_args
+    }
+
     /// P3.1 seam: stash cross-session lessons loaded at session bootstrap.
     /// Every subsequent `build_self_model_snapshot` will project them via
     /// [`astra_runtime::self_model::SelfModel::with_lessons`].
@@ -1961,23 +1982,7 @@ impl ToolExecutor {
                         None => return "Error: missing required parameter `action`. \
                              Use one of: remember, recall, expand, forget, update, focus, reflect, profile, feedback".to_string(),
                     };
-                    let mut clean_args = args.clone();
-                    if let Some(obj) = clean_args.as_object_mut() {
-                        obj.remove("action");
-                        // Inject the active session id so focus hints and
-                        // session-scoped recalls work. CLI does not own a
-                        // user_id — leave it to the cloud proxy / Memoria
-                        // server to fill in via the bearer token.
-                        let sid = self
-                            .active_session_id
-                            .lock()
-                            .ok()
-                            .and_then(|guard| guard.clone())
-                            .unwrap_or_default();
-                        if !sid.is_empty() {
-                            obj.insert("session_id".to_string(), serde_json::Value::String(sid));
-                        }
-                    }
+                    let clean_args = self.memory_args_with_context(args);
                     self.memoria_call(op, &clean_args).await
                 }
                 "adjust_config" => self.adjust_config(args),
@@ -2189,9 +2194,19 @@ impl ToolExecutor {
             );
             let ctx = format!("cli-tool:{name}");
             tokio::spawn(async move {
-                client
+                let report = client
                     .feedback_pending_recalls(&session_id, "useful", &ctx)
                     .await;
+                if report.attempted > 0 {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        context = %ctx,
+                        attempted = report.attempted,
+                        succeeded = report.succeeded,
+                        failed = report.failed,
+                        "closed recall feedback after successful cli tool"
+                    );
+                }
             });
         }
         self.record_output_size(output.len());
@@ -2924,6 +2939,23 @@ mod tests {
 
         executor.set_cloud_token("new-token");
         assert_eq!(executor.cloud_token().as_deref(), Some("new-token"));
+    }
+
+    #[test]
+    fn memory_args_include_session_and_current_turn() {
+        let executor = test_executor().with_active_session_id("mem-session");
+        executor
+            .journal_turn_index
+            .store(9, std::sync::atomic::Ordering::Release);
+
+        let args = executor.memory_args_with_context(&serde_json::json!({
+            "action": "recall",
+            "query": "memory loop",
+        }));
+
+        assert!(args.get("action").is_none());
+        assert_eq!(args["session_id"].as_str(), Some("mem-session"));
+        assert_eq!(args["turn"].as_u64(), Some(9));
     }
 
     // ── File-journal persistence wiring (regression guard) ──────────────

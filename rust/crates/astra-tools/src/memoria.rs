@@ -215,6 +215,24 @@ pub struct RecallSnapshot {
     pub at: Instant,
 }
 
+/// Result of draining recall snapshots into Memoria feedback calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FeedbackDrainReport {
+    pub attempted: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+}
+
+fn memoria_output_is_error(output: &str) -> bool {
+    if output.starts_with("Error") {
+        return true;
+    }
+    serde_json::from_str::<Value>(output)
+        .ok()
+        .and_then(|value| value.get("error").cloned())
+        .is_some()
+}
+
 /// Process-global FIFO queue of recall snapshots per session. Mirror of
 /// `MemoryOrchestrator::recall_ledger`, but accessible from the tool
 /// layer (which doesn't depend on runtime) so `decorate_recall_response`
@@ -451,36 +469,46 @@ impl MemoriaClient {
         }
     }
 
+    /// Clear all process-global memory state for a session. Long-lived CLI
+    /// and server processes call this at the session boundary so surfaced
+    /// memory ids, focus hints, and pending recall feedback cannot bleed into
+    /// the next session.
+    pub fn reset_session_process_state(session_id: &str) {
+        Self::reset_seen(session_id);
+        Self::reset_focus(session_id);
+        Self::reset_recall_ledger(session_id);
+    }
+
     /// Drain pending recalls and push one feedback signal for every
     /// surfaced memory id. Intended for tool-result lifecycle hooks:
     /// when a non-memory tool succeeds after a recall, the recall gets
     /// prompt feedback immediately instead of waiting for session-end.
     ///
-    /// Best-effort: individual feedback failures are ignored after being
-    /// attempted; the recall ledger is consumed exactly once.
+    /// Best-effort: the recall ledger is consumed exactly once, and failed
+    /// feedback attempts are counted + logged so loss is observable.
     pub async fn feedback_pending_recalls(
         &self,
         session_id: &str,
         signal: &str,
         context_prefix: &str,
-    ) -> usize {
+    ) -> FeedbackDrainReport {
         if session_id.is_empty() || signal.is_empty() {
-            return 0;
+            return FeedbackDrainReport::default();
         }
         let snapshots = Self::drain_recalls(session_id, None);
-        let mut attempted = 0usize;
+        let mut report = FeedbackDrainReport::default();
         for snap in snapshots {
             for id in snap.memory_ids {
                 if id.is_empty() {
                     continue;
                 }
-                attempted += 1;
+                report.attempted += 1;
                 let context = if context_prefix.is_empty() {
                     format!("auto: turn {} outcome", snap.turn)
                 } else {
                     format!("{context_prefix}: turn {} outcome", snap.turn)
                 };
-                let _ = self
+                let output = self
                     .call_with_timeout(
                         "feedback",
                         &json!({
@@ -491,9 +519,23 @@ impl MemoriaClient {
                         Duration::from_secs(3),
                     )
                     .await;
+                if memoria_output_is_error(&output) {
+                    report.failed += 1;
+                    tracing::warn!(
+                        target: "memoria",
+                        session_id = %snap.session_id,
+                        memory_id = %id,
+                        signal = %signal,
+                        context = %context,
+                        error = %output,
+                        "failed to close memory recall feedback"
+                    );
+                } else {
+                    report.succeeded += 1;
+                }
             }
         }
-        attempted
+        report
     }
 
     /// Inject focus hints into a `recall` payload. Called by the
@@ -2726,21 +2768,53 @@ mod memoria_http_client_tests {
         assert_eq!(MemoriaClient::pending_recall_count("r5-reset"), 0);
     }
 
+    #[test]
+    fn reset_session_process_state_clears_all_memory_globals() {
+        use super::*;
+        let session_id = "r5-reset-all";
+        let client = MemoriaClient::new(None, None);
+        MemoriaClient::record_seen(session_id, ["seen-1".into()]);
+        client.focus_set(
+            session_id,
+            &json!({
+                "focus_type": "topic",
+                "focus_value": "cleanup",
+            }),
+        );
+        MemoriaClient::record_recall(session_id, 4, vec!["recall-1".into()]);
+
+        assert!(!MemoriaClient::seen_snapshot(session_id).is_empty());
+        assert_eq!(MemoriaClient::pending_recall_count(session_id), 1);
+        let mut recall_payload = json!({"query": "cleanup"});
+        client.apply_focus_hints(session_id, &mut recall_payload);
+        assert!(recall_payload.get("boost_topics").is_some());
+
+        MemoriaClient::reset_session_process_state(session_id);
+
+        assert!(MemoriaClient::seen_snapshot(session_id).is_empty());
+        assert_eq!(MemoriaClient::pending_recall_count(session_id), 0);
+        let mut after_reset_payload = json!({"query": "cleanup"});
+        client.apply_focus_hints(session_id, &mut after_reset_payload);
+        assert!(after_reset_payload.get("boost_topics").is_none());
+    }
+
     #[tokio::test]
     async fn feedback_pending_recalls_drains_queue_once() {
         use super::*;
         let session_id = "r5-feedback-drain";
         MemoriaClient::reset_recall_ledger(session_id);
         MemoriaClient::record_recall(session_id, 7, vec!["m1".into(), "m2".into()]);
-        let client = MemoriaClient::new(None, None);
+        let client = MemoriaClient::new(Some("http://127.0.0.1:9".into()), Some("token".into()));
         let attempted = client
             .feedback_pending_recalls(session_id, "useful", "unit-test")
             .await;
-        assert_eq!(attempted, 2);
+        assert_eq!(attempted.attempted, 2);
+        assert_eq!(attempted.failed, 2);
+        assert_eq!(attempted.succeeded, 0);
         assert_eq!(MemoriaClient::pending_recall_count(session_id), 0);
         let attempted_again = client
             .feedback_pending_recalls(session_id, "useful", "unit-test")
             .await;
-        assert_eq!(attempted_again, 0);
+        assert_eq!(attempted_again.attempted, 0);
     }
 }

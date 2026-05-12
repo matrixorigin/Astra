@@ -189,17 +189,15 @@ async fn post_loop_memory_cleanup(
             );
         }
     }
-    // ── Always: clear the canonical seen store for this session ──
+    // ── Always: clear canonical memory process state for this session ──
     //
     // A single process-global set in `astra_tools::memoria` holds both
     // the bridge-side content-dedup keys and the tool-side
-    // memory_id dedup entries. One reset covers both.
-    astra_tools::memoria::MemoriaClient::reset_seen(session_id);
-    astra_tools::memoria::MemoriaClient::reset_focus(session_id);
-    // And ensure the recall ledger is clean even if governance didn't
-    // run (e.g. no memoria client configured, or drain was conditional
-    // on an episode being written).
-    astra_tools::memoria::MemoriaClient::reset_recall_ledger(session_id);
+    // memory_id dedup entries. The shared reset also ensures focus hints
+    // and the recall ledger are clean even if
+    // governance didn't run (e.g. no memoria client configured, or drain
+    // was conditional on an episode being written).
+    astra_tools::memoria::MemoriaClient::reset_session_process_state(session_id);
 
     // ── Always: release extraction service's per-session debounce ──
     if let Some(svc) = extraction_service {
