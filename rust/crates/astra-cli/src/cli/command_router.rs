@@ -486,10 +486,9 @@ pub(super) async fn execute_cli_command(
     api: &astra_thin_client::ThinClient,
     no_instructions: bool,
     max_budget: f64,
-    use_tui: bool,
 ) -> Result<ExitCode, String> {
     match command {
-        // No subcommand → interactive REPL (Codex-style default)
+        // No subcommand → interactive TUI (Codex-style default)
         None | Some(Command::Interactive) => {
             run_interactive_chat(
                 api,
@@ -498,7 +497,6 @@ pub(super) async fn execute_cli_command(
                 None,
                 no_instructions,
                 max_budget,
-                use_tui,
             )
             .await?;
             Ok(ExitCode::Success)
@@ -961,7 +959,7 @@ pub(super) async fn execute_cli_command(
                 }
                 m
             } else {
-                // No message → start REPL with optional pre-set session/model
+                // No message → start interactive TUI with optional pre-set session/model
                 let model = args.model.as_deref().or(global_model.as_deref());
                 run_interactive_chat(
                     api,
@@ -970,7 +968,6 @@ pub(super) async fn execute_cli_command(
                     None,
                     no_instructions,
                     max_budget,
-                    use_tui,
                 )
                 .await?;
                 return Ok(ExitCode::Success);

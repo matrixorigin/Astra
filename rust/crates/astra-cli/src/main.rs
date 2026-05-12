@@ -18,7 +18,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     fs,
-    io::{self, IsTerminal, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     process::{Command as SysCommand, Stdio},
     sync::{Mutex, OnceLock},
@@ -316,7 +316,7 @@ use cloud_sync::{
 
 // ══════════════════════════════════════════════════════ Slash Commands ════
 
-// ═══════════════════════════════════════════════════════════════ REPL ════
+// ═══════════════════════════════════════════════════════════ Interactive ════
 
 async fn run_interactive_chat(
     api: &astra_thin_client::ThinClient,
@@ -325,43 +325,29 @@ async fn run_interactive_chat(
     resume_session_id: Option<&str>,
     no_instructions: bool,
     max_budget: f64,
-    use_tui: bool,
 ) -> Result<(), String> {
-    if use_tui {
-        if !tui::can_run_tui() {
-            eprintln!("TUI mode requires an interactive terminal. Falling back to line mode.");
-            return run_chat_repl(
-                api,
-                profile,
-                initial_model,
-                resume_session_id,
-                no_instructions,
-                max_budget,
-            )
-            .await;
-        }
-        // Box::pin to reduce the parent future's stack frame size (avoids stack
-        // overflow in debug-mode tests that instantiate execute_cli_command).
-        Box::pin(tui::run_tui_repl(
-            api,
-            profile,
-            initial_model,
-            resume_session_id,
-            no_instructions,
-            max_budget,
-        ))
-        .await
-    } else {
-        run_chat_repl(
-            api,
-            profile,
-            initial_model,
-            resume_session_id,
-            no_instructions,
-            max_budget,
-        )
-        .await
+    if !tui::can_run_tui() {
+        eprintln!(
+            "{}",
+            "astra requires an interactive terminal (TTY) for interactive chat.".red()
+        );
+        eprintln!();
+        eprintln!("For one-shot use:   astra chat -m \"your message\"");
+        eprintln!("For SSH:            ssh -t host \"astra\"");
+        eprintln!("For scripts/CI:     astra --print \"your message\"");
+        return Err("no TTY".into());
     }
+    // Box::pin to reduce the parent future's stack frame size (avoids stack
+    // overflow in debug-mode tests that instantiate execute_cli_command).
+    Box::pin(tui::run_tui_repl(
+        api,
+        profile,
+        initial_model,
+        resume_session_id,
+        no_instructions,
+        max_budget,
+    ))
+    .await
 }
 
 async fn run_chat_repl(
@@ -1071,7 +1057,6 @@ async fn main() {
         session_id: cli_session_id,
         session_name,
         bare,
-        tui: enable_tui,
         no_instructions,
         no_journal_content,
         startup_trace,
@@ -1217,12 +1202,6 @@ async fn main() {
     // model-aware diagnostics without mutating the process environment.
     slash_config::set_active_model_for_display(resolved_model.clone());
 
-    let use_tui = enable_tui
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
-        && std::env::var("TERM").map_or(true, |t| t != "dumb")
-        && std::env::var("NO_COLOR").is_err();
-
     // --print mode: headless single-shot, always auto-approve (can't prompt)
     if print_mode {
         match run_print_mode(
@@ -1264,7 +1243,6 @@ async fn main() {
                     Some(&sid),
                     no_instructions,
                     max_budget,
-                    use_tui,
                 )
                 .await;
                 match result {
@@ -1294,7 +1272,6 @@ async fn main() {
         &api,
         no_instructions,
         max_budget,
-        use_tui,
     )
     .await
     {
@@ -1711,7 +1688,6 @@ mod tests {
             &api,
             false,
             0.0,
-            false,
         )
         .await;
         // Health command should succeed regardless of auth
@@ -1730,7 +1706,6 @@ mod tests {
             &api,
             false,
             0.0,
-            false,
         )
         .await;
         assert!(result.is_ok());
