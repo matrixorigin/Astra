@@ -182,8 +182,15 @@ pub async fn prefetch_session_start_memories(
 ///
 /// Backed by the same `/v1/memories/retrieve` endpoint with an empty
 /// query (browse mode). Returns `None` when the key is empty or no
-/// memories exist for this user.
-pub async fn prefetch_memory_index(mem_url: &str, mem_key: &str, user_id: &str) -> Option<String> {
+/// memories exist for this user. `exclude_ids` omits memory_ids that
+/// will appear in `<session_memory>` so the same content isn't shown
+/// in two blocks on turn 1.
+pub async fn prefetch_memory_index(
+    mem_url: &str,
+    mem_key: &str,
+    user_id: &str,
+    exclude_ids: &std::collections::HashSet<String>,
+) -> Option<String> {
     if mem_key.is_empty() {
         return None;
     }
@@ -192,22 +199,40 @@ pub async fn prefetch_memory_index(mem_url: &str, mem_key: &str, user_id: &str) 
     if items.is_empty() {
         return None;
     }
-    build_memory_index_block(&items)
+    build_memory_index_block(&items, exclude_ids)
 }
 
 /// Render a `<memory_index>` block — one line per entry, under 100
-/// chars of abstract. Returns `None` on empty input.
-fn build_memory_index_block(items: &[RankableMemory]) -> Option<String> {
+/// chars of abstract. Entries are sorted by `memory_id` so the block is
+/// byte-stable across turns (Memoria's browse-mode ordering drifts as
+/// scores decay). `exclude_ids` removes memory_ids that will already
+/// appear in `<session_memory>` to avoid duplication. Returns `None`
+/// on empty input (or when every input was excluded).
+fn build_memory_index_block(
+    items: &[RankableMemory],
+    exclude_ids: &std::collections::HashSet<String>,
+) -> Option<String> {
     if items.is_empty() {
         return None;
     }
+    let mut filtered: Vec<&RankableMemory> = items
+        .iter()
+        .filter(|m| !exclude_ids.contains(&m.memory_id))
+        .collect();
+    if filtered.is_empty() {
+        return None;
+    }
+    // Deterministic ordering so cached prefix bytes don't flip when
+    // Memoria returns the same set in a different order.
+    filtered.sort_by(|a, b| a.memory_id.cmp(&b.memory_id));
+
     let mut s = String::with_capacity(1024);
     s.push_str("<memory_index>\n");
     s.push_str(
         "(Ambient awareness. Call `memory(action=recall, query=X)` for full content \
         of a topic, or `memory(action=expand, memory_id=ID)` to drill into one entry.)\n",
     );
-    for m in items {
+    for m in filtered {
         let tag = if m.memory_type.is_empty() {
             "?".to_string()
         } else {
@@ -222,6 +247,76 @@ fn build_memory_index_block(items: &[RankableMemory]) -> Option<String> {
     }
     s.push_str("</memory_index>");
     Some(s)
+}
+
+/// Concatenate the session-stable memory blocks (`<memory_index>` +
+/// `<session_memory>`) into one text block suitable for insertion in
+/// the session-stable prompt lane. Pure; returns `None` when nothing
+/// to inject.
+///
+/// This block is **byte-stable across turns within a session** (assuming
+/// no new writes occur). It's separated from the per-turn recall block
+/// because per-turn content changes every turn and must sit in the
+/// volatile lane instead.
+pub fn build_session_stable_memory_block(
+    memory_index: Option<&str>,
+    session_start: Option<&str>,
+) -> Option<String> {
+    match (memory_index, session_start) {
+        (Some(idx), Some(start)) => Some(format!("{idx}\n\n{start}")),
+        (Some(idx), None) => Some(idx.to_string()),
+        (None, Some(start)) => Some(start.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Collect the memory_ids that a `SessionStartPrefetchResult` will
+/// surface via `<session_memory>` so the `<memory_index>` builder can
+/// dedup against them.
+pub fn session_start_exposed_ids(
+    result: &SessionStartPrefetchResult,
+) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for m in result.profile.iter().chain(result.recent_episodes.iter()) {
+        if !m.memory_id.is_empty() {
+            set.insert(m.memory_id.clone());
+        }
+    }
+    set
+}
+
+/// Filter a list of per-turn Memoria context entries, removing ones
+/// whose content is already surfaced in the session-stable block so the
+/// LLM doesn't see the same memory twice. `seen_contents` holds the
+/// compact-view text of every entry shown in `<session_memory>` /
+/// `<memory_index>` earlier this session; dedup is on content, not
+/// memory_id, because the typed-pipeline entries don't carry ids.
+pub fn filter_entries_already_surfaced(
+    entries: Vec<ContextMemoryEntry>,
+    seen_contents: &std::collections::HashSet<String>,
+) -> Vec<ContextMemoryEntry> {
+    if seen_contents.is_empty() {
+        return entries;
+    }
+    entries
+        .into_iter()
+        .filter(|e| {
+            let key = memory_dedup_key(e.content.trim());
+            !seen_contents.contains(&key)
+        })
+        .collect()
+}
+
+/// Extract dedup keys for every entry in a per-turn recall list so a
+/// later call to [`filter_entries_already_surfaced`] can prune
+/// duplicates. Returns a set of normalized (case-folded, collapsed)
+/// content strings.
+pub fn collect_seen_contents(entries: &[ContextMemoryEntry]) -> std::collections::HashSet<String> {
+    entries
+        .iter()
+        .map(|e| memory_dedup_key(e.content.trim()))
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Render the `<session_memory>` block injected into the system prompt
@@ -517,7 +612,7 @@ fn is_memory_worthy(trimmed: &str) -> bool {
 fn memory_dedup_key(trimmed: &str) -> String {
     let collapsed: String = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed
-        .trim_end_matches(['.', '!', '?', ';', ':', ','])
+        .trim_end_matches(['.', '!', '?', ';', ':', ',', ' '])
         .to_lowercase()
 }
 
@@ -1340,7 +1435,148 @@ mod tests {
 
     #[test]
     fn memory_index_block_none_when_empty() {
-        assert!(build_memory_index_block(&[]).is_none());
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(build_memory_index_block(&[], &empty).is_none());
+    }
+
+    fn ri(id: &str, ty: &str, content: &str) -> RankableMemory {
+        RankableMemory {
+            memory_id: id.into(),
+            content: content.into(),
+            memory_type: ty.into(),
+            retrieval_score: Some(0.5),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn memory_index_block_sorts_by_memory_id_for_cache_stability() {
+        // Same set, returned in different order from Memoria. Rendered
+        // block bytes must match — otherwise cross-turn cache misses.
+        let items_a = vec![
+            ri("m-z", "profile", "later-id"),
+            ri("m-a", "feedback", "earliest-id"),
+            ri("m-m", "project", "middle-id"),
+        ];
+        let items_b = vec![
+            ri("m-m", "project", "middle-id"),
+            ri("m-a", "feedback", "earliest-id"),
+            ri("m-z", "profile", "later-id"),
+        ];
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert_eq!(
+            build_memory_index_block(&items_a, &empty),
+            build_memory_index_block(&items_b, &empty),
+            "same set in different order must render identical bytes"
+        );
+    }
+
+    #[test]
+    fn memory_index_block_excludes_ids_in_session_memory() {
+        let items = vec![
+            ri("m1", "profile", "user prefers Rust"),
+            ri("m2", "episodic", "[episode] last session"),
+            ri("m3", "project", "milestone M3"),
+        ];
+        let mut excl = std::collections::HashSet::new();
+        excl.insert("m2".to_string());
+        let block = build_memory_index_block(&items, &excl).expect("non-empty");
+        assert!(!block.contains("m2"), "excluded id must not appear: {block}");
+        assert!(block.contains("m1"));
+        assert!(block.contains("m3"));
+    }
+
+    #[test]
+    fn memory_index_block_none_when_everything_excluded() {
+        let items = vec![ri("m1", "profile", "only entry")];
+        let mut excl = std::collections::HashSet::new();
+        excl.insert("m1".to_string());
+        assert!(
+            build_memory_index_block(&items, &excl).is_none(),
+            "index is None when every id is excluded"
+        );
+    }
+
+    #[test]
+    fn session_stable_block_concatenates_index_then_session_start() {
+        let idx = "<memory_index>\n- [profile] m1: x\n</memory_index>";
+        let start = "<session_memory>\n### User profile\n- y\n</session_memory>";
+        let out = build_session_stable_memory_block(Some(idx), Some(start)).expect("non-empty");
+        assert!(out.starts_with("<memory_index>"));
+        assert!(out.contains("</memory_index>"));
+        assert!(out.contains("<session_memory>"));
+    }
+
+    #[test]
+    fn session_stable_block_is_none_when_both_empty() {
+        assert!(build_session_stable_memory_block(None, None).is_none());
+    }
+
+    #[test]
+    fn session_stable_block_passes_through_single_source() {
+        let idx = "<memory_index>\n- [p] x\n</memory_index>";
+        assert_eq!(
+            build_session_stable_memory_block(Some(idx), None).unwrap(),
+            idx
+        );
+        let start = "<session_memory>\n### p\n- y\n</session_memory>";
+        assert_eq!(
+            build_session_stable_memory_block(None, Some(start)).unwrap(),
+            start
+        );
+    }
+
+    #[test]
+    fn session_start_exposed_ids_collects_profile_plus_episodes() {
+        let result = SessionStartPrefetchResult {
+            section: None,
+            profile: vec![ri("p1", "profile", "p"), ri("p2", "profile", "q")],
+            recent_episodes: vec![ri("e1", "episodic", "e")],
+            fetch_ms: 0,
+        };
+        let ids = session_start_exposed_ids(&result);
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains("p1"));
+        assert!(ids.contains("p2"));
+        assert!(ids.contains("e1"));
+    }
+
+    #[test]
+    fn filter_entries_already_surfaced_drops_seen_contents() {
+        let entries = vec![
+            ContextMemoryEntry::scored("user prefers Rust", 1.0),
+            ContextMemoryEntry::scored("use real DB in tests", 0.9),
+            ContextMemoryEntry::scored("milestone M3 ships 2026-06-01", 0.8),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(memory_dedup_key("user prefers Rust"));
+        seen.insert(memory_dedup_key("milestone M3 ships 2026-06-01"));
+        let filtered = filter_entries_already_surfaced(entries, &seen);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0].content.contains("real DB"));
+    }
+
+    #[test]
+    fn filter_entries_already_surfaced_is_identity_on_empty_seen() {
+        let entries = vec![ContextMemoryEntry::scored("something", 0.5)];
+        let empty = std::collections::HashSet::new();
+        let out = filter_entries_already_surfaced(entries, &empty);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn collect_seen_contents_case_folds_and_normalizes() {
+        let entries = vec![
+            ContextMemoryEntry::scored("  Hello  World .", 0.5),
+            ContextMemoryEntry::scored("hello world", 0.5),
+        ];
+        let seen = collect_seen_contents(&entries);
+        assert_eq!(
+            seen.len(),
+            1,
+            "case-fold + punctuation strip must collapse both into one"
+        );
+        assert!(seen.contains("hello world"));
     }
 
     #[test]
@@ -1359,7 +1595,8 @@ mod tests {
             mk("m2", "feedback", "use real DB in tests"),
             mk("m3", "project", "merge freeze 2026-05-08"),
         ];
-        let out = build_memory_index_block(&items).expect("non-empty");
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let out = build_memory_index_block(&items, &empty).expect("non-empty");
         assert!(out.starts_with("<memory_index>"));
         assert!(out.ends_with("</memory_index>"));
         assert!(out.contains("- [profile] m1: user prefers Rust"));
@@ -1376,7 +1613,8 @@ mod tests {
             retrieval_score: Some(0.5),
             ..Default::default()
         }];
-        let out = build_memory_index_block(&items).expect("non-empty");
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let out = build_memory_index_block(&items, &empty).expect("non-empty");
         // Entry line must cap at 100-char abstract + a bit of scaffold;
         // total under ~180 chars.
         let entry_line = out
@@ -1392,8 +1630,9 @@ mod tests {
 
     #[tokio::test]
     async fn prefetch_memory_index_empty_key_is_noop() {
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
         assert!(
-            prefetch_memory_index("http://localhost", "", "user1")
+            prefetch_memory_index("http://localhost", "", "user1", &empty)
                 .await
                 .is_none()
         );

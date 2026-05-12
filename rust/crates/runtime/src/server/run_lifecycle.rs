@@ -2764,6 +2764,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             tracing::warn!(session_id = %sid, error = %e, "session-end governance failed")
                         }
                     }
+                    // Clear the bridge's per-session seen-ledger so a
+                    // long-lived server doesn't accumulate an entry per
+                    // session. Safe even if this run wasn't terminal for
+                    // the session — the ledger rebuilds on demand.
+                    crate::turn::memory_seen_ledger::global().reset_session(sid);
                 }
             }
             // Release per-session debounce state held by the extraction

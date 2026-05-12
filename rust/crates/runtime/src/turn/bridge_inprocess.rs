@@ -1220,19 +1220,36 @@ impl InProcessChatTurnBridge {
             // `## User Memories`). When present, the CLI digest is
             // authoritative. See `bridge_should_run_memoria_prefetch`.
             let mut memoria_prefetch_entries = Vec::new();
-            // First-turn-only cold warmup: pull user profile + recent
-            // episodes so cross-session continuity is baked into the
-            // system prompt before the model starts reasoning. Bundled
-            // with the per-turn recall into a single `<session_memory>`
-            // block to keep the cache prefix stable across turns — the
-            // block only changes between session boundaries.
+            // Two memory surfaces, split by cache lane:
+            //
+            //   * **stable lane** — `<memory_index>` + `<session_memory>`.
+            //     Rebuilt on turn 1 from the memoria backend; the bytes
+            //     are session-stable (sorted by memory_id, deterministic
+            //     freshness labels). Pushed into `stable_sections` so
+            //     Anthropic's prompt cache covers them across every turn
+            //     in the session. The LLM gets ambient awareness of what
+            //     it could recall plus user profile + recent episodes.
+            //
+            //   * **volatile lane** — `## User Memories` from per-turn
+            //     hybrid recall. Changes every turn. Pushed into
+            //     `dynamic_sections`. Entries whose content was already
+            //     shown in the stable lane are dropped via the session
+            //     seen-ledger so we don't surface the same fact twice.
+            //
+            // The prior design bundled both into one `memoria_prefetch_section`
+            // and then only pushed it when the typed-pipeline per-turn
+            // entries were empty — which meant the stable lane got
+            // silently dropped on every warm session. Fixed here.
             let is_first_turn = trace_turn <= 1;
-            let memoria_prefetch_section = if !bridge_should_run_memoria_prefetch(&edge_profile) {
-                None
-            } else if let (Some(mem_url), Some(mem_key)) = (
-                edge_profile.get("memoria_url").and_then(Value::as_str),
-                edge_profile.get("memoria_key").and_then(Value::as_str),
-            ) {
+            let seen_ledger = crate::turn::memory_seen_ledger::global();
+            let mut stable_memory_section: Option<String> = None;
+            let mut volatile_memory_section: Option<String> = None;
+            if bridge_should_run_memoria_prefetch(&edge_profile)
+                && let (Some(mem_url), Some(mem_key)) = (
+                    edge_profile.get("memoria_url").and_then(Value::as_str),
+                    edge_profile.get("memoria_key").and_then(Value::as_str),
+                )
+            {
                 let user_msg = messages
                     .iter()
                     .rev()
@@ -1244,9 +1261,9 @@ impl InProcessChatTurnBridge {
                     .and_then(Value::as_u64)
                     .unwrap_or(5) as u32;
 
-                // Per-turn hybrid recall runs every turn. Session-start
-                // (profile + episodes) runs only on turn 1.
-                let (per_turn, session_start) = tokio::join!(
+                // Per-turn hybrid recall runs every turn; session-start
+                // (profile + episodes) only on turn 1.
+                let (per_turn, session_start_opt) = tokio::join!(
                     prefetch_memories(mem_url, mem_key, user_msg, &user_id, top_k),
                     async {
                         if is_first_turn {
@@ -1261,51 +1278,86 @@ impl InProcessChatTurnBridge {
                 );
 
                 memory_fetch_ms = per_turn.fetch_ms
-                    + session_start
+                    + session_start_opt
                         .as_ref()
                         .map(|s| s.fetch_ms)
                         .unwrap_or(0);
-                memory_items = per_turn.items;
-                memory_preview = per_turn.preview;
-                memoria_prefetch_entries = per_turn.entries;
 
-                // First-turn only: layer in a `<memory_index>` block —
-                // compact "name + abstract + age" listing of all known
-                // memories so the LLM has ambient awareness of what it
-                // could recall. Gated by env to stay off by default
-                // until we have real-traffic data on prompt budget
-                // impact; flip to on when comfortable.
+                // ── Stable lane: <memory_index> + <session_memory> ──
+                //
+                // `<memory_index>` is off by default behind
+                // `ASTRA_MEMORY_INDEX_INJECT`; when on, dedup against
+                // the ids that will already appear in `<session_memory>`
+                // so the two blocks don't repeat the same content.
+                let session_start_exposed_ids = session_start_opt
+                    .as_ref()
+                    .map(crate::turn::memory_prefetch::session_start_exposed_ids)
+                    .unwrap_or_default();
                 let memory_index = if is_first_turn
                     && std::env::var("ASTRA_MEMORY_INDEX_INJECT")
                         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                         .unwrap_or(false)
                 {
-                    prefetch_memory_index(mem_url, mem_key, &user_id).await
+                    prefetch_memory_index(
+                        mem_url,
+                        mem_key,
+                        &user_id,
+                        &session_start_exposed_ids,
+                    )
+                    .await
                 } else {
                     None
                 };
+                let session_start_section = session_start_opt.and_then(|s| s.section);
+                stable_memory_section = crate::turn::memory_prefetch::build_session_stable_memory_block(
+                    memory_index.as_deref(),
+                    session_start_section.as_deref(),
+                );
 
-                // Combine sections in order: memory index first (stable
-                // across turns — good cache citizen), then session-start
-                // warmup (also stable, first turn only), then the
-                // per-turn hybrid recall (volatile but fresh). Cache
-                // boundary sits between the index+start block and the
-                // per-turn block.
-                let session_start_section = session_start.and_then(|s| s.section);
-                let stable_part = match (memory_index, session_start_section) {
-                    (Some(idx), Some(start)) => Some(format!("{idx}\n\n{start}")),
-                    (Some(idx), None) => Some(idx),
-                    (None, Some(start)) => Some(start),
-                    (None, None) => None,
-                };
-                match (stable_part, per_turn.section) {
-                    (Some(stable), Some(turn)) => Some(format!("{stable}\n\n{turn}")),
-                    (Some(stable), None) => Some(stable),
-                    (None, turn) => turn,
+                // Record stable-lane contents into the seen-ledger so
+                // volatile entries matching them get filtered out.
+                if let Some(ref stable) = stable_memory_section {
+                    let keys: Vec<String> = stable
+                        .lines()
+                        .filter(|l| l.trim_start().starts_with("- "))
+                        .map(|l| l.trim_start_matches("- ").trim_end().to_string())
+                        .map(|content| {
+                            // Same normalization as
+                            // `collect_seen_contents` so the filter and
+                            // the recorded keys share a dedup vocabulary.
+                            content
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                                .trim_end_matches(['.', '!', '?', ';', ':', ','])
+                                .to_lowercase()
+                        })
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    seen_ledger.record(&session_id, keys);
                 }
-            } else {
-                None
-            };
+
+                // ── Volatile lane: filter per-turn entries against ledger ──
+                let already_seen = seen_ledger.snapshot(&session_id);
+                let filtered_entries = crate::turn::memory_prefetch::filter_entries_already_surfaced(
+                    per_turn.entries,
+                    &already_seen,
+                );
+                memory_items = filtered_entries.len();
+                memory_preview = filtered_entries
+                    .iter()
+                    .take(3)
+                    .map(|e| e.content.clone())
+                    .collect();
+                // Record per-turn entries so a subsequent same-session
+                // recall doesn't re-surface them either.
+                let new_keys = crate::turn::memory_prefetch::collect_seen_contents(&filtered_entries);
+                if !new_keys.is_empty() {
+                    seen_ledger.record(&session_id, new_keys);
+                }
+                memoria_prefetch_entries = filtered_entries;
+                volatile_memory_section = per_turn.section;
+            }
             // Read active skill hints from edge_profile (injected by CLI)
             let active_skill_names: Vec<&str> = edge_profile
                 .get("active_skills")
@@ -1494,11 +1546,20 @@ impl InProcessChatTurnBridge {
                     prompts::PromptTokenBucket::Environment,
                 ));
             }
-            if let Some(ref section) = memoria_prefetch_section
-                && memoria_prefetch_entries.is_empty()
-            {
+            // Stable-lane memory (index + session_memory) goes behind
+            // the cache marker — byte-stable across the session.
+            if let Some(ref stable) = stable_memory_section {
+                stable_sections.push(prompts::PromptSection::stable(
+                    stable.clone(),
+                    prompts::CacheScope::Session,
+                ));
+            }
+            // Volatile-lane memory (## User Memories from per-turn
+            // recall) sits post-marker so byte drift doesn't invalidate
+            // the cached prefix.
+            if let Some(ref volatile) = volatile_memory_section {
                 dynamic_sections.push(prompts::PromptSection::dynamic(
-                    section.clone(),
+                    volatile.clone(),
                     prompts::PromptTokenBucket::Environment,
                 ));
             }
@@ -2037,17 +2098,29 @@ impl InProcessChatTurnBridge {
                     // serialization = concatenation of per-entry content
                     // with a stable separator so identical retrievals
                     // across turns produce identical hashes.
-                    let memoria_prefetch_canonical = if memoria_prefetch_entries.is_empty() {
-                        // No typed entries → fall back to the raw section
-                        // (legacy path when the pipeline memory binder is
-                        // off). Still rendered post-gate.
-                        memoria_prefetch_section.as_deref().unwrap_or("").to_string()
-                    } else {
-                        memoria_prefetch_entries
-                            .iter()
-                            .map(|e| e.content.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n---\n")
+                    // Canonical fingerprint: concat(stable_lane,
+                    // typed_per_turn_entries). Stable lane goes first
+                    // so its contribution dominates the hash; a change
+                    // there (rare — new episode written) is a real
+                    // cache-prefix flip. Per-turn bytes come after as
+                    // the volatile tail.
+                    let memoria_prefetch_canonical = {
+                        let mut parts: Vec<String> = Vec::new();
+                        if let Some(ref s) = stable_memory_section {
+                            parts.push(s.clone());
+                        }
+                        if !memoria_prefetch_entries.is_empty() {
+                            parts.push(
+                                memoria_prefetch_entries
+                                    .iter()
+                                    .map(|e| e.content.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n---\n"),
+                            );
+                        } else if let Some(ref v) = volatile_memory_section {
+                            parts.push(v.clone());
+                        }
+                        parts.join("\n---\n")
                     };
                     let channels_payload = json!([
                         // CLI-owned channels: the bridge echoes them for
