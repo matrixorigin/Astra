@@ -207,6 +207,9 @@ pub fn idempotency_cache_hit_message(cached_output: &str) -> String {
     if trimmed.is_empty() {
         return "(cached — identical call already executed; original output was empty)".to_string();
     }
+    if trimmed == "{}" {
+        return "(cached — identical call already executed; degraded historical tool output was an empty JSON object placeholder)".to_string();
+    }
     if trimmed.len() <= IDEMPOTENCY_INLINE_MAX_BYTES {
         // If the cached output itself already starts with the sentinel
         // (e.g. a replay across a compaction boundary where the stored
@@ -851,6 +854,20 @@ mod tests {
         assert!(
             m.to_lowercase().contains("empty"),
             "empty-output cache-hit must say so explicitly: {m}"
+        );
+    }
+
+    #[test]
+    fn idempotency_cache_hit_empty_object_placeholder_is_degraded_not_replayed() {
+        let m = idempotency_cache_hit_message("{}");
+        assert!(m.starts_with("(cached"));
+        assert!(
+            m.to_lowercase().contains("degraded") || m.to_lowercase().contains("placeholder"),
+            "empty-object cache hits should be marked as suspect historical data: {m}"
+        );
+        assert!(
+            !m.lines().any(|line| line.trim() == "{}"),
+            "cache-hit wrapper must not replay a bare '{{}}' line to the LLM: {m}"
         );
     }
 

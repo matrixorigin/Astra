@@ -652,9 +652,11 @@ fn json_string_to_value_or_string(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
-fn content_text_value(content: Option<&Value>) -> Option<String> {
+fn coerce_tool_result_content(content: Option<&Value>) -> String {
     match content {
-        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(Value::Object(map)) if map.is_empty() => String::new(),
         Some(Value::Array(parts)) => {
             let joined = parts
                 .iter()
@@ -662,13 +664,32 @@ fn content_text_value(content: Option<&Value>) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join("");
             if joined.is_empty() {
-                None
+                Value::Array(parts.clone()).to_string()
             } else {
-                Some(joined)
+                joined
             }
         }
-        _ => None,
+        Some(other) => other.to_string(),
     }
+}
+
+fn normalize_openai_tool_message_content(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| {
+            if message.get("role").and_then(Value::as_str) != Some("tool") {
+                return message.clone();
+            }
+            let mut normalized = message.clone();
+            if let Some(obj) = normalized.as_object_mut() {
+                obj.insert(
+                    "content".to_string(),
+                    Value::String(coerce_tool_result_content(message.get("content"))),
+                );
+            }
+            normalized
+        })
+        .collect()
 }
 
 fn is_nonblank_text(text: &str) -> bool {
@@ -781,7 +802,7 @@ fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -
     match role {
         "tool" => {
             let tool_use_id = msg.get("tool_call_id").and_then(Value::as_str);
-            let content = content_text_value(msg.get("content")).unwrap_or_default();
+            let content = coerce_tool_result_content(msg.get("content"));
             tool_use_id
                 .map(|tool_use_id| {
                     // Bedrock's `toolResult.content[].json` field requires a
@@ -790,7 +811,7 @@ fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -
                     // Bedrock rejects with "messages.N.content.M.toolResult
                     // .content.0.json is invalid — provide a json object".
                     let result_block = if content.is_empty() {
-                        json!({"json": {}})
+                        json!({"text": ""})
                     } else {
                         match serde_json::from_str::<Value>(&content) {
                             Ok(parsed) if parsed.is_object() => json!({"json": parsed}),
@@ -1321,9 +1342,10 @@ pub(crate) fn build_provider_request_body(
                 thinking.apply_anthropic(&mut body);
                 return body;
             }
+            let normalized_messages = normalize_openai_tool_message_content(messages);
             let mut body = json!({
                 "model": model_name,
-                "messages": messages,
+                "messages": normalized_messages,
                 "stream": streaming,
             });
             if streaming {
@@ -1696,6 +1718,14 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
             let content = match msg.get("content") {
                 Some(Value::String(text)) => Value::String(text.clone()),
                 Some(Value::Null) | None => Value::String(String::new()),
+                Some(Value::Object(map)) if map.is_empty() => {
+                    astra_core::agent_warn!(
+                        "llm_client",
+                        "tool-role msg has empty-object content; degrading to empty string for tool_result_block. tool_use_id={}",
+                        tool_use_id
+                    );
+                    Value::String(String::new())
+                }
                 Some(other) => {
                     // Non-string content on a tool-role message is a
                     // serialization bug upstream (compaction, fold, or
@@ -5261,8 +5291,8 @@ mod tests {
     #[test]
     fn anthropic_tool_message_object_content_coerced_to_string_not_empty_json() {
         // Upstream bug: tool content ended up as `{}` (empty object).
-        // The converter must stringify it so the LLM never sees a
-        // bare JSON object as the tool_result body.
+        // The converter must degrade it to an empty string so the LLM
+        // never sees a bare JSON object as the tool_result body.
         let msg = json!({
             "role": "tool",
             "tool_call_id": "call_obj",
@@ -5277,8 +5307,64 @@ mod tests {
         );
         assert_eq!(
             body.as_str().unwrap(),
-            "{}",
-            "object content stringified to its JSON repr",
+            "",
+            "empty object content must be degraded to empty string, not bare '{{}}'",
+        );
+    }
+
+    #[test]
+    fn openai_request_body_tool_message_empty_object_content_becomes_empty_string() {
+        let messages = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call_obj",
+            "content": {},
+        })];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "gpt-test",
+            "openai",
+            None,
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+        assert_eq!(body["messages"][0]["content"].as_str(), Some(""));
+    }
+
+    #[test]
+    fn bedrock_tool_message_empty_object_content_becomes_text_empty_string() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_obj",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_obj",
+                "content": {},
+            }),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "anthropic.claude-3-5-sonnet-v1:0",
+            "bedrock",
+            None,
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let result_block = &body["messages"][1]["content"][0]["toolResult"]["content"][0];
+        assert_eq!(result_block.get("text").and_then(Value::as_str), Some(""));
+        assert!(
+            result_block.get("json").is_none(),
+            "empty object must not be sent as Bedrock json {{}}: {result_block:?}"
         );
     }
 

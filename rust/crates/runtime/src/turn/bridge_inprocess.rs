@@ -263,6 +263,14 @@ fn build_bridge_tool_call_records(
         let output = tool_result.get("output").map(|output| match output {
             Value::String(s) => s.clone(),
             Value::Null => String::new(),
+            Value::Object(map) if map.is_empty() => {
+                astra_core::agent_warn!(
+                    "bridge",
+                    "tool_result.output is an empty object (not String); degrading to empty string. request_id={}",
+                    request_id
+                );
+                String::new()
+            }
             other => {
                 // Non-string output is a serialization bug upstream —
                 // the contract is `output: Option<String>`. Log the
@@ -6637,11 +6645,13 @@ mod tests {
             &std::collections::HashMap::new(),
         );
         assert_eq!(records.len(), 1);
-        // Empty Object coerces to the JSON literal "{}"
+        // Empty Object is the historical pollution shape that made the
+        // model claim "tool returned {}". Treat it as degraded empty
+        // content rather than replaying a bare "{}" tool result.
         assert_eq!(
             records[0].result_preview.as_deref(),
-            Some("{}"),
-            "empty-object output coerces to its JSON string form '{{}}'"
+            Some(""),
+            "empty-object output must not be surfaced as bare '{{}}'"
         );
         // Must NOT contain the old sentinel marker
         assert!(

@@ -3,6 +3,9 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+const DEGRADED_EMPTY_OBJECT_TOOL_RESULT: &str =
+    "[degraded: historical tool result content was an empty JSON object placeholder]";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecoveredEventRow {
     pub event_type: String,
@@ -455,7 +458,11 @@ fn result_content(tool_result: &Value) -> String {
         return String::new();
     };
     match object.get("result") {
+        Some(Value::String(string)) if string.trim() == "{}" => {
+            DEGRADED_EMPTY_OBJECT_TOOL_RESULT.to_string()
+        }
         Some(Value::String(string)) => string.clone(),
+        Some(Value::Object(map)) if map.is_empty() => DEGRADED_EMPTY_OBJECT_TOOL_RESULT.to_string(),
         Some(value) => json_stringify(value),
         None => String::new(),
     }
@@ -1114,6 +1121,17 @@ mod tests {
         let v = json!({"result": {"code": 0}});
         let s = result_content(&v);
         assert!(s.contains("\"code\""));
+    }
+
+    #[test]
+    fn result_content_empty_object_placeholder_is_degraded() {
+        let from_object = result_content(&json!({"result": {}}));
+        assert!(from_object.contains("degraded"), "{from_object}");
+        assert!(!from_object.lines().any(|line| line.trim() == "{}"));
+
+        let from_string = result_content(&json!({"result": "{}"}));
+        assert!(from_string.contains("degraded"), "{from_string}");
+        assert!(!from_string.lines().any(|line| line.trim() == "{}"));
     }
 
     #[test]
