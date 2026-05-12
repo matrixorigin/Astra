@@ -23,12 +23,35 @@ pub fn journal_record_duplicate_within_turn(
     }
 }
 
+/// Maximum number of bytes from the cached body to embed in the
+/// journal's `result_preview` when a snippet is available. Keeps
+/// forensics useful (you can see *what* was reused) without
+/// blowing up the journal with duplicate content — the full body
+/// is already in the earlier turn the cache hit refers to.
+const CACHE_HIT_PREVIEW_SNIPPET_BYTES: usize = 400;
+
+/// Record a cross-turn cache hit.
+///
+/// Populates `result_preview` with a `[cached_cross_turn: ...]`
+/// tagged string so downstream analysis (digest, LLM self-
+/// diagnosis) can distinguish "cache reused N bytes" from "tool
+/// returned empty body". Before this, `result_preview` was `None`,
+/// which made the journal look like the tool silently returned
+/// nothing — session 6d6c1041 hallucinated a `{}`-bug off exactly
+/// this signal.
+///
+/// `cached_body` is optional because some short-circuit paths
+/// (e.g. pre-suppressed repeated cache hits) don't have the full
+/// body handy; when absent, the preview still carries the byte
+/// count and tag so it's self-identifying.
 #[must_use]
 pub fn journal_record_cross_turn_cache_hit(
     name: String,
     output_len: u32,
     args_preview: Option<String>,
+    cached_body: Option<String>,
 ) -> ToolCallRecord {
+    let preview = format_cross_turn_cache_hit_preview(output_len, cached_body.as_deref());
     ToolCallRecord {
         name,
         ok: true,
@@ -37,11 +60,30 @@ pub fn journal_record_cross_turn_cache_hit(
         input_bytes: None,
         output_bytes: Some(output_len),
         args_preview,
-        result_preview: None,
+        result_preview: Some(preview),
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
         ..Default::default()
+    }
+}
+
+fn format_cross_turn_cache_hit_preview(output_len: u32, cached_body: Option<&str>) -> String {
+    let tag = format!("[cached_cross_turn: reused {output_len} bytes from earlier turn]");
+    match cached_body {
+        Some(body) if !body.is_empty() => {
+            // Truncate at a char boundary to avoid splitting UTF-8
+            // codepoints. The tag stays first so scanners keying on
+            // the prefix don't have to strip a snippet header.
+            let snippet: String = body.chars().take(CACHE_HIT_PREVIEW_SNIPPET_BYTES).collect();
+            let ellipsis = if body.len() > snippet.len() {
+                "…"
+            } else {
+                ""
+            };
+            format!("{tag}\n{snippet}{ellipsis}")
+        }
+        _ => tag,
     }
 }
 
@@ -155,8 +197,58 @@ mod tests {
 
     #[test]
     fn cache_hit_record_has_output_bytes() {
-        let r = journal_record_cross_turn_cache_hit("read_file".into(), 12, None);
+        let r = journal_record_cross_turn_cache_hit("read_file".into(), 12, None, None);
         assert_eq!(r.output_bytes, Some(12));
+    }
+
+    #[test]
+    fn cache_hit_record_preview_populated_when_source_provided() {
+        // Regression (session 6d6c1041): cache-hit records used to
+        // leave `result_preview: None`, which makes the journal
+        // look like the tool returned an empty body.  Downstream
+        // analysis (`astra journal digest`, LLM self-diagnosis) was
+        // mis-led into reporting "empty output" and, in one case,
+        // hallucinating a `{}`-return bug.  The fix is to populate
+        // `result_preview` with a synthetic explanatory string that
+        // makes the cache-hit nature explicit.
+        let r = journal_record_cross_turn_cache_hit(
+            "read_file".into(),
+            2000,
+            Some("src/lib.rs".into()),
+            Some("fn main() {\n    println!(\"hi\");\n}\n// ... many more lines ...".to_string()),
+        );
+        let preview = r.result_preview.expect("cache-hit must carry a preview");
+        assert!(
+            preview.starts_with("[cached_cross_turn:"),
+            "preview must be tagged so analysis tools can classify it: {preview:?}"
+        );
+        assert!(
+            preview.contains("2000 bytes"),
+            "preview should state the reused byte count: {preview:?}"
+        );
+        assert!(
+            preview.contains("fn main"),
+            "preview should include a snippet of the cached content for forensics: {preview:?}"
+        );
+    }
+
+    #[test]
+    fn cache_hit_record_preview_omits_snippet_when_source_absent() {
+        // When the caller can't hand us the cached body (e.g. a
+        // pre-suppressed "repeated cache hit" short-circuit), we
+        // still emit a non-empty preview so downstream tooling
+        // isn't misled.
+        let r = journal_record_cross_turn_cache_hit(
+            "read_file".into(),
+            1024,
+            Some("src/lib.rs".into()),
+            None,
+        );
+        let preview = r
+            .result_preview
+            .expect("cache-hit with no snippet must still carry a preview");
+        assert!(preview.starts_with("[cached_cross_turn:"));
+        assert!(preview.contains("1024 bytes"));
     }
 
     #[test]
