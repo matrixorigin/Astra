@@ -1101,39 +1101,56 @@ fn build_bedrock_tools(tools: &[Value]) -> Vec<Value> {
 /// (stripped defensively — providers should ignore `x-` keys, but
 /// some strict validators don't).
 fn strip_unsupported_schema_fields(value: &mut Value) {
-    const UNSUPPORTED: &[&str] = &[
-        "default",
-        "minimum",
-        "maximum",
-        "minItems",
-        "maxItems",
-        "pattern",
-        "format",
-        "examples",
-        "title",
-        "$schema",
-        "additionalProperties",
-        "allOf",
-        "oneOf",
-        "anyOf",
-        "if",
-        "then",
-        "else",
-        "x-astra-per-action-required",
-    ];
+    strip_unsupported_schema_fields_inner(value, /* is_top_level */ true);
+}
+
+/// Keys always stripped — Bedrock's strict validator rejects them
+/// at any nesting level.
+const UNSUPPORTED_ANYWHERE: &[&str] = &[
+    "default",
+    "minimum",
+    "maximum",
+    "minItems",
+    "maxItems",
+    "pattern",
+    "format",
+    "examples",
+    "title",
+    "$schema",
+    "additionalProperties",
+    "allOf",
+    "oneOf",
+    "anyOf",
+];
+
+/// Keys stripped **only at the top level** of `input_schema`. JSON-Schema
+/// conditional validation on nested sub-properties is legitimate and must
+/// be preserved; Bedrock only chokes on these when they appear at the
+/// outermost level alongside `type: "object"` + `properties`.
+const UNSUPPORTED_TOP_LEVEL_ONLY: &[&str] = &["if", "then", "else"];
+
+fn strip_unsupported_schema_fields_inner(value: &mut Value, is_top_level: bool) {
     if let Some(obj) = value.as_object_mut() {
-        for key in UNSUPPORTED {
+        for key in UNSUPPORTED_ANYWHERE {
             obj.remove(*key);
         }
-        // Recurse into properties
-        if let Some(props) = obj.get_mut("properties").and_then(Value::as_object_mut) {
-            for (_, prop_val) in props.iter_mut() {
-                strip_unsupported_schema_fields(prop_val);
+        if is_top_level {
+            for key in UNSUPPORTED_TOP_LEVEL_ONLY {
+                obj.remove(*key);
             }
         }
-        // Recurse into items (array schemas)
+        // Always strip our internal vendor extension at every level.
+        obj.remove(astra_turn_core::tool_schema_prune::PER_ACTION_REQUIRED_KEY);
+
+        // Recurse into properties (nested = not top-level).
+        if let Some(props) = obj.get_mut("properties").and_then(Value::as_object_mut) {
+            for (_, prop_val) in props.iter_mut() {
+                strip_unsupported_schema_fields_inner(prop_val, false);
+            }
+        }
+        // Recurse into items (array schemas).
         if let Some(items) = obj.get_mut("items") {
-            strip_unsupported_schema_fields(items);
+            strip_unsupported_schema_fields_inner(items, false);
         }
     }
 }

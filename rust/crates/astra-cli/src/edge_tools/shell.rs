@@ -3003,8 +3003,11 @@ fn set_pipe_nonblocking_stdout(pipe: Option<&mut std::process::ChildStdout>) {
         // for the duration of our borrow — no concurrent close.
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
         if let Ok(flags) = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_GETFL) {
+            // `from_bits_retain` preserves platform-specific bits
+            // (O_LARGEFILE, O_CLOEXEC, etc.) that `from_bits_truncate`
+            // would silently drop when writing back via F_SETFL.
             let new_flags =
-                nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK;
+                nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK;
             let _ = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_SETFL(new_flags));
         }
     }
@@ -3020,8 +3023,9 @@ fn set_pipe_nonblocking_stderr(pipe: Option<&mut std::process::ChildStderr>) {
         // SAFETY: same reasoning as stdout variant.
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
         if let Ok(flags) = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_GETFL) {
+            // See stdout variant: retain unknown platform bits.
             let new_flags =
-                nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK;
+                nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK;
             let _ = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_SETFL(new_flags));
         }
     }
@@ -3050,6 +3054,9 @@ fn drain_pipe_nonblocking(
                 buf.extend_from_slice(&chunk[..n]);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            // Retry on EINTR — a signal interrupted read() before any
+            // bytes were consumed, and the pipe may still hold data.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
@@ -3073,6 +3080,7 @@ fn drain_pipe_nonblocking_stderr(
                 buf.extend_from_slice(&chunk[..n]);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
@@ -3105,6 +3113,9 @@ fn final_drain_stdout(
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }
+            // Retry on signal interruption — discarding here would
+            // drop trailing output written just before exit.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
@@ -3134,6 +3145,7 @@ fn final_drain_stderr(
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }

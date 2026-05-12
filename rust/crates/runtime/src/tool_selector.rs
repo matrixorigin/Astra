@@ -922,29 +922,13 @@ pub fn prune_schema(mut schema: Value, level: PruneLevel) -> Value {
 /// `allOf` in `input_schema`, so per-action required lives in a
 /// vendor-prefixed extension instead.
 fn collect_schema_required_union(params: &Value) -> std::collections::HashSet<String> {
-    let mut union = std::collections::HashSet::new();
-    if let Some(arr) = params.get("required").and_then(Value::as_array) {
-        for v in arr {
-            if let Some(s) = v.as_str() {
-                union.insert(s.to_string());
-            }
-        }
+    // Prefer the shared helper from `astra_turn_core` so the two
+    // code paths stay byte-compatible — this is the runtime-side
+    // mirror of `tool_schema_prune::collect_required_union`.
+    match params.as_object() {
+        Some(obj) => astra_turn_core::tool_schema_prune::collect_required_union(obj),
+        None => std::collections::HashSet::new(),
     }
-    if let Some(map) = params
-        .get("x-astra-per-action-required")
-        .and_then(Value::as_object)
-    {
-        for (_action, fields) in map {
-            if let Some(arr) = fields.as_array() {
-                for v in arr {
-                    if let Some(s) = v.as_str() {
-                        union.insert(s.to_string());
-                    }
-                }
-            }
-        }
-    }
-    union
 }
 
 /// Truncate a string at a word boundary, safely handling multi-byte UTF-8.

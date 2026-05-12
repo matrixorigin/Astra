@@ -338,6 +338,12 @@ const EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK: &str = "turn_rollback";
 struct BashProgressGuard {
     executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
     ticker: Option<tokio::task::JoinHandle<()>>,
+    /// Cloned observer tx so the `Drop` impl can emit one last
+    /// `ToolOutput` snapshot after the pipe's final drain ran.
+    /// Populated only when an observer was present at install time.
+    final_event_tx: Option<super::chat_stream::StreamEventTx>,
+    /// Tool name for the final `ToolOutput` snapshot.
+    tool_name: String,
 }
 
 impl BashProgressGuard {
@@ -385,12 +391,35 @@ impl BashProgressGuard {
         Self {
             executor: executor.clone(),
             ticker,
+            final_event_tx: stream_event_tx.cloned(),
+            tool_name: tool_name.to_string(),
         }
     }
 }
 
 impl Drop for BashProgressGuard {
     fn drop(&mut self) {
+        // Emit one last ToolOutput snapshot so the TUI counter
+        // reflects the final drain bytes.  `shell.rs::final_drain_*`
+        // already calls `sink.record_chunk` on every post-exit byte
+        // before returning, so by the time we get here the counters
+        // are authoritative.  The ticker fires at ~200 ms cadence
+        // and we abort it immediately after this snapshot, so
+        // without this emit the displayed "N lines / K KB" can
+        // undershoot by up to one tick.  Reading the sink is two
+        // atomic loads and sending is best-effort (we swallow
+        // closed-channel errors exactly like the ticker loop).
+        if let (Some(sink), Some(tx)) = (
+            self.executor.current_bash_progress_sink(),
+            self.final_event_tx.as_ref(),
+        ) {
+            let (lines, bytes) = sink.snapshot();
+            let _ = tx.send(super::chat_stream::StreamEvent::ToolOutput {
+                name: self.tool_name.clone(),
+                lines,
+                bytes,
+            });
+        }
         if let Some(h) = self.ticker.take() {
             h.abort();
         }

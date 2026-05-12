@@ -451,7 +451,7 @@ pub struct ToolExecutor {
     /// single in-flight call. Read by `shell_ops`/`edge_tools::shell`
     /// wait loops to record byte/line counters; polled by a
     /// `StreamEvent::ToolOutput` ticker.
-    pub bash_progress_sink:
+    pub(crate) bash_progress_sink:
         std::sync::RwLock<Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>>,
     /// After a `.rs` file is written under a Rust workspace, set so the next
     /// `/chat` turn with `tool_results` can run passive `cargo check` and inject diagnostics.

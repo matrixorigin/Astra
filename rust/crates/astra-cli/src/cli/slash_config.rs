@@ -32,6 +32,35 @@ fn active_model_for_display() -> Option<String> {
         .and_then(|lock| lock.read().ok().and_then(|guard| guard.clone()))
 }
 
+// ── `/session analyze deep <id>` TUI→line-mode hand-off ─────────
+//
+// The TUI-side `/session analyze` hands off to the line-mode deep
+// analyzer via `SlashResult::Fallback`. Because the fallback only
+// sees the bare command string we stash any user-supplied session
+// id in this slot so the line-mode handler can pick it up instead
+// of silently dropping it (the pre-fix behaviour).
+static DEEP_ANALYZE_ARG: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+/// Store (or clear) the session id the user passed to
+/// `/session analyze deep <id>`. `None` means "use the current
+/// session".
+pub(crate) fn set_deep_analyze_arg(arg: Option<String>) {
+    let lock = DEEP_ANALYZE_ARG.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = arg;
+    }
+}
+
+/// Consume the stashed `/session analyze deep` argument. Returns
+/// `None` when the caller didn't supply a session id (the
+/// line-mode analyzer should then default to the current session).
+#[allow(dead_code)]
+pub(crate) fn take_deep_analyze_arg() -> Option<String> {
+    DEEP_ANALYZE_ARG
+        .get()
+        .and_then(|lock| lock.write().ok().and_then(|mut g| g.take()))
+}
+
 /// Handle /config command.
 ///
 /// Primary dispatch matches the reference CLI: bare `/config` opens the

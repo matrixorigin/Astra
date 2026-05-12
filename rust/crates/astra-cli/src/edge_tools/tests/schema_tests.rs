@@ -302,6 +302,14 @@ fn git_commit_and_revert_actions_declare_required_fields() {
         conditional_required_for(git, "checkout_file"),
         vec!["path".to_string(), "ref".to_string()]
     );
+    assert_eq!(
+        conditional_required_for(git, "stash"),
+        vec!["sub_action".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(git, "worktree"),
+        vec!["sub_action".to_string()]
+    );
 }
 
 #[test]

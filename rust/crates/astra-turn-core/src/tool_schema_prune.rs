@@ -133,7 +133,14 @@ fn strip_optional_params(func: &mut Value) {
 /// ignored by providers but honoured here so `AggressivePrune`
 /// doesn't strip per-action required properties when the LLM is
 /// under context pressure.
-fn collect_required_union(params: &serde_json::Map<String, Value>) -> HashSet<String> {
+///
+/// Note: the extension key is deliberately a single constant
+/// (`PER_ACTION_REQUIRED_KEY`) to keep this logic and its mirror
+/// in `runtime::tool_selector::collect_schema_required_union` in
+/// lockstep — any rename must update both call sites.
+pub const PER_ACTION_REQUIRED_KEY: &str = "x-astra-per-action-required";
+
+pub fn collect_required_union(params: &serde_json::Map<String, Value>) -> HashSet<String> {
     let mut union: HashSet<String> = HashSet::new();
     if let Some(arr) = params.get("required").and_then(Value::as_array) {
         for v in arr {
@@ -143,7 +150,7 @@ fn collect_required_union(params: &serde_json::Map<String, Value>) -> HashSet<St
         }
     }
     if let Some(map) = params
-        .get("x-astra-per-action-required")
+        .get(PER_ACTION_REQUIRED_KEY)
         .and_then(Value::as_object)
     {
         for (_action, fields) in map {

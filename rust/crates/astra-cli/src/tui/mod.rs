@@ -1080,11 +1080,38 @@ pub(crate) async fn run_tui_repl(
                                             provider,
                                             thinking_cap,
                                         );
-                                        let suffix = opts
+                                        let suffix_opt = opts
                                             .iter()
                                             .find(|o| o.label == label)
-                                            .map(|o| astra_turn_core::thinking_config::thinking_suffix_for(&o.config))
-                                            .unwrap_or_default();
+                                            .map(|o| astra_turn_core::thinking_config::thinking_suffix_for(&o.config));
+                                        let suffix = match suffix_opt {
+                                            Some(s) => s,
+                                            None => {
+                                                // Model catalog shifted between the
+                                                // picker's two `fetch_model_list_raw`
+                                                // calls (or the server returned fewer
+                                                // thinking options) — the chosen label
+                                                // no longer maps to a suffix.  Warn
+                                                // instead of silently committing the
+                                                // bare model name, which would leave
+                                                // the user on a different thinking mode
+                                                // than they selected.
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::error(format!(
+                                                        "Thinking mode `{label}` is no longer available for {base_model}; model unchanged. Re-open the picker with `/model`."
+                                                    )),
+                                                );
+                                                let w = guard
+                                                    .terminal
+                                                    .size()
+                                                    .map(|s| s.width)
+                                                    .unwrap_or(80);
+                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                bottom_pane.sync_popups();
+                                                frame_requester.schedule_frame();
+                                                continue;
+                                            }
+                                        };
                                         let composed = format!("{base_model}{suffix}");
                                         state.model = Some(composed.clone());
                                         crate::slash_config::set_active_model_for_display(
@@ -1116,7 +1143,7 @@ pub(crate) async fn run_tui_repl(
                                     // parent); the fallback path is the same
                                     // code the line-mode handler runs
                                     // through, so it does the full restore.
-                                    if let Some(parent_sid) = name.strip_prefix("__fork__\n") {
+                                    if let Some(parent_sid) = name.strip_prefix(slash_dispatch::FORK_PICK_SENTINEL) {
                                         let slash_text = format!("/session fork {parent_sid}");
                                         let slash_result = guard
                                             .with_restored(|| async {

@@ -3649,8 +3649,31 @@ fn handle_session_drift(arg: &str, state: &ReplState) {
 /// - Issue detection: blocked tools, stalls, errors, latency spikes,
 ///   recording gaps, duplicate checkpoints
 fn handle_session_analyze(arg: &str, state: &ReplState) {
+    // When the TUI dispatcher handed off via `/session analyze deep
+    // <id>` it stashed the optional id in `slash_config` — recover
+    // it here so it isn't silently dropped.  A direct line-mode
+    // invocation passes the id through `arg` as usual.
+    //
+    // We *always* consume the stashed value (even when `arg` is
+    // non-empty) so a previously-stashed id from a cancelled or
+    // errored picker flow cannot leak into a later invocation and
+    // silently analyze the wrong session.  When `arg` is supplied
+    // the caller's value wins.
+    let stashed = crate::slash_config::take_deep_analyze_arg();
+    let arg_owned: String;
+    let effective_arg: &str = if arg.trim().is_empty() {
+        match stashed {
+            Some(v) => {
+                arg_owned = v;
+                arg_owned.as_str()
+            }
+            None => arg,
+        }
+    } else {
+        arg
+    };
     let (target_sid, resolved_prefix) = match resolve_journal_target_session(
-        arg,
+        effective_arg,
         state,
         "  No active session. Use /session analyze <session_id>.",
     ) {
@@ -3660,11 +3683,11 @@ fn handle_session_analyze(arg: &str, state: &ReplState) {
             return;
         }
     };
-    if resolved_prefix && !arg.is_empty() {
+    if resolved_prefix && !effective_arg.is_empty() {
         eprintln!(
             "  {} Resolved {} → {}",
             theme::icon_ok(),
-            arg.cyan(),
+            effective_arg.cyan(),
             target_sid.as_str().cyan()
         );
     }

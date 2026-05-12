@@ -1301,13 +1301,20 @@ fn split_sub(text: &str) -> (&str, &str) {
 
 // ── /model subcommand helpers ───────────────────────────────────
 
+/// Sentinel prefix used by the `/session fork` picker to hand the
+/// chosen parent session id back to the main input loop.  The
+/// outer loop strips this prefix and runs `fork_local_session`
+/// with the remainder.  Lives here (co-located with the dispatcher
+/// that emits it) so `tui/mod.rs` can import it instead of
+/// duplicating the literal and silently drifting.
+pub(crate) const FORK_PICK_SENTINEL: &str = "__fork__\n";
+
 /// Sentinel prefix emitted by the model-name picker.  The outer
 /// loop (in `tui/mod.rs`) strips the prefix and decides whether to
 /// commit immediately or push a second picker for the model's
 /// thinking modes.  Kept public(crate) so the mod.rs arm can
 /// strip it symmetrically with the other sentinels.
 pub(crate) const MODEL_PICK_SENTINEL: &str = "__model_pick__\n";
-
 /// Sentinel prefix for the thinking-mode picker. Payload format is
 /// `__model_thinking__\n<base_model>\n<thinking_label>`.  The
 /// handler composes `base + thinking_suffix_for(label)` and sets
@@ -1359,6 +1366,10 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
 /// fallback for `/model <name>` shorthand.
 fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
     let name = name.trim();
+    if name.is_empty() {
+        ctx.show_error("Model name cannot be empty — try `/model list`.".into());
+        return;
+    }
     ctx.state.model = Some(name.to_string());
     crate::slash_config::set_active_model_for_display(Some(name.to_string()));
     ctx.bottom_pane.footer.model = Some(name.to_string());
@@ -1472,7 +1483,11 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
 fn fmt_tokens(n: u64) -> String {
     if n < 1_000 {
         n.to_string()
-    } else if n < 1_000_000 {
+    } else if n < 999_950 {
+        // Cut over to the "M" scale slightly before exactly 1_000_000
+        // so boundary values (999_999) don't render as "1000.0k" —
+        // the "1000.0k" suffix is wider than the 6-char column the
+        // InfoView reserves and visually jarring next to "1.0M".
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -1615,7 +1630,7 @@ fn handle_session_fork_view(ctx: &mut DispatchContext<'_>) -> SlashResult {
         return SlashResult::Handled;
     }
     ctx.bottom_pane.push_view(Box::new(
-        SessionPickerView::new(disco).with_result_prefix("__fork__\n"),
+        SessionPickerView::new(disco).with_result_prefix(FORK_PICK_SENTINEL),
     ));
     SlashResult::Handled
 }
@@ -1625,14 +1640,21 @@ fn handle_session_analyze_view(ctx: &mut DispatchContext<'_>, arg: &str) -> Slas
     // textual diagnostic (latency spikes, per-turn token shape,
     // issue detection bullets) still lives in the line-mode
     // printer.  Users who want the full thing get it via
-    // `/session analyze <id>` falling back through SlashResult::Fallback
-    // explicitly with `+deep` suffix, handled below.
+    // `/session analyze deep [id]` falling back through
+    // `SlashResult::Fallback`; we propagate the optional session
+    // id (`rest`) so the downstream handler can see
+    // `/session analyze deep <id>` verbatim.
     let (flag, rest) = split_sub(arg);
     if flag == "deep" {
-        // Hand off to the full line-mode analyzer.  rest may hold
-        // a session id.  Rewrite args so the fallback parser sees
-        // the conventional `/session analyze <id>` shape.
-        let _ = rest;
+        // Expose the trailing id (if any) through a thread-local so
+        // the line-mode analyzer can recover the user's original
+        // intent without re-parsing the slash string.
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            crate::slash_config::set_deep_analyze_arg(Some(rest.to_string()));
+        } else {
+            crate::slash_config::set_deep_analyze_arg(None);
+        }
         return SlashResult::Fallback;
     }
     let Some(sid) = resolve_session_arg(ctx, arg) else {
@@ -1848,17 +1870,22 @@ fn truncate_rows(text: &str, max: usize) -> Vec<String> {
         return rows;
     }
     let total_non_blank = text.lines().filter(|l| !l.trim().is_empty()).count();
+    let mut seen = 0usize;
     for logical in text.lines() {
         let trimmed = logical.trim();
         if trimmed.is_empty() {
             continue;
         }
-        // Reserve the last slot for an overflow marker when there's
-        // still non-blank content to come.  Guarantees
-        // `rows.len() <= max` as a strict invariant so callers can
-        // safely allocate a fixed viewport.
-        let remaining_content = total_non_blank - rows.len();
-        if rows.len() + 1 >= max && remaining_content > 1 {
+        seen += 1;
+        // Reserve the last slot for an overflow marker only when
+        // there is still *further* non-blank content after the
+        // current line.  `seen` counts lines already processed
+        // (including this one) so `total_non_blank - seen` is the
+        // true remainder.  This keeps the final allowed row when
+        // the source has exactly `max` non-blank lines instead of
+        // prematurely ellipsing it.
+        let remaining_after = total_non_blank.saturating_sub(seen);
+        if rows.len() + 1 >= max && remaining_after > 0 {
             rows.push("…".into());
             break;
         }
@@ -2258,7 +2285,7 @@ mod fmt_tokens_tests {
         assert_eq!(fmt_tokens(0), "0");
         assert_eq!(fmt_tokens(42), "42");
         assert_eq!(fmt_tokens(1_200), "1.2k");
-        assert_eq!(fmt_tokens(999_999), "1000.0k");
+        assert_eq!(fmt_tokens(999_999), "1.0M");
         assert_eq!(fmt_tokens(1_500_000), "1.5M");
     }
 }
