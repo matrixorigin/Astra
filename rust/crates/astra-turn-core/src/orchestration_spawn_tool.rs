@@ -54,7 +54,7 @@ pub struct SpawnAgentInput {
     /// Run in background (async). Default false — synchronous mode
     /// ensures the parent receives the child's result in the tool-call
     /// response before its turn budget is consumed.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool_lenient")]
     pub background: bool,
 
     /// Name for agent-to-agent messaging.
@@ -72,7 +72,7 @@ pub struct SpawnAgentInput {
     pub max_output_tokens: Option<u32>,
 
     /// Create isolated git worktree for this agent.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool_lenient")]
     pub isolated: bool,
 
     /// Tool allowlist (overrides agent_type defaults).
@@ -108,6 +108,50 @@ pub struct SpawnAgentInput {
     /// load-bearing for schema cache; do NOT reorder.
     #[serde(default)]
     pub complexity: Option<String>,
+}
+
+/// Lenient bool deserializer: accepts `true`, `false`, `"true"`,
+/// `"false"`, `"1"`, `"0"`, `1`, `0`, or null/absent (→ false).
+/// LLMs frequently serialize booleans as strings (session 7e3fecb5:
+/// `"background": "true"` caused 3 consecutive InvalidInput errors
+/// that triggered ToolHealthTracker restriction).
+fn deserialize_bool_lenient<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+    struct BoolVisitor;
+    impl<'de> de::Visitor<'de> for BoolVisitor {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a boolean or string-encoded boolean")
+        }
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<bool, E> {
+            Ok(v)
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<bool, E> {
+            match v.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => Ok(true),
+                "false" | "0" | "no" | "" => Ok(false),
+                other => Err(E::custom(format!(
+                    "unrecognized boolean string: \"{other}\""
+                ))),
+            }
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_none<E: de::Error>(self) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<bool, E> {
+            Ok(false)
+        }
+    }
+    deserializer.deserialize_any(BoolVisitor)
 }
 
 /// Lenient deserializer for `inherit_prefix`: accepts a JSON object
@@ -632,5 +676,44 @@ mod tests {
             "inherit_prefix description must show the `{{}}` opt-in \
              shorthand so models know the minimum call form; got: {ip_desc}"
         );
+    }
+}
+
+#[cfg(test)]
+mod bool_lenient_tests {
+    use super::SpawnAgentInput;
+
+    #[test]
+    fn background_accepts_string_true() {
+        // Regression (session 7e3fecb5): LLM passed "true" (string)
+        // instead of true (bool) → serde rejected → 3 failures →
+        // tool restricted. Lenient deserializer fixes this.
+        let input: SpawnAgentInput =
+            serde_json::from_str(r#"{"description":"test","prompt":"p","background":"true"}"#)
+                .expect("string 'true' must deserialize");
+        assert!(input.background);
+    }
+
+    #[test]
+    fn background_accepts_bool_true() {
+        let input: SpawnAgentInput =
+            serde_json::from_str(r#"{"description":"test","prompt":"p","background":true}"#)
+                .expect("bool true must deserialize");
+        assert!(input.background);
+    }
+
+    #[test]
+    fn background_defaults_false_on_absence() {
+        let input: SpawnAgentInput = serde_json::from_str(r#"{"description":"test","prompt":"p"}"#)
+            .expect("absent background must default to false");
+        assert!(!input.background);
+    }
+
+    #[test]
+    fn isolated_accepts_string_false() {
+        let input: SpawnAgentInput =
+            serde_json::from_str(r#"{"description":"test","prompt":"p","isolated":"false"}"#)
+                .expect("string 'false' must deserialize");
+        assert!(!input.isolated);
     }
 }
