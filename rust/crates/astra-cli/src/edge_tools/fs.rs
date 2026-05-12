@@ -320,8 +320,21 @@ impl ToolExecutor {
                     Err(e) => return format!("Error reading file: {e}"),
                 };
                 let lines_in_cap = content.lines().count();
+                // Extrapolate total line count from the sampled portion
+                // rather than assuming a fixed 40 chars/line (which was
+                // wildly wrong for minified JS/CSS and near-binary files).
+                // Falls back to the old estimate only if the sample is
+                // empty (avoid div-by-zero).
                 let total_lines = if cap < size {
-                    lines_in_cap + (size - cap) / 40
+                    if lines_in_cap > 0 && cap > 0 {
+                        // Scale: lines_in_cap * (size / cap), using
+                        // u128 to avoid overflow on huge files.
+                        let scaled =
+                            (lines_in_cap as u128 * size as u128 / cap as u128) as usize;
+                        scaled.max(lines_in_cap)
+                    } else {
+                        lines_in_cap + (size - cap) / 40
+                    }
                 } else {
                     lines_in_cap
                 };

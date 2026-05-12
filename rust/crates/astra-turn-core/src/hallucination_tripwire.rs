@@ -79,7 +79,14 @@ pub fn detect<'a>(
     assistant_output: &str,
     tool_calls: impl IntoIterator<Item = TripwireToolObservation<'a>>,
 ) -> TripwireVerdict {
-    let lower = assistant_output.to_ascii_lowercase();
+    // Strip fenced code blocks and blockquoted lines before matching.
+    // Without this, an assistant that legitimately *quotes* a prior
+    // turn's tripwire nudge ("last turn the system said 'silently
+    // returned {}'…") would re-fire the wire and create a self-
+    // quoting loop. We only want to catch the model using these
+    // phrases in its *own* narrative voice.
+    let prose = strip_quoted_regions(assistant_output);
+    let lower = prose.to_ascii_lowercase();
     let matched: Vec<String> = HALLUCINATED_PHRASES
         .iter()
         .filter(|p| lower.contains(&p.to_ascii_lowercase()))
@@ -104,6 +111,31 @@ pub fn detect<'a>(
         nudge: build_nudge(&matched),
         matched_phrases: matched,
     }
+}
+
+/// Remove fenced code blocks (```...```) and blockquote lines
+/// (leading `>` after optional whitespace) from `input`. Used to
+/// avoid the tripwire echoing itself when the assistant quotes a
+/// previous nudge. Keeps newlines so line-based phrase matches
+/// still work over the surviving prose.
+fn strip_quoted_regions(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_fence = false;
+    for line in input.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if trimmed.starts_with('>') {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 fn build_nudge(matched: &[String]) -> String {
@@ -231,6 +263,26 @@ mod tests {
             }
             _ => panic!("should have fired"),
         }
+    }
+
+    #[test]
+    fn ignores_phrase_inside_fenced_code_block() {
+        // An assistant legitimately quoting a previous nudge inside
+        // a ```-fence must not retrigger the wire.
+        let v = detect(
+            "Earlier the system warned me:\n\n```\nYour prose said 'silently returned {}'.\n```\n\nI'll avoid that phrasing going forward.",
+            [obs("str_replace", "Error: old_str not found")],
+        );
+        assert_eq!(v, TripwireVerdict::Clean);
+    }
+
+    #[test]
+    fn ignores_phrase_inside_blockquote() {
+        let v = detect(
+            "> last turn: silently returned {}\n\nI won't use that phrasing.",
+            [obs("str_replace", "Error: old_str not found")],
+        );
+        assert_eq!(v, TripwireVerdict::Clean);
     }
 
     #[test]

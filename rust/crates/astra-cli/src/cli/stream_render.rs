@@ -6543,13 +6543,21 @@ fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
     if result.starts_with("Error:") || result.starts_with("error:") || result.trim().is_empty() {
         return result.to_string();
     }
-    // Sanitize: XML escape + strip control chars (including \n\r\t)
-    // that could break the XML tag structure. Linux allows filenames
-    // with newlines; a malicious skill name with \n could inject
-    // extra XML attributes or content.
+    // Sanitize: allowlist to a conservative set of filename-safe
+    // characters. A malicious skill registry entry could otherwise
+    // use path-like names (`../evil`) or Unicode line separators
+    // (U+2028 / U+2029, which `is_control` does NOT catch) to
+    // impersonate a different skill in LLM-visible output. Anything
+    // outside the allowlist is replaced with `_`.
     let safe_name: String = skill_name
         .chars()
-        .filter(|c| !c.is_control())
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '/') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>()
         .replace('&', "&amp;")
         .replace('<', "&lt;")
