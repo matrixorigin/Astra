@@ -266,9 +266,11 @@ fn build_bridge_tool_call_records(
             other => {
                 // Non-string output is a serialization bug upstream —
                 // the contract is `output: Option<String>`. Log the
-                // anomaly so we can trace the source instead of silently
-                // passing `"{}"` to the LLM (which it mis-reads as
-                // "tool returned empty JSON object").
+                // anomaly so we can trace the source, but preserve the
+                // real JSON payload for the LLM instead of replacing it
+                // with a synthetic error sentinel (the old behavior
+                // silently discarded real tool data if the upstream
+                // bug ever fired in prod).
                 let type_label = if other.is_object() {
                     "object"
                 } else if other.is_array() {
@@ -289,16 +291,14 @@ fn build_bridge_tool_call_records(
                     );
                 astra_core::agent_warn!(
                     "bridge",
-                    "tool_result.output is {} (not String); coercing. request_id={}, value={}",
+                    "tool_result.output is {} (not String); coercing to JSON repr. request_id={}, value={}",
                     type_label,
                     request_id,
                     preview
                 );
-                format!(
-                    "[BRIDGE_OUTPUT_TYPE_BUG] tool_result.output was JSON {} \
-                     (expected String). request_id={}. raw={}",
-                    type_label, request_id, preview
-                )
+                // Preserve the real payload. The warn! above still fires
+                // so operators can trace the upstream serialization bug.
+                stringified
             }
         });
         let error = tool_result
@@ -6617,10 +6617,9 @@ mod tests {
     #[test]
     fn build_bridge_records_object_output_coerces_to_string_not_silent() {
         // Regression: if upstream serialization bug puts an object `{}`
-        // in the `output` field instead of a string, the old code would
-        // silently pass `"{}"` to the LLM — the model then says "tool
-        // returned {}". The fix logs a warning and still coerces, but
-        // the string is at least traceable.
+        // in the `output` field instead of a string, we now preserve the
+        // real JSON form (not a synthetic sentinel) and log a warning so
+        // operators can trace the upstream bug.
         let tool_calls = vec![json!({
             "id": "call-1",
             "function": {"name": "bash", "arguments": "{}"}
@@ -6638,14 +6637,139 @@ mod tests {
             &std::collections::HashMap::new(),
         );
         assert_eq!(records.len(), 1);
-        // Coerced to string representation of the JSON value
+        // Empty Object coerces to the JSON literal "{}"
         assert_eq!(
             records[0].result_preview.as_deref(),
             Some("{}"),
-            "object output gets coerced to its JSON string form"
+            "empty-object output coerces to its JSON string form '{{}}'"
         );
-        // The key assertion is that this path now logs a warning
-        // (verified by the agent_warn! call presence in the code).
+        // Must NOT contain the old sentinel marker
+        assert!(
+            !records[0]
+                .result_preview
+                .as_deref()
+                .unwrap_or("")
+                .contains("[BRIDGE_OUTPUT_TYPE_BUG]"),
+            "must NOT replace real data with sentinel"
+        );
+    }
+
+    // ── Finding 🟡 6: non-empty Object output must preserve real data ──
+    //
+    // Regression guard: an earlier iteration of the bridge replaced
+    // Object-shaped output with a `[BRIDGE_OUTPUT_TYPE_BUG] ...` sentinel,
+    // silently discarding the actual tool payload. If the upstream
+    // serialization bug ever fires in prod, we want the LLM to see the
+    // real JSON — not a synthetic error tag.
+    #[test]
+    fn build_bridge_records_nonempty_object_output_preserves_real_payload() {
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "function": {"name": "bash", "arguments": "{}"}
+        })];
+        let tool_results = vec![json!({
+            "request_id": "call-1",
+            "name": "bash",
+            "status": "ok",
+            "output": {"stdout": "hello", "exit": 0},
+            "duration_ms": 50
+        })];
+        let records = build_bridge_tool_call_records(
+            &tool_calls,
+            &tool_results,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(records.len(), 1);
+        let preview = records[0]
+            .result_preview
+            .as_deref()
+            .expect("object payload must surface, not None");
+        // Real keys must survive coercion
+        assert!(
+            preview.contains("stdout") && preview.contains("hello"),
+            "real object data must be preserved, got: {preview}"
+        );
+        assert!(
+            !preview.contains("[BRIDGE_OUTPUT_TYPE_BUG]"),
+            "must NOT replace real data with sentinel: {preview}"
+        );
+    }
+
+    // ── Finding 🟡 8: Value::Array path ──
+    //
+    // Array outputs (e.g. list of content blocks) must also be preserved
+    // as JSON, not replaced with a sentinel.
+    #[test]
+    fn build_bridge_records_array_output_preserves_elements() {
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "function": {"name": "bash", "arguments": "{}"}
+        })];
+        let tool_results = vec![json!({
+            "request_id": "call-1",
+            "name": "bash",
+            "status": "ok",
+            "output": [{"type": "text", "text": "hello"}],
+            "duration_ms": 50
+        })];
+        let records = build_bridge_tool_call_records(
+            &tool_calls,
+            &tool_results,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(records.len(), 1);
+        let preview = records[0]
+            .result_preview
+            .as_deref()
+            .expect("array payload must surface, not None");
+        assert!(
+            preview.contains("hello"),
+            "array element content must survive: {preview}"
+        );
+        assert!(
+            !preview.contains("[BRIDGE_OUTPUT_TYPE_BUG]"),
+            "must NOT replace real data with sentinel: {preview}"
+        );
+    }
+
+    // ── Finding 🟡 7: null → "" is intentional, tripwire anchor ──
+    //
+    // Explicitly pin down the contract: `Value::Null` coerces to empty
+    // string (not the literal "null"), which is what the hallucination
+    // tripwire's `any_physical_empty` check relies on to distinguish
+    // "tool really returned nothing" from "tool returned valid JSON".
+    // If this ever changes, the tripwire will silently stop firing.
+    #[test]
+    fn build_bridge_records_null_output_contract_matches_tripwire_anchor() {
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "function": {"name": "bash", "arguments": "{}"}
+        })];
+        let tool_results = vec![json!({
+            "request_id": "call-1",
+            "name": "bash",
+            "status": "ok",
+            "output": null,
+            "duration_ms": 50
+        })];
+        let records = build_bridge_tool_call_records(
+            &tool_calls,
+            &tool_results,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(records.len(), 1);
+        // Must NOT be the literal string "null"
+        assert_ne!(
+            records[0].result_preview.as_deref(),
+            Some("null"),
+            "null JSON must not surface as literal 'null' string"
+        );
+        // Must be empty (None or "") — the tripwire anchor
+        let preview = records[0].result_preview.as_deref().unwrap_or("");
+        assert!(
+            preview.is_empty(),
+            "null output must coerce to empty, got: {preview:?}"
+        );
     }
 
     #[test]

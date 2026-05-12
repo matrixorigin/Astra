@@ -5243,6 +5243,154 @@ mod tests {
         assert_eq!(blocks[0]["content"], "hello");
     }
 
+    // ── Tool-role content-coercion boundary tests ─────────────────────────
+    //
+    // Regression guards for the six-session `{}` cascade bug
+    // (commit 104b4502). When compaction / fold / format-conversion
+    // produces a non-string `content` on a tool-role message, the
+    // converter must coerce the payload to a string rather than pass
+    // `{}`, `[]`, or `null` through verbatim — otherwise downstream
+    // LLM reads the empty object as "tool returned nothing" and
+    // hallucinates a retry or an error.
+    //
+    // These tests pin the FUNCTION-BOUNDARY contract of
+    // `anthropic_message_from_openai` for every shape
+    // (`Value::Object`, `Value::Array` with/without text, `Value::Null`,
+    // and content-field absent).
+
+    #[test]
+    fn anthropic_tool_message_object_content_coerced_to_string_not_empty_json() {
+        // Upstream bug: tool content ended up as `{}` (empty object).
+        // The converter must stringify it so the LLM never sees a
+        // bare JSON object as the tool_result body.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_obj",
+            "content": {},
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        let blocks = converted["content"].as_array().unwrap();
+        let body = &blocks[0]["content"];
+        assert!(
+            body.is_string(),
+            "tool_result.content must be a string after coercion, got: {body}",
+        );
+        assert_eq!(
+            body.as_str().unwrap(),
+            "{}",
+            "object content stringified to its JSON repr",
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_message_nonempty_object_content_stringified_verbatim() {
+        // An object payload (e.g. `{"error": "boom"}`) must survive
+        // as a readable string — not be silently elided.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_obj2",
+            "content": {"error": "boom", "code": 42},
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        let body = converted["content"][0]["content"].as_str().unwrap();
+        // serde_json preserves key order as inserted; both fields must be present.
+        assert!(
+            body.contains("\"error\":\"boom\""),
+            "error preserved: {body}"
+        );
+        assert!(body.contains("\"code\":42"), "code preserved: {body}");
+    }
+
+    #[test]
+    fn anthropic_tool_message_array_with_text_blocks_extracts_joined_text() {
+        // Content-block array shape: Anthropic-style
+        // `[{type:"text", text:"..."}]` — the coercion branch extracts
+        // the joined `text` fields rather than the raw JSON dump.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_arr",
+            "content": [
+                {"type": "text", "text": "hello "},
+                {"type": "text", "text": "world"},
+            ],
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        let body = converted["content"][0]["content"].as_str().unwrap();
+        assert_eq!(
+            body, "hello world",
+            "text blocks must be joined into a single string, got: {body}",
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_message_array_without_text_falls_back_to_json_repr() {
+        // An array of objects with NO `text` fields must round-trip
+        // as its JSON representation, not the empty string — else the
+        // LLM sees `""` and treats the tool as silent.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_arr2",
+            "content": [{"kind": "image"}, {"kind": "ref"}],
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        let body = converted["content"][0]["content"].as_str().unwrap();
+        assert!(
+            body.contains("\"kind\":\"image\""),
+            "non-text array serialized verbatim: {body}",
+        );
+        assert!(
+            body.contains("\"kind\":\"ref\""),
+            "all array elements preserved: {body}",
+        );
+        assert_ne!(body, "", "must not collapse to empty string");
+    }
+
+    #[test]
+    fn anthropic_tool_message_null_content_becomes_empty_string() {
+        // `Value::Null` is the documented empty-payload case. The
+        // converter MUST emit `""` (not null, not absent) so downstream
+        // wire serialization doesn't drop the tool_result.content key.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_null",
+            "content": serde_json::Value::Null,
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        let body = &converted["content"][0]["content"];
+        assert_eq!(body.as_str(), Some(""), "null → empty string, got: {body}");
+    }
+
+    #[test]
+    fn anthropic_tool_message_absent_content_becomes_empty_string() {
+        // No `content` key at all: same as Null — converter still emits
+        // a well-formed tool_result with an empty string body.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_missing",
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        let blocks = converted["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "still wraps into exactly one block");
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "call_missing");
+        assert_eq!(blocks[0]["content"].as_str(), Some(""));
+    }
+
+    #[test]
+    fn anthropic_tool_message_number_content_stringified_not_dropped() {
+        // A numeric payload (rare but possible from a misbehaving
+        // upstream) must stringify to its JSON form, not be silently
+        // dropped to `""`.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_num",
+            "content": 42,
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        let body = converted["content"][0]["content"].as_str().unwrap();
+        assert_eq!(body, "42", "number content stringified, got: {body}");
+    }
+
     #[test]
     fn anthropic_system_and_messages_preserves_cache_control_on_system_blocks() {
         let messages = vec![

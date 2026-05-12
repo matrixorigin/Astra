@@ -677,25 +677,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     }
     set_payload_tool_results_if_non_empty(&mut payload, ctx.tool_results);
 
-    // DEBUG: append tool_results to a temp file so we can see every payload
-    // the LLM receives. Unconditional on purpose — this is a temporary probe
-    // for the "{}" coercion bug; gating it would defeat the point (data lost
-    // if the env var isn't set when the bug reproduces).
-    // TODO(remove-before-merge): delete once the "{}" bug is root-caused.
-    if !ctx.tool_results.is_empty() {
-        use std::io::Write;
-        let dump = serde_json::json!({
-            "ts": chrono::Utc::now().to_rfc3339(),
-            "tool_results_count": ctx.tool_results.len(),
-            "tool_results": ctx.tool_results,
-        });
-        let path = std::env::temp_dir()
-            .join(format!("astra-tool-results-debug-{}.jsonl", std::process::id()));
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(f, "{}", serde_json::to_string(&dump).unwrap_or_default());
-        }
-    }
-
     record_agentic_step_plan_after_payload_prep(
         ctx.step_recorder,
         ctx.telem.first_selection_report.as_ref(),
