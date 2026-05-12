@@ -1221,10 +1221,15 @@ fn resolve_existing_search_path(
 /// substring + basename match — no heavy fuzzy-matching dependency.
 fn suggest_near_miss_paths(workspace_root: &Path, requested: &str) -> Vec<String> {
     let full = workspace_root.join(requested);
-    // Walk up to find the deepest ancestor that exists.
+    // Walk up to find the deepest ancestor that exists, but never
+    // escape above workspace_root (security: prevents leaking
+    // /etc, /home, etc. via `../../../` traversals).
     let mut ancestor = full.as_path();
     loop {
         if let Some(parent) = ancestor.parent() {
+            if !parent.starts_with(workspace_root) {
+                return Vec::new();
+            }
             if parent.exists() {
                 break;
             }
@@ -1234,6 +1239,9 @@ fn suggest_near_miss_paths(workspace_root: &Path, requested: &str) -> Vec<String
         }
     }
     let search_dir = ancestor.parent().unwrap_or(workspace_root);
+    if !search_dir.starts_with(workspace_root) {
+        return Vec::new();
+    }
     let needle = full
         .file_name()
         .unwrap_or_default()
@@ -1247,7 +1255,8 @@ fn suggest_near_miss_paths(workspace_root: &Path, requested: &str) -> Vec<String
     let Ok(entries) = std::fs::read_dir(search_dir) else {
         return Vec::new();
     };
-    for entry in entries.flatten() {
+    // Cap iteration to avoid O(n) scan of huge dirs (node_modules etc.)
+    for entry in entries.flatten().take(500) {
         let name = entry.file_name().to_string_lossy().to_lowercase();
         if name.contains(&needle) || needle.contains(&name) {
             let rel = entry
@@ -1265,10 +1274,11 @@ fn suggest_near_miss_paths(workspace_root: &Path, requested: &str) -> Vec<String
     // its children and pick ones that substring-match the last component.
     if candidates.is_empty()
         && let Some(parent) = full.parent()
+        && parent.starts_with(workspace_root)
         && parent.exists()
         && let Ok(entries) = std::fs::read_dir(parent)
     {
-        for entry in entries.flatten() {
+        for entry in entries.flatten().take(500) {
             let name = entry.file_name().to_string_lossy().to_lowercase();
             if name.contains(&needle) || needle.contains(&name) {
                 let rel = entry

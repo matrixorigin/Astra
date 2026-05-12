@@ -756,8 +756,9 @@ impl VolatileKind {
             | Self::CompactResume
             | Self::ExecutionRetry
             | Self::ExplorationBudget
-            | Self::BudgetReview
-            | Self::HallucinationTripwire => "user",
+            | Self::BudgetReview => "user",
+            // System-role: prevents injection via attacker-crafted file content.
+            Self::HallucinationTripwire => "system",
             // System-role: in-band runtime snapshots or coaching.
             Self::WorkingSet
             | Self::AlreadyFetched

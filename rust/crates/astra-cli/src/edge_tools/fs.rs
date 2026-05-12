@@ -309,11 +309,22 @@ impl ToolExecutor {
             let size = meta.len() as usize;
             let limit = self.scaled_output_limit();
             if size > limit {
-                let content = match read_to_string_lossy(&path) {
+                // Cap the read at 2× the output limit to avoid OOM on
+                // multi-GB files. We only need enough to generate an
+                // outline — symbols are typically in the first portion.
+                // `total_lines` is estimated from the capped read + the
+                // remaining unread bytes (assuming ~40 chars/line).
+                let cap = limit.saturating_mul(2).min(size);
+                let content = match read_capped_to_string_lossy(&path, cap) {
                     Ok(c) => c,
                     Err(e) => return format!("Error reading file: {e}"),
                 };
-                let total_lines = content.lines().count();
+                let lines_in_cap = content.lines().count();
+                let total_lines = if cap < size {
+                    lines_in_cap + (size - cap) / 40
+                } else {
+                    lines_in_cap
+                };
 
                 let outline_text = if let Some(lang) = super::code_intel::detect_language(&path) {
                     let generated = super::code_intel::generate_outline(&content, lang);
@@ -2689,6 +2700,22 @@ fn normalize_ws(s: &str) -> String {
 /// Returns a standard `io::Error` for I/O failures.
 fn read_to_string_lossy(path: &Path) -> std::io::Result<String> {
     let bytes = fs::read(path)?;
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok(s),
+        Err(e) => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),
+    }
+}
+
+/// Like `read_to_string_lossy` but reads at most `max_bytes` from the
+/// file. Used by the large-file auto-outline path to avoid OOM when the
+/// file is enormous (multi-GB). The returned string may be truncated
+/// mid-line; callers doing line analysis should be aware of the tail.
+fn read_capped_to_string_lossy(path: &Path, max_bytes: usize) -> std::io::Result<String> {
+    use std::io::Read;
+    let file = fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file).take(max_bytes as u64);
+    let mut bytes = Vec::with_capacity(max_bytes.min(1 << 20)); // cap alloc at 1MB initial
+    reader.read_to_end(&mut bytes)?;
     match String::from_utf8(bytes) {
         Ok(s) => Ok(s),
         Err(e) => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),

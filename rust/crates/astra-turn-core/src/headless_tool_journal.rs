@@ -58,31 +58,14 @@ fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> (&str, bool) {
 /// Populates `result_preview` with a `[cached_cross_turn: ...]`
 /// tagged string so downstream analysis (digest, LLM self-
 /// diagnosis) can distinguish "cache reused N bytes" from "tool
-/// returned empty body". Before this, `result_preview` was `None`,
-/// which made the journal look like the tool silently returned
-/// nothing — session 6d6c1041 hallucinated a `{}`-bug off exactly
-/// this signal.
-///
-/// Backwards-compatible entry point for callers that do not have the cached
-/// body handy; the preview still carries the byte count and tag so it is
-/// self-identifying.
-#[must_use]
-pub fn journal_record_cross_turn_cache_hit(
-    name: String,
-    output_len: u32,
-    args_preview: Option<String>,
-) -> ToolCallRecord {
-    journal_record_cross_turn_cache_hit_with_body(name, output_len, args_preview, None)
-}
-
-/// Record a cross-turn cache hit with an optional cached-body snippet.
+/// returned empty body".
 ///
 /// `cached_body` is optional because some short-circuit paths
 /// (e.g. pre-suppressed repeated cache hits) don't have the full
 /// body handy; when absent, the preview still carries the byte
 /// count and tag so it's self-identifying.
 #[must_use]
-pub fn journal_record_cross_turn_cache_hit_with_body(
+pub fn journal_record_cross_turn_cache_hit(
     name: String,
     output_len: u32,
     args_preview: Option<String>,
@@ -231,13 +214,13 @@ mod tests {
 
     #[test]
     fn cache_hit_record_has_output_bytes() {
-        let r = journal_record_cross_turn_cache_hit("read_file".into(), 12, None);
+        let r = journal_record_cross_turn_cache_hit("read_file".into(), 12, None, None);
         assert_eq!(r.output_bytes, Some(12));
     }
 
     #[test]
     fn cache_hit_record_old_api_remains_source_compatible() {
-        let r = journal_record_cross_turn_cache_hit("read_file".into(), 12, None);
+        let r = journal_record_cross_turn_cache_hit("read_file".into(), 12, None, None);
         assert_eq!(r.output_bytes, Some(12));
         assert!(
             r.result_preview
@@ -257,7 +240,7 @@ mod tests {
         // hallucinating a `{}`-return bug.  The fix is to populate
         // `result_preview` with a synthetic explanatory string that
         // makes the cache-hit nature explicit.
-        let r = journal_record_cross_turn_cache_hit_with_body(
+        let r = journal_record_cross_turn_cache_hit(
             "read_file".into(),
             2000,
             Some("src/lib.rs".into()),
@@ -285,7 +268,7 @@ mod tests {
         // intact (no panic, no truncation, no replacement char).
         let body: String = "中".repeat(100);
         assert_eq!(body.len(), 300, "setup: 100 Han chars must be 300 bytes");
-        let r = journal_record_cross_turn_cache_hit_with_body(
+        let r = journal_record_cross_turn_cache_hit(
             "read_file".into(),
             body.len() as u32,
             None,
@@ -314,7 +297,7 @@ mod tests {
         let body: String = "中".repeat(200);
         assert_eq!(body.len(), 600, "setup: 200 Han chars must be 600 bytes");
 
-        let r = journal_record_cross_turn_cache_hit_with_body(
+        let r = journal_record_cross_turn_cache_hit(
             "read_file".into(),
             body.len() as u32,
             None,
@@ -393,6 +376,7 @@ mod tests {
             "read_file".into(),
             1024,
             Some("src/lib.rs".into()),
+            None,
         );
         let preview = r
             .result_preview
