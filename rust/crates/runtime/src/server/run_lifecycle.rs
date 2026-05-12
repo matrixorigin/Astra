@@ -145,6 +145,9 @@ async fn post_loop_memory_cleanup(
     }
     // ── Always: clear bridge seen-ledger for this session ──
     crate::turn::memory_seen_ledger::global().reset_session(session_id);
+    // And the tool-side seen store so LLM-driven recalls can see
+    // previously-surfaced memories on the next session for this id.
+    astra_tools::memoria::MemoriaClient::reset_seen(session_id);
 
     // ── Always: release extraction service's per-session debounce ──
     if let Some(svc) = extraction_service {

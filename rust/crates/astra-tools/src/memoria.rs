@@ -130,6 +130,23 @@ pub struct MemoriaClient {
     focus_store: RwLock<HashMap<String, Vec<FocusHint>>>,
 }
 
+/// Process-global "already surfaced" set for `recall` responses, keyed
+/// by session_id. Written when a recall response is decorated; read by
+/// the next recall in the same session to drop already-seen memory_ids.
+/// `MemoriaClient` is instantiated per-tool-call in production
+/// (see `server_tool_executor.rs`, `edge_tools/memoria.rs`), so a
+/// per-client `seen_store` would reset every call. Process-global gives
+/// real session-lifetime dedup. Paired with the runtime-side
+/// `memory_seen_ledger` which covers the prefetch path; both are
+/// cleared on session-end cleanup.
+static SEEN_STORE: std::sync::OnceLock<
+    RwLock<HashMap<String, std::collections::HashSet<String>>>,
+> = std::sync::OnceLock::new();
+
+fn seen_store() -> &'static RwLock<HashMap<String, std::collections::HashSet<String>>> {
+    SEEN_STORE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
 const MAX_FAILS: u32 = 2;
 
 impl MemoriaClient {
@@ -223,6 +240,48 @@ impl MemoriaClient {
         Vec::new()
     }
 
+    /// Record memory_ids surfaced to the LLM in a given session
+    /// (process-global store).
+    fn record_seen(session_id: &str, ids: impl IntoIterator<Item = String>) {
+        if session_id.is_empty() {
+            return;
+        }
+        let Ok(mut store) = seen_store().write() else {
+            return;
+        };
+        let bucket = store.entry(session_id.to_string()).or_default();
+        for id in ids {
+            if !id.is_empty() {
+                bucket.insert(id);
+            }
+        }
+    }
+
+    /// Snapshot surfaced ids for a session (process-global store);
+    /// caller drops the clone after use.
+    fn seen_snapshot(session_id: &str) -> std::collections::HashSet<String> {
+        if session_id.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        seen_store()
+            .read()
+            .ok()
+            .and_then(|g| g.get(session_id).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Clear the "already surfaced" set for a session. Intended for
+    /// session-end cleanup. Public so the runtime's session-end path
+    /// can keep tool-side state in lock-step with its own seen ledger.
+    pub fn reset_seen(session_id: &str) {
+        if session_id.is_empty() {
+            return;
+        }
+        if let Ok(mut g) = seen_store().write() {
+            g.remove(session_id);
+        }
+    }
+
     /// Inject focus hints into a `recall` payload. Called by the
     /// `call_with_timeout` path right before the HTTP send when `op ==
     /// "recall"`.
@@ -255,6 +314,74 @@ impl MemoriaClient {
         if !memory_ids.is_empty() {
             obj.insert("boost_memory_ids".into(), Value::Array(memory_ids));
         }
+    }
+
+    /// Post-process a `recall` response so the LLM gets the same two
+    /// signals the prefetch path gives it:
+    ///
+    /// 1. **Freshness suffix** appended to each memory's `content`
+    ///    (e.g. ` (this week)`, ` (stale — verify first)`) — derived
+    ///    from `observed_at`/`updated_at` and the memory's `trust_tier`.
+    /// 2. **Surface-once dedup**: memories whose `memory_id` already
+    ///    appeared in an earlier recall this session are dropped.
+    ///
+    /// Input `raw_text` is the HTTP body from Memoria's retrieve
+    /// endpoint — expected to be a top-level JSON array of memory
+    /// entries. Non-array bodies (error envelopes, etc.) pass through
+    /// unchanged so the LLM still sees the original error.
+    ///
+    /// Pure so the wiring + the decoration logic stay testable in
+    /// isolation. `seen` is the callers' snapshot of memory_ids
+    /// previously surfaced; `newly_surfaced` receives the ids in the
+    /// final (post-filter) output so the caller can record them.
+    pub fn decorate_recall_response(
+        raw_text: &str,
+        seen: &std::collections::HashSet<String>,
+        newly_surfaced: &mut Vec<String>,
+    ) -> String {
+        let Ok(mut parsed) = serde_json::from_str::<Value>(raw_text) else {
+            return raw_text.to_string();
+        };
+        let Some(arr) = parsed.as_array_mut() else {
+            return raw_text.to_string();
+        };
+        arr.retain(|item| {
+            let id = item
+                .get("memory_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            id.is_empty() || !seen.contains(id)
+        });
+        for item in arr.iter_mut() {
+            let id = item
+                .get("memory_id")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let days = item
+                .get("observed_at")
+                .or_else(|| item.get("updated_at"))
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339_days_ago);
+            let trust_tier = item
+                .get("trust_tier")
+                .and_then(Value::as_str)
+                .map(String::from);
+            if let Some(days) = days {
+                let suffix = astra_turn_types::freshness_suffix_for(days, trust_tier.as_deref());
+                if !suffix.is_empty()
+                    && let Some(content) = item.get_mut("content")
+                    && let Some(c) = content.as_str()
+                {
+                    *content = Value::String(format!("{c}{suffix}"));
+                }
+            }
+            if let Some(id) = id
+                && !id.is_empty()
+            {
+                newly_surfaced.push(id);
+            }
+        }
+        serde_json::to_string(&parsed).unwrap_or_else(|_| raw_text.to_string())
     }
 
     /// Builds a tool result that confirms purge success to the agent.
@@ -448,7 +575,7 @@ impl MemoriaClient {
             self.apply_focus_hints(sid, &mut payload);
         }
 
-        match reqwest::Client::builder()
+        let raw_text = match reqwest::Client::builder()
             .timeout(timeout)
             .no_proxy()
             .build()
@@ -482,7 +609,23 @@ impl MemoriaClient {
                 }
             }
             Err(e) => json!({"error": format!("build client: {e}")}).to_string(),
+        };
+
+        // Post-process recall responses with freshness suffixes + surface-
+        // once dedup so LLM-driven recalls carry the same signals as the
+        // bridge-side prefetch path. Other verbs pass through verbatim.
+        if op == "recall" {
+            let session_id = args.get("session_id").and_then(Value::as_str).unwrap_or("");
+            let seen = Self::seen_snapshot(session_id);
+            let mut newly_surfaced = Vec::new();
+            let decorated =
+                Self::decorate_recall_response(&raw_text, &seen, &mut newly_surfaced);
+            if !newly_surfaced.is_empty() {
+                Self::record_seen(session_id, newly_surfaced);
+            }
+            return decorated;
         }
+        raw_text
     }
 
     /// Boost search: best-effort memory lookup on the critical path.
@@ -972,6 +1115,41 @@ impl MemoriaClient {
             ),
         }
     }
+}
+
+/// Very small RFC3339-ish parser: returns "days since" for a timestamp
+/// of the form `YYYY-MM-DDTHH:MM:SSZ` (or any prefix with a valid
+/// `YYYY-MM-DD`). Returns `None` on malformed input or future dates.
+fn parse_rfc3339_days_ago(ts: &str) -> Option<i64> {
+    let date_part = ts.get(..10)?;
+    let mut parts = date_part.split('-');
+    let y: i32 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    let date_days = days_from_civil(y, m, d)?;
+    let now_days = days_from_civil_now()?;
+    let diff = now_days - date_days;
+    if diff < 0 { None } else { Some(diff) }
+}
+
+fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i64> {
+    if !(1..=12).contains(&m) || d == 0 || d > 31 {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y } as i64;
+    let era = y.div_euclid(400);
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * if m > 2 { m - 3 } else { m + 9 } as i64 + 2) / 5 + d as i64 - 1;
+    let doe = yoe as i64 * 365 + (yoe / 4) as i64 - (yoe / 100) as i64 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+fn days_from_civil_now() -> Option<i64> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some(secs / 86_400)
 }
 
 /// Given the `memories` array from a Memoria retrieve response, return
@@ -1670,5 +1848,143 @@ mod memoria_http_client_tests {
         let enriched = MemoriaClient::purge_result_to_agent_response(&raw, "session:abc");
         assert_eq!(enriched["deleted_count"], 0);
         assert!(enriched["message"].as_str().unwrap().contains("0 deleted"));
+    }
+
+    // ── P6: decorate_recall_response (freshness + surface-once) ────────
+
+    fn days_ago_ts(days: i64) -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let total_days = secs / 86_400 - days;
+        // Inverse Howard-Hinnant
+        let z = total_days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = (z - era * 146_097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+        let y = if m <= 2 { y + 1 } else { y };
+        format!("{y:04}-{m:02}-{d:02}T00:00:00Z")
+    }
+
+    #[test]
+    fn decorate_recall_appends_freshness_suffix_per_memory() {
+        use super::*;
+        let raw = serde_json::json!([
+            {
+                "memory_id": "m1",
+                "content": "fresh memory",
+                "observed_at": days_ago_ts(0),
+                "trust_tier": "T1",
+            },
+            {
+                "memory_id": "m2",
+                "content": "mid memory",
+                "observed_at": days_ago_ts(10),
+                "trust_tier": "T3",
+            },
+            {
+                "memory_id": "m3",
+                "content": "stale memory",
+                "observed_at": days_ago_ts(200),
+                "trust_tier": "T3",
+            },
+        ])
+        .to_string();
+        let seen = std::collections::HashSet::new();
+        let mut newly = Vec::new();
+        let out = MemoriaClient::decorate_recall_response(&raw, &seen, &mut newly);
+        let arr: Vec<Value> = serde_json::from_str(&out).unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(
+            arr[0]["content"].as_str().unwrap(),
+            "fresh memory",
+            "≤1 day → no suffix"
+        );
+        let c2 = arr[1]["content"].as_str().unwrap();
+        assert!(
+            c2.ends_with(" (within the two months)"),
+            "T3 10d bucket mismatch: {c2}"
+        );
+        let c3 = arr[2]["content"].as_str().unwrap();
+        assert!(
+            c3.ends_with(" (stale — verify first)"),
+            "T3 200d → stale, got {c3}"
+        );
+        assert_eq!(newly, vec!["m1", "m2", "m3"]);
+    }
+
+    #[test]
+    fn decorate_recall_filters_already_surfaced_ids() {
+        use super::*;
+        let raw = serde_json::json!([
+            {"memory_id": "m-seen", "content": "old one"},
+            {"memory_id": "m-new", "content": "new one"},
+        ])
+        .to_string();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert("m-seen".to_string());
+        let mut newly = Vec::new();
+        let out = MemoriaClient::decorate_recall_response(&raw, &seen, &mut newly);
+        let arr: Vec<Value> = serde_json::from_str(&out).unwrap();
+        assert_eq!(arr.len(), 1, "seen id must be filtered");
+        assert_eq!(arr[0]["memory_id"].as_str(), Some("m-new"));
+        assert_eq!(newly, vec!["m-new"], "only surviving ids recorded");
+    }
+
+    #[test]
+    fn decorate_recall_passes_through_non_array_bodies() {
+        use super::*;
+        let err = r#"{"error": "server down"}"#;
+        let seen = std::collections::HashSet::new();
+        let mut newly = Vec::new();
+        let out = MemoriaClient::decorate_recall_response(err, &seen, &mut newly);
+        assert_eq!(out, err);
+        assert!(newly.is_empty());
+    }
+
+    #[test]
+    fn decorate_recall_passes_through_invalid_json() {
+        use super::*;
+        let bad = "not json at all";
+        let seen = std::collections::HashSet::new();
+        let mut newly = Vec::new();
+        let out = MemoriaClient::decorate_recall_response(bad, &seen, &mut newly);
+        assert_eq!(out, bad);
+    }
+
+    #[test]
+    fn decorate_recall_empty_array_is_noop() {
+        use super::*;
+        let seen = std::collections::HashSet::new();
+        let mut newly = Vec::new();
+        let out = MemoriaClient::decorate_recall_response("[]", &seen, &mut newly);
+        let arr: Vec<Value> = serde_json::from_str(&out).unwrap();
+        assert!(arr.is_empty());
+        assert!(newly.is_empty());
+    }
+
+    #[test]
+    fn seen_store_is_isolated_across_sessions() {
+        use super::*;
+        // Use unique session names so tests running concurrently don't
+        // poison each other via the process-global store.
+        MemoriaClient::record_seen("p6-seen-isolation-a", ["m1".into()]);
+        assert!(MemoriaClient::seen_snapshot("p6-seen-isolation-a").contains("m1"));
+        assert!(MemoriaClient::seen_snapshot("p6-seen-isolation-b").is_empty());
+        MemoriaClient::reset_seen("p6-seen-isolation-a");
+    }
+
+    #[test]
+    fn reset_seen_clears_session_state() {
+        use super::*;
+        MemoriaClient::record_seen("p6-reset-sess", ["m1".into(), "m2".into()]);
+        MemoriaClient::reset_seen("p6-reset-sess");
+        assert!(MemoriaClient::seen_snapshot("p6-reset-sess").is_empty());
     }
 }
