@@ -247,15 +247,15 @@ const WHEN_TO_ACCESS: &str = "\
 
 const BEFORE_RECOMMENDING: &str = "\
 ### Before recommending from memory
-A memory is a claim about what was true *when it was written*. Freshness hints (\
- `(N days ago)`, `(N days ago — verify first)`) appear on each memory in the \
- `<session_memory>` block — respect them:
+A memory is a claim about what was true *when it was written*. Freshness hints \
+(`(this week)`, `(within the month)`, `(within the year)`, `(stale — verify first)`) \
+appear on each memory in the `<session_memory>` block — respect them:
 
 - If it names a file path: check the file exists before citing it.
 - If it names a function or flag: grep for it.
-- If the suffix says `verify first` (past the tier half-life) OR the memory conflicts \
-  with current state: trust what you observe now and call `memory(action=update, \
-  memory_id=..., content=...)` to correct the stale record.
+- If the suffix says `stale — verify first` (past the tier half-life) OR the memory \
+  conflicts with current state: trust what you observe now and call \
+  `memory(action=update, memory_id=..., content=...)` to correct the stale record.
 - A memory that cites `[project]` or `[episode]` content is a snapshot of past work; \
   prefer `git log` / reading current files for anything about *current* repo state.\n";
 

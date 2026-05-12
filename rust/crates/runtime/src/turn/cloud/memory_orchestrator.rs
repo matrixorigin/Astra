@@ -869,9 +869,9 @@ mod tests {
     // ── Prompt block carries freshness suffix for old memories ─────
 
     #[test]
-    fn session_start_block_renders_freshness_for_stale_memory() {
+    fn session_start_block_renders_bucketed_freshness_for_recent_memory() {
         let mut m = memory("m1", "profile", "user is a data scientist");
-        // 10 days ago, T1 tier (365-day half-life) → "10 days ago", no verify.
+        // 10 days ago, T1 tier (365-day half-life) → "within the year" bucket.
         let ts = chrono::Utc::now() - chrono::Duration::days(10);
         m.observed_at = Some(ts.to_rfc3339());
         m.trust_tier = Some("T1".into());
@@ -881,16 +881,16 @@ mod tests {
         };
         let block = bundle.to_prompt_block().expect("non-empty");
         assert!(
-            block.contains("10 days ago"),
-            "freshness label missing: {block}"
+            block.contains("within the year"),
+            "bucket label missing: {block}"
         );
-        assert!(!block.contains("verify first"));
+        assert!(!block.contains("stale"));
     }
 
     #[test]
-    fn session_start_block_marks_verify_first_past_half_life() {
+    fn session_start_block_marks_stale_past_half_life() {
         let mut m = memory("m1", "episodic", "[episode] last session fix");
-        // 120 days ago, default T3 tier (60-day half-life) → verify.
+        // 120 days ago, default T3 tier (60-day half-life) → stale.
         let ts = chrono::Utc::now() - chrono::Duration::days(120);
         m.observed_at = Some(ts.to_rfc3339());
         // No trust_tier → defaults to T3 treatment in the formatter.
@@ -899,10 +899,9 @@ mod tests {
             ..Default::default()
         };
         let block = bundle.to_prompt_block().expect("non-empty");
-        assert!(block.contains("120 days ago"), "age label missing: {block}");
         assert!(
-            block.contains("verify first"),
-            "verify-first hint missing past half-life: {block}"
+            block.contains("stale — verify first"),
+            "stale bucket missing past half-life: {block}"
         );
     }
 

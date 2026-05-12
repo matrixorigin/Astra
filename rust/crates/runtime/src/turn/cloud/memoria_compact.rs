@@ -328,32 +328,17 @@ impl MemoriaMemory {
     }
 
     /// Append-friendly freshness marker for compact memory renderings.
-    /// Empty for fresh memories (≤ 1 day); otherwise a space-prefixed
-    /// ` (N days ago)` or, past the stale threshold, a
-    /// ` (N days ago — verify first)` hint that tells the LLM to
-    /// re-check before citing.
+    ///
+    /// Routes through [`astra_turn_types::freshness_suffix_for`] so the
+    /// runtime-side and types-side renderings stay byte-for-byte
+    /// identical. Bucketed (`(this week)` / `(within the month)` /
+    /// `(stale — verify first)`) rather than exact-day to keep prompt
+    /// cache stable across midnight UTC; see the helper's rustdoc.
     pub fn freshness_suffix(&self) -> String {
         let Some(days) = self.age_days() else {
             return String::new();
         };
-        if days <= 1 {
-            return String::new();
-        }
-        // "Verify first" threshold: default half-life boundary for the
-        // trust tier the memory carries (or T3 default = 60 days when
-        // the tier is unknown). Past this, the point-in-time observation
-        // is likely stale and the LLM should re-check.
-        let half_life = match self.trust_tier.as_deref() {
-            Some("T1") => 365,
-            Some("T2") => 180,
-            Some("T4") => 30,
-            _ => 60, // T3 default
-        };
-        if days >= half_life {
-            format!(" ({days} days ago — verify first)")
-        } else {
-            format!(" ({days} days ago)")
-        }
+        astra_turn_types::freshness_suffix_for(days, self.trust_tier.as_deref())
     }
 }
 

@@ -75,27 +75,52 @@ impl RankableMemory {
         parse_rfc3339_days_ago(ts)
     }
 
-    /// Compact freshness suffix. Empty for fresh memories (≤ 1 day);
-    /// otherwise ` (N days ago)` or, past the tier half-life,
-    /// ` (N days ago — verify first)`.
+    /// Compact freshness suffix.
+    ///
+    /// Bucketed, not exact-day, so the prompt cache is stable across
+    /// midnight boundaries — the label only flips when a memory
+    /// actually crosses into the next freshness bucket (~once per
+    /// week / once per half-life). An exact-days label would re-render
+    /// every day for every memory and invalidate cached blocks daily.
+    ///
+    /// Buckets:
+    /// - `≤ 1 day`  → empty (fresh enough to trust)
+    /// - `≤ 7 days` → ` (this week)`
+    /// - `≤ half-life` → ` (this month)` or ` (this year)` etc. — see
+    ///   [`tier_mid_label`]
+    /// - `> half-life` → ` (stale — verify first)`
     pub fn freshness_suffix(&self) -> String {
         let Some(days) = self.age_days() else {
             return String::new();
         };
-        if days <= 1 {
-            return String::new();
-        }
-        let half_life = match self.trust_tier.as_deref() {
-            Some("T1") => 365,
-            Some("T2") => 180,
-            Some("T4") => 30,
-            _ => 60, // T3 default when tier unknown
-        };
-        if days >= half_life {
-            format!(" ({days} days ago — verify first)")
-        } else {
-            format!(" ({days} days ago)")
-        }
+        freshness_suffix_for(days, self.trust_tier.as_deref())
+    }
+}
+
+/// Pure helper so both `RankableMemory::freshness_suffix` and the
+/// runtime-side `MemoriaMemory::freshness_suffix` share the exact
+/// same bucket boundaries + labels.
+pub fn freshness_suffix_for(days: i64, trust_tier: Option<&str>) -> String {
+    if days <= 1 {
+        return String::new();
+    }
+    let (half_life, mid_label) = tier_params(trust_tier);
+    if days > half_life {
+        return " (stale — verify first)".to_string();
+    }
+    if days <= 7 {
+        return " (this week)".to_string();
+    }
+    format!(" ({mid_label})")
+}
+
+fn tier_params(trust_tier: Option<&str>) -> (i64, &'static str) {
+    match trust_tier {
+        Some("T1") => (365, "within the year"),
+        Some("T2") => (180, "within the half-year"),
+        Some("T4") => (30, "within the month"),
+        // T3 default when tier unknown.
+        _ => (60, "within the two months"),
     }
 }
 
@@ -250,33 +275,59 @@ mod tests {
     }
 
     #[test]
-    fn freshness_suffix_emits_n_days_ago() {
-        // 10 days ago — under the T3 half-life (60), no verify hint.
-        let ts = chrono_like_days_ago(10);
+    fn freshness_suffix_reports_this_week_under_7_days() {
+        // 5 days ago → within-week bucket, no exact day count (cache-stable).
+        let ts = chrono_like_days_ago(5);
         let m = mem_with_observed("m", &ts, Some("T3"));
-        let s = m.freshness_suffix();
-        assert!(s.contains("10 days ago"), "got: {s:?}");
-        assert!(!s.contains("verify first"));
+        assert_eq!(m.freshness_suffix(), " (this week)");
     }
 
     #[test]
-    fn freshness_suffix_adds_verify_hint_past_half_life() {
-        // 120 days ago — past T3's 60-day half-life.
+    fn freshness_suffix_stale_past_half_life() {
+        // 120 days ago — past T3's 60-day half-life → stale/verify.
         let ts = chrono_like_days_ago(120);
         let m = mem_with_observed("m", &ts, Some("T3"));
-        let s = m.freshness_suffix();
-        assert!(s.contains("120 days ago"));
-        assert!(s.contains("verify first"), "got: {s:?}");
+        assert_eq!(m.freshness_suffix(), " (stale — verify first)");
     }
 
     #[test]
     fn freshness_suffix_respects_trust_tier_half_life() {
-        // 100 days ago. T1 (365d half-life) → no verify hint; T4 (30d) → verify.
+        // 100 days ago. T1 (365d half-life) → mid bucket; T4 (30d) → stale.
         let ts = chrono_like_days_ago(100);
         let t1 = mem_with_observed("m", &ts, Some("T1"));
         let t4 = mem_with_observed("m", &ts, Some("T4"));
-        assert!(!t1.freshness_suffix().contains("verify"));
-        assert!(t4.freshness_suffix().contains("verify"));
+        assert!(!t1.freshness_suffix().contains("stale"));
+        assert_eq!(t4.freshness_suffix(), " (stale — verify first)");
+    }
+
+    #[test]
+    fn freshness_suffix_is_bucket_stable_across_days() {
+        // Two timestamps within the same bucket must render identical
+        // bytes. Day 2 and day 6 are both "this week" under T3.
+        let ts_a = chrono_like_days_ago(2);
+        let ts_b = chrono_like_days_ago(6);
+        let a = mem_with_observed("m", &ts_a, Some("T3"));
+        let b = mem_with_observed("m", &ts_b, Some("T3"));
+        assert_eq!(
+            a.freshness_suffix(),
+            b.freshness_suffix(),
+            "day-2 and day-6 must share the `this week` bucket"
+        );
+    }
+
+    #[test]
+    fn freshness_suffix_includes_no_exact_day_count() {
+        // Regression: no suffix may include a raw day number — that was
+        // the cache-churn source the bucket scheme replaced.
+        for d in [2_i64, 5, 10, 30, 100, 365, 1000] {
+            let ts = chrono_like_days_ago(d);
+            let m = mem_with_observed("m", &ts, Some("T1"));
+            let s = m.freshness_suffix();
+            assert!(
+                !s.chars().any(|c| c.is_ascii_digit()),
+                "suffix must be digit-free for day={d}: {s:?}"
+            );
+        }
     }
 
     fn chrono_like_today() -> String {
