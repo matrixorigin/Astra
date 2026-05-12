@@ -1,54 +1,49 @@
 # Memory System Documentation
 
-> Two memory backends, one protocol interface. Pick the right one for your use case.
+> **Canonical reference**: [../memory-runtime.md](../memory-runtime.md)
 
 ---
 
-## Architecture
+## Canonical docs (current, Rust runtime)
 
-```
-                    ┌──────────────────────────┐
-                    │   MemoryReader Protocol   │
-                    │   MemoryWriter Protocol   │
-                    │   MemoryAdmin Protocol    │
-                    └────────────┬─────────────┘
-                                 │
-                    ┌────────────┴─────────────┐
-                    │     create_memory_service │
-                    │     (factory.py)          │
-                    └────┬──────────────┬──────┘
-                         │              │
-              ┌──────────▼──┐    ┌──────▼──────────┐
-              │   tabular   │    │      graph       │
-              │  backend    │    │     backend      │
-              │             │    │                  │
-              │ flat table  │    │ directed graph   │
-              │ vector+FTS  │    │ spreading activ. │
-              │ observer    │    │ 3-phase reflect  │
-              └─────────────┘    └─────────────────┘
-```
+The `astra-engine` memory runtime is documented end-to-end in
+[../memory-runtime.md](../memory-runtime.md). That single file covers:
 
-## Documents
+- Session start → per-turn recall → session-end governance loop
+- The `memory(action=...)` tool surface (9 cognitive verbs, schema, wire path)
+- Write paths: LLM-driven `remember`, background extraction, session-end
+- Read paths: session prewarm, `<memory_index>`, per-turn hybrid recall, LLM `recall` decoration
+- Freshness buckets, trust tiers, cache lanes (stable vs volatile)
+- Seen-ledger dedup (bridge + tool side)
+- Debounced governance, scene forward-feeding, auto-snapshot safety net
+- Team visibility via `astra:team:<id>` tag encoding
+- Environment variables, troubleshooting, source pointers
 
-| Document | What It Covers | When to Read |
-|---|---|---|
-| [memory-overview.md](memory-overview.md) | Cognitive architecture, 5-layer model, context engineering, ownership/privacy, lifecycle governance, protocol interfaces | Understanding the overall memory design |
-| [tabular-memory.md](tabular-memory.md) | `memories` table, vector+fulltext retrieval, observer, pollution detection, context snapshots, tool context engine | Working on the tabular backend (`core/memory/tabular/`) |
-| [graph-memory.md](graph-memory.md) | `memory_graph_nodes`, spreading activation, 3-phase lifecycle (perceive/consolidate/reflect), tiered graph loading | Working on the graph backend (`core/memory/graph/`) |
-| [intent-driven-loading.md](intent-driven-loading.md) | Task type → memory mode mapping, Tier 0/1 classification, token reduction | Working on context-layer memory loading optimization |
-| [backend-coexistence.md](backend-coexistence.md) | Factory design, directory layout, migration path, testing strategy | Understanding how tabular/graph coexist |
-| [mo-memory-mcp.md](mo-memory-mcp.md) | MCP server, CLI (`init`/`migrate`/`status`), IDE integration, standalone deployment | Setting up or deploying mo-memory for AI tools |
+See also:
+- [../session-memory-protocol.md](../session-memory-protocol.md) —
+  upstream L0/L1/L2 session memory pyramid (in-session context, distinct
+  from cross-session Memoria storage).
 
-## Quick Reference
+---
 
-| Aspect | Tabular Backend | Graph Backend |
-|---|---|---|
-| Data model | Flat rows in `memories` table | Typed directed graph in `memory_graph_nodes` |
-| Retrieval | Vector similarity + fulltext + temporal + confidence | Spreading activation over graph edges |
-| Write path | Observer → sensitivity filter → contradiction check → store | GraphBuilder → node + edge extraction → batch insert |
-| Consolidation | SessionSummarizer (incremental + full) | 3-phase: perceive → consolidate → reflect |
-| Reflection | ✅ Shared `ReflectionEngine` + `TabularCandidateProvider` | ✅ Shared `ReflectionEngine` + `GraphCandidateProvider` |
-| Governance | Hourly/daily/weekly cleanup cycles | Same + orphan detection + edge pruning |
-| Multi-hop | ❌ Single-hop vector search | ✅ 2-3 hop activation propagation |
-| Maturity | ✅ Production (820+ tests) | 🔵 Design complete, implementation planned |
-| Config key | `memory_backend = "tabular"` | `memory_backend = "graph"` |
+## Legacy Python-era docs (historical reference only)
+
+The files in *this* directory describe an earlier Python design
+(tabular + graph backends, protocol-based factory, Python
+`SessionSummarizer`). That architecture has been replaced by the
+current Rust runtime. These files are retained for historical context
+and for the ideas that carried over (tier-weighted decay, governance
+scheduling, 3-phase reflect), but they do NOT reflect how
+`astra-engine` works today:
+
+| Legacy document | Status |
+|---|---|
+| [memory-overview.md](memory-overview.md) | Historical — Python-era 5-layer model |
+| [tabular-memory.md](tabular-memory.md) | Historical — replaced by Memoria HTTP |
+| [graph-memory.md](graph-memory.md) | Historical — graph backend not in Rust runtime |
+| [intent-driven-loading.md](intent-driven-loading.md) | Historical — Python-era Tier 0/1 classification |
+| [backend-coexistence.md](backend-coexistence.md) | Obsolete — factory model retired |
+| [mo-memory-mcp.md](mo-memory-mcp.md) | Historical — Memoria MCP server docs |
+
+For the current Memoria HTTP server integration, refer to the Memoria
+project documentation directly.

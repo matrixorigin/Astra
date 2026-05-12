@@ -35,7 +35,9 @@ Welcome to astra documentation! This guide will help you find the information yo
 **Understand the system design:**
 
 - [Architecture](design/ARCHITECTURE.md) - System overview and data flow
-- [Memory Architecture](design/memory/README.md) - Cognitive memory and context engineering
+- [Memory Runtime](design/memory-runtime.md) - End-to-end cross-session memory loop (prewarm, recall, update, governance, forward-feed scenes) on the current Rust runtime
+- [Session Memory Protocol](design/session-memory-protocol.md) - In-session L0/L1/L2 context pyramid (upstream of Memoria)
+- [Memory Architecture (legacy)](design/memory/README.md) - Historical Python-era design, retained for context
 - [Context Window Management](design/context-window-management.md) - Token budgets, history compression, procedural memory injection
 - [Tool Result Quality Firewall](design/tool-result-quality-firewall.md) - Pre-LLM tool result quality assessment and annotation
 - [Trust and Safety](design/trust-and-safety.md) - Audit, guardrails, and robustness
