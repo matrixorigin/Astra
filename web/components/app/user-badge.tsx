@@ -45,7 +45,7 @@ export function UserBadge({ user, collapsed }: { user: UserSummary; collapsed?: 
         throw new Error(body.error ?? `Sign out failed: ${response.status}`);
       }
 
-      router.push('/login?next=/');
+      router.push('/');
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Sign out failed.');

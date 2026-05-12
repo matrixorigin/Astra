@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE } from '@/lib/runtime-config';
 
-const PUBLIC_PAGE_PATHS = new Set(['/login', '/register']);
+const PUBLIC_PAGE_PATHS = new Set(['/', '/login', '/register']);
 
 const PUBLIC_API_PATHS = new Set([
   '/api/runtime-config',

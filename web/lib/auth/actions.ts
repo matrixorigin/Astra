@@ -107,7 +107,7 @@ export async function logoutAction(): Promise<void> {
 
   cookieStore.delete(ACCESS_TOKEN_COOKIE);
   cookieStore.delete(REFRESH_TOKEN_COOKIE);
-  redirect('/login');
+  redirect('/');
 }
 
 export async function refreshTokenAction(): Promise<ActionResult> {

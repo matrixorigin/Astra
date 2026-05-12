@@ -68,6 +68,8 @@ type BackendTranscriptItemResponse = {
   run_id?: string | null;
   role?: string;
   content?: string;
+  reasoning?: string | null;
+  reasoning_status?: string | null;
   created_at?: string;
 };
 
@@ -889,11 +891,19 @@ function transcriptItemToMessage(chatId: string, item: BackendTranscriptItemResp
   if (item.role !== 'user' && item.role !== 'assistant' && item.role !== 'system') {
     return null;
   }
+  const reasoning = typeof item.reasoning === 'string' ? item.reasoning.trim() : '';
+  const reasoningStatus = item.reasoning_status === 'streaming' || item.reasoning_status === 'complete'
+    ? item.reasoning_status
+    : reasoning
+      ? 'complete'
+      : undefined;
 
   return {
     id: `${chatId}:${item.item_seq}`,
     role: item.role,
     content: item.content,
+    reasoning: reasoning || undefined,
+    reasoningStatus,
     createdAt: item.created_at ?? nowIso(),
     status: 'complete',
   };

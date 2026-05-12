@@ -1702,13 +1702,30 @@ fn merge_cancelled_run_events(run: &mut RunState, mut finalized_events: Vec<Valu
     }
 }
 
+fn durable_event_type(event: &Value) -> Option<&str> {
+    event
+        .get("event_type")
+        .or_else(|| event.get("type"))
+        .and_then(Value::as_str)
+}
+
 fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
     events
         .iter()
         .filter(|event| {
             matches!(
-                event.get("event_type").and_then(Value::as_str),
-                Some("text_done" | "run_error" | "run_interrupted" | "run_finished")
+                durable_event_type(event),
+                Some(
+                    "text_done"
+                        | "run_error"
+                        | "run_interrupted"
+                        | "run_finished"
+                        | "reasoning_delta"
+                        | "reasoning_message_content"
+                        | "reasoning_done"
+                        | "thinking_delta"
+                        | "thinking_done"
+                )
             )
         })
         .cloned()
@@ -5497,16 +5514,20 @@ mod tests {
     fn terminal_events_for_persistence_keeps_only_terminal_lifecycle_events() {
         let events = vec![
             json!({"event_type": "text_delta", "data": {"chunk": "hi"}}),
+            json!({"type": "reasoning_delta", "content": "thinking"}),
+            json!({"type": "reasoning_done"}),
             json!({"event_type": "text_done", "data": {"full_text": "final answer"}}),
             json!({"event_type": "run_error", "data": {"error": "boom"}}),
             json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
         ];
 
         let persisted = terminal_events_for_persistence(&events);
-        assert_eq!(persisted.len(), 3);
-        assert_eq!(persisted[0]["event_type"], "text_done");
-        assert_eq!(persisted[1]["event_type"], "run_error");
-        assert_eq!(persisted[2]["event_type"], "run_finished");
+        assert_eq!(persisted.len(), 5);
+        assert_eq!(persisted[0]["type"], "reasoning_delta");
+        assert_eq!(persisted[1]["type"], "reasoning_done");
+        assert_eq!(persisted[2]["event_type"], "text_done");
+        assert_eq!(persisted[3]["event_type"], "run_error");
+        assert_eq!(persisted[4]["event_type"], "run_finished");
     }
 
     #[tokio::test]

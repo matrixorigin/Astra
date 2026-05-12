@@ -199,15 +199,22 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   }), [chatListHref, detail.chat.id, isArchived, router]);
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden">
-      <header className="flex min-h-16 shrink-0 items-center gap-4 border-b border-border px-8">
+    <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-bg">
+      <header className="relative z-10 flex min-h-[58px] shrink-0 items-center gap-4 border-b border-border/60 bg-bg/85 px-7 backdrop-blur">
         <Link
           href={detail.chat.projectId ? `/projects/${detail.chat.projectId}` : '/chats'}
-          className="text-sm text-text-secondary hover:text-text"
+          className="inline-flex items-center gap-1 text-[13px] text-text-muted transition-colors hover:text-text"
         >
           ← {detail.project?.name ?? 'Chats'}
         </Link>
-        <h1 className="min-w-0 flex-1 truncate text-base font-semibold">{detail.chat.title ?? 'Untitled'}</h1>
+        <div className="min-w-0">
+          <h1 className="truncate text-sm font-semibold tracking-[-0.01em]">{detail.chat.title ?? 'Untitled'}</h1>
+          <div className="mt-0.5 flex items-center gap-1.5 text-xs text-text-muted">
+            <span className="size-1.5 rounded-full bg-success" />
+            <span>{isArchived ? 'Archived' : 'Active'} · {detail.chat.model ?? 'Default model'}</span>
+          </div>
+        </div>
+        <div className="min-w-0 flex-1" />
         {detail.chat.archivedAt ? (
           <span className="rounded-full bg-surface-muted px-2 py-1 text-xs font-medium text-text-muted">
             Archived
@@ -220,7 +227,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           afterMutationHref={chatListHref}
           onMove={() => setMoveOpen(true)}
           onChatUpdated={setDetail}
-          trigger={<IconButton icon={MoreVertical} label="Chat menu" />}
+          trigger={<IconButton icon={MoreVertical} label="Chat menu" className="size-8" />}
         />
       </header>
 
@@ -232,13 +239,13 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         }}
         className="min-h-0 flex-1 overscroll-contain overflow-y-auto scroll-smooth"
       >
-        <div className="mx-auto w-full max-w-composer px-6 py-4 pb-8">
+        <div className="mx-auto w-full max-w-[720px] px-7 pb-44 pt-10">
           {detail.messages.map((message) => <MessageBubble key={message.id} message={message} />)}
         </div>
       </div>
 
-      <div className="shrink-0 bg-bg px-4 pb-3 pt-4 md:px-6">
-        <div className="mx-auto max-w-composer">
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 bg-gradient-to-t from-bg via-bg/95 to-bg/0 px-7 pb-6 pt-12">
+        <div className="pointer-events-auto mx-auto max-w-[720px]">
           {isArchived ? (
             <div className="rounded-[20px] border border-border bg-surface px-5 py-4 shadow-[0_0.25rem_1.25rem_rgba(28,25,23,0.06),0_0_0_0.5px_rgba(120,113,108,0.18)]">
               <div className="flex items-center justify-between gap-4">

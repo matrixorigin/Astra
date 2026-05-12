@@ -5,8 +5,10 @@ use astra_services::{
     SessionArtifactJsonStore, UserAnchorMemoryItem, build_presigned_artifact_download,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::Row;
+use sqlx::{QueryBuilder, Row};
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 const DEFAULT_TRANSCRIPT_LIMIT: u32 = 50;
@@ -94,7 +96,43 @@ pub(super) struct TranscriptItemResponse {
     pub run_id: Option<String>,
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_status: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TranscriptReasoningProjection {
+    text: String,
+    done: bool,
+}
+
+impl TranscriptReasoningProjection {
+    fn append_delta(&mut self, delta: &str) {
+        if delta.is_empty() || self.text.ends_with(delta) {
+            return;
+        }
+        if !self.text.is_empty() && delta.starts_with(&self.text) {
+            self.text.clear();
+        }
+        self.text.push_str(delta);
+    }
+
+    fn reasoning(&self) -> Option<String> {
+        let trimmed = self.text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
+    fn status(&self) -> Option<String> {
+        self.reasoning()
+            .map(|_| if self.done { "complete" } else { "streaming" }.to_string())
+    }
 }
 
 #[derive(Serialize)]
@@ -374,15 +412,46 @@ pub(super) async fn get_session_transcript_handler(
     .await
     .map_err(internal_error)?;
 
+    let run_ids = transcript_assistant_run_ids(&rows);
+    let reasoning_by_run = load_transcript_reasoning_by_run(pool, &session_id, &run_ids)
+        .await
+        .map_err(|error| {
+            internal_error(format!(
+                "load transcript reasoning failed for session {session_id}: {error}"
+            ))
+        })?;
+
     let mut items = rows
         .into_iter()
-        .map(|row| TranscriptItemResponse {
-            session_id: row.try_get("session_id").unwrap_or_default(),
-            item_seq: row.try_get("item_seq").unwrap_or_default(),
-            run_id: row.try_get("run_id").ok(),
-            role: row.try_get("role").unwrap_or_default(),
-            content: row.try_get("content").unwrap_or_default(),
-            created_at: row.try_get("created_at").unwrap_or_default(),
+        .map(|row| {
+            let run_id = row.try_get::<Option<String>, _>("run_id").ok().flatten();
+            let role = row.try_get::<String, _>("role").unwrap_or_default();
+            let reasoning = if role == "assistant" {
+                run_id
+                    .as_deref()
+                    .and_then(|id| reasoning_by_run.get(id))
+                    .and_then(TranscriptReasoningProjection::reasoning)
+            } else {
+                None
+            };
+            let reasoning_status = if role == "assistant" {
+                run_id
+                    .as_deref()
+                    .and_then(|id| reasoning_by_run.get(id))
+                    .and_then(TranscriptReasoningProjection::status)
+            } else {
+                None
+            };
+            TranscriptItemResponse {
+                session_id: row.try_get("session_id").unwrap_or_default(),
+                item_seq: row.try_get("item_seq").unwrap_or_default(),
+                run_id,
+                role,
+                content: row.try_get("content").unwrap_or_default(),
+                reasoning,
+                reasoning_status,
+                created_at: row.try_get("created_at").unwrap_or_default(),
+            }
         })
         .collect::<Vec<_>>();
     items.reverse();
@@ -394,6 +463,104 @@ pub(super) async fn get_session_transcript_handler(
         next_before_seq,
         has_more,
     }))
+}
+
+fn transcript_assistant_run_ids(rows: &[sqlx::mysql::MySqlRow]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut run_ids = Vec::new();
+    for row in rows {
+        let role = row.try_get::<String, _>("role").unwrap_or_default();
+        if role != "assistant" {
+            continue;
+        }
+        let Some(run_id) = row.try_get::<Option<String>, _>("run_id").ok().flatten() else {
+            continue;
+        };
+        if seen.insert(run_id.clone()) {
+            run_ids.push(run_id);
+        }
+    }
+    run_ids
+}
+
+async fn load_transcript_reasoning_by_run(
+    pool: &SharedPool,
+    session_id: &str,
+    run_ids: &[String],
+) -> Result<HashMap<String, TranscriptReasoningProjection>, sqlx::Error> {
+    if run_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut query = QueryBuilder::<sqlx::MySql>::new(
+        "SELECT run_id, payload_json
+         FROM agent_run_events
+         WHERE session_id = ",
+    );
+    query.push_bind(session_id);
+    query.push(" AND run_id IN (");
+    {
+        let mut separated = query.separated(", ");
+        for run_id in run_ids {
+            separated.push_bind(run_id);
+        }
+    }
+    query.push(
+        ") AND event_type IN (
+             'reasoning_delta',
+             'reasoning_message_content',
+             'reasoning_done',
+             'thinking_delta',
+             'thinking_done'
+         )
+         ORDER BY run_id ASC, event_idx ASC",
+    );
+
+    let rows = query.build().fetch_all(pool.get()).await?;
+    let mut by_run: HashMap<String, TranscriptReasoningProjection> = HashMap::new();
+    for row in rows {
+        let run_id = row.try_get::<String, _>("run_id")?;
+        let payload_json = row.try_get::<String, _>("payload_json")?;
+        let payload = serde_json::from_str::<Value>(&payload_json).map_err(|error| {
+            sqlx::Error::Protocol(format!(
+                "invalid reasoning event payload for run {run_id}: {error}"
+            ))
+        })?;
+        let projection = by_run.entry(run_id).or_default();
+        apply_reasoning_event_payload(projection, &payload);
+    }
+    Ok(by_run)
+}
+
+fn apply_reasoning_event_payload(projection: &mut TranscriptReasoningProjection, payload: &Value) {
+    match reasoning_event_type(payload) {
+        Some("reasoning_delta" | "thinking_delta" | "reasoning_message_content") => {
+            if let Some(content) = reasoning_event_content(payload) {
+                projection.append_delta(content);
+            }
+        }
+        Some("reasoning_done" | "thinking_done") => {
+            projection.done = true;
+        }
+        _ => {}
+    }
+}
+
+fn reasoning_event_type(payload: &Value) -> Option<&str> {
+    payload
+        .get("event_type")
+        .or_else(|| payload.get("type"))
+        .and_then(Value::as_str)
+}
+
+fn reasoning_event_content(payload: &Value) -> Option<&str> {
+    payload
+        .get("content")
+        .and_then(Value::as_str)
+        .or_else(|| payload.pointer("/data/content").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/data/chunk").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/data/reasoning").and_then(Value::as_str))
+        .filter(|content| !content.trim().is_empty())
 }
 
 pub(super) async fn update_session_handler(
@@ -1307,6 +1474,9 @@ async fn load_device_lease_event_payloads(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use serde_json::json;
+
     #[test]
     fn session_artifact_handlers_enforce_session_scope_and_store_api() {
         let source = include_str!("session_handlers.rs");
@@ -1330,6 +1500,54 @@ mod tests {
             source.contains("build_presigned_artifact_download")
                 && !source.contains("serde_json::to_vec_pretty(&response)"),
             "artifact download handler should return a presigned URL without loading payload into API memory"
+        );
+    }
+
+    #[test]
+    fn reasoning_projection_collects_sse_reasoning_events() {
+        let mut projection = TranscriptReasoningProjection::default();
+        apply_reasoning_event_payload(
+            &mut projection,
+            &json!({"type": "reasoning_delta", "content": "checking "}),
+        );
+        apply_reasoning_event_payload(
+            &mut projection,
+            &json!({"type": "reasoning_delta", "content": "context"}),
+        );
+        apply_reasoning_event_payload(&mut projection, &json!({"type": "reasoning_done"}));
+
+        assert_eq!(
+            projection.reasoning().as_deref(),
+            Some("checking context"),
+            "transcript hydration should reconstruct persisted reasoning deltas in event order"
+        );
+        assert_eq!(
+            projection.status().as_deref(),
+            Some("complete"),
+            "hydrated reasoning blocks should render as complete after persistence"
+        );
+    }
+
+    #[test]
+    fn reasoning_projection_reads_event_type_and_nested_content() {
+        let mut projection = TranscriptReasoningProjection::default();
+        apply_reasoning_event_payload(
+            &mut projection,
+            &json!({"event_type": "reasoning_message_content", "data": {"content": "nested reasoning"}}),
+        );
+        apply_reasoning_event_payload(
+            &mut projection,
+            &json!({"event_type": "thinking_done", "data": {}}),
+        );
+
+        assert_eq!(
+            projection.reasoning().as_deref(),
+            Some("nested reasoning"),
+            "reasoning hydration should support persisted event_type/data.content payloads"
+        );
+        assert!(
+            projection.done,
+            "thinking_done should mark the block complete"
         );
     }
 }

@@ -437,11 +437,11 @@ export function Composer({
         submit();
       }}
       className={cn(
-        'relative rounded-[20px] border border-transparent bg-surface shadow-[0_0.25rem_1.25rem_rgba(28,25,23,0.06),0_0_0_0.5px_rgba(120,113,108,0.22)] transition-shadow hover:shadow-[0_0.25rem_1.25rem_rgba(28,25,23,0.08),0_0_0_0.5px_rgba(120,113,108,0.32)] focus-within:shadow-[0_0.25rem_1.25rem_rgba(28,25,23,0.12),0_0_0_1px_rgb(var(--color-accent))]',
+        'relative rounded-[20px] border border-border bg-surface shadow-[0_4px_20px_rgba(28,25,23,0.04),0_1px_3px_rgba(28,25,23,0.06)] transition-[border-color,box-shadow] focus-within:border-border-strong focus-within:shadow-[0_4px_24px_rgba(28,25,23,0.08),0_0_0_3px_rgba(37,99,235,0.10)]',
         className,
       )}
     >
-      <div className="flex min-h-20 w-full flex-wrap items-start gap-x-1 gap-y-2 rounded-t-[20px] px-5 pb-3 pt-4 text-base">
+      <div className="flex min-h-14 w-full flex-wrap items-start gap-x-1 gap-y-2 rounded-t-[20px] px-4 pb-2 pt-3 text-[17px]">
         <div
           ref={editorRef}
           data-composer-input="true"
@@ -501,7 +501,7 @@ export function Composer({
               submit();
             }
           }}
-          className="max-h-60 min-h-8 min-w-[14rem] flex-1 overflow-y-auto whitespace-pre-wrap break-words border-0 bg-transparent p-0 text-base text-text shadow-none outline-none ring-0 empty:before:text-text-muted empty:before:content-[attr(data-placeholder)] focus:border-0 focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0"
+          className="max-h-[200px] min-h-7 min-w-[14rem] flex-1 overflow-y-auto whitespace-pre-wrap break-words border-0 bg-transparent p-0 text-[17px] leading-[1.6] text-text shadow-none outline-none ring-0 empty:before:text-text-muted empty:before:content-[attr(data-placeholder)] focus:border-0 focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0"
           data-placeholder={placeholder}
         />
       </div>
@@ -514,7 +514,7 @@ export function Composer({
           onSelect={selectSlashCommand}
         />
       ) : null}
-      <div className="flex min-h-12 items-center gap-2 px-3 pb-3 pt-1">
+      <div className="flex min-h-11 items-center gap-2 px-3 pb-2 pt-1">
         <ComposerPlusMenu
           inProject={Boolean(projectContext)}
           webSearch={webSearch}
@@ -538,8 +538,8 @@ export function Composer({
           disabled={!canSubmit}
           className={cn(
             canSubmit
-              ? 'bg-accent text-white hover:bg-accent/90 hover:text-white'
-              : 'bg-border-strong text-white',
+              ? 'rounded-full bg-text text-white hover:bg-black hover:text-white'
+              : 'rounded-full bg-border text-white',
           )}
         />
       </div>

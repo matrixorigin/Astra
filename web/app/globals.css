@@ -1,4 +1,5 @@
 @import url('/fonts/inter/wght.css');
+@import url('/fonts/lxgw-wenkai-screen/wght.css');
 @import url('/fonts/noto-sans-sc/wght.css');
 
 @tailwind base;
@@ -45,6 +46,7 @@ body {
   color: rgb(var(--color-text));
   font-family:
     "Inter Variable",
+    "LXGW WenKai Screen",
     "Noto Sans SC Variable",
     ui-sans-serif,
     system-ui,
@@ -90,6 +92,31 @@ textarea {
   }
 }
 
+@keyframes astraLandingBreathe {
+  0%,
+  100% {
+    opacity: 0.9;
+    transform: translate(-50%, -50%) scale(1);
+  }
+
+  50% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1.05);
+  }
+}
+
+@keyframes astraLandingFadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 6px;
@@ -115,8 +142,8 @@ textarea {
   gap: 0.75rem;
   min-width: 0;
   color: rgb(var(--color-text));
-  font-size: 1rem;
-  line-height: 1.7;
+  font-size: 1.0625rem;
+  line-height: 1.75;
 }
 
 .astra-markdown > * {
@@ -301,4 +328,88 @@ textarea {
 .astra-markdown .katex-display > .katex {
   display: inline-block;
   max-width: 100%;
+}
+
+.astra-reasoning-markdown {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.85rem;
+  min-width: 0;
+  color: rgb(var(--color-text-secondary));
+  font-family:
+    "Inter Variable",
+    "Noto Sans SC Variable",
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  font-size: 1rem;
+  line-height: 1.68;
+}
+
+.astra-reasoning-markdown > * {
+  min-width: 0;
+}
+
+.astra-reasoning-markdown p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.astra-reasoning-markdown strong {
+  color: rgb(var(--color-text-secondary));
+  font-weight: 650;
+}
+
+.astra-reasoning-markdown ul,
+.astra-reasoning-markdown ol {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  margin: 0;
+  padding-left: 1.55rem;
+}
+
+.astra-reasoning-markdown ul {
+  list-style: disc;
+}
+
+.astra-reasoning-markdown ol {
+  list-style: decimal;
+}
+
+.astra-reasoning-markdown li {
+  padding-left: 0.25rem;
+  overflow-wrap: anywhere;
+}
+
+.astra-reasoning-markdown :not(pre) > code {
+  border-radius: 0.25rem;
+  background: rgb(var(--color-surface-muted));
+  padding: 0.06rem 0.25rem;
+  color: rgb(var(--color-text-secondary));
+  font-family:
+    "SFMono-Regular",
+    Consolas,
+    "Liberation Mono",
+    monospace;
+  font-size: 0.9em;
+}
+
+.astra-reasoning-markdown pre {
+  margin: 0;
+  overflow-x: auto;
+  border-radius: 0.5rem;
+  background: rgb(var(--color-surface-muted));
+  padding: 0.75rem 0.875rem;
+  color: rgb(var(--color-text-secondary));
+  font-family:
+    "SFMono-Regular",
+    Consolas,
+    "Liberation Mono",
+    monospace;
+  font-size: 0.875rem;
+  line-height: 1.55;
 }
