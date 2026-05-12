@@ -33,7 +33,6 @@ pub(crate) mod llm_client;
 pub(crate) mod llm_exchange_capture;
 pub mod loop_dispatcher;
 pub mod memory_prefetch;
-pub mod memory_seen_ledger;
 pub mod permission_gate;
 pub mod prompt_cache;
 pub mod session_end_debounce;

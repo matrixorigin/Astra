@@ -130,20 +130,52 @@ pub struct MemoriaClient {
     focus_store: RwLock<HashMap<String, Vec<FocusHint>>>,
 }
 
-/// Process-global "already surfaced" set for `recall` responses, keyed
-/// by session_id. Written when a recall response is decorated; read by
-/// the next recall in the same session to drop already-seen memory_ids.
-/// `MemoriaClient` is instantiated per-tool-call in production
-/// (see `server_tool_executor.rs`, `edge_tools/memoria.rs`), so a
-/// per-client `seen_store` would reset every call. Process-global gives
-/// real session-lifetime dedup. Paired with the runtime-side
-/// `memory_seen_ledger` which covers the prefetch path; both are
-/// cleared on session-end cleanup.
+/// Process-global "already surfaced" set for memory entries, keyed by
+/// session_id. Holds a union of two kinds of dedup keys:
+///
+/// - **memory_id** (written by tool-side `decorate_recall_response`
+///   and by the runtime `MemoryOrchestrator::mark_surfaced`)
+/// - **normalized content dedup key** (written by the bridge when it
+///   injects `<session_memory>` + the per-turn recall block)
+///
+/// Both paths share one canonical store so a memory shown via
+/// `<session_memory>` won't re-appear in per-turn recall, and a memory
+/// returned from an LLM-driven `memory(action=recall)` won't re-appear
+/// in the next recall. Cleared at session-end by
+/// `post_loop_memory_cleanup`. `MemoriaClient` is constructed per-
+/// tool-call in production (see `server_tool_executor.rs`,
+/// `edge_tools/memoria.rs`), so a per-client store would reset every
+/// call — process-global is the minimum viable scope.
 static SEEN_STORE: std::sync::OnceLock<RwLock<HashMap<String, std::collections::HashSet<String>>>> =
     std::sync::OnceLock::new();
 
 fn seen_store() -> &'static RwLock<HashMap<String, std::collections::HashSet<String>>> {
     SEEN_STORE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// One recall awaiting outcome attribution. Populated by the `recall`
+/// verb post-processor; drained by the runtime's feedback observer.
+#[derive(Debug, Clone)]
+pub struct RecallSnapshot {
+    pub session_id: String,
+    pub memory_ids: Vec<String>,
+    pub turn: u32,
+    pub at: Instant,
+}
+
+/// Process-global FIFO queue of recall snapshots per session. Mirror of
+/// `MemoryOrchestrator::recall_ledger`, but accessible from the tool
+/// layer (which doesn't depend on runtime) so `decorate_recall_response`
+/// can push without a cross-crate trait. The runtime observes and
+/// drains.
+static RECALL_LEDGER: std::sync::OnceLock<
+    RwLock<HashMap<String, std::collections::VecDeque<RecallSnapshot>>>,
+> = std::sync::OnceLock::new();
+
+const MAX_RECALL_LEDGER_PER_SESSION: usize = 16;
+
+fn recall_ledger() -> &'static RwLock<HashMap<String, std::collections::VecDeque<RecallSnapshot>>> {
+    RECALL_LEDGER.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 const MAX_FAILS: u32 = 2;
@@ -241,7 +273,11 @@ impl MemoriaClient {
 
     /// Record memory_ids surfaced to the LLM in a given session
     /// (process-global store).
-    fn record_seen(session_id: &str, ids: impl IntoIterator<Item = String>) {
+    ///
+    /// Public: this is the single canonical "already surfaced" store
+    /// for the process. The runtime's `MemoryOrchestrator` is a
+    /// delegating facade that calls this — no parallel store exists.
+    pub fn record_seen(session_id: &str, ids: impl IntoIterator<Item = String>) {
         if session_id.is_empty() {
             return;
         }
@@ -258,7 +294,9 @@ impl MemoriaClient {
 
     /// Snapshot surfaced ids for a session (process-global store);
     /// caller drops the clone after use.
-    fn seen_snapshot(session_id: &str) -> std::collections::HashSet<String> {
+    ///
+    /// Public: see [`record_seen`].
+    pub fn seen_snapshot(session_id: &str) -> std::collections::HashSet<String> {
         if session_id.is_empty() {
             return std::collections::HashSet::new();
         }
@@ -277,6 +315,76 @@ impl MemoriaClient {
             return;
         }
         if let Ok(mut g) = seen_store().write() {
+            g.remove(session_id);
+        }
+    }
+
+    /// Record a recall snapshot for later outcome attribution.
+    /// Pushed by `decorate_recall_response` when the LLM calls
+    /// `memory(action=recall)` and receives memory_ids; drained by the
+    /// runtime's feedback observer at tool-result boundaries.
+    ///
+    /// Per-session queue is FIFO, soft-capped at 16 entries; oldest
+    /// evicted beyond the cap so an LLM that never closes the loop
+    /// doesn't leak memory.
+    pub fn record_recall(session_id: &str, turn: u32, memory_ids: Vec<String>) {
+        if session_id.is_empty() || memory_ids.is_empty() {
+            return;
+        }
+        let snap = RecallSnapshot {
+            session_id: session_id.to_string(),
+            memory_ids,
+            turn,
+            at: Instant::now(),
+        };
+        if let Ok(mut g) = recall_ledger().write() {
+            let q = g.entry(session_id.to_string()).or_default();
+            if q.len() >= MAX_RECALL_LEDGER_PER_SESSION {
+                q.pop_front();
+            }
+            q.push_back(snap);
+        }
+    }
+
+    /// Drain and return all recall snapshots for a session older than
+    /// `max_age`. Entries within the window are returned; stale ones
+    /// are dropped (can no longer reliably attribute). Invoked by the
+    /// runtime's feedback observer.
+    pub fn drain_recalls(session_id: &str, max_age: Option<Duration>) -> Vec<RecallSnapshot> {
+        if session_id.is_empty() {
+            return Vec::new();
+        }
+        let Ok(mut g) = recall_ledger().write() else {
+            return Vec::new();
+        };
+        let Some(q) = g.remove(session_id) else {
+            return Vec::new();
+        };
+        q.into_iter()
+            .filter(|s| match max_age {
+                Some(max) => s.at.elapsed() <= max,
+                None => true,
+            })
+            .collect()
+    }
+
+    /// Number of unconsumed recall snapshots for a session (tests +
+    /// observability).
+    pub fn pending_recall_count(session_id: &str) -> usize {
+        recall_ledger()
+            .read()
+            .ok()
+            .and_then(|g| g.get(session_id).map(|q| q.len()))
+            .unwrap_or(0)
+    }
+
+    /// Clear the recall ledger for a session. Called at session-end
+    /// cleanup alongside `reset_seen`.
+    pub fn reset_recall_ledger(session_id: &str) {
+        if session_id.is_empty() {
+            return;
+        }
+        if let Ok(mut g) = recall_ledger().write() {
             g.remove(session_id);
         }
     }
@@ -642,11 +750,18 @@ impl MemoriaClient {
         // bridge-side prefetch path. Other verbs pass through verbatim.
         if op == "recall" {
             let session_id = args.get("session_id").and_then(Value::as_str).unwrap_or("");
+            let turn = args.get("turn").and_then(Value::as_u64).unwrap_or(0) as u32;
             let seen = Self::seen_snapshot(session_id);
             let mut newly_surfaced = Vec::new();
             let decorated = Self::decorate_recall_response(&raw_text, &seen, &mut newly_surfaced);
             if !newly_surfaced.is_empty() {
-                Self::record_seen(session_id, newly_surfaced);
+                // (a) dedup store: don't re-show same id this session
+                Self::record_seen(session_id, newly_surfaced.clone());
+                // (b) recall ledger: ids await outcome attribution so
+                //     the next tool-result can route useful/irrelevant
+                //     feedback back to them. Closes the recall→feedback
+                //     loop the prompt promises.
+                Self::record_recall(session_id, turn, newly_surfaced);
             }
             return decorated;
         }
@@ -2278,5 +2393,82 @@ mod memoria_http_client_tests {
         MemoriaClient::record_seen("p6-reset-sess", ["m1".into(), "m2".into()]);
         MemoriaClient::reset_seen("p6-reset-sess");
         assert!(MemoriaClient::seen_snapshot("p6-reset-sess").is_empty());
+    }
+
+    // ── R5: recall ledger (process-global, for feedback loop) ─────────
+
+    #[test]
+    fn record_recall_pushes_ids_onto_session_queue() {
+        use super::*;
+        MemoriaClient::reset_recall_ledger("r5-single");
+        MemoriaClient::record_recall("r5-single", 3, vec!["m1".into(), "m2".into()]);
+        assert_eq!(MemoriaClient::pending_recall_count("r5-single"), 1);
+        let drained = MemoriaClient::drain_recalls("r5-single", None);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].memory_ids, vec!["m1", "m2"]);
+        assert_eq!(drained[0].turn, 3);
+        assert_eq!(MemoriaClient::pending_recall_count("r5-single"), 0);
+    }
+
+    #[test]
+    fn record_recall_caps_queue_depth() {
+        use super::*;
+        MemoriaClient::reset_recall_ledger("r5-cap");
+        for i in 0..20 {
+            MemoriaClient::record_recall("r5-cap", i, vec![format!("m{i}")]);
+        }
+        assert!(MemoriaClient::pending_recall_count("r5-cap") <= 16);
+        MemoriaClient::reset_recall_ledger("r5-cap");
+    }
+
+    #[test]
+    fn drain_recalls_respects_max_age() {
+        use super::*;
+        MemoriaClient::reset_recall_ledger("r5-age");
+        MemoriaClient::record_recall("r5-age", 1, vec!["stale".into()]);
+        std::thread::sleep(Duration::from_millis(15));
+        MemoriaClient::record_recall("r5-age", 2, vec!["fresh".into()]);
+        let drained = MemoriaClient::drain_recalls("r5-age", Some(Duration::from_millis(5)));
+        // Stale entry filtered out; fresh one survives.
+        let ids: Vec<&str> = drained
+            .iter()
+            .flat_map(|s| s.memory_ids.iter().map(String::as_str))
+            .collect();
+        assert_eq!(ids, vec!["fresh"]);
+    }
+
+    #[test]
+    fn record_recall_empty_ids_is_noop() {
+        use super::*;
+        MemoriaClient::reset_recall_ledger("r5-empty");
+        MemoriaClient::record_recall("r5-empty", 1, vec![]);
+        assert_eq!(MemoriaClient::pending_recall_count("r5-empty"), 0);
+    }
+
+    #[test]
+    fn record_recall_empty_session_is_noop() {
+        use super::*;
+        MemoriaClient::record_recall("", 1, vec!["m1".into()]);
+        assert!(MemoriaClient::drain_recalls("", None).is_empty());
+    }
+
+    #[test]
+    fn drain_recalls_fifo_order_preserved() {
+        use super::*;
+        MemoriaClient::reset_recall_ledger("r5-fifo");
+        MemoriaClient::record_recall("r5-fifo", 1, vec!["first".into()]);
+        MemoriaClient::record_recall("r5-fifo", 2, vec!["second".into()]);
+        MemoriaClient::record_recall("r5-fifo", 3, vec!["third".into()]);
+        let drained = MemoriaClient::drain_recalls("r5-fifo", None);
+        let turns: Vec<u32> = drained.iter().map(|s| s.turn).collect();
+        assert_eq!(turns, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn reset_recall_ledger_empties_session_state() {
+        use super::*;
+        MemoriaClient::record_recall("r5-reset", 1, vec!["m1".into()]);
+        MemoriaClient::reset_recall_ledger("r5-reset");
+        assert_eq!(MemoriaClient::pending_recall_count("r5-reset"), 0);
     }
 }

@@ -1241,7 +1241,13 @@ impl InProcessChatTurnBridge {
             // entries were empty — which meant the stable lane got
             // silently dropped on every warm session. Fixed here.
             let is_first_turn = trace_turn <= 1;
-            let seen_ledger = crate::turn::memory_seen_ledger::global();
+            // Single canonical "already surfaced" store for the process
+            // lives on `astra_tools::memoria::MemoriaClient`. The bridge
+            // writes content-dedup keys to it; the tool-side `recall`
+            // decorator writes memory_ids. Both paths share the same
+            // snapshot so a memory shown via `<session_memory>` doesn't
+            // re-appear in per-turn recall, and vice versa.
+            use astra_tools::memoria::MemoriaClient as ToolClient;
             let mut stable_memory_section: Option<String> = None;
             let mut volatile_memory_section: Option<String> = None;
             if bridge_should_run_memoria_prefetch(&edge_profile)
@@ -1308,14 +1314,16 @@ impl InProcessChatTurnBridge {
                 } else {
                     None
                 };
-                let session_start_section = session_start_opt.and_then(|s| s.section);
+                let session_start_section = session_start_opt
+                    .as_ref()
+                    .and_then(|s| s.section.clone());
                 stable_memory_section = crate::turn::memory_prefetch::build_session_stable_memory_block(
                     memory_index.as_deref(),
                     session_start_section.as_deref(),
                 );
 
-                // Record stable-lane contents into the seen-ledger so
-                // volatile entries matching them get filtered out.
+                // Record stable-lane contents into the canonical store
+                // so volatile entries matching them get filtered out.
                 if let Some(ref stable) = stable_memory_section {
                     let keys: Vec<String> = stable
                         .lines()
@@ -1334,11 +1342,28 @@ impl InProcessChatTurnBridge {
                         })
                         .filter(|s| !s.is_empty())
                         .collect();
-                    seen_ledger.record(&session_id, keys);
+                    ToolClient::record_seen(&session_id, keys);
+                }
+                // Also record the memory_ids so tool-side recall dedup
+                // (which filters on memory_id) sees them too.
+                let stable_ids: Vec<String> = session_start_opt
+                    .as_ref()
+                    .map(|s| {
+                        s.profile
+                            .iter()
+                            .chain(s.recent_episodes.iter())
+                            .chain(s.recent_scenes.iter())
+                            .map(|m| m.memory_id.clone())
+                            .filter(|id| !id.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !stable_ids.is_empty() {
+                    ToolClient::record_seen(&session_id, stable_ids);
                 }
 
                 // ── Volatile lane: filter per-turn entries against ledger ──
-                let already_seen = seen_ledger.snapshot(&session_id);
+                let already_seen = ToolClient::seen_snapshot(&session_id);
                 let filtered_entries = crate::turn::memory_prefetch::filter_entries_already_surfaced(
                     per_turn.entries,
                     &already_seen,
@@ -1353,7 +1378,7 @@ impl InProcessChatTurnBridge {
                 // recall doesn't re-surface them either.
                 let new_keys = crate::turn::memory_prefetch::collect_seen_contents(&filtered_entries);
                 if !new_keys.is_empty() {
-                    seen_ledger.record(&session_id, new_keys);
+                    ToolClient::record_seen(&session_id, new_keys);
                 }
                 memoria_prefetch_entries = filtered_entries;
                 volatile_memory_section = per_turn.section;

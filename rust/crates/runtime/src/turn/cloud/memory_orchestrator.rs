@@ -48,6 +48,10 @@ pub struct SessionStartMemories {
     /// Recent cross-session episodes that may be relevant (sorted by
     /// retrieval score; top 3 by default).
     pub recent_episodes: Vec<MemoriaMemory>,
+    /// Reflect-produced scene abstractions (`astra:scene`-tagged
+    /// `semantic` memories prefixed `[scene…]`). Cross-session themes
+    /// that span multiple episodes.
+    pub recent_scenes: Vec<MemoriaMemory>,
     /// Best-effort query-relevant long-term memories for the first user
     /// message, if any was available.
     pub relevant: Vec<MemoriaMemory>,
@@ -55,7 +59,24 @@ pub struct SessionStartMemories {
 
 impl SessionStartMemories {
     pub fn is_empty(&self) -> bool {
-        self.profile.is_empty() && self.recent_episodes.is_empty() && self.relevant.is_empty()
+        self.profile.is_empty()
+            && self.recent_episodes.is_empty()
+            && self.recent_scenes.is_empty()
+            && self.relevant.is_empty()
+    }
+
+    /// All memory_ids that this bundle will surface — callers use this
+    /// to feed the "already surfaced" ledger so per-turn recall won't
+    /// re-inject them.
+    pub fn exposed_ids(&self) -> Vec<String> {
+        self.profile
+            .iter()
+            .chain(self.recent_episodes.iter())
+            .chain(self.recent_scenes.iter())
+            .chain(self.relevant.iter())
+            .map(|m| m.memory_id.clone())
+            .filter(|id| !id.is_empty())
+            .collect()
     }
 
     /// Render a compact text block suitable for the `<session_memory>`
@@ -78,6 +99,15 @@ impl SessionStartMemories {
         if !self.recent_episodes.is_empty() {
             s.push_str("### Recent sessions\n");
             for m in &self.recent_episodes {
+                s.push_str("- ");
+                s.push_str(compact_line(&m.content, 200).as_str());
+                s.push_str(&m.freshness_suffix());
+                s.push('\n');
+            }
+        }
+        if !self.recent_scenes.is_empty() {
+            s.push_str("### Recurring scenes\n");
+            for m in &self.recent_scenes {
                 s.push_str("- ");
                 s.push_str(compact_line(&m.content, 200).as_str());
                 s.push_str(&m.freshness_suffix());
@@ -177,13 +207,11 @@ pub struct MemoryOrchestrator {
     recall_ledger: std::sync::RwLock<
         std::collections::HashMap<String, std::collections::VecDeque<RecallLedgerEntry>>,
     >,
-    /// "Already surfaced to the LLM this session" — dedup set of
-    /// memory_ids that have appeared in a `<session_memory>` block
-    /// or a recall result. `filter_already_seen` applies this to
-    /// trim repeat hits from per-turn recall so the LLM doesn't see
-    /// the same abstract five turns in a row.
-    seen_memory_ids:
-        std::sync::RwLock<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+    // NOTE: "already surfaced" dedup lives in a single canonical store
+    // in astra-tools (`MemoriaClient::{record_seen, seen_snapshot,
+    // reset_seen}`) because the tool-side `decorate_recall_response`
+    // also needs it. The orchestrator is a thin facade — no parallel
+    // state here.
 }
 
 impl MemoryOrchestrator {
@@ -193,26 +221,21 @@ impl MemoryOrchestrator {
             prefetch_top_k: 5,
             max_episodes: 3,
             recall_ledger: std::sync::RwLock::new(std::collections::HashMap::new()),
-            seen_memory_ids: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
     /// Mark a set of memory_ids as already surfaced to the LLM in this
     /// session so future recalls can filter them out. Callers invoke
     /// this after injecting a memory block into the prompt.
+    ///
+    /// Delegates to the canonical `astra-tools` store so both the
+    /// bridge's session-start injection and the tool-side
+    /// `memory(action=recall)` post-processor see the same dedup set.
     pub fn mark_surfaced(&self, session_id: &str, memory_ids: &[String]) {
-        if memory_ids.is_empty() {
-            return;
-        }
-        let Ok(mut g) = self.seen_memory_ids.write() else {
-            return;
-        };
-        let bucket = g.entry(session_id.to_string()).or_default();
-        for id in memory_ids {
-            if !id.is_empty() {
-                bucket.insert(id.clone());
-            }
-        }
+        astra_tools::memoria::MemoriaClient::record_seen(
+            session_id,
+            memory_ids.iter().filter(|id| !id.is_empty()).cloned(),
+        );
     }
 
     /// Filter a candidate memory list down to ones not yet surfaced
@@ -223,12 +246,10 @@ impl MemoryOrchestrator {
         session_id: &str,
         memories: Vec<MemoriaMemory>,
     ) -> Vec<MemoriaMemory> {
-        let Ok(g) = self.seen_memory_ids.read() else {
+        let seen = astra_tools::memoria::MemoriaClient::seen_snapshot(session_id);
+        if seen.is_empty() {
             return memories;
-        };
-        let Some(seen) = g.get(session_id) else {
-            return memories;
-        };
+        }
         memories
             .into_iter()
             .filter(|m| !seen.contains(&m.memory_id))
@@ -239,9 +260,7 @@ impl MemoryOrchestrator {
     /// session-end cleanup so long-lived orchestrator processes don't
     /// keep per-session state indefinitely.
     pub fn reset_session_surface(&self, session_id: &str) {
-        if let Ok(mut g) = self.seen_memory_ids.write() {
-            g.remove(session_id);
-        }
+        astra_tools::memoria::MemoriaClient::reset_seen(session_id);
     }
 
     pub fn with_prefetch_top_k(mut self, top_k: usize) -> Self {
@@ -329,43 +348,56 @@ impl MemoryOrchestrator {
     }
 
     /// Pre-warm: on session start, gather profile + recent episodes +
-    /// (optionally) query-relevant memories for the first user message.
+    /// recent scenes + (optionally) query-relevant memories for the
+    /// first user message.
     ///
-    /// `first_user_message` may be `None` if the session was resumed
-    /// without a fresh prompt (e.g. background worker task).
+    /// All four fetches run concurrently to keep session-start latency
+    /// near the slowest single query. `first_user_message` may be
+    /// `None` if the session was resumed without a fresh prompt (e.g.
+    /// background worker task) — the relevant bucket is then empty.
+    ///
+    /// Each bucket is filtered client-side by `memory_type` (and for
+    /// scenes, by the `[scene…]` content prefix that `store_scene`
+    /// emits), sorted by server-side `retrieval_score`, and truncated.
     pub async fn on_session_start(
         &self,
         _session_id: &str,
         first_user_message: Option<&str>,
     ) -> SessionStartMemories {
-        let mut out = SessionStartMemories::default();
+        let relevant_query = first_user_message
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let (profile_res, episode_res, scene_res, relevant_res) = tokio::join!(
+            self.client
+                .retrieve("user profile preferences role", None, 5),
+            self.client.retrieve(
+                "recent session episode summary",
+                None,
+                self.max_episodes * 2,
+            ),
+            self.client.retrieve(
+                "recurring scene pattern insight",
+                None,
+                self.max_episodes * 2,
+            ),
+            async {
+                match relevant_query {
+                    Some(q) => self.client.retrieve(&q, None, self.prefetch_top_k).await,
+                    None => Ok(Vec::new()),
+                }
+            }
+        );
 
-        // Profile — pulls most recent "profile" memories. We use a
-        // broad query ("user profile") so the retrieval layer surfaces
-        // whatever is tagged profile.
-        match self
-            .client
-            .retrieve("user profile preferences role", None, 5)
-            .await
-        {
+        let mut out = SessionStartMemories::default();
+        match profile_res {
             Ok(mut memories) => {
                 memories.retain(|m| m.memory_type == "profile");
                 out.profile = memories;
             }
             Err(e) => tracing::debug!("session-start profile fetch failed: {e}"),
         }
-
-        // Recent episodic summaries. Pull ≤ max_episodes across all
-        // sessions (not session-scoped).
-        match self
-            .client
-            .retrieve(
-                "recent session episode summary",
-                None,
-                self.max_episodes * 2,
-            )
-            .await
-        {
+        match episode_res {
             Ok(mut memories) => {
                 memories.retain(|m| m.memory_type == "episodic");
                 memories.truncate(self.max_episodes);
@@ -373,30 +405,76 @@ impl MemoryOrchestrator {
             }
             Err(e) => tracing::debug!("session-start episode fetch failed: {e}"),
         }
-
-        // Query-relevant memories for the first user message (cross-session).
-        if let Some(msg) = first_user_message {
-            let trimmed = msg.trim();
-            if !trimmed.is_empty() {
-                match self
-                    .client
-                    .retrieve(trimmed, None, self.prefetch_top_k)
-                    .await
-                {
-                    Ok(memories) => {
-                        out.relevant = memories;
-                    }
-                    Err(e) => tracing::debug!("session-start relevant fetch failed: {e}"),
-                }
+        match scene_res {
+            Ok(mut memories) => {
+                memories.retain(|m| m.memory_type == "semantic" && m.content.starts_with("[scene"));
+                memories.truncate(self.max_episodes);
+                out.recent_scenes = memories;
             }
+            Err(e) => tracing::debug!("session-start scene fetch failed: {e}"),
         }
-
+        match relevant_res {
+            Ok(memories) => out.relevant = memories,
+            Err(e) => tracing::debug!("session-start relevant fetch failed: {e}"),
+        }
         out
+    }
+
+    /// Build the ambient `<memory_index>` block. Excludes memory_ids
+    /// already surfaced in `<session_memory>` to avoid duplication.
+    /// Returns `None` when the store is empty or every entry is excluded.
+    pub async fn build_memory_index_with_exclude(
+        &self,
+        limit: usize,
+        exclude_ids: &std::collections::HashSet<String>,
+    ) -> Option<String> {
+        let all = self.client.retrieve("", None, limit.max(1)).await.ok()?;
+        if all.is_empty() {
+            return None;
+        }
+        let mut filtered: Vec<&MemoriaMemory> = all
+            .iter()
+            .filter(|m| !exclude_ids.contains(&m.memory_id))
+            .collect();
+        if filtered.is_empty() {
+            return None;
+        }
+        // Deterministic ordering for cache stability.
+        filtered.sort_by(|a, b| a.memory_id.cmp(&b.memory_id));
+
+        let mut s = String::with_capacity(1024);
+        s.push_str("<memory_index>\n");
+        s.push_str(
+            "(Ambient awareness. Call `memory(action=recall, query=X)` for full content \
+            of a topic, or `memory(action=expand, memory_id=ID)` to drill into one entry.)\n",
+        );
+        for m in filtered {
+            let tag = if m.memory_type.is_empty() {
+                "?".to_string()
+            } else {
+                m.memory_type.clone()
+            };
+            let abstract_line = compact_line(&m.content, 100);
+            let suffix = m.freshness_suffix();
+            s.push_str(&format!(
+                "- [{tag}] {}: {abstract_line}{suffix}\n",
+                m.memory_id
+            ));
+        }
+        s.push_str("</memory_index>");
+        Some(s)
     }
 
     /// Per-turn recall. Session-scoped if `strict_session=true`, else
     /// unscoped (prefer-mode default). Active focus hints are applied
     /// at the transport layer (see `HttpMemoriaClient::retrieve_ext`).
+    ///
+    /// After fetching, filters the result against the canonical
+    /// "already surfaced" store so a memory shown by session-start
+    /// prewarm (or a prior recall) does not appear twice. Does **not**
+    /// record the result itself — callers that ship the memories to
+    /// the LLM invoke [`mark_surfaced`] afterwards with the ids they
+    /// kept.
     pub async fn on_turn_recall(
         &self,
         query: &str,
@@ -409,7 +487,7 @@ impl MemoryOrchestrator {
         } else {
             Some(session_id)
         };
-        match self
+        let raw = match self
             .client
             .retrieve_ext(query, sid, top_k, strict_session)
             .await
@@ -417,9 +495,10 @@ impl MemoryOrchestrator {
             Ok(memories) => memories,
             Err(e) => {
                 tracing::debug!("turn recall failed for session {session_id}: {e}");
-                Vec::new()
+                return Vec::new();
             }
-        }
+        };
+        self.filter_already_surfaced(session_id, raw)
     }
 
     /// Set a focus hint for the current session. TTL defaults to 1h
@@ -627,6 +706,7 @@ mod tests {
                 "episodic",
                 "[episode] turn=5, finished auth refactor.",
             )],
+            recent_scenes: Vec::new(),
             relevant: vec![memory(
                 "r1",
                 "semantic",

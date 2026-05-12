@@ -95,6 +95,7 @@ async fn post_loop_memory_cleanup(
     // session or the TUI issues follow-up turns). Running governance
     // per run would write one episode per turn and hammer reflect.
     // The debouncer allows one governance per session per window.
+    let mut episode_was_written = false;
     if let Some(ref memoria_client) =
         crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env()
     {
@@ -111,8 +112,8 @@ async fn post_loop_memory_cleanup(
             .await
             {
                 Ok(report) => {
-                    let wrote_episode = report.episode_chars > 0;
-                    if wrote_episode
+                    episode_was_written = report.episode_chars > 0;
+                    if episode_was_written
                         || report.working_purged > 0
                         || report.reflect_candidates > 0
                         || report.scenes_stored > 0
@@ -144,12 +145,60 @@ async fn post_loop_memory_cleanup(
                 "session-end governance skipped by debounce"
             );
         }
+
+        // ── Close the recall → outcome feedback loop ──────────────
+        //
+        // Every LLM-driven `memory(action=recall)` pushed its returned
+        // memory_ids onto the process-global recall ledger. Drain them
+        // here and route a feedback signal to Memoria. Conservative
+        // heuristic:
+        //   • episode was written (session did substantive work)
+        //       → signal `useful` — the recall was at least surfaced
+        //         into a productive session
+        //   • trivial session (no episode)
+        //       → drop without scoring — not enough evidence
+        //
+        // A richer attribution (per-tool-call outcome mapping) needs
+        // the tool dispatch layer to report success/failure per recall,
+        // which is a bigger refactor. The episode-level heuristic is
+        // the smallest step that closes the loop in production.
+        let snapshots = astra_tools::memoria::MemoriaClient::drain_recalls(session_id, None);
+        if !snapshots.is_empty() && episode_was_written {
+            use crate::turn::cloud::memoria_compact::MemoriaClient as ServerMemoriaClient;
+            for snap in &snapshots {
+                for id in &snap.memory_ids {
+                    let ctx = format!("session-end: turn {} productive session", snap.turn);
+                    if let Err(e) =
+                        ServerMemoriaClient::feedback(memoria_client, id, "useful", Some(&ctx))
+                            .await
+                    {
+                        tracing::debug!(memory_id = %id, error = %e, "feedback push failed");
+                    }
+                }
+            }
+            tracing::info!(
+                session_id = %session_id,
+                snapshots = snapshots.len(),
+                "closed recall → useful feedback loop"
+            );
+        } else if !snapshots.is_empty() {
+            tracing::debug!(
+                session_id = %session_id,
+                snapshots = snapshots.len(),
+                "session trivial; dropped recall snapshots without scoring"
+            );
+        }
     }
-    // ── Always: clear bridge seen-ledger for this session ──
-    crate::turn::memory_seen_ledger::global().reset_session(session_id);
-    // And the tool-side seen store so LLM-driven recalls can see
-    // previously-surfaced memories on the next session for this id.
+    // ── Always: clear the canonical seen store for this session ──
+    //
+    // A single process-global set in `astra_tools::memoria` holds both
+    // the bridge-side content-dedup keys and the tool-side
+    // memory_id dedup entries. One reset covers both.
     astra_tools::memoria::MemoriaClient::reset_seen(session_id);
+    // And ensure the recall ledger is clean even if governance didn't
+    // run (e.g. no memoria client configured, or drain was conditional
+    // on an episode being written).
+    astra_tools::memoria::MemoriaClient::reset_recall_ledger(session_id);
 
     // ── Always: release extraction service's per-session debounce ──
     if let Some(svc) = extraction_service {
