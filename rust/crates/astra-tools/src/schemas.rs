@@ -575,7 +575,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle and introspection. Per-action required fields: config→path+value; prioritize/deprioritize→tool; ask_user→question; tool_search→query. Other actions (compact, rollback_edits, sleep, timeline, summary, history) have no extra required fields.",
+                "description": "Session lifecycle. Per-action required fields: config→path+value; prioritize/deprioritize→tool; ask_user→question. Other actions (compact, rollback_edits, sleep, set_goal, timeline, summary, history) have no extra required fields.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -599,8 +599,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "config": ["path", "value"],
                         "prioritize": ["tool"],
                         "deprioritize": ["tool"],
-                        "ask_user": ["question"],
-                        "tool_search": ["query"]
+                        "ask_user": ["question"]
                     }
                 }
             }

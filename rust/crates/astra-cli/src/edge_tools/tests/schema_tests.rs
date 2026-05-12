@@ -384,10 +384,6 @@ fn session_schema_requires_path_value_tool_question_query() {
         conditional_required_for(sess, "ask_user"),
         vec!["question".to_string()]
     );
-    assert_eq!(
-        conditional_required_for(sess, "tool_search"),
-        vec!["query".to_string()]
-    );
 }
 
 #[test]
