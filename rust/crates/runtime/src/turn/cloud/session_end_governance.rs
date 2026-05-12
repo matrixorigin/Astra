@@ -67,21 +67,30 @@ pub fn build_episode_overview(facts: &SessionFacts) -> Option<String> {
         facts.estimated_tokens / 1000
     ));
 
-    // Files (most recent last — keep final 8 for brevity).
+    // Files (most recent last — keep final FILES_CAP for brevity).
+    // When truncating, append `(+N more)` so the reader knows the list
+    // is abbreviated — silent truncation makes the episode look
+    // complete when it isn't.
+    const FILES_CAP: usize = 8;
     if !facts.active_files.is_empty() {
+        let total = facts.active_files.len();
         let recent: Vec<&str> = facts
             .active_files
             .iter()
             .rev()
-            .take(8)
+            .take(FILES_CAP)
             .map(|f| f.path.as_str())
             .collect();
         s.push_str("Files: ");
         s.push_str(&recent.iter().rev().copied().collect::<Vec<_>>().join(", "));
+        if total > FILES_CAP {
+            s.push_str(&format!(" (+{} more)", total - FILES_CAP));
+        }
         s.push('\n');
     }
 
     // Tools: a compact ok/fail tally by name.
+    const TOOLS_CAP: usize = 6;
     if !facts.recent_tool_calls.is_empty() {
         use std::collections::BTreeMap;
         let mut by_name: BTreeMap<&str, (u32, u32)> = BTreeMap::new();
@@ -93,9 +102,10 @@ pub fn build_episode_overview(facts: &SessionFacts) -> Option<String> {
                 e.1 += 1;
             }
         }
+        let total = by_name.len();
         let parts: Vec<String> = by_name
             .iter()
-            .take(6)
+            .take(TOOLS_CAP)
             .map(|(name, (ok, fail))| match (*ok, *fail) {
                 (o, 0) => format!("{name}:{o}ok"),
                 (0, f) => format!("{name}:{f}fail"),
@@ -105,6 +115,9 @@ pub fn build_episode_overview(facts: &SessionFacts) -> Option<String> {
         if !parts.is_empty() {
             s.push_str("Tools: ");
             s.push_str(&parts.join(", "));
+            if total > TOOLS_CAP {
+                s.push_str(&format!(" (+{} more)", total - TOOLS_CAP));
+            }
             s.push('\n');
         }
     }
@@ -308,6 +321,73 @@ mod tests {
         assert!(overview.contains("read_file:2ok"));
         assert!(overview.contains("bash:1fail"));
         assert!(overview.contains("cargo build failed"));
+    }
+
+    #[test]
+    fn episode_overview_marks_files_overflow_with_plus_n_more() {
+        // 12 files exceeds the 8-file cap → "(+4 more)" annotation.
+        let files: Vec<FileEntry> = (0..12)
+            .map(|i| FileEntry {
+                path: format!("src/file_{i}.rs"),
+                last_action: "read".into(),
+                turn: i,
+            })
+            .collect();
+        let facts = SessionFacts {
+            active_files: files,
+            turn: 12,
+            estimated_tokens: 5_000,
+            ..Default::default()
+        };
+        let overview = build_episode_overview(&facts).expect("non-trivial session");
+        assert!(overview.contains("(+4 more)"), "got: {overview}");
+    }
+
+    #[test]
+    fn episode_overview_files_under_cap_has_no_plus_n_more() {
+        let files: Vec<FileEntry> = (0..3)
+            .map(|i| FileEntry {
+                path: format!("src/file_{i}.rs"),
+                last_action: "read".into(),
+                turn: i,
+            })
+            .collect();
+        let facts = SessionFacts {
+            active_files: files,
+            turn: 3,
+            estimated_tokens: 1_000,
+            ..Default::default()
+        };
+        let overview = build_episode_overview(&facts).expect("non-trivial session");
+        assert!(!overview.contains("+ more"));
+        assert!(!overview.contains("(+"));
+    }
+
+    #[test]
+    fn episode_overview_marks_tools_overflow_with_plus_n_more() {
+        // 9 distinct tool names exceeds the 6-tool cap → "(+3 more)".
+        let tools: Vec<ToolFact> = (0..9)
+            .map(|i| ToolFact {
+                name: format!("tool_{i}"),
+                ok: true,
+                turn: i,
+            })
+            .collect();
+        let facts = SessionFacts {
+            recent_tool_calls: tools,
+            turn: 9,
+            estimated_tokens: 2_000,
+            ..Default::default()
+        };
+        let overview = build_episode_overview(&facts).expect("non-trivial session");
+        let tools_line = overview
+            .lines()
+            .find(|l| l.starts_with("Tools:"))
+            .expect("tools line");
+        assert!(
+            tools_line.contains("(+3 more)"),
+            "tools line missing overflow marker: {tools_line}"
+        );
     }
 
     #[test]

@@ -526,28 +526,6 @@ impl MemoriaClient {
             }
         }
 
-        // Auto-snapshot before destructive ops so `memory_rollback` is a
-        // real recovery path. Best-effort: a snapshot failure (cloud
-        // down, Memoria misconfigured) logs and continues — we'd rather
-        // the op proceed than block on an unreachable snapshot service.
-        // Name is deterministic so callers can find the snapshot without
-        // listing: `pre_<op>_<ts_ms>`.
-        if matches!(op, "forget" | "update") {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            let name = pre_op_snapshot_name(op, ts);
-            if let Err(e) = memoria_snapshot_create(&name).await {
-                tracing::warn!(
-                    target: "astra::memory::auto_snapshot",
-                    op = %op,
-                    error = %e,
-                    "pre-op auto-snapshot failed; continuing without safety net"
-                );
-            }
-        }
-
         // The v2→v1 translation — including business-category expansion
         // into (content-prefix + trust_tier + tag) — now happens inside
         // `build_direct_request` for the `remember` branch. No
@@ -582,11 +560,38 @@ impl MemoriaClient {
             let (ep, pl, m) = Self::build_direct_request(&mem.base_url, op, args);
             if ep.is_empty() {
                 // Validation errors (and anything else the mapper decides
-                // to short-circuit) return the payload verbatim.
+                // to short-circuit) return the payload verbatim. Must
+                // happen BEFORE the auto-snapshot below so rejected
+                // calls don't produce orphan `pre_<op>_*` snapshots.
                 return pl.to_string();
             }
             (ep, pl, format!("Bearer {key}"), m)
         };
+
+        // Auto-snapshot before destructive ops so `memory_rollback` is a
+        // real recovery path. Happens AFTER validation (endpoint is
+        // non-empty, required args were verified) so rejected
+        // `forget`/`update` calls don't litter the snapshot store with
+        // orphan `pre_*` entries. Best-effort: a snapshot failure
+        // (cloud down, Memoria misconfigured) logs and continues — we'd
+        // rather the op proceed than block on an unreachable snapshot
+        // service. Name is deterministic so callers can find the
+        // snapshot without listing: `pre_<op>_<ts_ms>`.
+        if matches!(op, "forget" | "update") {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let name = pre_op_snapshot_name(op, ts);
+            if let Err(e) = memoria_snapshot_create(&name).await {
+                tracing::warn!(
+                    target: "astra::memory::auto_snapshot",
+                    op = %op,
+                    error = %e,
+                    "pre-op auto-snapshot failed; continuing without safety net"
+                );
+            }
+        }
 
         // For `recall`, layer in session-scoped focus boosts. The backend
         // is free to ignore fields it doesn't understand; they become
@@ -1901,6 +1906,39 @@ mod tests {
             "pre_forget_1700000000000"
         );
         assert_eq!(pre_op_snapshot_name("update", 42), "pre_update_42");
+    }
+
+    /// R2: auto-snapshot must happen AFTER `build_direct_request`
+    /// validates args. A rejected `forget` (missing reason, missing
+    /// memory_id/topic, etc.) must not produce an orphan `pre_forget_*`
+    /// snapshot. Verified by source ordering: in `call_with_timeout`
+    /// the `memoria_snapshot_create` call must appear after the early-
+    /// return `ep.is_empty()` guard.
+    #[test]
+    fn auto_snapshot_is_ordered_after_validation() {
+        let src = include_str!("memoria.rs");
+        let fn_start = src
+            .find("pub async fn call_with_timeout")
+            .expect("call_with_timeout must exist");
+        // Find the first Err / return-style terminator so we bound the body.
+        let fn_end = src[fn_start..]
+            .find("\n    /// Boost search")
+            .map(|i| fn_start + i)
+            .expect("fn body end sentinel not found");
+        let body = &src[fn_start..fn_end];
+
+        let snapshot_at = body
+            .find("memoria_snapshot_create")
+            .expect("auto-snapshot call must exist in call_with_timeout");
+        let validation_short_circuit_at = body
+            .find("if ep.is_empty()")
+            .expect("validation short-circuit must exist");
+        assert!(
+            snapshot_at > validation_short_circuit_at,
+            "auto-snapshot must happen AFTER the `if ep.is_empty()` short-\
+             circuit so rejected destructive calls don't create orphan \
+             `pre_<op>_*` snapshots"
+        );
     }
 
     // ── P8: reason required on forget / update ────────────────────────

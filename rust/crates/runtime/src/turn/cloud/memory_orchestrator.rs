@@ -139,8 +139,8 @@ impl RecallObservedOutcome {
     }
 }
 
-/// One entry in the "last recall" store — remembers which memory_ids
-/// were most recently surfaced to the LLM so a later tool-outcome
+/// One entry in the recall ledger — remembers which memory_ids
+/// were surfaced to the LLM at a given turn so a later tool-outcome
 /// observation can route feedback back to them.
 #[derive(Debug, Clone)]
 struct RecallLedgerEntry {
@@ -148,6 +148,13 @@ struct RecallLedgerEntry {
     turn: u32,
     at: std::time::Instant,
 }
+
+/// Soft cap on recall-ledger depth per session. When an LLM probes
+/// repeatedly without outcomes closing the loop we discard the oldest
+/// entry so the ledger doesn't grow unbounded. Tuned conservatively —
+/// a typical turn produces at most 1–2 recalls, so 16 entries covers
+/// ~10+ turns of accumulation.
+const MAX_RECALL_LEDGER_PER_SESSION: usize = 16;
 
 /// The orchestrator itself. Cheap to construct — just an Arc'd trait
 /// object — so callers instantiate one per session without worrying
@@ -160,11 +167,16 @@ pub struct MemoryOrchestrator {
     prefetch_top_k: usize,
     /// Maximum episodes surfaced on session start.
     max_episodes: usize,
-    /// Last recall per session — maps session_id → (memory_ids, turn,
-    /// observed_at). Bounded by explicit `record_recall` calls; oldest
-    /// entries are evicted on observation so a long-lived orchestrator
-    /// doesn't leak memory.
-    recall_ledger: std::sync::RwLock<std::collections::HashMap<String, RecallLedgerEntry>>,
+    /// Per-session FIFO queue of recalls awaiting outcome attribution.
+    /// A single turn can legitimately fire multiple recalls (the LLM
+    /// may probe for different topics before acting); each sits in the
+    /// queue until [`observe_recall_outcome`] consumes it. Bounded
+    /// softly by [`MAX_RECALL_LEDGER_PER_SESSION`] — when the cap is
+    /// reached the oldest entry is dropped so we don't leak memory on
+    /// sessions whose LLMs never let us close the loop.
+    recall_ledger: std::sync::RwLock<
+        std::collections::HashMap<String, std::collections::VecDeque<RecallLedgerEntry>>,
+    >,
     /// "Already surfaced to the LLM this session" — dedup set of
     /// memory_ids that have appeared in a `<session_memory>` block
     /// or a recall result. `filter_already_seen` applies this to
@@ -436,12 +448,14 @@ impl MemoryOrchestrator {
     }
 
     /// Record the memory_ids surfaced to the LLM by a recall at a
-    /// given turn. Later, [`observe_recall_outcome`] uses the ledger to
-    /// route feedback back to those ids.
+    /// given turn. Appends to the session's FIFO queue;
+    /// [`observe_recall_outcome`] drains the queue oldest-first so the
+    /// same memory_id is scored at most once per recall.
     ///
-    /// Overwrites any prior entry for the session — only the **latest**
-    /// recall can be scored against tool outcomes, because older
-    /// recalls' memory_ids have probably already been acted on.
+    /// Multiple recalls in the same turn are each retained — the prior
+    /// "latest only" policy lost attribution when the LLM probed twice
+    /// before acting. When the per-session queue exceeds
+    /// [`MAX_RECALL_LEDGER_PER_SESSION`] the oldest entry is dropped.
     pub fn record_recall(&self, session_id: &str, turn: u32, memories: &[MemoriaMemory]) {
         if session_id.is_empty() || memories.is_empty() {
             return;
@@ -452,45 +466,50 @@ impl MemoryOrchestrator {
             at: std::time::Instant::now(),
         };
         if let Ok(mut g) = self.recall_ledger.write() {
-            g.insert(session_id.to_string(), entry);
+            let q = g.entry(session_id.to_string()).or_default();
+            if q.len() >= MAX_RECALL_LEDGER_PER_SESSION {
+                q.pop_front();
+            }
+            q.push_back(entry);
         }
     }
 
-    /// Observe the outcome of a downstream action that followed a
-    /// recall in this session. For each memory_id surfaced by the
-    /// previous recall, records the mapped feedback signal to Memoria.
-    /// The ledger entry is consumed (evicted) so a single recall is
-    /// scored at most once.
+    /// Observe the outcome of a downstream action that followed recalls
+    /// in this session. Drains the session's recall queue (FIFO) and
+    /// routes the mapped feedback signal to Memoria for every
+    /// memory_id in every drained entry. Entries are evicted so each
+    /// recall is scored at most once.
     ///
-    /// `max_age`: if provided, ignore recalls older than this — a
-    /// stale ledger entry would attribute a new tool outcome to a
-    /// recall the agent may have already moved past. Default (None)
-    /// preserves full history.
+    /// `max_age`: if provided, entries older than this are dropped
+    /// *without* scoring (we can no longer attribute reliably). Entries
+    /// within the window are scored in order.
     pub async fn observe_recall_outcome(
         &self,
         session_id: &str,
         outcome: RecallObservedOutcome,
         max_age: Option<std::time::Duration>,
     ) -> Vec<Result<(), String>> {
-        let entry = {
+        let entries: Vec<RecallLedgerEntry> = {
             let Ok(mut g) = self.recall_ledger.write() else {
                 return Vec::new();
             };
-            let Some(entry) = g.remove(session_id) else {
+            let Some(q) = g.remove(session_id) else {
                 return Vec::new();
             };
-            if let Some(max) = max_age {
-                if entry.at.elapsed() > max {
-                    return Vec::new();
-                }
-            }
-            entry
+            q.into_iter()
+                .filter(|e| match max_age {
+                    Some(max) => e.at.elapsed() <= max,
+                    None => true,
+                })
+                .collect()
         };
         let signal = outcome.signal();
-        let mut results = Vec::with_capacity(entry.memory_ids.len());
-        for id in &entry.memory_ids {
-            let ctx = format!("auto: turn {} outcome", entry.turn);
-            results.push(self.client.feedback(id, signal, Some(&ctx)).await);
+        let mut results = Vec::new();
+        for entry in entries {
+            for id in &entry.memory_ids {
+                let ctx = format!("auto: turn {} outcome", entry.turn);
+                results.push(self.client.feedback(id, signal, Some(&ctx)).await);
+            }
         }
         results
     }
@@ -501,7 +520,18 @@ impl MemoryOrchestrator {
         self.recall_ledger
             .read()
             .ok()
-            .is_some_and(|g| g.contains_key(session_id))
+            .is_some_and(|g| g.get(session_id).is_some_and(|q| !q.is_empty()))
+    }
+
+    /// Count of unconsumed recall ledger entries for this session.
+    /// Exposed so tests can assert FIFO depth without reaching into
+    /// private fields.
+    pub fn pending_recall_count(&self, session_id: &str) -> usize {
+        self.recall_ledger
+            .read()
+            .ok()
+            .and_then(|g| g.get(session_id).map(|q| q.len()))
+            .unwrap_or(0)
     }
 
     /// Given a rolling window of recent user messages (oldest first),
@@ -820,6 +850,86 @@ mod tests {
                 outcome
             );
         }
+    }
+
+    // ── R4: multi-entry recall ledger (FIFO) ───────────────────────
+
+    #[tokio::test]
+    async fn record_recall_keeps_multiple_entries_in_same_turn() {
+        // The LLM probes twice before acting. Both recalls must be
+        // preserved — the prior single-entry ledger would drop the
+        // first one silently.
+        let client = std::sync::Arc::new(FeedbackCapturingClient::new());
+        let orch = MemoryOrchestrator::new(client.clone());
+        orch.record_recall("sess_multi", 1, &[memory("m1", "semantic", "a")]);
+        orch.record_recall("sess_multi", 1, &[memory("m2", "semantic", "b")]);
+        assert_eq!(orch.pending_recall_count("sess_multi"), 2);
+
+        let results = orch
+            .observe_recall_outcome("sess_multi", RecallObservedOutcome::UsefulSuccess, None)
+            .await;
+        assert_eq!(results.len(), 2, "both recalls must be scored");
+
+        let calls = client.feedback_calls.lock().unwrap().clone();
+        let ids: Vec<&str> = calls.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["m1", "m2"], "FIFO — first recall scored first");
+    }
+
+    #[tokio::test]
+    async fn record_recall_caps_queue_at_soft_limit() {
+        let client = std::sync::Arc::new(FeedbackCapturingClient::new());
+        let orch = MemoryOrchestrator::new(client);
+        // Blast past the cap; oldest must evict.
+        for i in 0..(MAX_RECALL_LEDGER_PER_SESSION + 5) {
+            let id = format!("m{i}");
+            orch.record_recall("sess_cap", i as u32, &[memory(&id, "semantic", "x")]);
+        }
+        assert_eq!(
+            orch.pending_recall_count("sess_cap"),
+            MAX_RECALL_LEDGER_PER_SESSION,
+            "queue depth must cap at MAX_RECALL_LEDGER_PER_SESSION"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_drains_all_entries_fifo_order() {
+        let client = std::sync::Arc::new(FeedbackCapturingClient::new());
+        let orch = MemoryOrchestrator::new(client.clone());
+        orch.record_recall("sess_fifo", 1, &[memory("first", "semantic", "a")]);
+        orch.record_recall("sess_fifo", 2, &[memory("second", "semantic", "b")]);
+        orch.record_recall("sess_fifo", 3, &[memory("third", "semantic", "c")]);
+
+        let _ = orch
+            .observe_recall_outcome("sess_fifo", RecallObservedOutcome::UsefulSuccess, None)
+            .await;
+
+        let calls = client.feedback_calls.lock().unwrap().clone();
+        let ids: Vec<&str> = calls.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["first", "second", "third"], "strict FIFO");
+        assert_eq!(orch.pending_recall_count("sess_fifo"), 0);
+    }
+
+    #[tokio::test]
+    async fn observe_with_max_age_drops_stale_entries_but_keeps_fresh() {
+        // Mixed queue: two old entries + one fresh. max_age filters
+        // only the old ones; fresh one still scores.
+        let client = std::sync::Arc::new(FeedbackCapturingClient::new());
+        let orch = MemoryOrchestrator::new(client.clone());
+        orch.record_recall("sess_mix", 1, &[memory("old1", "semantic", "a")]);
+        orch.record_recall("sess_mix", 2, &[memory("old2", "semantic", "b")]);
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        orch.record_recall("sess_mix", 3, &[memory("fresh", "semantic", "c")]);
+        // old1 + old2 are now ≥30ms; fresh < 30ms.
+        let _ = orch
+            .observe_recall_outcome(
+                "sess_mix",
+                RecallObservedOutcome::UsefulSuccess,
+                Some(std::time::Duration::from_millis(10)),
+            )
+            .await;
+        let calls = client.feedback_calls.lock().unwrap().clone();
+        let ids: Vec<&str> = calls.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["fresh"], "only the fresh entry scores");
     }
 
     // ── "Already surfaced" dedup ───────────────────────────────────
