@@ -1693,15 +1693,43 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
                 carry_cache_annotations(msg, &mut out);
                 return Some(out);
             }
-            let content = msg
-                .get("content")
-                .and_then(Value::as_str)
-                .map(|text| Value::String(text.to_string()))
-                .unwrap_or_else(|| {
-                    msg.get("content")
-                        .cloned()
-                        .unwrap_or(Value::String(String::new()))
-                });
+            let content = match msg.get("content") {
+                Some(Value::String(text)) => Value::String(text.clone()),
+                Some(Value::Null) | None => Value::String(String::new()),
+                Some(other) => {
+                    // Non-string content on a tool-role message is a
+                    // serialization bug upstream (compaction, fold, or
+                    // format conversion set it to an object/array instead
+                    // of a string). Coerce to string representation so
+                    // the LLM sees SOMETHING — not a bare `{}` that it
+                    // misreads as "tool returned empty JSON object".
+                    astra_core::agent_warn!(
+                        "llm_client",
+                        "tool-role msg has non-string content (type={}); \
+                         coercing to string for tool_result_block. \
+                         tool_use_id={}",
+                        if other.is_object() { "object" }
+                        else if other.is_array() { "array" }
+                        else { "other" },
+                        tool_use_id
+                    );
+                    match other {
+                        Value::Array(arr) => {
+                            // Content-array: extract text blocks
+                            let text: String = arr.iter()
+                                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                                .collect::<Vec<_>>()
+                                .join("");
+                            if text.is_empty() {
+                                Value::String(other.to_string())
+                            } else {
+                                Value::String(text)
+                            }
+                        }
+                        _ => Value::String(other.to_string()),
+                    }
+                }
+            };
             let tool_result_block = json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
