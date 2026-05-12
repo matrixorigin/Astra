@@ -37,7 +37,7 @@ const CACHE_HIT_PREVIEW_SNIPPET_BYTES: usize = 400;
 /// Return the longest prefix of `s` whose byte length is `≤ max_bytes` that
 /// still ends on a UTF-8 char boundary, together with a flag indicating
 /// whether any content was dropped.
-fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> (&str, bool) {
+pub fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> (&str, bool) {
     if s.len() <= max_bytes {
         return (s, false);
     }
@@ -358,8 +358,8 @@ mod tests {
         // largest char boundary ≤ the ceiling and never produces an
         // invalid slice.
         let body = "abc🎉🎉🎉"; // 3 ASCII + 3 × 4-byte emoji = 15 bytes
-        // Ceiling = 10: fits "abc" (3) + 1 emoji (4) = 7 bytes.
-        // Adding the next emoji would take us to 11 bytes > 10.
+                                // Ceiling = 10: fits "abc" (3) + 1 emoji (4) = 7 bytes.
+                                // Adding the next emoji would take us to 11 bytes > 10.
         let (out, truncated) = truncate_on_char_boundary(body, 10);
         assert!(truncated);
         assert_eq!(out, "abc🎉");

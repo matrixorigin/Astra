@@ -277,14 +277,28 @@ fn build_bridge_tool_call_records(
                     "non-string"
                 };
                 let stringified = other.to_string();
+                // Byte-slice is UTF-8-unsafe: serde_json emits ASCII-escaped
+                // today, but one config flip to raw UTF-8 would turn this
+                // into a panic on multi-byte boundaries. Route through the
+                // shared char-boundary helper instead — same helper that
+                // fixed the cross-turn cache-hit preview regression.
+                let (preview, _truncated) =
+                    astra_turn_core::headless_tool_journal::truncate_on_char_boundary(
+                        &stringified,
+                        200,
+                    );
                 astra_core::agent_warn!(
                     "bridge",
                     "tool_result.output is {} (not String); coercing. request_id={}, value={}",
                     type_label,
                     request_id,
-                    &stringified[..stringified.len().min(200)]
+                    preview
                 );
-                stringified
+                format!(
+                    "[BRIDGE_OUTPUT_TYPE_BUG] tool_result.output was JSON {} \
+                     (expected String). request_id={}. raw={}",
+                    type_label, request_id, preview
+                )
             }
         });
         let error = tool_result

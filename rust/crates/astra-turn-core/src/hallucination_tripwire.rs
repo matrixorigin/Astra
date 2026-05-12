@@ -277,6 +277,21 @@ mod tests {
     }
 
     #[test]
+    fn unclosed_fence_swallows_rest_of_output() {
+        // Contract pin: an unclosed ```fence strips everything that
+        // follows — safer to under-match than over-match (false
+        // negative preferable to false positive for the tripwire).
+        // Without this, a truncated assistant output containing a
+        // quoted prior nudge + live confabulation would re-fire.
+        let out = "Context:\n```rust\nsilently returned {} in prior turn\n// fence never closes";
+        let v = detect(out, std::iter::empty());
+        assert!(
+            matches!(v, TripwireVerdict::Clean),
+            "unclosed fence must strip trailing prose (got {v:?})"
+        );
+    }
+
+    #[test]
     fn ignores_phrase_inside_blockquote() {
         let v = detect(
             "> last turn: silently returned {}\n\nI won't use that phrasing.",

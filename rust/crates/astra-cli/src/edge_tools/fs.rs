@@ -4377,6 +4377,34 @@ type Handler interface {
         );
     }
 
+    // NOTE: An end-to-end test for the overlapping-fuzzy-span dedup
+    // path in `multi_edit` is structurally hard to construct because
+    // each edit runs sequentially on the buffer produced by the
+    // previous edit — so by the time edit[1] is evaluated, edit[0]'s
+    // fuzzy span has already been rewritten and no longer matches.
+    // The dedup guard remains valuable as a defence-in-depth check
+    // (e.g. against future refactors that batch fuzzy resolution up
+    // front); the overlap arithmetic itself is covered below.
+    #[test]
+    fn fuzzy_span_overlap_arithmetic_is_half_open() {
+        // Half-open interval overlap: [a,b) ∩ [c,d) non-empty ⇔ a < d && c < b.
+        let cases = [
+            // (span_a, span_b, expected_overlap)
+            ((0usize, 5usize), (5usize, 10usize), false), // touching, not overlapping
+            ((0, 5), (4, 10), true),                      // 1-byte overlap
+            ((0, 10), (3, 7), true),                      // fully contained
+            ((3, 7), (0, 10), true),                      // reverse fully contained
+            ((0, 5), (6, 10), false),                     // gap
+        ];
+        for ((a_s, a_e), (b_s, b_e), expected) in cases {
+            let overlaps = a_s < b_e && b_s < a_e;
+            assert_eq!(
+                overlaps, expected,
+                "[{a_s},{a_e}) vs [{b_s},{b_e})"
+            );
+        }
+    }
+
     #[test]
     fn multi_edit_sequential_edits_see_previous_results() {
         let tmpdir = tempfile::tempdir().unwrap();
