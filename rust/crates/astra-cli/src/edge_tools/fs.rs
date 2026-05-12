@@ -1728,8 +1728,21 @@ impl ToolExecutor {
             Err(e) => return format!("Error reading file: {e}"),
         };
 
-        // Validate all edits first (atomic: all or nothing)
+        // Validate + apply all edits atomically (all or nothing).
+        //
+        // Exact-match first. When a given edit's old_str doesn't
+        // match verbatim, fall back to the same fuzzy cascade that
+        // single-edit `str_replace` uses — whitespace-normalized,
+        // indentation-flexible, etc. — so the common "LLM got the
+        // indent off by 4 spaces" case auto-succeeds instead of
+        // aborting the whole batch. Ambiguous fuzzy matches (more
+        // than one candidate) still bail out safely.
+        //
+        // We collect `(strategy_name, edit_index)` pairs for any
+        // fuzzy applications so the caller sees which edits
+        // deviated from a verbatim match and can re-inspect.
         let mut working = content.clone();
+        let mut fuzzy_applications: Vec<(usize, &'static str)> = Vec::new();
         for (i, edit) in edits.iter().enumerate() {
             let old_str = match edit.get("old_str").and_then(Value::as_str) {
                 Some(s) => s,
@@ -1746,10 +1759,25 @@ impl ToolExecutor {
             }
             let count = working.matches(old_str).count();
             if count == 0 {
-                return format!(
-                    "Error: edit[{i}] old_str not found. Aborting all edits.\n{}",
-                    str_replace_not_found_hint(&working, old_str)
-                );
+                // Try the fuzzy cascade. If it returns a unique
+                // match, apply it at that location using the
+                // caller's new_str; record which strategy matched.
+                match super::fuzzy_replacer::fuzzy_find_replacement(
+                    &working, old_str, /* replace_all */ false,
+                ) {
+                    Some(fuzzy_match) => {
+                        let actual = fuzzy_match.actual.to_string();
+                        fuzzy_applications.push((i, fuzzy_match.strategy));
+                        working = working.replacen(&actual, new_str, 1);
+                        continue;
+                    }
+                    None => {
+                        return format!(
+                            "Error: edit[{i}] old_str not found. Aborting all edits.\n{}",
+                            str_replace_not_found_hint(&working, old_str)
+                        );
+                    }
+                }
             }
             if count > 1 {
                 return format!(
@@ -1794,6 +1822,17 @@ impl ToolExecutor {
                 let mut result = format!("Applied {} edit(s) successfully", edits.len());
                 if let Some(fmt_note) = format_result {
                     result.push_str(&format!("\n{fmt_note}"));
+                }
+                // Disclose any edits that required fuzzy matching so
+                // the caller sees the old_str wasn't byte-exact.
+                // Format: one bullet per fuzzy edit, tagged with the
+                // strategy name (whitespace-normalized, line-trimmed,
+                // etc.) and the 1-based edit index.
+                if !fuzzy_applications.is_empty() {
+                    result.push_str("\n⚠ fuzzy match used (old_str did not match byte-exactly):");
+                    for (idx, strategy) in &fuzzy_applications {
+                        result.push_str(&format!("\n  edit[{idx}]: {strategy}"));
+                    }
                 }
 
                 // Scope context for the first edit location
@@ -4114,6 +4153,121 @@ type Handler interface {
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
         let result = exe.multi_edit(&json!({"path": "f.txt", "edits": []}));
         assert!(result.contains("empty"), "result: {result}");
+    }
+
+    #[test]
+    fn multi_edit_auto_applies_whitespace_normalized_match() {
+        // Regression (session 5933ebce turn 4 rounds 17+20): LLM
+        // submitted old_str with 20-space indent but the actual
+        // file had 24-space indent. Single-edit `str_replace`
+        // already falls through to the fuzzy cascade for this case;
+        // `multi_edit` used to die with
+        // "Error: edit[0] old_str not found" even though the
+        // cascade's whitespace-normalized strategy has a unique
+        // match.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("code.rs");
+        // Actual file: 24-space indent.
+        std::fs::write(
+            &file,
+            "fn outer() {\n                        Some(body.clone()),\n}\n",
+        )
+        .unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "code.rs"}));
+        // LLM supplies 20-space indent — intent is clear, whitespace
+        // is the only mismatch.
+        let result = exe.multi_edit(&json!({
+            "path": "code.rs",
+            "edits": [
+                {
+                    "old_str": "                    Some(body.clone()),",
+                    "new_str": "                    Some(&body),"
+                }
+            ]
+        }));
+        assert!(
+            result.contains("Applied 1 edit(s)"),
+            "whitespace-only mismatch should auto-apply: {result}"
+        );
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            content.contains("Some(&body)"),
+            "new_str must be in file: {content}"
+        );
+        assert!(
+            !content.contains("Some(body.clone())"),
+            "old_str must be gone: {content}"
+        );
+        // Indentation of the replaced line must match the actual
+        // file's 24-space indent, not the LLM's 20-space version.
+        assert!(
+            content.contains("                        Some(&body),"),
+            "replacement must preserve file's own indentation: {content}"
+        );
+    }
+
+    #[test]
+    fn multi_edit_reports_fuzzy_strategy_in_success_message() {
+        // When multi_edit falls back to fuzzy matching, the result
+        // should say so — users/LLM can then see that the old_str
+        // didn't match exactly and inspect the diff, instead of
+        // silently losing awareness.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("code.rs");
+        std::fs::write(&file, "fn f() {\n    let  x = 1;\n}\n").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "code.rs"}));
+        let result = exe.multi_edit(&json!({
+            "path": "code.rs",
+            "edits": [
+                {
+                    // Only one space between `let` and `x`, file has two.
+                    "old_str": "    let x = 1;",
+                    "new_str": "    let x = 2;"
+                }
+            ]
+        }));
+        assert!(
+            result.contains("Applied 1 edit(s)"),
+            "whitespace-normalized fuzzy match should succeed: {result}"
+        );
+        assert!(
+            result.to_ascii_lowercase().contains("fuzzy") || result.contains("whitespace"),
+            "result must disclose that fuzzy matching was used: {result}"
+        );
+    }
+
+    #[test]
+    fn multi_edit_rejects_fuzzy_match_when_ambiguous() {
+        // If the fuzzy cascade finds two+ candidates, multi_edit
+        // must NOT auto-apply — that's unsafe. User has to give
+        // more context.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("code.rs");
+        // Two locations with whitespace-equivalent "Some(body.clone())".
+        std::fs::write(
+            &file,
+            "fn a() {\n    Some(body.clone())\n}\nfn b() {\n    Some(body.clone())\n}\n",
+        )
+        .unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "code.rs"}));
+        let result = exe.multi_edit(&json!({
+            "path": "code.rs",
+            "edits": [
+                {
+                    "old_str": "Some(body.clone())",
+                    "new_str": "Some(&body)"
+                }
+            ]
+        }));
+        // With 2 exact matches, the original ambiguity path already
+        // handles this — keep it failing safely.
+        assert!(
+            result.starts_with("Error") || result.contains("must be unique"),
+            "ambiguous matches must not silently auto-apply: {result}"
+        );
     }
 
     #[test]
