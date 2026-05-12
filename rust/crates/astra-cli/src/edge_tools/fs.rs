@@ -1743,6 +1743,7 @@ impl ToolExecutor {
         // deviated from a verbatim match and can re-inspect.
         let mut working = content.clone();
         let mut fuzzy_applications: Vec<(usize, &'static str)> = Vec::new();
+        let mut first_edit_start_byte: Option<usize> = None;
         for (i, edit) in edits.iter().enumerate() {
             let old_str = match edit.get("old_str").and_then(Value::as_str) {
                 Some(s) => s,
@@ -1767,6 +1768,9 @@ impl ToolExecutor {
                 ) {
                     Some(fuzzy_match) => {
                         let actual = fuzzy_match.actual.to_string();
+                        if i == 0 {
+                            first_edit_start_byte = working.find(&actual);
+                        }
                         fuzzy_applications.push((i, fuzzy_match.strategy));
                         working = working.replacen(&actual, new_str, 1);
                         continue;
@@ -1784,6 +1788,9 @@ impl ToolExecutor {
                     "Error: edit[{i}] old_str matches {count} times (must be unique). Aborting all edits.\n{}",
                     str_replace_ambiguous_hint(&working, old_str, count)
                 );
+            }
+            if i == 0 {
+                first_edit_start_byte = working.find(old_str);
             }
             working = working.replacen(old_str, new_str, 1);
         }
@@ -1837,15 +1844,9 @@ impl ToolExecutor {
 
                 // Scope context for the first edit location
                 if let Some(lang) = super::code_intel::detect_language(&path)
-                    && let Some(first_old) = edits
-                        .first()
-                        .and_then(|e| e.get("old_str"))
-                        .and_then(Value::as_str)
+                    && let Some(first_edit_start) = first_edit_start_byte
                 {
-                    let edit_line = content[..content.find(first_old).unwrap_or(0)]
-                        .matches('\n')
-                        .count()
-                        + 1;
+                    let edit_line = content[..first_edit_start].matches('\n').count() + 1;
                     let scope = super::code_intel::scope_at_line(&working, lang, edit_line);
                     if !scope.breadcrumbs.is_empty() {
                         result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
@@ -4397,6 +4398,39 @@ type Handler interface {
         assert!(result.contains("Applied 2 edit(s)"), "result: {result}");
         assert!(result.contains("📍"), "should show scope: {result}");
         assert!(result.contains("main"), "should mention fn main: {result}");
+    }
+
+    #[test]
+    fn multi_edit_fuzzy_match_scope_uses_actual_location() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("lib.rs");
+        std::fs::write(
+            &file,
+            "fn top_level() {\n    let unrelated = 1;\n}\n\nfn outer() {\n    fn inner() {\n        let  value = compute();\n    }\n}\n",
+        )
+        .unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "lib.rs"}));
+        let result = exe.multi_edit(&json!({
+            "path": "lib.rs",
+            "edits": [
+                {
+                    "old_str": "        let value = compute();",
+                    "new_str": "        let value = finish();"
+                }
+            ]
+        }));
+
+        assert!(result.contains("Applied 1 edit(s)"), "result: {result}");
+        assert!(result.contains("📍"), "should show scope: {result}");
+        assert!(
+            result.contains("outer") && result.contains("inner"),
+            "scope should use actual fuzzy match location, not line 1: {result}"
+        );
+        assert!(
+            !result.contains("top_level"),
+            "scope must not fall back to the beginning of the file: {result}"
+        );
     }
 
     #[test]

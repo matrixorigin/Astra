@@ -708,6 +708,12 @@ pub enum VolatileKind {
     ExplorationBudget,
     /// Execution retry with corrective reason.
     ExecutionRetry,
+    /// Post-turn hallucination self-check nudge. Fires when the
+    /// assistant's prose for the just-finished turn claimed a
+    /// phantom tool outcome (e.g. "silently returned {}") that no
+    /// tool call actually produced. See
+    /// [`astra_turn_core::hallucination_tripwire`] for the detector.
+    HallucinationTripwire,
     /// Catch-all for producers we haven't categorized yet. Prefer
     /// adding a new variant over reusing this — introspect reports
     /// by kind and a generic bucket degrades the signal.
@@ -750,7 +756,8 @@ impl VolatileKind {
             | Self::CompactResume
             | Self::ExecutionRetry
             | Self::ExplorationBudget
-            | Self::BudgetReview => "user",
+            | Self::BudgetReview
+            | Self::HallucinationTripwire => "user",
             // System-role: in-band runtime snapshots or coaching.
             Self::WorkingSet
             | Self::AlreadyFetched

@@ -13,7 +13,7 @@ use astra_turn_core::headless_tool_assembly::{
 };
 use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
 use astra_turn_core::headless_tool_journal::{
-    journal_record_blocked_tool, journal_record_cross_turn_cache_hit,
+    journal_record_blocked_tool, journal_record_cross_turn_cache_hit_with_body,
     journal_record_duplicate_within_turn, journal_record_unknown_tool,
 };
 use astra_turn_core::headless_tool_stderr_lines::{
@@ -302,7 +302,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     .record_cache_hit_for_signature(&slot.name, &call_sig);
                 self.ctx
                     .tool_call_records
-                    .push(journal_record_cross_turn_cache_hit(
+                    .push(journal_record_cross_turn_cache_hit_with_body(
                         slot.name.clone(),
                         body.len() as u32,
                         args_preview,
@@ -355,7 +355,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 .record_cache_hit_for_signature(&slot.name, &call_sig);
             self.ctx
                 .tool_call_records
-                .push(journal_record_cross_turn_cache_hit(
+                .push(journal_record_cross_turn_cache_hit_with_body(
                     slot.name.clone(),
                     cached.output.len() as u32,
                     args_preview,
@@ -412,7 +412,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 .record_cache_hit_for_signature(&slot.name, &call_sig);
             self.ctx
                 .tool_call_records
-                .push(journal_record_cross_turn_cache_hit(
+                .push(journal_record_cross_turn_cache_hit_with_body(
                     slot.name.clone(),
                     cached_output.len() as u32,
                     args_preview,
