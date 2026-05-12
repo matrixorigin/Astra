@@ -585,14 +585,21 @@ impl MemoriaClient for HttpMemoriaClient {
     }
 
     /// Purge working memories for a session.
-    /// NOTE: Currently uses topic-based purge which does fulltext search on content.
-    /// This does NOT reliably match UUID-style session IDs (ngram tokenizer issue).
-    /// TODO: switch to session_id-based purge once Memoria supports it
-    ///       (https://github.com/matrixorigin/Memoria/issues/182)
+    ///
+    /// Uses Memoria's `session_id` + `memory_types=["working"]` selector,
+    /// which is an exact filter on the session column — reliable even
+    /// for UUID-style session IDs. The prior implementation used
+    /// `topic="session:<uuid>"` which resolved via fulltext ngram
+    /// tokenization; UUID tokens never matched, so `purge_working` was
+    /// silently a no-op on every real session.
     async fn purge_working(&self, session_id: &str) -> Result<u64, String> {
+        if session_id.is_empty() {
+            return Err("purge_working requires non-empty session_id".into());
+        }
         let url = format!("{}/v1/memories/purge", self.base_url.trim_end_matches('/'));
         let body = json!({
-            "topic": format!("session:{}", session_id),
+            "session_id": session_id,
+            "memory_types": ["working"],
             "reason": "session compaction cleanup",
         });
 
@@ -614,8 +621,12 @@ impl MemoriaClient for HttpMemoriaClient {
             .await
             .map_err(|e| format!("Memoria purge parse failed: {e}"))?;
 
+        // Memoria returns `{ "purged": N, ... }` (see `PurgeResponse`);
+        // prior v1 also emitted `deleted_count` for topic-mode. Accept
+        // either so this works against both shapes.
         Ok(data
-            .get("deleted_count")
+            .get("purged")
+            .or_else(|| data.get("deleted_count"))
             .and_then(Value::as_u64)
             .unwrap_or(0))
     }
@@ -2569,6 +2580,100 @@ mod tests {
             "should not store semantic entries when disabled, got {}",
             semantic_entries.len()
         );
+    }
+
+    /// P3 regression: `purge_working` must send `session_id` +
+    /// `memory_types=["working"]` to Memoria's v1 purge endpoint, NOT a
+    /// topic-based fulltext query. Verified by running a one-shot TCP
+    /// mock that captures the request body and echoes a response.
+    #[tokio::test]
+    async fn purge_working_sends_session_id_selector_not_topic() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_cl = captured.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            // Read until we see \r\n\r\n then the declared Content-Length.
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(idx) =
+                    buf.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let headers = std::str::from_utf8(&buf[..idx]).unwrap_or("");
+                    let cl: usize = headers
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("content-length: ")
+                                .or_else(|| l.strip_prefix("Content-Length: "))
+                        })
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    let body_so_far = buf.len() - idx - 4;
+                    if body_so_far >= cl {
+                        break;
+                    }
+                }
+            }
+            let full = String::from_utf8_lossy(&buf).to_string();
+            let body_start = full.find("\r\n\r\n").map(|i| i + 4).unwrap_or(full.len());
+            *captured_cl.lock().unwrap() = full[body_start..].to_string();
+            let payload = b"{\"purged\": 3}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.write_all(payload).await;
+            let _ = sock.shutdown().await;
+        });
+
+        let client = HttpMemoriaClient::new(
+            format!("http://{addr}"),
+            "test-key".to_string(),
+        );
+        let purged = client
+            .purge_working("8ae95566-f123-4abc-9def-0123456789ab")
+            .await
+            .expect("purge ok");
+        assert_eq!(purged, 3, "must parse `purged` from response");
+        server.await.unwrap();
+
+        let body = captured.lock().unwrap().clone();
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("body parse fail: {e}, body=<{body}>"));
+        assert_eq!(
+            json.get("session_id").and_then(Value::as_str),
+            Some("8ae95566-f123-4abc-9def-0123456789ab"),
+            "session_id must be forwarded exactly"
+        );
+        let types = json
+            .get("memory_types")
+            .and_then(Value::as_array)
+            .expect("memory_types array");
+        assert_eq!(types.len(), 1);
+        assert_eq!(types[0].as_str(), Some("working"));
+        assert!(
+            json.get("topic").is_none(),
+            "must NOT send topic-based selector (ngram doesn't match UUIDs)"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_working_rejects_empty_session_id() {
+        let client =
+            HttpMemoriaClient::new("http://127.0.0.1:1".into(), "key".into());
+        let err = client.purge_working("").await.unwrap_err();
+        assert!(err.contains("non-empty"), "expected validation error: {err}");
     }
 
     /// audit-A3: HttpMemoriaClient must have connect_timeout and timeout so a
