@@ -296,8 +296,12 @@ impl ToolExecutor {
             }
         }
 
-        // Pre-read size gate: check file size before reading.
-        // Large files without a line range should use outline or start_line/end_line.
+        // Pre-read size gate: large files without a line range auto-degrade
+        // to outline mode + guidance. Old behavior was a hard refusal ("Error:
+        // file is too large") which gave the LLM no useful content — it then
+        // had to guess start_line/end_line blind. New behavior: read the file
+        // anyway (for outline only), return the outline + explicit instructions
+        // on how to drill into specific ranges.
         if !has_range
             && !has_outline
             && let Ok(meta) = fs::metadata(&path)
@@ -305,12 +309,37 @@ impl ToolExecutor {
             let size = meta.len() as usize;
             let limit = self.scaled_output_limit();
             if size > limit {
-                let total_lines = size / 40; // rough estimate
+                let content = match read_to_string_lossy(&path) {
+                    Ok(c) => c,
+                    Err(e) => return format!("Error reading file: {e}"),
+                };
+                let total_lines = content.lines().count();
+
+                let outline_text = if let Some(lang) = super::code_intel::detect_language(&path) {
+                    let generated = super::code_intel::generate_outline(&content, lang);
+                    if generated.trim().is_empty() {
+                        format!(
+                            "(outline generation returned empty for this file — \
+                                 {total_lines} total lines)"
+                        )
+                    } else {
+                        generated
+                    }
+                } else {
+                    format!(
+                        "(no symbol outline available for this file type — \
+                             {total_lines} total lines)"
+                    )
+                };
+
                 return format!(
-                    "Error: file is too large ({} bytes, ~{} lines). \
-                     Use start_line/end_line to read a specific range, \
-                     or outline=true to see definitions only.",
-                    size, total_lines
+                    "File is large ({size} bytes, {total_lines} lines). \
+                     Auto-generated outline below.\n\n\
+                     {outline_text}\n\n\
+                     To read specific sections, use:\n\
+                     • read_file(path=\"{path_str}\", start_line=1, end_line=100) — first 100 lines\n\
+                     • read_file(path=\"{path_str}\", start_line=N, end_line=M) — specific range\n\
+                     • grep(pattern=\"keyword\", path=\"{path_str}\") — find specific symbols",
                 );
             }
         }
@@ -3361,16 +3390,16 @@ type Handler interface {
         let executor = test_executor_in(dir.path());
         let result = executor.read_file(&serde_json::json!({"path": "big.txt"}));
 
-        // Pre-read size gate: large files without a range return an error
-        // directing the LLM to use start_line/end_line or outline.
+        // Pre-read size gate: large files without a range now auto-degrade
+        // to an outline + guidance, not a hard refusal.
         assert!(
-            result.contains("too large") || result.contains("truncated"),
-            "should reject or truncate large file: last 100 chars: {}",
-            &result[result.len().saturating_sub(100)..]
+            result.contains("File is large") || result.contains("outline"),
+            "should auto-generate outline for large file: last 200 chars: {}",
+            &result[result.len().saturating_sub(200)..]
         );
         assert!(
-            result.contains("outline") || result.contains("start_line"),
-            "should suggest alternatives: last 200 chars: {}",
+            result.contains("start_line") || result.contains("read_file"),
+            "should suggest how to drill into specific ranges: last 200 chars: {}",
             &result[result.len().saturating_sub(200)..]
         );
     }
@@ -3388,18 +3417,21 @@ type Handler interface {
         drop(f);
 
         let executor = test_executor_in(dir.path());
-        // Full read should be rejected
+        // Full read should auto-degrade to outline (not a hard rejection)
         let full = executor.read_file(&serde_json::json!({"path": "big.txt"}));
         assert!(
-            full.contains("too large"),
-            "full read should be rejected: {}",
-            &full[..100.min(full.len())]
+            full.contains("File is large"),
+            "full read should auto-degrade: {}",
+            &full[..200.min(full.len())]
         );
 
-        // Ranged read should succeed
+        // Ranged read should succeed (bypass the size gate entirely)
         let ranged = executor
             .read_file(&serde_json::json!({"path": "big.txt", "start_line": 1, "end_line": 10}));
-        assert!(!ranged.contains("too large"), "ranged read should succeed");
+        assert!(
+            !ranged.contains("File is large"),
+            "ranged read must not trigger size gate"
+        );
         assert!(ranged.contains("line 0"), "should contain first line");
     }
 
