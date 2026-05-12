@@ -445,7 +445,34 @@ awareness of what it could recall.
 ## 11. Review-driven design choices
 
 Lessons from multi-agent reviews on the `enhance_tool` branch that
-shaped the current design:
+shaped the current design.
+
+**Meta-rules for future maintainers** — these are the anti-patterns
+we fell into and the guardrails against them:
+
+1. **Never create a parallel store to avoid touching an existing one.**
+   When a new code path needs the same state some other path already
+   tracks, _share the store_. Three parallel "already surfaced" sets
+   is what we got from three successive "I'll just add another ledger
+   to avoid touching X" decisions. Symptom to watch for: writing a
+   comment like *"paired with the runtime-side `memory_seen_ledger`"*
+   — that's the moment to stop and unify.
+2. **Dead code left in tree is a maintenance trap, not a future hook.**
+   `MemoryOrchestrator` sat un-wired for months while 3 other modules
+   reimplemented its API half-heartedly. Either wire it or delete it;
+   "leave it for later" produces the worst outcome.
+3. **Destructive ops validate args *before* side effects, always.**
+   Snapshot/log/commit before-the-guard creates orphans that look
+   identical to real artifacts. The order is: validate → commit → act.
+4. **No silent truncation in summary outputs.** If the full list
+   mattered enough to collect, the fact of truncation matters enough
+   to render. `(+N more)` / `…` / `[truncated]` — pick one.
+5. **When a design note "justifies" a limit with an assumption, flag
+   the assumption as a test.** "latest-only because older are probably
+   acted on" was a guess. Write the test that proves or disproves it,
+   or remove the limit.
+
+Concrete applications of these rules:
 
 - **One canonical dedup store, not three.** An earlier iteration had
   parallel "already surfaced" sets in the orchestrator, a runtime
