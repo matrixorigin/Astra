@@ -168,4 +168,87 @@ mod tests {
         assert_eq!(d.should_run("sess1"), DebounceDecision::Run);
         assert_eq!(d.session_count(), 0);
     }
+
+    // ─── Caller-sequence integration tests ─────────────────────────────
+    //
+    // These lock the exact should_run/record/forget sequence used by
+    // `server::run_lifecycle::post_loop_memory_cleanup` (lines 98-147
+    // and the final `forget` at the end of cleanup). Regressions in
+    // the caller — e.g. recording on failure, skipping forget, or
+    // reversing the order — will show up here rather than only in a
+    // six-session production cascade.
+
+    #[test]
+    fn caller_sequence_success_path_skips_on_second_turn() {
+        // Simulates: first terminal run completes governance successfully,
+        // then the user issues another turn on the same session within
+        // the window. Caller path:
+        //   should_run=Run → governance Ok → record → forget-at-teardown
+        // Second turn (before forget, e.g. still active) must Skip.
+        let d = SessionEndDebouncer::with_interval(Duration::from_secs(60));
+        assert_eq!(d.should_run("sess-caller-1"), DebounceDecision::Run);
+        // caller: governance succeeded → record()
+        d.record("sess-caller-1");
+        // Second turn arrives on same session_id before forget/teardown:
+        assert_eq!(d.should_run("sess-caller-1"), DebounceDecision::Skip);
+    }
+
+    #[test]
+    fn caller_sequence_governance_failure_does_not_consume_window() {
+        // Simulates: should_run=Run, governance returns Err, caller
+        // logs warn and SKIPS record (see run_lifecycle.rs ~132 vs 134).
+        // Next turn must still get Run — a failed governance attempt
+        // must not burn the 15-min window.
+        let d = SessionEndDebouncer::with_interval(Duration::from_secs(60));
+        assert_eq!(d.should_run("sess-fail"), DebounceDecision::Run);
+        // caller: governance returned Err → NO record() call.
+        // Next turn:
+        assert_eq!(d.should_run("sess-fail"), DebounceDecision::Run);
+        assert_eq!(d.session_count(), 0);
+    }
+
+    #[test]
+    fn caller_sequence_forget_allows_immediate_rerun_on_same_session_id() {
+        // Simulates: long-lived server reaches explicit teardown for a
+        // session_id, calls forget(), then the user reconnects with the
+        // same session_id (sticky IDs). Next should_run must be Run so
+        // the new conversation gets its own governance window.
+        let d = SessionEndDebouncer::with_interval(Duration::from_secs(60));
+        d.record("sess-sticky");
+        assert_eq!(d.should_run("sess-sticky"), DebounceDecision::Skip);
+        // Explicit teardown path:
+        d.forget("sess-sticky");
+        // Reconnect with same id:
+        assert_eq!(d.should_run("sess-sticky"), DebounceDecision::Run);
+    }
+
+    #[test]
+    fn caller_sequence_empty_session_id_is_noop_throughout() {
+        // run_lifecycle.rs: `if session_id.is_empty() { return; }` at the
+        // top of post_loop_memory_cleanup. But if a future refactor drops
+        // that guard, the debouncer itself must still no-op cleanly for
+        // every method in the caller sequence.
+        let d = SessionEndDebouncer::with_interval(Duration::from_secs(60));
+        assert_eq!(d.should_run(""), DebounceDecision::Skip);
+        d.record("");
+        d.forget("");
+        assert_eq!(d.session_count(), 0);
+        assert_eq!(d.should_run(""), DebounceDecision::Skip);
+    }
+
+    #[test]
+    fn caller_sequence_concurrent_sessions_do_not_cross_contaminate() {
+        // Server handles multiple sessions in flight. One session's
+        // record()/forget() must not affect another's window — regression
+        // guard against a future HashMap keying bug.
+        let d = SessionEndDebouncer::with_interval(Duration::from_secs(60));
+        d.record("sess-A");
+        d.record("sess-B");
+        assert_eq!(d.should_run("sess-A"), DebounceDecision::Skip);
+        assert_eq!(d.should_run("sess-B"), DebounceDecision::Skip);
+        d.forget("sess-A");
+        assert_eq!(d.should_run("sess-A"), DebounceDecision::Run);
+        // B's window must be untouched:
+        assert_eq!(d.should_run("sess-B"), DebounceDecision::Skip);
+    }
 }

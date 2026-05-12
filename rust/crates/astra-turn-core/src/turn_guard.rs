@@ -237,6 +237,14 @@ impl TurnGuard {
                     | error_recovery::ErrorCategory::ResourceLimit => {
                         self.health.record_resource_limit_failure(tool_name);
                     }
+                    // Schema / input-validation failures are the *caller*'s fault
+                    // (bad args from the LLM), not the tool's. Don't deprioritize
+                    // the tool — otherwise a few malformed calls can banish a
+                    // perfectly healthy tool (regression from session 7e3fecb5).
+                    // See commit 60203cab for the new API; this is the wiring.
+                    error_recovery::ErrorCategory::ToolInvalidArgs => {
+                        self.health.record_input_validation_failure(tool_name);
+                    }
                     _ => {
                         self.health.record_failure(tool_name);
                     }

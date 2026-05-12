@@ -1624,6 +1624,46 @@ mod tests {
     }
 
     #[test]
+    fn digest_does_not_flag_cross_turn_cache_hits_as_failures() {
+        // Regression guard for session 6d6c1041: cross-turn cache
+        // hits are recorded with `error: "cached_cross_turn"` (an
+        // info tag, not a failure) + a non-empty
+        // `result_preview` starting with "[cached_cross_turn:".
+        // Earlier versions with `result_preview: None` mis-reported
+        // the tool as having returned an empty body and the LLM
+        // hallucinated a `{}`-return bug. Pin both invariants:
+        // - cache hits are NOT counted in `tool_calls_failed`
+        // - `result_body_signals_failure` returns false for the
+        //   tagged preview shape
+        assert!(
+            !result_body_signals_failure(
+                "[cached_cross_turn: reused 2000 bytes — refer to earlier read_file]"
+            ),
+            "cache-hit preview must not trip the failure detector"
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "test-cachehit-00000000-0000-0000-0000-0000000000aa";
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"read_file","ok":true,"ms":0,"error":"cached_cross_turn","output_bytes":2000,"result_preview":"[cached_cross_turn: reused 2000 bytes]","args_preview":"src/lib.rs"},{"name":"bash","ok":true,"ms":5,"result_preview":"ok"}]}"#,
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(
+            d.aggregates.tool_calls_failed, 0,
+            "cross-turn cache hits must not count as failures"
+        );
+        assert!(
+            d.failed_tool_calls.is_empty(),
+            "cross-turn cache hits must not appear in failed_tool_calls"
+        );
+    }
+
+    #[test]
     fn digest_failed_tool_calls_empty_in_summary_focus() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = JournalDirGuard::new(tmp.path());

@@ -519,8 +519,12 @@ impl DefaultToolExecutor {
             "memory" => {
                 let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
                 ToolResult::error(format!(
-                    "Error: Memory tool (action='{action}') requires a configured memoria endpoint. \
-                     Use ServerToolExecutor or CliToolExecutor instead of DefaultToolExecutor."
+                    "Error: Memory tool (action='{action}') is not available — the memoria \
+                     service endpoint is not configured in this session.\n\n\
+                     This usually means the session was started without `--memoria-url` or \
+                     the MEMORIA_URL environment variable is unset.\n\
+                     Workaround: skip memory operations for now, or ask the user to \
+                     configure the memoria endpoint and restart."
                 ))
             }
 
@@ -559,8 +563,13 @@ impl DefaultToolExecutor {
             Some(c) => c,
             None => {
                 return ToolResult::error(format!(
-                    "Error: GitHub tool '{name}' requires a configured GitHub client. \
-                     Call with_github_client() when building DefaultToolExecutor."
+                    "Error: GitHub tool '{name}' failed — no GitHub token is configured.\n\n\
+                     To fix, do ONE of:\n\
+                     1. Run `gh auth login` in a terminal (gh CLI stores the token)\n\
+                     2. Set the GITHUB_TOKEN environment variable before starting this session\n\n\
+                     After authenticating, restart the session and retry.\n\
+                     Workaround: use `bash` with `gh issue create ...` or `gh pr create ...` directly \
+                     (the gh CLI may already be authenticated separately)."
                 ));
             }
         };
@@ -1343,21 +1352,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_github_without_client() {
+    async fn dispatch_github_without_client_gives_actionable_guidance() {
         let (_tmp, exec) = test_executor();
         let result = exec
             .execute("github_list_prs", &serde_json::json!({}))
             .await;
         assert!(result.is_error);
         assert!(
-            result
-                .output
-                .contains("requires a configured GitHub client")
+            result.output.contains("no GitHub token is configured"),
+            "error must describe the problem, not the internal API: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("gh auth login"),
+            "error must suggest a concrete fix action: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("Workaround"),
+            "error must offer a fallback path: {}",
+            result.output
         );
     }
 
     #[tokio::test]
-    async fn dispatch_memory_without_endpoint() {
+    async fn dispatch_memory_without_endpoint_gives_actionable_guidance() {
         let (_tmp, exec) = test_executor();
         let result = exec
             .execute(
@@ -1367,9 +1386,19 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(
-            result
-                .output
-                .contains("requires a configured memoria endpoint")
+            result.output.contains("not available"),
+            "error must describe unavailability: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("Workaround"),
+            "error must offer a fallback: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("ServerToolExecutor"),
+            "error must not leak internal type names: {}",
+            result.output
         );
     }
 

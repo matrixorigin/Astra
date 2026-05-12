@@ -41,7 +41,13 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         let mut missing = Vec::new();
 
         for name in requested {
-            let name_lower = name.to_lowercase();
+            // Resolve legacy tool names to their consolidated equivalents.
+            // LLMs (and old prompts/training) may reference tools by their
+            // pre-consolidation names; without this alias layer they get
+            // `missing:["spawn_agent"]` even though `agent(action=spawn)`
+            // is the correct call.
+            let resolved = resolve_legacy_tool_alias(name);
+            let name_lower = resolved.to_lowercase();
             if let Some(tool) = schemas.iter().find(|t| {
                 t.get("function")
                     .and_then(|f| f.get("name"))
@@ -69,7 +75,9 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                     found.push(entry);
                 }
             } else {
-                missing.push(name.to_string());
+                // Report the RESOLVED (canonical) name so the LLM sees the
+                // name it actually needs to invoke — not the legacy alias.
+                missing.push(resolved.to_string());
             }
         }
 
@@ -170,6 +178,36 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         "total_tools": schemas.len()
     })
     .to_string()
+}
+
+/// Map legacy/pre-consolidation tool names to their current canonical
+/// equivalents. Returns the input unchanged if no alias exists.
+///
+/// Background: tools like `spawn_agent`, `git_diff`, `github_get_pr`,
+/// `memory_store` were consolidated into action-based tools (`agent`,
+/// `git`, `github`, `memory`). LLMs trained on older data or with
+/// stale prompts still reference the old names via `tool_search`.
+fn resolve_legacy_tool_alias(name: &str) -> &str {
+    match name.to_lowercase().as_str() {
+        "spawn_agent" | "agent_spawn" | "sub_agent" => "agent",
+        "get_agent_result" => "agent",
+        "send_message" => "agent",
+        "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame" | "git_commit"
+        | "git_stash" | "git_file_history" | "git_log_search" | "git_contributors"
+        | "git_revert_commit" => "git",
+        "github_list_prs"
+        | "github_get_pr"
+        | "github_ci_status"
+        | "github_list_issues"
+        | "github_get_issue"
+        | "github_repo_stats"
+        | "github_create_issue" => "github",
+        "memory_store" | "memory_retrieve" | "memory_search" | "memory_purge"
+        | "memory_correct" | "memory_profile" | "memory_feedback" => "memory",
+        "mo_query" | "mo_snapshot" | "mo_branch" => "mo",
+        "task_create" | "task_update" | "task_list" | "task_get" | "task_stop" => "task",
+        _ => name,
+    }
 }
 
 #[cfg(test)]
@@ -313,6 +351,168 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result).unwrap();
         let desc = parsed["matches"][0]["description"].as_str().unwrap();
         assert!(desc.len() <= 200, "keyword search should stay compact");
+    }
+
+    // ── Legacy alias resolution (commit 748e84fd) ────────────────────
+    // The resolve_legacy_tool_alias match has 20+ arms; regressions here
+    // silently break `tool_search select:spawn_agent` and the LLM gets a
+    // `missing` entry with no path forward. These tests pin the contract.
+
+    fn consolidated_schemas() -> Vec<Value> {
+        vec![
+            json!({"function": {"name": "agent", "description": "spawn/list agents", "parameters": {"type":"object"}}}),
+            json!({"function": {"name": "git", "description": "git operations", "parameters": {"type":"object"}}}),
+            json!({"function": {"name": "github", "description": "github operations", "parameters": {"type":"object"}}}),
+            json!({"function": {"name": "memory", "description": "memory tool", "parameters": {"type":"object"}}}),
+            json!({"function": {"name": "task", "description": "task management", "parameters": {"type":"object"}}}),
+            json!({"function": {"name": "mo", "description": "memoria direct", "parameters": {"type":"object"}}}),
+        ]
+    }
+
+    #[test]
+    fn resolve_legacy_alias_returns_input_when_unknown() {
+        assert_eq!(resolve_legacy_tool_alias("read_file"), "read_file");
+        assert_eq!(resolve_legacy_tool_alias("bash"), "bash");
+        assert_eq!(resolve_legacy_tool_alias(""), "");
+    }
+
+    #[test]
+    fn resolve_legacy_alias_agent_family() {
+        assert_eq!(resolve_legacy_tool_alias("spawn_agent"), "agent");
+        assert_eq!(resolve_legacy_tool_alias("agent_spawn"), "agent");
+        assert_eq!(resolve_legacy_tool_alias("sub_agent"), "agent");
+        assert_eq!(resolve_legacy_tool_alias("get_agent_result"), "agent");
+        assert_eq!(resolve_legacy_tool_alias("send_message"), "agent");
+    }
+
+    #[test]
+    fn resolve_legacy_alias_git_family() {
+        for legacy in [
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_show",
+            "git_blame",
+            "git_commit",
+            "git_stash",
+            "git_file_history",
+            "git_log_search",
+            "git_contributors",
+            "git_revert_commit",
+        ] {
+            assert_eq!(
+                resolve_legacy_tool_alias(legacy),
+                "git",
+                "alias for {legacy}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_legacy_alias_github_family() {
+        for legacy in [
+            "github_list_prs",
+            "github_get_pr",
+            "github_ci_status",
+            "github_list_issues",
+            "github_get_issue",
+            "github_repo_stats",
+            "github_create_issue",
+        ] {
+            assert_eq!(
+                resolve_legacy_tool_alias(legacy),
+                "github",
+                "alias for {legacy}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_legacy_alias_memory_family() {
+        for legacy in [
+            "memory_store",
+            "memory_retrieve",
+            "memory_search",
+            "memory_purge",
+            "memory_correct",
+            "memory_profile",
+            "memory_feedback",
+        ] {
+            assert_eq!(
+                resolve_legacy_tool_alias(legacy),
+                "memory",
+                "alias for {legacy}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_legacy_alias_case_insensitive() {
+        assert_eq!(resolve_legacy_tool_alias("Spawn_Agent"), "agent");
+        assert_eq!(resolve_legacy_tool_alias("GIT_DIFF"), "git");
+        assert_eq!(resolve_legacy_tool_alias("GitHub_Get_PR"), "github");
+    }
+
+    #[test]
+    fn select_mode_resolves_legacy_alias_at_boundary() {
+        let schemas = consolidated_schemas();
+        let result = tool_search(&schemas, &json!({"query": "select:spawn_agent"}));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        // Matched the consolidated `agent` tool via alias — found, not missing.
+        assert_eq!(
+            parsed["matches"].as_array().unwrap().len(),
+            1,
+            "spawn_agent must resolve to agent: {result}"
+        );
+        assert_eq!(parsed["matches"][0]["name"], "agent");
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "spawn_agent must not be reported missing after alias resolution: {result}"
+        );
+    }
+
+    #[test]
+    fn select_mode_reports_resolved_name_on_miss_not_legacy() {
+        // No consolidated tools at all — spawn_agent alias resolves to
+        // `agent`, which is still missing. The LLM must see `agent` (the
+        // canonical name it can re-query) in the missing list, NOT the
+        // legacy `spawn_agent`.
+        let schemas: Vec<Value> = vec![json!({
+            "function": {"name": "read_file", "description": "rf"}
+        })];
+        let result = tool_search(&schemas, &json!({"query": "select:spawn_agent"}));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let missing = parsed["missing"].as_array().unwrap();
+        assert_eq!(missing.len(), 1, "exactly one missing entry, got: {result}");
+        assert_eq!(
+            missing[0].as_str(),
+            Some("agent"),
+            "missing must report RESOLVED name (agent), not legacy (spawn_agent): {result}"
+        );
+    }
+
+    #[test]
+    fn select_mode_mixed_aliases_and_canonical() {
+        let schemas = consolidated_schemas();
+        let result = tool_search(
+            &schemas,
+            &json!({"query": "select:spawn_agent,git_diff,github_get_pr,memory_store"}),
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let names: Vec<&str> = parsed["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["name"].as_str())
+            .collect();
+        assert!(names.contains(&"agent"), "got names: {names:?}");
+        assert!(names.contains(&"git"), "got names: {names:?}");
+        assert!(names.contains(&"github"), "got names: {names:?}");
+        assert!(names.contains(&"memory"), "got names: {names:?}");
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "all four aliases must resolve: {result}"
+        );
     }
 
     #[test]

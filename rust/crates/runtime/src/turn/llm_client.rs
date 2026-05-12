@@ -652,9 +652,11 @@ fn json_string_to_value_or_string(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
-fn content_text_value(content: Option<&Value>) -> Option<String> {
+fn coerce_tool_result_content(content: Option<&Value>) -> String {
     match content {
-        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(Value::Object(map)) if map.is_empty() => String::new(),
         Some(Value::Array(parts)) => {
             let joined = parts
                 .iter()
@@ -662,13 +664,52 @@ fn content_text_value(content: Option<&Value>) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join("");
             if joined.is_empty() {
-                None
+                // No joinable text parts (e.g. image-only array). Returning the
+                // raw JSON-stringified array would leak structural noise to the
+                // model; prefer empty string + a warn so the degradation is
+                // observable without polluting the prompt.
+                tracing::warn!(
+                    target: "astra::tool_result",
+                    parts = parts.len(),
+                    "tool_result content array had no text parts; coercing to empty string"
+                );
+                String::new()
             } else {
-                Some(joined)
+                joined
             }
         }
-        _ => None,
+        Some(other) => other.to_string(),
     }
+}
+
+fn normalize_openai_tool_message_content(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| {
+            if message.get("role").and_then(Value::as_str) != Some("tool") {
+                return message.clone();
+            }
+            // Only rewrite content that OpenAI would reject or misread:
+            // bare objects (most notably the empty `{}` placeholder) and nulls.
+            // Leave well-formed String and Array content untouched so future
+            // multi-part tool messages pass through intact.
+            let needs_rewrite = matches!(
+                message.get("content"),
+                Some(Value::Object(_)) | Some(Value::Null) | None
+            );
+            if !needs_rewrite {
+                return message.clone();
+            }
+            let mut normalized = message.clone();
+            if let Some(obj) = normalized.as_object_mut() {
+                obj.insert(
+                    "content".to_string(),
+                    Value::String(coerce_tool_result_content(message.get("content"))),
+                );
+            }
+            normalized
+        })
+        .collect()
 }
 
 fn is_nonblank_text(text: &str) -> bool {
@@ -781,7 +822,7 @@ fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -
     match role {
         "tool" => {
             let tool_use_id = msg.get("tool_call_id").and_then(Value::as_str);
-            let content = content_text_value(msg.get("content")).unwrap_or_default();
+            let content = coerce_tool_result_content(msg.get("content"));
             tool_use_id
                 .map(|tool_use_id| {
                     // Bedrock's `toolResult.content[].json` field requires a
@@ -789,8 +830,13 @@ fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -
                     // booleans, and null must use the `text` branch — or
                     // Bedrock rejects with "messages.N.content.M.toolResult
                     // .content.0.json is invalid — provide a json object".
+                    //
+                    // Empty content uses `{"text": ""}` (not `{"json": {}}`)
+                    // because Bedrock accepts an empty string here but rejects
+                    // an empty JSON object as "invalid". Do not switch to
+                    // `{"json": {}}` — it will 400 at the provider.
                     let result_block = if content.is_empty() {
-                        json!({"json": {}})
+                        json!({"text": ""})
                     } else {
                         match serde_json::from_str::<Value>(&content) {
                             Ok(parsed) if parsed.is_object() => json!({"json": parsed}),
@@ -1321,9 +1367,10 @@ pub(crate) fn build_provider_request_body(
                 thinking.apply_anthropic(&mut body);
                 return body;
             }
+            let normalized_messages = normalize_openai_tool_message_content(messages);
             let mut body = json!({
                 "model": model_name,
-                "messages": messages,
+                "messages": normalized_messages,
                 "stream": streaming,
             });
             if streaming {
@@ -1693,15 +1740,56 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
                 carry_cache_annotations(msg, &mut out);
                 return Some(out);
             }
-            let content = msg
-                .get("content")
-                .and_then(Value::as_str)
-                .map(|text| Value::String(text.to_string()))
-                .unwrap_or_else(|| {
-                    msg.get("content")
-                        .cloned()
-                        .unwrap_or(Value::String(String::new()))
-                });
+            let content = match msg.get("content") {
+                Some(Value::String(text)) => Value::String(text.clone()),
+                Some(Value::Null) | None => Value::String(String::new()),
+                Some(Value::Object(map)) if map.is_empty() => {
+                    astra_core::agent_warn!(
+                        "llm_client",
+                        "tool-role msg has empty-object content; degrading to empty string for tool_result_block. tool_use_id={}",
+                        tool_use_id
+                    );
+                    Value::String(String::new())
+                }
+                Some(other) => {
+                    // Non-string content on a tool-role message is a
+                    // serialization bug upstream (compaction, fold, or
+                    // format conversion set it to an object/array instead
+                    // of a string). Coerce to string representation so
+                    // the LLM sees SOMETHING — not a bare `{}` that it
+                    // misreads as "tool returned empty JSON object".
+                    astra_core::agent_warn!(
+                        "llm_client",
+                        "tool-role msg has non-string content (type={}); \
+                         coercing to string for tool_result_block. \
+                         tool_use_id={}",
+                        if other.is_object() {
+                            "object"
+                        } else if other.is_array() {
+                            "array"
+                        } else {
+                            "other"
+                        },
+                        tool_use_id
+                    );
+                    match other {
+                        Value::Array(arr) => {
+                            // Content-array: extract text blocks
+                            let text: String = arr
+                                .iter()
+                                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                                .collect::<Vec<_>>()
+                                .join("");
+                            if text.is_empty() {
+                                Value::String(other.to_string())
+                            } else {
+                                Value::String(text)
+                            }
+                        }
+                        _ => Value::String(other.to_string()),
+                    }
+                }
+            };
             let tool_result_block = json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
@@ -5208,6 +5296,210 @@ mod tests {
         assert_eq!(blocks[0]["type"], "tool_result");
         assert_eq!(blocks[0]["tool_use_id"], "call_xyz");
         assert_eq!(blocks[0]["content"], "hello");
+    }
+
+    // ── Tool-role content-coercion boundary tests ─────────────────────────
+    //
+    // Regression guards for the six-session `{}` cascade bug
+    // (commit 104b4502). When compaction / fold / format-conversion
+    // produces a non-string `content` on a tool-role message, the
+    // converter must coerce the payload to a string rather than pass
+    // `{}`, `[]`, or `null` through verbatim — otherwise downstream
+    // LLM reads the empty object as "tool returned nothing" and
+    // hallucinates a retry or an error.
+    //
+    // These tests pin the FUNCTION-BOUNDARY contract of
+    // `anthropic_message_from_openai` for every shape
+    // (`Value::Object`, `Value::Array` with/without text, `Value::Null`,
+    // and content-field absent).
+
+    #[test]
+    fn anthropic_tool_message_object_content_coerced_to_string_not_empty_json() {
+        // Upstream bug: tool content ended up as `{}` (empty object).
+        // The converter must degrade it to an empty string so the LLM
+        // never sees a bare JSON object as the tool_result body.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_obj",
+            "content": {},
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        let blocks = converted["content"].as_array().unwrap();
+        let body = &blocks[0]["content"];
+        assert!(
+            body.is_string(),
+            "tool_result.content must be a string after coercion, got: {body}",
+        );
+        assert_eq!(
+            body.as_str().unwrap(),
+            "",
+            "empty object content must be degraded to empty string, not bare '{{}}'",
+        );
+    }
+
+    #[test]
+    fn openai_request_body_tool_message_empty_object_content_becomes_empty_string() {
+        let messages = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call_obj",
+            "content": {},
+        })];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "gpt-test",
+            "openai",
+            None,
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+        assert_eq!(body["messages"][0]["content"].as_str(), Some(""));
+    }
+
+    #[test]
+    fn bedrock_tool_message_empty_object_content_becomes_text_empty_string() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_obj",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_obj",
+                "content": {},
+            }),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "anthropic.claude-3-5-sonnet-v1:0",
+            "bedrock",
+            None,
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let result_block = &body["messages"][1]["content"][0]["toolResult"]["content"][0];
+        assert_eq!(result_block.get("text").and_then(Value::as_str), Some(""));
+        assert!(
+            result_block.get("json").is_none(),
+            "empty object must not be sent as Bedrock json {{}}: {result_block:?}"
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_message_nonempty_object_content_stringified_verbatim() {
+        // An object payload (e.g. `{"error": "boom"}`) must survive
+        // as a readable string — not be silently elided.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_obj2",
+            "content": {"error": "boom", "code": 42},
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        let body = converted["content"][0]["content"].as_str().unwrap();
+        // serde_json preserves key order as inserted; both fields must be present.
+        assert!(
+            body.contains("\"error\":\"boom\""),
+            "error preserved: {body}"
+        );
+        assert!(body.contains("\"code\":42"), "code preserved: {body}");
+    }
+
+    #[test]
+    fn anthropic_tool_message_array_with_text_blocks_extracts_joined_text() {
+        // Content-block array shape: Anthropic-style
+        // `[{type:"text", text:"..."}]` — the coercion branch extracts
+        // the joined `text` fields rather than the raw JSON dump.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_arr",
+            "content": [
+                {"type": "text", "text": "hello "},
+                {"type": "text", "text": "world"},
+            ],
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        let body = converted["content"][0]["content"].as_str().unwrap();
+        assert_eq!(
+            body, "hello world",
+            "text blocks must be joined into a single string, got: {body}",
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_message_array_without_text_falls_back_to_json_repr() {
+        // An array of objects with NO `text` fields must round-trip
+        // as its JSON representation, not the empty string — else the
+        // LLM sees `""` and treats the tool as silent.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_arr2",
+            "content": [{"kind": "image"}, {"kind": "ref"}],
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        let body = converted["content"][0]["content"].as_str().unwrap();
+        assert!(
+            body.contains("\"kind\":\"image\""),
+            "non-text array serialized verbatim: {body}",
+        );
+        assert!(
+            body.contains("\"kind\":\"ref\""),
+            "all array elements preserved: {body}",
+        );
+        assert_ne!(body, "", "must not collapse to empty string");
+    }
+
+    #[test]
+    fn anthropic_tool_message_null_content_becomes_empty_string() {
+        // `Value::Null` is the documented empty-payload case. The
+        // converter MUST emit `""` (not null, not absent) so downstream
+        // wire serialization doesn't drop the tool_result.content key.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_null",
+            "content": serde_json::Value::Null,
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        let body = &converted["content"][0]["content"];
+        assert_eq!(body.as_str(), Some(""), "null → empty string, got: {body}");
+    }
+
+    #[test]
+    fn anthropic_tool_message_absent_content_becomes_empty_string() {
+        // No `content` key at all: same as Null — converter still emits
+        // a well-formed tool_result with an empty string body.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_missing",
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        let blocks = converted["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "still wraps into exactly one block");
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "call_missing");
+        assert_eq!(blocks[0]["content"].as_str(), Some(""));
+    }
+
+    #[test]
+    fn anthropic_tool_message_number_content_stringified_not_dropped() {
+        // A numeric payload (rare but possible from a misbehaving
+        // upstream) must stringify to its JSON form, not be silently
+        // dropped to `""`.
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_num",
+            "content": 42,
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        let body = converted["content"][0]["content"].as_str().unwrap();
+        assert_eq!(body, "42", "number content stringified, got: {body}");
     }
 
     #[test]

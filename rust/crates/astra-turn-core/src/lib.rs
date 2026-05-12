@@ -196,6 +196,7 @@ pub mod result_quality {
     pub use astra_turn_types::{ResultQuality, classify_result, quality_feedback};
 }
 pub mod agentic_prepare_payload;
+pub mod hallucination_tripwire;
 pub mod routing_engine;
 pub mod tool_categories;
 pub mod tool_registry_plugin;

@@ -223,8 +223,9 @@ fn multi_turn_review_scenario_read_file_downgrades_to_outline() {
     let result = executor.read_file(&json!({"path": "big.rs"}));
     assert!(
         result.contains("Auto-downgraded to outline")
-            || result.contains("too large")
-            || result.contains("Outline"),
+            || result.contains("File is large")
+            || result.contains("Outline")
+            || result.contains("outline"),
         "should downgrade or reject full read under aggregate pressure \
              (file={file_size}, agg={agg}, remaining={}), got first 300 chars: {}",
         AGGREGATE_OUTPUT_BUDGET.saturating_sub(agg),

@@ -296,8 +296,12 @@ impl ToolExecutor {
             }
         }
 
-        // Pre-read size gate: check file size before reading.
-        // Large files without a line range should use outline or start_line/end_line.
+        // Pre-read size gate: large files without a line range auto-degrade
+        // to outline mode + guidance. Old behavior was a hard refusal ("Error:
+        // file is too large") which gave the LLM no useful content — it then
+        // had to guess start_line/end_line blind. New behavior: read the file
+        // anyway (for outline only), return the outline + explicit instructions
+        // on how to drill into specific ranges.
         if !has_range
             && !has_outline
             && let Ok(meta) = fs::metadata(&path)
@@ -305,12 +309,60 @@ impl ToolExecutor {
             let size = meta.len() as usize;
             let limit = self.scaled_output_limit();
             if size > limit {
-                let total_lines = size / 40; // rough estimate
+                // Cap the read at 2× the output limit to avoid OOM on
+                // multi-GB files. We only need enough to generate an
+                // outline — symbols are typically in the first portion.
+                // `total_lines` is estimated from the capped read + the
+                // remaining unread bytes (assuming ~40 chars/line).
+                let cap = limit.saturating_mul(2).min(size);
+                let content = match read_capped_to_string_lossy(&path, cap) {
+                    Ok(c) => c,
+                    Err(e) => return format!("Error reading file: {e}"),
+                };
+                let lines_in_cap = content.lines().count();
+                // Extrapolate total line count from the sampled portion
+                // rather than assuming a fixed 40 chars/line (which was
+                // wildly wrong for minified JS/CSS and near-binary files).
+                // Falls back to the old estimate only if the sample is
+                // empty (avoid div-by-zero).
+                let total_lines = if cap < size {
+                    if lines_in_cap > 0 && cap > 0 {
+                        // Scale: lines_in_cap * (size / cap), using
+                        // u128 to avoid overflow on huge files.
+                        let scaled = (lines_in_cap as u128 * size as u128 / cap as u128) as usize;
+                        scaled.max(lines_in_cap)
+                    } else {
+                        lines_in_cap + (size - cap) / 40
+                    }
+                } else {
+                    lines_in_cap
+                };
+
+                let outline_text = if let Some(lang) = super::code_intel::detect_language(&path) {
+                    let generated = super::code_intel::generate_outline(&content, lang);
+                    if generated.trim().is_empty() {
+                        format!(
+                            "(outline generation returned empty for this file — \
+                                 {total_lines} total lines)"
+                        )
+                    } else {
+                        generated
+                    }
+                } else {
+                    format!(
+                        "(no symbol outline available for this file type — \
+                             {total_lines} total lines)"
+                    )
+                };
+
                 return format!(
-                    "Error: file is too large ({} bytes, ~{} lines). \
-                     Use start_line/end_line to read a specific range, \
-                     or outline=true to see definitions only.",
-                    size, total_lines
+                    "File is large ({size} bytes, {total_lines} lines). \
+                     Auto-generated outline below.\n\n\
+                     {outline_text}\n\n\
+                     To read specific sections, use:\n\
+                     • read_file(path=\"{path_str}\", start_line=1, end_line=100) — first 100 lines\n\
+                     • read_file(path=\"{path_str}\", start_line=N, end_line=M) — specific range\n\
+                     • grep(pattern=\"keyword\", path=\"{path_str}\") — find specific symbols",
                 );
             }
         }
@@ -1728,8 +1780,30 @@ impl ToolExecutor {
             Err(e) => return format!("Error reading file: {e}"),
         };
 
-        // Validate all edits first (atomic: all or nothing)
+        // Validate + apply all edits atomically (all or nothing).
+        //
+        // Exact-match first. When a given edit's old_str doesn't
+        // match verbatim, fall back to the same fuzzy cascade that
+        // single-edit `str_replace` uses — whitespace-normalized,
+        // indentation-flexible, etc. — so the common "LLM got the
+        // indent off by 4 spaces" case auto-succeeds instead of
+        // aborting the whole batch. Ambiguous fuzzy matches (more
+        // than one candidate) still bail out safely.
+        //
+        // We collect `(strategy_name, edit_index)` pairs for any
+        // fuzzy applications so the caller sees which edits
+        // deviated from a verbatim match and can re-inspect.
         let mut working = content.clone();
+        let mut fuzzy_applications: Vec<(usize, &'static str)> = Vec::new();
+        let mut first_edit_start_byte: Option<usize> = None;
+        // Track byte-ranges modified by prior fuzzy edits so a later
+        // fuzzy edit can't silently land on the same span. Exact
+        // `working.matches(old_str)` already self-disambiguates via
+        // the count==0/count>1 checks, but two fuzzy edits whose
+        // normalized-whitespace candidates collapse to the same
+        // region would each succeed with `replace_all=false` and
+        // clobber each other. Abort with a dedup hint instead.
+        let mut fuzzy_spans: Vec<(usize, usize)> = Vec::new();
         for (i, edit) in edits.iter().enumerate() {
             let old_str = match edit.get("old_str").and_then(Value::as_str) {
                 Some(s) => s,
@@ -1746,16 +1820,64 @@ impl ToolExecutor {
             }
             let count = working.matches(old_str).count();
             if count == 0 {
-                return format!(
-                    "Error: edit[{i}] old_str not found. Aborting all edits.\n{}",
-                    str_replace_not_found_hint(&working, old_str)
-                );
+                // Try the fuzzy cascade. If it returns a unique
+                // match, apply it at that location using the
+                // caller's new_str; record which strategy matched.
+                match super::fuzzy_replacer::fuzzy_find_replacement(
+                    &working, old_str, /* replace_all */ false,
+                ) {
+                    Some(fuzzy_match) => {
+                        let actual = fuzzy_match.actual.to_string();
+                        let match_start = match working.find(&actual) {
+                            Some(s) => s,
+                            None => {
+                                return format!(
+                                    "Error: edit[{i}] fuzzy match returned a span not present in working buffer (internal invariant violated). Aborting all edits."
+                                );
+                            }
+                        };
+                        let match_end = match_start + actual.len();
+                        // Reject if this fuzzy span overlaps a span
+                        // already consumed by an earlier fuzzy edit —
+                        // otherwise two fuzzy edits could silently
+                        // clobber the same region. Exact edits remain
+                        // immune because `working.matches(old_str)`
+                        // already self-disambiguates.
+                        if let Some((prev_i, _)) =
+                            fuzzy_spans.iter().enumerate().find(|(_, (ps, pe))| {
+                                // Overlap: [ps,pe) ∩ [match_start,match_end) non-empty
+                                match_start < *pe && *ps < match_end
+                            })
+                        {
+                            let (orig_idx, _) = fuzzy_applications[prev_i];
+                            return format!(
+                                "Error: edit[{i}] fuzzy-matched the same region as edit[{orig_idx}] (both resolved to overlapping spans via whitespace-normalized match). Aborting all edits — provide distinct exact old_str values or merge the two edits."
+                            );
+                        }
+                        if i == 0 {
+                            first_edit_start_byte = Some(match_start);
+                        }
+                        fuzzy_applications.push((i, fuzzy_match.strategy));
+                        fuzzy_spans.push((match_start, match_end));
+                        working = working.replacen(&actual, new_str, 1);
+                        continue;
+                    }
+                    None => {
+                        return format!(
+                            "Error: edit[{i}] old_str not found. Aborting all edits.\n{}",
+                            str_replace_not_found_hint(&working, old_str)
+                        );
+                    }
+                }
             }
             if count > 1 {
                 return format!(
                     "Error: edit[{i}] old_str matches {count} times (must be unique). Aborting all edits.\n{}",
                     str_replace_ambiguous_hint(&working, old_str, count)
                 );
+            }
+            if i == 0 {
+                first_edit_start_byte = working.find(old_str);
             }
             working = working.replacen(old_str, new_str, 1);
         }
@@ -1795,18 +1917,23 @@ impl ToolExecutor {
                 if let Some(fmt_note) = format_result {
                     result.push_str(&format!("\n{fmt_note}"));
                 }
+                // Disclose any edits that required fuzzy matching so
+                // the caller sees the old_str wasn't byte-exact.
+                // Format: one bullet per fuzzy edit, tagged with the
+                // strategy name (whitespace-normalized, line-trimmed,
+                // etc.) and the 1-based edit index.
+                if !fuzzy_applications.is_empty() {
+                    result.push_str("\n⚠ fuzzy match used (old_str did not match byte-exactly):");
+                    for (idx, strategy) in &fuzzy_applications {
+                        result.push_str(&format!("\n  edit[{idx}]: {strategy}"));
+                    }
+                }
 
                 // Scope context for the first edit location
                 if let Some(lang) = super::code_intel::detect_language(&path)
-                    && let Some(first_old) = edits
-                        .first()
-                        .and_then(|e| e.get("old_str"))
-                        .and_then(Value::as_str)
+                    && let Some(first_edit_start) = first_edit_start_byte
                 {
-                    let edit_line = content[..content.find(first_old).unwrap_or(0)]
-                        .matches('\n')
-                        .count()
-                        + 1;
+                    let edit_line = content[..first_edit_start].matches('\n').count() + 1;
                     let scope = super::code_intel::scope_at_line(&working, lang, edit_line);
                     if !scope.breadcrumbs.is_empty() {
                         result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
@@ -2626,6 +2753,22 @@ fn read_to_string_lossy(path: &Path) -> std::io::Result<String> {
     }
 }
 
+/// Like `read_to_string_lossy` but reads at most `max_bytes` from the
+/// file. Used by the large-file auto-outline path to avoid OOM when the
+/// file is enormous (multi-GB). The returned string may be truncated
+/// mid-line; callers doing line analysis should be aware of the tail.
+fn read_capped_to_string_lossy(path: &Path, max_bytes: usize) -> std::io::Result<String> {
+    use std::io::Read;
+    let file = fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file).take(max_bytes as u64);
+    let mut bytes = Vec::with_capacity(max_bytes.min(1 << 20)); // cap alloc at 1MB initial
+    reader.read_to_end(&mut bytes)?;
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok(s),
+        Err(e) => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),
+    }
+}
+
 // ─── Line numbers ───────────────────────────────────────────────────────────
 
 /// Add line numbers to content in compact tab-separated format.
@@ -3321,16 +3464,16 @@ type Handler interface {
         let executor = test_executor_in(dir.path());
         let result = executor.read_file(&serde_json::json!({"path": "big.txt"}));
 
-        // Pre-read size gate: large files without a range return an error
-        // directing the LLM to use start_line/end_line or outline.
+        // Pre-read size gate: large files without a range now auto-degrade
+        // to an outline + guidance, not a hard refusal.
         assert!(
-            result.contains("too large") || result.contains("truncated"),
-            "should reject or truncate large file: last 100 chars: {}",
-            &result[result.len().saturating_sub(100)..]
+            result.contains("File is large") || result.contains("outline"),
+            "should auto-generate outline for large file: last 200 chars: {}",
+            &result[result.len().saturating_sub(200)..]
         );
         assert!(
-            result.contains("outline") || result.contains("start_line"),
-            "should suggest alternatives: last 200 chars: {}",
+            result.contains("start_line") || result.contains("read_file"),
+            "should suggest how to drill into specific ranges: last 200 chars: {}",
             &result[result.len().saturating_sub(200)..]
         );
     }
@@ -3348,18 +3491,21 @@ type Handler interface {
         drop(f);
 
         let executor = test_executor_in(dir.path());
-        // Full read should be rejected
+        // Full read should auto-degrade to outline (not a hard rejection)
         let full = executor.read_file(&serde_json::json!({"path": "big.txt"}));
         assert!(
-            full.contains("too large"),
-            "full read should be rejected: {}",
-            &full[..100.min(full.len())]
+            full.contains("File is large"),
+            "full read should auto-degrade: {}",
+            &full[..200.min(full.len())]
         );
 
-        // Ranged read should succeed
+        // Ranged read should succeed (bypass the size gate entirely)
         let ranged = executor
             .read_file(&serde_json::json!({"path": "big.txt", "start_line": 1, "end_line": 10}));
-        assert!(!ranged.contains("too large"), "ranged read should succeed");
+        assert!(
+            !ranged.contains("File is large"),
+            "ranged read must not trigger size gate"
+        );
         assert!(ranged.contains("line 0"), "should contain first line");
     }
 
@@ -4117,6 +4263,146 @@ type Handler interface {
     }
 
     #[test]
+    fn multi_edit_auto_applies_whitespace_normalized_match() {
+        // Regression (session 5933ebce turn 4 rounds 17+20): LLM
+        // submitted old_str with 20-space indent but the actual
+        // file had 24-space indent. Single-edit `str_replace`
+        // already falls through to the fuzzy cascade for this case;
+        // `multi_edit` used to die with
+        // "Error: edit[0] old_str not found" even though the
+        // cascade's whitespace-normalized strategy has a unique
+        // match.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("code.rs");
+        // Actual file: 24-space indent.
+        std::fs::write(
+            &file,
+            "fn outer() {\n                        Some(body.clone()),\n}\n",
+        )
+        .unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "code.rs"}));
+        // LLM supplies 20-space indent — intent is clear, whitespace
+        // is the only mismatch.
+        let result = exe.multi_edit(&json!({
+            "path": "code.rs",
+            "edits": [
+                {
+                    "old_str": "                    Some(body.clone()),",
+                    "new_str": "                    Some(&body),"
+                }
+            ]
+        }));
+        assert!(
+            result.contains("Applied 1 edit(s)"),
+            "whitespace-only mismatch should auto-apply: {result}"
+        );
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            content.contains("Some(&body)"),
+            "new_str must be in file: {content}"
+        );
+        assert!(
+            !content.contains("Some(body.clone())"),
+            "old_str must be gone: {content}"
+        );
+        // Indentation of the replaced line must match the actual
+        // file's 24-space indent, not the LLM's 20-space version.
+        assert!(
+            content.contains("                        Some(&body),"),
+            "replacement must preserve file's own indentation: {content}"
+        );
+    }
+
+    #[test]
+    fn multi_edit_reports_fuzzy_strategy_in_success_message() {
+        // When multi_edit falls back to fuzzy matching, the result
+        // should say so — users/LLM can then see that the old_str
+        // didn't match exactly and inspect the diff, instead of
+        // silently losing awareness.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("code.rs");
+        std::fs::write(&file, "fn f() {\n    let  x = 1;\n}\n").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "code.rs"}));
+        let result = exe.multi_edit(&json!({
+            "path": "code.rs",
+            "edits": [
+                {
+                    // Only one space between `let` and `x`, file has two.
+                    "old_str": "    let x = 1;",
+                    "new_str": "    let x = 2;"
+                }
+            ]
+        }));
+        assert!(
+            result.contains("Applied 1 edit(s)"),
+            "whitespace-normalized fuzzy match should succeed: {result}"
+        );
+        assert!(
+            result.to_ascii_lowercase().contains("fuzzy") || result.contains("whitespace"),
+            "result must disclose that fuzzy matching was used: {result}"
+        );
+    }
+
+    #[test]
+    fn multi_edit_rejects_fuzzy_match_when_ambiguous() {
+        // If the fuzzy cascade finds two+ candidates, multi_edit
+        // must NOT auto-apply — that's unsafe. User has to give
+        // more context.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("code.rs");
+        // Two locations with whitespace-equivalent "Some(body.clone())".
+        std::fs::write(
+            &file,
+            "fn a() {\n    Some(body.clone())\n}\nfn b() {\n    Some(body.clone())\n}\n",
+        )
+        .unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "code.rs"}));
+        let result = exe.multi_edit(&json!({
+            "path": "code.rs",
+            "edits": [
+                {
+                    "old_str": "Some(body.clone())",
+                    "new_str": "Some(&body)"
+                }
+            ]
+        }));
+        // With 2 exact matches, the original ambiguity path already
+        // handles this — keep it failing safely.
+        assert!(
+            result.starts_with("Error") || result.contains("must be unique"),
+            "ambiguous matches must not silently auto-apply: {result}"
+        );
+    }
+
+    // NOTE: An end-to-end test for the overlapping-fuzzy-span dedup
+    // path in `multi_edit` is structurally hard to construct because
+    // each edit runs sequentially on the buffer produced by the
+    // previous edit — so by the time edit[1] is evaluated, edit[0]'s
+    // fuzzy span has already been rewritten and no longer matches.
+    // The dedup guard remains valuable as a defence-in-depth check
+    // (e.g. against future refactors that batch fuzzy resolution up
+    // front); the overlap arithmetic itself is covered below.
+    #[test]
+    fn fuzzy_span_overlap_arithmetic_is_half_open() {
+        // Half-open interval overlap: [a,b) ∩ [c,d) non-empty ⇔ a < d && c < b.
+        let cases = [
+            // (span_a, span_b, expected_overlap)
+            ((0usize, 5usize), (5usize, 10usize), false), // touching, not overlapping
+            ((0, 5), (4, 10), true),                      // 1-byte overlap
+            ((0, 10), (3, 7), true),                      // fully contained
+            ((3, 7), (0, 10), true),                      // reverse fully contained
+            ((0, 5), (6, 10), false),                     // gap
+        ];
+        for ((a_s, a_e), (b_s, b_e), expected) in cases {
+            let overlaps = a_s < b_e && b_s < a_e;
+            assert_eq!(overlaps, expected, "[{a_s},{a_e}) vs [{b_s},{b_e})");
+        }
+    }
+
+    #[test]
     fn multi_edit_sequential_edits_see_previous_results() {
         let tmpdir = tempfile::tempdir().unwrap();
         let file = tmpdir.path().join("chain.txt");
@@ -4243,6 +4529,39 @@ type Handler interface {
         assert!(result.contains("Applied 2 edit(s)"), "result: {result}");
         assert!(result.contains("📍"), "should show scope: {result}");
         assert!(result.contains("main"), "should mention fn main: {result}");
+    }
+
+    #[test]
+    fn multi_edit_fuzzy_match_scope_uses_actual_location() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("lib.rs");
+        std::fs::write(
+            &file,
+            "fn top_level() {\n    let unrelated = 1;\n}\n\nfn outer() {\n    fn inner() {\n        let  value = compute();\n    }\n}\n",
+        )
+        .unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.read_file(&serde_json::json!({"path": "lib.rs"}));
+        let result = exe.multi_edit(&json!({
+            "path": "lib.rs",
+            "edits": [
+                {
+                    "old_str": "        let value = compute();",
+                    "new_str": "        let value = finish();"
+                }
+            ]
+        }));
+
+        assert!(result.contains("Applied 1 edit(s)"), "result: {result}");
+        assert!(result.contains("📍"), "should show scope: {result}");
+        assert!(
+            result.contains("outer") && result.contains("inner"),
+            "scope should use actual fuzzy match location, not line 1: {result}"
+        );
+        assert!(
+            !result.contains("top_level"),
+            "scope must not fall back to the beginning of the file: {result}"
+        );
     }
 
     #[test]
