@@ -1708,15 +1708,20 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
                         "tool-role msg has non-string content (type={}); \
                          coercing to string for tool_result_block. \
                          tool_use_id={}",
-                        if other.is_object() { "object" }
-                        else if other.is_array() { "array" }
-                        else { "other" },
+                        if other.is_object() {
+                            "object"
+                        } else if other.is_array() {
+                            "array"
+                        } else {
+                            "other"
+                        },
                         tool_use_id
                     );
                     match other {
                         Value::Array(arr) => {
                             // Content-array: extract text blocks
-                            let text: String = arr.iter()
+                            let text: String = arr
+                                .iter()
                                 .filter_map(|b| b.get("text").and_then(Value::as_str))
                                 .collect::<Vec<_>>()
                                 .join("");

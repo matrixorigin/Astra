@@ -41,7 +41,13 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         let mut missing = Vec::new();
 
         for name in requested {
-            let name_lower = name.to_lowercase();
+            // Resolve legacy tool names to their consolidated equivalents.
+            // LLMs (and old prompts/training) may reference tools by their
+            // pre-consolidation names; without this alias layer they get
+            // `missing:["spawn_agent"]` even though `agent(action=spawn)`
+            // is the correct call.
+            let resolved = resolve_legacy_tool_alias(name);
+            let name_lower = resolved.to_lowercase();
             if let Some(tool) = schemas.iter().find(|t| {
                 t.get("function")
                     .and_then(|f| f.get("name"))
@@ -170,6 +176,36 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         "total_tools": schemas.len()
     })
     .to_string()
+}
+
+/// Map legacy/pre-consolidation tool names to their current canonical
+/// equivalents. Returns the input unchanged if no alias exists.
+///
+/// Background: tools like `spawn_agent`, `git_diff`, `github_get_pr`,
+/// `memory_store` were consolidated into action-based tools (`agent`,
+/// `git`, `github`, `memory`). LLMs trained on older data or with
+/// stale prompts still reference the old names via `tool_search`.
+fn resolve_legacy_tool_alias(name: &str) -> &str {
+    match name.to_lowercase().as_str() {
+        "spawn_agent" | "agent_spawn" | "sub_agent" => "agent",
+        "get_agent_result" => "agent",
+        "send_message" => "agent",
+        "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame" | "git_commit"
+        | "git_stash" | "git_file_history" | "git_log_search" | "git_contributors"
+        | "git_revert_commit" => "git",
+        "github_list_prs"
+        | "github_get_pr"
+        | "github_ci_status"
+        | "github_list_issues"
+        | "github_get_issue"
+        | "github_repo_stats"
+        | "github_create_issue" => "github",
+        "memory_store" | "memory_retrieve" | "memory_search" | "memory_purge"
+        | "memory_correct" | "memory_profile" | "memory_feedback" => "memory",
+        "mo_query" | "mo_snapshot" | "mo_branch" => "mo",
+        "task_create" | "task_update" | "task_list" | "task_get" | "task_stop" => "task",
+        _ => name,
+    }
 }
 
 #[cfg(test)]

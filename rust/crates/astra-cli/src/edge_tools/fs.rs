@@ -4398,10 +4398,7 @@ type Handler interface {
         ];
         for ((a_s, a_e), (b_s, b_e), expected) in cases {
             let overlaps = a_s < b_e && b_s < a_e;
-            assert_eq!(
-                overlaps, expected,
-                "[{a_s},{a_e}) vs [{b_s},{b_e})"
-            );
+            assert_eq!(overlaps, expected, "[{a_s},{a_e}) vs [{b_s},{b_e})");
         }
     }
 
