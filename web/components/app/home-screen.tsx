@@ -1,7 +1,6 @@
 'use client';
 
 import { BookOpen, Code2, Coffee, Lightbulb, PenLine } from 'lucide-react';
-import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useState } from 'react';
 import { Composer } from '@/components/app/composer';
@@ -24,10 +23,7 @@ export function HomeScreen() {
 
   return (
     <div className="flex h-full overflow-y-auto overscroll-contain flex-col items-center justify-center px-6 py-12">
-      <div className="rounded-full border border-border bg-surface px-3 py-1 text-xs font-medium text-text-secondary">
-        Free plan · <Link href="/login?next=/" className="hover:text-text">Sign in</Link>
-      </div>
-      <h1 className="mt-6 text-center text-4xl font-semibold tracking-normal">
+      <h1 className="text-center text-4xl font-semibold tracking-normal">
         {greetingFor()}, Astra user
       </h1>
 

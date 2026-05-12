@@ -41,6 +41,20 @@ export type AttachmentRef = {
   url?: string;
 };
 
+export type ChatArtifactRef = {
+  id: string;
+  kind: string;
+  source?: string | null;
+  title?: string | null;
+  filename?: string | null;
+  sizeBytes?: number | null;
+  contentType?: string | null;
+  renderer?: string | null;
+  downloadFilename?: string | null;
+  content?: unknown;
+  createdAt?: string | null;
+};
+
 export type ComposerOptions = {
   webSearch: boolean;
   thinking: boolean;
@@ -56,15 +70,18 @@ export type ChatSummary = {
   lastMessagePreview?: string;
   projectId: string | null;
   archivedAt?: string | null;
+  model?: string | null;
 };
 
 export type ChatMessage = {
   id: string;
   role: MessageRole;
   content: string;
+  activeSkills?: string[];
   reasoning?: string;
   reasoningStatus?: 'streaming' | 'complete';
   attachments?: AttachmentRef[];
+  artifacts?: ChatArtifactRef[];
   createdAt: string;
   status?: MessageStatus;
 };
@@ -77,6 +94,7 @@ export type ChatDetail = {
     createdAt: string;
     updatedAt: string;
     archivedAt?: string | null;
+    model?: string | null;
   };
   messages: ChatMessage[];
   project?: { id: string; name: string };

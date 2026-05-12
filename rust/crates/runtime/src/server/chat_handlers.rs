@@ -83,17 +83,16 @@ pub(super) async fn resolve_or_create_chat_session(
                 )])
             });
 
-            match state
-                .session_service
-                .create_session(
-                    user.user_id.clone(),
-                    SessionCreateRequestData {
-                        agent_id,
-                        title: None,
-                        metadata,
-                    },
-                )
-                .await
+            match super::session_quota::create_session_with_resource_quota(
+                state,
+                user.user_id.clone(),
+                SessionCreateRequestData {
+                    agent_id,
+                    title: None,
+                    metadata,
+                },
+            )
+            .await
             {
                 Ok(session) => Ok(ResolvedChatSession {
                     session_id: Some(session.session_id),

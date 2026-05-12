@@ -19,7 +19,7 @@ use std::sync::Arc;
 use astra_core::ErrorResponse;
 use astra_services::{
     pagination::clamp_api_list_pagination,
-    skills::{SkillListItem, SkillListRecord, SkillService},
+    skills::{SkillListItem, SkillListRecord, SkillRecord, SkillService},
 };
 use axum::{Json, http::StatusCode};
 
@@ -62,19 +62,30 @@ pub fn build_server_visible_skill_registry(
 /// centralized here so handler/runtime paths use the same discovery semantics
 /// and future async refactors have one place to replace.
 pub fn discover_registry_now(registry: &Arc<UnifiedSkillRegistry>) {
+    fn log_discovery_result(result: Result<Vec<String>, astra_skills::traits::SkillError>) {
+        if let Err(source) = result {
+            tracing::warn!(error = %source, "skill catalog discovery failed");
+        }
+    }
+
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         let registry = Arc::clone(registry);
         match handle.runtime_flavor() {
             tokio::runtime::RuntimeFlavor::MultiThread => {
-                let _ = tokio::task::block_in_place(|| handle.block_on(registry.discover_all()));
+                log_discovery_result(tokio::task::block_in_place(|| {
+                    handle.block_on(registry.discover_all())
+                }));
             }
             _ => {
-                let _ = std::thread::scope(|scope| {
+                let joined = std::thread::scope(|scope| {
                     scope
                         .spawn(|| handle.block_on(registry.discover_all()))
                         .join()
-                        .ok()
                 });
+                match joined {
+                    Ok(result) => log_discovery_result(result),
+                    Err(_) => tracing::warn!("skill catalog discovery thread panicked"),
+                }
             }
         }
     }
@@ -130,6 +141,35 @@ pub async fn list_server_visible_skills(
     })
 }
 
+/// Load one skill from the same server-visible catalog used by `/skills`.
+///
+/// Local API-server skills are checked first to match the list/dedupe
+/// precedence above. Database lookup remains delegated to `SkillService`, which
+/// enforces `created_by = current_user OR is_public = 1`.
+pub async fn get_server_visible_skill(
+    skill_service: Arc<dyn SkillService>,
+    user_id: String,
+    skill_id: String,
+    version: Option<String>,
+) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
+    if version.is_none() {
+        match LocalSkillProvider::home_global().load(&skill_id).await {
+            Ok(loaded) => return Ok(skill_record_from_loaded_skill(loaded)),
+            Err(astra_skills::traits::SkillError::NotFound(_)) => {}
+            Err(source) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new(format!(
+                        "failed to load api-server local skill '{skill_id}': {source}"
+                    ))),
+                ));
+            }
+        }
+    }
+
+    skill_service.get_skill(user_id, skill_id, version).await
+}
+
 fn skill_source_label(source: &SkillSourceKind) -> &'static str {
     match source {
         SkillSourceKind::Local => "local",
@@ -153,6 +193,61 @@ fn skill_list_item_from_manifest(manifest: astra_skills::manifest::SkillManifest
         status: Some("active".to_string()),
         source: Some(skill_source_label(&manifest.source).to_string()),
         category: manifest.category,
+        created_at: None,
+    }
+}
+
+fn skill_record_from_loaded_skill(loaded: astra_skills::manifest::LoadedSkill) -> SkillRecord {
+    let manifest = loaded.manifest;
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "instructions".to_string(),
+        serde_json::Value::String(loaded.instructions),
+    );
+    metadata.insert(
+        "source".to_string(),
+        serde_json::Value::String(skill_source_label(&manifest.source).to_string()),
+    );
+    metadata.insert(
+        "execution_context".to_string(),
+        serde_json::Value::String(
+            match manifest.execution_context {
+                astra_skills::manifest::ExecutionContext::Inline => "inline",
+                astra_skills::manifest::ExecutionContext::Fork => "fork",
+            }
+            .to_string(),
+        ),
+    );
+    metadata.insert(
+        "user_invocable".to_string(),
+        serde_json::Value::Bool(manifest.user_invocable),
+    );
+    if let Some(category) = manifest.category.clone() {
+        metadata.insert("category".to_string(), serde_json::Value::String(category));
+    }
+    if !manifest.tags.is_empty() {
+        metadata.insert("tags".to_string(), serde_json::json!(manifest.tags));
+    }
+    if !manifest.triggers.is_empty() {
+        metadata.insert("triggers".to_string(), serde_json::json!(manifest.triggers));
+    }
+    if !manifest.allowed_tools.is_empty() {
+        metadata.insert(
+            "allowed_tools".to_string(),
+            serde_json::json!(manifest.allowed_tools),
+        );
+    }
+
+    SkillRecord {
+        skill_id: manifest.name.clone(),
+        skill_name: manifest.name,
+        version: manifest.version.to_string(),
+        description: if manifest.description.is_empty() {
+            None
+        } else {
+            Some(manifest.description)
+        },
+        metadata: Some(serde_json::Value::Object(metadata)),
         created_at: None,
     }
 }

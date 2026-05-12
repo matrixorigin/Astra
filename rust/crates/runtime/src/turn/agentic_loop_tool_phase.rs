@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
+use uuid::Uuid;
 
 use astra_services::EvaluationService;
 use astra_services::evaluation::SessionQualityAssessmentRequest;
+use astra_services::runs::ToolOutputBatchItem;
+use astra_services::session_journal::ToolCallRecord;
 
 use super::agentic_adaptive_tuning::{
     apply_per_turn_adaptation, apply_tactical_actions, maybe_run_tuning_cycle,
@@ -92,14 +95,14 @@ async fn refresh_runtime_promotion_signals_from_db(state: &mut AgenticLoopState)
     }
 }
 
-fn tool_record_result_text(rec: &astra_services::session_journal::ToolCallRecord) -> &str {
+fn tool_record_result_text(rec: &ToolCallRecord) -> &str {
     rec.result_preview
         .as_deref()
         .or(rec.error.as_deref())
         .unwrap_or("")
 }
 
-fn tool_record_was_rejected(rec: &astra_services::session_journal::ToolCallRecord) -> bool {
+fn tool_record_was_rejected(rec: &ToolCallRecord) -> bool {
     rec.error
         .as_deref()
         .map(|error| error.starts_with("blocked_tool:"))
@@ -122,7 +125,7 @@ fn advance_runtime_todo_before_tool_round(state: &mut AgenticLoopState) {
 
 fn update_runtime_todo_from_tool_records(
     state: &mut AgenticLoopState,
-    new_records: &[astra_services::session_journal::ToolCallRecord],
+    new_records: &[ToolCallRecord],
 ) {
     let Some(active_id) = state
         .continuity
@@ -132,7 +135,7 @@ fn update_runtime_todo_from_tool_records(
     else {
         return;
     };
-    let meaningful: Vec<&astra_services::session_journal::ToolCallRecord> = new_records
+    let meaningful: Vec<&ToolCallRecord> = new_records
         .iter()
         .filter(|record| !record.is_synthetic_placeholder())
         .collect();
@@ -225,6 +228,77 @@ fn update_runtime_todo_from_tool_records(
     }
     state.continuity.sync_facts(state.session_facts.clone());
     state.session_facts = state.continuity.facts.clone();
+}
+
+fn tool_result_string_field(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn build_tool_output_batch_items(
+    round_tool_calls: &[ToolCallRecord],
+    new_tool_results: &[Value],
+) -> Vec<ToolOutputBatchItem> {
+    new_tool_results
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, result)| {
+            let record = round_tool_calls
+                .iter()
+                .filter(|record| !record.is_synthetic_placeholder())
+                .nth(idx);
+            let tool_name = tool_result_string_field(result, "name")
+                .or_else(|| record.map(|record| record.name.clone()))?;
+            Some(ToolOutputBatchItem {
+                output_id: format!("out-{}", Uuid::new_v4()),
+                tool_call_id: tool_result_string_field(result, "tool_call_id"),
+                tool_name,
+                output_json: result.clone(),
+            })
+        })
+        .collect()
+}
+
+async fn persist_tool_output_batch_for_round(
+    state: &AgenticLoopState,
+    round_tool_calls: &[ToolCallRecord],
+    new_tool_results: &[Value],
+) {
+    if new_tool_results.is_empty() {
+        return;
+    }
+    let (Some(pool), Some(user_id), Some(session_id), Some(run_id)) = (
+        state.context_manifest_pool.clone(),
+        state.context_manifest_user_id.as_deref(),
+        state.current_session_id.as_deref(),
+        state.current_run_id.as_deref(),
+    ) else {
+        return;
+    };
+    let items = build_tool_output_batch_items(round_tool_calls, new_tool_results);
+    if items.is_empty() {
+        return;
+    }
+    let batch_id = format!("batch-{}", Uuid::new_v4());
+    let store = astra_services::DatabaseRunStateStore::new(pool);
+    if let Err(error) = store
+        .insert_tool_output_batch(&batch_id, session_id, run_id, user_id, &items)
+        .await
+    {
+        astra_core::agent_warn!(
+            "tool-output-persistence",
+            "failed to persist tool output batch batch_id={} session_id={} run_id={} outputs={} error={}",
+            batch_id,
+            session_id,
+            run_id,
+            items.len(),
+            error
+        );
+    }
 }
 
 fn record_recent_read_file_path(
@@ -688,7 +762,7 @@ async fn finalize_server_rollback_boundary(
     session_id: Option<&str>,
     executor: &crate::server::server_tool_executor::ServerToolExecutor,
     active: &ServerRollbackBoundary,
-    new_records: &[astra_services::session_journal::ToolCallRecord],
+    new_records: &[ToolCallRecord],
     new_tool_results: &[Value],
 ) {
     let file_entries_added = active.file_checkpoint.map_or(0, |checkpoint| {
@@ -1211,23 +1285,25 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             agentic_step: Some(agentic_step),
             source: Some("agentic_loop".into()),
             run_id,
-            tool_calls: Some(round_tool_calls),
+            tool_calls: Some(round_tool_calls.clone()),
             ..Default::default()
         });
     }
+
+    let new_tool_results = state.tool_results[tool_results_before..].to_vec();
+    persist_tool_output_batch_for_round(state, &round_tool_calls, &new_tool_results).await;
 
     if let (Some(active), Some(executor)) = (
         active_server_rollback_boundary.as_ref(),
         state.server_tool_executor.as_deref(),
     ) {
         let new_records = &state.stall.tool_call_records[evo_records_before..];
-        let new_tool_results = &state.tool_results[tool_results_before..];
         finalize_server_rollback_boundary(
             state.current_session_id.as_deref(),
             executor,
             active,
             new_records,
-            new_tool_results,
+            &new_tool_results,
         )
         .await;
     }

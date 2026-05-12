@@ -94,8 +94,7 @@ fn build_server_skill_resolver(
     if matches!(allow_skills, Some(allow_skills) if allow_skills.is_empty()) {
         return (None, None);
     }
-    let Some(registry) =
-        crate::skills::catalog::build_server_visible_skill_registry(skill_service, user_id)
+    let Some(registry) = crate::capabilities::build_server_skill_registry(skill_service, user_id)
     else {
         return (None, None);
     };
@@ -2091,6 +2090,29 @@ impl AgenticRunLifecycleService {
         (run_state, cancel_flag, pause_flag, llm_cancel_token)
     }
 
+    /// Return true when an existing run should block starting a new turn in the
+    /// same session.
+    ///
+    /// `paused` is intentionally split:
+    /// - `paused + waiting_for=Some(..)` is a real user/approval wait and must
+    ///   be resumed or cancelled before another run starts.
+    /// - `paused + waiting_for=None` is used for resumable interruptions such as
+    ///   `budget_exhausted`; the user-facing contract says the next message can
+    ///   continue from the checkpoint, so it must not block a fresh web turn.
+    fn blocks_new_session_run(run: &RunState, session_id: &str) -> bool {
+        run.session_id == session_id
+            && match run.status {
+                RunStatus::Running | RunStatus::Waiting => true,
+                RunStatus::Paused => run.waiting_for.is_some(),
+                RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled => false,
+            }
+    }
+
+    fn session_has_blocking_run(runs: &HashMap<String, RunState>, session_id: &str) -> bool {
+        runs.values()
+            .any(|run| Self::blocks_new_session_run(run, session_id))
+    }
+
     fn configure_loop_state_runtime_controls(
         &self,
         loop_state: &mut AgenticLoopState,
@@ -2955,7 +2977,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // ── Resource governance check (Phase 5) ─────────────────────
         if let Some(ref gov) = self.resource_governor {
             if let astra_services::resource_governor::LimitCheck::Denied { reason } =
-                gov.check_session_create(&user_id).await
+                gov.check_run_start(&user_id).await
             {
                 return Err(error_response(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -2970,16 +2992,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        // Guard: reject if this session already has an active (running/paused) run.
+        // Guard: reject if this session already has a blocking run.
         // Hold write lock across check+insert to prevent TOCTOU race.
         let (run_state, cancel_flag, pause_flag, llm_cancel_token) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
         {
             let mut runs = self.runs.write().await;
-            let has_active = runs.values().any(|r| {
-                r.session_id == session_id
-                    && matches!(r.status, RunStatus::Running | RunStatus::Paused)
-            });
+            let has_active = Self::session_has_blocking_run(&runs, &session_id);
             if has_active {
                 return Err(error_response(
                     StatusCode::CONFLICT,
@@ -2992,11 +3011,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Persist to durable store if available
         self.persist_run_start_if_configured(&run_id, &user_id, &session_id)
             .await;
-
-        // Record session creation for resource tracking (Phase 5).
-        if let Some(ref gov) = self.resource_governor {
-            gov.record_session_created(&user_id).await;
-        }
 
         // Spawn background agentic loop.
         let edge_tools = Self::extract_edge_tools(&request);
@@ -3122,6 +3136,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             // the write-tool guard can check `active_plan_id`.
             if let Some(shared) = &self.shared_pool {
                 executor.set_context_manifest_pool(shared.clone());
+                executor = executor.with_workspace_artifact_store(
+                    astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
+                        .with_pool(shared.clone()),
+                );
                 executor.set_plan_repository(std::sync::Arc::new(
                     astra_plan::CloudPlanRepository::new(shared.get().clone()),
                 ));
@@ -3428,7 +3446,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // ── Resource governance check ────────────────────────────────
         if let Some(ref gov) = self.resource_governor {
             if let astra_services::resource_governor::LimitCheck::Denied { reason } =
-                gov.check_session_create(&user_id).await
+                gov.check_run_start(&user_id).await
             {
                 return Err(error_response(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -3549,14 +3567,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         host.set_event_tx(event_tx.clone());
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
 
-        // Guard: reject if this session already has an active (running/paused) run.
+        // Guard: reject if this session already has a blocking run.
         // Hold write lock across check+insert to prevent TOCTOU race.
         {
             let mut runs = self.runs.write().await;
-            let has_active = runs.values().any(|r| {
-                r.session_id == session_id
-                    && matches!(r.status, RunStatus::Running | RunStatus::Paused)
-            });
+            let has_active = Self::session_has_blocking_run(&runs, &session_id);
             if has_active {
                 return Err(error_response(
                     StatusCode::CONFLICT,
@@ -3575,11 +3590,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 source_event_id: format!("run:{run_id}:user"),
             };
             persist_session_transcript_items(pool, &user_id, &session_id, &[user_transcript]).await;
-        }
-
-        // Record session creation for resource tracking.
-        if let Some(ref gov) = self.resource_governor {
-            gov.record_session_created(&user_id).await;
         }
 
         self.configure_loop_state_runtime_controls(
@@ -3613,6 +3623,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
             if let Some(shared) = &self.shared_pool {
                 executor.set_context_manifest_pool(shared.clone());
+                executor = executor.with_workspace_artifact_store(
+                    astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
+                        .with_pool(shared.clone()),
+                );
                 executor.set_plan_repository(std::sync::Arc::new(
                     astra_plan::CloudPlanRepository::new(shared.get().clone()),
                 ));
@@ -4846,6 +4860,40 @@ mod tests {
         assert_eq!(event["type"], "turn_complete");
         assert_eq!(event["has_tool_calls"], true);
         assert!(event.get("assistant_text").is_none());
+    }
+
+    #[test]
+    fn budget_exhausted_paused_run_does_not_block_next_session_turn() {
+        let (mut run, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+            "run-1".to_string(),
+            "session-1".to_string(),
+            "user-1".to_string(),
+        );
+
+        run.status = RunStatus::Running;
+        assert!(
+            AgenticRunLifecycleService::blocks_new_session_run(&run, "session-1"),
+            "running run must block a concurrent turn"
+        );
+
+        run.status = RunStatus::Paused;
+        run.waiting_for = Some("user_resume".to_string());
+        assert!(
+            AgenticRunLifecycleService::blocks_new_session_run(&run, "session-1"),
+            "manual/user-wait paused run must block until resumed or cancelled"
+        );
+
+        run.waiting_for = None;
+        assert!(
+            !AgenticRunLifecycleService::blocks_new_session_run(&run, "session-1"),
+            "budget-exhausted paused run has no waiting_for and must allow the next message"
+        );
+
+        run.status = RunStatus::Waiting;
+        assert!(
+            AgenticRunLifecycleService::blocks_new_session_run(&run, "session-1"),
+            "waiting run must still block a concurrent turn"
+        );
     }
 
     #[test]

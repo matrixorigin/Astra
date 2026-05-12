@@ -24,34 +24,26 @@ async function tryRefreshToken(): Promise<boolean> {
     const { cookies } = await import('next/headers');
     const cookieStore = await cookies();
     const { REFRESH_TOKEN_COOKIE, API_URL_COOKIE, ACCESS_TOKEN_COOKIE, DEFAULT_API_URL } = await import('@/lib/runtime-config');
+    const { runtimeRefresh } = await import('@/lib/auth/runtime-auth-client');
 
     const refreshTokenVal = cookieStore.get(REFRESH_TOKEN_COOKIE)?.value;
     const apiUrl = cookieStore.get(API_URL_COOKIE)?.value ?? DEFAULT_API_URL;
 
     if (!refreshTokenVal) return false;
 
-    const res = await fetch(new URL('/auth/refresh', apiUrl).toString(), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refresh_token: refreshTokenVal }),
-      cache: 'no-store',
-    });
+    const result = await runtimeRefresh(apiUrl, refreshTokenVal);
+    if (!result.ok) return false;
 
-    if (!res.ok) return false;
-
-    const data = (await res.json()) as { access_token: string; refresh_token?: string };
-    cookieStore.set(ACCESS_TOKEN_COOKIE, data.access_token, {
+    cookieStore.set(ACCESS_TOKEN_COOKIE, result.data.access_token, {
       httpOnly: true,
       sameSite: 'lax',
       path: '/',
     });
-    if (data.refresh_token) {
-      cookieStore.set(REFRESH_TOKEN_COOKIE, data.refresh_token, {
-        httpOnly: true,
-        sameSite: 'lax',
-        path: '/',
-      });
-    }
+    cookieStore.set(REFRESH_TOKEN_COOKIE, result.data.refresh_token, {
+      httpOnly: true,
+      sameSite: 'lax',
+      path: '/',
+    });
     return true;
   } catch {
     return false;

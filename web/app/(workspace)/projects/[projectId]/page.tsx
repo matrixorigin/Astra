@@ -1,14 +1,19 @@
 import { notFound } from 'next/navigation';
 import { ProjectDetail } from '@/components/app/project-detail';
-import { getProject } from '@/lib/api/web-store';
+import { getCurrentUser } from '@/lib/auth/actions';
+import { getProjectHydrated } from '@/lib/api/web-store';
 
 export default async function ProjectPage({
   params,
 }: {
   params: Promise<{ projectId: string }>;
 }) {
+  const user = await getCurrentUser();
+  if (!user) {
+    notFound();
+  }
   const { projectId } = await params;
-  const detail = getProject(projectId);
+  const detail = await getProjectHydrated(user.user_id, projectId);
   if (!detail) {
     notFound();
   }

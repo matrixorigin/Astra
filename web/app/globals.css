@@ -1,3 +1,6 @@
+@import url('/fonts/inter/wght.css');
+@import url('/fonts/noto-sans-sc/wght.css');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -41,7 +44,8 @@ body {
   background: rgb(var(--color-bg));
   color: rgb(var(--color-text));
   font-family:
-    Inter,
+    "Inter Variable",
+    "Noto Sans SC Variable",
     ui-sans-serif,
     system-ui,
     -apple-system,

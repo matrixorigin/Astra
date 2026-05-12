@@ -11,7 +11,7 @@ import { MoveChatModal } from '@/components/app/move-chat-modal';
 import { IconButton } from '@/components/ui/icon-button';
 import { useChatLifecycleActions } from '@/hooks/use-chat-lifecycle-actions';
 import { subscribeChatLifecycleChange } from '@/lib/chat-lifecycle-events';
-import { getChat, streamChatMessage } from '@/lib/api/chats';
+import { getChat, streamChatMessage, updateChatModel } from '@/lib/api/chats';
 import { isAuthRequiredError } from '@/lib/api/errors';
 import type { ChatDetail, ChatMessage, ComposerOptions } from '@/lib/api/types';
 
@@ -50,6 +50,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       id: crypto.randomUUID(),
       role: 'user',
       content: text,
+      activeSkills: options.activeSkills,
       createdAt: timestamp,
       status: 'complete',
     };
@@ -75,6 +76,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     setSending(true);
     setDetail((current) => ({
       ...current,
+      chat: {
+        ...current.chat,
+        model: options.model,
+      },
       pendingTurn: pendingMessageId ? undefined : current.pendingTurn,
       messages: appendUser
         ? [...current.messages, userMessage, assistantMessage]
@@ -94,6 +99,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         },
         onText: (content) => {
           patchAssistant({ content, status: 'streaming' });
+        },
+        onArtifacts: (artifacts) => {
+          patchAssistant({ artifacts });
         },
         onDone: (content) => {
           patchAssistant({
@@ -122,7 +130,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     if (pinnedRef.current) {
       scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
     }
-  }, [detail.messages.length, latestMessage?.content, latestMessage?.reasoning]);
+  }, [detail.messages.length, latestMessage?.content, latestMessage?.reasoning, latestMessage?.artifacts?.length]);
 
   useEffect(() => {
     if (
@@ -144,6 +152,26 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   async function refresh() {
     setDetail(await getChat(detail.chat.id));
   }
+
+  const handleModelChange = useCallback((model: string) => {
+    const previousModel = detail.chat.model ?? null;
+    setDetail((current) => ({
+      ...current,
+      chat: {
+        ...current.chat,
+        model,
+      },
+    }));
+    void updateChatModel(detail.chat.id, model).catch(() => {
+      setDetail((current) => ({
+        ...current,
+        chat: {
+          ...current.chat,
+          model: previousModel,
+        },
+      }));
+    });
+  }, [detail.chat.id, detail.chat.model]);
 
   useEffect(() => subscribeChatLifecycleChange((event) => {
     if (event.action === 'clearArchived') {
@@ -232,7 +260,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             <Composer
               disabled={sending}
               placeholder="Reply to Astra..."
-              initialModel={detail.pendingTurn?.options.model}
+              initialModel={detail.pendingTurn?.options.model ?? detail.chat.model ?? undefined}
+              persistModelPreference={false}
+              onModelChange={handleModelChange}
               projectContext={detail.chat.projectId ? { projectId: detail.chat.projectId } : undefined}
               onSubmit={async ({ text, options }) => {
                 await startStream({ text, options, appendUser: true });

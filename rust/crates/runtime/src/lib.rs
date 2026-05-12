@@ -71,6 +71,7 @@ mod app_state;
 pub mod auto_invoke_handler;
 pub mod bash_intent;
 pub mod bridge;
+pub mod capabilities;
 pub mod evaluation;
 pub mod evolution;
 pub mod guardrail_tuning;

@@ -4,7 +4,10 @@
 > Status: v1.0.0 implementation complete; E2E joint verification PASS; known residuals are non-blocking v1.0.1 quality follow-ups.
 > Post-E2E hotfix: CSL snapshot loading now uses a MatrixOne-stable `COUNT(*)` probe and assistant final text is included in CSL persistence. Runtime resume does **not** silently rebuild the prompt from `session_transcript_items`; old details are exposed to the LLM through explicit, read-only `session_history_page` / `session_history_search` / `session_history_around` tools so retrieval stays user-scoped, cursor-based, and token-bounded.
 > Web UI test hotfix: the resource governor now interprets `max_concurrent_sessions` as sessions with active runs (`agent_runs.status IN ('running','paused','waiting')`), not all durable/resumable historical `agent_sessions`; persisted web chats must not consume execution concurrency after their run completes.
+> Web UI quota hotfix: `max_sessions_per_day` is enforced only when an `agent_sessions` row is created. Starting additional turns in an existing chat creates durable `agent_runs`, but those runs do not increment `resource_usage.sessions_created`; run start only checks active execution capacity and token budget.
 > Web UI usability patch: chats can now be archived into a default-collapsed sidebar section, unarchived, or permanently deleted from the chat menu/sidebar menu. Archived chats are read-only until unarchived. Archive/unarchive persists `agent_sessions.status='archived'/'active'` for sessions with a runtime ID. Permanent delete and clear-archive actions use local inline confirmation near the action and call the runtime `DELETE /sessions/{session_id}` hard-delete path for persisted sessions before removing the Web UI record.
+> Web UI identity cleanup: `/chats/{id}` and `/projects/{project_id}/chats/{id}` now use the remote MatrixOne `agent_sessions.session_id` as the only chat id. New chats call `POST /sessions` first, then stream the first turn against that same `session_id`; browser-only provisional chat ids are no longer durable or routable.
+> Web UI hydration hotfix: the Next.js in-process chat projection is treated as a cache only. Chat list/sidebar/detail/message routes hydrate `metadata.source='web_v1'` sessions from runtime `GET /sessions` before rendering, and chat detail hydrates display messages from `GET /sessions/{session_id}/transcript` when the cache is empty after a Web server restart.
 
 ## §1 Design to Implementation Closure
 
@@ -115,7 +118,12 @@ The web-agent v1 implementation owns or extends **29 schema surfaces**:
 The implementation also seeds:
 
 - 25+ context manifest reason values including `progressive_loading`, `intent_driven_preview_expand`, and user-memory reasons.
-- 18+ preview templates, currently 19 baselines: `pg_dump`, `fetch_url`, `parse_pdf`, `SKILL.md`, `cargo`, `rustc`, `clippy`, `sql_compat_scan`, `pg_schema_structurize`, `slow_query_analyzer`, `curl`, `git_log`, `docker_logs`, `kubectl`, `python_stdout`, `npm_build`, `csv_head`, `json_preview`, `markdown_preview`.
+- 18+ preview templates, currently 25 baselines: `bash`, `run_script`,
+  `read_file`, `write_file`, `web_search`, `pg_dump`, `fetch_url`,
+  `parse_pdf`, `SKILL.md`, `cargo`, `rustc`, `clippy`, `sql_compat_scan`,
+  `pg_schema_structurize`, `slow_query_analyzer`, `curl`, `git_log`,
+  `docker_logs`, `kubectl`, `python_stdout`, `npm_build`, `csv_head`,
+  `json_preview`, `markdown_preview`, `publish_artifact`.
 - Raw-ref schemes including `artifact://`, `s3://`, `conversation_log://`, `tool_output://`, `chunk://`, and `state_item://`.
 
 ### §2.2 Rust Modules
@@ -131,6 +139,10 @@ Services:
 
 Runtime/server:
 
+- `rust/crates/runtime/src/capabilities.rs` centralizes CLI/Web capability
+  resolution: Web and remote CLI surfaces see server-executable tools plus the
+  server-visible skill catalog; local CLI sees client-executable tools/MCP plus
+  project/home skills and the authenticated server catalog.
 - `rust/crates/runtime/src/server/device_lease_sweeper.rs`
 - `rust/crates/runtime/src/server/artifact_retention_sweeper.rs`
 - `rust/crates/runtime/src/server/user_skill_handlers.rs`
@@ -138,6 +150,19 @@ Runtime/server:
 - `rust/crates/runtime/src/server/run_handlers.rs` extended for durable run stream/input/cancel.
 - `rust/crates/runtime/src/server/run_lifecycle.rs` restores web-agent history from CSL and persists completed assistant text back into CSL. Transcript display rows remain an audit/UI projection, not an automatic prompt source.
 - `rust/crates/runtime/src/server/server_tool_executor.rs` exposes read-only session history tools so the LLM can page, search, and expand old transcript details on demand without loading the full session.
+- `rust/crates/runtime/src/server/server_tool_executor.rs` exposes the
+  server-side `publish_artifact` capability: files already generated in the
+  session workspace or `/tmp` are validated, persisted to
+  `session_artifacts`, and returned as `artifact://` references. Chart/image
+  generation remains normal model+tool work; publishing is the single bridge
+  that makes the resulting file previewable and downloadable in Web. Web chat
+  only renders `source='publish_artifact'` / `artifact_file_v1` rows as
+  attachments; internal rows such as `composite_snapshot_index` stay storage-only.
+- `rust/crates/runtime/src/server/server_tool_executor.rs` now executes the
+  schema-advertised `run_script` tool in server mode. Its Python RPC helper
+  list is the server-routable subset only, and
+  `rust/crates/runtime/src/turn/agentic_loop_tool_phase.rs` batch-persists
+  model-visible tool results into `session_tool_outputs`.
 - `rust/crates/runtime/src/server/delegation_engine.rs` wired to state projection and bubble-up.
 - `rust/crates/runtime/src/server/state_builder.rs` starts device lease and artifact retention sweepers.
 
@@ -193,6 +218,8 @@ Personal skill endpoints:
 
 | Method | Path |
 | --- | --- |
+| `GET` | `/skills` |
+| `GET` | `/skills/{skill_name}` |
 | `GET` / `POST` | `/skills/user` |
 | `GET` / `POST` | `/skills/user/{skill_name}/versions` |
 | `POST` | `/skills/user/{skill_name}/evaluations` |
@@ -203,14 +230,20 @@ Personal skill endpoints:
 
 Web UI MVP items:
 
-1. Login page backed by existing auth sessions.
-2. Session list sorted by `updated_at` with pagination.
-3. Session chat view: create/open session, keep the composer anchored to the chat viewport while only the transcript pane scrolls, optimistically render the user message, send the turn's `context.thinking` hint to the runtime, forward provider SSE `text_delta` / `reasoning_delta` / `thinking_delta` while they arrive, show a Thinking placeholder while streaming, normalize provider reasoning plus `<think>` / `<thinking>` into a bounded collapsible Thinking timeline with small-region scrolling and per-block "Show more", hide the placeholder after completion if no reasoning was exposed, and return focus to the composer after completion.
+1. Login and registration pages backed by the shared runtime `/auth/*` endpoints, plus a two-layer route guard: middleware redirects requests without browser auth cookies to `/login?next=...`, and the workspace layout validates the cookie with `/auth/me` before rendering protected pages. Login/register pages remain directly reachable so stale cookies cannot trap users away from re-authentication. The left-sidebar account menu shows Sign in only on authenticated layouts and Sign out when authenticated. CLI and Web use the same register/login/refresh/logout service contract; Web stores returned tokens in httpOnly cookies, while CLI stores them in the active profile.
+2. Session list sorted by `updated_at` with pagination, hydrated from remote MatrixOne-backed runtime sessions after Web server restarts.
+3. Session chat view: create/open session, keep the composer anchored to the chat viewport while only the transcript pane scrolls, optimistically render the user message, keep selected model state bound to the current session/chat instead of a global composer preference and mirror changes to `agent_sessions.metadata.current_model`, send the turn's `context.thinking` hint to the runtime, forward provider SSE `text_delta` / `reasoning_delta` / `thinking_delta` while they arrive, show a Thinking placeholder while streaming, normalize provider reasoning plus `<think>` / `<thinking>` into a bounded collapsible Thinking timeline with small-region scrolling and per-block "Show more", hide the placeholder after completion if no reasoning was exposed, and return focus to the composer after completion.
 4. IndexedDB session cache with atomic run-event and watermark writes.
 5. Stop button wired to run/session cancellation endpoint.
 6. Device revoke UI in settings/device list.
 7. Archived chats section plus read-only archived sessions and inline-confirmed permanent delete/clear-archive actions for chat lifecycle cleanup.
-8. Composer Skills picker: paginated/searchable skill selection for large skill catalogs; selected skills are sent as `allow_skills` and mirrored into `context.edge_profile.active_skills` for the runtime turn. The picker and runtime resolver read the same server-visible catalog: API-server HOME skills (`~/.astra/skills`, `~/.claude/skills`) plus database skills visible to the current user (`created_by = current_user OR is_public = 1`). CLI project-local filesystem skills remain CLI-only until imported. Runtime builds this resolver by default; `allow_skills` only filters it, and the LLM sees pinned/active skills plus the shared selector shortlist rather than the full catalog.
+8. Composer Skills picker: paginated/searchable skill selection for large skill catalogs; selected skills render as inline `/skill-name` composer tokens inserted at the current caret position, can be chosen from the `+` menu or the generic slash command palette, are sent as `allow_skills`, mirrored into `context.edge_profile.active_skills`, cleared immediately when the turn is submitted, and restored on submit failure for retry. Typing `/` at a word boundary opens a prefix-matched command list; typing whitespace closes it without selecting. v1 registers `kind='skill'` slash commands from the shared catalog, while the command data model is already open to later `mode` / `action` commands such as `/plan`. The picker and runtime resolver read the same server-visible catalog: API-server HOME skills (`~/.astra/skills`, `~/.claude/skills`) plus database skills visible to the current user (`created_by = current_user OR is_public = 1`). CLI project-local filesystem skills remain CLI-only until imported. Runtime builds this resolver by default; `allow_skills` only filters it, and the LLM sees pinned/active skills plus the shared selector shortlist rather than the full catalog. CLI prompt assembly now uses the same capability catalog: local CLI turns combine client edge tools, client MCP tools, project/home skills, and the authenticated server skill catalog; remote/thin CLI turns intentionally match Web.
+9. Generic artifact rendering: the web SSE proxy snapshots pre-turn artifacts,
+   attaches newly produced `session_artifacts` to the assistant message after
+   the turn, previews supported image/text payloads inline, and exposes a local
+   download action for the stored artifact bytes. The proxy filters the mixed
+   artifact table to user-facing `publish_artifact` rows so restore/debug
+   artifacts are not shown as chat attachments.
 
 Incremental v1 UI additions:
 

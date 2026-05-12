@@ -1,0 +1,74 @@
+# Astra Gateway 配置
+#
+# 启动:
+#   make gateway                        # 或直接:
+#   cargo run -p astra-gateway --release -- --config gateway.yaml
+#
+# 微信登录:
+#   make gateway-login-weixin           # 扫码获取 token, 填入下方 weixin 配置
+#
+# 环境变量覆盖:
+#   WECOM_BOT_ID, WECOM_SECRET — 企微凭证
+#   WEIXIN_TOKEN, WEIXIN_ACCOUNT_ID — 微信凭证
+#   GATEWAY_DATABASE_URL — MySQL / MatrixOne storage URL
+
+
+cli_profiles:
+  claude:
+    type: claude
+    bin: "/Users/ghs-mo/.local/bin/claude"
+    stream_json: true
+  astra:
+    type: astra
+    bin: "/Users/ghs-mo/MOWorkSpace/mo-agent-engine/rust/target/release/astra"
+    permission_mode: auto
+    model: "MiniMax-M2.7"
+  copilot:
+    type: copilot
+    bin: copilot
+    launcher:
+      type: script
+      path: ~/.astra-gateway/copilot-launcher
+    stream_json: true
+    allow_all_tools: true
+    extra_args: ["--disable-builtin-mcps"]
+
+cli:
+  type: astra
+  bin: "/Users/ghs-mo/MOWorkSpace/mo-agent-engine/rust/target/release/astra"
+  permission_mode: auto
+  model: "MiniMax-M2.7"
+
+astra:
+  base_url: "http://127.0.0.1:8000"    # Astra server 地址
+  api_key: ""                          # Astra API key (如开启认证)
+  default_model: "MiniMax-M2.7"       # 默认模型
+
+storage:
+  backend: mysql
+  url: "mysql://root:111@127.0.0.1:6001/astra_gateway"  # Gateway durable storage
+
+# 全局并发上限；同一会话仍会按顺序串行执行，避免 session race
+max_concurrent_runs: 4
+
+# 网关动作安全策略
+action_policy:
+  allow_slash_mutations: true             # 允许用户手动 slash 修改操作
+  allow_model_generated_mutations: true   # 是否允许模型输出 [[GATEWAY:...]] 修改状态
+  workspace_roots: []                     # 非空时 /workspace 和 workspace_set 只能指向这些根目录
+
+# 至少启用一个平台
+platforms:
+  # ── 微信个人号 (iLink Bot API) ──
+  # 首次使用: make gateway-login-weixin 扫码获取 token
+  weixin:
+    enabled: true
+    token: "6ce8bf79ccdc@im.bot:060000c5c449c0640a2dcbf66aedd6757bc082"                          # 扫码获取，或 WEIXIN_TOKEN 环境变量
+    account_id: "6ce8bf79ccdc@im.bot"                     # 扫码获取，或 WEIXIN_ACCOUNT_ID 环境变量
+
+  # ── 企业微信 AI Bot ──
+  # wecom:
+  #   enabled: true
+  #   bot_id: ""                       # 企微 AI Bot ID
+  #   secret: ""                       # 企微 AI Bot Secret
+  #   # websocket_url: "wss://openws.work.weixin.qq.com"

@@ -1,13 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireRuntimeAuth } from '@/lib/api/auth-guard';
+import { requireRuntimeUser } from '@/lib/api/auth-guard';
 import {
   beginStreamingMessage,
-  getChat,
+  getChatHydrated,
   resolveBackendModelName,
   updateStreamingAssistantMessage,
 } from '@/lib/api/web-store';
 import { getRuntimeConfig } from '@/lib/runtime-config';
-import type { SendMessageRequest } from '@/lib/api/types';
+import type { ChatArtifactRef, SendMessageRequest } from '@/lib/api/types';
 
 const encoder = new TextEncoder();
 
@@ -44,6 +44,102 @@ function normalizedActiveSkills(skills?: string[]) {
   return [...new Set(skills.map((skill) => skill.trim()).filter(Boolean))].sort((left, right) => (
     left.localeCompare(right)
   ));
+}
+
+type RuntimeArtifactResponse = {
+  artifact_id?: string;
+  artifact_kind?: string;
+  source?: string | null;
+  content?: unknown;
+  metadata?: Record<string, unknown> | null;
+  created_at?: string | null;
+};
+
+type RuntimeArtifactListResponse = {
+  artifacts?: RuntimeArtifactResponse[];
+};
+
+function stringField(value: unknown) {
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
+function numberField(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+const INTERNAL_ARTIFACT_KINDS = new Set(['composite_snapshot_index']);
+const INTERNAL_ARTIFACT_SOURCES = new Set(['composite_snapshot_index']);
+const CHAT_VISIBLE_ARTIFACT_SOURCES = new Set(['publish_artifact']);
+const CHAT_VISIBLE_ARTIFACT_NORMALIZE_VERSIONS = new Set(['artifact_file_v1']);
+
+function isChatVisibleRuntimeArtifact(
+  source: string | null,
+  kind: string,
+  metadata: Record<string, unknown> | null,
+) {
+  if (INTERNAL_ARTIFACT_KINDS.has(kind) || (source && INTERNAL_ARTIFACT_SOURCES.has(source))) {
+    return false;
+  }
+
+  const normalizeVersion = stringField(metadata?.normalize_version);
+  return Boolean(
+    source
+      && CHAT_VISIBLE_ARTIFACT_SOURCES.has(source)
+      && normalizeVersion
+      && CHAT_VISIBLE_ARTIFACT_NORMALIZE_VERSIONS.has(normalizeVersion),
+  );
+}
+
+function artifactFromRuntime(artifact: RuntimeArtifactResponse): ChatArtifactRef | null {
+  const content = artifact.content && typeof artifact.content === 'object'
+    ? artifact.content as Record<string, unknown>
+    : null;
+  const metadata = artifact.metadata && typeof artifact.metadata === 'object'
+    ? artifact.metadata
+    : null;
+  const id = stringField(artifact.artifact_id);
+  const kind = stringField(artifact.artifact_kind) ?? stringField(content?.kind);
+  const source = stringField(artifact.source);
+  if (!id || !kind || !content) {
+    return null;
+  }
+  if (!isChatVisibleRuntimeArtifact(source, kind, metadata)) {
+    return null;
+  }
+  return {
+    id,
+    kind,
+    source,
+    title: stringField(content.title) ?? stringField(metadata?.title) ?? stringField(content.filename),
+    filename: stringField(content.filename) ?? stringField(metadata?.download_filename),
+    sizeBytes: numberField(content.byte_size) ?? numberField(metadata?.byte_size),
+    contentType: stringField(content.content_type) ?? stringField(metadata?.content_type),
+    renderer: stringField(content.renderer) ?? stringField(metadata?.renderer),
+    downloadFilename: stringField(metadata?.download_filename),
+    content,
+    createdAt: artifact.created_at ?? null,
+  };
+}
+
+async function fetchSessionArtifacts(
+  apiUrl: string,
+  accessToken: string,
+  sessionId: string,
+) {
+  const url = new URL(`/sessions/${encodeURIComponent(sessionId)}/artifacts`, apiUrl);
+  url.searchParams.set('limit', '50');
+  const response = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    cache: 'no-store',
+  });
+  if (!response.ok) {
+    const detail = await readErrorDetail(response);
+    throw new Error(`Failed to load artifacts for session ${sessionId}: ${detail}`);
+  }
+  const body = (await response.json()) as RuntimeArtifactListResponse;
+  return (body.artifacts ?? [])
+    .map(artifactFromRuntime)
+    .filter((artifact): artifact is ChatArtifactRef => Boolean(artifact));
 }
 
 function mergeTextDelta(current: string, delta: string) {
@@ -136,13 +232,18 @@ export async function POST(
   request: NextRequest,
   context: { params: Promise<{ chatId: string }> },
 ) {
+  const auth = await requireRuntimeUser();
+  if (auth.response) {
+    return auth.response;
+  }
+  const ownerUserId = auth.user.user_id;
   const { chatId } = await context.params;
   const body = (await request.json()) as SendMessageRequest;
   if (!body.content?.trim()) {
     return NextResponse.json({ error: 'content is required' }, { status: 400 });
   }
 
-  const chat = getChat(chatId);
+  const chat = await getChatHydrated(ownerUserId, chatId);
   if (!chat) {
     return NextResponse.json({ error: 'chat not found' }, { status: 404 });
   }
@@ -150,36 +251,52 @@ export async function POST(
     return NextResponse.json({ error: 'archived chat is read-only' }, { status: 409 });
   }
 
-  const authError = await requireRuntimeAuth();
-  if (authError) {
-    return authError;
-  }
-
-  const started = beginStreamingMessage(chatId, body);
+  const started = beginStreamingMessage(ownerUserId, chatId, body);
   if (!started) {
     return NextResponse.json({ error: 'chat not found' }, { status: 404 });
   }
 
   const config = await getRuntimeConfig();
   if (config.mode !== 'live' || !config.apiUrl || !config.accessToken) {
-    updateStreamingAssistantMessage(chatId, started.assistantMessage.id, {
+    updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
       content: 'Runtime authentication is required.',
       status: 'failed',
     });
     return NextResponse.json({ error: 'AUTH_REQUIRED' }, { status: 401 });
   }
+  const apiUrl = config.apiUrl;
+  const accessToken = config.accessToken;
 
   const model = await resolveBackendModelName(config, body.options?.model);
   const activeSkills = normalizedActiveSkills(body.options?.activeSkills);
-  const backendResponse = await fetch(new URL('/chat/stream', config.apiUrl).toString(), {
+  const sessionId = started.sessionId;
+  const knownArtifactIds = new Set<string>();
+  try {
+    const existingArtifacts = await fetchSessionArtifacts(
+      apiUrl,
+      accessToken,
+      sessionId,
+    );
+    for (const artifact of existingArtifacts) {
+      knownArtifactIds.add(artifact.id);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to load artifacts.';
+    updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
+      content: message,
+      status: 'failed',
+    });
+    return NextResponse.json({ error: message }, { status: 502 });
+  }
+  const backendResponse = await fetch(new URL('/chat/stream', apiUrl).toString(), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.accessToken}`,
+      Authorization: `Bearer ${accessToken}`,
     },
     body: JSON.stringify({
       message: body.content,
-      session_id: started.backendSessionId,
+      session_id: sessionId,
       model,
       allow_skills: activeSkills.length ? activeSkills : undefined,
       context: {
@@ -196,7 +313,7 @@ export async function POST(
 
   if (!backendResponse.ok || !backendResponse.body) {
     const detail = await readErrorDetail(backendResponse);
-    updateStreamingAssistantMessage(chatId, started.assistantMessage.id, {
+    updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
       content: detail,
       status: 'failed',
     });
@@ -207,6 +324,7 @@ export async function POST(
   let assistantRawText = '';
   let reasoningText = '';
   let lastStatus: 'streaming' | 'complete' | 'failed' = 'streaming';
+  let protocolError = false;
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -228,6 +346,9 @@ export async function POST(
 
       const applyEvent = (event: Record<string, unknown>) => {
         const type = typeof event.type === 'string' ? event.type : '';
+        if (protocolError) {
+          return;
+        }
 
         const applyAssistantText = (rawText: string, status: 'streaming' | 'complete' | 'failed') => {
           const split = splitThinkingTags(rawText);
@@ -235,7 +356,7 @@ export async function POST(
           if (split.hasThinking) {
             reasoningText = split.reasoning;
           }
-          updateStreamingAssistantMessage(chatId, started.assistantMessage.id, {
+          updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
             content: assistantText,
             reasoning: reasoningText || undefined,
             reasoningStatus: reasoningText
@@ -246,9 +367,17 @@ export async function POST(
         };
 
         if (type === 'session_info' && typeof event.session_id === 'string') {
-          updateStreamingAssistantMessage(chatId, started.assistantMessage.id, {
-            backendSessionId: event.session_id,
-          });
+          if (event.session_id !== sessionId) {
+            const message = `Runtime returned session_id ${event.session_id}, but Web chat is bound to ${sessionId}.`;
+            protocolError = true;
+            assistantText = message;
+            lastStatus = 'failed';
+            updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
+              content: message,
+              status: 'failed',
+            });
+            controller.enqueue(sseFrame({ type: 'error', message }));
+          }
           return;
         }
 
@@ -263,7 +392,7 @@ export async function POST(
           typeof event.content === 'string'
         ) {
           reasoningText = mergeTextDelta(reasoningText, event.content);
-          updateStreamingAssistantMessage(chatId, started.assistantMessage.id, {
+          updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
             reasoning: reasoningText,
             reasoningStatus: 'streaming',
             status: 'streaming',
@@ -272,7 +401,7 @@ export async function POST(
         }
 
         if (type === 'reasoning_done' || type === 'thinking_done') {
-          updateStreamingAssistantMessage(chatId, started.assistantMessage.id, {
+          updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
             reasoning: reasoningText,
             reasoningStatus: 'complete',
             status: 'streaming',
@@ -296,7 +425,7 @@ export async function POST(
           const message = typeof event.message === 'string' ? event.message : 'Astra stream failed.';
           assistantText = assistantText || message;
           lastStatus = 'failed';
-          updateStreamingAssistantMessage(chatId, started.assistantMessage.id, {
+          updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
             content: assistantText,
             status: 'failed',
           });
@@ -312,7 +441,7 @@ export async function POST(
           } else {
             lastStatus = 'complete';
           }
-          updateStreamingAssistantMessage(chatId, started.assistantMessage.id, {
+          updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
             content: assistantText,
             reasoning: reasoningText || undefined,
             reasoningStatus: lastStatus === 'complete' ? 'complete' : (reasoningText ? 'complete' : undefined),
@@ -353,16 +482,30 @@ export async function POST(
 
         if (lastStatus === 'streaming') {
           lastStatus = assistantText ? 'complete' : 'failed';
-          updateStreamingAssistantMessage(chatId, started.assistantMessage.id, {
+          updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
             content: assistantText || 'Astra completed the run without returning visible text.',
             reasoning: reasoningText || undefined,
             reasoningStatus: lastStatus === 'complete' ? 'complete' : undefined,
             status: lastStatus,
           });
         }
+
+        if (lastStatus === 'complete') {
+          const artifacts = (await fetchSessionArtifacts(
+            apiUrl,
+            accessToken,
+            sessionId,
+          )).filter((artifact) => !knownArtifactIds.has(artifact.id));
+          if (artifacts.length > 0) {
+            updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
+              artifacts,
+            });
+            controller.enqueue(sseFrame({ type: 'artifacts', artifacts }));
+          }
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Astra stream failed.';
-        updateStreamingAssistantMessage(chatId, started.assistantMessage.id, {
+        updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
           content: assistantText || message,
           status: 'failed',
         });

@@ -67,15 +67,16 @@ fn budget_exhaustion_completion_text(state: &AgenticLoopState) -> String {
         " You can continue in the next message."
     };
     let completed_tool_calls = completed_tool_calls(state);
+    let completed_agentic_turns = current_agentic_step(state);
     if completed_tool_calls > 0 {
         format!(
             "[Turn budget exhausted after {} agentic turn(s). {} completed tool call(s) are preserved above.{}]\n",
-            state.max_turns, completed_tool_calls, checkpoint_note
+            completed_agentic_turns, completed_tool_calls, checkpoint_note
         )
     } else {
         format!(
             "[Turn budget exhausted after {} agentic turn(s). Partial progress is preserved.{}]\n",
-            state.max_turns, checkpoint_note
+            completed_agentic_turns, checkpoint_note
         )
     }
 }

@@ -19,10 +19,14 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
+use uuid::Uuid;
 
 use astra_core::SharedPool;
+use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore};
 use astra_tools::executor::DefaultToolExecutor;
 use astra_tools::{AskUserDecision, AskUserGate, ToolExecutor};
 use async_trait::async_trait;
@@ -55,6 +59,121 @@ fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
         variants.push(canonical);
     }
     variants
+}
+
+const MAX_PUBLISH_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
+
+fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_short_token(value: &str, field: &str, max_len: usize) -> Result<(), String> {
+    if value.len() > max_len {
+        return Err(format!("Error: {field} must be at most {max_len} bytes"));
+    }
+    if value.chars().any(|ch| ch.is_control()) {
+        return Err(format!(
+            "Error: {field} must not contain control characters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_artifact_kind(value: &str) -> Result<String, String> {
+    validate_short_token(value, "artifact_kind", 64)?;
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err(
+            "Error: artifact_kind may only contain ASCII letters, digits, '_', '-', or '.'"
+                .to_string(),
+        );
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn validate_content_type(value: &str) -> Result<String, String> {
+    validate_short_token(value, "content_type", 128)?;
+    if !value.contains('/') || value.contains(';') {
+        return Err("Error: content_type must be a simple MIME type such as image/png".to_string());
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn infer_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("avif") => "image/avif",
+        Some("pdf") => "application/pdf",
+        Some("html") | Some("htm") => "text/html",
+        Some("md") | Some("markdown") => "text/markdown",
+        Some("txt") | Some("log") => "text/plain",
+        Some("json") => "application/json",
+        Some("jsonl") => "application/x-ndjson",
+        Some("csv") => "text/csv",
+        Some("tsv") => "text/tab-separated-values",
+        Some("yaml") | Some("yml") => "application/yaml",
+        Some("toml") => "application/toml",
+        Some("xml") => "application/xml",
+        Some("zip") => "application/zip",
+        Some("tar") => "application/x-tar",
+        Some("gz") | Some("tgz") => "application/gzip",
+        Some("parquet") => "application/vnd.apache.parquet",
+        _ => "application/octet-stream",
+    }
+}
+
+fn infer_artifact_kind(path: &Path, content_type: &str) -> &'static str {
+    if content_type.starts_with("image/") {
+        return "image";
+    }
+    match content_type {
+        "application/pdf" => "pdf",
+        "text/html" => "html",
+        "text/markdown" => "markdown",
+        "application/json"
+        | "application/x-ndjson"
+        | "text/csv"
+        | "text/tab-separated-values"
+        | "application/yaml"
+        | "application/toml" => "data",
+        "text/plain" => "text",
+        "application/zip" | "application/x-tar" | "application/gzip" => "archive",
+        _ => match path.extension().and_then(|ext| ext.to_str()) {
+            Some("rs" | "go" | "py" | "ts" | "tsx" | "js" | "jsx" | "sql" | "sh") => "code",
+            _ => "file",
+        },
+    }
+}
+
+fn should_store_artifact_as_text(content_type: &str, path: &Path) -> bool {
+    content_type.starts_with("text/")
+        || matches!(
+            content_type,
+            "image/svg+xml"
+                | "application/json"
+                | "application/x-ndjson"
+                | "application/yaml"
+                | "application/toml"
+                | "application/xml"
+        )
+        || matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("rs" | "go" | "py" | "ts" | "tsx" | "js" | "jsx" | "sql" | "sh")
+        )
 }
 
 fn undo_file_with_candidates(
@@ -1300,6 +1419,201 @@ impl ServerToolExecutor {
         self.context_manifest_pool = Some(pool);
     }
 
+    async fn server_run_script(&self, args: &Value) -> astra_tools::ToolResult {
+        #[cfg(unix)]
+        {
+            use std::collections::HashSet;
+
+            let mut config = astra_tools::run_script::RunScriptConfig::default();
+            config.mode = astra_tools::run_script::ExecutionMode::Project;
+            config.session_cwd = Some(self.workspace_root.clone());
+            config.allowed_tools = astra_tools::schemas::SERVER_RUN_SCRIPT_RPC_TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<HashSet<_>>();
+            astra_tools::run_script::handle_run_script(args, self, config).await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = args;
+            astra_tools::ToolResult::error(
+                "run_script is not available on this platform (requires Unix domain sockets)"
+                    .to_string(),
+            )
+        }
+    }
+
+    async fn publish_artifact(&self, args: &Value) -> astra_tools::ToolResult {
+        let Some(store) = self.workspace_artifact_store.as_ref() else {
+            return astra_tools::ToolResult::error(
+                "Error: publish_artifact requires a configured MatrixOne artifact store for this session"
+                    .to_string(),
+            );
+        };
+
+        let Some(raw_path) = string_arg(args, "path") else {
+            return astra_tools::ToolResult::error(
+                "Error: publish_artifact requires a non-empty path".to_string(),
+            );
+        };
+        let path = match self.resolve_publish_artifact_path(raw_path) {
+            Ok(path) => path,
+            Err(error) => return astra_tools::ToolResult::error(error),
+        };
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return astra_tools::ToolResult::error(format!(
+                    "Error: failed to inspect artifact file {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        if !metadata.is_file() {
+            return astra_tools::ToolResult::error(format!(
+                "Error: publish_artifact path is not a regular file: {}",
+                path.display()
+            ));
+        }
+        if metadata.len() > MAX_PUBLISH_ARTIFACT_BYTES {
+            return astra_tools::ToolResult::error(format!(
+                "Error: publish_artifact currently supports files up to {} MiB; {} is {} bytes",
+                MAX_PUBLISH_ARTIFACT_BYTES / 1024 / 1024,
+                path.display(),
+                metadata.len()
+            ));
+        }
+
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return astra_tools::ToolResult::error(format!(
+                    "Error: failed to read artifact file {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+
+        let content_type = match string_arg(args, "content_type") {
+            Some(value) => match validate_content_type(value) {
+                Ok(value) => value,
+                Err(error) => return astra_tools::ToolResult::error(error),
+            },
+            None => infer_content_type(&path).to_string(),
+        };
+        let artifact_kind = match string_arg(args, "artifact_kind") {
+            Some(value) => match validate_artifact_kind(value) {
+                Ok(value) => value,
+                Err(error) => return astra_tools::ToolResult::error(error),
+            },
+            None => infer_artifact_kind(&path, &content_type).to_string(),
+        };
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("artifact")
+            .to_string();
+        let title = string_arg(args, "title")
+            .map(ToString::to_string)
+            .unwrap_or_else(|| filename.clone());
+        if let Err(error) = validate_short_token(&title, "title", 160) {
+            return astra_tools::ToolResult::error(error);
+        }
+        let description = string_arg(args, "description").map(ToString::to_string);
+        if let Some(description) = &description
+            && let Err(error) = validate_short_token(description, "description", 1000)
+        {
+            return astra_tools::ToolResult::error(error);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let sha256 = format!("{:x}", hasher.finalize());
+        let (encoding, data) = if should_store_artifact_as_text(&content_type, &path) {
+            match std::str::from_utf8(&bytes) {
+                Ok(text) => ("utf-8", text.to_string()),
+                Err(_) => ("base64", BASE64_STANDARD.encode(&bytes)),
+            }
+        } else {
+            ("base64", BASE64_STANDARD.encode(&bytes))
+        };
+
+        let source_path = self
+            .relative_to_workspace_root(&path)
+            .map(|relative| relative.display().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        let artifact_id = Uuid::new_v4().to_string();
+        let record = SessionArtifactJsonRecord {
+            artifact_id: artifact_id.clone(),
+            session_id: self.session_id.clone(),
+            user_id: self.user_id.clone(),
+            artifact_kind: artifact_kind.clone(),
+            source: Some("publish_artifact".to_string()),
+            turn: Some(self.journal_turn_index.load(Ordering::Relaxed)),
+            round: None,
+            content: json!({
+                "kind": artifact_kind.clone(),
+                "title": title.clone(),
+                "filename": filename.clone(),
+                "content_type": content_type.clone(),
+                "encoding": encoding,
+                "data": data,
+                "description": description.clone(),
+                "byte_size": bytes.len(),
+                "sha256": sha256.clone(),
+            }),
+            metadata: Some(json!({
+                "download_filename": filename.clone(),
+                "content_type": content_type.clone(),
+                "byte_size": bytes.len(),
+                "sha256": sha256.clone(),
+                "source_path": source_path,
+                "normalize_version": "artifact_file_v1",
+            })),
+        };
+
+        let artifact = match store.persist_json_artifact(record).await {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                return astra_tools::ToolResult::error(format!(
+                    "Error: failed to persist published artifact: {error}"
+                ));
+            }
+        };
+        let artifact_ref = format!(
+            "artifact://session/{}/{}",
+            self.session_id, artifact.artifact_id
+        );
+        let output = format!(
+            "Published artifact '{title}'.\n\
+             artifact_ref: {artifact_ref}\n\
+             artifact_id: {artifact_id}\n\
+             artifact_kind: {artifact_kind}\n\
+             content_type: {content_type}\n\
+             download_filename: {filename}\n\
+             byte_size: {byte_size}\n\
+             The web UI can preview supported file types and download the stored artifact.",
+            title = title,
+            artifact_id = artifact.artifact_id,
+            artifact_kind = artifact.artifact_kind,
+            content_type = content_type,
+            filename = filename,
+            byte_size = bytes.len(),
+        );
+        let mut result_metadata = serde_json::Map::new();
+        result_metadata.insert("artifact_id".to_string(), json!(artifact.artifact_id));
+        result_metadata.insert("artifact_kind".to_string(), json!(artifact.artifact_kind));
+        result_metadata.insert("artifact_ref".to_string(), json!(artifact_ref));
+        result_metadata.insert("download_filename".to_string(), json!(filename));
+        result_metadata.insert("content_type".to_string(), json!(content_type));
+        result_metadata.insert("byte_size".to_string(), json!(bytes.len()));
+        astra_tools::ToolResult {
+            output,
+            metadata: Some(result_metadata),
+            is_error: false,
+        }
+    }
+
     async fn query_session_history_rows(
         &self,
         before_seq: Option<i64>,
@@ -1777,11 +2091,13 @@ impl ServerToolExecutor {
                     astra_tools::ToolResult::text(output)
                 }
             }
+            "publish_artifact" => self.publish_artifact(args).await,
             "ask_user" => self.server_ask_user(args).await,
             // ── File operations ─────────────────────────────────────────
             // Write operations use server-specific journal recording.
             // Read-only operations delegate to DefaultToolExecutor.
             "web_fetch" => self.default_executor.execute("web_fetch", args).await,
+            "run_script" => self.server_run_script(args).await,
             "read_file" => self.default_executor.execute("read_file", args).await,
             "write_file" => {
                 // delete=true routes to delete_file handler
@@ -1823,7 +2139,7 @@ impl ServerToolExecutor {
                     "ask_user" => self.server_ask_user(args).await,
                     "sleep" => self.default_executor.execute("sleep", args).await,
                     "tool_search" => tool_result_from_output(astra_tools::tool_search::tool_search(
-                        &astra_tools::schemas::server_executor_tool_schemas(),
+                        &crate::capabilities::server_runtime_tool_schemas(),
                         args,
                     )),
                     "history_page" => self.tool_session_history_page(args).await,
@@ -1844,6 +2160,19 @@ impl ServerToolExecutor {
             "task_get" => tool_result_from_output(self.task_get(args)),
             "task_update" => tool_result_from_output(self.task_update(args)),
             "task_stop" => tool_result_from_output(self.task_stop(args)),
+            "task" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
+                match action {
+                    "create" => tool_result_from_output(self.task_create(args)),
+                    "list" => tool_result_from_output(self.task_list(args)),
+                    "get" => tool_result_from_output(self.task_get(args)),
+                    "update" => tool_result_from_output(self.task_update(args)),
+                    "stop" => tool_result_from_output(self.task_stop(args)),
+                    other => tool_result_from_output(format!(
+                        "Unknown task action: '{other}'. Use: create, list, get, update, stop"
+                    )),
+                }
+            }
             // ── Consolidated mo tool ───────────────────────────────────
             "mo" => {
                 let action = args
@@ -1929,6 +2258,7 @@ impl ServerToolExecutor {
                     .execute("github_create_issue", args)
                     .await
             }
+            "github" => self.default_executor.execute("github", args).await,
             // ── Agent introspection ────────────────────────────────────
             "get_agent_info" => tool_result_from_output(self.server_get_agent_info(args)),
             // ── Consolidated agent tool ────────────────────────────────
@@ -1955,6 +2285,16 @@ impl ServerToolExecutor {
                  this request and provide results in the next round."
                     .to_string(),
             ),
+            "notify" => {
+                let message = string_arg(args, "message").unwrap_or("");
+                if message.is_empty() {
+                    astra_tools::ToolResult::error(
+                        "Error: notify requires a non-empty message".to_string(),
+                    )
+                } else {
+                    astra_tools::ToolResult::text(format!("Notification: {message}"))
+                }
+            }
             // ── Unknown tool fallback ──────────────────────────────────
             _ => {
                 self.record_preview_template_missing(name).await;
@@ -1966,7 +2306,7 @@ impl ServerToolExecutor {
                      grep, glob, git_status, git_diff, git_log, git_file_history, git_contributors, git_log_search, \
                      git_show, git_blame, symbols, git_commit, git_stash, git_revert_commit, github_list_prs, github_get_pr, \
                      github_ci_status, github_list_issues, github_get_issue, github_repo_stats, github_create_issue, memory_*, web_fetch, \
-                     web_search, ask_user, get_agent_info"
+                     web_search, publish_artifact, run_script, notify, ask_user, get_agent_info"
                 ))
             }
         };
@@ -2737,7 +3077,7 @@ impl ServerToolExecutor {
             })
         };
         let capability = || {
-            let schemas = astra_tools::schemas::server_executor_tool_schemas();
+            let schemas = crate::capabilities::server_runtime_tool_schemas();
             let tool_names: Vec<&str> = schemas
                 .iter()
                 .filter_map(|t| {
@@ -3704,6 +4044,46 @@ impl ServerToolExecutor {
         astra_tools::fs_ops::resolve_path(&self.workspace_root, relative)
     }
 
+    fn resolve_publish_artifact_path(&self, raw_path: &str) -> Result<PathBuf, String> {
+        let requested = Path::new(raw_path);
+        let candidate = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            self.workspace_root.join(requested)
+        };
+        let canonical = candidate.canonicalize().map_err(|error| {
+            format!(
+                "Error: publish_artifact path does not resolve to an existing file: {} ({error})",
+                candidate.display()
+            )
+        })?;
+
+        // `publish_artifact` is intentionally narrower than arbitrary file
+        // reads. It can only publish files produced inside the session
+        // workspace or the process temp directory, which are the same roots the
+        // server-side executor allows generated artifacts to land in.
+        let mut allowed_roots = Vec::new();
+        for root in [&self.workspace_root, Path::new("/tmp")] {
+            if let Ok(canonical_root) = root.canonicalize() {
+                allowed_roots.push(canonical_root);
+            } else {
+                allowed_roots.push(root.to_path_buf());
+            }
+        }
+        if let Ok(temp_root) = std::env::temp_dir().canonicalize() {
+            allowed_roots.push(temp_root);
+        }
+
+        if allowed_roots.iter().any(|root| canonical.starts_with(root)) {
+            Ok(canonical)
+        } else {
+            Err(format!(
+                "Error: publish_artifact can only publish files under the session workspace or /tmp: {}",
+                canonical.display()
+            ))
+        }
+    }
+
     fn server_write_file(&self, args: &Value) -> String {
         let prepared = match astra_tools::fs_ops::prepare_write_file(&self.workspace_root, args) {
             Ok(prepared) => prepared,
@@ -4229,7 +4609,7 @@ impl ToolExecutor for ServerToolExecutor {
     }
 
     fn tool_schemas(&self) -> Vec<Value> {
-        astra_tools::schemas::server_executor_tool_schemas()
+        crate::capabilities::server_runtime_tool_schemas()
     }
 
     fn project_root(&self) -> &Path {
@@ -4291,7 +4671,7 @@ mod tests {
     #[test]
     fn session_history_actions_are_advertised_on_session_tool() {
         let names: std::collections::HashSet<String> =
-            astra_tools::schemas::server_executor_tool_schemas()
+            crate::capabilities::server_runtime_tool_schemas()
                 .into_iter()
                 .filter_map(|schema| {
                     schema
@@ -4310,7 +4690,7 @@ mod tests {
             "session must be accepted by ServerToolExecutor"
         );
 
-        let session_schema = astra_tools::schemas::server_executor_tool_schemas()
+        let session_schema = crate::capabilities::server_runtime_tool_schemas()
             .into_iter()
             .find(|schema| {
                 schema.pointer("/function/name").and_then(Value::as_str) == Some("session")
@@ -5036,6 +5416,35 @@ esac
             .server_bash(&json!({"command": "cat marker.txt"}))
             .await;
         assert_eq!(result.trim(), "found");
+    }
+
+    #[tokio::test]
+    async fn run_script_executes_in_server_workspace() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let (exec, dir) = test_executor();
+        std::fs::write(dir.path().join("marker.txt"), "server-script").unwrap();
+        let result = exec
+            .execute(
+                "run_script",
+                &json!({
+                    "script": "from pathlib import Path\nprint(Path('marker.txt').read_text())"
+                }),
+            )
+            .await;
+        assert!(
+            result.contains("server-script"),
+            "server run_script should execute in the session workspace, got: {result}"
+        );
+        assert!(
+            !result.contains("not available in server-side execution mode"),
+            "server run_script is advertised and must be actually executable, got: {result}"
+        );
     }
 
     #[tokio::test]

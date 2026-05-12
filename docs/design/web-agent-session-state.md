@@ -384,6 +384,13 @@ hashes.
 The browser should cache session display state to reduce MatrixOne and network
 cost, but it must never become the source of truth.
 
+Session identity is also remote-owned. A Web chat URL must use the MatrixOne
+`agent_sessions.session_id` as its only chat identifier. Creating a new Web chat
+therefore starts with `POST /sessions`; the returned `session_id` becomes the
+route id, cache key, transcript key, archive/delete target, and stream
+`session_id`. Browser-generated ids are allowed only for unsent draft composer
+state and must not enter `/chats/{id}` routes or durable session APIs.
+
 Use IndexedDB or an equivalent browser store for:
 
 - recent `session_state` projection;
@@ -987,6 +994,14 @@ Different adapters:
 | Tool execution | Local filesystem/shell/MCP | Cloud tools or edge bridge |
 | Browser cache | None or local UI cache | IndexedDB display cache |
 | Auth | Local config/token | Web auth/session cookies |
+
+Authentication is also shared at the service boundary. CLI and Web both call
+the same runtime `/auth/register`, `/auth/login`, `/auth/refresh`,
+`/auth/logout`, and `/auth/me` endpoints backed by `AuthService`. The clients
+only differ in credential storage: CLI writes the selected profile in
+`~/.astra/credentials.json`, while Web writes httpOnly cookies. Registration is
+a token-producing operation for both clients, so neither CLI nor Web should
+perform a second login after a successful register response.
 
 Shared LLM turn flow:
 
@@ -2688,9 +2703,51 @@ Runtime visibility contract:
   LLM still receives only pinned/active skills plus the shared
   `visible_skills_for_host_turn(...)` selector shortlist; full `SKILL.md`
   content is injected only after the model calls the `skill` tool.
+- Web composer skill tokens are per-turn selections, not session pins. The
+  composer clears the submitted skill tokens as soon as the turn is submitted;
+  failures restore them so the same request can be retried.
+- The composer exposes the same per-turn skill selection through both the `+`
+  menu and slash command palette. Typing `/` at a word boundary opens a
+  prefix-matched command list; typing whitespace closes it without selecting
+  anything. v1 registers `kind='skill'` commands from the shared skill catalog,
+  while the command model is intentionally generic (`skill` / `mode` / `action`)
+  so later `/plan` or other execution-mode commands can reuse the same palette.
+  Skill tokens are inserted at the current caret position in the editable
+  message stream, so users can describe each selected skill in context instead
+  of having all selected skills grouped at the start.
 - If a user-owned and public skill share a logical name, "latest by name"
   resolution prefers the user-owned row before comparing `created_at`. This
   prevents a newly published public skill from shadowing a user's private skill.
+
+Capability catalog contract:
+
+- Runtime capability resolution is centralized behind `CapabilityCatalog` rather
+  than duplicated in Web UI, runtime handlers, and CLI prompt assembly.
+- `surface='web'` and `surface='cli_remote'` are server-executed surfaces. They
+  see only server-executable tools plus server MCP tools, and they use the same
+  server-visible skill catalog:
+  `api_server_home_skills ∪ skills_registry(created_by = current_user) ∪
+  skills_registry(is_public = 1)`.
+- `surface='cli_local'` is edge-executed. It sees local CLI tools plus local MCP
+  tools and uses a registry ordered as:
+  `cli_project_and_home_skills > bundled_cli_skills > authenticated_server_catalog`.
+  This means project-local CLI skills can override same-named server catalog
+  skills for local CLI execution, but they are still invisible to Web until
+  explicitly published/registered.
+- API-server HOME skills are discoverable over the authenticated `/skills`
+  catalog as full records, not just list rows, so a local CLI connected to a
+  remote API server can load the same server-local skill body that Web can use.
+- No surface silently claims a capability it cannot execute. If a tool lives in
+  a client-side MCP process, Web cannot see it unless that MCP process is also
+  mounted server-side or the user runs a local/edge-assisted CLI turn.
+- Expected visibility by deployment shape:
+
+| Deployment shape | Web sees | CLI local sees | CLI remote/thin sees |
+| --- | --- | --- | --- |
+| Remote API + remote MCP | Server tools, remote MCP, API-server HOME skills, visible DB skills | Client tools plus client project/home skills; visible DB/API-server catalog if authenticated | Same as Web |
+| Remote API + client MCP | Server tools, API-server HOME skills, visible DB skills | Client tools, client MCP, client project/home skills, plus authenticated server catalog | Same as Web; client MCP is not visible |
+| CLI runs on API host | Server-local HOME skills and server-side tools line up with Web because the client and server execution site are the same host | Same host local tools/MCP plus project-local skills | Same as Web |
+| All-in-one local dev | Web sees the API server's HOME catalog and server tools; CLI local sees the same HOME skills plus project-local skills and local MCP | Same as previous cell | Same as Web |
 
 Future MatrixOne full-text/vector indexes can be added for skill retrieval. Use
 append-only versions; do not update historical skill content in place.
@@ -3721,3 +3778,45 @@ subsequent UI and context work debuggable instead of speculative.
 - Resolved Sprint D G27 by adding tool runner registration, canonical raw_ref
   schemes, expanded baseline preview/normalize templates, `raw_v1`, and
   multi-source artifact provenance.
+
+## Changelog v0.4
+
+- Unified CLI/Web tool and skill visibility behind the capability catalog:
+  Web and remote CLI use server-executable capabilities; local CLI uses
+  client-executable capabilities plus the authenticated server-visible skill
+  catalog. This codifies the API-server HOME skill boundary, DB skill visibility
+  predicate, MCP execution-site boundary, and project-local CLI-only rule.
+- Added the generic Web artifact publishing path for agent-generated files:
+  `publish_artifact` is the only server-executable publication capability. The
+  model can create charts/images/documents with existing execution tools, then
+  publish the generated file from the session workspace or `/tmp` into
+  `session_artifacts`; Web attaches newly created artifacts to the assistant
+  message, previews supported image/text payloads inline, and offers download.
+  Chat rendering treats `session_artifacts` as a mixed storage table: only
+  `source='publish_artifact'` records with
+  `metadata.normalize_version='artifact_file_v1'` are user-visible attachments.
+  Internal artifacts such as `source='composite_snapshot_index'` remain
+  queryable for restore/debug and must not be rendered in the transcript.
+- Tightened the Web/server tool capability contract: `run_script` is now a real
+  server-executable tool, not merely a schema-advertised capability. Its
+  Python-side RPC allowlist is the server-routable subset
+  (`read_file`, `write_file`, `list_dir`, `grep`, `web_fetch`, `bash`), so the
+  LLM does not see `run_script` helper tools that the API server cannot
+  execute. Each server tool round now batch-persists the model-visible tool
+  result rows into `session_tool_outputs`, and each LLM manifest records a
+  non-zero `system_tool_schemas` token estimate when tool schemas were exposed.
+- Split resource governance into session-create quota and run-start quota.
+  `max_sessions_per_day` is checked and incremented only around actual
+  `agent_sessions` creation. Each chat turn may create a durable run, but run
+  start checks only execution capacity (`max_concurrent_sessions`) and token
+  budget; it must never increment `resource_usage.sessions_created`.
+- Bound Web composer model selection to the session/chat. New chats may use
+  the user's global default model as the initial value, but once a chat exists,
+  model changes are persisted on that chat and mirrored to the remote
+  `agent_sessions.metadata.current_model` field so switching between chats
+  cannot leak one chat's model into another.
+- Tightened Bedrock thinking request construction: unsigned historical
+  `reasoning_content` is never serialized as Bedrock `reasoningContent`.
+  Bedrock only accepts signed provider reasoning blocks, so mixed-provider or
+  switched-model sessions keep visible text/tool calls while omitting invalid
+  thinking blocks from the request body.

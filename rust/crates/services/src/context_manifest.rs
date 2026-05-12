@@ -75,6 +75,11 @@ pub const CONTEXT_MANIFEST_REASONS: &[(&str, &str, Option<&str>)] = &[
 ];
 
 pub const BASELINE_PREVIEW_TEMPLATES: &[(&str, u32, &str)] = &[
+    ("bash", 1200, "shell_v1"),
+    ("run_script", 1200, "python_stdout_v1"),
+    ("read_file", 1000, "text_v1"),
+    ("write_file", 1000, "text_v1"),
+    ("web_search", 1000, "search_v1"),
     ("pg_dump", 1000, "sql_v1"),
     ("fetch_url", 1000, "html_v1"),
     ("parse_pdf", 1000, "pdf_v1"),
@@ -94,6 +99,7 @@ pub const BASELINE_PREVIEW_TEMPLATES: &[(&str, u32, &str)] = &[
     ("csv_head", 1200, "csv_v1"),
     ("json_preview", 1200, "json_v1"),
     ("markdown_preview", 1200, "markdown_v1"),
+    ("publish_artifact", 1200, "artifact_file_v1"),
 ];
 
 pub fn preview_template_fts_field_weights(normalize_version: &str) -> &'static str {
@@ -108,6 +114,12 @@ pub fn preview_template_fts_field_weights(normalize_version: &str) -> &'static s
         "pdf_v1" => r#"{"title":1.8,"section":1.5,"preview_text":1.0}"#,
         "js_v1" => r#"{"package":1.6,"script":1.4,"error":2.0,"preview_text":1.0}"#,
         "markdown_v1" => r#"{"heading":1.7,"link":1.2,"preview_text":1.0}"#,
+        "artifact_file_v1" => {
+            r#"{"title":2.0,"filename":1.8,"content_type":1.3,"preview_text":1.0}"#
+        }
+        "shell_v1" => r#"{"command":1.6,"stderr":2.0,"stdout":1.0,"preview_text":1.0}"#,
+        "python_stdout_v1" => r#"{"script":1.5,"stdout":1.0,"stderr":2.0,"preview_text":1.0}"#,
+        "search_v1" => r#"{"query":2.0,"title":1.5,"snippet":1.2,"preview_text":1.0}"#,
         _ => r#"{"preview_text":1.0,"tool_name":1.2,"error":1.8}"#,
     }
 }

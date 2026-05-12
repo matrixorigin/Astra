@@ -37,6 +37,13 @@ export function archiveChat(chatId: string, archived: boolean) {
   });
 }
 
+export function updateChatModel(chatId: string, model: string) {
+  return requestJson<ChatDetail>(`/api/chats/${encodeURIComponent(chatId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ model }),
+  });
+}
+
 export function deleteChat(chatId: string) {
   return requestJson<{ deleted: true }>(`/api/chats/${encodeURIComponent(chatId)}`, {
     method: 'DELETE',
@@ -58,6 +65,7 @@ export function sendChatMessage(chatId: string, payload: SendMessageRequest) {
 
 export type ChatStreamHandlers = {
   onLocalMessages?: (messages: { userMessage: ChatMessage; assistantMessage: ChatMessage }) => void;
+  onArtifacts?: (artifacts: NonNullable<ChatMessage['artifacts']>) => void;
   onReasoning?: (reasoning: string) => void;
   onReasoningDone?: (reasoning: string) => void;
   onText?: (text: string) => void;
@@ -203,6 +211,11 @@ function applyStreamEvent(event: Record<string, unknown>, state: ChatStreamState
   if (type === 'text_delta' && typeof event.content === 'string') {
     state.rawText = mergeTextDelta(state.rawText, event.content);
     applyAssistantText(state.rawText, state, handlers);
+    return;
+  }
+
+  if (type === 'artifacts' && Array.isArray(event.artifacts)) {
+    handlers.onArtifacts?.(event.artifacts as NonNullable<ChatMessage['artifacts']>);
     return;
   }
 

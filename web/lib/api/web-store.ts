@@ -18,7 +18,6 @@ import type {
 
 type ChatRecord = ChatSummary & {
   createdAt: string;
-  backendSessionId?: string | null;
   archivedAt?: string | null;
   messages: ChatMessage[];
   pendingTurn?: {
@@ -38,11 +37,45 @@ type Store = {
 
 const AGENT_RESPONSE_TIMEOUT_MS = 30_000;
 const AGENT_STREAM_TIMEOUT_MS = 180_000;
+const LEGACY_LOCAL_CHAT_IDS = new Set(['chat-web-agent-notes']);
 
 type BackendChatResponse = {
   session_id?: string;
   run_id?: string;
   status?: string;
+};
+
+type BackendSessionResponse = {
+  session_id?: string;
+  user_id?: string;
+  title?: string | null;
+  metadata?: Record<string, unknown>;
+  status?: string;
+  created_at?: string;
+  updated_at?: string | null;
+};
+
+type BackendSessionListResponse = {
+  sessions?: BackendSessionResponse[];
+  total?: number;
+  limit?: number;
+  offset?: number;
+};
+
+type BackendTranscriptItemResponse = {
+  session_id?: string;
+  item_seq?: number;
+  run_id?: string | null;
+  role?: string;
+  content?: string;
+  created_at?: string;
+};
+
+type BackendTranscriptResponse = {
+  session_id?: string;
+  items?: BackendTranscriptItemResponse[];
+  next_before_seq?: number | null;
+  has_more?: boolean;
 };
 
 type BackendModelListItem = {
@@ -57,10 +90,23 @@ type StreamResult = {
   nextOffset?: number;
 };
 
+class RuntimeHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly statusText: string,
+  ) {
+    super(message);
+    this.name = 'RuntimeHttpError';
+  }
+}
+
 declare global {
   // eslint-disable-next-line no-var
-  var __astraWebStore: Store | undefined;
+  var __astraWebStores: Record<string, Store> | undefined;
 }
+
+const DEFAULT_STORE_SCOPE = 'offline';
 
 function nowIso() {
   return new Date().toISOString();
@@ -101,43 +147,19 @@ function seedStore(): Store {
         updatedAt: now,
       },
     ],
-    chats: [
-      {
-        id: 'chat-web-agent-notes',
-        title: 'Web agent UI refactor',
-        lastMessageAt: now,
-        lastMessagePreview: 'The old operator console is being replaced by the v1 workspace.',
-        projectId,
-        createdAt: now,
-        backendSessionId: null,
-        messages: [
-          {
-            id: 'msg-seed-user',
-            role: 'user',
-            content: 'Track the web agent UI refactor.',
-            createdAt: now,
-            status: 'complete',
-          },
-          {
-            id: 'msg-seed-assistant',
-            role: 'assistant',
-            content:
-              'The workspace is ready to organize chats, projects, knowledge, and artifacts.',
-            createdAt: now,
-            status: 'complete',
-          },
-        ],
-      },
-    ],
+    chats: [],
     files: {
       [projectId]: [],
     },
   };
 }
 
-export function getStore() {
-  globalThis.__astraWebStore ??= seedStore();
-  return globalThis.__astraWebStore;
+export function getStore(ownerUserId = DEFAULT_STORE_SCOPE) {
+  globalThis.__astraWebStores ??= {};
+  globalThis.__astraWebStores[ownerUserId] ??= seedStore();
+  const store = globalThis.__astraWebStores[ownerUserId];
+  normalizeCanonicalChatIds(store);
+  return store;
 }
 
 export function getCurrentUser(): UserSummary {
@@ -171,14 +193,15 @@ export function listModelSummaries(): ModelSummary[] {
   ];
 }
 
-export function listChats(params: {
+export async function listChats(ownerUserId: string, params: {
   projectId?: string | null;
   q?: string | null;
   cursor?: string | null;
   limit?: number;
   archived?: boolean;
-}): ChatListResponse {
-  const store = getStore();
+}): Promise<ChatListResponse> {
+  await syncBackendSessions(ownerUserId);
+  const store = getStore(ownerUserId);
   const limit = params.limit ?? 50;
   const offset = Number(params.cursor ?? 0);
   const hasProjectFilter = params.projectId !== undefined;
@@ -209,13 +232,13 @@ export function listChats(params: {
   };
 }
 
-export function listProjects(params: {
+export function listProjects(ownerUserId: string, params: {
   q?: string | null;
   sort?: 'activity' | 'created' | 'name';
   cursor?: string | null;
   limit?: number;
 }): ProjectListResponse {
-  const store = getStore();
+  const store = getStore(ownerUserId);
   const limit = params.limit ?? 24;
   const offset = Number(params.cursor ?? 0);
   const query = params.q?.trim().toLowerCase();
@@ -242,8 +265,8 @@ export function listProjects(params: {
   };
 }
 
-export function createProject(payload: CreateProjectRequest) {
-  const store = getStore();
+export function createProject(ownerUserId: string, payload: CreateProjectRequest) {
+  const store = getStore(ownerUserId);
   const timestamp = nowIso();
   const project: ProjectRecord = {
     id: crypto.randomUUID(),
@@ -261,8 +284,8 @@ export function createProject(payload: CreateProjectRequest) {
   return projectSummary(project);
 }
 
-export function getProject(projectId: string): ProjectDetail | null {
-  const store = getStore();
+export function getProject(ownerUserId: string, projectId: string): ProjectDetail | null {
+  const store = getStore(ownerUserId);
   const project = store.projects.find((item) => item.id === projectId);
   if (!project) {
     return null;
@@ -277,8 +300,13 @@ export function getProject(projectId: string): ProjectDetail | null {
   };
 }
 
-export function updateProject(projectId: string, payload: Partial<CreateProjectRequest>) {
-  const store = getStore();
+export async function getProjectHydrated(ownerUserId: string, projectId: string): Promise<ProjectDetail | null> {
+  await syncBackendSessions(ownerUserId);
+  return getProject(ownerUserId, projectId);
+}
+
+export function updateProject(ownerUserId: string, projectId: string, payload: Partial<CreateProjectRequest>) {
+  const store = getStore(ownerUserId);
   const project = store.projects.find((item) => item.id === projectId);
   if (!project) {
     return null;
@@ -293,11 +321,11 @@ export function updateProject(projectId: string, payload: Partial<CreateProjectR
     project.instructions = payload.instructions?.trim() || null;
   }
   project.updatedAt = nowIso();
-  return getProject(projectId);
+  return getProject(ownerUserId, projectId);
 }
 
-export function setProjectStar(projectId: string, starred: boolean) {
-  const store = getStore();
+export function setProjectStar(ownerUserId: string, projectId: string, starred: boolean) {
+  const store = getStore(ownerUserId);
   const project = store.projects.find((item) => item.id === projectId);
   if (!project) {
     return null;
@@ -307,8 +335,8 @@ export function setProjectStar(projectId: string, starred: boolean) {
   return { starred };
 }
 
-export function addProjectFile(projectId: string, file: File): KnowledgeFile | null {
-  const store = getStore();
+export function addProjectFile(ownerUserId: string, projectId: string, file: File): KnowledgeFile | null {
+  const store = getStore(ownerUserId);
   if (!store.projects.some((project) => project.id === projectId)) {
     return null;
   }
@@ -325,12 +353,12 @@ export function addProjectFile(projectId: string, file: File): KnowledgeFile | n
   };
   store.files[projectId] ??= [];
   store.files[projectId].unshift(record);
-  touchProject(projectId);
+  touchProjectInStore(store, projectId);
   return record;
 }
 
-export function removeProjectFile(projectId: string, fileId: string) {
-  const store = getStore();
+export function removeProjectFile(ownerUserId: string, projectId: string, fileId: string) {
+  const store = getStore(ownerUserId);
   const files = store.files[projectId];
   if (!files) {
     return false;
@@ -338,14 +366,14 @@ export function removeProjectFile(projectId: string, fileId: string) {
   const before = files.length;
   store.files[projectId] = files.filter((file) => file.id !== fileId);
   if (store.files[projectId].length !== before) {
-    touchProject(projectId);
+    touchProjectInStore(store, projectId);
     return true;
   }
   return false;
 }
 
-export function getChat(chatId: string): ChatDetail | null {
-  const store = getStore();
+export function getChat(ownerUserId: string, chatId: string): ChatDetail | null {
+  const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
     return null;
@@ -361,6 +389,7 @@ export function getChat(chatId: string): ChatDetail | null {
       createdAt: chat.createdAt,
       updatedAt: chat.lastMessageAt,
       archivedAt: chat.archivedAt ?? null,
+      model: chat.model ?? null,
     },
     messages: chat.messages,
     project: project ? { id: project.id, name: project.name } : undefined,
@@ -368,29 +397,46 @@ export function getChat(chatId: string): ChatDetail | null {
   };
 }
 
-export async function createChatWithMessage(payload: {
+export async function getChatHydrated(ownerUserId: string, chatId: string): Promise<ChatDetail | null> {
+  await syncBackendSessions(ownerUserId);
+  await syncBackendTranscript(ownerUserId, chatId);
+  return getChat(ownerUserId, chatId);
+}
+
+export async function createChatWithMessage(ownerUserId: string, payload: {
   message: string;
   model: string;
   options: Omit<ComposerOptions, 'model'>;
   projectId?: string | null;
 }) {
+  const store = getStore(ownerUserId);
   const timestamp = nowIso();
-  const provisionalId = crypto.randomUUID();
+  const projectId = payload.projectId ?? null;
+  if (projectId && !store.projects.some((project) => project.id === projectId)) {
+    throw new Error(`Cannot create chat: project ${projectId} was not found.`);
+  }
+  const title = titleFromMessage(payload.message);
+  const session = await createBackendSession({
+    title,
+    projectId,
+    model: payload.model,
+  });
   const userMessage: ChatMessage = {
     id: crypto.randomUUID(),
     role: 'user',
     content: payload.message,
+    activeSkills: payload.options.activeSkills,
     createdAt: timestamp,
     status: 'complete',
   };
   const chat: ChatRecord = {
-    id: provisionalId,
-    title: titleFromMessage(payload.message),
-    projectId: payload.projectId ?? null,
+    id: session.sessionId,
+    title,
+    projectId,
     createdAt: timestamp,
     lastMessageAt: timestamp,
     lastMessagePreview: payload.message,
-    backendSessionId: null,
+    model: payload.model,
     messages: [userMessage],
     pendingTurn: {
       messageId: userMessage.id,
@@ -402,9 +448,9 @@ export async function createChatWithMessage(payload: {
     },
   };
 
-  getStore().chats.unshift(chat);
+  store.chats.unshift(chat);
   if (chat.projectId) {
-    touchProject(chat.projectId);
+    touchProjectInStore(store, chat.projectId);
   }
   return {
     chatId: chat.id,
@@ -412,11 +458,11 @@ export async function createChatWithMessage(payload: {
   };
 }
 
-export async function sendMessage(chatId: string, payload: {
+export async function sendMessage(ownerUserId: string, chatId: string, payload: {
   content: string;
   options?: ComposerOptions;
 }) {
-  const store = getStore();
+  const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
     return null;
@@ -426,6 +472,7 @@ export async function sendMessage(chatId: string, payload: {
     id: crypto.randomUUID(),
     role: 'user',
     content: payload.content,
+    activeSkills: payload.options?.activeSkills,
     createdAt: timestamp,
     status: 'complete',
   };
@@ -433,29 +480,30 @@ export async function sendMessage(chatId: string, payload: {
   chat.lastMessageAt = timestamp;
   chat.lastMessagePreview = payload.content;
   chat.title ??= titleFromMessage(payload.content);
+  if (payload.options?.model) {
+    chat.model = payload.options.model;
+  }
 
   const agentResult = await callBackendAgent({
-    sessionId: chat.backendSessionId ?? undefined,
+    sessionId: chat.id,
     text: payload.content,
     model: payload.options?.model,
     activeSkills: payload.options?.activeSkills,
   });
-  if (agentResult.sessionId) {
-    chat.backendSessionId = agentResult.sessionId;
-  }
+  assertBackendSessionMatchesChat(chat.id, agentResult.sessionId);
   const assistantMessage = appendAssistantMessage(chat, agentResult.assistantText, agentResult.ok);
   if (chat.projectId) {
-    touchProject(chat.projectId);
+    touchProjectInStore(store, chat.projectId);
   }
   return { userMessage, assistantMessage };
 }
 
-export function beginStreamingMessage(chatId: string, payload: {
+export function beginStreamingMessage(ownerUserId: string, chatId: string, payload: {
   content: string;
   options?: ComposerOptions;
   pendingMessageId?: string;
 }) {
-  const store = getStore();
+  const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
     return null;
@@ -472,9 +520,13 @@ export function beginStreamingMessage(chatId: string, payload: {
     id: crypto.randomUUID(),
     role: 'user',
     content: payload.content,
+    activeSkills: payload.options?.activeSkills,
     createdAt: timestamp,
     status: 'complete',
   };
+  if (pendingUserMessage && payload.options?.activeSkills?.length) {
+    pendingUserMessage.activeSkills = payload.options.activeSkills;
+  }
   const assistantMessage: ChatMessage = {
     id: crypto.randomUUID(),
     role: 'assistant',
@@ -494,32 +546,31 @@ export function beginStreamingMessage(chatId: string, payload: {
   chat.lastMessageAt = timestamp;
   chat.lastMessagePreview = payload.content;
   chat.title ??= titleFromMessage(payload.content);
+  if (payload.options?.model) {
+    chat.model = payload.options.model;
+  }
   if (chat.projectId) {
-    touchProject(chat.projectId);
+    touchProjectInStore(store, chat.projectId);
   }
 
   return {
     userMessage,
     assistantMessage,
-    backendSessionId: chat.backendSessionId ?? undefined,
+    sessionId: chat.id,
   };
 }
 
-export function updateStreamingAssistantMessage(chatId: string, messageId: string, patch: {
+export function updateStreamingAssistantMessage(ownerUserId: string, chatId: string, messageId: string, patch: {
   content?: string;
   reasoning?: string;
   reasoningStatus?: ChatMessage['reasoningStatus'];
   status?: ChatMessage['status'];
-  backendSessionId?: string;
+  artifacts?: ChatMessage['artifacts'];
 }) {
-  const store = getStore();
+  const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
     return null;
-  }
-
-  if (patch.backendSessionId) {
-    chat.backendSessionId = patch.backendSessionId;
   }
 
   const message = chat.messages.find((item) => item.id === messageId);
@@ -540,15 +591,33 @@ export function updateStreamingAssistantMessage(chatId: string, messageId: strin
   if (patch.status !== undefined) {
     message.status = patch.status;
   }
+  if (patch.artifacts !== undefined) {
+    message.artifacts = patch.artifacts;
+  }
   chat.lastMessageAt = nowIso();
   if (chat.projectId) {
-    touchProject(chat.projectId);
+    touchProjectInStore(store, chat.projectId);
   }
   return message;
 }
 
-export function moveChat(chatId: string, projectId: string | null) {
-  const store = getStore();
+export async function updateChatModel(ownerUserId: string, chatId: string, model: string) {
+  const normalized = model.trim();
+  if (!normalized) {
+    return null;
+  }
+  const store = getStore(ownerUserId);
+  const chat = store.chats.find((item) => item.id === chatId);
+  if (!chat) {
+    return null;
+  }
+  await updateBackendSessionModel(chat, normalized);
+  chat.model = normalized;
+  return getChat(ownerUserId, chatId);
+}
+
+export function moveChat(ownerUserId: string, chatId: string, projectId: string | null) {
+  const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
     return null;
@@ -558,38 +627,39 @@ export function moveChat(chatId: string, projectId: string | null) {
   }
   chat.projectId = projectId;
   chat.lastMessageAt = nowIso();
-  return getChat(chatId);
+  return getChat(ownerUserId, chatId);
 }
 
-export async function archiveChat(chatId: string, archived: boolean) {
-  const chat = getStore().chats.find((item) => item.id === chatId);
+export async function archiveChat(ownerUserId: string, chatId: string, archived: boolean) {
+  const chat = getStore(ownerUserId).chats.find((item) => item.id === chatId);
   if (!chat) {
     return null;
   }
-  await updateBackendSessionArchiveIfNeeded(chat, archived);
+  await updateBackendSessionArchive(chat, archived);
   chat.archivedAt = archived ? nowIso() : null;
-  return getChat(chatId);
+  return getChat(ownerUserId, chatId);
 }
 
-export async function deleteChat(chatId: string): Promise<boolean> {
-  const store = getStore();
+export async function deleteChat(ownerUserId: string, chatId: string): Promise<boolean> {
+  const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
     return false;
   }
-  await deleteBackendSessionIfNeeded(chat);
+  await deleteBackendSession(chat);
   store.chats = store.chats.filter((item) => item.id !== chatId);
   if (chat.projectId) {
-    touchProject(chat.projectId);
+    touchProjectInStore(store, chat.projectId);
   }
   return true;
 }
 
-export async function deleteArchivedChats(): Promise<number> {
-  const store = getStore();
+export async function deleteArchivedChats(ownerUserId: string): Promise<number> {
+  await syncBackendSessions(ownerUserId);
+  const store = getStore(ownerUserId);
   const archivedChats = store.chats.filter((chat) => chat.archivedAt);
   for (const chat of archivedChats) {
-    await deleteBackendSessionIfNeeded(chat);
+    await deleteBackendSession(chat);
   }
   const archivedIds = new Set(archivedChats.map((chat) => chat.id));
   store.chats = store.chats.filter((chat) => !archivedIds.has(chat.id));
@@ -597,13 +667,14 @@ export async function deleteArchivedChats(): Promise<number> {
     archivedChats.map((chat) => chat.projectId).filter((projectId): projectId is string => Boolean(projectId)),
   );
   for (const projectId of touchedProjectIds) {
-    touchProject(projectId);
+    touchProjectInStore(store, projectId);
   }
   return archivedChats.length;
 }
 
-export function getSidebar(): SidebarData {
-  const store = getStore();
+export async function getSidebar(ownerUserId: string): Promise<SidebarData> {
+  await syncBackendSessions(ownerUserId);
+  const store = getStore(ownerUserId);
   const recentChats: Array<{ kind: 'chat'; id: string; title: string; href: string; updatedAt: string }> =
     store.chats.filter((chat) => !chat.archivedAt).map((chat) => ({
       kind: 'chat',
@@ -687,9 +758,9 @@ export function getSidebar(): SidebarData {
   };
 }
 
-export function searchData(query: string): SearchResponse {
+export function searchData(ownerUserId: string, query: string): SearchResponse {
   const q = query.trim().toLowerCase();
-  const store = getStore();
+  const store = getStore(ownerUserId);
   const projects = store.projects
     .filter((project) => !q || `${project.name} ${project.description ?? ''}`.toLowerCase().includes(q))
     .slice(0, 8)
@@ -715,14 +786,218 @@ function chatSummary(chat: ChatRecord): ChatSummary {
     lastMessagePreview: chat.lastMessagePreview,
     projectId: chat.projectId,
     archivedAt: chat.archivedAt ?? null,
+    model: chat.model ?? null,
   };
 }
 
-async function deleteBackendSessionIfNeeded(chat: ChatRecord): Promise<void> {
-  if (!chat.backendSessionId) {
+function metadataString(metadata: Record<string, unknown> | undefined, key: string): string | null {
+  const value = metadata?.[key];
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
+function isWebSession(session: BackendSessionResponse): boolean {
+  return metadataString(session.metadata, 'source') === 'web_v1';
+}
+
+function chatRecordFromBackendSession(session: BackendSessionResponse, existing?: ChatRecord): ChatRecord | null {
+  if (!session.session_id || !isWebSession(session)) {
+    return null;
+  }
+
+  const createdAt = session.created_at ?? existing?.createdAt ?? nowIso();
+  const updatedAt = session.updated_at ?? existing?.lastMessageAt ?? createdAt;
+  const projectId = metadataString(session.metadata, 'project_id');
+  const model = metadataString(session.metadata, 'current_model')
+    ?? metadataString(session.metadata, 'initial_model')
+    ?? existing?.model
+    ?? null;
+  const title = session.title ?? existing?.title ?? null;
+  const archivedAt = session.status === 'archived' ? updatedAt : null;
+
+  return {
+    id: session.session_id,
+    title,
+    projectId,
+    createdAt,
+    lastMessageAt: updatedAt,
+    lastMessagePreview: existing?.lastMessagePreview ?? title ?? undefined,
+    archivedAt,
+    model,
+    messages: existing?.messages ?? [],
+    pendingTurn: existing?.pendingTurn,
+  };
+}
+
+async function syncBackendSessions(ownerUserId: string): Promise<void> {
+  const config = await getRuntimeConfig();
+  if (config.mode !== 'live' || !config.apiUrl || !config.accessToken) {
     return;
   }
 
+  const limit = 200;
+  const url = new URL('/sessions', config.apiUrl);
+  url.searchParams.set('limit', String(limit));
+  url.searchParams.set('offset', '0');
+
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${config.accessToken}`,
+    },
+    cache: 'no-store',
+  });
+  if (!response.ok) {
+    let detail = `${response.status} ${response.statusText}`;
+    try {
+      const body = (await response.json()) as { detail?: string; error?: string };
+      detail = body.detail ?? body.error ?? detail;
+    } catch {
+      // Preserve the HTTP status.
+    }
+    throw new Error(`Cannot sync persisted sessions for user ${ownerUserId}: ${detail}`);
+  }
+
+  const parsed = (await response.json()) as BackendSessionListResponse;
+  const sessions = Array.isArray(parsed.sessions) ? parsed.sessions : [];
+  const store = getStore(ownerUserId);
+  const byId = new Map(store.chats.map((chat) => [chat.id, chat]));
+
+  for (const session of sessions) {
+    const existing = session.session_id ? byId.get(session.session_id) : undefined;
+    const record = chatRecordFromBackendSession(session, existing);
+    if (!record) {
+      continue;
+    }
+    const index = store.chats.findIndex((chat) => chat.id === record.id);
+    if (index >= 0) {
+      store.chats[index] = record;
+    } else {
+      store.chats.push(record);
+    }
+  }
+
+  store.chats.sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt));
+}
+
+function transcriptItemToMessage(chatId: string, item: BackendTranscriptItemResponse): ChatMessage | null {
+  if (
+    typeof item.item_seq !== 'number' ||
+    typeof item.role !== 'string' ||
+    typeof item.content !== 'string'
+  ) {
+    return null;
+  }
+  if (item.role !== 'user' && item.role !== 'assistant' && item.role !== 'system') {
+    return null;
+  }
+
+  return {
+    id: `${chatId}:${item.item_seq}`,
+    role: item.role,
+    content: item.content,
+    createdAt: item.created_at ?? nowIso(),
+    status: 'complete',
+  };
+}
+
+async function syncBackendTranscript(ownerUserId: string, chatId: string): Promise<void> {
+  const store = getStore(ownerUserId);
+  const chat = store.chats.find((item) => item.id === chatId);
+  if (!chat || chat.messages.length > 0) {
+    return;
+  }
+
+  const config = await getRuntimeConfig();
+  if (config.mode !== 'live' || !config.apiUrl || !config.accessToken) {
+    return;
+  }
+
+  const url = new URL(`/sessions/${encodeURIComponent(chatId)}/transcript`, config.apiUrl);
+  url.searchParams.set('limit', '200');
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${config.accessToken}`,
+    },
+    cache: 'no-store',
+  });
+  if (!response.ok) {
+    let detail = `${response.status} ${response.statusText}`;
+    try {
+      const body = (await response.json()) as { detail?: string; error?: string };
+      detail = body.detail ?? body.error ?? detail;
+    } catch {
+      // Preserve the HTTP status.
+    }
+    throw new Error(`Cannot sync persisted transcript for session ${chatId}: ${detail}`);
+  }
+
+  const parsed = (await response.json()) as BackendTranscriptResponse;
+  const messages = (parsed.items ?? [])
+    .map((item) => transcriptItemToMessage(chatId, item))
+    .filter((message): message is ChatMessage => Boolean(message));
+  if (!messages.length) {
+    return;
+  }
+  chat.messages = messages;
+  const latest = messages[messages.length - 1];
+  chat.lastMessageAt = latest?.createdAt ?? chat.lastMessageAt;
+  chat.lastMessagePreview = latest?.content ?? chat.lastMessagePreview;
+}
+
+async function createBackendSession(params: {
+  title: string | null;
+  projectId: string | null;
+  model: string;
+}): Promise<{ sessionId: string }> {
+  const config = await getRuntimeConfig();
+  if (config.mode !== 'live' || !config.apiUrl) {
+    throw new Error('Cannot create persisted session: runtime API is not configured.');
+  }
+  if (!config.accessToken) {
+    throw new Error('Cannot create persisted session: runtime authentication is missing.');
+  }
+
+  const response = await fetch(
+    new URL('/sessions', config.apiUrl).toString(),
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${config.accessToken}`,
+      },
+      body: JSON.stringify({
+        agent_id: null,
+        title: params.title,
+        metadata: {
+          source: 'web_v1',
+          project_id: params.projectId,
+          initial_model: params.model,
+          current_model: params.model,
+        },
+      }),
+      cache: 'no-store',
+    },
+  );
+
+  if (!response.ok) {
+    let detail = `${response.status} ${response.statusText}`;
+    try {
+      const body = (await response.json()) as { detail?: string; error?: string };
+      detail = body.detail ?? body.error ?? detail;
+    } catch {
+      // Preserve the HTTP status.
+    }
+    throw new Error(`Cannot create persisted session: ${detail}`);
+  }
+
+  const parsed = (await response.json()) as BackendSessionResponse;
+  if (!parsed.session_id) {
+    throw new Error('Cannot create persisted session: runtime response did not include session_id.');
+  }
+
+  return { sessionId: parsed.session_id };
+}
+
+async function deleteBackendSession(chat: ChatRecord): Promise<void> {
   const config = await getRuntimeConfig();
   if (config.mode !== 'live' || !config.apiUrl) {
     throw new Error('Cannot delete persisted session: runtime API is not configured.');
@@ -732,7 +1007,7 @@ async function deleteBackendSessionIfNeeded(chat: ChatRecord): Promise<void> {
   }
 
   const response = await fetch(
-    new URL(`/sessions/${encodeURIComponent(chat.backendSessionId)}`, config.apiUrl).toString(),
+    new URL(`/sessions/${encodeURIComponent(chat.id)}`, config.apiUrl).toString(),
     {
       method: 'DELETE',
       headers: {
@@ -750,18 +1025,14 @@ async function deleteBackendSessionIfNeeded(chat: ChatRecord): Promise<void> {
     } catch {
       // Preserve the HTTP status.
     }
-    throw new Error(`Cannot delete persisted session ${chat.backendSessionId}: ${detail}`);
+    throw new Error(`Cannot delete persisted session ${chat.id}: ${detail}`);
   }
 }
 
-async function updateBackendSessionArchiveIfNeeded(
+async function updateBackendSessionArchive(
   chat: ChatRecord,
   archived: boolean,
 ): Promise<void> {
-  if (!chat.backendSessionId) {
-    return;
-  }
-
   const config = await getRuntimeConfig();
   if (config.mode !== 'live' || !config.apiUrl) {
     throw new Error('Cannot archive persisted session: runtime API is not configured.');
@@ -771,7 +1042,7 @@ async function updateBackendSessionArchiveIfNeeded(
   }
 
   const response = await fetch(
-    new URL(`/sessions/${encodeURIComponent(chat.backendSessionId)}`, config.apiUrl).toString(),
+    new URL(`/sessions/${encodeURIComponent(chat.id)}`, config.apiUrl).toString(),
     {
       method: 'PUT',
       headers: {
@@ -791,8 +1062,94 @@ async function updateBackendSessionArchiveIfNeeded(
     } catch {
       // Preserve the HTTP status.
     }
-    throw new Error(`Cannot update persisted session ${chat.backendSessionId}: ${detail}`);
+    throw new Error(`Cannot update persisted session ${chat.id}: ${detail}`);
   }
+}
+
+async function updateBackendSessionModel(
+  chat: ChatRecord,
+  model: string,
+): Promise<void> {
+  const config = await getRuntimeConfig();
+  if (config.mode !== 'live' || !config.apiUrl) {
+    throw new Error('Cannot update persisted session model: runtime API is not configured.');
+  }
+  if (!config.accessToken) {
+    throw new Error('Cannot update persisted session model: runtime authentication is missing.');
+  }
+
+  const sessionUrl = new URL(`/sessions/${encodeURIComponent(chat.id)}`, config.apiUrl).toString();
+  const current = await fetch(sessionUrl, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${config.accessToken}`,
+    },
+    cache: 'no-store',
+  });
+  if (!current.ok) {
+    let detail = `${current.status} ${current.statusText}`;
+    try {
+      const body = (await current.json()) as { detail?: string; error?: string };
+      detail = body.detail ?? body.error ?? detail;
+    } catch {
+      // Preserve the HTTP status.
+    }
+    throw new Error(`Cannot read persisted session ${chat.id} before model update: ${detail}`);
+  }
+
+  const parsed = (await current.json()) as BackendSessionResponse;
+  const metadata = {
+    ...(parsed.metadata ?? {}),
+    current_model: model,
+  };
+
+  const response = await fetch(sessionUrl, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${config.accessToken}`,
+    },
+    body: JSON.stringify({ metadata }),
+    cache: 'no-store',
+  });
+
+  if (!response.ok) {
+    let detail = `${response.status} ${response.statusText}`;
+    try {
+      const body = (await response.json()) as { detail?: string; error?: string };
+      detail = body.detail ?? body.error ?? detail;
+    } catch {
+      // Preserve the HTTP status.
+    }
+    throw new Error(`Cannot update persisted session ${chat.id} model: ${detail}`);
+  }
+}
+
+function assertBackendSessionMatchesChat(chatId: string, sessionId?: string) {
+  if (sessionId && sessionId !== chatId) {
+    throw new Error(`Runtime returned session_id ${sessionId}, but Web chat is bound to ${chatId}.`);
+  }
+}
+
+function normalizeCanonicalChatIds(store: Store) {
+  const seen = new Set<string>();
+  const normalized: ChatRecord[] = [];
+  for (const chat of store.chats) {
+    const legacyBackendSessionId = (chat as ChatRecord & { backendSessionId?: unknown }).backendSessionId;
+    if (typeof legacyBackendSessionId === 'string' && legacyBackendSessionId.trim()) {
+      chat.id = legacyBackendSessionId;
+    }
+    delete (chat as ChatRecord & { backendSessionId?: unknown }).backendSessionId;
+    if (LEGACY_LOCAL_CHAT_IDS.has(chat.id)) {
+      continue;
+    }
+    if (seen.has(chat.id)) {
+      continue;
+    }
+    seen.add(chat.id);
+    normalized.push(chat);
+  }
+  store.chats = normalized;
 }
 
 function projectSummary(project: ProjectRecord): ProjectSummary {
@@ -806,8 +1163,8 @@ function projectSummary(project: ProjectRecord): ProjectSummary {
   };
 }
 
-function touchProject(projectId: string) {
-  const project = getStore().projects.find((item) => item.id === projectId);
+function touchProjectInStore(store: Store, projectId: string) {
+  const project = store.projects.find((item) => item.id === projectId);
   if (project) {
     project.updatedAt = nowIso();
   }
@@ -873,7 +1230,7 @@ async function callBackendAgent(params: {
       } catch {
         // Preserve status text when the server returns a non-JSON error body.
       }
-      throw new Error(detail);
+      throw new RuntimeHttpError(detail, response.status, response.statusText);
     }
 
     const parsed = (await response.json()) as BackendChatResponse;
@@ -906,9 +1263,12 @@ async function callBackendAgent(params: {
         : error instanceof Error
           ? error.message
           : 'unknown error';
+    const prefix = error instanceof RuntimeHttpError
+      ? 'Astra runtime rejected the request'
+      : 'I could not reach the Astra runtime from the web UI';
     return {
       ok: false,
-      assistantText: `I could not reach the Astra runtime from the web UI. The message was saved locally for this preview. (${message})`,
+      assistantText: `${prefix}. (${message})`,
     };
   } finally {
     clearTimeout(timeout);

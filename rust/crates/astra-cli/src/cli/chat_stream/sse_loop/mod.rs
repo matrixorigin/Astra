@@ -318,13 +318,16 @@ pub(crate) async fn stream_chat_sse(
             m.consume_prompt_changes();
             m.consume_resource_changes();
         }
-        let mut schemas = edge_tools::all_tool_schemas();
-        // Inject MCP tool schemas from connected servers
-        if let Some(ref mgr) = p.mcp_manager {
+        let mcp_schemas = if let Some(ref mgr) = p.mcp_manager {
             let m = mgr.read().await;
-            schemas.extend(m.all_tool_schemas());
-        }
-        schemas
+            m.all_tool_schemas()
+        } else {
+            Vec::new()
+        };
+        astra_runtime::capabilities::cli_local_tool_schemas(
+            edge_tools::all_tool_schemas(),
+            mcp_schemas,
+        )
     };
     let mut registry = ToolRegistry::new(all_schemas.clone());
     // G3: when a DynamicAgentSpawner is wired, force-pin spawn_agent's

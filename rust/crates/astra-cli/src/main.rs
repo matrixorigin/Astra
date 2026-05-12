@@ -1491,12 +1491,29 @@ mod tests {
         let _creds_dir = isolate_credentials();
         let app = Router::new().route(
             "/auth/register",
-            post(|| async { axum::Json(serde_json::json!({"ok": true})) }),
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "user_id": "user-123",
+                    "username": "newuser",
+                    "email": "a@b.com",
+                    "display_name": null,
+                    "access_token": "tok-new",
+                    "refresh_token": "ref-new",
+                    "token_type": "Bearer",
+                    "expires_in": 3600
+                }))
+            }),
         );
         let base = spawn_mock(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-        let result = do_register(&api, "newuser", "a@b.com", "pass").await;
-        assert!(result.is_ok());
+        let result = do_register(&api, Some("test-profile"), "newuser", "a@b.com", "pass").await;
+        assert_eq!(result.unwrap(), "tok-new");
+
+        let creds = load_credentials();
+        let profile = creds.profiles.get("test-profile").unwrap();
+        assert_eq!(profile.username.as_deref(), Some("newuser"));
+        assert_eq!(profile.access_token.as_deref(), Some("tok-new"));
+        assert_eq!(profile.refresh_token.as_deref(), Some("ref-new"));
     }
 
     #[tokio::test]
@@ -1513,7 +1530,7 @@ mod tests {
         );
         let base = spawn_mock(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-        let result = do_register(&api, "taken", "a@b.com", "pass").await;
+        let result = do_register(&api, Some("test-profile"), "taken", "a@b.com", "pass").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("409"));
     }

@@ -280,17 +280,16 @@ pub(super) async fn prepare_chat_turn_bridge_body(
                     serde_json::Value::String(agent_id.clone()),
                 )])
             });
-            let session = state
-                .session_service
-                .create_session(
-                    user.user_id.clone(),
-                    SessionCreateRequestData {
-                        agent_id,
-                        title: None,
-                        metadata,
-                    },
-                )
-                .await?;
+            let session = super::session_quota::create_session_with_resource_quota(
+                state,
+                user.user_id.clone(),
+                SessionCreateRequestData {
+                    agent_id,
+                    title: None,
+                    metadata,
+                },
+            )
+            .await?;
 
             let created_session_id = session.session_id;
             let created_session_created_at =

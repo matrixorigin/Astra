@@ -827,14 +827,23 @@ fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -
                 && let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str)
             {
                 if !rc.is_empty() {
-                    let mut reasoning_text = json!({"text": rc});
-                    if let Some(sig) = msg.get("reasoning_signature").and_then(Value::as_str) {
-                        if !sig.is_empty() {
-                            reasoning_text["signature"] = Value::String(sig.to_string());
-                        }
+                    let signature = msg
+                        .get("reasoning_signature")
+                        .and_then(Value::as_str)
+                        .filter(|sig| !sig.is_empty());
+                    if let Some(sig) = signature {
+                        let reasoning_text = json!({"text": rc, "signature": sig});
+                        blocks.push(json!({"reasoningContent": {"reasoningText": reasoning_text}}));
+                        true
+                    } else {
+                        // Bedrock thinking blocks are cryptographically bound to a
+                        // provider-emitted signature. Replaying unsigned reasoning
+                        // text is invalid and produces HTTP 400, especially after a
+                        // session switches from an OpenAI-compatible thinking model
+                        // to Bedrock. Keep the visible assistant text/tool calls, but
+                        // do not serialize an invalid reasoningContent block.
+                        false
                     }
-                    blocks.push(json!({"reasoningContent": {"reasoningText": reasoning_text}}));
-                    true
                 } else {
                     false
                 }
@@ -7510,35 +7519,20 @@ mod tests {
         );
     }
 
-    /// Helper for counter tests: build a body that would violate the
-    /// signature contract, catching the debug_assert panic so the test can
-    /// observe the counter's post-increment state.
-    fn attempt_violating_bedrock_thinking_build() {
-        let messages = vec![
-            json!({"role": "user", "content": "q"}),
-            json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": "tc1", "type": "function",
-                    "function": {"name": "noop", "arguments": "{}"}
-                }],
-                "reasoning_content": "thinking without signature",
-            }),
-            json!({"role": "tool", "tool_call_id": "tc1", "content": "ok"}),
-        ];
-        let _ = build_provider_request_body(
-            &messages,
-            &[],
-            "us.anthropic.claude-sonnet-4-6",
-            "bedrock",
-            Some(4096),
-            None,
-            true,
-            &ThinkingConfig::Enabled {
-                budget_tokens: 1024,
-            },
-        );
+    /// Helper for counter tests: feed a deliberately malformed Bedrock message
+    /// directly into the guard. Normal request construction strips unsigned
+    /// reasoning before this point, so direct guard tests are the only valid way
+    /// to exercise the invariant.
+    fn assert_malformed_bedrock_thinking_body() {
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": [{
+                "reasoningContent": {
+                    "reasoningText": {"text": "thinking without signature"}
+                }
+            }]
+        })];
+        assert_bedrock_thinking_signature_contract(&messages);
     }
 
     // Counter increments alongside the debug_assert so release builds can
@@ -7553,7 +7547,7 @@ mod tests {
         // counter afterward. The fetch_add runs *before* the debug_assert so
         // the counter observes the violation even when the assert fires.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-            attempt_violating_bedrock_thinking_build,
+            assert_malformed_bedrock_thinking_body,
         ));
         let after = BEDROCK_THINKING_SIGNATURE_VIOLATION_COUNT.load(Ordering::Relaxed);
         assert!(
@@ -7570,9 +7564,15 @@ mod tests {
     #[test]
     #[should_panic(expected = "Bedrock thinking contract violation")]
     fn bedrock_thinking_signature_contract_panics_on_missing_signature() {
-        // Simulate what happens if the SSE → accum → next-assistant-message
-        // pipeline ever drops the signature: reasoning_content is present but
-        // reasoning_signature is empty.
+        assert_malformed_bedrock_thinking_body();
+    }
+
+    // Request construction must never produce the malformed body above. If a
+    // session carries reasoning text from a provider/model that did not emit a
+    // Bedrock-compatible signature, the Bedrock request keeps text/tool calls
+    // and omits the invalid reasoningContent block.
+    #[test]
+    fn build_bedrock_body_omits_unsigned_reasoning_when_thinking_on() {
         let messages = vec![
             json!({"role": "user", "content": "What is 2+2?"}),
             json!({
@@ -7580,11 +7580,11 @@ mod tests {
                 "content": null,
                 "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "calc", "arguments": "{}"}}],
                 "reasoning_content": "let me compute",
-                // reasoning_signature intentionally MISSING
+                // reasoning_signature intentionally missing
             }),
             json!({"role": "tool", "tool_call_id": "tc1", "content": "4"}),
         ];
-        let _ = build_provider_request_body(
+        let body = build_provider_request_body(
             &messages,
             &[],
             "us.anthropic.claude-sonnet-4-6",
@@ -7595,6 +7595,17 @@ mod tests {
             &ThinkingConfig::Enabled {
                 budget_tokens: 1024,
             },
+        );
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert!(
+            !content
+                .iter()
+                .any(|block| block.get("reasoningContent").is_some()),
+            "unsigned historical reasoning must not be serialized into Bedrock reasoningContent"
+        );
+        assert!(
+            content.iter().any(|block| block.get("toolUse").is_some()),
+            "assistant tool calls must remain visible after unsigned reasoning is omitted"
         );
     }
 

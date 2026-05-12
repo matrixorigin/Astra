@@ -1,8 +1,8 @@
 'use client';
 
 import { ArrowLeft, Check, Loader2, Search } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { listSkills } from '@/lib/api/skills';
+import { useEffect, useMemo, useState } from 'react';
+import { useSkillCatalog } from '@/hooks/use-skill-catalog';
 import type { SkillSummary } from '@/lib/api/types';
 import { cn } from '@/lib/utils/cn';
 
@@ -29,11 +29,15 @@ function selectedSet(skills: string[]) {
 }
 
 export function SkillPickerPanel({ selected, onChange, onBack }: SkillPickerPanelProps) {
-  const [items, setItems] = useState<SkillSummary[]>([]);
-  const [nextOffset, setNextOffset] = useState<number | null>(0);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
+  const {
+    items,
+    nextOffset,
+    loading,
+    error,
+    loadInitial,
+    loadNextPage,
+  } = useSkillCatalog({ pageSize: PAGE_SIZE });
 
   const selectedNames = useMemo(() => selectedSet(selected), [selected]);
   const filtered = useMemo(() => {
@@ -47,29 +51,9 @@ export function SkillPickerPanel({ selected, onChange, onBack }: SkillPickerPane
     });
   }, [items, query]);
 
-  const loadPage = useCallback(async (offset: number) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const response = await listSkills({ limit: PAGE_SIZE, offset });
-      setItems((current) => {
-        const byName = new Map(current.map((skill) => [skill.name, skill]));
-        for (const skill of response.items) {
-          byName.set(skill.name, skill);
-        }
-        return [...byName.values()].sort((left, right) => left.name.localeCompare(right.name));
-      });
-      setNextOffset(response.nextOffset);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load skills.');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
   useEffect(() => {
-    void loadPage(0);
-  }, [loadPage]);
+    void loadInitial();
+  }, [loadInitial]);
 
   function toggle(skillName: string) {
     const next = selectedSet(selected);
@@ -179,7 +163,7 @@ export function SkillPickerPanel({ selected, onChange, onBack }: SkillPickerPane
           <button
             type="button"
             disabled={loading}
-            onClick={() => void loadPage(nextOffset)}
+            onClick={() => void loadNextPage()}
             className="flex h-9 w-full items-center justify-center gap-2 rounded-control text-sm text-text-secondary hover:bg-surface-muted disabled:opacity-50"
           >
             {loading ? <Loader2 className="size-4 animate-spin" /> : null}

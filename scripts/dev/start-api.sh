@@ -64,10 +64,28 @@ fi
 start_detached() {
     if command -v setsid >/dev/null 2>&1; then
         setsid "$@" >> "$LOG_FILE" 2>&1 &
+        DETACHED_PID=$!
+    elif command -v screen >/dev/null 2>&1; then
+        # macOS does not ship setsid(1). A plain background nohup process is
+        # still tied to the launching terminal/process group in several agent
+        # and IDE environments, so use screen when available to create an
+        # actually detached process. The command is passed as argv rather than
+        # string-concatenated so paths and env values remain shell-safe.
+        screen -dmS astra-api bash -lc \
+            'cd "$1"; log_file="$2"; shift 2; exec "$@" >> "$log_file" 2>&1' \
+            bash "$PWD" "$LOG_FILE" "$@"
+        for _ in {1..20}; do
+            DETACHED_PID=$(pgrep -x "astra-server" 2>/dev/null | tail -n 1)
+            if [ -n "$DETACHED_PID" ] && kill -0 "$DETACHED_PID" 2>/dev/null; then
+                return
+            fi
+            sleep 0.2
+        done
+        DETACHED_PID=""
     else
         nohup "$@" >> "$LOG_FILE" 2>&1 &
+        DETACHED_PID=$!
     fi
-    DETACHED_PID=$!
 }
 
 # Start server in a detached process so it survives Ctrl+C from parent.

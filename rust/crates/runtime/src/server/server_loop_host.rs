@@ -76,6 +76,16 @@ fn llm_cancel_for_state(state: &AgenticLoopState) -> LlmCancel<'_> {
     }
 }
 
+fn estimate_tool_schema_tokens(tools: &[Value]) -> u64 {
+    // Provider tokenizers differ, but UTF-8 bytes / 4 is the same coarse
+    // estimator used elsewhere in the manifest path. The important invariant
+    // is not exact accounting; it is that each LLM call's manifest records a
+    // non-zero, queryable tool-schema budget when tools were actually exposed.
+    serde_json::to_string(tools)
+        .map(|value| value.len().div_ceil(4) as u64)
+        .unwrap_or(0)
+}
+
 fn record_full_llm_request_event(
     state: &mut AgenticLoopState,
     full_llm_capture: bool,
@@ -932,7 +942,7 @@ impl ServerAgenticLoopHostBuilder {
         // server-side tool schemas from astra-tools so the LLM knows what's available.
         let server_side_tools = self.edge_tools.is_empty();
         let edge_tools = if server_side_tools {
-            astra_tools::schemas::server_executor_tool_schemas()
+            crate::capabilities::server_runtime_tool_schemas()
         } else {
             self.edge_tools
         };
@@ -2509,6 +2519,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut final_tools = pipeline_tool_schemas;
         // Annotate tool schemas with cache_control for Anthropic.
         annotate_tool_schemas_for_caching(&mut final_tools, &cache_cfg);
+        state.pinned_tool_schema_tokens = estimate_tool_schema_tokens(&final_tools);
         state.last_turn_policy =
             TurnInteractionPolicy::from_tool_schemas(interaction_mode, &final_tools);
 

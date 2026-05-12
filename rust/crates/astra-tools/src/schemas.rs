@@ -37,14 +37,31 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "mo",
     "agent",
     "introspect",
-    "lsp",
     "web_fetch",
     "web_search",
+    "publish_artifact",
     "symbols",
     "run_script",
     "notify",
     "ask_user",
     "task",
+];
+
+/// RPC tools exposed inside server-side `run_script`.
+///
+/// This is intentionally narrower than [`crate::run_script::RPC_ALLOWED_TOOLS`]:
+/// the web/API server must only advertise sub-tools that the
+/// `ServerToolExecutor` can actually route in-process. Keeping this list next
+/// to `SERVER_EXECUTOR_TOOL_NAMES` makes capability drift visible during code
+/// review and prevents the LLM from being told to call a Python-side helper
+/// that will later fail at runtime.
+pub const SERVER_RUN_SCRIPT_RPC_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "write_file",
+    "list_dir",
+    "grep",
+    "web_fetch",
+    "bash",
 ];
 
 fn filter_tool_schemas_by_name(allowed_names: &[&str]) -> Vec<Value> {
@@ -65,7 +82,20 @@ pub fn default_executor_tool_schemas() -> Vec<Value> {
 }
 
 pub fn server_executor_tool_schemas() -> Vec<Value> {
-    filter_tool_schemas_by_name(SERVER_EXECUTOR_TOOL_NAMES)
+    let mut schemas = filter_tool_schemas_by_name(SERVER_EXECUTOR_TOOL_NAMES);
+    #[cfg(unix)]
+    {
+        if let Some(slot) = schemas.iter_mut().find(|schema| {
+            schema
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                == Some("run_script")
+        }) {
+            *slot = run_script_schema_for(SERVER_RUN_SCRIPT_RPC_TOOL_NAMES);
+        }
+    }
+    schemas
 }
 
 pub fn all_tool_schemas() -> Vec<Value> {
@@ -110,8 +140,13 @@ pub fn all_tool_schemas_with_env<F: Fn(&str) -> Option<String>>(env: F) -> Vec<V
 /// `run_script::build_run_script_schema` directly for a tighter schema.
 #[cfg(unix)]
 fn run_script_schema_default() -> Value {
+    run_script_schema_for(crate::run_script::RPC_ALLOWED_TOOLS)
+}
+
+#[cfg(unix)]
+fn run_script_schema_for(enabled_tool_names: &[&str]) -> Value {
     use std::collections::HashSet;
-    let enabled: HashSet<String> = crate::run_script::RPC_ALLOWED_TOOLS
+    let enabled: HashSet<String> = enabled_tool_names
         .iter()
         .map(|s| (*s).to_string())
         .collect();
@@ -124,6 +159,27 @@ fn run_script_schema_default() -> Value {
 
 fn all_tool_schemas_core() -> Vec<Value> {
     vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "publish_artifact",
+                "description": "Publish a file that was already generated in the current session workspace or /tmp so the web UI can preview and download it. Use this after creating images, PDFs, CSVs, Markdown, HTML, or other files with bash/write_file/run_script. Do not use this to generate content directly; first create the file, then publish its path.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path of the generated file. Relative paths are resolved under the session workspace. Absolute paths are allowed only under the session workspace or /tmp."
+                        },
+                        "title": {"type": "string", "description": "Optional short display title for the artifact."},
+                        "artifact_kind": {"type": "string", "description": "Optional stable kind such as image, pdf, markdown, html, data, text, code, archive, or file. If omitted, Astra infers it from the filename/content type."},
+                        "content_type": {"type": "string", "description": "Optional MIME type. If omitted, Astra infers it from the file extension."},
+                        "description": {"type": "string", "description": "Optional one-sentence explanation shown next to the artifact in the web UI."}
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
         json!({
             "type": "function",
             "function": {
@@ -722,6 +778,32 @@ mod tests {
         assert!(
             desc.contains("web_fetch"),
             "default schema should list web_fetch"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_run_script_schema_lists_only_server_routable_rpc_tools() {
+        let schemas = server_executor_tool_schemas();
+        let rs = schemas
+            .iter()
+            .find(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    == Some("run_script")
+            })
+            .expect("server run_script schema present");
+        let desc = rs["function"]["description"].as_str().unwrap();
+        for name in SERVER_RUN_SCRIPT_RPC_TOOL_NAMES {
+            assert!(
+                desc.contains(name),
+                "server run_script schema should mention routable RPC tool `{name}`"
+            );
+        }
+        assert!(
+            !desc.contains("search_files") && !desc.contains("patch"),
+            "server run_script must not advertise RPC tools not routed by ServerToolExecutor"
         );
     }
 

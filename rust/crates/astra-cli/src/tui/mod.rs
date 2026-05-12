@@ -814,18 +814,10 @@ pub(crate) async fn run_tui_repl(
                                         let username = parts.next().unwrap_or("").to_string();
                                         let email = parts.next().unwrap_or("").to_string();
                                         let password = parts.next().unwrap_or("").to_string();
-                                        match crate::auth_flow::do_register(api, &username, &email, &password).await {
+                                        match crate::auth_flow::do_register(api, profile, &username, &email, &password).await {
                                             Ok(_) => {
-                                                chat_widget.commit_system(history_cell::system::SystemCell::response("Registered — logging in…"));
-                                                match crate::auth_flow::do_login(api, profile, &username, &password).await {
-                                                    Ok(_) => {
-                                                        chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
-                                                        crate::post_auth_cloud_resync(profile, &mut state).await;
-                                                    }
-                                                    Err(e) => {
-                                                        chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Auto-login failed: {e}")));
-                                                    }
-                                                }
+                                                chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Registered and logged in as {username}")));
+                                                crate::post_auth_cloud_resync(profile, &mut state).await;
                                             }
                                             Err(e) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Register failed: {e}")));

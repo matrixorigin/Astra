@@ -166,17 +166,16 @@ pub(super) async fn create_session_handler(
     Json(request): Json<SessionCreateRequest>,
 ) -> Result<(StatusCode, Json<SessionResponse>), (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let session = state
-        .session_service
-        .create_session(
-            user.user_id,
-            SessionCreateRequestData {
-                agent_id: request.agent_id,
-                title: request.title,
-                metadata: request.metadata,
-            },
-        )
-        .await?;
+    let session = super::session_quota::create_session_with_resource_quota(
+        &state,
+        user.user_id,
+        SessionCreateRequestData {
+            agent_id: request.agent_id,
+            title: request.title,
+            metadata: request.metadata,
+        },
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(SessionResponse::from(session))))
 }
 

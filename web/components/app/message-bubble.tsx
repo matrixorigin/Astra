@@ -1,6 +1,6 @@
 'use client';
 
-import { Bot, CheckCircle2, ChevronDown, Clock3, Copy, Loader, RefreshCcw, ThumbsDown, ThumbsUp, User } from 'lucide-react';
+import { Bot, CheckCircle2, ChevronDown, Clock3, Copy, Download, Loader, RefreshCcw, ThumbsDown, ThumbsUp, User } from 'lucide-react';
 import { Children, isValidElement, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
@@ -9,9 +9,10 @@ import rehypeHighlight from 'rehype-highlight';
 import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
+import { SkillMentionText } from '@/components/app/skill-mention-text';
 import { IconButton } from '@/components/ui/icon-button';
 import { splitThinkingTags } from '@/lib/api/chats';
-import type { ChatMessage } from '@/lib/api/types';
+import type { ChatArtifactRef, ChatMessage } from '@/lib/api/types';
 import { cn } from '@/lib/utils/cn';
 
 const markdownRemarkPlugins = [remarkGfm, remarkMath];
@@ -126,7 +127,7 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
         <div className="mb-2 flex items-center gap-2">
           <span className="text-sm font-semibold">{isUser ? 'You' : 'Astra'}</span>
           {message.status === 'failed' ? (
-            <span className="rounded-full bg-danger/10 px-2 py-0.5 text-xs text-danger">offline preview</span>
+            <span className="rounded-full bg-danger/10 px-2 py-0.5 text-xs text-danger">error</span>
           ) : null}
         </div>
         {showReasoning ? (
@@ -141,9 +142,14 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
             <span className="size-1.5 animate-pulse rounded-full bg-text-muted [animation-delay:120ms]" />
             <span className="size-1.5 animate-pulse rounded-full bg-text-muted [animation-delay:240ms]" />
           </div>
+        ) : isUser ? (
+          <SkillMentionText content={content} skills={message.activeSkills} />
         ) : (
           <MarkdownContent content={content} />
         )}
+        {!isUser && message.artifacts?.length ? (
+          <ArtifactList artifacts={message.artifacts} />
+        ) : null}
         {!isUser && message.status !== 'streaming' ? (
           <div className="mt-3 flex gap-1">
             <IconButton icon={Copy} label="Copy response" onClick={() => navigator.clipboard?.writeText(content)} />
@@ -155,6 +161,186 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
       </div>
     </article>
   );
+}
+
+function ArtifactList({ artifacts }: { artifacts: ChatArtifactRef[] }) {
+  const visibleArtifacts = artifacts.filter(isChatVisibleArtifact);
+  if (visibleArtifacts.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="mt-5 space-y-4">
+      {visibleArtifacts.map((artifact) => (
+        <ArtifactCard key={artifact.id} artifact={artifact} />
+      ))}
+    </div>
+  );
+}
+
+function isChatVisibleArtifact(artifact: ChatArtifactRef) {
+  return artifact.kind !== 'composite_snapshot_index'
+    && artifact.source !== 'composite_snapshot_index';
+}
+
+function ArtifactCard({ artifact }: { artifact: ChatArtifactRef }) {
+  const content = artifact.content && typeof artifact.content === 'object'
+    ? artifact.content as Record<string, unknown>
+    : null;
+  const payload = buildArtifactPayload(artifact, content);
+  const title = artifact.title || artifact.filename || artifact.downloadFilename || artifact.kind;
+  const subtitle = [
+    artifact.contentType,
+    formatBytes(artifact.sizeBytes),
+  ].filter(Boolean).join(' · ') || artifact.kind;
+
+  const download = () => {
+    if (!payload) {
+      return;
+    }
+    const blob = new Blob([payload.bytes], { type: payload.contentType });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = artifact.downloadFilename || artifact.filename || title;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="overflow-hidden rounded-[18px] border border-border bg-surface shadow-[0_0.25rem_1.25rem_rgba(28,25,23,0.06),0_0_0_0.5px_rgba(120,113,108,0.18)]">
+      <div className="flex items-center justify-between gap-4 border-b border-border px-4 py-3">
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold text-text">{title}</div>
+          <div className="mt-0.5 text-xs text-text-muted">{subtitle}</div>
+        </div>
+        <button
+          type="button"
+          onClick={download}
+          disabled={!payload}
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-control border border-border bg-bg px-2.5 py-1.5 text-xs font-medium text-text-secondary transition hover:bg-surface-muted hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <Download className="size-3.5" />
+          Download
+        </button>
+      </div>
+      {payload?.previewKind === 'image' ? (
+        <div className="bg-white p-4">
+          {/* Artifact previews may be data URLs generated at runtime, so next/image cannot optimize them. */}
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={payload.previewUrl}
+            alt={title}
+            className="max-h-[560px] w-full object-contain"
+          />
+        </div>
+      ) : payload?.previewKind === 'text' ? (
+        <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap bg-[#0d1117] p-4 font-mono text-sm leading-6 text-[#e6edf3]">
+          {payload.previewText}
+        </pre>
+      ) : (
+        <div className="px-4 py-5 text-sm text-text-muted">
+          {payload
+            ? 'Preview is not available for this artifact type. Use Download to open the file.'
+            : 'Artifact payload is not available in this message.'}
+        </div>
+      )}
+    </div>
+  );
+}
+
+type ArtifactPayload = {
+  bytes: BlobPart;
+  contentType: string;
+  previewKind: 'image' | 'text' | 'none';
+  previewUrl?: string;
+  previewText?: string;
+};
+
+function buildArtifactPayload(
+  artifact: ChatArtifactRef,
+  content: Record<string, unknown> | null,
+): ArtifactPayload | null {
+  if (!content) {
+    return null;
+  }
+  const contentType = artifact.contentType || stringValue(content.content_type) || 'application/octet-stream';
+  const encoding = stringValue(content.encoding);
+  const data = stringValue(content.data);
+
+  if (encoding === 'base64' && data) {
+    const bytes = bytesFromBase64(data);
+    return {
+      bytes,
+      contentType,
+      previewKind: contentType.startsWith('image/') ? 'image' : 'none',
+      previewUrl: contentType.startsWith('image/') ? `data:${contentType};base64,${data}` : undefined,
+    };
+  }
+
+  if (encoding === 'utf-8' && typeof data === 'string') {
+    const previewKind = contentType.startsWith('image/svg+xml') ? 'image' : (isTextPreviewType(contentType) ? 'text' : 'none');
+    return {
+      bytes: data,
+      contentType: contentType.startsWith('text/') ? `${contentType};charset=utf-8` : contentType,
+      previewKind,
+      previewUrl: previewKind === 'image' ? `data:${contentType};charset=utf-8,${encodeURIComponent(data)}` : undefined,
+      previewText: previewKind === 'text' ? truncateArtifactPreview(data) : undefined,
+    };
+  }
+
+  const legacySvg = stringValue(content.svg);
+  if (legacySvg) {
+    return {
+      bytes: legacySvg,
+      contentType: 'image/svg+xml;charset=utf-8',
+      previewKind: 'image',
+      previewUrl: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(legacySvg)}`,
+    };
+  }
+
+  return null;
+}
+
+function stringValue(value: unknown) {
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function bytesFromBase64(value: string) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function isTextPreviewType(contentType: string) {
+  return contentType.startsWith('text/')
+    || contentType === 'application/json'
+    || contentType === 'application/x-ndjson'
+    || contentType === 'application/yaml'
+    || contentType === 'application/toml'
+    || contentType === 'application/xml';
+}
+
+function truncateArtifactPreview(value: string) {
+  return value.length > 6000 ? `${value.slice(0, 6000)}\n...` : value;
+}
+
+function formatBytes(value?: number | null) {
+  if (!value || value <= 0) {
+    return null;
+  }
+  if (value < 1024) {
+    return `${value} B`;
+  }
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)} KiB`;
+  }
+  return `${(value / 1024 / 1024).toFixed(1)} MiB`;
 }
 
 function ReasoningPanel({ reasoning, streaming }: { reasoning: string; streaming: boolean }) {
