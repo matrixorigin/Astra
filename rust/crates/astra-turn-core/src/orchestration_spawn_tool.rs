@@ -130,19 +130,35 @@ where
             Ok(v)
         }
         fn visit_str<E: de::Error>(self, v: &str) -> Result<bool, E> {
+            // Empty string is NOT a valid bool — fail loudly so LLM bugs
+            // surface instead of being silently coerced to `false`.
             match v.to_ascii_lowercase().as_str() {
                 "true" | "1" | "yes" => Ok(true),
-                "false" | "0" | "no" | "" => Ok(false),
+                "false" | "0" | "no" => Ok(false),
                 other => Err(E::custom(format!(
-                    "unrecognized boolean string: \"{other}\""
+                    "unrecognized boolean string: \"{other}\" (expected true/false/1/0/yes/no)"
                 ))),
             }
         }
         fn visit_i64<E: de::Error>(self, v: i64) -> Result<bool, E> {
-            Ok(v != 0)
+            // Accept only the canonical 0/1 contract; reject arbitrary
+            // integers so malformed input doesn't silently become `true`.
+            match v {
+                0 => Ok(false),
+                1 => Ok(true),
+                other => Err(E::custom(format!(
+                    "unrecognized boolean integer: {other} (expected 0 or 1)"
+                ))),
+            }
         }
         fn visit_u64<E: de::Error>(self, v: u64) -> Result<bool, E> {
-            Ok(v != 0)
+            match v {
+                0 => Ok(false),
+                1 => Ok(true),
+                other => Err(E::custom(format!(
+                    "unrecognized boolean integer: {other} (expected 0 or 1)"
+                ))),
+            }
         }
         fn visit_none<E: de::Error>(self) -> Result<bool, E> {
             Ok(false)
@@ -715,5 +731,53 @@ mod bool_lenient_tests {
             serde_json::from_str(r#"{"description":"test","prompt":"p","isolated":"false"}"#)
                 .expect("string 'false' must deserialize");
         assert!(!input.isolated);
+    }
+
+    #[test]
+    fn background_rejects_unknown_string() {
+        // Contract: only {true,false,1,0,yes,no} are accepted. Anything
+        // else must error instead of silently defaulting to false — so
+        // genuine LLM bugs surface rather than masquerading as success.
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"test","prompt":"p","background":"maybe"}"#,
+        )
+        .expect_err("unknown string must be rejected");
+        assert!(
+            err.to_string().contains("unrecognized boolean string"),
+            "error must name the contract violation; got: {err}"
+        );
+    }
+
+    #[test]
+    fn background_rejects_empty_string() {
+        // Regression guard: empty string used to coerce to `false`,
+        // hiding malformed `"background": ""` input. Now must error.
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"test","prompt":"p","background":""}"#,
+        )
+        .expect_err("empty string must be rejected");
+        assert!(err.to_string().contains("unrecognized boolean string"));
+    }
+
+    #[test]
+    fn background_rejects_arbitrary_integer() {
+        // Contract: only 0/1 are accepted. `42` used to silently
+        // coerce to `true`; now must error.
+        let err = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"test","prompt":"p","background":42}"#,
+        )
+        .expect_err("arbitrary integer must be rejected");
+        assert!(
+            err.to_string().contains("unrecognized boolean integer"),
+            "error must name the contract violation; got: {err}"
+        );
+    }
+
+    #[test]
+    fn background_accepts_integer_one() {
+        let input: SpawnAgentInput =
+            serde_json::from_str(r#"{"description":"test","prompt":"p","background":1}"#)
+                .expect("integer 1 must deserialize to true");
+        assert!(input.background);
     }
 }
