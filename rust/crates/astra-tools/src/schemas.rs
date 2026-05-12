@@ -435,7 +435,16 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "description": "Exact stash selector or OID. Used by: stash with sub_action=apply. Takes precedence over index."
                         }
                     },
-                    "required": ["action"]
+                    "required": ["action"],
+                    "x-astra-per-action-required": {
+                        "commit": ["message"],
+                        "revert_commit": ["commit_sha"],
+                        "file_history": ["file"],
+                        "log_search": ["query"],
+                        "stash": ["sub_action"],
+                        "checkout_file": ["path", "ref"],
+                        "worktree": ["sub_action"]
+                    }
                 }
             }
         }),
@@ -443,16 +452,24 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "github",
-                "description": "GitHub operations. Actions: list_prs, get_pr, ci_status, repo_stats, list_issues, get_issue, create_issue.",
+                "description": "GitHub operations. Per-action required fields: get_pr/ci_status→pr_number, get_issue→issue_number, create_issue→title. `repo` (owner/name or bare name) is inferred from git remote when omitted.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["list_prs","get_pr","ci_status","repo_stats","list_issues","get_issue","create_issue"], "description": "GitHub operation"},
-                        "owner": {"type": "string"},
-                        "repo": {"type": "string"},
-                        "number": {"type": "integer", "description": "PR or issue number"}
+                        "repo": {"type": "string", "description": "owner/name or bare name (e.g. 'anthropics/claude-code' or 'memoria'). Inferred from current git remote when omitted."},
+                        "pr_number": {"type": "integer", "description": "PR number. REQUIRED when action=get_pr or action=ci_status."},
+                        "issue_number": {"type": "integer", "description": "Issue number. REQUIRED when action=get_issue."},
+                        "title": {"type": "string", "description": "Issue title. REQUIRED when action=create_issue."},
+                        "body": {"type": "string", "description": "Issue body (create_issue)."}
                     },
-                    "required": ["action"]
+                    "required": ["action"],
+                    "x-astra-per-action-required": {
+                        "get_pr": ["pr_number"],
+                        "ci_status": ["pr_number"],
+                        "get_issue": ["issue_number"],
+                        "create_issue": ["title"]
+                    }
                 }
             }
         }),
@@ -543,16 +560,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         }
                     },
                     "required": ["action"],
-                    "allOf": [
-                        {
-                            "if": {"properties": {"action": {"const": "forget"}}, "required": ["action"]},
-                            "then": {"required": ["reason"], "properties": {"reason": {"minLength": 1}}}
-                        },
-                        {
-                            "if": {"properties": {"action": {"const": "update"}}, "required": ["action"]},
-                            "then": {"required": ["reason"], "properties": {"reason": {"minLength": 1}}}
-                        }
-                    ]
+                    "x-astra-per-action-required": {
+                        "remember": ["content"],
+                        "recall": ["query"],
+                        "expand": ["memory_id"],
+                        "forget": ["reason"],
+                        "update": ["reason"],
+                        "feedback": ["memory_id", "signal"]
+                    }
                 }
             }
         }),
@@ -560,7 +575,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle. Actions: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, timeline, summary, history.",
+                "description": "Session lifecycle and introspection. Per-action required fields: config→path+value; prioritize/deprioritize→tool; ask_user→question; tool_search→query. Other actions (compact, rollback_edits, sleep, timeline, summary, history) have no extra required fields.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -579,7 +594,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "duration_ms": {"type": "integer", "description": "Sleep ms, max 300000"},
                         "reason": {"type": "string", "description": "Reason (sleep)"}
                     },
-                    "required": ["action"]
+                    "required": ["action"],
+                    "x-astra-per-action-required": {
+                        "config": ["path", "value"],
+                        "prioritize": ["tool"],
+                        "deprioritize": ["tool"],
+                        "ask_user": ["question"],
+                        "tool_search": ["query"]
+                    }
                 }
             }
         }),
@@ -595,7 +617,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "sql": {"type": "string", "description": "SQL to execute (for query)"},
                         "name": {"type": "string", "description": "Snapshot/branch name"}
                     },
-                    "required": ["action"]
+                    "required": ["action"],
+                    "x-astra-per-action-required": {
+                        "query": ["sql"],
+                        "snapshot": ["sub_action"],
+                        "branch": ["sub_action"]
+                    }
                 }
             }
         }),
@@ -626,7 +653,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
                         "priority": {"type": "string", "enum": ["low","normal","high"]}
                     },
-                    "required": ["action"]
+                    "required": ["action"],
+                    "x-astra-per-action-required": {
+                        "spawn": ["description", "prompt"],
+                        "delegate": ["task"],
+                        "run_chain": ["steps"],
+                        "get_result": ["agent_id"],
+                        "send_message": ["to", "message"]
+                    }
                 }
             }
         }),
@@ -747,7 +781,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "reason": {"type": "string", "description": "(stop) Why the task is being stopped"},
                         "error_message": {"type": "string", "description": "(update) Reason for failure"}
                     },
-                    "required": ["action"]
+                    "required": ["action"],
+                    "x-astra-per-action-required": {
+                        "create": ["title"],
+                        "update": ["task_id"],
+                        "get": ["task_id"],
+                        "stop": ["task_id"]
+                    }
                 }
             }
         }),
