@@ -293,6 +293,18 @@ impl ToolHealthTracker {
     /// Session 7e3fecb5: 3× `"background": "true"` (string instead of
     /// bool) caused agent tool to be deprioritized. The tool was
     /// perfectly healthy — serde just rejected the input shape.
+    ///
+    /// ## Reporting note
+    /// Both `total_calls` and `total_failures` are incremented, so
+    /// `failure_rate = total_failures / total_calls` WILL reflect
+    /// input-validation failures. Operator dashboards that use
+    /// `failure_rate` to flag "unhealthy" tools should either
+    /// (a) separately surface `input_validation_failures` (TODO:
+    /// add as dedicated counter), or (b) cross-check with
+    /// `consecutive_failures` / `deprioritized` before alerting —
+    /// a tool with high `failure_rate` but `consecutive_failures == 0`
+    /// and `!deprioritized` is almost certainly being misused by the
+    /// LLM, not broken.
     pub fn record_input_validation_failure(&mut self, tool_name: &str) {
         let health = self.tools.entry(tool_name.to_string()).or_default();
         health.total_calls += 1;

@@ -329,8 +329,7 @@ impl ToolExecutor {
                     if lines_in_cap > 0 && cap > 0 {
                         // Scale: lines_in_cap * (size / cap), using
                         // u128 to avoid overflow on huge files.
-                        let scaled =
-                            (lines_in_cap as u128 * size as u128 / cap as u128) as usize;
+                        let scaled = (lines_in_cap as u128 * size as u128 / cap as u128) as usize;
                         scaled.max(lines_in_cap)
                     } else {
                         lines_in_cap + (size - cap) / 40
@@ -1797,6 +1796,14 @@ impl ToolExecutor {
         let mut working = content.clone();
         let mut fuzzy_applications: Vec<(usize, &'static str)> = Vec::new();
         let mut first_edit_start_byte: Option<usize> = None;
+        // Track byte-ranges modified by prior fuzzy edits so a later
+        // fuzzy edit can't silently land on the same span. Exact
+        // `working.matches(old_str)` already self-disambiguates via
+        // the count==0/count>1 checks, but two fuzzy edits whose
+        // normalized-whitespace candidates collapse to the same
+        // region would each succeed with `replace_all=false` and
+        // clobber each other. Abort with a dedup hint instead.
+        let mut fuzzy_spans: Vec<(usize, usize)> = Vec::new();
         for (i, edit) in edits.iter().enumerate() {
             let old_str = match edit.get("old_str").and_then(Value::as_str) {
                 Some(s) => s,
@@ -1821,10 +1828,37 @@ impl ToolExecutor {
                 ) {
                     Some(fuzzy_match) => {
                         let actual = fuzzy_match.actual.to_string();
+                        let match_start = match working.find(&actual) {
+                            Some(s) => s,
+                            None => {
+                                return format!(
+                                    "Error: edit[{i}] fuzzy match returned a span not present in working buffer (internal invariant violated). Aborting all edits."
+                                );
+                            }
+                        };
+                        let match_end = match_start + actual.len();
+                        // Reject if this fuzzy span overlaps a span
+                        // already consumed by an earlier fuzzy edit —
+                        // otherwise two fuzzy edits could silently
+                        // clobber the same region. Exact edits remain
+                        // immune because `working.matches(old_str)`
+                        // already self-disambiguates.
+                        if let Some((prev_i, _)) =
+                            fuzzy_spans.iter().enumerate().find(|(_, (ps, pe))| {
+                                // Overlap: [ps,pe) ∩ [match_start,match_end) non-empty
+                                match_start < *pe && *ps < match_end
+                            })
+                        {
+                            let (orig_idx, _) = fuzzy_applications[prev_i];
+                            return format!(
+                                "Error: edit[{i}] fuzzy-matched the same region as edit[{orig_idx}] (both resolved to overlapping spans via whitespace-normalized match). Aborting all edits — provide distinct exact old_str values or merge the two edits."
+                            );
+                        }
                         if i == 0 {
-                            first_edit_start_byte = working.find(&actual);
+                            first_edit_start_byte = Some(match_start);
                         }
                         fuzzy_applications.push((i, fuzzy_match.strategy));
+                        fuzzy_spans.push((match_start, match_end));
                         working = working.replacen(&actual, new_str, 1);
                         continue;
                     }

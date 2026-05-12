@@ -261,8 +261,31 @@ fn build_bridge_tool_call_records(
             Some(0)
         );
         let output = tool_result.get("output").map(|output| match output {
-            Value::String(output) => output.clone(),
-            other => other.to_string(),
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            other => {
+                // Non-string output is a serialization bug upstream —
+                // the contract is `output: Option<String>`. Log the
+                // anomaly so we can trace the source instead of silently
+                // passing `"{}"` to the LLM (which it mis-reads as
+                // "tool returned empty JSON object").
+                let type_label = if other.is_object() {
+                    "object"
+                } else if other.is_array() {
+                    "array"
+                } else {
+                    "non-string"
+                };
+                let stringified = other.to_string();
+                astra_core::agent_warn!(
+                    "bridge",
+                    "tool_result.output is {} (not String); coercing. request_id={}, value={}",
+                    type_label,
+                    request_id,
+                    &stringified[..stringified.len().min(200)]
+                );
+                stringified
+            }
         });
         let error = tool_result
             .get("error")
@@ -6547,5 +6570,118 @@ mod tests {
             Value::Number(42.into()),
         );
         assert!(bridge_should_run_memoria_prefetch(&ep));
+    }
+
+    // ── tool_result.output non-string coercion tests ──────────────────
+
+    #[test]
+    fn build_bridge_records_string_output_passes_through() {
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "function": {"name": "bash", "arguments": "{\"command\":\"echo hello\"}"}
+        })];
+        let tool_results = vec![json!({
+            "request_id": "call-1",
+            "name": "bash",
+            "status": "ok",
+            "output": "hello\n",
+            "duration_ms": 50
+        })];
+        let records = build_bridge_tool_call_records(
+            &tool_calls,
+            &tool_results,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].result_preview.as_deref(),
+            Some("hello\n"),
+            "string output must pass through verbatim"
+        );
+    }
+
+    #[test]
+    fn build_bridge_records_object_output_coerces_to_string_not_silent() {
+        // Regression: if upstream serialization bug puts an object `{}`
+        // in the `output` field instead of a string, the old code would
+        // silently pass `"{}"` to the LLM — the model then says "tool
+        // returned {}". The fix logs a warning and still coerces, but
+        // the string is at least traceable.
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "function": {"name": "bash", "arguments": "{}"}
+        })];
+        let tool_results = vec![json!({
+            "request_id": "call-1",
+            "name": "bash",
+            "status": "ok",
+            "output": {},
+            "duration_ms": 50
+        })];
+        let records = build_bridge_tool_call_records(
+            &tool_calls,
+            &tool_results,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(records.len(), 1);
+        // Coerced to string representation of the JSON value
+        assert_eq!(
+            records[0].result_preview.as_deref(),
+            Some("{}"),
+            "object output gets coerced to its JSON string form"
+        );
+        // The key assertion is that this path now logs a warning
+        // (verified by the agent_warn! call presence in the code).
+    }
+
+    #[test]
+    fn build_bridge_records_null_output_becomes_empty() {
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "function": {"name": "bash", "arguments": "{}"}
+        })];
+        let tool_results = vec![json!({
+            "request_id": "call-1",
+            "name": "bash",
+            "status": "ok",
+            "output": null,
+            "duration_ms": 50
+        })];
+        let records = build_bridge_tool_call_records(
+            &tool_calls,
+            &tool_results,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(records.len(), 1);
+        // null output → empty string (not "null")
+        assert!(
+            records[0].result_preview.is_none() || records[0].result_preview.as_deref() == Some(""),
+            "null output should become empty, got: {:?}",
+            records[0].result_preview
+        );
+    }
+
+    #[test]
+    fn build_bridge_records_missing_output_is_none() {
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "function": {"name": "bash", "arguments": "{}"}
+        })];
+        let tool_results = vec![json!({
+            "request_id": "call-1",
+            "name": "bash",
+            "status": "ok",
+            "duration_ms": 50
+        })];
+        let records = build_bridge_tool_call_records(
+            &tool_calls,
+            &tool_results,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].result_preview, None,
+            "missing output field → None (not empty string)"
+        );
     }
 }
