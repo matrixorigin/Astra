@@ -111,6 +111,43 @@ pub(crate) trait HistoryCell: Debug + Send + Sync + Any {
     }
 }
 
+/// Tracks the moment a live cell freezes so the gradient gutter can
+/// pin its phase. Centralised here so all `HistoryCell` impls share
+/// one stamping discipline:
+///   * `stamp_now()` — first-write-wins stamp at finalize / complete.
+///   * `revived()` — launch-independent sentinel for cells rebuilt
+///     from persistence.
+///   * `phase()` — feeds `frozen_phase()` via `shimmer::time_at`.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct FreezeStamp(Option<std::time::Instant>);
+
+impl FreezeStamp {
+    /// First-write-wins. Subsequent calls are no-ops so re-entrant
+    /// finalize/complete paths don't push the pinned phase forward.
+    pub(crate) fn stamp_now(&mut self) {
+        if self.0.is_none() {
+            self.0 = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Stamp used by `from_persist` constructors. Pins all revived
+    /// cells to the process time origin (= phase 0) so they share
+    /// a deterministic, launch-independent gutter hue.
+    pub(crate) fn revived() -> Self {
+        Self(Some(crate::tui::shimmer::process_start()))
+    }
+
+    /// Process-relative phase in seconds, or `None` while live.
+    pub(crate) fn phase(self) -> Option<f32> {
+        self.0.map(crate::tui::shimmer::time_at)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_set(self) -> bool {
+        self.0.is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Unit tests that pin trait defaults. Concrete cell tests live

@@ -69,7 +69,7 @@ pub(crate) struct AssistantCell {
     /// Stamped by `finalize()`. Lets the active-slot gradient gutter
     /// pin its phase at the freeze moment instead of snapping to
     /// `t = 0` on the post-freeze frame.
-    frozen_at: Option<Instant>,
+    frozen_at: super::FreezeStamp,
 }
 
 impl AssistantCell {
@@ -80,7 +80,7 @@ impl AssistantCell {
             ts: None,
             started_at: None,
             token_estimate: 0.0,
-            frozen_at: None,
+            frozen_at: super::FreezeStamp::default(),
         }
     }
 
@@ -94,7 +94,7 @@ impl AssistantCell {
             ts: None,
             started_at: None,
             token_estimate: 0.0,
-            frozen_at: None,
+            frozen_at: super::FreezeStamp::default(),
         }
     }
 
@@ -114,7 +114,10 @@ impl AssistantCell {
                 ts,
                 started_at: None,
                 token_estimate: 0.0,
-                frozen_at: None,
+                // Resumed from persistence — already settled. See
+                // `FreezeStamp::revived` for the launch-independent
+                // phase rationale.
+                frozen_at: super::FreezeStamp::revived(),
             }),
             _ => None,
         }
@@ -276,13 +279,11 @@ impl HistoryCell for AssistantCell {
 
     fn finalize(&mut self) {
         self.live = false;
-        if self.frozen_at.is_none() {
-            self.frozen_at = Some(Instant::now());
-        }
+        self.frozen_at.stamp_now();
     }
 
     fn frozen_phase(&self) -> Option<f32> {
-        self.frozen_at.map(crate::tui::shimmer::time_at)
+        self.frozen_at.phase()
     }
 
     fn to_persist(&self) -> Option<TurnEvent> {
@@ -376,14 +377,14 @@ fn render_body_with_gutter(
         return Vec::new();
     }
     // When the cell owns the gutter, reserve 2 cols for `┃ `. While
-    // live, the active-slot wrapper already reserved those cols on
-    // the outside, so we render flush to use the full inner width.
+    // live, the active-slot wrapper (`tui::LiveFramedCell`) has
+    // *already* subtracted those 2 cols from the `width` it forwarded
+    // via `display_lines`, so on both paths `width` is the inner
+    // width — apply the floor uniformly. Keeping the two paths on the
+    // same `inner_w` formula prevents a one-column re-wrap when a
+    // cell transitions live → settled near the floor boundary.
     let prepend_gutter = !live;
-    let inner_w = if prepend_gutter {
-        (width as usize).saturating_sub(2).max(20)
-    } else {
-        (width as usize).max(20)
-    };
+    let inner_w = (width as usize).max(20);
     let text = render_markdown_text_with_width(source, Some(inner_w));
     let rendered: Vec<Line<'static>> = text.lines.iter().map(line_to_static).collect();
 

@@ -9,14 +9,33 @@ use super::terminal_palette::{default_bg, default_fg};
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
+/// Period in seconds for one full hue revolution along the live
+/// gradient gutter painted by `tui::LiveFramedCell`. Centralised so
+/// the live-frame renderer and any future caller (status bars,
+/// secondary accents) share a single tempo.
+pub(crate) const LIVE_GUTTER_PERIOD_SECS: f32 = 3.0;
+
 /// Eagerly initialize the shimmer time origin. Call once near the
 /// top of `run_tui_repl` so any `Instant` captured later by a cell's
 /// `finalize()` is guaranteed to be `>= PROCESS_START`. Without this,
 /// the first cell to finalize before any `elapsed_since_start()` /
-/// `gradient_color_at` call would saturate `time_at` to 0 and the
+/// `gradient_color_at_t` call would saturate `time_at` to 0 and the
 /// gutter colour would jump on freeze.
 pub(crate) fn init_time_origin() {
     let _ = PROCESS_START.get_or_init(Instant::now);
+}
+
+/// Stable freeze stamp for cells revived from persistence. Uses the
+/// process time origin (= phase 0) instead of `Instant::now()` so all
+/// resumed cells share a deterministic, launch-independent gutter
+/// hue. Avoids the "every revived cell pinned to launch-time phase"
+/// visual where they would all render the same colour after resume.
+/// Process time origin. Lazy on first call but `init_time_origin()`
+/// is invoked at TUI startup so subsequent reads are pure getters.
+/// Used by `FreezeStamp::revived` to pin all persistence-restored
+/// cells to phase 0 (= deterministic, launch-independent gutter hue).
+pub(crate) fn process_start() -> Instant {
+    *PROCESS_START.get_or_init(Instant::now)
 }
 
 pub(crate) fn elapsed_since_start() -> Duration {
@@ -34,23 +53,14 @@ pub(crate) fn time_at(i: Instant) -> f32 {
     i.saturating_duration_since(start).as_secs_f32()
 }
 
-/// RGB color for a given "position along a border" (0..len) at the
-/// current moment in time. Produces a flowing rainbow-ish gradient
-/// — warm pinks → cool blues → back. Hue advances with time and
-/// along the border, giving a "wave travelling along the bar" effect.
-pub(crate) fn gradient_color_at(pos: usize, len: usize, period_seconds: f32) -> (u8, u8, u8) {
-    gradient_color_at_t(
-        pos,
-        len,
-        period_seconds,
-        elapsed_since_start().as_secs_f32(),
-    )
-}
-
-/// Same as [`gradient_color_at`] but takes the time component
-/// explicitly, so callers can lock the phase at a snapshot moment
-/// (e.g. when a streaming cell finalizes — pin `t = freeze_phase` so
-/// the gradient stops in place instead of jumping back to t=0).
+/// RGB color for a given "position along a border" (0..len) at time
+/// `t` (process-relative seconds, same basis as [`time_at`] /
+/// [`elapsed_since_start`]). Live callers pass `elapsed_since_start()`;
+/// frozen callers pass the cell's `frozen_phase` so the gradient
+/// locks at the exact phase it had on the final live frame instead
+/// of jumping back to t=0. Produces a flowing rainbow-ish gradient
+/// — warm pinks → cool blues → back; hue advances with both `t` and
+/// `pos`, giving a "wave travelling along the bar" effect.
 pub(crate) fn gradient_color_at_t(
     pos: usize,
     len: usize,

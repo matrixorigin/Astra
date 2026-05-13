@@ -1361,7 +1361,7 @@ impl render::renderable::Renderable for LiveFramedCell {
         // the time component. Live reads `now`; frozen pins the value
         // captured at finalize, so colors don't snap on transition.
         let height = area.height as usize;
-        let period = 3.0_f32;
+        let period = shimmer::LIVE_GUTTER_PERIOD_SECS;
         let t = match self.freeze_phase {
             Some(t) => t,
             None => shimmer::elapsed_since_start().as_secs_f32(),
