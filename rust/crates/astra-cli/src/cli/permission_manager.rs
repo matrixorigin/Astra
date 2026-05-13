@@ -668,6 +668,14 @@ impl PermissionManager {
     ///
     /// The child agent inherits the parent's permission mode and rules,
     /// but can still load project-level settings for additional rules.
+    ///
+    /// Issue #326 P0 / R1 Major 10 / task #17: if the parent envelope
+    /// carries a `fingerprinted_overrides` JSON blob, we deserialize
+    /// it back into the child's `session_overrides` so the child
+    /// honours per-fingerprint decisions (`Bash(cargo test:*) → Allow`)
+    /// instead of relying on the legacy `tool_name → bool` collapse.
+    /// A deserialization failure logs a warning and leaves overrides
+    /// empty rather than silently downgrading to a wider rule.
     pub(super) fn with_inherited(
         project_root: &Path,
         inherited: astra_runtime::orchestration::InheritedPermissions,
@@ -696,10 +704,30 @@ impl PermissionManager {
         let user_settings = user_outcome.settings;
         let cached_user_allow = user_settings.parsed_allow_rules();
         let cached_user_deny = user_settings.parsed_deny_rules();
+
+        // Decode the parent's fingerprinted overrides if any. Failures
+        // are loud (tracing::warn) — we never silently fall back to a
+        // wider tool-level rule.
+        let session_overrides = match inherited.fingerprinted_overrides.as_ref() {
+            Some(value) => match serde_json::from_value::<
+                astra_turn_core::approval_fingerprint::FingerprintedOverrides,
+            >(value.clone())
+            {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    tracing::warn!(
+                        "permission_manager: child failed to decode fingerprinted_overrides from parent: {err}; \
+                         child will run with no session overrides (still has parent allow/deny rules)"
+                    );
+                    astra_turn_core::approval_fingerprint::FingerprintedOverrides::default()
+                }
+            },
+            None => astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
+        };
+
         Self {
             mode,
-            session_overrides:
-                astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
+            session_overrides,
             denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker::default(),
             recent_rejections: std::collections::VecDeque::new(),
             trusted_sandbox_roots: Vec::new(),
@@ -749,6 +777,22 @@ impl PermissionManager {
     }
 
     /// Export the current effective permission envelope for a spawned child agent.
+    ///
+    /// Issue #326 P0 / R1 Major 10 / task #17: previously this method
+    /// called `session_overrides.to_legacy_overrides()`, which collapses
+    /// every fingerprinted decision into a `tool_name → bool` map. So
+    /// a parent who pressed "Always" on `Bash(cargo test:*)` would
+    /// hand the child a `Bash → Allow` envelope, and the child could
+    /// then run `Bash(rm -rf …)` without ever asking. That is exactly
+    /// the bypass review-r1 calls out.
+    ///
+    /// We now hand the child the raw `FingerprintedOverrides` (encoded
+    /// as JSON because runtime types can't depend on
+    /// `approval_fingerprint`). The child is expected to consult those
+    /// fingerprints first; only if no fingerprint matches does it fall
+    /// through to the legacy `allow_rules` / `deny_rules`. The
+    /// `to_legacy_overrides()` helper still exists for telemetry /
+    /// display but is **no longer wired into enforcement**.
     pub(super) fn inherited_permissions_for_child(
         &self,
         is_background: bool,
@@ -782,14 +826,24 @@ impl PermissionManager {
         for rule in self.cached_user_deny.iter().chain(self.cached_deny.iter()) {
             inherited.add_deny(RuntimePermissionRule::parse(&rule.to_string()));
         }
-        for (tool, allowed) in &self.session_overrides.to_legacy_overrides() {
-            let runtime_rule = RuntimePermissionRule::parse(tool);
-            if *allowed {
-                inherited.deny_rules.retain(|rule| rule != &runtime_rule);
-                inherited.add_allow(runtime_rule);
-            } else {
-                inherited.allow_rules.retain(|rule| rule != &runtime_rule);
-                inherited.add_deny(runtime_rule);
+
+        // Pass fingerprinted overrides as the **authoritative** source
+        // of session-level decisions. We serialize the
+        // FingerprintedOverrides to JSON so the runtime type stays
+        // dependency-free; the child decodes it back. If serialization
+        // fails (it shouldn't — these are simple owned strings/enums),
+        // we deliberately do NOT fall back to to_legacy_overrides:
+        // a downgrade-on-error would re-introduce the bypass we're
+        // fixing here.
+        match serde_json::to_value(&self.session_overrides) {
+            Ok(value) if !value.is_null() => {
+                inherited.fingerprinted_overrides = Some(value);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    "permission_manager: failed to serialize session_overrides for child agent: {err} — child will see only persistent allow/deny rules"
+                );
             }
         }
 
@@ -3685,9 +3739,12 @@ mod tests {
 
     #[test]
     fn inherited_permissions_for_child_includes_session_overrides() {
-        use astra_runtime::orchestration::{
-            PermissionMode as RuntimeMode, PermissionRule as RuntimeRule,
-        };
+        // Issue #326 P0 / R1 Major 10 / task #17:
+        // session_overrides now flow through `fingerprinted_overrides`
+        // (a serde_json::Value carrying the full FingerprintedOverrides),
+        // NOT through allow_rules / deny_rules. The latter would lose
+        // command-prefix granularity.
+        use astra_runtime::orchestration::PermissionMode as RuntimeMode;
 
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
@@ -3698,8 +3755,85 @@ mod tests {
 
         assert_eq!(inherited.mode, RuntimeMode::Prompt);
         assert!(inherited.is_background);
-        assert!(inherited.allow_rules.contains(&RuntimeRule::parse("bash")));
-        assert!(inherited.deny_rules.contains(&RuntimeRule::parse("edit")));
+        // The fingerprinted overrides survived the trip across the
+        // runtime boundary as a JSON blob.
+        assert!(
+            inherited.fingerprinted_overrides.is_some(),
+            "fingerprinted_overrides must be populated; got {:?}",
+            inherited.fingerprinted_overrides
+        );
+    }
+
+    #[test]
+    fn child_inherits_fingerprinted_session_overrides_not_collapsed_to_tool_level() {
+        // Contract test for issue #326 P0 / R1 Major 10 / task #17:
+        // parent allowed `Bash(cargo test:*)` via session override.
+        // The child must NOT see this as `Bash(*) → Allow` (which would
+        // let it run `Bash(rm -rf …)`); it must reconstruct the same
+        // command-prefix-level fingerprint and only allow `cargo test`.
+        use astra_runtime::orchestration::PermissionMode as RuntimeMode;
+        use astra_turn_core::approval_fingerprint::{ApprovalFingerprint, SideEffectClass};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        // Parent presses Always on `Bash(cargo test:*)` → session override.
+        let cargo_test_fp = ApprovalFingerprint {
+            tool_name: "bash".to_string(),
+            command_prefix: Some("cargo test".to_string()),
+            path_pattern: None,
+            side_effect: SideEffectClass::Execute,
+        };
+        parent.session_overrides.insert(cargo_test_fp.clone(), true);
+
+        // Hand off to child.
+        let envelope = parent.inherited_permissions_for_child(true);
+        assert_eq!(envelope.mode, RuntimeMode::Prompt);
+
+        let child_dir = tempfile::tempdir().unwrap();
+        let child = PermissionManager::with_inherited(child_dir.path(), envelope);
+
+        // The child's session_overrides must contain the same fingerprint.
+        // Verify by re-running the override lookup: `cargo test` should
+        // be allowed; `rm -rf /tmp` must NOT match the override (the
+        // override is command-prefix-level; rm doesn't share that prefix).
+        let cargo_test_match = child.session_overrides.check(&cargo_test_fp);
+        assert_eq!(
+            cargo_test_match,
+            Some(true),
+            "child must inherit the cargo-test fingerprint Allow decision"
+        );
+
+        let rm_fp = ApprovalFingerprint {
+            tool_name: "bash".to_string(),
+            command_prefix: Some("rm -rf".to_string()),
+            path_pattern: None,
+            side_effect: SideEffectClass::Execute,
+        };
+        let rm_match = child.session_overrides.check(&rm_fp);
+        assert!(
+            rm_match.is_none() || rm_match == Some(false),
+            "child must NOT see the cargo-test override generalize to rm; got {rm_match:?}"
+        );
+    }
+
+    #[test]
+    fn child_with_corrupt_fingerprinted_payload_falls_back_quietly() {
+        // If the JSON blob fails to decode (shouldn't happen in
+        // practice, but the contract is "warn loudly, never silently
+        // downgrade to a wider rule"), the child gets an empty
+        // session_overrides and otherwise-default behaviour. Crucially
+        // the parent's allow_rules / deny_rules are still honoured.
+        use astra_runtime::orchestration::{InheritedPermissions, PermissionMode as RuntimeMode};
+
+        let mut envelope = InheritedPermissions::new(RuntimeMode::Prompt);
+        envelope.fingerprinted_overrides =
+            Some(serde_json::json!({"this is": "not the right shape"}));
+
+        let dir = tempfile::tempdir().unwrap();
+        let child = PermissionManager::with_inherited(dir.path(), envelope);
+
+        assert!(child.session_overrides.is_empty());
     }
 
     #[test]

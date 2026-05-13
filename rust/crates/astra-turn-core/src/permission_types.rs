@@ -178,6 +178,25 @@ pub struct InheritedPermissions {
     /// Whether this agent runs in background (cannot show interactive prompts).
     #[serde(default)]
     pub is_background: bool,
+    /// Issue #326 P0 / R1 Major 10 / task #17:
+    /// Fingerprinted session overrides from the parent. The legacy
+    /// `allow_rules` / `deny_rules` above carry **command-prefix-level**
+    /// rules; this field carries **per-fingerprint** decisions
+    /// (`Bash(cargo test:*) → Allow` is **not** the same as
+    /// `Bash(*) → Allow`). Children must consult this BEFORE the legacy
+    /// rules so a "user pressed Always on cargo test" decision doesn't
+    /// get downgraded to "Bash is fully allowed".
+    ///
+    /// Stored as a serialized JSON Value so we don't pull
+    /// `astra_turn_core::approval_fingerprint::FingerprintedOverrides`
+    /// into the public type signature (avoids the cyclic dependency
+    /// between `astra-turn-core::permission_types` and
+    /// `astra-turn-core::approval_fingerprint`). The deserialization
+    /// is best-effort: if a child receives a payload that fails to
+    /// parse, it falls back to the legacy allow/deny rules and logs a
+    /// warning — never silently downgrades.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprinted_overrides: Option<serde_json::Value>,
 }
 
 impl InheritedPermissions {
