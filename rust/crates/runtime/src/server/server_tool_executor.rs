@@ -1769,10 +1769,10 @@ impl ServerToolExecutor {
                 "Error: session_history_search failed operation=preflight reason=database_pool_not_configured".to_string(),
             );
         }
-        let query = json_str_arg(args, "query").unwrap_or("").trim();
-        if query.is_empty() {
+        let pattern = json_str_arg(args, "pattern").unwrap_or("").trim();
+        if pattern.is_empty() {
             return astra_tools::ToolResult::error(
-                "Error: session_history_search requires a non-empty query".to_string(),
+                "Error: session_history_search requires a non-empty pattern".to_string(),
             );
         }
 
@@ -1798,7 +1798,7 @@ impl ServerToolExecutor {
         let scanned = rows.len();
         let chunk_rows = if role.is_none() {
             match self
-                .query_session_history_chunk_rows(query, limit.saturating_mul(4).max(20))
+                .query_session_history_chunk_rows(pattern, limit.saturating_mul(4).max(20))
                 .await
             {
                 Ok(chunk_rows) => chunk_rows,
@@ -1817,10 +1817,10 @@ impl ServerToolExecutor {
         };
         let chunk_candidates = chunk_rows.len();
         rows.extend(chunk_rows);
-        rows.retain(|row| session_history_match_score(query, &row.content) > 0);
+        rows.retain(|row| session_history_match_score(pattern, &row.content) > 0);
         rows.sort_by(|left, right| {
-            let right_score = session_history_match_score(query, &right.content);
-            let left_score = session_history_match_score(query, &left.content);
+            let right_score = session_history_match_score(pattern, &right.content);
+            let left_score = session_history_match_score(pattern, &left.content);
             right_score
                 .cmp(&left_score)
                 .then_with(|| right.item_seq.cmp(&left.item_seq))
@@ -1831,7 +1831,7 @@ impl ServerToolExecutor {
             "session_history_search",
             &rows,
             Some(format!(
-                "query={query:?} scanned_transcript_rows={scanned} chunk_candidates={chunk_candidates}; call session_history_around(item_seq=<seq>) to inspect exact surrounding turns"
+                "pattern={pattern:?} scanned_transcript_rows={scanned} chunk_candidates={chunk_candidates}; call session_history_around(item_seq=<seq>) to inspect exact surrounding turns"
             )),
         ))
     }
@@ -2104,14 +2104,10 @@ impl ServerToolExecutor {
                     "rollback_edits" => tool_result_from_output(self.rollback_file_edits(args)),
                     "ask_user" => self.server_ask_user(args).await,
                     "sleep" => self.default_executor.execute("sleep", args).await,
-                    "tool_search" => tool_result_from_output(astra_tools::tool_search::tool_search(
-                        &crate::capabilities::server_runtime_tool_schemas(),
-                        args,
-                    )),
                     "history_page" => self.tool_session_history_page(args).await,
                     "history_search" => self.tool_session_history_search(args).await,
                     "history_around" => self.tool_session_history_around(args).await,
-                    "" => tool_result_from_output("Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep, tool_search, history_page, history_search, history_around".to_string()),
+                    "" => tool_result_from_output("Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep, history_page, history_search, history_around".to_string()),
                     other => tool_result_from_output(format!("Unknown session action: '{other}'")),
                 }
             }

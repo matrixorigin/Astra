@@ -287,6 +287,42 @@ async fn column_exists(
     Ok(row.try_get::<i64, _>("count").unwrap_or(0) > 0)
 }
 
+async fn varchar_column_max_len(
+    pool: &Pool<MySql>,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    let row = query(
+        "SELECT CHARACTER_MAXIMUM_LENGTH AS max_len
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?
+         LIMIT 1",
+    )
+    .bind(schema)
+    .bind(table)
+    .bind(column)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|row| row.try_get::<i64, _>("max_len").ok()))
+}
+
+async fn widen_varchar_if_shorter(
+    pool: &Pool<MySql>,
+    schema: &str,
+    table: &str,
+    column: &str,
+    min_len: i64,
+    ddl: &str,
+) -> Result<(), sqlx::Error> {
+    if let Some(current_len) = varchar_column_max_len(pool, schema, table, column).await?
+        && current_len < min_len
+    {
+        query(ddl).execute(pool).await?;
+    }
+    Ok(())
+}
+
 async fn index_exists(
     pool: &Pool<MySql>,
     schema: &str,
@@ -303,25 +339,6 @@ async fn index_exists(
     .fetch_one(pool)
     .await?;
     Ok(row.try_get::<i64, _>("count").unwrap_or(0) > 0)
-}
-
-async fn check_clause_contains(
-    pool: &Pool<MySql>,
-    schema: &str,
-    needle: &str,
-) -> Result<bool, sqlx::Error> {
-    let rows = query(
-        "SELECT CHECK_CLAUSE FROM INFORMATION_SCHEMA.CHECK_CONSTRAINTS
-         WHERE CONSTRAINT_SCHEMA = ?",
-    )
-    .bind(schema)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().any(|row| {
-        row.try_get::<String, _>("CHECK_CLAUSE")
-            .map(|clause| clause.contains(needle))
-            .unwrap_or(false)
-    }))
 }
 
 async fn add_column_if_missing(
@@ -776,6 +793,15 @@ pub async fn ensure_core_schema(
         )",
     )
     .execute(&pool)
+    .await?;
+    widen_varchar_if_shorter(
+        &pool,
+        &settings.database,
+        "session_state_revisions",
+        "revision_hash",
+        96,
+        "ALTER TABLE session_state_revisions MODIFY COLUMN revision_hash VARCHAR(96) NOT NULL",
+    )
     .await?;
 
     query(
@@ -1425,7 +1451,7 @@ pub async fn ensure_core_schema(
             quirks JSON NULL,
             thinking_capability VARCHAR(20) NULL,
             thinking_probe_error TEXT NULL,
-            created_by VARCHAR(36) NULL,
+            created_by VARCHAR(128) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             INDEX idx_infra_llm_models_active_provider_name (is_active, provider, model_name)
@@ -1435,13 +1461,20 @@ pub async fn ensure_core_schema(
     .await?;
 
     // Migration: add thinking_capability columns for existing deployments.
-    for alter in [
-        "ALTER TABLE infra_llm_models ADD COLUMN IF NOT EXISTS thinking_capability VARCHAR(20) NULL",
-        "ALTER TABLE infra_llm_models ADD COLUMN IF NOT EXISTS thinking_probe_error TEXT NULL",
+    // MatrixOne does not support MySQL's `ADD COLUMN IF NOT EXISTS`, so use
+    // INFORMATION_SCHEMA first and only issue plain ALTER when the column is
+    // absent. This keeps startup logs clean and avoids swallowing syntax errors.
+    for (column, ddl) in [
+        (
+            "thinking_capability",
+            "ALTER TABLE infra_llm_models ADD COLUMN thinking_capability VARCHAR(20) NULL",
+        ),
+        (
+            "thinking_probe_error",
+            "ALTER TABLE infra_llm_models ADD COLUMN thinking_probe_error TEXT NULL",
+        ),
     ] {
-        if let Err(e) = query(alter).execute(&pool).await {
-            tracing::warn!("migration skip (may already exist): {e}");
-        }
+        add_column_if_missing(&pool, &settings.database, "infra_llm_models", column, ddl).await?;
     }
 
     // Migration: promote legacy quirks.fallback_model (string) → quirks.fallback_chain (array).
@@ -1454,8 +1487,7 @@ pub async fn ensure_core_schema(
                 JSON_ARRAY(JSON_EXTRACT(quirks, '$.fallback_model'))
             )
           WHERE JSON_EXTRACT(quirks, '$.fallback_model') IS NOT NULL
-            AND (JSON_EXTRACT(quirks, '$.fallback_chain') IS NULL
-                 OR JSON_LENGTH(JSON_EXTRACT(quirks, '$.fallback_chain')) = 0)",
+            AND JSON_EXTRACT(quirks, '$.fallback_chain') IS NULL",
     )
     .execute(&pool)
     .await
@@ -1558,7 +1590,7 @@ pub async fn ensure_core_schema(
             status VARCHAR(20) NOT NULL DEFAULT 'active',
             source VARCHAR(50) NOT NULL DEFAULT 'user',
             is_public SMALLINT NOT NULL DEFAULT 0,
-            created_by VARCHAR(36) NULL,
+            created_by VARCHAR(128) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY uq_skill_name_version (skill_name, version),
@@ -1572,6 +1604,15 @@ pub async fn ensure_core_schema(
         )",
     )
     .execute(&pool)
+    .await?;
+    widen_varchar_if_shorter(
+        &pool,
+        &settings.database,
+        "skills_registry",
+        "created_by",
+        128,
+        "ALTER TABLE skills_registry MODIFY COLUMN created_by VARCHAR(128) NULL",
+    )
     .await?;
 
     query(
@@ -1941,18 +1982,6 @@ pub async fn ensure_core_schema(
             tracing::debug!("phase4 additive index migration skipped: {table}.{index}: {e}");
         }
     }
-    if !check_clause_contains(&pool, &settings.database, "access_scope")
-        .await
-        .unwrap_or(false)
-        && let Err(e) = query(
-            "ALTER TABLE session_artifacts ADD CONSTRAINT chk_session_artifacts_access_scope CHECK (access_scope IN ('private', 'delegation', 'delegation_direct', 'same_root_tree', 'user'))",
-        )
-        .execute(&pool)
-        .await
-    {
-        tracing::debug!("phase4 access_scope constraint migration skipped: {e}");
-    }
-
     // Step Protocol idempotency cache
     query(
         "CREATE TABLE IF NOT EXISTS step_idempotency_cache (

@@ -1608,6 +1608,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "session_info",
     "turn_complete",
     "turn_done",
+    "user_input",
     "usage",
     "explain",
     "error",
@@ -1654,6 +1655,14 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         "text_delta" => serde_json::json!({
             "type": "text_delta",
             "content": data.get("chunk").cloned().unwrap_or(serde_json::Value::String(String::new())),
+        }),
+        "assistant_delta" => serde_json::json!({
+            "type": "text_delta",
+            "content": data
+                .get("text")
+                .or_else(|| data.get("chunk"))
+                .cloned()
+                .unwrap_or(serde_json::Value::String(String::new())),
         }),
         "text_done" => serde_json::json!({
             "type": "text_done",
@@ -1711,6 +1720,24 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             "message": data.get("error").cloned().unwrap_or(serde_json::Value::String("Unknown error".to_string())),
             "code": "RUN_ERROR",
         }),
+        "approval_request" => {
+            let mut out = serde_json::json!({ "type": "approval_required" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
+        "user_input" => {
+            let mut out = serde_json::json!({ "type": "user_input" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
         // Turn-completion events carry the authoritative assistant
         // text for client reconciliation (the streaming deltas may be
         // stale if the server recovered mid-turn). Pass through with
@@ -1910,6 +1937,14 @@ mod tests {
     }
 
     #[test]
+    fn assistant_delta_maps_to_text_delta() {
+        let out =
+            transform_run_event_for_client(make_event("assistant_delta", json!({"text": "hi"})));
+        assert_eq!(out["type"], "text_delta");
+        assert_eq!(out["content"], "hi");
+    }
+
+    #[test]
     fn text_done() {
         let out =
             transform_run_event_for_client(make_event("text_done", json!({"full_text": "all"})));
@@ -2001,6 +2036,21 @@ mod tests {
     fn run_error_default_message() {
         let out = transform_run_event_for_client(make_event("run_error", json!({})));
         assert_eq!(out["message"], "Unknown error");
+    }
+
+    #[test]
+    fn approval_and_user_input_events_are_client_visible_for_replay() {
+        let approval = transform_run_event_for_client(make_event(
+            "approval_request",
+            json!({"approval_id": "approval-1"}),
+        ));
+        assert_eq!(approval["type"], "approval_required");
+        assert_eq!(approval["approval_id"], "approval-1");
+
+        let input =
+            transform_run_event_for_client(make_event("user_input", json!({"text": "approved"})));
+        assert_eq!(input["type"], "user_input");
+        assert_eq!(input["text"], "approved");
     }
 
     #[test]

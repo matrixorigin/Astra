@@ -143,19 +143,13 @@ async fn phase1_run_durability_schema_contract() {
         );
     }
 
-    let check_rows = sqlx::query(
-        "SELECT CHECK_CLAUSE FROM INFORMATION_SCHEMA.CHECK_CONSTRAINTS
-         WHERE CONSTRAINT_SCHEMA = ?",
-    )
-    .bind(&schema)
-    .fetch_all(pool.get())
-    .await
-    .expect("load check constraints");
-    let check_text = check_rows
-        .into_iter()
-        .filter_map(|row| row.try_get::<String, _>("CHECK_CLAUSE").ok())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let check_row = sqlx::query("SHOW CREATE TABLE agent_runs")
+        .fetch_one(pool.get())
+        .await
+        .expect("show create table agent_runs");
+    let check_text = check_row
+        .try_get::<String, _>(1)
+        .expect("agent_runs CREATE TABLE DDL");
     assert!(
         check_text.contains("retry_scope")
             && check_text.contains("node")

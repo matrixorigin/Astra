@@ -1480,25 +1480,29 @@ mod tests {
     #[test]
     fn session_artifact_handlers_enforce_session_scope_and_store_api() {
         let source = include_str!("session_handlers.rs");
+        let production_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("session_handlers.rs should contain production code before tests");
         assert!(
-            source.contains("get_session(session_id.clone(), user.user_id)"),
+            production_source.contains("get_session(session_id.clone(), user.user_id)"),
             "artifact handlers should verify session ownership before reading artifacts"
         );
         assert!(
-            source.contains(".list_json_artifacts("),
+            production_source.contains(".list_json_artifacts("),
             "artifact list handler should use the session artifact store list API"
         );
         assert!(
-            source.contains(".load_json_artifact(&artifact_id)"),
+            production_source.contains(".load_json_artifact(&artifact_id)"),
             "artifact get handler should use the session artifact store get API"
         );
         assert!(
-            source.contains(".load_latest_json_artifact(&session_id, &artifact_kind)"),
+            production_source.contains(".load_latest_json_artifact(&session_id, &artifact_kind)"),
             "artifact latest handler should use the session artifact store latest API"
         );
         assert!(
-            source.contains("build_presigned_artifact_download")
-                && !source.contains("serde_json::to_vec_pretty(&response)"),
+            production_source.contains("build_presigned_artifact_download")
+                && !production_source.contains("serde_json::to_vec_pretty(&response)"),
             "artifact download handler should return a presigned URL without loading payload into API memory"
         );
     }

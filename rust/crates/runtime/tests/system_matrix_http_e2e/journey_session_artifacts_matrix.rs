@@ -136,6 +136,51 @@ async fn get_bytes(
     (status, headers, bytes.to_vec())
 }
 
+fn assert_presigned_artifact_download(
+    session_id: &str,
+    artifact_id: &str,
+    body: &[u8],
+) -> serde_json::Value {
+    let download_j: serde_json::Value =
+        serde_json::from_slice(body).expect("presigned artifact download json");
+    assert_eq!(
+        download_j["artifact_id"].as_str(),
+        Some(artifact_id),
+        "download descriptor should identify the requested artifact: {download_j}"
+    );
+    assert_eq!(
+        download_j["method"].as_str(),
+        Some("GET"),
+        "download descriptor should use GET: {download_j}"
+    );
+    assert!(
+        download_j["expires_at"]
+            .as_str()
+            .is_some_and(|expires_at| !expires_at.is_empty()),
+        "download descriptor should include a non-empty expiry: {download_j}"
+    );
+    assert!(
+        download_j["signature"]
+            .as_str()
+            .is_some_and(|signature| signature.starts_with("sha256:")),
+        "download descriptor should include a sha256 signature: {download_j}"
+    );
+    let download_url = download_j["download_url"]
+        .as_str()
+        .expect("download descriptor URL");
+    assert!(
+        download_url.contains(&format!(
+            "/sessions/{session_id}/artifacts/{artifact_id}/download/presigned"
+        )),
+        "download descriptor should target the scoped presigned route: {download_j}"
+    );
+    assert!(
+        download_url.contains("expires_at=") && download_url.contains("signature=sha256:"),
+        "download descriptor URL should carry expiry and signature query parameters: {download_j}"
+    );
+    download_j
+}
+
 #[derive(Clone)]
 struct RawTransportServerHits {
     stream_hits: Arc<AtomicU32>,
@@ -1191,20 +1236,9 @@ pub async fn run_session_artifact_latest_and_download_routes() {
             .and_then(|value| value.to_str().ok()),
         Some("application/json")
     );
-    let content_disposition = download_headers
-        .get("content-disposition")
-        .and_then(|value| value.to_str().ok())
-        .expect("content-disposition");
-    assert!(
-        content_disposition.contains("attachment;"),
-        "download should be an attachment: {content_disposition}"
-    );
-    assert!(
-        content_disposition.contains(artifact_id.as_str()),
-        "download filename should include the artifact id: {content_disposition}"
-    );
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(
         download_j["artifact_id"].as_str(),
         Some(artifact_id.as_str())
@@ -1435,8 +1469,9 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
             .and_then(|value| value.to_str().ok()),
         Some("application/json")
     );
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(
         download_j["artifact_id"].as_str(),
         Some(artifact_id.as_str())
@@ -1559,8 +1594,9 @@ async fn run_bridge_failure_session_artifact_latest_and_download_routes(
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(download_j["artifact_kind"].as_str(), Some("llm_capture"));
     assert_eq!(download_j["source"].as_str(), Some("bridge_inprocess"));
     assert_eq!(
@@ -1695,8 +1731,9 @@ pub async fn run_server_loop_block_parse_recovery_session_artifact_latest_and_do
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("success"));
     assert_eq!(
         download_j["content"]["response"]["full_text"].as_str(),
@@ -1841,8 +1878,9 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
     assert!(
         download_j["content"]["response"]["error"]
@@ -1988,8 +2026,9 @@ pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_downl
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
     assert_eq!(
         download_j["content"]["response"]["kind"].as_str(),
@@ -2135,8 +2174,9 @@ pub async fn run_server_loop_transport_recovery_session_artifact_latest_and_down
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("success"));
     assert_eq!(
         download_j["content"]["response"]["full_text"].as_str(),
@@ -2283,8 +2323,9 @@ pub async fn run_server_loop_transport_failure_session_artifact_latest_and_downl
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
     assert_eq!(
         download_j["content"]["response"]["kind"].as_str(),
@@ -2436,8 +2477,9 @@ pub async fn run_server_loop_idle_recovery_session_artifact_latest_and_download_
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("success"));
     assert_eq!(
         download_j["content"]["response"]["full_text"].as_str(),
@@ -2582,8 +2624,9 @@ pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_r
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
     assert!(
         download_j["content"]["response"]["error"]
@@ -2719,8 +2762,9 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
     assert_eq!(
         download_j["content"]["response"]["kind"].as_str(),
@@ -2867,8 +2911,9 @@ pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_an
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("success"));
     assert_eq!(
         download_j["content"]["response"]["full_text"].as_str(),
@@ -3042,8 +3087,9 @@ pub async fn run_bridge_tail_parse_error_artifact_preserves_partial_state_routes
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(
         download_j["metadata"]["outcome"].as_str(),
         Some("sse_parse_error")
@@ -3185,8 +3231,9 @@ pub async fn run_bridge_transport_failure_session_artifact_latest_and_download_r
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
     assert_eq!(
         download_j["content"]["response"]["kind"].as_str(),
@@ -3343,8 +3390,9 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(
         download_j["metadata"]["outcome"].as_str(),
         Some("client_disconnect")
@@ -3481,8 +3529,9 @@ pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
     assert_eq!(
         download_j["content"]["response"]["kind"].as_str(),
@@ -3606,8 +3655,9 @@ pub async fn run_bridge_rate_limit_failure_session_artifact_latest_and_download_
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
     assert_eq!(
         download_j["content"]["response"]["kind"].as_str(),
@@ -3750,8 +3800,9 @@ pub async fn run_bridge_rate_limit_retry_success_session_artifact_latest_and_dow
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("success"));
     assert_eq!(
         download_j["content"]["response"]["full_text"].as_str(),
@@ -3895,8 +3946,9 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
     let (st_download, _download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
+    let _download_descriptor =
+        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
+    let download_j = latest_j.clone();
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("success"));
     assert_eq!(
         download_j["content"]["response"]["tool_calls"][0]["function"]["name"].as_str(),

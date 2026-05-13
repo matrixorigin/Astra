@@ -858,6 +858,7 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
             &json!({
                 "version": "checkpoint_v1",
                 "graceful": true,
+                "last_batch_id": "batch-17",
                 "extra": {"partial_progress": {"step_index": 17, "total_steps": 17}}
             })
             .to_string(),

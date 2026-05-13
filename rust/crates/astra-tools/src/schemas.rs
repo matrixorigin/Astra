@@ -632,11 +632,11 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle and introspection. Actions: config, prioritize, deprioritize, set_goal, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep, tool_search, timeline, summary, history_page, history_search, history_around. Use the history_* actions when the user refers to older turns in this same chat and the visible context is insufficient.",
+                "description": "Session lifecycle and introspection. Actions: config, prioritize, deprioritize, set_goal, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep, timeline, summary, history_page, history_search, history_around. Use the history_* actions when the user refers to older turns in this same chat and the visible context is insufficient.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","enter_plan","exit_plan","rollback_edits","ask_user","sleep","tool_search","timeline","summary","history_page","history_search","history_around"]},
+                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","enter_plan","exit_plan","rollback_edits","ask_user","sleep","timeline","summary","history_page","history_search","history_around"]},
                         "key": {"type": "string", "description": "Config key"},
                         "value": {"type": "string", "description": "Config value"},
                         "tool": {"type": "string", "description": "Tool name (prioritize/deprioritize)"},
@@ -650,8 +650,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "context": {"type": "string", "description": "Brief context (ask_user)"},
                         "duration_ms": {"type": "integer", "description": "Sleep ms, max 300000"},
                         "reason": {"type": "string", "description": "Reason (sleep)"},
-                        "query": {"type": "string", "description": "Query for tool_search or history_search. For history_search, use a compact topic, phrase, filename, error text, decision, or Chinese/English keyword."},
-                        "max_results": {"type": "integer", "description": "Max results for tool_search (default 5)"},
+                        "pattern": {"type": "string", "description": "history_search search text: compact topic, phrase, filename, error text, decision, or Chinese/English keyword."},
                         "before_seq": {"type": "integer", "description": "history_page/history_search cursor: return transcript rows older than this item_seq."},
                         "after_seq": {"type": "integer", "description": "history_page/history_search cursor: return transcript rows newer than this item_seq."},
                         "item_seq": {"type": "integer", "description": "history_around anchor returned by history_page/history_search."},
@@ -666,7 +665,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "config": ["path", "value"],
                         "prioritize": ["tool"],
                         "deprioritize": ["tool"],
-                        "ask_user": ["question"]
+                        "ask_user": ["question"],
+                        "history_search": ["pattern"]
                     }
                 }
             }

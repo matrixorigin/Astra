@@ -248,7 +248,8 @@ async fn l2_13_revoke_and_auto_expire_events_have_symmetric_payload_shape() {
     }
 
     let rows = sqlx::query(
-        "SELECT event_type, lease_id, session_id, device_id, device_fingerprint, reason, ended_at_server
+        "SELECT event_type, lease_id, session_id, device_id, device_fingerprint, reason,
+                DATE_FORMAT(ended_at_server, '%Y-%m-%dT%H:%i:%s') AS ended_at_server
          FROM session_device_lease_events
          WHERE session_id = ?
          ORDER BY event_type ASC",
