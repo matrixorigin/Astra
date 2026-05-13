@@ -152,11 +152,11 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
   if (isUser) {
     return (
       <article className="flex justify-end py-4">
-        <div className="max-w-[80%] rounded-[22px] rounded-br-md bg-surface-muted px-[18px] py-3 text-[17px] leading-[1.6] text-text">
+        <div className="max-w-[80%] rounded-[22px] rounded-br-md bg-surface-muted px-[18px] py-3 text-[15px] font-normal leading-[1.55] tracking-[0.06em] text-text [-webkit-text-stroke:0.03px_currentColor]">
           <SkillMentionText
             content={content}
             skills={message.activeSkills}
-            className="text-[17px] leading-[1.6]"
+            className="text-[15px] leading-[1.55]"
           />
         </div>
       </article>
@@ -164,7 +164,7 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
   }
 
   return (
-    <article className="group py-1 pb-7">
+    <article className="group py-1 pb-8">
       {message.status === 'failed' ? (
         <div className="mb-3 inline-flex rounded-full bg-danger/10 px-2.5 py-1 text-xs font-medium text-danger">
           error

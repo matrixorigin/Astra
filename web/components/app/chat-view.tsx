@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ChatActionsMenu } from '@/components/app/chat-actions-menu';
+import { ChatDotNavigator } from '@/components/app/chat-dot-navigator';
 import { Composer } from '@/components/app/composer';
 import { MessageBubble } from '@/components/app/message-bubble';
 import { MoveChatModal } from '@/components/app/move-chat-modal';
@@ -239,13 +240,18 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         }}
         className="min-h-0 flex-1 overscroll-contain overflow-y-auto scroll-smooth"
       >
-        <div className="mx-auto w-full max-w-[720px] px-7 pb-44 pt-10">
-          {detail.messages.map((message) => <MessageBubble key={message.id} message={message} />)}
+        <div className="mx-auto w-full px-7 pb-44 pt-10 md:w-[70%]">
+          {detail.messages.map((message, index) => (
+            <div key={message.id} data-chat-message-index={index}>
+              <MessageBubble message={message} />
+            </div>
+          ))}
         </div>
       </div>
+      <ChatDotNavigator messageCount={detail.messages.length} scrollContainerRef={scrollRef} />
 
       <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 bg-gradient-to-t from-bg via-bg/95 to-bg/0 px-7 pb-6 pt-12">
-        <div className="pointer-events-auto mx-auto max-w-[720px]">
+        <div className="pointer-events-auto mx-auto w-full md:w-[70%]">
           {isArchived ? (
             <div className="rounded-[20px] border border-border bg-surface px-5 py-4 shadow-[0_0.25rem_1.25rem_rgba(28,25,23,0.06),0_0_0_0.5px_rgba(120,113,108,0.18)]">
               <div className="flex items-center justify-between gap-4">

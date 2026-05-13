@@ -1,0 +1,8 @@
+@font-face {
+  font-family: 'FZ PingXian YaSong';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url('./FZPingXianYaSong.ttf') format('truetype');
+  unicode-range: U+4E00-9FFF, U+3000-303F, U+FF00-FFEF, U+2000-206F;
+}
