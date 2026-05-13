@@ -1859,8 +1859,23 @@ impl PermissionManager {
                 .to_string()
                 + "."
         }
+
+        // ── Issue #326 P2 / R1 Major 3 / EVALUATION_ORDER ────────────────
+        //
+        // Step 1 (DenyRules) runs first, even for `sandbox_expand:*`.
+        // Previously the sandbox_expand short-circuit sat above this
+        // block, which let Auto mode bypass deny rules — exactly the
+        // R1 Major 3 finding. The pinning test in
+        // `astra_turn_core::permission_engine::tests::deny_rules_precede_sandbox_expand`
+        // locks this ordering.
+        if self.check_deny_rules(name, args) {
+            return PermissionDecision::Deny("Denied by rule".into());
+        }
+
         // Sandbox expansion requests always require explicit user approval,
         // regardless of permission mode (except Auto which trusts everything).
+        // BUT: deny rules ran first (above), so a user who has explicitly
+        // denied a path still wins over Auto mode's "trust everything".
         if let Some(inner_tool) = name.strip_prefix("sandbox_expand:") {
             let reason = args
                 .get("reason")
@@ -1907,11 +1922,6 @@ impl PermissionManager {
                     reason: trim_sandbox_reason_for_ui(reason),
                 },
             };
-        }
-
-        // Step 1: Deny rules (bypass-immune).
-        if self.check_deny_rules(name, args) {
-            return PermissionDecision::Deny("Denied by rule".into());
         }
 
         // Step 2: Read-only tools always allowed (before overrides, same as check()).
@@ -3300,6 +3310,36 @@ mod tests {
             matches!(decision, PermissionDecision::NeedApproval { .. }),
             "canonicalized candidate should point at the symlink target, not the trusted root"
         );
+    }
+
+    #[test]
+    fn sandbox_expand_respects_deny_rule_in_auto_mode() {
+        // Issue #326 P2 / R1 Major 3: previously the `sandbox_expand:*`
+        // short-circuit ran BEFORE deny rules, so Auto mode would
+        // grant sandbox expansion even for a path the user had
+        // explicitly denied. Now Step 1 (DenyRules) runs first.
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+
+        // User pinned a deny rule on `sandbox_expand` — represents
+        // "I never want this tool to widen the sandbox".
+        pm.settings.deny.push("sandbox_expand:read_file".to_string());
+        pm.cached_deny = pm.settings.parsed_deny_rules();
+
+        let args = serde_json::json!({"reason": "/tmp/foo"});
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+
+        match decision {
+            PermissionDecision::Deny(reason) => {
+                assert!(
+                    reason.contains("rule") || reason.contains("Denied"),
+                    "expected deny-by-rule message, got: {reason}"
+                );
+            }
+            other => panic!(
+                "deny rule must beat sandbox_expand even in Auto mode; got {other:?}"
+            ),
+        }
     }
 
     #[test]
