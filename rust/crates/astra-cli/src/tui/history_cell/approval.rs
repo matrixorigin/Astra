@@ -76,6 +76,16 @@ pub(crate) struct ApprovalCell {
     /// Issue #326 P3 / scenario #39: remote host label rendered
     /// as `host:` prefix on the detail block.
     pub host: Option<String>,
+    /// Issue #326 P5d / R2 Minor 1: post-save confirmation
+    /// message. Distinct from `will_save_preview` (the *future*
+    /// rule shown before the user clicks Always) — this is the
+    /// *past* outcome shown after the save attempt:
+    ///
+    ///   None        -> not yet attempted (or no Always pressed)
+    ///   Some("…")   -> save outcome, e.g.
+    ///                  "Saved to .kiro/permissions.json" or
+    ///                  "Failed to save rule: <reason>"
+    pub save_outcome: Option<String>,
 }
 
 impl ApprovalCell {
@@ -99,6 +109,7 @@ impl ApprovalCell {
             will_save_preview: None,
             source_agent: None,
             host: None,
+            save_outcome: None,
         }
     }
 
@@ -125,6 +136,7 @@ impl ApprovalCell {
             will_save_preview: None,
             source_agent: None,
             host: None,
+            save_outcome: None,
         }
     }
 
@@ -153,6 +165,15 @@ impl ApprovalCell {
     #[must_use]
     pub fn with_host(mut self, host: impl Into<String>) -> Self {
         self.host = Some(host.into());
+        self
+    }
+
+    /// Issue #326 P5d / R2 Minor 1: post-save confirmation
+    /// line. Use `Saved to …` for success, `Failed to save
+    /// rule: …` for failure.
+    #[must_use]
+    pub fn with_save_outcome(mut self, outcome: impl Into<String>) -> Self {
+        self.save_outcome = Some(outcome.into());
         self
     }
 
@@ -307,6 +328,23 @@ impl HistoryCell for ApprovalCell {
                     preview.clone(),
                     body_style.add_modifier(Modifier::BOLD),
                 ),
+            ]));
+        }
+
+        // Save outcome (issue #326 P5d / R2 Minor 1): the
+        // post-action confirmation. We use a green-leaning
+        // body style for "Saved" and yellow for "Failed".
+        if let Some(outcome) = &self.save_outcome {
+            let outcome_style = if outcome.starts_with("Failed") {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            lines.push(Line::from(vec![
+                bar.clone(),
+                Span::styled(outcome.clone(), outcome_style),
             ]));
         }
 
@@ -469,6 +507,42 @@ mod tests {
             rendered.contains("Will save: Bash(npm test:*)"),
             "expected Will save preview line, got:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn renders_save_outcome_when_present() {
+        // Issue #326 P5d / R2 Minor 1: post-save confirmation
+        // line appears below Will save and tells the user the
+        // rule actually persisted.
+        let cell = ApprovalCell::new(
+            1,
+            "bash".into(),
+            "npm test".into(),
+            None,
+            "execute".into(),
+            true,
+        )
+        .with_save_outcome("Saved to .kiro/permissions.json");
+        let rendered = render(&cell);
+        assert!(
+            rendered.contains("Saved to .kiro/permissions.json"),
+            "save outcome should render verbatim, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn renders_failed_save_outcome_when_present() {
+        let cell = ApprovalCell::new(
+            1,
+            "bash".into(),
+            "npm test".into(),
+            None,
+            "execute".into(),
+            true,
+        )
+        .with_save_outcome("Failed to save rule: read-only filesystem");
+        let rendered = render(&cell);
+        assert!(rendered.contains("Failed to save rule"));
     }
 
     #[test]

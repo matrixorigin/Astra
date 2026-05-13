@@ -35,6 +35,17 @@ pub(crate) const PRIMARY_BUTTONS: &[Button] = &[
         label: "Accept",
         action: ButtonAction::Respond(ApprovalResponse::AllowOnce),
     },
+    // Issue #326 P5e: Reject is intentionally **one-shot** — it
+    // resolves THIS approval as Deny and does NOT persist a deny
+    // rule. The user's "no" is local to this call. The only way
+    // to add a permanent deny is the explicit
+    // `/permissions add deny <rule>` slash command, so accidental
+    // Rejects never grow the deny list.
+    //
+    // The user-visible label is short ("Reject") for terminal-
+    // width reasons; the tooltip / footer text spells out the
+    // semantics ("Reject (this call only)") so first-time users
+    // aren't surprised.
     Button {
         label: "Reject",
         action: ButtonAction::Respond(ApprovalResponse::Deny),
@@ -55,6 +66,7 @@ pub(crate) const BATCH_BUTTONS: &[Button] = &[
         label: "Accept all",
         action: ButtonAction::RespondAll(ApprovalResponse::AllowOnce),
     },
+    // Same one-shot semantics as the single Reject (P5e).
     Button {
         label: "Reject all",
         action: ButtonAction::RespondAll(ApprovalResponse::Deny),
