@@ -3180,7 +3180,7 @@ type Handler interface {
         let content = "fn hello() {}\n";
         let old_str = "completely_nonexistent_text";
         let msg = str_replace_not_found_hint(content, old_str);
-        assert!(msg.contains("Error"), "should be error: {msg}");
+        assert!(msg.contains("FAILED"), "should be error: {msg}");
         assert!(
             msg.contains("read_file") || msg.contains("Hint"),
             "should give guidance: {msg}"
@@ -3231,7 +3231,7 @@ type Handler interface {
             "new_str": "fn replaced() {}"
         }));
         assert!(
-            result2.contains("Error"),
+            result2.contains("FAILED"),
             "truly different should be error: {result2}"
         );
         assert!(result2.contains("Hint"), "should have hints: {result2}");
@@ -3436,7 +3436,7 @@ type Handler interface {
             "replace_all": true
         }));
         assert!(
-            result.contains("Error"),
+            result.contains("FAILED"),
             "should error on mixed curly-quote forms: {result}"
         );
         assert!(
