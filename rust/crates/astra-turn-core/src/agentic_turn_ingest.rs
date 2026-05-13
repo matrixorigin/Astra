@@ -10,10 +10,10 @@ use astra_core::agent_warn;
 use serde_json::Value;
 
 use crate::chat_turn_heuristics::{
-    openai_factual_tool_retry_user_message, should_force_factual_tool_retry, TaskExecutionProfile,
+    TaskExecutionProfile, openai_factual_tool_retry_user_message, should_force_factual_tool_retry,
 };
 use crate::chat_turn_sse_dispatch::ChatTurnSseAccum;
-use crate::interaction_types::{tool_counts_as_factual_evidence, TurnInteractionPolicy};
+use crate::interaction_types::{TurnInteractionPolicy, tool_counts_as_factual_evidence};
 use crate::response_guard::apply_response_guards;
 use crate::tool_call_shape::tool_call_name;
 use astra_pipeline::step_recorder::StepRecorder;
@@ -765,10 +765,12 @@ mod tests {
         assert_eq!(pack.messages.len(), 1, "nudge message should be injected");
         let nudge = &pack.messages[0];
         assert_eq!(nudge["role"], "user");
-        assert!(nudge["content"]
-            .as_str()
-            .unwrap()
-            .contains("Runtime correction"),);
+        assert!(
+            nudge["content"]
+                .as_str()
+                .unwrap()
+                .contains("Runtime correction"),
+        );
     }
 
     #[test]
