@@ -10,8 +10,37 @@ pub(super) fn credentials_path() -> PathBuf {
     credential_store().path().clone()
 }
 
+/// Load credentials from disk, falling back to defaults on error.
+///
+/// A non-default load failure (e.g. fd exhaustion, permission denied, JSON
+/// corruption) used to be silently swallowed by `unwrap_or_default()`, which
+/// would then surface upstream as a misleading "Not logged in" prompt. We
+/// now log the underlying error so the user sees the real cause; the
+/// fallback to default is preserved so callers (notably `current_access_token`
+/// and `try_silent_auth`) keep their current contracts.
+///
+/// Repeated failures within a single process are deduplicated (we only print
+/// a warning when the error string changes) to avoid flooding stderr when
+/// the underlying condition persists across many calls.
 pub(super) fn load_credentials() -> CredentialsFile {
-    credential_store().load().unwrap_or_default()
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static LAST_ERR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+    match credential_store().load() {
+        Ok(creds) => creds,
+        Err(err) => {
+            let msg = err.to_string();
+            let last = LAST_ERR.get_or_init(|| Mutex::new(None));
+            let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.as_deref() != Some(msg.as_str()) {
+                eprintln!("  ⚠ failed to read credentials: {msg}");
+                *guard = Some(msg);
+            }
+            CredentialsFile::default()
+        }
+    }
 }
 
 #[cfg(test)]
