@@ -15,7 +15,6 @@
 )]
 
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet},
     fs,
     io::{self, Write},
@@ -25,7 +24,9 @@ use std::{
 };
 
 use astra_core::SharedPool;
-use astra_runtime::{plan_decompose, prompts, tool_registry, tool_selector};
+#[cfg(test)]
+use astra_runtime::plan_decompose;
+use astra_runtime::{prompts, tool_registry, tool_selector};
 use astra_services::session_journal;
 use clap::Parser;
 use crossterm::{
@@ -40,17 +41,6 @@ mod edge_tools;
 mod manifest_loader;
 mod mcp_client;
 mod skill_instructions;
-use rustyline::{
-    Cmd as RlCmd, CompletionType, ConditionalEventHandler, Config, Context, Editor,
-    Event as RlEvent, EventContext as RlEventContext, EventHandler as RlEventHandler, Helper,
-    KeyCode as RlKeyCode, KeyEvent as RlKeyEvent, Modifiers as RlModifiers, Movement as RlMovement,
-    completion::{Completer, Pair},
-    error::ReadlineError,
-    highlight::Highlighter,
-    hint::Hinter,
-    history::FileHistory,
-    validate::{ValidationContext, ValidationResult, Validator},
-};
 use serde::{Deserialize, Serialize};
 
 #[path = "cli/agent_loader.rs"]
@@ -82,6 +72,8 @@ mod context_dump;
 #[path = "cli/context_references.rs"]
 mod context_references;
 
+#[path = "cli/chat_turn.rs"]
+mod chat_turn;
 #[path = "cli/delegate_subrun.rs"]
 mod delegate_subrun;
 #[path = "cli/diagnostic_log.rs"]
@@ -90,8 +82,6 @@ mod diagnostic_log;
 mod diff_presenter;
 #[path = "cli/durable_bridge.rs"]
 mod durable_bridge;
-#[path = "cli/dynamic_completions.rs"]
-mod dynamic_completions;
 #[path = "cli/edge_lifecycle.rs"]
 mod edge_lifecycle;
 #[path = "cli/effects/mod.rs"]
@@ -116,8 +106,6 @@ mod mock_llm;
 mod notifications;
 #[path = "cli/permission_manager.rs"]
 mod permission_manager;
-#[path = "cli/picker_echo.rs"]
-mod picker_echo;
 #[path = "cli/plan_auto_suggest.rs"]
 mod plan_auto_suggest;
 #[path = "cli/plan_executor.rs"]
@@ -130,22 +118,6 @@ mod plan_monitor;
 mod plan_runtime;
 #[path = "cli/project_instructions.rs"]
 mod project_instructions;
-#[path = "cli/prompt_input.rs"]
-mod prompt_input;
-#[path = "cli/readline_actor.rs"]
-mod readline_actor;
-#[path = "cli/repl_exit.rs"]
-mod repl_exit;
-#[path = "cli/repl_runtime.rs"]
-mod repl_runtime;
-#[path = "cli/repl_startup.rs"]
-mod repl_startup;
-#[path = "cli/repl_state.rs"]
-mod repl_state;
-#[path = "cli/repl_turn.rs"]
-mod repl_turn;
-#[path = "cli/repl_ui.rs"]
-mod repl_ui;
 mod sandbox_retry;
 #[path = "cli/self_command.rs"]
 mod self_command;
@@ -153,6 +125,12 @@ mod self_command;
 mod session_cleanup;
 #[path = "cli/session_guard.rs"]
 mod session_guard;
+#[path = "cli/session_runtime.rs"]
+mod session_runtime;
+#[path = "cli/session_startup.rs"]
+mod session_startup;
+#[path = "cli/session_state.rs"]
+mod session_state;
 #[path = "cli/skill_subrun.rs"]
 mod skill_subrun;
 #[path = "cli/slash_account.rs"]
@@ -242,41 +220,27 @@ use cli_utils::{
     validated_resumable_last_session_id,
 };
 use command_router::{ExitCode, execute_cli_command, run_print_mode};
-use dynamic_completions::refresh_dynamic_completions;
-#[cfg(test)]
-use dynamic_completions::truncate_skill_desc_for_completion;
 use edge_lifecycle::register_and_start_heartbeat;
-use idle_agent_messages::flush_idle_agent_messages_between_prompts;
 use permission_manager::PermissionManager;
-#[cfg(test)]
-use picker_echo::build_picker_submission_echo;
-use picker_echo::{replace_picker_submission_echo, should_clear_picker_submission_echo};
-use prompt_input::{PromptInput, normalize_repl_input, wait_for_prompt_input};
-use repl_exit::{ReplExit, finalize_repl_exit};
-use repl_startup::complete_repl_startup;
 use startup_trace::StartupTracer;
 #[cfg(test)]
 use stream_render::{RenderPolicy, StreamRenderState, TurnResult, dispatch_turn_event_block};
 
-use plan_interaction::{handle_plan_mode_input, plan_execution_ui_active};
-use repl_runtime::{
-    build_repl_editor, check_server_has_models, create_tool_selector, create_tool_selector_quiet,
-    create_tool_selector_with_quality, current_access_token, initialize_repl_state,
-    maybe_restore_pending_plan_mode, print_repl_banner, try_silent_auth,
+use chat_turn::create_manual_checkpoint;
+#[cfg(test)]
+use chat_turn::{TurnContext, handle_chat_input};
+use session_runtime::{
+    check_server_has_models, create_tool_selector, create_tool_selector_quiet,
+    create_tool_selector_with_quality, current_access_token, initialize_session_state,
+    print_session_banner, try_silent_auth,
 };
-use repl_turn::{ReplTurnContext, create_manual_repl_checkpoint, handle_chat_input};
-use repl_ui::{
-    ReplHelper, SlashStartCompleteHandler, clear_followup_prompt_hint, clear_slash_overlay,
-    history_path, is_slash_picker_active, print_keyboard_shortcuts, print_slash_commands,
-    resolve_slash_command, suggest_commands,
-};
-use session_guard::update_panic_guard;
 use slash_account::handle_account_command;
 use slash_bug::handle_bug_command;
 use slash_debug::handle_debug_command;
 use slash_info::handle_info_command;
 use slash_memory::handle_memory_domain_command;
 use slash_messaging::handle_messaging_command;
+#[cfg(test)]
 use slash_router::handle_slash_command;
 use slash_session::handle_session_command;
 #[cfg(test)]
@@ -290,16 +254,11 @@ use cli_args::*;
 // SSE streaming types moved to cli/streaming_types.rs
 pub(crate) use streaming_types::{PartialTurnData, StreamResult, TurnFailure, VerdictEvent};
 
-// REPL state moved to cli/repl_state.rs
+// Session state moved to cli/session_state.rs
 #[cfg(test)]
 use idle_agent_messages::drain_root_mailbox_into_idle_queue;
-use plan_monitor::{
-    finalize_plan_run_task_after_executor, flush_plan_updates_between_prompts,
-    sync_plan_run_task_progress,
-};
 pub(crate) use plan_monitor::{format_duration_short, format_plan_progress};
-use plan_runtime::start_and_monitor_plan;
-pub(crate) use repl_state::{ExplainMode, ReplState, SkillDevState};
+pub(crate) use session_state::{ExplainMode, SessionState, SkillDevState};
 
 // ═══════════════════════════════════════════════ Output Styles ═════════════
 
@@ -307,10 +266,9 @@ pub(crate) use repl_state::{ExplainMode, ReplState, SkillDevState};
 // Cloud sync moved to cli/cloud_sync.rs
 
 pub(crate) use cloud_sync::post_auth_cloud_resync;
-use cloud_sync::{
-    append_cloud_pull_sync_journal, try_cloud_pull, try_cloud_pull_preferences,
-    try_cloud_push_preferences,
-};
+#[cfg(test)]
+use cloud_sync::try_cloud_push_preferences;
+use cloud_sync::{append_cloud_pull_sync_journal, try_cloud_pull, try_cloud_pull_preferences};
 
 // ═══════════════════════════════════════════════════════ Task Commands ════
 
@@ -339,7 +297,7 @@ async fn run_interactive_chat(
     }
     // Box::pin to reduce the parent future's stack frame size (avoids stack
     // overflow in debug-mode tests that instantiate execute_cli_command).
-    Box::pin(tui::run_tui_repl(
+    Box::pin(tui::run_tui(
         api,
         profile,
         initial_model,
@@ -348,606 +306,6 @@ async fn run_interactive_chat(
         max_budget,
     ))
     .await
-}
-
-async fn run_chat_repl(
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    initial_model: Option<&str>,
-    resume_session_id: Option<&str>,
-    no_instructions: bool,
-    max_budget: f64,
-) -> Result<(), String> {
-    let mut tracer = StartupTracer::new();
-
-    // Try silent auth (validate/refresh token) but don't block entry.
-    // If not authenticated, user can still explore — operations that need
-    // auth will prompt "Not logged in. Use /login."
-    try_silent_auth(api, profile).await;
-    tracer.phase("auth");
-
-    let (editor, hist_path) = build_repl_editor()?;
-    let mut readline = readline_actor::ReadlineActor::spawn(editor)?;
-    tracer.phase("editor");
-
-    let mut state = initialize_repl_state(profile, initial_model);
-    if max_budget > 0.0 {
-        state.max_budget_limit = max_budget;
-    }
-    tracer.phase("state_init");
-
-    let repl_startup::ReplStartupArtifacts {
-        selector,
-        pipeline_modules: _pipeline_modules,
-        mut edge_heartbeat_task,
-        skill_quality_path,
-        pinned_skills_path,
-        mut shutdown_signal_rx,
-    } = complete_repl_startup(
-        &mut state,
-        &mut tracer,
-        api,
-        profile,
-        resume_session_id,
-        no_instructions,
-    )
-    .await?;
-
-    // Print startup trace summary if enabled
-    tracer.finish();
-
-    // ── Main loop ─────────────────────────────────────────────────────────────
-    let repl_exit = loop {
-        flush_idle_agent_messages_between_prompts(&mut state);
-        let plan_terminal = flush_plan_updates_between_prompts(&mut state);
-        sync_plan_run_task_progress(&mut state).await;
-        if plan_terminal {
-            finalize_plan_run_task_after_executor(&mut state).await;
-        }
-        // Refresh Tab-completion data (skills/MCP may change mid-session).
-        // On first iteration, this seeds the initial completions lazily.
-        refresh_dynamic_completions(&state).await;
-        let current_token = current_access_token(profile);
-
-        // Keep readline prompt TEXT as ASCII-only. Unicode characters (⏸, 🔄, ❯)
-        // have ambiguous display widths that break cursor tracking for CJK input.
-        // ANSI color codes are safe — rustyline's calculate_position() treats them
-        // as width=0 so cursor math is unaffected.
-        if let Some(ref dev) = state.skill_dev {
-            eprintln!(
-                "  \u{1f527} {}",
-                format!("Skill dev: {}", dev.name).cyan().dim()
-            );
-        }
-        // Single source for "plan run in progress": live handle and/or persisted background flag.
-        let plan_run_active = plan_execution_ui_active(&state);
-        let prompt_str = if let Some(ref ps) = state.plan_mode {
-            if ps.goal.is_empty() {
-                if plan_run_active {
-                    "\x1b[1;33mplan*>\x1b[0m ".to_string()
-                } else {
-                    theme::PROMPT_PLAN.to_string()
-                }
-            } else {
-                let short_goal: String = ps.goal.chars().take(20).collect();
-                let suffix = if ps.goal.len() > 20 { "…" } else { "" };
-                let star = if plan_run_active { "*" } else { "" };
-                format!("\x1b[1;33mplan{star}[{short_goal}{suffix}]>\x1b[0m ")
-            }
-        } else if state.executing_plan.is_some() {
-            theme::PROMPT_PAUSE.to_string()
-        } else if plan_run_active {
-            theme::PROMPT_BG.to_string()
-        } else if state.chat_plan_only {
-            theme::PROMPT_PLAN_ONLY.to_string()
-        } else {
-            theme::PROMPT_DEFAULT.to_string()
-        };
-
-        // Do NOT flush plan updates during active readline — writing to stderr
-        // (\r\x1b[2K) while rustyline owns the terminal disrupts cursor
-        // tracking for wide (CJK) characters, causing the last character to
-        // visually disappear. Plan updates are buffered and flushed between
-        // prompts instead.
-        let prompt_input = wait_for_prompt_input(
-            &mut state,
-            &mut readline,
-            prompt_str.clone(),
-            &mut shutdown_signal_rx,
-        )
-        .await;
-
-        // ── Process readline result ──────────────────────────────────
-        match prompt_input {
-            PromptInput::Shutdown(signal) => {
-                clear_slash_overlay();
-                eprintln!(
-                    "\n  {} Received {}. Shutting down gracefully...",
-                    theme::icon_warn(),
-                    signal.label().bold()
-                );
-                break ReplExit::Shutdown(signal);
-            }
-            PromptInput::Readline(readline_result, pending_execute) => match readline_result {
-                Ok(line) => {
-                    clear_slash_overlay();
-                    let line = normalize_repl_input(&line);
-                    if line.is_empty() {
-                        continue;
-                    }
-                    clear_followup_prompt_hint();
-                    state.pending_followup_suggestion = None;
-                    readline.add_history(line.clone());
-
-                    // ── Handle pending approval from background plan executor ──
-                    if let Some(tx) = state.pending_approval.take() {
-                        let trimmed = line.trim().to_lowercase();
-                        let approved = trimmed == "y" || trimmed == "yes" || trimmed == "a";
-                        let autorun = trimmed == "!" || trimmed == "all" || trimmed == "yolo";
-                        let denied = trimmed == "n" || trimmed == "no";
-                        if approved || autorun || denied {
-                            let response = if autorun {
-                                chat_stream::ApprovalResponse::AutoRunSession
-                            } else if denied {
-                                chat_stream::ApprovalResponse::Deny
-                            } else {
-                                chat_stream::ApprovalResponse::AllowOnce
-                            };
-                            let _ = tx.send(response);
-                            if autorun {
-                                let was_auto = matches!(
-                                    state.perm_manager.mode(),
-                                    permission_manager::PermissionMode::Auto
-                                );
-                                state
-                                    .perm_manager
-                                    .set_mode(permission_manager::PermissionMode::Auto);
-                                if !was_auto {
-                                    // Transition-only banner — repeat '!' while
-                                    // already in Auto is a no-op so the user
-                                    // doesn't see the banner fire twice
-                                    // (observed in session c6e18730).
-                                    eprintln!(
-                                        "  {} {} All tools auto-approved for this session.",
-                                        "⚡".yellow(),
-                                        "Auto-run enabled!".bold().yellow()
-                                    );
-                                    eprintln!(
-                                        "  {}",
-                                        "  Use /allow prompt to restore confirmation prompts."
-                                            .dim()
-                                    );
-                                }
-                            } else if approved {
-                                eprintln!("  {} Approved", theme::icon_ok());
-                            } else {
-                                eprintln!("  {} Denied", theme::icon_err());
-                            }
-                            continue;
-                        } else {
-                            // Unrecognized — treat as deny and fall through
-                            let _ = tx.send(chat_stream::ApprovalResponse::Deny);
-                            eprintln!(
-                                "  {} Unrecognized response, treating as denied",
-                                theme::icon_err()
-                            );
-                            // Fall through to normal input handling
-                        }
-                    }
-
-                    if line.starts_with('/') {
-                        if should_clear_picker_submission_echo(&line, pending_execute.as_deref()) {
-                            replace_picker_submission_echo(
-                                &prompt_str,
-                                pending_execute.as_deref().unwrap_or(&line),
-                            );
-                        }
-                        // If Enter was pressed in the picker, the selected command is
-                        // stored in pending-execute (captured by readline actor thread).
-                        let dispatch_line_owned = pending_execute.unwrap_or_else(|| line.clone());
-                        let dispatch_line = dispatch_line_owned.as_str();
-                        let should_exit = handle_slash_command(
-                            dispatch_line,
-                            api,
-                            profile,
-                            &mut state,
-                            current_token.as_deref(),
-                            &*selector,
-                        )
-                        .await?;
-                        if should_exit {
-                            break ReplExit::Command;
-                        }
-
-                        // /ask (and future slash commands) can queue a message for
-                        // immediate dispatch — send it as if the user typed it.
-                        if let Some(queued) = state.queued_message.take() {
-                            handle_chat_input(
-                                queued,
-                                current_token.as_deref(),
-                                &mut state,
-                                ReplTurnContext {
-                                    api,
-                                    profile,
-                                    selector: &*selector,
-                                },
-                            )
-                            .await?;
-                        }
-
-                        // If /plan auto triggered execution, start the background executor
-                        if state.executing_plan.is_some() && state.plan_mode.is_none() {
-                            start_and_monitor_plan(
-                                &mut state,
-                                current_token.as_deref(),
-                                api,
-                                profile,
-                            )
-                            .await?;
-                        }
-                    } else if state.plan_mode.is_some()
-                        || maybe_restore_pending_plan_mode(&line, &mut state)
-                    {
-                        // Plan mode: handle input as plan editing
-                        let mut plan_monitor_started = false;
-                        match handle_plan_mode_input(
-                            line.clone(),
-                            current_token.as_deref(),
-                            &mut state,
-                            api,
-                        )
-                        .await
-                        {
-                            Ok(plan_interaction::PlanInputResult::Handled) => {}
-                            Ok(plan_interaction::PlanInputResult::DispatchSlash(cmd)) => {
-                                let should_exit = handle_slash_command(
-                                    &cmd,
-                                    api,
-                                    profile,
-                                    &mut state,
-                                    current_token.as_deref(),
-                                    &*selector,
-                                )
-                                .await?;
-                                if should_exit {
-                                    break ReplExit::Command;
-                                }
-                                if state.executing_plan.is_some() && state.plan_mode.is_none() {
-                                    start_and_monitor_plan(
-                                        &mut state,
-                                        current_token.as_deref(),
-                                        api,
-                                        profile,
-                                    )
-                                    .await?;
-                                    plan_monitor_started = true;
-                                }
-                            }
-                            Ok(plan_interaction::PlanInputResult::SendAsChat(msg)) => {
-                                // Plan was abandoned; send the message as normal chat
-                                handle_chat_input(
-                                    msg,
-                                    current_token.as_deref(),
-                                    &mut state,
-                                    ReplTurnContext {
-                                        api,
-                                        profile,
-                                        selector: &*selector,
-                                    },
-                                )
-                                .await?;
-                            }
-                            Err(e) => {
-                                return Err(e);
-                            }
-                        }
-
-                        // If plan execution was just triggered, start the blocking monitor (once
-                        // per readline event — DispatchSlash may have already run it).
-                        if state.executing_plan.is_some() && !plan_monitor_started {
-                            start_and_monitor_plan(
-                                &mut state,
-                                current_token.as_deref(),
-                                api,
-                                profile,
-                            )
-                            .await?;
-                        }
-                    } else if (state.executing_plan.is_some() || state.plan_handle.is_some())
-                        && plan_decompose::is_resume_command(&line)
-                    {
-                        // Resume paused plan execution
-                        eprintln!();
-                        eprintln!("{}  Resuming plan execution...", "▶".cyan());
-                        if let Some(ref handle) = state.plan_handle {
-                            let _ = handle.send_command(plan_executor::PlanCommand::Resume {
-                                corrections: if state.plan_execution_corrections.is_empty() {
-                                    None
-                                } else {
-                                    Some(std::mem::take(&mut state.plan_execution_corrections))
-                                },
-                            });
-                        } else {
-                            start_and_monitor_plan(
-                                &mut state,
-                                current_token.as_deref(),
-                                api,
-                                profile,
-                            )
-                            .await?;
-                        }
-                    } else {
-                        let has_paused_plan =
-                            state.executing_plan.is_some() || state.plan_handle.is_some();
-                        if has_paused_plan {
-                            if let Some(action) = plan_decompose::parse_plan_paused_user_line(&line)
-                            {
-                                match action {
-                                    plan_decompose::PlanPausedUserAction::ClearCorrections => {
-                                        state.plan_execution_corrections.clear();
-                                        eprintln!(
-                                            "{}",
-                                            "  Cleared stacked operator guidance.".dim()
-                                        );
-                                    }
-                                    plan_decompose::PlanPausedUserAction::Correction(s) => {
-                                        state.plan_execution_corrections.push(s);
-                                        eprintln!(
-                                            "{}  Recorded guidance ({}). It will prefix each upcoming subtask. Type continue when ready.",
-                                            "💡".cyan(),
-                                            state.plan_execution_corrections.len(),
-                                        );
-                                    }
-                                    plan_decompose::PlanPausedUserAction::Rewind(anchor) => {
-                                        if let Some(plan) = state.executing_plan.as_mut() {
-                                            match plan_decompose::resolve_rewind_start_index(
-                                                plan, &anchor,
-                                            ) {
-                                                Ok(idx) => {
-                                                    let reset =
-                                                        plan_decompose::rewind_plan_from_subtask(
-                                                            plan, idx,
-                                                        );
-                                                    eprintln!(
-                                                        "{}  Rewound from step {} — {} subtask(s) set back to pending. Type continue to resume.",
-                                                        "↩".cyan(),
-                                                        idx + 1,
-                                                        reset,
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    eprintln!(
-                                                        "{}",
-                                                        format!("  {} {e}", theme::icon_err())
-                                                            .red()
-                                                    );
-                                                }
-                                            }
-                                        } else {
-                                            eprintln!(
-                                                "  {} Rewind not available while plan is held by the executor. Type continue first.",
-                                                theme::icon_warn()
-                                            );
-                                        }
-                                    }
-                                }
-                                continue;
-                            }
-                            // Paused plan: any other non-resume line abandons and becomes normal chat
-                            let had_executor = state.plan_handle.is_some();
-                            plan_interaction::shutdown_plan_executor(&mut state);
-                            let plan = state.executing_plan.take();
-                            state.plan_execution_corrections.clear();
-                            match plan.as_ref() {
-                                Some(p) => {
-                                    let (done, total) = (p.items_done(), p.subtasks.len());
-                                    if done < total as u32 {
-                                        eprintln!(
-                                            "{}  Plan abandoned ({}/{} done). Processing as normal chat.",
-                                            "·".dim(),
-                                            done,
-                                            total
-                                        );
-                                    }
-                                }
-                                None if had_executor => {
-                                    eprintln!(
-                                        "{}  Plan abandoned (executor was cancelled; in-memory progress was not available). Processing as normal chat.",
-                                        "·".dim(),
-                                    );
-                                }
-                                None => {}
-                            }
-                        }
-
-                        // Auto plan detection: suggest plan mode for complex tasks
-                        let mut should_proceed_normal = true;
-                        let line_for_plan = line.clone(); // Clone early to avoid borrow issues
-                        if let Some(reason) = plan_decompose::should_suggest_plan_mode(&line) {
-                            let banner = format!("{reason} (execution plan)");
-                            let decision = plan_auto_suggest::prompt_auto_suggest(
-                                &banner,
-                                plan_auto_suggest::DEFAULT_TIMEOUT,
-                            );
-                            match decision {
-                                plan_auto_suggest::AutoSuggestDecision::Accepted => {
-                                    let project_root = std::env::current_dir()
-                                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                                    let context = plan_decompose::analyze_project(&project_root);
-                                    let goal_display = line_for_plan.clone();
-                                    let plan_state = plan_decompose::PlanModeState::new(
-                                        line_for_plan.clone(),
-                                        context,
-                                    );
-
-                                    eprintln!(
-                                        "{}  Entering plan mode for: {}",
-                                        "📋".green(),
-                                        goal_display.cyan()
-                                    );
-                                    eprintln!("{}  Generating plan...", "⋯".dim());
-
-                                    state.plan_mode = Some(plan_state);
-                                    should_proceed_normal = false;
-
-                                    handle_plan_mode_input(
-                                        line_for_plan,
-                                        current_token.as_deref(),
-                                        &mut state,
-                                        api,
-                                    )
-                                    .await?;
-                                }
-                                plan_auto_suggest::AutoSuggestDecision::Declined
-                                | plan_auto_suggest::AutoSuggestDecision::TimedOut
-                                | plan_auto_suggest::AutoSuggestDecision::Interrupted => {
-                                    // Fall through to normal chat. Decision banner
-                                    // already printed by prompt_auto_suggest.
-                                }
-                            }
-                        }
-
-                        if should_proceed_normal {
-                            handle_chat_input(
-                                line,
-                                current_token.as_deref(),
-                                &mut state,
-                                ReplTurnContext {
-                                    api,
-                                    profile,
-                                    selector: &*selector,
-                                },
-                            )
-                            .await?;
-                        }
-
-                        // Keep panic guard in sync with current session state.
-                        if let Some(ref sid) = state.session_id {
-                            update_panic_guard(sid, state.turn);
-                        }
-
-                        // --max-budget enforcement: check accumulated cost against budget limit
-                        if state.max_budget_limit > 0.0 {
-                            let current_cost = slash_stats::cost_for_tokens(
-                                state.total_prompt_tokens,
-                                state.total_completion_tokens,
-                                state.total_cache_read_tokens,
-                                state.total_cache_creation_tokens,
-                                &state.cached_pricing,
-                            );
-                            state.total_session_cost = current_cost;
-                            if current_cost >= state.max_budget_limit {
-                                eprintln!(
-                                    "\n  {} Session budget reached: {} / {} limit. Exiting.",
-                                    theme::icon_warn(),
-                                    slash_stats::format_cost(current_cost).bold(),
-                                    slash_stats::format_cost(state.max_budget_limit),
-                                );
-                                break ReplExit::BudgetLimit;
-                            }
-                        }
-
-                        if let Some(signal) = *shutdown_signal_rx.borrow() {
-                            clear_slash_overlay();
-                            eprintln!(
-                                "\n  {} Received {}. Shutting down gracefully...",
-                                theme::icon_warn(),
-                                signal.label().bold()
-                            );
-                            break ReplExit::Shutdown(signal);
-                        }
-                    }
-                }
-                Err(ReadlineError::Interrupted) => {
-                    clear_slash_overlay();
-                    eprintln!("^C");
-                }
-                Err(ReadlineError::Eof) => {
-                    clear_slash_overlay();
-                    eprintln!("{}", "\nGoodbye.".dim());
-                    break ReplExit::Eof;
-                }
-                Err(e) => {
-                    clear_slash_overlay();
-                    eprintln!(
-                        "  {} {}",
-                        theme::icon_err(),
-                        "Input error — exiting session.".red()
-                    );
-                    eprintln!("{}", format!("  ({e})").dim());
-                    break ReplExit::InputError;
-                }
-            },
-        }
-    };
-
-    finalize_repl_exit(&mut state, profile, repl_exit).await;
-
-    // Save cross-session learning state (including tool health)
-    {
-        // Save skill quality metrics
-        if let Err(e) = state.skill_quality_tracker.save(&skill_quality_path) {
-            eprintln!(
-                "{}",
-                format!("  ⚠ Skill quality data not saved: {e}").yellow()
-            );
-        }
-
-        // Save pinned skills (atomic: write to temp file, then rename)
-        if !state.pinned_skills.is_empty() {
-            if let Ok(json) = serde_json::to_string_pretty(&state.pinned_skills) {
-                if let Some(parent) = pinned_skills_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let tmp = pinned_skills_path.with_extension("tmp");
-                match std::fs::write(&tmp, &json) {
-                    Ok(()) => {
-                        if let Err(e) = std::fs::rename(&tmp, &pinned_skills_path) {
-                            eprintln!("⚠ Failed to save pinned_skills.json: {e}");
-                            let _ = std::fs::remove_file(&tmp);
-                        }
-                    }
-                    Err(e) => eprintln!("⚠ Failed to write pinned_skills.json: {e}"),
-                }
-            }
-        } else {
-            let _ = std::fs::remove_file(&pinned_skills_path);
-        }
-
-        // Upload quality metrics to marketplace (opt-in via ASTRA_QUALITY_UPLOAD=true)
-        slash_skill::maybe_upload_quality_on_exit(
-            api,
-            &state.skill_quality_tracker,
-            current_access_token(profile).as_deref(),
-        )
-        .await;
-
-        let profile_name = profile.unwrap_or("default");
-        let tool_quality_entries = state
-            .tool_quality_tracker
-            .as_ref()
-            .and_then(|t| t.lock().ok().map(|g| g.export()))
-            .unwrap_or_default();
-        if let Err(e) = astra_turn_core::tool_health_persistence::save_learning_state(
-            profile_name,
-            &state.tool_health_entries,
-            &tool_quality_entries,
-        ) {
-            eprintln!(
-                "{}",
-                format!("  ⚠ Learning state not saved (will retry next session): {e}").yellow()
-            );
-        }
-        // Push preferences to cloud (best-effort)
-        try_cloud_push_preferences(&state).await;
-    }
-
-    if let Some(h) = edge_heartbeat_task.take() {
-        h.abort();
-    }
-
-    readline.shutdown(hist_path);
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,7 +449,7 @@ async fn main() {
     });
 
     // Merge project instructions into system_prompt for inline/print modes.
-    // REPL mode handles this separately via build_effective_line.
+    // TUI mode handles this separately via build_effective_line.
     let system_prompt = if no_instructions {
         system_prompt
     } else {
@@ -1149,8 +507,8 @@ async fn main() {
         }
     }
 
-    // --yes (-y): set auto-approve mode for the interactive REPL. ReplState::default()
-    // reads ASTRA_CLI_AUTO_APPROVE, so propagate the flag before REPL startup.
+    // --yes (-y): set auto-approve mode for the interactive TUI. SessionState::default()
+    // reads ASTRA_CLI_AUTO_APPROVE, so propagate the flag before TUI startup.
     if auto_approve {
         unsafe {
             std::env::set_var("ASTRA_CLI_AUTO_APPROVE", "1");
@@ -1168,7 +526,7 @@ async fn main() {
         }
     }
 
-    // --session-id: validate UUID format and export for REPL to pick up
+    // --session-id: validate UUID format and export for TUI to pick up
     if let Some(ref sid) = cli_session_id {
         if uuid::Uuid::parse_str(sid).is_err() {
             tracing::error!(
@@ -1347,11 +705,11 @@ mod tests {
 
     mod auth_tests;
     mod chat_stream_tests;
+    mod chat_turn_tests;
     mod cli_args_tests;
     mod cloud_sync_tests;
     mod cost_tracking_tests;
     mod preamble_tests;
-    mod repl_tests;
     mod resume_tests;
     mod self_command_tests;
     mod slash_command_tests;
@@ -1447,7 +805,7 @@ mod tests {
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
-        let mut state = ReplState {
+        let mut state = SessionState {
             session_id: Some("old-sess".to_string()),
             turn: 5,
             history: vec![("q".to_string(), "a".to_string())],
@@ -1475,7 +833,7 @@ mod tests {
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let exit = handle_slash_command("/model gpt-4o", &api, None, &mut state, None, &selector)
             .await
             .unwrap();
@@ -1489,94 +847,19 @@ mod tests {
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let exit = handle_slash_command("/exit", &api, None, &mut state, None, &selector)
             .await
             .unwrap();
         assert!(exit);
     }
 
-    #[tokio::test]
-    async fn slash_exit_writes_session_end_to_journal() {
-        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-            edge_tools::all_tool_schemas(),
-        ));
-
-        let sid = format!("test-exit-end-{}", uuid::Uuid::new_v4());
-        // Set the panic guard for this session so try_write_session_end works.
-        session_guard::update_panic_guard(&sid, 3);
-
-        let writer = session_journal::JournalWriter::new(&sid).unwrap();
-        writer
-            .append(&session_journal::JournalEvent::session_start(
-                Some(&sid),
-                None,
-            ))
-            .unwrap();
-
-        let mut state = ReplState {
-            session_id: Some(sid.clone()),
-            turn: 3,
-            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
-            ..ReplState::default()
-        };
-
-        let exit = handle_slash_command("/exit", &api, None, &mut state, None, &selector)
-            .await
-            .unwrap();
-        assert!(exit);
-        finalize_repl_exit(&mut state, None, ReplExit::Command).await;
-
-        // Verify session_end was written to journal
-        let events = session_journal::read_journal(&sid).unwrap();
-        let has_session_end = events
-            .iter()
-            .any(|e| matches!(e.event_type, session_journal::JournalEventType::SessionEnd));
-        assert!(
-            has_session_end,
-            "session_end event must be written to journal on /exit"
-        );
-    }
-
-    #[tokio::test]
-    async fn slash_quit_writes_session_end_to_journal() {
-        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-            edge_tools::all_tool_schemas(),
-        ));
-
-        let sid = format!("test-quit-end-{}", uuid::Uuid::new_v4());
-        let writer = session_journal::JournalWriter::new(&sid).unwrap();
-        writer
-            .append(&session_journal::JournalEvent::session_start(
-                Some(&sid),
-                None,
-            ))
-            .unwrap();
-
-        let mut state = ReplState {
-            session_id: Some(sid.clone()),
-            turn: 1,
-            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
-            ..ReplState::default()
-        };
-
-        let exit = handle_slash_command("/quit", &api, None, &mut state, None, &selector)
-            .await
-            .unwrap();
-        assert!(exit);
-        finalize_repl_exit(&mut state, None, ReplExit::Command).await;
-
-        let events = session_journal::read_journal(&sid).unwrap();
-        let has_session_end = events
-            .iter()
-            .any(|e| matches!(e.event_type, session_journal::JournalEventType::SessionEnd));
-        assert!(
-            has_session_end,
-            "session_end event must be written to journal on /quit"
-        );
-    }
+    // The `slash_exit_writes_session_end_to_journal` and
+    // `slash_quit_writes_session_end_to_journal` tests previously
+    // exercised `finalize_repl_exit`, which lived inside the
+    // line-mode REPL exit path. Both the function and the path are
+    // gone; session_end is now written by the TUI shutdown handler
+    // and exercised by `tui::tests::*`.
 
     #[tokio::test]
     async fn slash_unknown_command_does_not_crash() {
@@ -1584,7 +867,7 @@ mod tests {
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let exit = handle_slash_command(
             "/nonexistent_command_xyz",
             &api,
@@ -1604,7 +887,7 @@ mod tests {
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         // No health entries — should print "no data" gracefully
         let exit = handle_slash_command("/health", &api, None, &mut state, None, &selector)
             .await
@@ -1618,7 +901,7 @@ mod tests {
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
-        let mut state = ReplState {
+        let mut state = SessionState {
             tool_health_entries: vec![
                 astra_turn_core::tool_health_persistence::ToolHealthEntry {
                     name: "bash".into(),
@@ -1651,7 +934,7 @@ mod tests {
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
-        let mut state = ReplState {
+        let mut state = SessionState {
             tool_health_entries: vec![astra_turn_core::tool_health_persistence::ToolHealthEntry {
                 name: "bash".into(),
                 total_calls: 10,
@@ -1711,51 +994,31 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── repl_turn pure functions ──────────────────────────────────────────
+    // ── chat_turn pure functions ──────────────────────────────────────────
 
-    #[test]
-    fn picker_submission_echo_is_cleared_only_when_picker_rewrites_input() {
-        assert!(should_clear_picker_submission_echo(
-            "/",
-            Some("/checkpoint")
-        ));
-        assert!(should_clear_picker_submission_echo(
-            "/chec",
-            Some("/checkpoint")
-        ));
-        assert!(!should_clear_picker_submission_echo("/", None));
-        assert!(!should_clear_picker_submission_echo(
-            "/checkpoint",
-            Some("/checkpoint")
-        ));
-    }
-
-    #[test]
-    fn picker_submission_echo_reprints_prompt_and_selected_command() {
-        let rendered = build_picker_submission_echo(theme::PROMPT_DEFAULT, "/checkpoint");
-        assert_eq!(
-            rendered,
-            format!("\x1b[A\x1b[2K\r{}/checkpoint\n", theme::PROMPT_DEFAULT)
-        );
-    }
+    // The `picker_submission_echo_*` tests verified line-mode-only
+    // behaviour around the rustyline picker overlay; both
+    // `should_clear_picker_submission_echo` and
+    // `build_picker_submission_echo` are gone with the rest of the
+    // line-mode REPL.
 
     #[test]
     fn build_effective_line_plain() {
-        let state = ReplState::default();
+        let state = SessionState::default();
         let result =
-            repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+            chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert_eq!(result, "hello");
     }
 
     #[test]
     fn build_effective_line_with_system_skills() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let skills = prompts::builtin_system_skills();
         if let Some(md) = skills.iter().find(|s| s.name == "markdown") {
             state.active_system_skills.push(md.clone());
         }
         let result =
-            repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+            chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(result.contains("hello"));
         assert!(result.contains("Markdown"));
     }
@@ -1766,7 +1029,7 @@ mod tests {
             ("q1".to_string(), "a1".to_string()),
             ("q2".to_string(), "a2".to_string()),
         ];
-        let msgs = repl_turn::history_as_messages(&history);
+        let msgs = chat_turn::history_as_messages(&history);
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[1]["role"], "assistant");
@@ -1775,7 +1038,7 @@ mod tests {
     #[test]
     fn history_as_messages_compacted_turn() {
         let history = vec![("".to_string(), "summary".to_string())];
-        let msgs = repl_turn::history_as_messages(&history);
+        let msgs = chat_turn::history_as_messages(&history);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], "assistant");
     }
@@ -1796,7 +1059,7 @@ mod tests {
         );
         let base = spawn_mock(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-        let mut state = ReplState {
+        let mut state = SessionState {
             session_id: Some("sess-1".to_string()),
             ..Default::default()
         };
@@ -2101,7 +1364,7 @@ total_tokens_out: 500
     #[test]
     fn stats_no_active_session_does_not_panic() {
         // state with no session_id → should not panic
-        let state = super::ReplState::default();
+        let state = super::SessionState::default();
         tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(slash_stats::handle_stats_command("", &state)); // current session mode, no session
@@ -2109,7 +1372,7 @@ total_tokens_out: 500
 
     #[test]
     fn stats_history_no_sessions_does_not_panic() {
-        let state = super::ReplState::default();
+        let state = super::SessionState::default();
         tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(slash_stats::handle_stats_command("history", &state));
@@ -2169,7 +1432,7 @@ total_tokens_out: 500
         assert_eq!(stats.avg_tokens_per_turn, 1350); // (1800+900)/2
 
         // Now verify handle_stats_command doesn't panic with this session
-        let state = super::ReplState {
+        let state = super::SessionState {
             session_id: Some(sid),
             ..Default::default()
         };
@@ -2221,7 +1484,7 @@ total_tokens_out: 500
 
     #[test]
     fn tools_no_active_session_does_not_panic() {
-        let state = super::ReplState::default();
+        let state = super::SessionState::default();
         slash_tools::handle_tools_command(&state);
     }
 
@@ -2245,7 +1508,7 @@ total_tokens_out: 500
             .unwrap();
         drop(writer);
 
-        let state = super::ReplState {
+        let state = super::SessionState {
             session_id: Some(sid),
             ..Default::default()
         };
@@ -2339,7 +1602,7 @@ total_tokens_out: 500
         assert_eq!(profiles[1].error_rate, 0.0);
 
         // Verify handle_tools_command doesn't panic with this data
-        let state = super::ReplState {
+        let state = super::SessionState {
             session_id: Some(sid),
             ..Default::default()
         };
@@ -2436,7 +1699,7 @@ total_tokens_out: 500
         let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
             edge_tools::all_tool_schemas(),
         ));
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         // No matrix runtime — should show "Offline" in cloud section
         assert!(state.matrix_runtime.is_none());
         let exit = handle_slash_command("/health", &api, None, &mut state, None, &selector)
@@ -2490,7 +1753,7 @@ total_tokens_out: 500
 
     #[serial_test::serial]
     #[test]
-    fn should_append_cloud_pull_journal_repl_startup_empty_without_env() {
+    fn should_append_cloud_pull_journal_session_startup_empty_without_env() {
         unsafe {
             std::env::remove_var(ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
         }
@@ -2500,13 +1763,13 @@ total_tokens_out: 500
         assert!(!should_append_cloud_pull_journal(
             &pull,
             &[],
-            "repl_startup"
+            "session_startup"
         ));
     }
 
     #[serial_test::serial]
     #[test]
-    fn should_append_repl_startup_when_empty_ack_env_set() {
+    fn should_append_session_startup_when_empty_ack_env_set() {
         let pull = CloudPullResult {
             cloud_reachable: true,
         };
@@ -2516,12 +1779,16 @@ total_tokens_out: 500
         assert!(!should_append_cloud_pull_journal(
             &pull,
             &[],
-            "repl_startup"
+            "session_startup"
         ));
         unsafe {
             std::env::set_var(ASTRA_JOURNAL_CLOUD_EMPTY_ACK, "1");
         }
-        assert!(should_append_cloud_pull_journal(&pull, &[], "repl_startup"));
+        assert!(should_append_cloud_pull_journal(
+            &pull,
+            &[],
+            "session_startup"
+        ));
         unsafe {
             std::env::remove_var(ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
         }
@@ -2532,14 +1799,14 @@ total_tokens_out: 500
         let pull = CloudPullResult {
             cloud_reachable: true,
         };
-        let state = ReplState::default();
-        append_cloud_pull_sync_journal(&state, "default", "repl_startup", &pull, &[]);
+        let state = SessionState::default();
+        append_cloud_pull_sync_journal(&state, "default", "session_startup", &pull, &[]);
     }
 
     #[test]
     fn append_cloud_pull_sync_journal_writes_sync_marker_jsonl() {
         let sid = format!("test-cloud-pull-journal-{}", uuid::Uuid::new_v4());
-        let state = ReplState {
+        let state = SessionState {
             session_id: Some(sid.clone()),
             ..Default::default()
         };
@@ -2547,7 +1814,7 @@ total_tokens_out: 500
             cloud_reachable: true,
         };
         let prefs = vec!["explain_mode".to_string()];
-        append_cloud_pull_sync_journal(&state, "work", "repl_startup", &pull, &prefs);
+        append_cloud_pull_sync_journal(&state, "work", "session_startup", &pull, &prefs);
         let events = session_journal::read_journal(&sid).expect("read journal");
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -2570,7 +1837,7 @@ total_tokens_out: 500
     #[test]
     fn append_cloud_pull_post_login_reachable_empty_writes_marker() {
         let sid = format!("test-cloud-pull-empty-{}", uuid::Uuid::new_v4());
-        let state = ReplState {
+        let state = SessionState {
             session_id: Some(sid.clone()),
             ..Default::default()
         };
@@ -2609,7 +1876,7 @@ total_tokens_out: 500
         unsafe {
             std::env::remove_var("MATRIXONE_HOST");
         }
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         // Should not panic (was the original bug)
         let keys = try_cloud_pull_preferences(&mut state).await;
         assert!(keys.is_empty());
@@ -2620,7 +1887,7 @@ total_tokens_out: 500
         unsafe {
             std::env::remove_var("MATRIXONE_HOST");
         }
-        let state = ReplState::default();
+        let state = SessionState::default();
         // Should not panic (was the original bug)
         try_cloud_push_preferences(&state).await;
     }
@@ -3969,16 +3236,16 @@ total_tokens_out: 500
         assert!((cli.max_budget - 10.0).abs() < f64::EPSILON);
     }
 
-    // Verify that --max-budget wires through to ReplState.max_budget_limit.
-    // The initialize_repl_state default is 0.0; after applying the flag it must equal the value.
+    // Verify that --max-budget wires through to SessionState.max_budget_limit.
+    // The initialize_session_state default is 0.0; after applying the flag it must equal the value.
     #[test]
-    fn max_budget_applied_to_repl_state() {
-        let mut state = initialize_repl_state(None, None);
+    fn max_budget_applied_to_session_state() {
+        let mut state = initialize_session_state(None, None);
         assert!(
             (state.max_budget_limit - 0.0).abs() < f64::EPSILON,
             "default max_budget_limit must be 0.0"
         );
-        // Apply the flag value — this is what run_chat_repl now does.
+        // Apply the flag value — this is what the TUI bootstrap now does.
         state.max_budget_limit = 7.5;
         assert!(
             (state.max_budget_limit - 7.5).abs() < f64::EPSILON,
@@ -4092,12 +3359,12 @@ total_tokens_out: 500
     }
 
     #[test]
-    fn repl_state_auto_approve_env_activates_auto_mode() {
-        // When ASTRA_CLI_AUTO_APPROVE=1, ReplState should start in Auto mode
+    fn session_state_auto_approve_env_activates_auto_mode() {
+        // When ASTRA_CLI_AUTO_APPROVE=1, SessionState should start in Auto mode
         unsafe {
             std::env::set_var("ASTRA_CLI_AUTO_APPROVE", "1");
         }
-        let state = ReplState::default();
+        let state = SessionState::default();
         unsafe {
             std::env::remove_var("ASTRA_CLI_AUTO_APPROVE");
         }
@@ -4357,10 +3624,10 @@ total_tokens_out: 500
 
     #[test]
     fn build_effective_line_includes_project_instructions() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.project_instructions = Some("Always use Rust.".to_string());
         let result =
-            repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+            chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(
             result.contains("<project_instructions>"),
             "should wrap in tags"
@@ -4374,9 +3641,9 @@ total_tokens_out: 500
 
     #[test]
     fn build_effective_line_no_instructions_when_none() {
-        let state = ReplState::default();
+        let state = SessionState::default();
         let result =
-            repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+            chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(
             !result.contains("<project_instructions>"),
             "should not inject when None"

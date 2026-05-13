@@ -9,7 +9,7 @@ use astra_thin_client::{
 use crossterm::style::Stylize;
 
 use crate::chat_stream::edge_executor_instance_id;
-use crate::repl_runtime::{attempt_token_refresh, current_access_token};
+use crate::session_runtime::{attempt_token_refresh, current_access_token};
 
 /// When `ASTRA_EDGE_REGISTRY` is `0`, `false`, or `off`, skip register and heartbeat.
 pub fn edge_cloud_registry_enabled() -> bool {

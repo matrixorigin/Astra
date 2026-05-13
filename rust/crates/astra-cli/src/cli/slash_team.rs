@@ -61,7 +61,7 @@ pub(super) struct TeamMember {
     pub model_override: Option<String>,
 }
 
-/// Registry of all defined teams (stored in ReplState).
+/// Registry of all defined teams (stored in SessionState).
 #[derive(Clone, Debug)]
 pub(super) struct TeamRegistry {
     teams: HashMap<String, Team>,
@@ -425,7 +425,7 @@ fn infer_coordination(team: &Team) -> astra_services::team_persistence::TeamCoor
 async fn ensure_team_run_session(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    state: &mut super::ReplState,
+    state: &mut super::SessionState,
 ) -> Result<String, String> {
     let token = current_access_token(profile).ok_or_else(|| "Not logged in".to_string())?;
     if let Some(session_id) = state.session_id.clone() {
@@ -458,8 +458,8 @@ async fn ensure_team_run_session(
         .ok_or_else(|| "session create response missing session_id".to_string())?
         .to_string();
 
-    crate::repl_turn::initialize_journal_pub(state, &session_id);
-    crate::repl_turn::persist_last_session_id(profile, &session_id);
+    crate::chat_turn::initialize_journal_pub(state, &session_id);
+    crate::chat_turn::persist_last_session_id(profile, &session_id);
     state.session_id = Some(session_id.clone());
     Ok(session_id)
 }
@@ -468,7 +468,7 @@ pub(super) async fn handle_team_command(
     arg: &str,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    state: &mut super::ReplState,
+    state: &mut super::SessionState,
 ) {
     // Hydrate registry from persistence store on first command
     if !state.team_registry.store_loaded {
@@ -2172,7 +2172,7 @@ mod tests {
         );
         let base = spawn_mock(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
 
         let session_id = ensure_team_run_session(&api, None, &mut state)
             .await
@@ -2221,7 +2221,7 @@ mod tests {
             );
         let base = spawn_mock(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-        let mut state = ReplState {
+        let mut state = SessionState {
             session_id: Some("stale-sess".to_string()),
             journal: session_journal::JournalWriter::new("stale-sess").ok(),
             ..Default::default()

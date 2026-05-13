@@ -73,7 +73,7 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub root_send_message_context:
         Option<crate::edge_tools::agent_messaging::SendMessageRuntimeContext>,
     /// REPL turn counter (0-based) for correct turn_id in trace collector.
-    pub repl_turn_index: u32,
+    pub chat_turn_index: u32,
     /// Cross-turn tool output cache for edge-path dedup.
     pub tool_cache: crate::stream_render::EdgeToolCache,
     /// Extra context appended to the system prompt via edge_profile.system_prompt_override.
@@ -171,7 +171,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
         // Preserve the lifecycle-created collector: it may already contain the
         // initial skill selector shortlist for this turn.
-        let turn_id = format!("turn-{}", self.repl_turn_index);
+        let turn_id = format!("turn-{}", self.chat_turn_index);
         let session_id = state.current_session_id.clone().unwrap_or_default();
         if let Some(ref collector) = state.telemetry.turn_trace_collector {
             collector.set_turn_id(turn_id);
@@ -637,7 +637,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             astra_turn_core::fork_prefix::build_tool_schema_entries(&self.all_schemas);
         let req = astra_turn_core::fork_capture::CaptureRequest {
             parent_run_id,
-            parent_turn_seq: self.repl_turn_index,
+            parent_turn_seq: self.chat_turn_index,
             provider,
             model_id,
             thinking: None,

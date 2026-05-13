@@ -4,7 +4,7 @@ use crate::{cli_dim, cli_err, cli_info, cli_ok, cli_section, cli_warn};
 
 /// Handle `/sync` command — show unified sync state across all domains.
 /// Subcommands: `/sync push`, `/sync pull`, `/sync log`.
-pub(super) async fn handle_sync_command(arg: &str, state: &ReplState) {
+pub(super) async fn handle_sync_command(arg: &str, state: &SessionState) {
     let sub = arg.trim();
 
     // /sync push — force-push all dirty domains
@@ -119,7 +119,7 @@ pub(super) async fn handle_sync_command(arg: &str, state: &ReplState) {
 }
 
 /// Force-push all dirty sync domains to cloud.
-async fn handle_sync_push(state: &ReplState) {
+async fn handle_sync_push(state: &SessionState) {
     cli_section!("Sync Push");
     eprintln!();
 
@@ -199,7 +199,7 @@ async fn handle_sync_push(state: &ReplState) {
 }
 
 /// Force-pull all pullable domains from cloud (skips write-only domains like Events).
-async fn handle_sync_pull(state: &ReplState) {
+async fn handle_sync_pull(state: &SessionState) {
     cli_section!("Sync Pull");
     eprintln!();
 

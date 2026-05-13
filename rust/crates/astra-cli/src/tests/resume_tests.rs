@@ -210,7 +210,7 @@ total_tokens_out: 3
 }
 
 #[tokio::test]
-async fn initialize_repl_state_marks_workspace_session_as_pending_recovery() {
+async fn initialize_session_state_marks_workspace_session_as_pending_recovery() {
     let _creds = isolate_credentials();
     let temp = tempfile::tempdir().unwrap();
     let _sessions = session_journal::JournalDirGuard::new(temp.path());
@@ -290,7 +290,7 @@ async fn initialize_repl_state_marks_workspace_session_as_pending_recovery() {
     );
     save_credentials(&creds).unwrap();
 
-    let state = repl_runtime::initialize_repl_state(None, None);
+    let state = session_runtime::initialize_session_state(None, None);
     assert_eq!(state.session_id, None);
     assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
     assert!(state.history.is_empty());
@@ -421,7 +421,7 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
     );
     save_credentials(&creds).unwrap();
 
-    let mut state = repl_runtime::initialize_repl_state(None, Some("gpt-4o"));
+    let mut state = session_runtime::initialize_session_state(None, Some("gpt-4o"));
     assert_eq!(state.session_id, None);
     assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
 
@@ -490,7 +490,7 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
         "继续".to_string(),
         Some("fake-token"),
         &mut state,
-        ReplTurnContext {
+        TurnContext {
             api: &api,
             profile: None,
             selector: &selector,
@@ -583,7 +583,7 @@ async fn crash_recovery_low_information_repair_followup_rebuilds_attachment() {
     );
     save_credentials(&creds).unwrap();
 
-    let mut state = repl_runtime::initialize_repl_state(None, Some("qwen3.6-plus"));
+    let mut state = session_runtime::initialize_session_state(None, Some("qwen3.6-plus"));
     assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
 
     #[derive(Clone)]
@@ -651,7 +651,7 @@ async fn crash_recovery_low_information_repair_followup_rebuilds_attachment() {
         "修复?".to_string(),
         Some("fake-token"),
         &mut state,
-        ReplTurnContext {
+        TurnContext {
             api: &api,
             profile: None,
             selector: &selector,

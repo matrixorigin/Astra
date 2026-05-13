@@ -1,7 +1,7 @@
 #![allow(unused_imports)]
 use super::*;
 
-pub(super) async fn handle_health_command(arg: &str, state: &ReplState) {
+pub(super) async fn handle_health_command(arg: &str, state: &SessionState) {
     use astra_turn_core::tool_health::ToolHealthTracker;
 
     let detail = arg.trim() == "detail";

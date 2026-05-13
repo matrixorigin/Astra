@@ -1069,7 +1069,7 @@ pub(super) async fn handle_info_command(
     cmd: &str,
     arg: &str,
     api: &astra_thin_client::ThinClient,
-    state: &mut ReplState,
+    state: &mut SessionState,
     profile: Option<&str>,
     token: Option<&str>,
 ) -> Result<(), String> {
@@ -1217,7 +1217,7 @@ pub(super) async fn handle_info_command(
                     .bold()
                     .cyan()
             );
-            let selector = crate::repl_runtime::create_tool_selector_quiet(api, None);
+            let selector = crate::session_runtime::create_tool_selector_quiet(api, None);
             let mut pm = PermissionManager::with_project(false, &project_root);
             let turn_start = std::time::Instant::now();
             let sr = stream_chat_sse(ChatTurnParams {
@@ -1279,7 +1279,7 @@ pub(super) async fn handle_info_command(
             .await
             .map_err(|f| f.error)?;
             if let Some(session_id) = sr.session_id.as_deref() {
-                crate::repl_turn::initialize_journal_pub(state, session_id);
+                crate::chat_turn::initialize_journal_pub(state, session_id);
                 state.session_id = Some(session_id.to_string());
             }
             state.last_response = Some(sr.full_text.clone());
@@ -2339,7 +2339,7 @@ fn describe_context_pressure(
 ///
 /// Returns the rendered string so both the handler and tests can consume it
 /// without relying on stderr capture.
-pub(super) fn render_whoami(state: &ReplState) -> String {
+pub(super) fn render_whoami(state: &SessionState) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let sep = "─".repeat(38);
@@ -2384,12 +2384,12 @@ pub(super) fn render_whoami(state: &ReplState) -> String {
     out
 }
 
-fn print_whoami(state: &ReplState) {
+fn print_whoami(state: &SessionState) {
     eprint!("{}", render_whoami(state));
 }
 
 /// Compact cognition-state view, printed on `/context cognition`.
-pub(super) fn render_cognition(state: &ReplState) -> String {
+pub(super) fn render_cognition(state: &SessionState) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let sep = "─".repeat(30);
@@ -2435,7 +2435,7 @@ pub(super) fn render_cognition(state: &ReplState) -> String {
     out
 }
 
-fn print_cognition_view(state: &ReplState) {
+fn print_cognition_view(state: &SessionState) {
     eprint!("{}", render_cognition(state));
 }
 
@@ -2654,7 +2654,7 @@ mod tests {
 
     #[test]
     fn render_whoami_includes_identity_and_skills() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.session_id = Some("sess-abc".to_string());
         state.model = Some("gpt-5".to_string());
         state.turn = 3;
@@ -2670,7 +2670,7 @@ mod tests {
 
     #[test]
     fn render_whoami_surfaces_pending_improvement_proposal() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.session_id = Some("s".into());
         state
             .skill_improvement_tracker
@@ -2685,7 +2685,7 @@ mod tests {
 
     #[test]
     fn render_cognition_reports_recent_tools_and_proposal_counts() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.recent_tools = vec!["bash".into(), "read_file".into()];
         let out = super::render_cognition(&state);
         assert!(

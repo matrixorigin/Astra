@@ -2,7 +2,7 @@
 //! snapshot of everything the `/context` panel can see.
 //!
 //! Two entry points share one writer:
-//! - [`write_dump_for_repl`] pulls from the live `ReplState` +
+//! - [`write_dump_for_repl`] pulls from the live `SessionState` +
 //!   `ChatWidget` the TUI owns.  Used by the in-session
 //!   `/context dump [path]` slash command.
 //! - [`write_dump_from_journal`] rebuilds a dump from a persisted
@@ -41,7 +41,7 @@ use std::time::SystemTime;
 
 use serde::Serialize;
 
-use crate::repl_state::ReplState;
+use crate::session_state::SessionState;
 
 const SCHEMA_VERSION: &str = "astra.context_dump/v1";
 
@@ -97,7 +97,7 @@ pub struct ActiveSkillDump {
 /// chat history separately because `ChatWidget` lives in a
 /// private module that `cli::` can't import.
 pub fn write_dump_for_repl(
-    state: &ReplState,
+    state: &SessionState,
     chat_history: Vec<ChatTurnDump>,
     arg: Option<&str>,
 ) -> Result<PathBuf, String> {
@@ -107,7 +107,7 @@ pub fn write_dump_for_repl(
     Ok(path)
 }
 
-fn build_dump_from_repl(state: &ReplState, chat_history: Vec<ChatTurnDump>) -> ContextDump {
+fn build_dump_from_repl(state: &SessionState, chat_history: Vec<ChatTurnDump>) -> ContextDump {
     let trace_json = state.observability_session.as_ref().and_then(|session| {
         let guard = session.read().unwrap_or_else(|e| e.into_inner());
         guard
@@ -328,7 +328,7 @@ fn build_dump_from_journal(session_id: &str) -> Result<ContextDump, String> {
     let mut cache_creation_tokens: u64 = 0;
     // Journal doesn't track per-event USD cost today; forensic
     // dumps report 0 here. Live dumps (the `/context dump` slash)
-    // still carry the accumulated cost from ReplState.
+    // still carry the accumulated cost from SessionState.
     let cost_usd: f64 = 0.0;
 
     for ev in &events {

@@ -2,7 +2,7 @@
 
 **Status**: Implemented design
 **Updated**: 2026-04-16
-**Goal**: 让一次真实的 REPL 崩溃/中断之后，用户重启并说一句 `继续` / `resume` / `continue`，系统就能走**真正的恢复路径**，而不是仅仅复用旧的 session id。
+**Goal**: 让一次真实的 TUI 崩溃/中断之后，用户重启并说一句 `继续` / `resume` / `continue`，系统就能走**真正的恢复路径**，而不是仅仅复用旧的 session id。
 
 ## 1. 设计结论
 
@@ -53,7 +53,7 @@
 
 旧实现里有三个问题：
 
-1. `initialize_repl_state()` 会直接把 `last_session_id` 绑定到 `state.session_id`
+1. `initialize_session_state()` 会直接把 `last_session_id` 绑定到 `state.session_id`
 2. `-c/-r` 只设置 session id，不做真正 restore
 3. `/resume` 的恢复逻辑只存在于 slash handler 内部，别的路径无法复用
 
@@ -63,7 +63,7 @@
 
 ### 4.1 Startup: detect, do not resume
 
-`initialize_repl_state()` 现在只做两件事：
+`initialize_session_state()` 现在只做两件事：
 
 1. 保持 `state.session_id = None`
 2. 如果最近一次 session 同时满足：
@@ -188,9 +188,9 @@ Use the persisted notes below when continuing the interrupted work.
 
 ```text
 startup
-  -> initialize_repl_state()
+  -> initialize_session_state()
      -> pending_recovery = detect(...)
-  -> complete_repl_startup()
+  -> complete_session_startup()
      -> print banner
      -> print recovery hint (if any)
 ```
@@ -265,7 +265,7 @@ handle_chat_input("继续")
 2. 写真实 workspace.yaml
 3. 写真实 heavy checkpoint
 4. 写真实 session-memory summary.md
-5. 通过 `initialize_repl_state()` 得到 `pending_recovery`
+5. 通过 `initialize_session_state()` 得到 `pending_recovery`
 6. 调用 `handle_chat_input("继续")`
 7. mock `/chat/turn` 先返回 stale-session 404，再成功
 8. 断言首个恢复 turn 的 request body 包含：
@@ -290,10 +290,10 @@ handle_chat_input("继续")
 | 目标 | 位置 |
 | --- | --- |
 | shared journal classifier | `services/src/session_journal.rs` |
-| startup pending detection | `astra-cli/src/cli/repl_runtime.rs` |
-| startup explicit restore / hint | `astra-cli/src/cli/repl_startup.rs` |
+| startup pending detection | `astra-cli/src/cli/session_runtime.rs` |
+| startup explicit restore / hint | `astra-cli/src/cli/session_startup.rs` |
 | shared restore helper | `astra-cli/src/cli/slash_session.rs` |
-| short continuation trigger | `astra-cli/src/cli/repl_turn.rs` |
+| short continuation trigger | `astra-cli/src/cli/chat_turn.rs` |
 | recovery session-memory resolver | `runtime/src/turn/cloud/memoria_compact.rs` |
 | interruption JSON persistence | `runtime/src/turn/agentic_loop_finalization.rs` |
 | online e2e | `astra-cli/src/tests/resume_tests.rs` |

@@ -3,7 +3,7 @@ use super::*;
 
 pub(super) async fn handle_task_command(
     arg: &str,
-    state: &mut ReplState,
+    state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     token: Option<&str>,

@@ -263,7 +263,7 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 - 500ms debounce interval
 - Monitors `.astra/skills/`, `skills/`, `~/.astra/skills/`
 - Triggers `discover_all()` on SKILL.md / manifest.yaml changes
-- Handle stored in REPL state, dropped on exit
+- Handle stored in session state, dropped on exit
 
 ### 3.2 Layer 2: Registered Skills [DESIGN TARGET]
 
@@ -592,7 +592,7 @@ Tool execution goes through a 6-step permission pipeline:
 6. **Mode-based** — Auto/Ask/Deny based on configuration
 
 **Non-blocking in SSE consumer**: `check_nonblocking()` avoids blocking the async
-runtime. For normal REPL, `spawn_blocking()` used for terminal prompt.
+runtime. For normal TUI sessions, `spawn_blocking()` used for terminal prompt.
 
 ---
 

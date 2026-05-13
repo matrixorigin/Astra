@@ -121,7 +121,7 @@ fn classify_active(cell: &dyn history_cell::HistoryCell) -> Option<ActiveKind> {
 ///    caller can draw a bordered frame.
 /// 2. No active cell but the status indicator has content →
 ///    `Status` line (spinner + short label, no frame).
-/// 3. Neither → `Empty`. Idle REPL shows nothing above the
+/// 3. Neither → `Empty`. Idle TUI shows nothing above the
 ///    composer.
 fn active_viewport(
     chat_widget: &chat_widget::ChatWidget,
@@ -300,7 +300,7 @@ pub(crate) fn can_run_tui() -> bool {
         && std::env::var("TERM").map_or(true, |t| t != "dumb")
 }
 
-pub(crate) async fn run_tui_repl(
+pub(crate) async fn run_tui(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     initial_model: Option<&str>,
@@ -308,8 +308,8 @@ pub(crate) async fn run_tui_repl(
     no_instructions: bool,
     max_budget: f64,
 ) -> Result<(), String> {
-    use crate::repl_runtime::{build_repl_editor, initialize_repl_state};
-    use crate::repl_startup::complete_repl_startup;
+    use crate::session_runtime::initialize_session_state;
+    use crate::session_startup::complete_session_startup;
     use crate::startup_trace::StartupTracer;
 
     // ── Ensure terminal is in sane state before startup output ────────
@@ -319,16 +319,14 @@ pub(crate) async fn run_tui_repl(
 
     // ── Business initialization BEFORE entering TUI ─────────────────────
     let mut tracer = StartupTracer::new();
-    crate::repl_runtime::try_silent_auth(api, profile).await;
+    crate::session_runtime::try_silent_auth(api, profile).await;
     tracer.phase("auth");
-    let (_editor, _hist_path) = build_repl_editor()?;
-    tracer.phase("editor");
-    let mut state = initialize_repl_state(profile, initial_model);
+    let mut state = initialize_session_state(profile, initial_model);
     if max_budget > 0.0 {
         state.max_budget_limit = max_budget;
     }
     tracer.phase("state_init");
-    let startup = complete_repl_startup(
+    let startup = complete_session_startup(
         &mut state,
         &mut tracer,
         api,
@@ -537,7 +535,7 @@ pub(crate) async fn run_tui_repl(
                                         slash_dispatch::SlashResult::Fallback => {
                                             let slash_text = text.clone();
                                             let slash_result = guard.with_restored(|| async {
-                                                let token = crate::repl_runtime::current_access_token(profile);
+                                                let token = crate::session_runtime::current_access_token(profile);
                                                 crate::slash_router::handle_slash_command(
                                                     &slash_text, api, profile, &mut state,
                                                     token.as_deref(), &*startup.selector,
@@ -589,10 +587,10 @@ pub(crate) async fn run_tui_repl(
                                     state.tui_stream_event_tx = Some(turn_tx);
 
                                     let turn_result = {
-                                        let ctx = crate::repl_turn::ReplTurnContext { api, profile, selector: &*startup.selector };
-                                        let token = crate::repl_runtime::current_access_token(profile);
+                                        let ctx = crate::chat_turn::TurnContext { api, profile, selector: &*startup.selector };
+                                        let token = crate::session_runtime::current_access_token(profile);
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
-                                        let fut = crate::repl_turn::handle_chat_input_with_ui(text, token.as_deref(), &mut state, ctx, &mut tui_ui);
+                                        let fut = crate::chat_turn::handle_chat_input_with_ui(text, token.as_deref(), &mut state, ctx, &mut tui_ui);
                                         tokio::pin!(fut);
 
                                         let r: Result<(), String> = loop {
@@ -910,7 +908,7 @@ pub(crate) async fn run_tui_repl(
                                                 // If the save produced a new version id,
                                                 // emit a ConfigChange journal event
                                                 // recording the transition and update
-                                                // ReplState so subsequent HeavyCheckpoints
+                                                // SessionState so subsequent HeavyCheckpoints
                                                 // carry the new pointer.
                                                 if let Some(save) = outcome.save.as_ref() {
                                                     let prev = state.config_version_id.clone();
@@ -980,7 +978,7 @@ pub(crate) async fn run_tui_repl(
                                         name.strip_prefix(slash_dispatch::MODEL_PICK_SENTINEL)
                                     {
                                         let base_model = base_model.to_string();
-                                        let token = crate::repl_runtime::current_access_token(profile);
+                                        let token = crate::session_runtime::current_access_token(profile);
                                         let raw = crate::slash_router::fetch_model_list_raw(
                                             api,
                                             token.as_deref(),
@@ -1060,7 +1058,7 @@ pub(crate) async fn run_tui_repl(
                                         let base_model =
                                             parts.next().unwrap_or("").to_string();
                                         let label = parts.next().unwrap_or("").to_string();
-                                        let token = crate::repl_runtime::current_access_token(profile);
+                                        let token = crate::session_runtime::current_access_token(profile);
                                         let raw = crate::slash_router::fetch_model_list_raw(
                                             api,
                                             token.as_deref(),
@@ -1137,7 +1135,7 @@ pub(crate) async fn run_tui_repl(
                                     // `/session fork` picker → hand off to
                                     // the line-mode `/session fork <parent>`
                                     // pipeline. Calling `fork_local_session`
-                                    // inline here used to leave ReplState in
+                                    // inline here used to leave SessionState in
                                     // a half-done state (session_id /
                                     // journal / CSL all still pointed at the
                                     // parent); the fallback path is the same
@@ -1147,7 +1145,7 @@ pub(crate) async fn run_tui_repl(
                                         let slash_text = format!("/session fork {parent_sid}");
                                         let slash_result = guard
                                             .with_restored(|| async {
-                                                let tok = crate::repl_runtime::current_access_token(
+                                                let tok = crate::session_runtime::current_access_token(
                                                     profile,
                                                 );
                                                 crate::slash_router::handle_slash_command(
@@ -1217,7 +1215,7 @@ pub(crate) async fn run_tui_repl(
                                         let pre_sid = state.session_id.clone();
                                         let slash_text = format!("/resume {name}");
                                         let slash_result = guard.with_restored(|| async {
-                                            let token = crate::repl_runtime::current_access_token(profile);
+                                            let token = crate::session_runtime::current_access_token(profile);
                                             crate::slash_router::handle_slash_command(
                                                 &slash_text, api, profile, &mut state,
                                                 token.as_deref(), &*startup.selector,

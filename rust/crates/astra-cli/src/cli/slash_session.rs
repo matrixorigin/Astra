@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 
 use super::*;
 use crate::cli_utils::{fetch_session_trace_state, update_session_trace_state};
-use crate::repl_runtime;
+use crate::session_runtime;
 use crate::tool_call_groups;
 
 /// `/home/foo/bar` → `~/bar` when under the user home dir (readability).
@@ -91,7 +91,7 @@ fn workspace_summary_line(sid: &str) -> String {
 }
 
 /// Resolve parent session id and optional label for `/session fork`.
-fn parse_fork_source(arg: &str, state: &ReplState) -> Result<(String, Option<String>), String> {
+fn parse_fork_source(arg: &str, state: &SessionState) -> Result<(String, Option<String>), String> {
     let arg = arg.trim();
     if arg.is_empty() {
         return state
@@ -267,7 +267,7 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
 ///
 /// Search:
 /// - Matches session ID prefix, cwd, git branch, or summary
-fn handle_session_list(sub_arg: &str, state: &ReplState) {
+fn handle_session_list(sub_arg: &str, state: &SessionState) {
     // Parse options
     let mut show_all = false;
     let mut filter_active = false;
@@ -531,7 +531,7 @@ fn get_session_shortcut(num: usize) -> Option<String> {
 }
 
 /// Handle `/session switch <N>` - quick switch to session by number from last list
-fn handle_session_switch(sub_arg: &str, state: &mut ReplState) {
+fn handle_session_switch(sub_arg: &str, state: &mut SessionState) {
     let arg = sub_arg.trim();
 
     if arg.is_empty() {
@@ -608,7 +608,7 @@ fn handle_session_switch(sub_arg: &str, state: &mut ReplState) {
     }
 
     // Restore session state
-    let st = crate::repl_runtime::session_state_from_journal(&session_id);
+    let st = crate::session_runtime::session_state_from_journal(&session_id);
     state.session_id = Some(session_id.clone());
     state.journal = session_journal::JournalWriter::new(&session_id).ok();
     state.history = st.history;
@@ -629,7 +629,7 @@ fn handle_session_switch(sub_arg: &str, state: &mut ReplState) {
 
 pub(super) fn resolve_journal_target_session(
     sub_arg: &str,
-    state: &ReplState,
+    state: &SessionState,
     _missing_active_msg: &str,
 ) -> Result<(String, bool), String> {
     if !sub_arg.is_empty() {
@@ -683,7 +683,7 @@ pub(super) fn resolve_journal_target_session(
 async fn resolve_remote_trace_target(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    state: &ReplState,
+    state: &SessionState,
     requested: &str,
 ) -> Result<String, String> {
     match requested.trim() {
@@ -703,7 +703,7 @@ pub(super) async fn handle_session_command(
     arg: &str,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    state: &mut ReplState,
+    state: &mut SessionState,
     token: Option<&str>,
 ) {
     let (sub_cmd, sub_arg) = match arg.find(char::is_whitespace) {
@@ -865,7 +865,7 @@ pub(super) async fn handle_session_command(
                     );
                     // Fork CSL and restore child state.
                     // Journal provides turn/token counters (not in CSL).
-                    let st = repl_runtime::session_state_from_journal(&new_sid);
+                    let st = session_runtime::session_state_from_journal(&new_sid);
                     state.session_id = Some(new_sid.clone());
                     state.journal = session_journal::JournalWriter::new(&new_sid).ok();
                     state.turn = st.turn;
@@ -2962,7 +2962,7 @@ fn export_session_markdown(session_id: &str) {
 /// `--days N` overrides the age threshold.
 /// `--force` skips the confirmation prompt.
 /// `--compress` archives completed journals to .jsonl.gz (instead of deleting).
-fn handle_session_cleanup(arg: &str, state: &ReplState) {
+fn handle_session_cleanup(arg: &str, state: &SessionState) {
     let tokens: Vec<&str> = arg.split_whitespace().collect();
     let mut max_days: u64 = 30;
     let mut force = false;
@@ -3120,7 +3120,7 @@ fn handle_session_cleanup(arg: &str, state: &ReplState) {
 }
 
 /// Compress completed session journals to .jsonl.gz.
-fn handle_compress(state: &ReplState, force: bool) {
+fn handle_compress(state: &SessionState, force: bool) {
     let current_sid = state.session_id.as_deref();
     let archivable = match session_journal::find_archivable_sessions(current_sid) {
         Ok(a) => a,
@@ -3219,7 +3219,7 @@ fn format_age_days(d: std::time::Duration) -> String {
 /// per-turn adaptations, and tuning rule history from the session journal.
 ///
 /// Usage: /session adaptive [--verbose]
-fn handle_session_adaptive(_arg: &str, state: &ReplState) {
+fn handle_session_adaptive(_arg: &str, state: &SessionState) {
     use astra_services::session_journal;
 
     eprintln!(
@@ -3449,7 +3449,7 @@ fn handle_session_adaptive(_arg: &str, state: &ReplState) {
 ///
 /// Uses the DriftDetector to analyze the conversation history for signs of
 /// focus drift caused by compression, topic shifts, or user corrections.
-fn handle_session_drift(arg: &str, state: &ReplState) {
+fn handle_session_drift(arg: &str, state: &SessionState) {
     let verbose = arg.contains("--verbose") || arg.contains("-v");
 
     eprintln!(
@@ -3648,7 +3648,7 @@ fn handle_session_drift(arg: &str, state: &ReplState) {
 /// - Token budget analysis: per-turn, cumulative, cache rate
 /// - Issue detection: blocked tools, stalls, errors, latency spikes,
 ///   recording gaps, duplicate checkpoints
-fn handle_session_analyze(arg: &str, state: &ReplState) {
+fn handle_session_analyze(arg: &str, state: &SessionState) {
     // When the TUI dispatcher handed off via `/session analyze deep
     // <id>` it stashed the optional id in `slash_config` — recover
     // it here so it isn't silently dropped.  A direct line-mode
@@ -4139,7 +4139,7 @@ fn handle_session_analyze(arg: &str, state: &ReplState) {
 }
 
 /// Show local journal vs cloud ingestion sync health.
-fn handle_session_verify(state: &ReplState) {
+fn handle_session_verify(state: &SessionState) {
     let sid = state.session_id.as_deref().unwrap_or("none");
     eprintln!(
         "\n{}",
@@ -4589,14 +4589,14 @@ mod export_tests {
 
 // ═══════════════════════════════════════════════════════════ Resume ═══════
 
-fn resume_restore_service(state: &ReplState) -> HybridRestoreService {
+fn resume_restore_service(state: &SessionState) -> HybridRestoreService {
     match &state.matrix_runtime {
         Some(mc) => HybridRestoreService::new(mc.shared_pool().get().clone()),
         None => HybridRestoreService::local_only(),
     }
 }
 
-fn reset_state_for_session_restore(state: &mut ReplState) {
+fn reset_state_for_session_restore(state: &mut SessionState) {
     state.session_id = None;
     state.pending_recovery = None;
     state.run_id = None;
@@ -4631,7 +4631,7 @@ fn reset_state_for_session_restore(state: &mut ReplState) {
     state.discovered_skills.clear();
 }
 
-fn apply_restored_workspace_state(state: &mut ReplState, session_id: &str) {
+fn apply_restored_workspace_state(state: &mut SessionState, session_id: &str) {
     match session_workspace::read_workspace(session_id) {
         Ok(ws) => {
             state.pinned_skills = ws.pinned_skills.into_iter().collect();
@@ -4642,7 +4642,7 @@ fn apply_restored_workspace_state(state: &mut ReplState, session_id: &str) {
                 || ws.active_experiment_id.is_some()
                 || ws.tuned_config_json.is_some()
             {
-                state.pending_adaptive_state = Some(super::repl_state::PersistedAdaptiveState {
+                state.pending_adaptive_state = Some(super::session_state::PersistedAdaptiveState {
                     last_scenario_change_turn: ws.last_scenario_change_turn,
                     last_token_budget_direction: ws.last_token_budget_direction,
                     last_token_budget_change_turn: ws.last_token_budget_change_turn,
@@ -4657,7 +4657,7 @@ fn apply_restored_workspace_state(state: &mut ReplState, session_id: &str) {
         }
     }
 
-    repl_turn::apply_pending_adaptive_state(state);
+    chat_turn::apply_pending_adaptive_state(state);
 }
 
 fn build_step_resume_guidance(
@@ -4723,7 +4723,7 @@ fn blocked_tool_health_entry(
 }
 
 fn apply_heavy_state_fallback(
-    state: &mut ReplState,
+    state: &mut SessionState,
     blocked_tools: &[String],
     recent_tools: &[String],
     messages: &[serde_json::Value],
@@ -4751,7 +4751,7 @@ fn apply_heavy_state_fallback(
 }
 
 fn apply_heavy_checkpoint_fallback(
-    state: &mut ReplState,
+    state: &mut SessionState,
     heavy: &astra_pipeline::step_protocol::HeavyCheckpoint,
 ) {
     apply_heavy_state_fallback(
@@ -4763,7 +4763,7 @@ fn apply_heavy_checkpoint_fallback(
     );
 }
 
-fn apply_restored_cloud_heavy_state(state: &mut ReplState, restored: &RestoredSession) {
+fn apply_restored_cloud_heavy_state(state: &mut SessionState, restored: &RestoredSession) {
     apply_heavy_state_fallback(
         state,
         &restored.blocked_tools,
@@ -4776,7 +4776,7 @@ fn apply_restored_cloud_heavy_state(state: &mut ReplState, restored: &RestoredSe
 /// Apply the child CslManager and its materialized state from `fork()` to REPL
 /// state. No additional I/O — the fork already loaded the child.
 fn apply_csl_fork_to_state(
-    state: &mut ReplState,
+    state: &mut SessionState,
     mgr: astra_turn_core::conversation_log::manager::CslManager,
     mat: Option<astra_turn_core::conversation_log::MaterializedState>,
 ) {
@@ -4789,7 +4789,7 @@ fn apply_csl_fork_to_state(
     state.csl_manager = Some(mgr);
 }
 
-async fn restore_journal_history_if_available(state: &mut ReplState, session_id: &str) {
+async fn restore_journal_history_if_available(state: &mut SessionState, session_id: &str) {
     // Try CSL first — full-fidelity message history via CslManager
     let base_dir = session_journal::local_sessions_dir();
     let store = std::sync::Arc::new(
@@ -4817,7 +4817,7 @@ async fn restore_journal_history_if_available(state: &mut ReplState, session_id:
     }
 
     // Fall back to journal-based history (pre-CSL sessions)
-    let history = repl_runtime::restore_history_from_journal(session_id);
+    let history = session_runtime::restore_history_from_journal(session_id);
     if history.len() > state.history.len() || state.history.is_empty() {
         state.history = history;
     }
@@ -4864,7 +4864,7 @@ fn derive_history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(St
 async fn apply_restored_session(
     profile: Option<&str>,
     api: &astra_thin_client::ThinClient,
-    state: &mut ReplState,
+    state: &mut SessionState,
     restored: RestoredSession,
 ) -> Result<(), String> {
     if !restored.restored_from_cloud && session_journal::read_journal(&restored.session_id).is_err()
@@ -5006,14 +5006,14 @@ async fn apply_restored_session(
             .find(|e| e.event_type == session_journal::JournalEventType::Turn)
             .cloned();
     }
-    repl_turn::rebuild_continuation_anchor_from_state(state);
+    chat_turn::rebuild_continuation_anchor_from_state(state);
 
     if let Some(ref json) = restored.executing_plan_json {
         state.executing_plan = serde_json::from_str(json).ok();
     }
     if let Some(ref goal) = restored.plan_goal {
         state.executing_plan_goal = Some(goal.clone());
-        repl_turn::steer_observability_goal(state, goal);
+        chat_turn::steer_observability_goal(state, goal);
     }
     if let Some(ref json) = restored.plan_config_json {
         state.plan_execution_config = serde_json::from_str(json).ok();
@@ -5075,8 +5075,8 @@ async fn apply_restored_session(
         });
     }
 
-    repl_turn::initialize_journal_pub(state, &restored.session_id);
-    repl_turn::persist_last_session_id(profile, &restored.session_id);
+    chat_turn::initialize_journal_pub(state, &restored.session_id);
+    chat_turn::persist_last_session_id(profile, &restored.session_id);
     if let Ok(mut ws) = astra_services::session_workspace::read_workspace(&restored.session_id) {
         ws.turn_count = restored.turn_count;
         ws.total_tokens_in = restored.total_tokens_in;
@@ -5148,7 +5148,7 @@ pub(super) async fn restore_session_into_state(
     session_id: &str,
     profile: Option<&str>,
     api: &astra_thin_client::ThinClient,
-    state: &mut ReplState,
+    state: &mut SessionState,
 ) -> Result<(), String> {
     if matches!(
         preflight_remote_resume_session(api, profile, session_id).await,
@@ -5179,7 +5179,7 @@ pub(super) async fn handle_resume_command(
     arg: &str,
     profile: Option<&str>,
     api: &astra_thin_client::ThinClient,
-    state: &mut ReplState,
+    state: &mut SessionState,
 ) {
     let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
     let svc = resume_restore_service(state);
@@ -5658,7 +5658,7 @@ mod resume_tests {
     fn apply_heavy_checkpoint_fallback_restores_history_and_approval_overrides() {
         use astra_turn_core::approval_fingerprint::{ApprovalFingerprint, FingerprintedOverrides};
 
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let mut overrides = FingerprintedOverrides::default();
         overrides.insert(
             ApprovalFingerprint::shell("bash", "git commit -m 'wip'", false),
@@ -5707,7 +5707,7 @@ mod resume_tests {
     async fn restore_journal_history_if_available_preserves_existing_history_when_journal_missing()
     {
         let (_tmp, _guard) = isolated_sessions_dir();
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.history = vec![("from-cloud".to_string(), "still-here".to_string())];
 
         restore_journal_history_if_available(&mut state, "missing-session").await;
@@ -5724,7 +5724,7 @@ mod resume_tests {
         let session_id = format!("resume-history-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 1);
 
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.history = vec![("from-cloud".to_string(), "cloud-data".to_string())];
 
         restore_journal_history_if_available(&mut state, &session_id).await;
@@ -5765,7 +5765,7 @@ mod resume_tests {
                 .unwrap();
         }
 
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.history = vec![("from-cloud".to_string(), "cloud-1".to_string())];
 
         restore_journal_history_if_available(&mut state, &session_id).await;
@@ -5821,7 +5821,7 @@ mod resume_tests {
             .await
             .unwrap();
 
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         restore_journal_history_if_available(&mut state, &session_id).await;
 
         assert_eq!(state.history.len(), 2, "should have 2 user/assistant pairs");
@@ -5843,7 +5843,7 @@ mod resume_tests {
         let session_id = format!("no-csl-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 3);
 
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         restore_journal_history_if_available(&mut state, &session_id).await;
 
         assert!(
@@ -5935,7 +5935,7 @@ mod resume_tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let err = restore_session_into_state(&session_id, None, &api, &mut state)
             .await
             .unwrap_err();
@@ -5972,7 +5972,7 @@ mod resume_tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         restore_session_into_state(&session_id, None, &api, &mut state)
             .await
             .unwrap();
@@ -6020,7 +6020,7 @@ mod resume_tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.session_id = Some(session_id.clone());
 
         handle_session_command("trace on", &api, None, &mut state, Some("test-token")).await;
@@ -6126,7 +6126,7 @@ mod resume_tests {
 
         // Simulate resume: restore_journal_history_if_available should pick up
         // the child's CSL data (not fall back to journal).
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         restore_journal_history_if_available(&mut state, &child_id).await;
 
         assert!(state.csl_manager.is_some(), "should use CSL path");
@@ -6157,7 +6157,7 @@ mod resume_tests {
 
         // Child has no CSL file, so resume falls back to journal (which is also
         // empty). No error should occur.
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         restore_journal_history_if_available(&mut state, &child_id).await;
 
         assert!(

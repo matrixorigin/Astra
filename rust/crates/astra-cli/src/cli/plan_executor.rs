@@ -1084,10 +1084,10 @@ pub(super) async fn record_cloud_step_run(
     }
 }
 
-/// Owned state extracted from ReplState for the background plan executor task.
+/// Owned state extracted from SessionState for the background plan executor task.
 ///
 /// All fields are owned (no lifetimes) so the struct is `Send + 'static`.
-/// Created by [`spawn_plan_executor`] which takes these fields from ReplState.
+/// Created by [`spawn_plan_executor`] which takes these fields from SessionState.
 #[allow(dead_code)] // Some fields reserved for future plan features
 pub(super) struct BackgroundPlanContext {
     pub api: astra_thin_client::ThinClient,
@@ -2440,7 +2440,7 @@ mod tests {
     #[tokio::test]
     async fn background_selector_without_pipeline_modules_still_selects() {
         let ctx = test_background_plan_context();
-        let selector = crate::repl_runtime::create_background_plan_selector(&ctx);
+        let selector = crate::session_runtime::create_background_plan_selector(&ctx);
         let sel_ctx = SelectionContext {
             query: "list files in current directory",
             turn_count: 1,

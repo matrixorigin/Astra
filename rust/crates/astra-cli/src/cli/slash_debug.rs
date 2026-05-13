@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 /// numeric prefix). UI and JSON dumps show **message delta** (suffix after shared prefix with the
 /// previous heavy snapshot), not the entire accumulated history. If there are fewer heavy files
 /// than journal turns, the latest heavy file is used and a warning is recorded.
-pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
+pub(super) fn handle_debug_command(arg: &str, state: &SessionState) {
     let session_id = if arg.is_empty() {
         match &state.session_id {
             Some(id) => id.clone(),

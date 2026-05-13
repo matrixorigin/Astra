@@ -239,7 +239,7 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) task_manager: Option<std::sync::Arc<crate::edge_tools::TaskManager>>,
     /// Current REPL turn number — used to tag journal entries for undo.
     pub(crate) turn_index: u32,
-    /// Pre-loaded CSL messages (from CslManager.load() in repl_turn).
+    /// Pre-loaded CSL messages (from CslManager.load() in chat_turn).
     /// Restored pipeline state from a checkpoint (enables warm-start on resume).
     pub(crate) pipeline_state: Option<serde_json::Value>,
     /// When present, these are used instead of converting history pairs.
@@ -247,7 +247,7 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Extra context appended to the system prompt (gateway injects cron/session context here).
     pub(crate) append_system_prompt: Option<String>,
     /// Background session-memory.md extraction coordinator. Cloned
-    /// from `ReplState::session_memory_extractor`. `None` keeps
+    /// from `SessionState::session_memory_extractor`. `None` keeps
     /// extraction disabled (one-shot `chat -m`, plan subtasks, tests).
     pub(crate) session_memory_extractor:
         Option<std::sync::Arc<astra_runtime::session_memory::MemoryExtractionService>>,

@@ -13,13 +13,13 @@
 use astra_services::session_journal;
 use std::time::Duration;
 
-use super::ReplState;
+use super::SessionState;
+use super::chat_turn::enqueue_ingestion_pub;
 use super::edge_tools;
-use super::repl_turn::enqueue_ingestion_pub;
 use super::session_guard::clear_panic_guard;
 
 /// Finalize a REPL session: journal end event, persist state, extract learnings.
-pub(super) async fn finalize_session(state: &mut ReplState) {
+pub(super) async fn finalize_session(state: &mut SessionState) {
     // 0. Drain any background session-memory extraction worker still in
     //    flight from the final turn, then forget per-session debounce
     //    state so the service doesn't leak it. Without the drain, the

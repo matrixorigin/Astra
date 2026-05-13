@@ -1,6 +1,6 @@
 //! REPL state management.
 //!
-//! This module defines `ReplState`, the central struct that holds all session state
+//! This module defines `SessionState`, the central struct that holds all session state
 //! for the CLI REPL. It also includes helper types like `ExplainMode` and `SkillDevState`.
 
 use crate::PermissionManager;
@@ -52,10 +52,10 @@ pub(crate) struct PersistedAdaptiveState {
     pub tuned_config_json: Option<String>,
 }
 
-// NOTE: ReplState is per-session and NOT shared across sessions. In future
-// server/multi-session mode, ensure each session gets its own ReplState
+// NOTE: SessionState is per-session and NOT shared across sessions. In future
+// server/multi-session mode, ensure each session gets its own SessionState
 // instance to prevent cross-session data leakage (permissions, history, tokens).
-pub(crate) struct ReplState {
+pub(crate) struct SessionState {
     pub session_id: Option<String>,
     /// Project-scoped recoverable session detected at startup.
     /// Becomes a true resume only after explicit user intent (`continue` / `resume` / `继续`)
@@ -376,7 +376,7 @@ pub(crate) struct ReplState {
     pub harness_trace: std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>,
 }
 
-impl Default for ReplState {
+impl Default for SessionState {
     fn default() -> Self {
         Self {
             session_id: None,
@@ -427,10 +427,10 @@ impl Default for ReplState {
             // Load RuntimeConfig from config files + env vars, then create
             // ContextBudget using the loaded config (M3 wiring).
             runtime_config: { astra_config::runtime_config::RuntimeConfig::load() },
-            // Startup id is resolved after ReplState is constructed so
+            // Startup id is resolved after SessionState is constructed so
             // `adopt_session_id` can stamp the pointer with the actual
             // session id as PutMetadata.source_session. See
-            // `repl_runtime::resolve_startup_config_version`. Until
+            // `session_runtime::resolve_startup_config_version`. Until
             // then, legacy code paths treat None as "unknown".
             config_version_id: None,
             // Temporary: will be replaced with from_runtime_config when model is known
@@ -544,7 +544,7 @@ impl Default for ReplState {
     }
 }
 
-impl ReplState {
+impl SessionState {
     /// Unregister and drop the root mailbox so a subsequent turn can
     /// re-register without agent_id collision.
     pub async fn unregister_root_mailbox(&mut self) {

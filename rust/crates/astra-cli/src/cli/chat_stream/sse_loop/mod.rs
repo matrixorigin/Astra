@@ -501,7 +501,7 @@ pub(crate) async fn stream_chat_sse(
         stream_event_tx: p.stream_event_tx,
         approval_request_tx: p.approval_request_tx,
         root_send_message_context,
-        repl_turn_index: p.turn_index,
+        chat_turn_index: p.turn_index,
         tool_cache: crate::stream_render::EdgeToolCache::new(
             resolved_tool_policy.max_identical_tool_calls,
         ),
@@ -789,7 +789,7 @@ pub(crate) async fn stream_chat_sse(
                         );
                         let session_id = p.session_id.map(|s| s.to_string());
                         let recording = if let Some(ref trace_arc) = p.harness_trace {
-                            // Share ReplState's trace Arc so /inspect reads live data
+                            // Share SessionState's trace Arc so /inspect reads live data
                             if let Ok(mut t) = trace_arc.write() {
                                 t.session_id = session_id.clone();
                             }

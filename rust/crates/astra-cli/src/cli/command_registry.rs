@@ -7,8 +7,9 @@
 //! - Subcommand completions
 //! - Argument hints
 //!
-//! All slash command metadata should be defined here. Other modules (repl_ui, main.rs)
-//! should query this registry rather than maintaining their own static arrays.
+//! All slash command metadata should be defined here. Other modules (TUI slash
+//! menus, main.rs) should query this registry rather than maintaining their
+//! own static arrays.
 
 use crate::command_usage;
 
@@ -402,10 +403,10 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Cheat sheet of all TUI-native panels",
         CommandGroup::Core,
     ),
-    CommandMeta::new("/exit", "Exit the REPL", CommandGroup::Core),
+    CommandMeta::new("/exit", "Exit astra", CommandGroup::Core),
     CommandMeta::new(
         "/quit",
-        "Exit the REPL (alias for /exit)",
+        "Exit astra (alias for /exit)",
         CommandGroup::Core,
     )
     .alias(),

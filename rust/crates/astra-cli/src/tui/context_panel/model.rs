@@ -149,7 +149,7 @@ pub(crate) enum SignalKind {
 }
 
 /// Session + budget summary built from [`ContextSnapshot::session`]
-/// (which in turn wraps `ReplState` fields).  Rendered as a
+/// (which in turn wraps `SessionState` fields).  Rendered as a
 /// dedicated section so users can see cost, token totals, and
 /// sticky state that drives follow-up turns.
 #[derive(Debug, Clone, PartialEq)]
@@ -452,7 +452,7 @@ pub(crate) struct ContextSnapshot<'a> {
     /// section (e.g. `~/.astra/rules/…`).
     pub user_rules_path: Option<String>,
     /// Session + budget state the trace doesn't carry. Populated
-    /// by the `/context` dispatch from `ReplState`.
+    /// by the `/context` dispatch from `SessionState`.
     pub session: Option<SessionSummary>,
     /// User-activated system skills (from `/skill` or auto-detect).
     /// These feed the prompt via `edge_profile.active_skills` but

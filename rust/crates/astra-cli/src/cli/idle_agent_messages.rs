@@ -1,9 +1,9 @@
 //! Idle agent mailbox draining and prompt-safe rendering.
 
-use super::ReplState;
+use super::SessionState;
 use crossterm::style::Stylize;
 
-pub(crate) fn drain_root_mailbox_into_idle_queue(state: &mut ReplState) {
+pub(crate) fn drain_root_mailbox_into_idle_queue(state: &mut SessionState) {
     let Some(mailbox) = state.root_mailbox.as_mut() else {
         return;
     };
@@ -76,7 +76,7 @@ fn format_idle_agent_message_payload(payload: &astra_messaging::MessagePayload) 
     }
 }
 
-pub(crate) fn flush_idle_agent_messages_between_prompts(state: &mut ReplState) {
+pub(crate) fn flush_idle_agent_messages_between_prompts(state: &mut SessionState) {
     drain_root_mailbox_into_idle_queue(state);
     if state.pending_idle_agent_messages.is_empty() {
         return;

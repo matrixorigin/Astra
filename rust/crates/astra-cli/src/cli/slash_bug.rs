@@ -9,7 +9,7 @@ use std::process::{Command as SysCommand, Stdio};
 ///   /bug           — print diagnostic report to terminal
 ///   /bug copy      — copy report to clipboard
 ///   /bug save      — save report to file in cwd
-pub(super) fn handle_bug_command(arg: &str, state: &ReplState) {
+pub(super) fn handle_bug_command(arg: &str, state: &SessionState) {
     let report = build_bug_report(state);
 
     match arg.trim() {
@@ -74,7 +74,7 @@ fn copy_to_clipboard(text: &str) -> bool {
     false
 }
 
-fn build_bug_report(state: &ReplState) -> String {
+fn build_bug_report(state: &SessionState) -> String {
     let mut lines = Vec::new();
 
     lines.push("# Astra Bug Report".to_string());

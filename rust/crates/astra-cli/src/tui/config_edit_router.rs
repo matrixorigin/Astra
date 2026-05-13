@@ -14,7 +14,7 @@ use std::path::PathBuf;
 /// Result of resolving the `__config_edit__` completion token.
 ///
 /// `message` goes to the scrollback as-is. `save` is populated only
-/// when the save succeeded; the caller uses it to stamp the ReplState
+/// when the save succeeded; the caller uses it to stamp the SessionState
 /// pointer and emit a `ConfigChange` journal event carrying
 /// `from → to`. None means cancel / discard / error — no state change.
 #[derive(Debug)]

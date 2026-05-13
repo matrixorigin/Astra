@@ -1,7 +1,7 @@
 use super::*;
+use crate::chat_turn::is_auth_error;
 use crate::cli_utils::{fetch_session_trace_state, update_session_trace_state};
 use crate::permission_manager::PermissionMode;
-use crate::repl_turn::is_auth_error;
 use astra_thin_client::paths;
 use clap::CommandFactory;
 use crossterm::style::Stylize;
@@ -333,12 +333,12 @@ fn render_bug_args(args: &BugArgs) -> String {
     }
 }
 
-fn maybe_load_project_instructions(state: &mut ReplState) {
+fn maybe_load_project_instructions(state: &mut SessionState) {
     state.project_instructions = discover_project_instructions();
 }
 
 fn maybe_wire_delegation_engine(
-    state: &mut ReplState,
+    state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
     token: &str,
 ) {
@@ -374,7 +374,7 @@ async fn execute_repl_bridge_command(
 ) -> Result<ExitCode, String> {
     try_silent_auth(api, profile).await;
 
-    let mut state = initialize_repl_state(profile, global_model);
+    let mut state = initialize_session_state(profile, global_model);
     if let Ok(sid) = std::env::var("ASTRA_CLI_SESSION_ID") {
         state.session_id = Some(sid);
     }
@@ -427,7 +427,7 @@ async fn execute_repl_bridge_command(
     Ok(ExitCode::Success)
 }
 
-fn handle_permission_command(arg: &str, state: &mut ReplState) {
+fn handle_permission_command(arg: &str, state: &mut SessionState) {
     use permission_manager::PermissionMode;
 
     match arg {
@@ -585,9 +585,9 @@ pub(super) async fn execute_cli_command(
                     .map_err(|f| f.error)?
                 }
                 Err(e) if is_auth_error(&e.error) => {
-                    if repl_runtime::attempt_token_refresh(api, profile.as_deref()).await {
+                    if session_runtime::attempt_token_refresh(api, profile.as_deref()).await {
                         if let Some(new_token) =
-                            repl_runtime::current_access_token(profile.as_deref())
+                            session_runtime::current_access_token(profile.as_deref())
                         {
                             eprintln!("  {} Token refreshed, retrying…", crate::theme::icon_ok());
                             stream_chat_sse(ChatTurnParams::basic_cli(

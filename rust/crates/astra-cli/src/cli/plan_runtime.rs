@@ -7,8 +7,8 @@
 use crate::durable_bridge;
 use crate::plan_executor;
 use crate::plan_interaction;
-use crate::repl_runtime::create_background_plan_selector;
-use crate::repl_state::ReplState;
+use crate::session_runtime::create_background_plan_selector;
+use crate::session_state::SessionState;
 use crate::theme;
 use crossterm::style::Stylize;
 
@@ -33,7 +33,7 @@ fn build_fallback_delegation_engine()
 /// and corrections out of `state`, and leaves an in-memory copy behind so
 /// `/plan status` can keep reporting progress after plan mode exits.
 fn take_plan_context(
-    state: &mut ReplState,
+    state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
     current_token: Option<&str>,
     profile: Option<&str>,
@@ -105,7 +105,7 @@ fn create_background_selector(
 /// `plan_handle` keep [`crate::plan_monitor::flush_plan_updates_between_prompts`] and
 /// `/plan status` useful when the user is at the prompt again.
 pub(crate) async fn start_and_monitor_plan(
-    state: &mut ReplState,
+    state: &mut SessionState,
     current_token: Option<&str>,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
@@ -137,11 +137,11 @@ pub(crate) async fn start_and_monitor_plan(
     Ok(())
 }
 
-/// Initialize `durable_task_state` on `ReplState` if it's `None` and a plan
+/// Initialize `durable_task_state` on `SessionState` if it's `None` and a plan
 /// is ready for execution. This generates a [`TaskContract`] with structured
 /// verification criteria so the background executor can gate subtask completion.
 async fn ensure_durable_task_state(
-    state: &mut ReplState,
+    state: &mut SessionState,
     api: Option<&astra_thin_client::ThinClient>,
     token: Option<&str>,
 ) {
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn take_plan_context_preserves_nested_turn_runtime_context() {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.executing_plan = Some(TaskPlan::default());
         state.session_id = Some("sess-plan".to_string());
         state.turn = 7;

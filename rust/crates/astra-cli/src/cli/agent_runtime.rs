@@ -1,10 +1,10 @@
 //! Multi-agent runtime initialization for the interactive REPL.
 
-use super::{ReplState, agent_loader, delegate_subrun, spawn_subrun};
+use super::{SessionState, agent_loader, delegate_subrun, spawn_subrun};
 use std::path::PathBuf;
 
 /// Build a fully-wired [`DynamicAgentSpawner`] without mutating a
-/// ReplState. Extracted from [`initialize_multi_agent_runtime`] so
+/// SessionState. Extracted from [`initialize_multi_agent_runtime`] so
 /// the one-shot `chat -m` code path can wire `spawn_agent` support
 /// into a `BasicCliChatContext` without constructing a full REPL
 /// state.
@@ -97,7 +97,7 @@ async fn build_turn_skill_resolver(
 }
 
 pub(crate) async fn initialize_multi_agent_runtime(
-    state: &mut ReplState,
+    state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
     token: String,
 ) {

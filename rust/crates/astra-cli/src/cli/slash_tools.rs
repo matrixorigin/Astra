@@ -4,7 +4,7 @@ use crate::{cli_dim, cli_section, cli_warn};
 
 // ═══════════════════════════════════════════════ Tool Profile ═════════════
 
-pub(super) fn handle_tools_command(state: &ReplState) {
+pub(super) fn handle_tools_command(state: &SessionState) {
     use astra_services::session_analytics;
 
     let sid = match &state.session_id {

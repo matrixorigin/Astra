@@ -3,7 +3,7 @@ use super::*;
 
 // ═══════════════════════════════════════════════════════ Stats ════════════
 
-pub(super) async fn handle_stats_command(arg: &str, state: &ReplState) {
+pub(super) async fn handle_stats_command(arg: &str, state: &SessionState) {
     use astra_services::session_analytics;
 
     match arg {
@@ -208,7 +208,7 @@ struct TurnCostEntry {
 ///   /cost           — current session summary
 ///   /cost detail    — per-turn breakdown
 ///   /cost history   — across recent sessions
-pub(super) fn handle_cost_command(arg: &str, state: &ReplState) {
+pub(super) fn handle_cost_command(arg: &str, state: &SessionState) {
     use astra_services::session_analytics;
 
     match arg {

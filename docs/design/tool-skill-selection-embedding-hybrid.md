@@ -24,7 +24,7 @@
 
 - **打分与索引**：[`tool_registry/scoring.rs`](../../rust/crates/runtime/src/tool_registry/scoring.rs) — TF-IDF 余弦（预计算 IDF）+ **trigger 词边界匹配** + 路由/质量等；静态元数据见 [`tool_registry_meta.rs`](../../rust/crates/astra-turn-core/src/tool_registry_meta.rs)（`description` 字段注释预留「embedding 索引」用语，当前产品仍以 **多语言 triggers** 为主）。
 - **选择器**：[`TfIdfSelector::select`](../../rust/crates/runtime/src/tool_selector.rs) — `RoutingEngine`、实体/pattern boost、共现、`ToolRegistry::select_routed_with_pressure`；返回 `SelectionResult.confidence`（**约** `routing.confidence * 0.7 + tool_factor`，与动态工具数量有关）—— **这不是** TOML 里的 `tool_selection.confidence_threshold`（后者用于别处配置语义，勿混用）。
-- **生产 CLI**：[`repl_runtime.rs`](../../rust/crates/astra-cli/src/cli/repl_runtime.rs) 仅装配 **`TfIdfSelector`**，已移除每轮 **`LlmToolSelector`** 预选（避免二次 LLM 往返延迟）。
+- **生产 CLI**：[`session_runtime.rs`](../../rust/crates/astra-cli/src/cli/session_runtime.rs) 仅装配 **`TfIdfSelector`**，已移除每轮 **`LlmToolSelector`** 预选（避免二次 LLM 往返延迟）。
 - **库内保留**：[`LlmToolSelector`](../../rust/crates/runtime/src/tool_selector.rs)、[`FallbackSelector`](../../rust/crates/runtime/src/tool_selector.rs) — `FallbackSelector` 的行为是 **先跑 fallback 链上的 TfIdf 结果**，仅在低置信等条件下再调用 primary（曾为 LLM）。**「高置信则跳过后续重活」** 的门控可直接类比到 **「高置信则跳过 embedding」**。
 
 ### 2.2 技能路径（与工具独立）

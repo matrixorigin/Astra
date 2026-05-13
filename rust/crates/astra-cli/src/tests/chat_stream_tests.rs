@@ -515,7 +515,7 @@ async fn drain_root_mailbox_into_idle_queue_collects_pending_messages() {
         .await
         .unwrap();
 
-    let mut state = ReplState::default();
+    let mut state = SessionState::default();
     state.root_mailbox = Some(root_mailbox);
 
     drain_root_mailbox_into_idle_queue(&mut state);

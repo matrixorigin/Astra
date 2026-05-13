@@ -14,7 +14,7 @@ async fn slash_clear_creates_new_session() {
     let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
         edge_tools::all_tool_schemas(),
     ));
-    let mut state = ReplState {
+    let mut state = SessionState {
         session_id: Some("old-sess".to_string()),
         turn: 5,
         history: vec![("q".to_string(), "a".to_string())],
@@ -42,7 +42,7 @@ async fn slash_model_with_arg_sets_model() {
     let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
         edge_tools::all_tool_schemas(),
     ));
-    let mut state = ReplState::default();
+    let mut state = SessionState::default();
     let exit = handle_slash_command("/model gpt-4o", &api, None, &mut state, None, &selector)
         .await
         .unwrap();
@@ -56,94 +56,18 @@ async fn slash_exit_returns_true() {
     let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
         edge_tools::all_tool_schemas(),
     ));
-    let mut state = ReplState::default();
+    let mut state = SessionState::default();
     let exit = handle_slash_command("/exit", &api, None, &mut state, None, &selector)
         .await
         .unwrap();
     assert!(exit);
 }
 
-#[tokio::test]
-async fn slash_exit_writes_session_end_to_journal() {
-    let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-        edge_tools::all_tool_schemas(),
-    ));
-
-    let sid = format!("test-exit-end-{}", uuid::Uuid::new_v4());
-    let writer = session_journal::JournalWriter::new(&sid).unwrap();
-    writer
-        .append(&session_journal::JournalEvent::session_start(
-            Some(&sid),
-            None,
-        ))
-        .unwrap();
-
-    let mut state = ReplState {
-        session_id: Some(sid.clone()),
-        turn: 3,
-        journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
-        ..ReplState::default()
-    };
-
-    let exit = handle_slash_command("/exit", &api, None, &mut state, None, &selector)
-        .await
-        .unwrap();
-    assert!(exit);
-    finalize_repl_exit(&mut state, None, ReplExit::Command).await;
-
-    // Verify session_end was written to journal
-    let events = session_journal::read_journal(&sid).unwrap();
-    let has_session_end = events
-        .iter()
-        .any(|e| matches!(e.event_type, session_journal::JournalEventType::SessionEnd));
-    assert!(
-        has_session_end,
-        "session_end event must be written to journal on /exit"
-    );
-}
-
-#[tokio::test]
-async fn slash_quit_writes_session_end_to_journal() {
-    let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-        edge_tools::all_tool_schemas(),
-    ));
-
-    let sid = format!("test-quit-end-{}", uuid::Uuid::new_v4());
-    // Set the panic guard for this session so try_write_session_end works.
-    crate::session_guard::update_panic_guard(&sid, 1);
-
-    let writer = session_journal::JournalWriter::new(&sid).unwrap();
-    writer
-        .append(&session_journal::JournalEvent::session_start(
-            Some(&sid),
-            None,
-        ))
-        .unwrap();
-
-    let mut state = ReplState {
-        session_id: Some(sid.clone()),
-        turn: 1,
-        journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
-        ..ReplState::default()
-    };
-
-    let exit = handle_slash_command("/quit", &api, None, &mut state, None, &selector)
-        .await
-        .unwrap();
-    assert!(exit);
-    finalize_repl_exit(&mut state, None, ReplExit::Command).await;
-
-    let events = session_journal::read_journal(&sid).unwrap();
-    let has_session_end = events
-        .iter()
-        .any(|e| matches!(e.event_type, session_journal::JournalEventType::SessionEnd));
-    assert!(
-        has_session_end,
-        "session_end event must be written to journal on /quit"
-    );
-}
+// `slash_exit_writes_session_end_to_journal` and
+// `slash_quit_writes_session_end_to_journal` exercised the
+// line-mode REPL exit path through `finalize_repl_exit`. Both the
+// path and the function are gone with the rest of the line-mode
+// REPL; session_end is written by the TUI shutdown handler instead.
 
 #[tokio::test]
 async fn slash_unknown_command_does_not_crash() {
@@ -151,7 +75,7 @@ async fn slash_unknown_command_does_not_crash() {
     let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
         edge_tools::all_tool_schemas(),
     ));
-    let mut state = ReplState::default();
+    let mut state = SessionState::default();
     let exit = handle_slash_command(
         "/nonexistent_command_xyz",
         &api,
@@ -171,7 +95,7 @@ async fn slash_health_does_not_crash_empty() {
     let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
         edge_tools::all_tool_schemas(),
     ));
-    let mut state = ReplState::default();
+    let mut state = SessionState::default();
     // No health entries — should print "no data" gracefully
     let exit = handle_slash_command("/health", &api, None, &mut state, None, &selector)
         .await
@@ -185,7 +109,7 @@ async fn slash_lsp_status_does_not_crash() {
     let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
         edge_tools::all_tool_schemas(),
     ));
-    let mut state = ReplState::default();
+    let mut state = SessionState::default();
 
     let exit = handle_slash_command("/lsp", &api, None, &mut state, None, &selector)
         .await
@@ -204,7 +128,7 @@ async fn slash_health_with_entries_does_not_crash() {
     let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
         edge_tools::all_tool_schemas(),
     ));
-    let mut state = ReplState {
+    let mut state = SessionState {
         tool_health_entries: vec![
             astra_turn_core::tool_health_persistence::ToolHealthEntry {
                 name: "bash".into(),
@@ -237,7 +161,7 @@ async fn slash_health_detail_mode() {
     let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
         edge_tools::all_tool_schemas(),
     ));
-    let mut state = ReplState {
+    let mut state = SessionState {
         tool_health_entries: vec![astra_turn_core::tool_health_persistence::ToolHealthEntry {
             name: "bash".into(),
             total_calls: 10,

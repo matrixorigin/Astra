@@ -1,12 +1,12 @@
 //! REPL startup/setup orchestration extracted from `run_chat_repl`.
 
 use super::*;
-use repl_runtime::PipelineModules;
 use session_guard::{
     install_session_panic_hook, install_sigterm_handler, subscribe_shutdown_signal,
 };
+use session_runtime::PipelineModules;
 
-pub(crate) struct ReplStartupArtifacts {
+pub(crate) struct SessionStartupArtifacts {
     pub selector: Box<dyn tool_selector::ToolSelector>,
     pub pipeline_modules: PipelineModules,
     pub edge_heartbeat_task: Option<tokio::task::JoinHandle<()>>,
@@ -18,7 +18,7 @@ pub(crate) struct ReplStartupArtifacts {
 async fn prune_stale_pending_recovery(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    state: &mut ReplState,
+    state: &mut SessionState,
 ) {
     let Some(session_id) = state.pending_recovery.clone() else {
         return;
@@ -32,14 +32,14 @@ async fn prune_stale_pending_recovery(
     }
 }
 
-pub(crate) async fn complete_repl_startup(
-    state: &mut ReplState,
+pub(crate) async fn complete_session_startup(
+    state: &mut SessionState,
     tracer: &mut StartupTracer,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     resume_session_id: Option<&str>,
     no_instructions: bool,
-) -> Result<ReplStartupArtifacts, String> {
+) -> Result<SessionStartupArtifacts, String> {
     // Install panic hook to write session_end on unexpected crashes.
     install_session_panic_hook();
     // Install signal handlers so SIGTERM/SIGHUP can drain through normal REPL shutdown.
@@ -241,7 +241,7 @@ pub(crate) async fn complete_repl_startup(
     append_cloud_pull_sync_journal(
         state,
         profile_name,
-        "repl_startup",
+        "session_startup",
         &cloud_pull_result,
         &pref_keys_after_pull,
     );
@@ -261,7 +261,7 @@ pub(crate) async fn complete_repl_startup(
         slash_session::restore_session_into_state(sid, profile, api, state).await?;
     }
 
-    print_repl_banner(profile, state);
+    print_session_banner(profile, state);
     tracer.phase("banner");
 
     if let Some(ref sid) = state.pending_recovery {
@@ -336,7 +336,7 @@ pub(crate) async fn complete_repl_startup(
         );
     }
 
-    Ok(ReplStartupArtifacts {
+    Ok(SessionStartupArtifacts {
         selector,
         pipeline_modules,
         edge_heartbeat_task,
@@ -399,7 +399,7 @@ mod tests {
     }
 
     // Verify that no_instructions=true prevents project instructions from being
-    // loaded into ReplState, regardless of what's on disk.
+    // loaded into SessionState, regardless of what's on disk.
     #[test]
     fn no_instructions_true_skips_loading() {
         use project_instructions::discover_instructions_from_paths;
@@ -413,7 +413,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         // Simulate the guard: when no_instructions is true, skip the load.
         let no_instructions = true;
         if !no_instructions {
@@ -441,7 +441,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let no_instructions = false;
         if !no_instructions {
             if let Some(instructions) = discover_instructions_from_paths(Some(tmp.path()), None) {
@@ -473,7 +473,7 @@ mod tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let mut state = ReplState {
+        let mut state = SessionState {
             pending_recovery: Some(session_id.clone()),
             ..Default::default()
         };
@@ -509,7 +509,7 @@ mod tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let mut state = ReplState {
+        let mut state = SessionState {
             pending_recovery: Some(session_id.clone()),
             ..Default::default()
         };

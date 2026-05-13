@@ -26,25 +26,25 @@ async fn execute_cli_health_command() {
     assert!(result.is_ok());
 }
 
-// ── repl_turn pure functions ──────────────────────────────────────────
+// ── chat_turn pure functions ──────────────────────────────────────────
 
 #[test]
 fn build_effective_line_plain() {
-    let state = ReplState::default();
+    let state = SessionState::default();
     let result =
-        repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+        chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
     assert_eq!(result, "hello");
 }
 
 #[test]
 fn build_effective_line_with_system_skills() {
-    let mut state = ReplState::default();
+    let mut state = SessionState::default();
     let skills = prompts::builtin_system_skills();
     if let Some(md) = skills.iter().find(|s| s.name == "markdown") {
         state.active_system_skills.push(md.clone());
     }
     let result =
-        repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+        chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
     assert!(result.contains("hello"));
     assert!(result.contains("Markdown"));
 }
@@ -55,7 +55,7 @@ fn history_as_messages_normal_turns() {
         ("q1".to_string(), "a1".to_string()),
         ("q2".to_string(), "a2".to_string()),
     ];
-    let msgs = repl_turn::history_as_messages(&history);
+    let msgs = chat_turn::history_as_messages(&history);
     assert_eq!(msgs.len(), 4);
     assert_eq!(msgs[0]["role"], "user");
     assert_eq!(msgs[1]["role"], "assistant");
@@ -64,7 +64,7 @@ fn history_as_messages_normal_turns() {
 #[test]
 fn history_as_messages_compacted_turn() {
     let history = vec![("".to_string(), "summary".to_string())];
-    let msgs = repl_turn::history_as_messages(&history);
+    let msgs = chat_turn::history_as_messages(&history);
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0]["role"], "assistant");
 }
@@ -85,7 +85,7 @@ async fn slash_memory_search_with_mock() {
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let mut state = ReplState {
+    let mut state = SessionState {
         session_id: Some("sess-1".to_string()),
         ..Default::default()
     };

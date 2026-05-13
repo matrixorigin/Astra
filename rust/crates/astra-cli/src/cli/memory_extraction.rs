@@ -863,7 +863,7 @@ async fn run_extraction(
 
 /// Build a JournalEvent capturing the given extraction outcome, including
 /// structured metadata specific to the outcome variant (e.g. `prior_turn`
-/// for `SkippedBusy`). Centralizing this keeps repl_turn/session_cleanup
+/// for `SkippedBusy`). Centralizing this keeps chat_turn/session_cleanup
 /// from dropping fields during manual construction.
 pub fn journal_event_for_outcome(
     session_id: Option<&str>,
@@ -1453,7 +1453,7 @@ mod tests {
     // ── review-critical #2: prior_turn must land in the journal event ─────
     //
     // P0-3's commit message claimed prior_turn was "plumbed into journal
-    // for ops correlation" — but the repl_turn path only used
+    // for ops correlation" — but the chat_turn path only used
     // JournalEvent::memory_extraction, dropping the field. Ops saw
     // `tag="skipped_busy"` with no way to know WHICH turn was blocking.
 

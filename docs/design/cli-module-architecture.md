@@ -1,6 +1,6 @@
 # CLI Module Architecture
 
-The `astra-cli` crate provides the interactive REPL and command-line interface for Mo Dev Agent. This document describes the architecture of the `cli/` module (~52,500 lines across 54 files).
+The `astra-cli` crate provides the interactive TUI and command-line interface for Mo Dev Agent. This document describes the architecture of the `cli/` module.
 
 ## Module Overview
 
@@ -9,9 +9,10 @@ cli/
 ├── Core Infrastructure
 │   ├── command_registry.rs    — Single source of truth for 62 slash commands
 │   ├── command_router.rs      — CLI argument parsing and one-shot command dispatch
-│   ├── repl_runtime.rs        — Tool selector, skill registry, MCP manager setup
-│   ├── repl_turn.rs           — Single conversation turn execution
-│   └── repl_ui.rs             — Interactive UI (help palette, fuzzy matching)
+│   ├── session_runtime.rs     — Tool selector, skill registry, MCP manager setup
+│   ├── session_state.rs       — `SessionState` for the active chat session
+│   ├── session_startup.rs     — Startup orchestration shared with the TUI
+│   └── chat_turn.rs           — Single conversation turn execution
 │
 ├── Streaming & Rendering
 │   ├── stream_render.rs       — SSE stream consumption with terminal effects
@@ -57,8 +58,7 @@ cli/
 └── Utilities
     ├── cli_utils.rs           — Common utilities
     ├── sse_utils.rs           — SSE parsing helpers
-    ├── mock_llm.rs            — Mock LLM for testing
-    └── readline_actor.rs      — Async readline integration
+    └── mock_llm.rs            — Mock LLM for testing
 ```
 
 ## Data Flow
@@ -70,31 +70,31 @@ main.rs
   └─► command_router.rs::route_cli_command()
         ├─► Parse clap args
         ├─► Apply system prompt
-        ├─► repl_runtime::create_tool_selector()
+        ├─► session_runtime::create_tool_selector()
         └─► stream_render::consume_chat_turn_sse()
               └─► Terminal output
 ```
 
-### Interactive REPL Session
+### Interactive TUI Session
 
 ```
 main.rs
-  └─► repl_loop()
-        ├─► repl_ui::show_help_palette() [on /]
+  └─► tui::run_tui_repl()
+        ├─► tui::slash_dispatch::dispatch() [on /]
         ├─► command_registry::resolve_command()
         └─► Dispatch to slash handler
               │
               ├─ Local handlers (slash_*.rs)
-              │    └─► Direct terminal output
+              │    └─► TUI history cells / system messages
               │
               └─ LLM chat turns
-                   └─► repl_turn::run_chat_turn()
+                   └─► chat_turn::handle_chat_input_with_ui()
                          ├─► Build prompt
                          ├─► API call with SSE
                          └─► stream_render::consume_chat_turn_sse()
                                ├─► Tool execution (edge_tools)
-                               ├─► Permission prompts
-                               └─► Terminal rendering
+                               ├─► Permission prompts (TUI bottom pane)
+                               └─► TUI rendering (ratatui)
 ```
 
 ## Key Components
@@ -133,7 +133,7 @@ Query functions:
 - `subcommand_completions(cmd, partial)` → Subcommand completion
 - `commands_by_group()` → Grouped for help palette
 
-### 2. REPL Runtime (`repl_runtime.rs`)
+### 2. Session Runtime (`session_runtime.rs`)
 
 Sets up the execution environment:
 
@@ -235,7 +235,7 @@ Each `slash_*.rs` file follows a consistent pattern:
 use super::*;
 
 pub(super) async fn handle_example_command(
-    state: &mut ReplState,
+    state: &mut SessionState,
     args: &str,
     api: &ThinClient,
     token: &str,
@@ -251,8 +251,8 @@ pub(super) async fn handle_example_command(
 }
 
 // Private helpers for each subcommand
-async fn handle_list(state: &ReplState) -> Result<()> { ... }
-async fn handle_add(state: &mut ReplState, args: &[&str]) -> Result<()> { ... }
+async fn handle_list(state: &SessionState) -> Result<()> { ... }
+async fn handle_add(state: &mut SessionState, args: &[&str]) -> Result<()> { ... }
 ```
 
 ## Extension Points
@@ -269,7 +269,7 @@ async fn handle_add(state: &mut ReplState, args: &[&str]) -> Result<()> { ... }
 2. **Create handler in `slash_newcmd.rs`**:
    ```rust
    pub(super) async fn handle_newcmd_command(
-       state: &mut ReplState,
+       state: &mut SessionState,
        args: &str,
        // ... other context as needed
    ) -> Result<()>;
@@ -315,7 +315,7 @@ cd rust && cargo test -p astra-cli
 
 ## Performance Considerations
 
-- **Startup**: Tool selector creation is expensive (~200ms). Deferred completions refresh to first REPL iteration.
+- **Startup**: Tool selector creation is expensive (~200ms). Deferred completions refresh to first TUI iteration.
 - **Streaming**: SSE events processed incrementally; terminal updates batched.
 - **Skills**: Hot-reload via `SkillWatcherHandle` avoids restart for skill changes.
 - **Fuzzy matching**: Incremental scoring with early termination.

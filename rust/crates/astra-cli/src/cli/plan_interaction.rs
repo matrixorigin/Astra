@@ -31,7 +31,7 @@ enum PlanLlmOutcome {
 }
 
 /// If the LLM response contains a session_id and we don't have one yet, initialize it.
-fn maybe_init_session_from_plan(state: &mut ReplState, outcome: &PlanLlmOutcome) {
+fn maybe_init_session_from_plan(state: &mut SessionState, outcome: &PlanLlmOutcome) {
     if let PlanLlmOutcome::Ok {
         session_id: Some(sid),
         ..
@@ -40,7 +40,7 @@ fn maybe_init_session_from_plan(state: &mut ReplState, outcome: &PlanLlmOutcome)
         // Always adopt the server-created session_id. The local session_id
         // (generated at plan entry for journal) may differ from the server's.
         if state.session_id.as_deref() != Some(sid.as_str()) {
-            super::repl_turn::initialize_journal_pub(state, sid);
+            super::chat_turn::initialize_journal_pub(state, sid);
             state.session_id = Some(sid.clone());
         }
     }
@@ -827,7 +827,7 @@ fn journal_plan_event(
 /// purgatory rather than back in normal chat.
 ///
 /// We deliberately keep the journal event so the failure is auditable.
-fn abort_plan_mode_after_failure(state: &mut ReplState, stage: &'static str, reason: &str) {
+fn abort_plan_mode_after_failure(state: &mut SessionState, stage: &'static str, reason: &str) {
     journal_plan_event(
         &mut state.journal,
         session_journal::JournalEventType::PlanLifecycle,
@@ -854,7 +854,7 @@ fn abort_plan_mode_after_failure(state: &mut ReplState, stage: &'static str, rea
 async fn handle_analytical_goal(
     goal: String,
     tok: &str,
-    state: &mut ReplState,
+    state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
 ) -> Result<PlanInputResult, String> {
     let context = state
@@ -955,7 +955,7 @@ pub(super) fn journal_goal_steering_event(
 /// Sends `Cancel`, drains remaining updates, and returns `true` if a handle was
 /// actually present (i.e. an executor was running). Call this before spawning a
 /// new executor or when exiting plan mode.
-pub fn shutdown_plan_executor(state: &mut ReplState) -> bool {
+pub fn shutdown_plan_executor(state: &mut SessionState) -> bool {
     if let Some(mut h) = state.plan_handle.take() {
         let _ = h.send_command(crate::plan_executor::PlanCommand::Cancel);
         while h.try_recv().is_some() {}
@@ -966,7 +966,7 @@ pub fn shutdown_plan_executor(state: &mut ReplState) -> bool {
 }
 
 /// True while a plan executor handle is alive (running or paused waiting for Resume).
-pub fn plan_execution_ui_active(state: &ReplState) -> bool {
+pub fn plan_execution_ui_active(state: &SessionState) -> bool {
     state.plan_handle.is_some()
 }
 
@@ -995,7 +995,7 @@ pub fn plan_idle_review_not_started(ps: &plan::PlanModeState) -> bool {
 pub async fn handle_plan_mode_input(
     input: String,
     token: Option<&str>,
-    state: &mut ReplState,
+    state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
 ) -> Result<PlanInputResult, String> {
     use plan::{
@@ -1166,7 +1166,7 @@ pub async fn handle_plan_mode_input(
 
         // Apply session_id captured from the LLM response (plan_state borrow ends here).
         if let Some(sid) = new_session_id {
-            super::repl_turn::initialize_journal_pub(state, &sid);
+            super::chat_turn::initialize_journal_pub(state, &sid);
             state.session_id = Some(sid);
         }
         return Ok(PlanInputResult::Handled);
@@ -1527,7 +1527,7 @@ fn recover_plan_for_resume(
 async fn handle_plan_command(
     cmd: PlanCommand,
     token: Option<&str>,
-    state: &mut ReplState,
+    state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
 ) -> Result<PlanInputResult, String> {
     use plan::{PlanExecutionConfig, PlanModeState};
@@ -1800,7 +1800,7 @@ async fn handle_plan_command(
                 auto_execute: !step_by_step,
             });
             state.executing_plan_goal = Some(goal.clone());
-            if let Some(change) = super::repl_turn::steer_observability_goal(state, &goal) {
+            if let Some(change) = super::chat_turn::steer_observability_goal(state, &goal) {
                 journal_goal_steering_event(
                     &mut state.journal,
                     change.turn,
@@ -2154,7 +2154,7 @@ async fn handle_plan_command(
 async fn handle_goal_submission(
     goal: String,
     token: Option<&str>,
-    state: &mut ReplState,
+    state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
 ) -> Result<PlanInputResult, String> {
     use astra_runtime::plan::outline;
@@ -2176,11 +2176,11 @@ async fn handle_goal_submission(
     // outline call would silently drop every plan-mode event.
     if state.session_id.is_none() {
         let new_sid = uuid::Uuid::new_v4().to_string();
-        super::repl_turn::initialize_journal_pub(state, &new_sid);
+        super::chat_turn::initialize_journal_pub(state, &new_sid);
         state.session_id = Some(new_sid);
     } else if state.journal.is_none() {
         if let Some(sid) = state.session_id.clone() {
-            super::repl_turn::initialize_journal_pub(state, &sid);
+            super::chat_turn::initialize_journal_pub(state, &sid);
         }
     }
 
@@ -2415,7 +2415,7 @@ async fn handle_outline_clarifications(
     questions: Vec<plan::ClarificationQuestion>,
     goal: &str,
     token: Option<&str>,
-    state: &mut ReplState,
+    state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
 ) -> Result<PlanInputResult, String> {
     use plan::{PendingClarifications, PlanModeState};
@@ -2571,7 +2571,7 @@ async fn expand_outline_to_plan(
     ol: &astra_runtime::plan::outline::PlanOutline,
     goal: &str,
     tok: &str,
-    state: &mut ReplState,
+    state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
 ) -> Result<PlanInputResult, String> {
     use astra_runtime::plan::outline;
@@ -2719,7 +2719,7 @@ async fn expand_outline_to_plan(
 async fn accept_generated_plan(
     mut plan: astra_services::task_orchestrator::TaskPlan,
     token: Option<&str>,
-    state: &mut ReplState,
+    state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
 ) -> Result<PlanInputResult, String> {
     use plan::PlanModeState;
@@ -2871,10 +2871,10 @@ mod tests {
 
     #[test]
     fn plan_execution_ui_active_follows_handle() {
-        let state = ReplState::default();
+        let state = SessionState::default();
         assert!(!plan_execution_ui_active(&state), "no handle => inactive");
 
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let (handle, _update_tx, _cmd_rx) = plan_executor::create_plan_channels();
         state.plan_handle = Some(handle);
         assert!(plan_execution_ui_active(&state), "handle present => active");
@@ -2950,7 +2950,7 @@ mod tests {
 
     #[tokio::test]
     async fn paused_plan_slash_command_is_redispatched() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.plan_mode = Some(plan::PlanModeState::new(
             "goal".into(),
             plan::ProjectContext::default(),
@@ -2980,7 +2980,7 @@ mod tests {
 
     #[tokio::test]
     async fn paused_plan_plain_text_abandons_and_sends_chat() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.plan_mode = Some(plan::PlanModeState::new(
             "goal".into(),
             plan::ProjectContext::default(),
@@ -3010,7 +3010,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_exits_plan_mode_and_leaves_background_state() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.chat_plan_only = true;
         let mut ps = plan::PlanModeState::new("goal".into(), plan::ProjectContext::default());
         ps.plan.subtasks.push(SubtaskPlan {
@@ -3064,13 +3064,13 @@ mod tests {
 
     #[test]
     fn shutdown_plan_executor_returns_false_when_no_handle() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         assert!(!shutdown_plan_executor(&mut state));
     }
 
     #[test]
     fn shutdown_plan_executor_cancels_and_drains_handle() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let (handle, update_tx, mut cmd_rx) = plan_executor::create_plan_channels();
         state.plan_handle = Some(handle);
 
@@ -3323,7 +3323,7 @@ mod tests {
 
     #[test]
     fn maybe_init_session_from_plan_adopts_server_session_even_when_local_exists() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         // Simulate local session_id generated at plan entry
         state.session_id = Some("local-uuid-1234".to_string());
 
@@ -3342,7 +3342,7 @@ mod tests {
 
     #[test]
     fn maybe_init_session_from_plan_noop_when_already_matching() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.session_id = Some("same-id".to_string());
 
         let outcome = PlanLlmOutcome::Ok {
@@ -3356,7 +3356,7 @@ mod tests {
 
     #[test]
     fn maybe_init_session_from_plan_noop_on_no_server_session() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.session_id = Some("local-id".to_string());
 
         let outcome = PlanLlmOutcome::Ok {
