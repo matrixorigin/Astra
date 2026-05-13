@@ -264,17 +264,7 @@ pub(crate) async fn complete_repl_startup(
     print_repl_banner(profile, state);
     tracer.phase("banner");
 
-    if let Some(ref sid) = state.pending_recovery {
-        let short = truncate_str(sid, 12);
-        eprintln!(
-            "{}",
-            format!(
-                "  ↻ Recoverable session {short} detected for this project. Say continue / resume / 继续 to restore it, or use /resume {short}."
-            )
-            .magenta()
-        );
-        eprintln!();
-    }
+    // Pending recovery is silently retained in state for /resume; no startup banner.
 
     // Proxy info now shown in startup card — no separate line needed.
 

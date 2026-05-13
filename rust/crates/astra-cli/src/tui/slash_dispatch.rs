@@ -644,8 +644,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
-        // ── Style ───────────────────────────────────────────────────
-        "/style" => SlashResult::Fallback,
 
         // ── Instructions — subcommand menu or direct action ─────────
         "/instructions" => {

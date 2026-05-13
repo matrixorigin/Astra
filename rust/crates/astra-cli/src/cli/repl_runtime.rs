@@ -815,11 +815,22 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     }
 
     // ── Render helper ────────────────────────────────────────────────────
-    let h_bar = "─".repeat(total_inner + 2);
+    // Body row width (between the two outer │):
+    //   " " + left_col_w + " " + "│" + " " + right_col_w + " "
+    //   = 1 + left_col_w + 1 + 1 + 1 + right_col_w + 1 = total_inner + 4
+    // …but the divider counts as part of total_inner already (total_inner = left + right + 3),
+    // so the inner span between the two outer │ is `total_inner + 2`.
+    let inner_w = total_inner + 2;
+    let h_bar = "─".repeat(inner_w);
+
+    // Title embedded in the top edge: ╭─ astra v0.1.0 ─────────╮
     let title_text = format!("astra v{version}");
-    let title_segment = format!("─── {} ", title_text);
-    let header_fill = (total_inner + 2)
-        .saturating_sub(title_segment.chars().count() + 1);
+    // " astra v0.1.0 " — leading and trailing space so the title breathes.
+    let title_padded = format!(" {} ", title_text);
+    let title_w = crate::terminal_region::visible_char_width(&title_padded);
+    // Layout: ╭ ─ <title> ── … ── ╮  (1 leading dash before the title)
+    let lead_dash = 1usize;
+    let trail_dash = inner_w.saturating_sub(lead_dash + title_w);
 
     // Total lines in the card (header + body + footer)
     let card_lines = 1 + total_rows + 1;
@@ -828,8 +839,9 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     struct BannerLayout<'a> {
         left: &'a [String],
         right: &'a [String],
-        title_segment: &'a str,
-        header_fill: usize,
+        title_padded: &'a str,
+        lead_dash: usize,
+        trail_dash: usize,
         h_bar: &'a str,
         total_rows: usize,
         left_col_w: usize,
@@ -849,8 +861,9 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
         let BannerLayout {
             left,
             right,
-            title_segment,
-            header_fill,
+            title_padded,
+            lead_dash,
+            trail_dash,
             h_bar,
             total_rows,
             left_col_w,
@@ -872,35 +885,33 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
             out
         };
 
-        // Header
-        eprintln!(
-            "{}{}{}{}",
-            "╭".dark_grey(),
-            title_segment.dark_grey(),
-            "─".repeat(*header_fill).dark_grey(),
-            "╮".dark_grey()
-        );
+        // Header — title is embedded inline; brighter so it stands out.
+        eprint!("{}", "╭".grey());
+        eprint!("{}", "─".repeat(*lead_dash).grey());
+        eprint!("{}", title_padded.bold().magenta());
+        eprint!("{}", "─".repeat(*trail_dash).grey());
+        eprintln!("{}", "╮".grey());
         // Body
         for row in 0..*total_rows {
             let l_pad = starfield_pad(*left_col_w, vis_w(&left[row]), &mut rng_seed, 12);
             let r_pad = starfield_pad(*right_col_w, vis_w(&right[row]), &mut rng_seed, 8);
             eprintln!(
                 "{} {}{} {} {}{} {}",
-                "│".dark_grey(),
+                "│".grey(),
                 left[row],
                 l_pad,
-                "│".dark_grey(),
+                "│".grey(),
                 right[row],
                 r_pad,
-                "│".dark_grey(),
+                "│".grey(),
             );
         }
         // Footer
         eprintln!(
             "{}{}{}",
-            "╰".dark_grey(),
-            h_bar.dark_grey(),
-            "╯".dark_grey()
+            "╰".grey(),
+            h_bar.grey(),
+            "╯".grey()
         );
         let _ = std::io::stderr().flush();
     }
@@ -915,8 +926,9 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     let layout = BannerLayout {
         left: &left,
         right: &right,
-        title_segment: &title_segment,
-        header_fill,
+        title_padded: &title_padded,
+        lead_dash,
+        trail_dash,
         h_bar: &h_bar,
         total_rows,
         left_col_w,

@@ -189,8 +189,6 @@ mod slash_skill;
 mod slash_state;
 #[path = "cli/slash_stats.rs"]
 mod slash_stats;
-#[path = "cli/slash_style.rs"]
-mod slash_style;
 #[path = "cli/slash_sync.rs"]
 mod slash_sync;
 #[path = "cli/slash_task.rs"]

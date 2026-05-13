@@ -338,10 +338,6 @@ pub(super) async fn handle_slash_command(
             slash_inspect::handle_inspect_command(arg, state);
         }
 
-        "/style" => {
-            slash_style::handle_style_command(arg);
-        }
-
         "/history" | "/grep" | "/review" | "/copy" | "/diagnostics" | "/lsp" | "/context"
         | "/version" | "/whoami" | "/rewind" | "/report" => {
             handle_info_command(cmd, arg, api, state, profile, token).await?;

@@ -250,14 +250,6 @@ const DIFF_SUBCOMMANDS: &[(&str, &str)] = &[
 
 // EXPERIMENT_SUBCOMMANDS removed — /experiment is dead code
 
-const STYLE_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("colorful", "Colorful theme"),
-    ("default", "Default theme"),
-    ("high-contrast", "High-contrast theme"),
-    ("list", "List available themes"),
-    ("minimal", "Minimal theme"),
-];
-
 const ALLOW_SUBCOMMANDS: &[(&str, &str)] = &[
     ("all", "Auto-approve all (alias for auto)"),
     ("auto", "Auto-approve all tool use"),
@@ -702,13 +694,6 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_subcommands(INSTRUCTIONS_SUBCOMMANDS)
     .with_arg_hint("[show|reload|off]"),
-    CommandMeta::new(
-        "/style",
-        "Output theme: default | minimal | colorful | high-contrast",
-        CommandGroup::System,
-    )
-    .with_subcommands(STYLE_SUBCOMMANDS)
-    .with_arg_hint("[list|default|minimal|colorful|high-contrast]"),
     CommandMeta::new(
         "/diagnostics",
         "Binary, API, auth, environment checks",

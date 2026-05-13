@@ -3059,7 +3059,6 @@ mod tests {
                 "/allow",
                 "/yolo",
                 "/instructions",
-                "/style",
             ],
         ];
         let known: std::collections::HashSet<&str> = COMMANDS.iter().map(|m| m.name).collect();
