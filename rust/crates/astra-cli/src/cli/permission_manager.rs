@@ -300,12 +300,26 @@ impl PermissionSettings {
     }
 
     /// Save to the project-level settings file.
+    ///
+    /// Atomic: writes to a temp file, fsyncs, renames into place, then
+    /// fsyncs the parent directory. This guarantees that an interrupted
+    /// save (SIGINT, crash, OS shutdown) never leaves a partially-written
+    /// `permissions.json` on disk.
     pub fn save(&self, project_root: &Path) -> io::Result<()> {
         let dir = project_root.join(".kiro");
         fs::create_dir_all(&dir)?;
         let path = dir.join("permissions.json");
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(path, json)
+
+        let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
+        std::io::Write::write_all(&mut tmp, json.as_bytes())?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&path).map_err(|e| e.error)?;
+
+        if let Ok(dir_handle) = fs::File::open(&dir) {
+            let _ = dir_handle.sync_all();
+        }
+        Ok(())
     }
     #[allow(dead_code)] // Used in tests and by with_project
     fn parsed_allow_rules(&self) -> Vec<PermissionRule> {
@@ -347,6 +361,11 @@ pub(super) struct PermissionManager {
     /// later requests under the same subtree (regardless of which tool)
     /// are auto-allowed without re-prompting.
     trusted_sandbox_roots: Vec<PathBuf>,
+    /// Last error from persisting an allow rule to disk (project or
+    /// user settings). Surfaced via [`last_save_error`] so the TUI can
+    /// show a "Failed to save rule" toast and fall back to session-only
+    /// behaviour. `None` after a successful save.
+    last_save_error: Option<String>,
 }
 
 impl PermissionManager {
@@ -470,6 +489,7 @@ impl PermissionManager {
             cached_user_allow: Vec::new(),
             cached_user_deny: Vec::new(),
             inherited: None,
+            last_save_error: None,
         }
     }
 
@@ -507,6 +527,7 @@ impl PermissionManager {
             cached_user_allow,
             cached_user_deny,
             inherited: None,
+            last_save_error: None,
         }
     }
 
@@ -545,6 +566,7 @@ impl PermissionManager {
             cached_user_allow,
             cached_user_deny,
             inherited: Some(inherited),
+            last_save_error: None,
         }
     }
 
@@ -1338,14 +1360,42 @@ impl PermissionManager {
     }
 
     /// Add a persistent allow rule and save to disk.
+    ///
+    /// Save errors are surfaced via `last_save_error()` and a `tracing::warn`
+    /// rather than silently swallowed. The in-memory rule is added even
+    /// if the save fails — callers can fall back to session-only
+    /// behaviour by inspecting the error and informing the user.
     pub(super) fn add_allow_rule(&mut self, rule: &str) {
         if !self.settings.allow.contains(&rule.to_string()) {
             self.settings.allow.push(rule.to_string());
             self.cached_allow = self.settings.parsed_allow_rules();
             if let Some(ref root) = self.project_root {
-                let _ = self.settings.save(root);
+                if let Err(e) = self.settings.save(root) {
+                    tracing::warn!(
+                        "permission_manager: failed to persist allow rule '{}' to {}: {}",
+                        rule,
+                        root.join(".kiro/permissions.json").display(),
+                        e
+                    );
+                    self.last_save_error = Some(e.to_string());
+                } else {
+                    self.last_save_error = None;
+                }
             }
         }
+    }
+
+    /// Returns the last persistence error, if any. UI layers consult
+    /// this after invoking `add_allow_rule` / similar mutations to
+    /// decide whether to display a `Failed to save rule` toast.
+    pub fn last_save_error(&self) -> Option<&str> {
+        self.last_save_error.as_deref()
+    }
+
+    /// Clear the last persistence error (e.g. after the user has been
+    /// notified, so the next save attempt starts with a clean slate).
+    pub fn clear_last_save_error(&mut self) {
+        self.last_save_error = None;
     }
 
     /// Build a pattern-specific allow rule from a tool name and its arguments.

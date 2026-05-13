@@ -2863,10 +2863,21 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // `3b7ac18f` where `cat ~/claudecode/*` was blocked 4 times in
         // auto mode with no approval path.
         //
-        // Interactive / Prompt mode intentionally stays on the
-        // sequential path — the parallel batch is only used when the
-        // cloud has already pre-approved every request in it, so there
-        // is no UI to invoke here anyway.
+        // For NeedApproval and Deny we now route to the same approval
+        // sink as the sequential path (issue #326 P0 #1 fix). Previously
+        // both were silently `continue`d, which meant Prompt-mode users
+        // never got asked about parallel sandbox-denied tools and Deny
+        // rules fired by parallel retries were invisible. This restores
+        // the contract that **no decision is silently dropped**:
+        //   - Allow       → expand sandbox + retry
+        //   - Deny(reason)→ surface the reason in the SANDBOX_DENIED
+        //                   output so the LLM/user can see it
+        //   - NeedApproval→ ask the TUI sink synchronously; on
+        //                   approval, expand + retry; on rejection,
+        //                   surface the reason
+        //
+        // Interactive / Prompt mode now reaches this branch too because
+        // we no longer assume the parallel batch was pre-approved.
         let mut outputs = outputs;
         for pos in 0..outputs.len() {
             if !crate::sandbox_retry::is_sandbox_denied(&outputs[pos].0.output) {
@@ -2885,10 +2896,74 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 &sandbox_tool_key,
                 &guard_args,
             );
-            let approved = matches!(
-                decision,
-                crate::permission_manager::PermissionDecision::Allow
-            );
+            let approved = match decision {
+                crate::permission_manager::PermissionDecision::Allow => true,
+                crate::permission_manager::PermissionDecision::Deny(reason) => {
+                    // Surface the deny reason so the LLM and user can
+                    // see why the sandbox refused to widen, instead of
+                    // silently continuing with the original
+                    // SANDBOX_DENIED output.
+                    let prefix = "SANDBOX_DENIED: ";
+                    let suffix = format!(" (sandbox_expand:{tool} denied: {reason})");
+                    if !outputs[pos].0.output.contains(&suffix) {
+                        if outputs[pos].0.output.starts_with(prefix) {
+                            outputs[pos].0.output.push_str(&suffix);
+                        } else {
+                            outputs[pos].0.output =
+                                format!("{prefix}{}{suffix}", outputs[pos].0.output);
+                        }
+                    }
+                    false
+                }
+                crate::permission_manager::PermissionDecision::NeedApproval {
+                    tool: approval_tool,
+                    header,
+                    detail,
+                    reason,
+                } => {
+                    use super::chat_stream::ApprovalResponse;
+                    if let Some(tx) = &self.approval_request_tx {
+                        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                        let _ = tx.send(super::chat_stream::ApprovalRequest {
+                            tool: approval_tool.clone(),
+                            header,
+                            detail,
+                            reason,
+                            response_tx: resp_tx,
+                        });
+                        let response = if let Some(token) = self.cancel_token {
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => ApprovalResponse::Deny,
+                                r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
+                            }
+                        } else {
+                            resp_rx.await.unwrap_or(ApprovalResponse::Deny)
+                        };
+                        if let Some(pm) = self.perm_manager.as_mut() {
+                            pm.record_approval(
+                                &approval_tool,
+                                Some(&guard_args),
+                                response.is_approved(),
+                            );
+                        }
+                        response.is_approved()
+                    } else {
+                        // No approval sink (headless / sub-run): fail
+                        // closed. The contract is enforced upstream by
+                        // forcing PermissionMode::Auto for headless
+                        // entries; reaching this branch with no sink
+                        // means a misconfiguration. Surface a clear
+                        // reason in the SANDBOX_DENIED output.
+                        let suffix = " (approval required for sandbox_expand but no TUI; \
+                                       pass --mode auto or add allow rule)";
+                        if !outputs[pos].0.output.contains(suffix) {
+                            outputs[pos].0.output.push_str(suffix);
+                        }
+                        false
+                    }
+                }
+            };
             if !approved {
                 continue;
             }
