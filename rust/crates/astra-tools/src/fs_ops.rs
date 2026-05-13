@@ -815,7 +815,7 @@ pub fn prepare_str_replace(
 
         if replace_all && normalized_quote_count > 1 {
             return Err(ToolResult::error(format!(
-                "Error: old_str matches {normalized_quote_count} occurrences in {path_str} after normalizing curly quotes, but the file contains mixed curly quote forms. Cannot safely replace_all with inconsistent quoting styles."
+                "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: Cannot replace_all in {path_str}.\nWHY:  old_str matches {normalized_quote_count} occurrences after normalizing curly quotes, but the file mixes straight and curly quote forms.\nNEXT: Either (a) split into multiple targeted str_replace calls with surrounding context to disambiguate, or (b) normalize the file's quote style first, then retry."
             )));
         }
 
@@ -825,7 +825,7 @@ pub fn prepare_str_replace(
     }
     if count > 1 && !replace_all {
         return Err(ToolResult::error(format!(
-            "Error: old_str found {count} times in {path_str}. Make old_str more specific to match exactly once."
+            "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: old_str is ambiguous in {path_str}.\nWHY:  old_str matched {count} times; without replace_all=true the target location is undefined.\nNEXT: Add more surrounding context lines to old_str so it matches exactly once, OR pass replace_all=true if you intend to replace every occurrence."
         )));
     }
 
@@ -966,18 +966,18 @@ pub fn prepare_multi_edit(
         };
         if old_str == new_str {
             return Err(ToolResult::error(format!(
-                "Error: edit[{i}] old_str and new_str are identical"
+                "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: edit[{i}] is a no-op.\nWHY:  old_str and new_str are byte-for-byte identical.\nNEXT: Remove this edit, or fix new_str to reflect the intended change."
             )));
         }
         let count = working.matches(old_str).count();
         if count == 0 {
             return Err(ToolResult::error(format!(
-                "Error: edit[{i}] old_str not found in {path_str}"
+                "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: edit[{i}] old_str not found in {path_str}.\nWHY:  The exact byte sequence does not appear in the current file content (whitespace, indentation, or quote style may differ; or the file changed since you last read it).\nNEXT: Re-read the target region with read_file, copy the exact bytes (including leading whitespace) into old_str, then retry."
             )));
         }
         if count > 1 {
             return Err(ToolResult::error(format!(
-                "Error: edit[{i}] old_str found {count} times in {path_str}. Must match exactly once."
+                "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: edit[{i}] old_str is ambiguous in {path_str}.\nWHY:  old_str matched {count} times; batch edits require exactly one match per edit.\nNEXT: Extend old_str with more surrounding context lines so it matches exactly once."
             )));
         }
         let next = working.replacen(old_str, new_str, 1);
@@ -1473,10 +1473,18 @@ fn tree_sitter_has_error(source: &str, lang: crate::code_intel::Language) -> Opt
         .map(|tree| tree.root_node().has_error())
 }
 
+/// Build a structured error message for failed str_replace lookups.
+///
+/// Output starts with a prominent `❌ STR_REPLACE FAILED — FILE NOT MODIFIED`
+/// banner, followed by WHAT/WHY/NEXT sections so the caller (typically an LLM)
+/// can immediately see the failure category and recovery action. Diagnostic
+/// hints (whitespace match, line-by-line near-misses) are appended below.
 fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let old_lines: Vec<&str> = old_str.lines().collect();
-    let mut msg = format!("Error: old_str not found in {path_str}.\n");
+    let mut msg = format!(
+        "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: old_str not found in {path_str}.\nWHY:  The exact byte sequence does not appear in the current file content.\nNEXT: Re-read the target region with read_file, copy the actual bytes into old_str (including indentation), then retry. Diagnostic hints below:\n"
+    );
     let mut has_specific_hint = false;
 
     let normalized_old = normalize_ws(old_str);
