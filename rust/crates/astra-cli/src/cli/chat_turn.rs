@@ -3227,6 +3227,29 @@ mod tests {
     }
 
     #[test]
+    fn auth_error_predicates_distinguish_provider_from_session() {
+        // Regression: provider-auth strings must route to is_llm_provider_auth_error
+        // (which triggers a model retry) and NOT to is_auth_error (which would
+        // wrongly send the user to /login).
+        // Upstream emit sites:
+        //   - rust/crates/runtime/src/turn/llm_client.rs (~L2485): the literal
+        //     "LLM provider authentication failed" classified-error message.
+        //   - "[auth] LLM provider" prefix used by upstream agent_warn! emits.
+        let provider_msg = "LLM provider authentication failed";
+        assert!(super::is_llm_provider_auth_error(provider_msg));
+        assert!(!super::is_auth_error(provider_msg));
+
+        let prefixed = "[auth] LLM provider rejected request: 401";
+        assert!(super::is_llm_provider_auth_error(prefixed));
+        assert!(!super::is_auth_error(prefixed));
+
+        // Plain session 401 must still be detected by the generic predicate.
+        let session_msg = "HTTP 401 Unauthorized";
+        assert!(!super::is_llm_provider_auth_error(session_msg));
+        assert!(super::is_auth_error(session_msg));
+    }
+
+    #[test]
     fn initialize_journal_attaches_without_duplicate_start_or_workspace_reset() {
         let (_tmp, _g) = isolated_sessions_dir();
         let sid = format!("test-attach-{}", uuid::Uuid::new_v4());

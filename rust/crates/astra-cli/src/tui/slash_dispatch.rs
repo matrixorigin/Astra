@@ -7,8 +7,8 @@
 
 use crate::command_registry;
 use crate::session_state::SessionState;
-use crate::tui::bottom_pane::BottomPane;
 use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
+use crate::tui::bottom_pane::BottomPane;
 use crate::tui::history_cell::system::SystemCell;
 use crate::tui::terminal::TerminalGuard;
 
@@ -481,7 +481,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         // ── Worktrees (TUI-native) ──────────────────────────────────
         "/worktrees" => {
             use crate::tui::bottom_pane::worktrees_view::WorktreesView;
-            use crate::tui::worktrees::{WorktreeList, parse};
+            use crate::tui::worktrees::{parse, WorktreeList};
 
             // `git worktree list --porcelain` on a blocking thread.
             let porcelain = tokio::task::spawn_blocking(|| {
@@ -1284,78 +1284,77 @@ pub(crate) const MODEL_THINKING_SENTINEL: &str = "__model_thinking__\n";
 /// the picker.  The picker emits `MODEL_PICK_SENTINEL + <name>`; the
 /// outer loop then checks the model's `thinking_capability` and
 /// either commits or pushes a thinking-mode picker.
+/// True when an error string came from an HTTP 401 response.
+/// Mirrors `chat_turn::is_auth_error` minus the LLM-provider escape — kept
+/// local because slash dispatch only sees `fetch_model_list` errors which
+/// never come from upstream model providers.
+fn is_http_401(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("401 unauthorized")
+        || lower.contains("status: 401")
+        || lower.contains("status code: 401")
+        || lower.contains("http 401")
+        || lower.contains("unauthorized")
+}
+
+/// Build the model picker view from a fetched model list and push it.
+fn push_model_picker(ctx: &mut DispatchContext<'_>, models: Vec<String>) {
+    // Strip any `-thinking:*` suffix from the cached model when
+    // highlighting the current row — the picker shows base names only,
+    // and the suffix is re-applied by the thinking stage.
+    let current_raw = ctx.state.model.clone().unwrap_or_default();
+    let current_base = current_raw
+        .split_once("-thinking:")
+        .map(|(b, _)| b.to_string())
+        .unwrap_or(current_raw);
+    let items: Vec<SelectionItem> = models
+        .into_iter()
+        .map(|m| {
+            let is_current = m == current_base;
+            SelectionItem {
+                name: m,
+                description: None,
+                is_current,
+            }
+        })
+        .collect();
+    if items.is_empty() {
+        ctx.show_info("No models available".into());
+    } else {
+        let view = ListSelectionView::new(items, Some("Select model:".into()))
+            .with_result_prefix(MODEL_PICK_SENTINEL);
+        ctx.bottom_pane.push_view(Box::new(view));
+    }
+}
+
 async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
     let token = crate::session_runtime::current_access_token(ctx.profile);
     match crate::slash_router::fetch_model_list(ctx.api, token.as_deref()).await {
-        Ok(models) => {
-            // Strip any `-thinking:*` suffix from the cached model
-            // when highlighting the current row — the picker shows
-            // base names only, and the suffix is re-applied by the
-            // thinking stage.
-            let current_raw = ctx.state.model.clone().unwrap_or_default();
-            let current_base = current_raw
-                .split_once("-thinking:")
-                .map(|(b, _)| b.to_string())
-                .unwrap_or(current_raw);
-            let items: Vec<SelectionItem> = models
-                .into_iter()
-                .map(|m| {
-                    let is_current = m == current_base;
-                    SelectionItem {
-                        name: m,
-                        description: None,
-                        is_current,
-                    }
-                })
-                .collect();
-            if items.is_empty() {
-                ctx.show_info("No models available".into());
-            } else {
-                let view = ListSelectionView::new(items, Some("Select model:".into()))
-                    .with_result_prefix(MODEL_PICK_SENTINEL);
-                ctx.bottom_pane.push_view(Box::new(view));
-            }
-        }
+        Ok(models) => push_model_picker(ctx, models),
         Err(e) => {
             let msg = e.to_string();
-            let lower = msg.to_lowercase();
-            let is_auth = lower.contains("401 unauthorized")
-                || lower.contains("status: 401")
-                || lower.contains("status code: 401")
-                || lower.contains("http 401")
-                || lower.contains("unauthorized");
-            if is_auth {
-                // Attempt silent token refresh + retry once.
+            if is_http_401(&msg) {
+                // Attempt silent token refresh + retry once. If the retry
+                // itself fails with a non-auth error (e.g. 5xx after refresh),
+                // surface that real error instead of the generic /login hint.
                 if crate::session_runtime::attempt_token_refresh(ctx.api, ctx.profile).await {
                     let fresh = crate::session_runtime::current_access_token(ctx.profile);
-                    if let Ok(models) =
-                        crate::slash_router::fetch_model_list(ctx.api, fresh.as_deref()).await
-                    {
-                        let current_raw = ctx.state.model.clone().unwrap_or_default();
-                        let current_base = current_raw
-                            .split_once("-thinking:")
-                            .map(|(b, _)| b.to_string())
-                            .unwrap_or(current_raw);
-                        let items: Vec<SelectionItem> = models
-                            .into_iter()
-                            .map(|m| {
-                                let is_current = m == current_base;
-                                SelectionItem {
-                                    name: m,
-                                    description: None,
-                                    is_current,
-                                }
-                            })
-                            .collect();
-                        if items.is_empty() {
-                            ctx.show_info("No models available".into());
-                        } else {
-                            let view =
-                                ListSelectionView::new(items, Some("Select model:".into()))
-                                    .with_result_prefix(MODEL_PICK_SENTINEL);
-                            ctx.bottom_pane.push_view(Box::new(view));
+                    match crate::slash_router::fetch_model_list(ctx.api, fresh.as_deref()).await {
+                        Ok(models) => {
+                            push_model_picker(ctx, models);
+                            return SlashResult::Handled;
                         }
-                        return SlashResult::Handled;
+                        Err(retry_err) => {
+                            let retry_msg = retry_err.to_string();
+                            if !is_http_401(&retry_msg) {
+                                ctx.show_error(format!(
+                                    "Failed to fetch models: {}",
+                                    retry_msg.lines().next().unwrap_or(&retry_msg)
+                                ));
+                                return SlashResult::Handled;
+                            }
+                            // Still 401 after refresh — fall through to /login hint.
+                        }
                     }
                 }
                 ctx.show_error("Not authorized — try /login first".into());
