@@ -404,12 +404,7 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Core,
     ),
     CommandMeta::new("/exit", "Exit astra", CommandGroup::Core),
-    CommandMeta::new(
-        "/quit",
-        "Exit astra (alias for /exit)",
-        CommandGroup::Core,
-    )
-    .alias(),
+    CommandMeta::new("/quit", "Exit astra (alias for /exit)", CommandGroup::Core).alias(),
     // ── Workspace ─────────────────────────────────────────────────────────
     CommandMeta::new(
         "/grep",
