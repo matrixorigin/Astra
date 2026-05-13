@@ -1771,16 +1771,150 @@ pub fn strip_sql_comments(sql: &str) -> String {
 
 #[must_use]
 pub fn check_sql_safety(sql: &str) -> Option<&'static str> {
-    let stripped = strip_sql_comments(sql).to_uppercase();
-    for stmt in stripped.split(';') {
-        let first_word = stmt.split_whitespace().next().unwrap_or("");
+    // Issue #326 P5 / R2 Major: previously this only checked the
+    // first whitespace-separated word of each statement, which let
+    // these patterns slip through:
+    //
+    //   WITH cte AS (SELECT 1) DELETE FROM users;
+    //   INSERT INTO log SELECT * FROM (DELETE FROM secrets RETURNING *) d;
+    //   SELECT 1; /* hidden */ DROP TABLE users;
+    //   INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET x = 2;
+    //
+    // The new scanner tokenizes the input (skipping comments and
+    // string/identifier literals) and asks: does any TOKEN whose
+    // role could be "verb" match a destructive keyword? CTEs,
+    // sub-queries, UPSERT clauses, and trailing statements after
+    // a comment all surface.
+    scan_sql_destructive_keyword(sql)
+}
+
+/// Token-level scan for destructive SQL verbs.
+///
+/// Skips:
+/// - Line comments (`-- … \n`)
+/// - Block comments (`/* … */`)
+/// - Single-quoted string literals (`'…'` with `''` escape)
+/// - Double-quoted identifiers / strings (`"…"` with `""` escape)
+/// - Backtick-quoted identifiers (MySQL)
+///
+/// Then walks word-boundaries and reports the first token that
+/// matches `DESTRUCTIVE_KEYWORDS`. We intentionally don't filter
+/// "is this a verb position?" — for the purposes of approval
+/// gating, a literal keyword anywhere in user-supplied SQL is
+/// suspicious enough to require the user's eye on it. False
+/// positives are bounded (the legitimate `SELECT name FROM
+/// drop_log` where `drop_log` is a column name does NOT trigger
+/// because the keyword check is exact-match against the whole
+/// token, not substring).
+fn scan_sql_destructive_keyword(sql: &str) -> Option<&'static str> {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let n = bytes.len();
+    let mut current_word = String::new();
+
+    let flush_word = |word: &mut String| -> Option<&'static str> {
+        if word.is_empty() {
+            return None;
+        }
+        let upper: String = word.chars().map(|c| c.to_ascii_uppercase()).collect();
+        word.clear();
         for &kw in DESTRUCTIVE_KEYWORDS {
-            if first_word == kw {
+            if upper == kw {
                 return Some(kw);
             }
         }
+        None
+    };
+
+    while i < n {
+        let b = bytes[i];
+
+        // Line comment
+        if b == b'-' && i + 1 < n && bytes[i + 1] == b'-' {
+            if let Some(found) = flush_word(&mut current_word) {
+                return Some(found);
+            }
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment
+        if b == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+            if let Some(found) = flush_word(&mut current_word) {
+                return Some(found);
+            }
+            i += 2;
+            while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(n);
+            continue;
+        }
+        // Single-quoted string
+        if b == b'\'' {
+            if let Some(found) = flush_word(&mut current_word) {
+                return Some(found);
+            }
+            i += 1;
+            while i < n {
+                if bytes[i] == b'\'' {
+                    if i + 1 < n && bytes[i + 1] == b'\'' {
+                        i += 2; // escaped
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Double-quoted identifier / string
+        if b == b'"' {
+            if let Some(found) = flush_word(&mut current_word) {
+                return Some(found);
+            }
+            i += 1;
+            while i < n {
+                if bytes[i] == b'"' {
+                    if i + 1 < n && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Backtick identifier (MySQL)
+        if b == b'`' {
+            if let Some(found) = flush_word(&mut current_word) {
+                return Some(found);
+            }
+            i += 1;
+            while i < n && bytes[i] != b'`' {
+                i += 1;
+            }
+            if i < n {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Word-character boundary
+        if (b.is_ascii_alphanumeric() || b == b'_') && current_word.len() < 64 {
+            current_word.push(b as char);
+        } else {
+            if let Some(found) = flush_word(&mut current_word) {
+                return Some(found);
+            }
+        }
+        i += 1;
     }
-    None
+    flush_word(&mut current_word)
 }
 
 #[cfg(test)]
@@ -1788,7 +1922,127 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // ── Issue #326 P0 / R1 Major 6: catastrophic command circuit breaker ──
+    // ── Issue #326 P5 / R2 Major: SQL AST-style scanner ──
+
+    #[test]
+    fn sql_safety_blocks_cte_with_destructive_body() {
+        // Pre-fix: only `WITH` was on the first line, so the
+        // first-word scan returned None.
+        assert_eq!(
+            check_sql_safety("WITH t AS (SELECT 1) DELETE FROM users"),
+            Some("DELETE")
+        );
+    }
+
+    #[test]
+    fn sql_safety_blocks_destructive_after_select() {
+        assert_eq!(
+            check_sql_safety("SELECT 1 FROM dual UNION SELECT 2; DROP TABLE x"),
+            Some("DROP")
+        );
+    }
+
+    #[test]
+    fn sql_safety_does_not_flag_plain_upsert() {
+        // INSERT and UPDATE are NOT in DESTRUCTIVE_KEYWORDS by
+        // policy — they're routine. The scanner correctly returns
+        // None for a plain UPSERT (issue #326 P5 contract).
+        let result = check_sql_safety(
+            "INSERT INTO t (id, x) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET x = EXCLUDED.x",
+        );
+        assert!(
+            result.is_none(),
+            "plain UPSERT must not trigger SQL guard, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn sql_safety_blocks_destructive_after_upsert() {
+        // …but a destructive verb after the upsert (separated
+        // by `;` or buried in a CTE) must still be caught.
+        let result = check_sql_safety(
+            "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING; DROP TABLE secrets",
+        );
+        assert_eq!(result, Some("DROP"));
+    }
+
+    #[test]
+    fn sql_safety_blocks_destructive_in_subquery() {
+        // INSERT … SELECT … FROM (DELETE …) — the DELETE in the
+        // sub-query must surface even though the outer statement
+        // is "just" an INSERT.
+        let result = check_sql_safety(
+            "INSERT INTO log SELECT * FROM (DELETE FROM secrets RETURNING *) d",
+        );
+        assert_eq!(result, Some("DELETE"));
+    }
+
+    #[test]
+    fn sql_safety_ignores_keyword_inside_string_literal() {
+        // The word DELETE inside a quoted string is data, not a
+        // verb. We must not flag it. (This is the false-positive
+        // R2 mentioned about substring matching.)
+        assert_eq!(
+            check_sql_safety("SELECT 'this string contains DELETE' FROM dual"),
+            None
+        );
+    }
+
+    #[test]
+    fn sql_safety_ignores_keyword_inside_quoted_identifier() {
+        // Postgres-style "DELETE" used as a column name.
+        assert_eq!(
+            check_sql_safety(r#"SELECT "DELETE" FROM audit_log"#),
+            None
+        );
+    }
+
+    #[test]
+    fn sql_safety_ignores_keyword_inside_block_comment() {
+        assert_eq!(
+            check_sql_safety("SELECT 1 /* DROP TABLE foo */ FROM dual"),
+            None
+        );
+    }
+
+    #[test]
+    fn sql_safety_ignores_keyword_inside_line_comment() {
+        assert_eq!(
+            check_sql_safety("SELECT 1 -- DROP TABLE foo\nFROM dual"),
+            None
+        );
+    }
+
+    #[test]
+    fn sql_safety_does_not_trigger_on_substring_keyword() {
+        // `drop_log` is a column name, not the DROP verb.
+        assert_eq!(
+            check_sql_safety("SELECT name FROM drop_log WHERE deleted = false"),
+            None
+        );
+    }
+
+    #[test]
+    fn sql_safety_blocks_truncate_anywhere() {
+        assert_eq!(
+            check_sql_safety("BEGIN; TRUNCATE TABLE users; COMMIT"),
+            Some("TRUNCATE")
+        );
+    }
+
+    #[test]
+    fn sql_safety_handles_escaped_string_delimiters() {
+        // `''` inside a string is a literal apostrophe; the
+        // string ends at the third quote. Make sure we don't
+        // misread the closing quote and flag the keyword that
+        // follows.
+        assert_eq!(
+            check_sql_safety("SELECT 'O''Brien said DELETE' FROM authors"),
+            None
+        );
+    }
+
+    // ── catastrophic-command tests (issue #326 P0 / R1 Major 6) ────
 
     #[test]
     fn circuit_breaker_blocks_rm_rf_root() {
