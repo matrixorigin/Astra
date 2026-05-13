@@ -182,9 +182,13 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 inherited.clone(),
             )
         } else {
-            super::permission_manager::PermissionManager::with_project_mode(
+            // Issue #326 P5b: spawned agent sub-run is headless
+            // when no inherited permissions are provided either.
+            // Either way, project allow rules don't apply.
+            super::permission_manager::PermissionManager::with_load_policy(
                 self.permission_mode,
                 &self.project_root,
+                &super::permission_manager::PermissionLoadPolicy::HeadlessSafe,
             )
         };
 

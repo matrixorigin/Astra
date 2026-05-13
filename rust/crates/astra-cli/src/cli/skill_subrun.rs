@@ -507,8 +507,14 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         let all_schemas = edge_tools::all_tool_schemas();
         let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
 
-        let perm_manager =
-            PermissionManager::with_project_mode(self.permission_mode, &self.project_root);
+        // Issue #326 P5b: skill subruns are headless — never read
+        // project allow rules. Deny rules and the user-level rule
+        // file are still honoured (apply_load_policy(HeadlessSafe)).
+        let perm_manager = PermissionManager::with_load_policy(
+            self.permission_mode,
+            &self.project_root,
+            &super::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+        );
 
         let executor = edge_tools::ToolExecutor::new(&self.project_root)
             .with_cloud(self.api.api_origin(), &self.token);

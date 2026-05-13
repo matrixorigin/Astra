@@ -238,9 +238,12 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         let all_schemas = edge_tools::all_tool_schemas();
         let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
 
-        let perm_manager = super::permission_manager::PermissionManager::with_project_mode(
+        // Issue #326 P5b: delegate sub-run is headless — strip project
+        // allow rules but honour deny + user file.
+        let perm_manager = super::permission_manager::PermissionManager::with_load_policy(
             self.permission_mode,
             &self.project_root,
+            &super::permission_manager::PermissionLoadPolicy::HeadlessSafe,
         );
 
         // T-9: Worktree CWD injection — when team isolation provides a per-agent

@@ -1818,9 +1818,15 @@ pub(super) async fn run_print_mode(
     // NeedApproval (e.g. compensation prompts after a denial), the
     // gate fans out to silent-fail-closed in stream_render.rs (line
     // ~1983), surfacing the deny reason to the LLM instead of hanging.
-    let mut pm = PermissionManager::with_project(
-        true,
+    // Issue #326 P5b: print mode is headless — strip project
+    // allow rules so a hostile project file can't quietly enable
+    // capabilities the user didn't ask for. Project deny rules
+    // still apply (a project can tighten, never loosen, the
+    // headless policy).
+    let mut pm = PermissionManager::with_load_policy(
+        crate::permission_manager::PermissionMode::Auto,
         &std::env::current_dir().unwrap_or_default(),
+        &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
     );
     // Surface load_errors as exit-1: a corrupt project permissions.json
     // in CI must not silently fall back to "no rules" (issue #326 P0
