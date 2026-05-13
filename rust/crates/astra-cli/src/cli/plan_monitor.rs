@@ -910,35 +910,22 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
         }
 
         if state.pending_approval.is_some() {
-            let approved = tokio::task::spawn_blocking(|| {
-                use std::io::IsTerminal;
-                if std::io::stdin().is_terminal() {
-                    let ch = crate::permission_manager::PermissionManager::prompt_approval(
-                        crate::permission_manager::ApprovalPromptKind::LocalStandard,
-                    );
-                    matches!(ch, 'y' | 'a' | '!')
-                } else {
-                    use std::io::Write;
-                    let _ = std::io::stderr().flush();
-                    eprint!("   Approve? [y/N]: ");
-                    let _ = std::io::stderr().flush();
-                    let mut line = String::new();
-                    if std::io::stdin().read_line(&mut line).is_err() {
-                        return false;
-                    }
-                    let t = line.trim().to_lowercase();
-                    t == "y" || t == "yes"
-                }
-            })
-            .await
-            .unwrap_or(false);
-            if let Some(tx) = state.pending_approval.take() {
-                let _ = tx.send(if approved {
-                    crate::chat_stream::ApprovalResponse::AllowOnce
-                } else {
-                    crate::chat_stream::ApprovalResponse::Deny
-                });
-            }
+            // Issue #326 P0 (tui-only) / #331: with the REPL gone,
+            // plan_monitor no longer prompts on stdin. The approval
+            // is owned by the TUI's bottom_pane queue (which receives
+            // it via the same response_tx channel pending_approval
+            // wraps). plan_monitor's only job here is to **not
+            // block** — drop through and let the next select branch
+            // tick the TUI / plan executor. If for some reason no
+            // TUI sink is attached (regression in caller wiring),
+            // the silent-deny in stream_render.rs:1985 still fires
+            // so we never hang waiting for a stdin readline.
+            //
+            // Keep the early-continue for back-pressure: tools that
+            // landed approvals during the previous loop iteration
+            // are settled via state.pending_approval = None on the
+            // TUI side, so the if-check above is the right gate.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             continue;
         }
 

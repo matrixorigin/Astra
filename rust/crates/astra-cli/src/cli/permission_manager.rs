@@ -1571,92 +1571,36 @@ impl PermissionManager {
         }
     }
 
-    pub(crate) fn prompt_approval(kind: ApprovalPromptKind) -> char {
-        use std::io::IsTerminal;
-
-        // Build options based on prompt kind
-        let options: Vec<(&str, char)> = match kind {
-            ApprovalPromptKind::LocalStandard => vec![
-                ("✓  Yes (once)", 'y'),
-                ("✕  No", 'n'),
-                ("◉  Always allow this tool", 'a'),
-                ("▶  Auto-run session", '!'),
-                ("⏭  Skip tool", 's'),
-            ],
-            ApprovalPromptKind::CloudStandard => vec![
-                ("✓  Yes (once)", 'y'),
-                ("✕  No", 'n'),
-                ("◉  Allow tool (session)", 'a'),
-                ("▶  Auto-run session", '!'),
-                ("⏭  Skip tool", 's'),
-            ],
-            ApprovalPromptKind::ConfirmOnce => vec![
-                ("✓  Confirm", 'y'),
-                ("▶  Auto-run session", '!'),
-                ("✕  Cancel", 'n'),
-            ],
-        };
-
-        // Use inquire Select if terminal, fallback to single-char input
-        if std::io::stdin().is_terminal() {
-            let labels: Vec<String> = options.iter().map(|(s, _)| s.to_string()).collect();
-            match inquire::Select::new("", labels)
-                .with_render_config(Self::approval_select_theme())
-                .without_help_message()
-                .prompt()
-            {
-                Ok(choice) => {
-                    // Find the char for the selected option
-                    options
-                        .iter()
-                        .find(|(label, _)| choice == *label)
-                        .map(|(_, c)| *c)
-                        .unwrap_or('n')
-                }
-                Err(_) => 'n', // Esc or interrupt
-            }
-        } else {
-            // Non-terminal fallback: single character input
-            let hint = options
-                .iter()
-                .map(|(label, c)| {
-                    format!(
-                        "[{}] {}",
-                        c,
-                        label.trim_start_matches(|x: char| !x.is_alphabetic())
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" · ");
-            eprint!("  {} {hint} → ", "▸".magenta());
-            let _ = io::stderr().flush();
-
-            let mut response = String::new();
-            let _ = io::stdin().read_line(&mut response);
-            let ch = response.trim().to_lowercase().chars().next().unwrap_or('n');
-            if response.trim() == "!" { '!' } else { ch }
-        }
-    }
-
-    fn approval_select_theme() -> inquire::ui::RenderConfig<'static> {
-        use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet};
-        let magenta = Color::Rgb {
-            r: 200,
-            g: 80,
-            b: 200,
-        };
-        let mut rc = RenderConfig::default_colored();
-        rc.prompt_prefix = inquire::ui::Styled::new("▸").with_fg(magenta);
-        rc.highlighted_option_prefix = inquire::ui::Styled::new("▸").with_fg(magenta);
-        rc.selected_option = Some(
-            StyleSheet::new()
-                .with_fg(magenta)
-                .with_attr(Attributes::BOLD),
+    /// Issue #326 P0 (tui-only) / #331: legacy stdin-/inquire-based
+    /// approval prompt.
+    ///
+    /// Before #331 deleted the line-mode REPL, this function was the
+    /// fallback when a tool needed approval but no approval-channel
+    /// (TUI bottom_pane queue) was attached. With the REPL gone, the
+    /// only interactive surface is the TUI, which always installs an
+    /// approval channel. Callers that still reach this function are
+    /// in non-interactive contexts (sub-runs, scripted CI) where
+    /// reading stdin would either hang or accept stray input from a
+    /// pipe — neither is what the user wants.
+    ///
+    /// Behaviour: return `'n'` (deny). The caller's downstream
+    /// `apply_cloud_approval_choice` translates this to
+    /// `ApprovalDecision::Deny`. Callers that genuinely needed an
+    /// interactive prompt should switch to `ApprovalRequestTx` /
+    /// `ApprovalSink` (the contract described in plan v3 §P2).
+    ///
+    /// We deliberately keep the function shape — `kind` and the
+    /// `char` return type — so the surrounding cloud-approval logic
+    /// (which still encodes 'y'/'n'/'a'/'!'/'s' choices) compiles
+    /// without churn. A follow-up PR can collapse this into
+    /// `ApprovalSink` proper.
+    pub(crate) fn prompt_approval(_kind: ApprovalPromptKind) -> char {
+        astra_core::agent_warn!(
+            "permission",
+            "prompt_approval invoked in non-TUI context: returning Deny. \
+             This path is dead code post-#331; callers should switch to ApprovalSink."
         );
-        rc.answer = StyleSheet::new()
-            .with_fg(magenta)
-            .with_attr(Attributes::BOLD);
-        rc
+        'n'
     }
 
     pub(super) fn apply_cloud_approval_choice(

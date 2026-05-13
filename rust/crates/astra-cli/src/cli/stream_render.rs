@@ -1990,67 +1990,25 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     }
                     false
                 } else {
-                    self.render.stop_tool_stderr_running();
-                    self.render.stop_tool_stdout_anim();
-                    use crossterm::style::Stylize;
-                    eprintln!("  {}", format!("⚠  {header}").yellow());
-                    if let Some(d) = &detail {
-                        eprintln!("{}", d.as_str().dim());
-                    }
-                    if !reason.is_empty() {
-                        eprintln!("  {}", reason.dim());
-                    }
-                    let ch = tokio::task::spawn_blocking(|| {
-                        crate::permission_manager::PermissionManager::prompt_approval(
-                            crate::permission_manager::ApprovalPromptKind::LocalStandard,
-                        )
-                    })
-                    .await
-                    .unwrap_or('n');
-                    let approved = matches!(ch, 'y' | 'a' | '!');
+                    // Issue #326 P0 (tui-only) / #331: with the
+                    // REPL deleted upstream, TUI is the sole
+                    // interactive mode and it always installs an
+                    // `approval_request_tx`. Reaching this branch
+                    // means: no approval channel AND not silent —
+                    // a configuration mismatch, not a user
+                    // workflow. Fail closed with an actionable
+                    // reason so the LLM sees a Deny instead of
+                    // hanging on a stdin readline that the user
+                    // can't see.
+                    astra_core::agent_warn!(
+                        "permission",
+                        "Auto-denied {t}: no approval sink installed (no TUI, not silent). \
+                         Pass --mode auto or attach to a TUI session. reason={reason}"
+                    );
                     if let Some(pm) = self.perm_manager.as_mut() {
-                        if approved {
-                            pm.record_approval(&t, Some(args), true);
-                        }
-                        if ch == '!' {
-                            let was_auto = matches!(
-                                pm.mode(),
-                                crate::permission_manager::PermissionMode::Auto
-                            );
-                            pm.set_mode(crate::permission_manager::PermissionMode::Auto);
-                            if !was_auto {
-                                // Banner only on actual transition Prompt/Deny → Auto.
-                                // Repeat '!' while already in Auto is a no-op — avoid
-                                // the double-banner the user saw in session c6e18730.
-                                eprintln!(
-                                    "  {}",
-                                    "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
-                                        .yellow()
-                                );
-                            }
-                        }
-                        if ch == 'a' {
-                            let rule =
-                                crate::permission_manager::PermissionManager::make_allow_rule(
-                                    &t, args,
-                                );
-                            pm.add_allow_rule(&rule);
-                            let scope = if pm.has_project_root() {
-                                "project"
-                            } else {
-                                "session"
-                            };
-                            eprintln!(
-                                "  {}",
-                                format!("  ✓ {rule}: always allowed ({scope})").dim()
-                            );
-                        }
-                        if ch == 's' {
-                            pm.record_approval(&t, Some(args), false);
-                            eprintln!("  {}", format!("  ✗ {t}: skipped for session").dim());
-                        }
+                        pm.record_approval(&t, Some(args), false);
                     }
-                    approved
+                    false
                 }
             }
         };
@@ -2201,58 +2159,19 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     pm.record_approval(&sandbox_tool_key, Some(args), false);
                                     false
                                 } else {
-                                    // Interactive mode: prompt directly
-                                    self.render.stop_tool_stderr_running();
-                                    self.render.stop_tool_stdout_anim();
-                                    use crossterm::style::Stylize;
-                                    eprintln!("  {}", format!("🔒 {sandbox_msg}").yellow());
-                                    if let Some(d) = &detail {
-                                        eprintln!("{}", d.as_str().dim());
-                                    }
-                                    if !reason.is_empty() {
-                                        eprintln!("  {}", reason.dim());
-                                    }
-                                    let ch = tokio::task::spawn_blocking(
-                                        || {
-                                            crate::permission_manager::PermissionManager::prompt_approval(
-                                                crate::permission_manager::ApprovalPromptKind::LocalStandard,
-                                            )
-                                        },
-                                    )
-                                    .await
-                                    .unwrap_or('n');
-                                    let grant = matches!(ch, 'y' | 'a' | '!');
-                                    if grant {
-                                        pm.record_approval(&sandbox_tool_key, Some(args), true);
-                                    }
-                                    if ch == 'a' {
-                                        let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, args);
-                                        pm.add_allow_rule(&rule);
-                                        pm.trust_sandbox_root_from_reason(sandbox_msg);
-                                    }
-                                    if ch == '!' {
-                                        let was_auto = matches!(
-                                            pm.mode(),
-                                            crate::permission_manager::PermissionMode::Auto
-                                        );
-                                        pm.set_mode(
-                                            crate::permission_manager::PermissionMode::Auto,
-                                        );
-                                        if !was_auto {
-                                            // Transition-only banner. Repeat '!'
-                                            // while already in Auto is a no-op.
-                                            use crossterm::style::Stylize;
-                                            eprintln!(
-                                                "  {}",
-                                                "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
-                                                .yellow()
-                                            );
-                                        }
-                                    }
-                                    if ch == 's' {
-                                        pm.record_approval(&sandbox_tool_key, Some(args), false);
-                                    }
-                                    grant
+                                    // Issue #326 P0 (tui-only) / #331:
+                                    // legacy interactive stdin path is dead
+                                    // code now that the REPL is gone. With
+                                    // no approval channel and not silent =
+                                    // configuration mismatch, fail closed.
+                                    astra_core::agent_warn!(
+                                        "permission",
+                                        "Auto-denied sandbox expansion {sandbox_tool_key}: \
+                                         no approval sink installed (no TUI, not silent). \
+                                         Pass --mode auto or attach to a TUI session. reason={reason}"
+                                    );
+                                    pm.record_approval(&sandbox_tool_key, Some(args), false);
+                                    false
                                 }
                             }
                         };
