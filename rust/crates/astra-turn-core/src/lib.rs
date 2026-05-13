@@ -126,6 +126,7 @@ pub mod permission_engine;
 pub mod permission_path_glob;
 pub mod permission_redact;
 pub mod permission_rule_grammar;
+pub mod permission_scope;
 pub mod chat_turn_sse_dispatch;
 pub mod cloud_approval_policy;
 pub mod cloud_attachments;
