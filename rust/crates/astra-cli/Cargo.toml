@@ -13,6 +13,7 @@ harness = ["astra-runtime/harness", "dep:astra-harness"]
 
 [dependencies]
 astra-core.workspace = true
+astra-credentials.workspace = true
 astra-harness = { workspace = true, optional = true }
 astra-logging.workspace = true
 astra-prompts.workspace = true

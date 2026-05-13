@@ -338,12 +338,8 @@ pub(super) async fn handle_slash_command(
             slash_inspect::handle_inspect_command(arg, state);
         }
 
-        "/style" => {
-            slash_style::handle_style_command(arg);
-        }
-
         "/history" | "/grep" | "/review" | "/copy" | "/diagnostics" | "/lsp" | "/context"
-        | "/version" | "/whoami" | "/rewind" | "/turn" | "/report" => {
+        | "/version" | "/whoami" | "/rewind" | "/report" => {
             handle_info_command(cmd, arg, api, state, profile, token).await?;
         }
 
@@ -423,7 +419,7 @@ pub(super) async fn handle_slash_command(
                         eprintln!(
                             "  {} Permission mode → {}",
                             theme::icon_info(),
-                            next.to_string().cyan()
+                            next.to_string().magenta()
                         );
                     }
                     "all" => {
@@ -431,7 +427,7 @@ pub(super) async fn handle_slash_command(
                         eprintln!(
                             "  {} Permission mode → {} (all tools auto-approved)",
                             "⚡".yellow(),
-                            "auto".cyan()
+                            "auto".magenta()
                         );
                     }
                     "rules" | "status" => {
@@ -444,7 +440,7 @@ pub(super) async fn handle_slash_command(
                             eprintln!(
                                 "  {} Permission mode → {}",
                                 theme::icon_info(),
-                                mode.to_string().cyan()
+                                mode.to_string().magenta()
                             );
                         }
                         Err(_) => {
@@ -508,7 +504,7 @@ pub(super) async fn handle_slash_command(
             }
         },
 
-        "/clear" | "/explain" | "/verbose" | "/compact" | "/reflect" | "/undo" | "/redo" => {
+        "/clear" | "/explain" | "/compact" | "/reflect" | "/undo" | "/redo" => {
             handle_state_command(
                 cmd,
                 arg,

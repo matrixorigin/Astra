@@ -100,7 +100,7 @@ impl DiffSink for TerminalDiffSink {
         if !self.bump() {
             return;
         }
-        let _ = writeln!(io::stdout(), "{}", self.clip(line).cyan().bold());
+        let _ = writeln!(io::stdout(), "{}", self.clip(line).magenta().bold());
     }
 
     fn stats_line(&mut self, stats: DiffStats) {
@@ -476,7 +476,7 @@ fn print_diff_usage() {
     eprintln!(
         "{}",
         "  /diff — review changes (unified diff, colored)"
-            .cyan()
+            .magenta()
             .bold()
     );
     eprintln!(

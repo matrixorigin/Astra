@@ -189,8 +189,6 @@ mod slash_skill;
 mod slash_state;
 #[path = "cli/slash_stats.rs"]
 mod slash_stats;
-#[path = "cli/slash_style.rs"]
-mod slash_style;
 #[path = "cli/slash_sync.rs"]
 mod slash_sync;
 #[path = "cli/slash_task.rs"]
@@ -234,11 +232,14 @@ use astra_turn_core::chat_turn_heuristics::{
 };
 use auth_flow::{clear_profile_last_session, do_login, do_register};
 use chat_stream::{ChatTurnParams, stream_chat_sse};
+#[cfg(test)]
+use cli_utils::save_credentials;
 use cli_utils::{
     SessionResumePreflight, clear_profile_last_session_if_matches, compact_or_raw,
-    get_profile_and_token, interactive_select, load_credentials, map_thin_err, prefix_chars,
-    preflight_remote_resume_session, print_json_or_raw, profile_name, prompt_or,
-    prompt_password_masked, resumable_last_session_id, save_credentials, truncate_str, urlencoding,
+    credential_store, get_profile_and_token, interactive_select, load_credentials, map_thin_err,
+    mutate_credentials, persist_profile_last_session, persist_profile_memoria_api_key,
+    prefix_chars, preflight_remote_resume_session, print_json_or_raw, profile_name, prompt_or,
+    prompt_password_masked, resumable_last_session_id, truncate_str, urlencoding,
     validated_resumable_last_session_id,
 };
 use command_router::{ExitCode, execute_cli_command, run_print_mode};
@@ -430,7 +431,7 @@ async fn run_chat_repl(
         if let Some(ref dev) = state.skill_dev {
             eprintln!(
                 "  \u{1f527} {}",
-                format!("Skill dev: {}", dev.name).cyan().dim()
+                format!("Skill dev: {}", dev.name).magenta().dim()
             );
         }
         // Single source for "plan run in progress": live handle and/or persisted background flag.
@@ -672,7 +673,7 @@ async fn run_chat_repl(
                     {
                         // Resume paused plan execution
                         eprintln!();
-                        eprintln!("{}  Resuming plan execution...", "▶".cyan());
+                        eprintln!("{}  Resuming plan execution...", "▶".magenta());
                         if let Some(ref handle) = state.plan_handle {
                             let _ = handle.send_command(plan_executor::PlanCommand::Resume {
                                 corrections: if state.plan_execution_corrections.is_empty() {
@@ -708,7 +709,7 @@ async fn run_chat_repl(
                                         state.plan_execution_corrections.push(s);
                                         eprintln!(
                                             "{}  Recorded guidance ({}). It will prefix each upcoming subtask. Type continue when ready.",
-                                            "💡".cyan(),
+                                            "💡".magenta(),
                                             state.plan_execution_corrections.len(),
                                         );
                                     }
@@ -724,7 +725,7 @@ async fn run_chat_repl(
                                                         );
                                                     eprintln!(
                                                         "{}  Rewound from step {} — {} subtask(s) set back to pending. Type continue to resume.",
-                                                        "↩".cyan(),
+                                                        "↩".magenta(),
                                                         idx + 1,
                                                         reset,
                                                     );
@@ -797,7 +798,7 @@ async fn run_chat_repl(
                                     eprintln!(
                                         "{}  Entering plan mode for: {}",
                                         "📋".green(),
-                                        goal_display.cyan()
+                                        goal_display.magenta()
                                     );
                                     eprintln!("{}  Generating plan...", "⋯".dim());
 

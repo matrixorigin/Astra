@@ -83,11 +83,7 @@ pub(super) async fn handle_account_command(
                     "Get a key from Memoria: curl -X POST http://localhost:8100/auth/keys -H 'Authorization: Bearer <master_key>' -H 'Content-Type: application/json' -d '{{\"user_id\":\"<user>\",\"name\":\"astra\"}}'"
                 );
             } else {
-                let mut creds = load_credentials();
-                let pname = profile_name(profile, &creds);
-                let p = creds.profiles.entry(pname).or_default();
-                p.memoria_api_key = Some(arg.to_string());
-                let _ = save_credentials(&creds);
+                let _ = persist_profile_memoria_api_key(profile, arg);
                 // SAFETY: This runs during single-threaded REPL command processing.
                 // No concurrent threads read MEMORIA_MASTER_KEY at this point.
                 unsafe {

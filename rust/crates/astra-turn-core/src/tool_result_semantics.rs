@@ -72,6 +72,17 @@ pub enum ToolErrorSeverity {
 /// because they need tool-type awareness (mutation tool timeout → HardError).
 const SOFT_ERROR_PATTERNS: &[&str] = &[
     // str_replace benign failures
+    //
+    // The canonical structured banner emitted by both
+    // `astra-tools::fs_ops::str_replace_fail` and
+    // `astra-cli::edge_tools::fs::str_replace_fail` is the primary
+    // sentinel; the legacy substrings below are kept for backward
+    // compatibility with older error strings still in flight.
+    // Catch-all sentinel for any future str_replace failure variant. The specific
+    // patterns above (old_str not found / must be unique / identical / no change)
+    // already cover all current paths via short-circuit OR; this entry exists so
+    // a new failure mode that only ships the banner still classifies as soft.
+    "str_replace failed",
     "old_str and new_str are identical",
     "old_str not found",
     "must be unique",

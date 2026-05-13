@@ -66,6 +66,10 @@ pub(crate) struct AssistantCell {
     /// number only returns in TurnStats) but close enough that the
     /// on-screen "42 tok/s · 1.2k" matches reality within ±15%.
     token_estimate: f64,
+    /// Stamped by `finalize()`. Lets the active-slot gradient gutter
+    /// pin its phase at the freeze moment instead of snapping to
+    /// `t = 0` on the post-freeze frame.
+    frozen_at: super::FreezeStamp,
 }
 
 impl AssistantCell {
@@ -76,6 +80,7 @@ impl AssistantCell {
             ts: None,
             started_at: None,
             token_estimate: 0.0,
+            frozen_at: super::FreezeStamp::default(),
         }
     }
 
@@ -89,6 +94,7 @@ impl AssistantCell {
             ts: None,
             started_at: None,
             token_estimate: 0.0,
+            frozen_at: super::FreezeStamp::default(),
         }
     }
 
@@ -108,6 +114,10 @@ impl AssistantCell {
                 ts,
                 started_at: None,
                 token_estimate: 0.0,
+                // Resumed from persistence — already settled. See
+                // `FreezeStamp::revived` for the launch-independent
+                // phase rationale.
+                frozen_at: super::FreezeStamp::revived(),
             }),
             _ => None,
         }
@@ -269,6 +279,11 @@ impl HistoryCell for AssistantCell {
 
     fn finalize(&mut self) {
         self.live = false;
+        self.frozen_at.stamp_now();
+    }
+
+    fn frozen_phase(&self) -> Option<f32> {
+        self.frozen_at.phase()
     }
 
     fn to_persist(&self) -> Option<TurnEvent> {
@@ -347,10 +362,11 @@ fn rhythm_dots_span() -> Span<'static> {
     )
 }
 
-/// Render the reply body the classic way — `┃ ` accent gutter on
-/// every line, optional blink cursor on the last line while live.
-/// Factored out so the `<think>`-aware `display_lines` can reuse
-/// it for the post-`</think>` body without duplicating layout.
+/// Render the reply body. Settled (scrollback) cells get a static
+/// `┃ ` accent gutter on every line. Live cells drop the gutter —
+/// the active-slot wrapper (`tui::LiveFramedCell`) paints its own
+/// gradient `┃` at the same column, and stacking both produces a
+/// visible double bar.
 fn render_body_with_gutter(
     source: &str,
     width: u16,
@@ -360,11 +376,15 @@ fn render_body_with_gutter(
     if source.trim().is_empty() {
         return Vec::new();
     }
-    // Reserve two columns for the `┃ ` gutter so tables, horizontal
-    // rules, and code blocks don't overflow the terminal and wrap
-    // mid-border. The width floor (20) keeps the renderer sane on
-    // very small terminals.
-    let inner_w = (width as usize).saturating_sub(2).max(20);
+    // When the cell owns the gutter, reserve 2 cols for `┃ `. While
+    // live, the active-slot wrapper (`tui::LiveFramedCell`) has
+    // *already* subtracted those 2 cols from the `width` it forwarded
+    // via `display_lines`, so on both paths `width` is the inner
+    // width — apply the floor uniformly. Keeping the two paths on the
+    // same `inner_w` formula prevents a one-column re-wrap when a
+    // cell transitions live → settled near the floor boundary.
+    let prepend_gutter = !live;
+    let inner_w = (width as usize).max(20);
     let text = render_markdown_text_with_width(source, Some(inner_w));
     let rendered: Vec<Line<'static>> = text.lines.iter().map(line_to_static).collect();
 
@@ -373,10 +393,6 @@ fn render_body_with_gutter(
     }
 
     let theme = crate::tui::theme::current();
-    // Dedicated `theme.gutter` (soft pink) keeps assistant replies
-    // visually distinct from cyan-accented UI chrome (composer prefix,
-    // slash-response corners, selection highlights). Bold so the gutter
-    // reads even at 1-cell width.
     let gutter_style = Style::default().fg(theme.gutter).bold();
     let dim = Style::default().fg(Color::DarkGray);
     let last_idx = rendered.len() - 1;
@@ -385,7 +401,10 @@ fn render_body_with_gutter(
         .into_iter()
         .enumerate()
         .map(|(i, line)| {
-            let mut spans = vec![Span::styled("┃ ", gutter_style)];
+            let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 3);
+            if prepend_gutter {
+                spans.push(Span::styled("┃ ", gutter_style));
+            }
             spans.extend(line.spans.iter().cloned());
             // Trailing rhythm-dot indicator + tok/s suffix on the
             // final row while live. Replaces the old `▎` slow-blink

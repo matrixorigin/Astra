@@ -46,7 +46,7 @@ impl Spinner {
         }
 
         let w = term_width();
-        let icon = format!("{}", ICON_RUNNING.cyan());
+        let icon = format!("{}", ICON_RUNNING.magenta());
 
         // Paint the first frame on the calling thread so the user sees feedback
         // before the background thread is scheduled (avoids a blank gap).

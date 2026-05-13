@@ -207,6 +207,12 @@ pub fn idempotency_cache_hit_message(cached_output: &str) -> String {
     if trimmed.is_empty() {
         return "(cached — identical call already executed; original output was empty)".to_string();
     }
+    if trimmed == "{}" {
+        return format!(
+            "(cached — identical call already executed; degraded historical tool output was an empty JSON object placeholder) [tag={}]",
+            crate::history::DEGRADED_EMPTY_OBJECT_TAG
+        );
+    }
     if trimmed.len() <= IDEMPOTENCY_INLINE_MAX_BYTES {
         // If the cached output itself already starts with the sentinel
         // (e.g. a replay across a compaction boundary where the stored
@@ -334,8 +340,21 @@ pub fn take_edge_output_for_tool_call_with_duration<T: EdgeToolRoundRow>(
     }
     MatchedEdgeToolOutput {
         output: by_sig.get(&sig).cloned().unwrap_or_else(|| {
+            // IMPORTANT: the prefix "Error: headless edge protocol" is
+            // load-bearing — `execute.rs::execute_tool_pure` keys on it
+            // to trigger server-side re-execution. If this tool has a
+            // ServerToolExecutor available, the error below is replaced
+            // with the real result. Only tools that truly have NO
+            // server-side executor will surface this message to the LLM.
             format!(
-                "Error: headless edge protocol — expected SSE `tool_request` before assistant `tool_call` for `{name}` (no matching edge execution in this turn)."
+                "Error: headless edge protocol — tool `{name}` has no matching \
+                 edge execution in this turn.\n\n\
+                 This means `{name}` requires a server-side execution path that is \
+                 not available in the current session mode.\n\
+                 Workaround: use `bash` to accomplish the same task directly. For \
+                 example, use `gh issue create ...` instead of `github(action=create_issue)`, \
+                 or shell commands instead of `run_script`.\n\
+                 If you believe this tool should work here, ask the user to file a bug."
             )
         }),
         duration_ms: 0,
@@ -838,6 +857,20 @@ mod tests {
         assert!(
             m.to_lowercase().contains("empty"),
             "empty-output cache-hit must say so explicitly: {m}"
+        );
+    }
+
+    #[test]
+    fn idempotency_cache_hit_empty_object_placeholder_is_degraded_not_replayed() {
+        let m = idempotency_cache_hit_message("{}");
+        assert!(m.starts_with("(cached"));
+        assert!(
+            m.to_lowercase().contains("degraded") || m.to_lowercase().contains("placeholder"),
+            "empty-object cache hits should be marked as suspect historical data: {m}"
+        );
+        assert!(
+            !m.lines().any(|line| line.trim() == "{}"),
+            "cache-hit wrapper must not replay a bare '{{}}' line to the LLM: {m}"
         );
     }
 

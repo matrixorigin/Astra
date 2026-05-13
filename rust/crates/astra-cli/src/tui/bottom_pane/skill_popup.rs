@@ -127,7 +127,7 @@ impl SkillPopup {
 
             let line = if is_sel {
                 let sel = Style::default()
-                    .fg(Color::Cyan)
+                    .fg(crate::tui::theme::current().accent)
                     .add_modifier(ratatui::style::Modifier::BOLD);
                 Line::from(vec![
                     Span::styled("  ", sel),
@@ -139,7 +139,10 @@ impl SkillPopup {
                 Line::from(vec![
                     Span::raw("  "),
                     Span::raw(padded_name),
-                    Span::styled(format!("{tag} "), Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!("{tag} "),
+                        Style::default().fg(crate::tui::theme::current().accent),
+                    ),
                     Span::styled(desc, dim),
                 ])
             };

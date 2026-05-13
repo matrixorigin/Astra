@@ -49,7 +49,7 @@ impl PlanActivitySpinner {
         let full_label = format!("[{tag}] {label}");
         let t0 = std::time::Instant::now();
         let w = term_width();
-        let icon = format!("{}", ICON_RUNNING.cyan());
+        let icon = format!("{}", ICON_RUNNING.magenta());
 
         // Paint immediately — no startup delay for plan spinners.
         paint_unified_line(&icon, &full_label, "0s", SPINNER_FRAMES[0], w);

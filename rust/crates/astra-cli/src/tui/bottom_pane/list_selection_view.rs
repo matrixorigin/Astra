@@ -122,7 +122,7 @@ impl BottomPaneView for ListSelectionView {
             let current_tag = if item.is_current { " (current)" } else { "" };
 
             let sel_style = Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Green)
                 .add_modifier(Modifier::BOLD);
 
             let mut spans = if is_sel {

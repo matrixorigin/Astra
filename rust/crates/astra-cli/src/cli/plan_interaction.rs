@@ -253,7 +253,7 @@ pub(super) async fn enrich_with_templates(
     if verbose {
         eprintln!(
             "  {} {}",
-            "⋯".cyan(),
+            "⋯".magenta(),
             "Searching for similar plan templates…".dim()
         );
     }
@@ -263,7 +263,7 @@ pub(super) async fn enrich_with_templates(
         eprintln!(
             "  {} Found {} learned template{}",
             theme::icon_ok(),
-            format!("{}", templates.len()).cyan(),
+            format!("{}", templates.len()).magenta(),
             if templates.len() == 1 { "" } else { "s" }
         );
         context.prior_templates = templates;
@@ -299,7 +299,7 @@ pub(super) fn eprint_plan_json_parse_failed(full_text: &str, _err: &str) {
 fn eprint_styled_plan(plan: &astra_runtime::plan::TaskPlan, goal: &str) {
     use astra_runtime::plan::TaskStatus;
 
-    eprintln!("  {} {}", "Plan:".bold(), goal.cyan());
+    eprintln!("  {} {}", "Plan:".bold(), goal.magenta());
     if let Some(ref notes) = plan.notes {
         eprintln!("  {}", notes.as_str().dim());
     }
@@ -315,7 +315,7 @@ fn eprint_styled_plan(plan: &astra_runtime::plan::TaskPlan, goal: &str) {
         };
         let icon_str = match icon_style {
             "green" => icon.green().to_string(),
-            "cyan" => icon.cyan().to_string(),
+            "cyan" => icon.magenta().to_string(),
             "red" => icon.red().to_string(),
             "yellow" => icon.yellow().to_string(),
             _ => icon.dim().to_string(),
@@ -375,7 +375,7 @@ fn eprint_styled_plan(plan: &astra_runtime::plan::TaskPlan, goal: &str) {
     eprintln!(
         "  {} {}/{} ({}%)",
         format_progress_bar(pct, 15),
-        format!("{done}").cyan(),
+        format!("{done}").magenta(),
         format!("{total}").dim(),
         pct
     );
@@ -390,12 +390,12 @@ fn eprint_styled_outline(outline: &astra_runtime::plan::outline::PlanOutline, go
         other => other.to_string(),
     };
 
-    eprintln!("  {} {}", "Plan:".bold(), goal.cyan());
+    eprintln!("  {} {}", "Plan:".bold(), goal.magenta());
     eprintln!(
         "  {} {}  ·  {} phase{}",
         "Effort:".bold(),
         effort_styled,
-        format!("{}", outline.phases.len()).cyan(),
+        format!("{}", outline.phases.len()).magenta(),
         if outline.phases.len() == 1 { "" } else { "s" }
     );
     eprintln!();
@@ -403,13 +403,13 @@ fn eprint_styled_outline(outline: &astra_runtime::plan::outline::PlanOutline, go
     for (i, phase) in outline.phases.iter().enumerate() {
         eprintln!(
             "  {} {} — {}",
-            format!("{}.", i + 1).bold().cyan(),
+            format!("{}.", i + 1).bold().magenta(),
             phase.title.as_str().bold(),
             phase.description.as_str().dim()
         );
         let mut detail = format!(
             "     ~{} subtask{}",
-            format!("{}", phase.estimated_subtasks).cyan(),
+            format!("{}", phase.estimated_subtasks).magenta(),
             if phase.estimated_subtasks == 1 {
                 ""
             } else {
@@ -433,28 +433,33 @@ fn eprint_styled_outline(outline: &astra_runtime::plan::outline::PlanOutline, go
 pub(super) fn eprint_plan_commands_help() {
     eprintln!(
         "  {} {} to run  {} {} to modify  {} {} to leave",
-        "▸".cyan(),
-        "go".bold().cyan(),
+        "▸".magenta(),
+        "go".bold().magenta(),
         "▸".dim(),
         "describe changes".dim(),
         "▸".dim(),
-        "exit".cyan(),
+        "exit".magenta(),
     );
 }
 
-/// Branded `inquire` theme: cyan prompt, bold+cyan highlight, dim unselected.
 fn plan_select_theme() -> inquire::ui::RenderConfig<'static> {
     use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet};
-    let cyan = Color::Rgb {
-        r: 0,
-        g: 200,
+    let magenta = Color::Rgb {
+        r: 200,
+        g: 80,
         b: 200,
     };
     let mut rc = RenderConfig::default_colored();
-    rc.prompt_prefix = inquire::ui::Styled::new("▸").with_fg(cyan);
-    rc.highlighted_option_prefix = inquire::ui::Styled::new("▸").with_fg(cyan);
-    rc.selected_option = Some(StyleSheet::new().with_fg(cyan).with_attr(Attributes::BOLD));
-    rc.answer = StyleSheet::new().with_fg(cyan).with_attr(Attributes::BOLD);
+    rc.prompt_prefix = inquire::ui::Styled::new("▸").with_fg(magenta);
+    rc.highlighted_option_prefix = inquire::ui::Styled::new("▸").with_fg(magenta);
+    rc.selected_option = Some(
+        StyleSheet::new()
+            .with_fg(magenta)
+            .with_attr(Attributes::BOLD),
+    );
+    rc.answer = StyleSheet::new()
+        .with_fg(magenta)
+        .with_attr(Attributes::BOLD);
     rc
 }
 
@@ -473,7 +478,7 @@ pub(super) fn eprint_clarification_question(
         astra_runtime::plan_decompose::ClarificationCategory::Other => "💬",
     };
 
-    eprintln!("  {} {}", icon, q.question.as_str().bold().cyan());
+    eprintln!("  {} {}", icon, q.question.as_str().bold().magenta());
     eprintln!();
 
     for (i, opt) in q.options.iter().enumerate() {
@@ -482,8 +487,8 @@ pub(super) fn eprint_clarification_question(
         if is_default {
             eprintln!(
                 "  {} {} {}",
-                "▸".cyan(),
-                format!("[{num}]").cyan(),
+                "▸".magenta(),
+                format!("[{num}]").magenta(),
                 format!("{opt} (default)").bold()
             );
         } else {
@@ -492,7 +497,7 @@ pub(super) fn eprint_clarification_question(
     }
 
     eprintln!();
-    eprint!("  {} ", "→".cyan());
+    eprint!("  {} ", "→".magenta());
     let _ = std::io::Write::flush(&mut std::io::stderr());
 }
 
@@ -548,7 +553,7 @@ fn eprint_styled_execution_preview(plan: &astra_runtime::plan::TaskPlan) {
     eprintln!(
         "  {} {} subtasks, {} ready",
         "Execution:".bold(),
-        format!("{}", plan.subtasks.len()).cyan(),
+        format!("{}", plan.subtasks.len()).magenta(),
         format!("{}", ready.len()).green()
     );
 
@@ -556,7 +561,7 @@ fn eprint_styled_execution_preview(plan: &astra_runtime::plan::TaskPlan) {
         for (i, group) in analysis.groups.iter().enumerate() {
             let ids: Vec<_> = group
                 .iter()
-                .map(|id| format!("{}", id.as_str().cyan()))
+                .map(|id| format!("{}", id.as_str().magenta()))
                 .collect();
             let parallel = if group.len() > 1 {
                 format!(" {}", "(parallel)".dim())
@@ -630,7 +635,7 @@ pub(super) fn eprint_plan_mode_banner(goal: &str) {
     if !goal.is_empty() {
         let display_goal: String = goal.chars().take(60).collect();
         let suffix = if goal.len() > 60 { "…" } else { "" };
-        eprint!(" — {}{}", display_goal.cyan(), suffix);
+        eprint!(" — {}{}", display_goal.magenta(), suffix);
     }
     eprintln!();
     eprintln!(
@@ -1024,12 +1029,12 @@ pub async fn handle_plan_mode_input(
                 eprintln!(
                     "  {} Selected: {}",
                     theme::icon_ok(),
-                    selected.as_str().cyan()
+                    selected.as_str().magenta()
                 );
             }
             ClarificationAnswer::Freeform(text) => {
                 pending.record_answer(text.clone());
-                eprintln!("  {} Answer: {}", theme::icon_ok(), text.as_str().cyan());
+                eprintln!("  {} Answer: {}", theme::icon_ok(), text.as_str().magenta());
             }
             ClarificationAnswer::Invalid(msg) => {
                 eprintln!("  {} {}", theme::icon_err(), msg);
@@ -1050,7 +1055,7 @@ pub async fn handle_plan_mode_input(
         eprintln!();
         eprintln!(
             "  {} All clarifications answered. Regenerating plan...",
-            "🔄".cyan()
+            "🔄".magenta()
         );
 
         let answers_context = pending.format_for_prompt();
@@ -1186,11 +1191,11 @@ pub async fn handle_plan_mode_input(
             PlanEntryChoice::Exit => {
                 state.plan_mode = None;
                 eprintln!();
-                eprintln!("  {} Left plan mode → back to normal chat.", "←".cyan());
+                eprintln!("  {} Left plan mode → back to normal chat.", "←".magenta());
                 return Ok(PlanInputResult::Handled);
             }
             PlanEntryChoice::Continue => {
-                eprintln!("  {} Continuing with current plan", "→".cyan());
+                eprintln!("  {} Continuing with current plan", "→".magenta());
                 return Ok(PlanInputResult::Handled);
             }
             PlanEntryChoice::Restart => {
@@ -1206,17 +1211,17 @@ pub async fn handle_plan_mode_input(
                 if state.plan_handle.is_some() {
                     eprintln!(
                         "  {} Type {} to resume background execution.",
-                        "💡".cyan(),
-                        "resume".cyan()
+                        "💡".magenta(),
+                        "resume".magenta()
                     );
                 } else if state.executing_plan.is_some() {
-                    eprintln!("  {} Resuming plan execution...", "▶".cyan());
+                    eprintln!("  {} Resuming plan execution...", "▶".magenta());
                 }
                 return Ok(PlanInputResult::Handled);
             }
             PlanEntryChoice::New(_) => {
                 plan_state.plan = Default::default();
-                eprintln!("  {} Describe what you want to do:", "📝".cyan());
+                eprintln!("  {} Describe what you want to do:", "📝".magenta());
                 return Ok(PlanInputResult::Handled);
             }
             PlanEntryChoice::Goal(goal) => {
@@ -1248,7 +1253,7 @@ pub async fn handle_plan_mode_input(
                 eprintln!(
                     "  {} Completed: {} ({}%)",
                     theme::icon_ok(),
-                    title.as_str().cyan(),
+                    title.as_str().magenta(),
                     pct
                 );
                 let _ = plan_state.save_to_file(&PlanModeState::state_path());
@@ -1279,12 +1284,12 @@ pub async fn handle_plan_mode_input(
 
                 let ready = plan_state.plan.ready_subtasks();
                 if !ready.is_empty() {
-                    eprintln!("  {} Next ready:", "→".cyan());
+                    eprintln!("  {} Next ready:", "→".magenta());
                     for st in &ready {
                         eprintln!("    {} [{}] {}", "○".dim(), st.id, st.title);
                     }
                 } else if plan_state.plan.progress_pct() == 100 {
-                    eprintln!("  {} All tasks complete!", "✓".green());
+                    eprintln!("  {} All tasks complete!", theme::icon_ok());
                     if let Some(ref svc) = state.task_service {
                         use astra_services::TaskService;
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
@@ -1298,7 +1303,7 @@ pub async fn handle_plan_mode_input(
                     eprintln!();
                     eprintln!(
                         "  {} Rate this plan (1-5)? Or 'skip' to skip: /plan rate <1-5>",
-                        "💡".cyan()
+                        "💡".magenta()
                     );
                 }
             }
@@ -1425,7 +1430,7 @@ pub async fn handle_plan_mode_input(
                     eprintln!(
                         "  {} {} new subtask{} added.",
                         theme::icon_ok(),
-                        format!("{pending_count}").cyan(),
+                        format!("{pending_count}").magenta(),
                         if pending_count == 1 { "" } else { "s" }
                     );
                     if let Some(choice) = prompt_plan_confirmation(pending_count) {
@@ -1463,7 +1468,7 @@ pub async fn handle_plan_mode_input(
                 eprintln!(
                     "  {} Plan unchanged. Try {} for the current plan.",
                     "⋯".dim(),
-                    "show".cyan()
+                    "show".magenta()
                 );
             }
         }
@@ -1547,7 +1552,7 @@ async fn handle_plan_command(
             state.plan_mode = None;
             state.executing_plan_goal = None;
             eprintln!();
-            eprintln!("  {} Left plan mode → back to normal chat.", "←".cyan());
+            eprintln!("  {} Left plan mode → back to normal chat.", "←".magenta());
             eprintln!();
         }
 
@@ -1563,18 +1568,18 @@ async fn handle_plan_command(
                         .unwrap_or(ps.goal.as_str());
                     let round = state.plan_execution_rounds;
 
-                    eprintln!("  {} {}", "Plan:".bold().cyan(), goal_display);
+                    eprintln!("  {} {}", "Plan:".bold().magenta(), goal_display);
                     let bar = format_progress_bar(pct, 20);
                     eprintln!(
                         "  {} {bar} {}/{} {}  {}",
                         "Progress:".dim(),
-                        format!("{done}").cyan(),
+                        format!("{done}").magenta(),
                         format!("{total}").dim(),
                         format!("({pct}%)").bold(),
                         format!("round {round}").dim(),
                     );
                     if let Some(ref stid) = state.current_plan_subtask_id {
-                        eprintln!("  {} {}", "Current:".dim(), stid.clone().cyan());
+                        eprintln!("  {} {}", "Current:".dim(), stid.clone().magenta());
                     }
                     if !state.plan_execution_corrections.is_empty() {
                         eprintln!(
@@ -1591,9 +1596,9 @@ async fn handle_plan_command(
                     let versions = ps.version_history.versions.len();
                     let edits = ps.history.len();
 
-                    eprintln!("  {} {}", "Plan:".bold().cyan(), ps.goal);
+                    eprintln!("  {} {}", "Plan:".bold().magenta(), ps.goal);
                     let phase = if plan_idle_review_not_started(ps) {
-                        format!("not started — type {} to run", "go".cyan())
+                        format!("not started — type {} to run", "go".magenta())
                     } else {
                         "editing".to_string()
                     };
@@ -1603,7 +1608,7 @@ async fn handle_plan_command(
                     eprintln!(
                         "  {} {bar} {}/{} {}  {} {}",
                         "Progress:".dim(),
-                        format!("{done}").cyan(),
+                        format!("{done}").magenta(),
                         format!("{total}").dim(),
                         format!("({pct}%)").bold(),
                         format!("v{versions}").dim(),
@@ -1613,7 +1618,7 @@ async fn handle_plan_command(
                     let ready = ps.plan.ready_subtasks();
                     if !ready.is_empty() {
                         let ready_ids: Vec<_> = ready.iter().map(|st| st.id.as_str()).collect();
-                        eprintln!("  {} {}", "Ready:".dim(), ready_ids.join(", ").cyan());
+                        eprintln!("  {} {}", "Ready:".dim(), ready_ids.join(", ").magenta());
                     }
 
                     let blocked: Vec<_> = ps.plan.subtasks.iter()
@@ -1644,19 +1649,19 @@ async fn handle_plan_command(
                 let goal = state.executing_plan_goal.as_deref().unwrap_or("(unknown)");
                 let round = state.plan_execution_rounds;
 
-                eprintln!("  {} {goal}", "Plan:".bold().cyan());
+                eprintln!("  {} {goal}", "Plan:".bold().magenta());
                 let bar = format_progress_bar(pct, 20);
                 eprintln!(
                     "  {} {bar} {}/{} {}  {}",
                     "Progress:".dim(),
-                    format!("{done}").cyan(),
+                    format!("{done}").magenta(),
                     format!("{total}").dim(),
                     format!("({pct}%)").bold(),
                     format!("round {round}").dim(),
                 );
 
                 if let Some(ref stid) = state.current_plan_subtask_id {
-                    eprintln!("  {} {}", "Current:".dim(), stid.clone().cyan());
+                    eprintln!("  {} {}", "Current:".dim(), stid.clone().magenta());
                 }
 
                 let corrections = &state.plan_execution_corrections;
@@ -1683,8 +1688,8 @@ async fn handle_plan_command(
                 eprintln!(
                     "  {} A plan is already running. Wait for it to finish, or use {} / {}.",
                     theme::icon_warn(),
-                    "pause".cyan(),
-                    "exit".cyan()
+                    "pause".magenta(),
+                    "exit".magenta()
                 );
                 return Ok(PlanInputResult::Handled);
             }
@@ -1707,7 +1712,7 @@ async fn handle_plan_command(
             if step_by_step {
                 eprintln!(
                     "  {} Step-by-step mode: you'll confirm each subtask before execution.",
-                    "⚙".cyan()
+                    "⚙".magenta()
                 );
                 eprintln!(
                     "  {} The run continues in background; approvals and status stay available on the normal prompt.",
@@ -1774,9 +1779,9 @@ async fn handle_plan_command(
             if !step_by_step {
                 eprintln!(
                     "  {} {} ({} subtasks)",
-                    "▸".bold().cyan(),
+                    "▸".bold().magenta(),
                     "Auto-executing plan".bold(),
-                    format!("{}", plan.subtasks.len()).cyan()
+                    format!("{}", plan.subtasks.len()).magenta()
                 );
                 eprintln!();
             }
@@ -1822,8 +1827,8 @@ async fn handle_plan_command(
             PlanModeState::clear_saved_state();
             eprintln!(
                 "  {} Left plan mode — execution is now running in background. Use {} to inspect it.",
-                "←".cyan(),
-                "/plan status".cyan()
+                "←".magenta(),
+                "/plan status".magenta()
             );
         }
 
@@ -1846,8 +1851,8 @@ async fn handle_plan_command(
                         );
                         eprintln!(
                             "  {} Resuming plan execution in background. Use {} for progress.",
-                            "▶".cyan(),
-                            "/plan status".cyan()
+                            "▶".magenta(),
+                            "/plan status".magenta()
                         );
                     }
                     Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
@@ -1856,7 +1861,7 @@ async fn handle_plan_command(
                 match recover_plan_for_resume(&mut ps.plan) {
                     PlanResumeRecovery::Ready(plan) => {
                         state.executing_plan = Some(plan);
-                        eprintln!("  {} Resuming plan execution...", "▶".cyan());
+                        eprintln!("  {} Resuming plan execution...", "▶".magenta());
                     }
                     PlanResumeRecovery::AllCompleted => {
                         eprintln!(
@@ -1895,12 +1900,12 @@ async fn handle_plan_command(
                             "Plan execution pause requested",
                             Some(serde_json::json!({ "stage": "pause_requested" })),
                         );
-                        eprintln!("  {} Pause requested.", "⏸".cyan());
+                        eprintln!("  {} Pause requested.", "⏸".magenta());
                     }
                     Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
                 }
             } else {
-                eprintln!("  {} Use Ctrl+C during execution to pause", "💡".cyan());
+                eprintln!("  {} Use Ctrl+C during execution to pause", "💡".magenta());
             }
         }
 
@@ -1921,11 +1926,11 @@ async fn handle_plan_command(
                 let edits = ps.history.len();
                 let timeline_events = ps.timeline.events.len();
 
-                eprintln!("{}", "Metrics".bold().cyan());
+                eprintln!("{}", "Metrics".bold().magenta());
                 eprintln!(
                     "  {} {}/{} {}  {} {}  {} events",
                     "Progress:".dim(),
-                    format!("{done}").cyan(),
+                    format!("{done}").magenta(),
                     format!("{total}").dim(),
                     format!("({pct}%)").bold(),
                     format!("v{versions}").dim(),
@@ -1937,13 +1942,13 @@ async fn handle_plan_command(
                     for st in &ps.plan.subtasks {
                         let icon = match st.status {
                             astra_services::task_orchestrator::TaskStatus::Completed => {
-                                "✓".green().to_string()
+                                theme::icon_ok().to_string()
                             }
                             astra_services::task_orchestrator::TaskStatus::Failed => {
                                 "✗".red().to_string()
                             }
                             astra_services::task_orchestrator::TaskStatus::InProgress => {
-                                "▶".cyan().to_string()
+                                "▶".magenta().to_string()
                             }
                             _ => "○".dim().to_string(),
                         };
@@ -1952,7 +1957,7 @@ async fn handle_plan_command(
                         } else {
                             format!(" {}", format!("(deps: {})", st.depends_on.join(", ")).dim())
                         };
-                        eprintln!("  {icon} {} {}{deps}", st.id.clone().cyan(), st.title);
+                        eprintln!("  {icon} {} {}{deps}", st.id.clone().magenta(), st.title);
                     }
                 }
             } else {
@@ -2048,8 +2053,8 @@ async fn handle_plan_command(
                         eprintln!(
                             "  {} Rewound {} subtask(s) from '{}'",
                             theme::icon_ok(),
-                            count.to_string().cyan(),
-                            anchor.cyan(),
+                            count.to_string().magenta(),
+                            anchor.magenta(),
                         );
                     }
                     Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
@@ -2058,7 +2063,7 @@ async fn handle_plan_command(
                 eprintln!(
                     "  {} Rewind targets the live executor after a pause. Pause the run first ({} or Ctrl+C).",
                     theme::icon_warn(),
-                    "pause".cyan()
+                    "pause".magenta()
                 );
             } else if state.plan_mode.is_some() {
                 eprintln!(
@@ -2079,8 +2084,8 @@ async fn handle_plan_command(
                         eprintln!(
                             "  {} Reset subtask '{}' ({}) for redo",
                             theme::icon_ok(),
-                            title.cyan(),
-                            subtask_id.cyan(),
+                            title.magenta(),
+                            subtask_id.magenta(),
                         );
                     }
                     Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
@@ -2089,7 +2094,7 @@ async fn handle_plan_command(
                 eprintln!(
                     "  {} Redo targets the live executor after a pause. Pause the run first ({} or Ctrl+C).",
                     theme::icon_warn(),
-                    "pause".cyan()
+                    "pause".magenta()
                 );
             } else if state.plan_mode.is_some() {
                 eprintln!(
@@ -2303,7 +2308,7 @@ async fn handle_goal_submission(
                         return expand_outline_to_plan(ol, &goal, tok, state, api).await;
                     }
                     OutlineChoice::SkipToFull => {
-                        eprintln!("  {} Generating full plan directly…", "⏭".cyan());
+                        eprintln!("  {} Generating full plan directly…", "⏭".magenta());
                     }
                     OutlineChoice::Edit => {
                         match inquire::Text::new("  Describe changes:")
@@ -2424,14 +2429,14 @@ async fn handle_outline_clarifications(
     eprintln!();
     eprintln!(
         "  {} {}",
-        "▸".cyan(),
+        "▸".magenta(),
         format!(
             "{} question{} before planning:",
             questions.len(),
             if questions.len() == 1 { "" } else { "s" }
         )
         .bold()
-        .cyan()
+        .magenta()
     );
     eprintln!();
 
@@ -2586,7 +2591,7 @@ async fn expand_outline_to_plan(
     for (i, phase) in ol.phases.iter().enumerate() {
         eprintln!(
             "  {} Expanding phase {}/{}: {}",
-            "⋯".cyan(),
+            "⋯".magenta(),
             i + 1,
             ol.phases.len(),
             phase.title.as_str().bold()

@@ -16,10 +16,22 @@ fn turn(t: u32, tin: u64, tout: u64, tools: u32, user: &str, err: Option<&str>) 
         user_preview: Some(user.into()),
         assistant_preview: Some(format!("reply to turn {t}")),
         error: err.map(String::from),
-        // cumulative fields are what the engine computes; raw fixture
-        // starts at zero and the engine should overwrite them.
         cumulative_tokens_in: 0,
         cumulative_tokens_out: 0,
+        ttft_ms: None,
+        context_ms: None,
+        selector_ms: None,
+        selector_strategy: None,
+        selector_tokens_in: None,
+        selector_tokens_out: None,
+        memoria_ms: None,
+        llm_rounds: None,
+        selected_skills: None,
+        total_tool_ms: None,
+        total_llm_ms: None,
+        tool_calls: Vec::new(),
+        user_input: None,
+        assistant_output: None,
     }
 }
 

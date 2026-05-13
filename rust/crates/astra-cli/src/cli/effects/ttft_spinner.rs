@@ -35,7 +35,7 @@ impl TtftWaitLineSpinner {
         let t0 = std::time::Instant::now();
         let w = term_width();
         let label = "Waiting for model";
-        let icon = format!("{}", ICON_RUNNING.cyan());
+        let icon = format!("{}", ICON_RUNNING.magenta());
 
         // Paint immediately: prep line just cleared and the first SSE byte may take seconds.
         paint_unified_line(&icon, label, "0s", SPINNER_FRAMES[0], w);

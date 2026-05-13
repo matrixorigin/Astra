@@ -33,7 +33,7 @@ pub(super) async fn handle_health_command(arg: &str, state: &ReplState) {
         eprintln!("  Status: {status}");
         eprintln!(
             "  Tools: {}  Errors: {}  Timeouts: {}  Cache hits: {}",
-            summary.total_tools.to_string().cyan(),
+            summary.total_tools.to_string().magenta(),
             if summary.total_errors > 0 {
                 summary.total_errors.to_string().red().to_string()
             } else {
@@ -82,7 +82,7 @@ pub(super) async fn handle_health_command(arg: &str, state: &ReplState) {
                 };
                 eprintln!(
                     "  {:<20} {:>5} {:>5} {:>4} {:>5} {:>5}  {}",
-                    name.as_str().cyan(),
+                    name.as_str().magenta(),
                     health.total_calls,
                     health.total_failures,
                     health.timeout_count,
@@ -181,7 +181,7 @@ pub(super) fn display_sync_status(status: &astra_services::SyncStatus) {
 
     // Preferences
     if let Some(ts) = &status.preferences_last_sync {
-        eprintln!("  Prefs sync: {}", ts.as_str().cyan());
+        eprintln!("  Prefs sync: {}", ts.as_str().magenta());
     }
 
     // Pending pushes

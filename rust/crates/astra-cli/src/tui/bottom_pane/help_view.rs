@@ -69,7 +69,7 @@ impl BottomPaneView for HelpView {
 
         let dim = Style::default().fg(Color::DarkGray);
         let sel = Style::default()
-            .fg(Color::Cyan)
+            .fg(crate::tui::theme::current().accent)
             .add_modifier(Modifier::BOLD);
         let mut y = area.y;
 

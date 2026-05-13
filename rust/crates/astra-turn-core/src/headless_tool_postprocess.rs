@@ -149,7 +149,23 @@ pub struct HeadlessCacheableRecordCtx<'a> {
     pub semantic_dedup: &'a mut SemanticDedup,
 }
 
-/// After a successful cacheable tool: persist idempotency row, attach to recorder, semantic hint.
+/// After a successful cacheable tool: persist idempotency row, attach
+/// to recorder, semantic hint.  Wrapper that no-ops when the tool
+/// errored, so callers don't have to repeat the `!is_err` guard at
+/// every site.
+pub fn record_headless_cacheable_success_and_semantic_hint_if_ok(
+    name: &str,
+    args: &Value,
+    idem_key: &IdempotencyKey,
+    ctx: HeadlessCacheableRecordCtx<'_>,
+    is_err: bool,
+) {
+    if is_err {
+        return;
+    }
+    record_headless_cacheable_success_and_semantic_hint(name, args, idem_key, ctx);
+}
+
 pub fn record_headless_cacheable_success_and_semantic_hint(
     name: &str,
     args: &Value,

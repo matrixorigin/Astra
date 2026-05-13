@@ -30,7 +30,7 @@ fn show_metrics(state: &ReplState) {
     // Check if we have messaging metrics in the shared runtime.
     if let Some(ref metrics) = state.messaging_metrics {
         let snap = metrics.snapshot();
-        eprintln!("\n  {}", "📊 Messaging Metrics".cyan().bold());
+        eprintln!("\n  {}", "📊 Messaging Metrics".magenta().bold());
         eprintln!("  {}", "─".repeat(40).dim());
         eprintln!(
             "  {} {} sent, {} received, {} dropped",
@@ -101,7 +101,7 @@ fn show_metrics(state: &ReplState) {
             eprintln!(
                 "  {} avg={}µs min={}µs max={}µs (n={})",
                 "Delivery latency:".white().bold(),
-                snap.delivery_latency.avg_us.to_string().cyan(),
+                snap.delivery_latency.avg_us.to_string().magenta(),
                 snap.delivery_latency.min_us.to_string().dim(),
                 snap.delivery_latency.max_us.to_string().dim(),
                 snap.delivery_latency.count.to_string().dim()
@@ -111,7 +111,7 @@ fn show_metrics(state: &ReplState) {
             eprintln!(
                 "  {} avg={}µs min={}µs max={}µs (n={})",
                 "Ack latency:".white().bold(),
-                snap.ack_latency.avg_us.to_string().cyan(),
+                snap.ack_latency.avg_us.to_string().magenta(),
                 snap.ack_latency.min_us.to_string().dim(),
                 snap.ack_latency.max_us.to_string().dim(),
                 snap.ack_latency.count.to_string().dim()
@@ -186,7 +186,7 @@ fn show_dlq(state: &ReplState) {
                     eprintln!(
                         "    {} {} → {}",
                         short_id.dim(),
-                        dl.message.from.agent_id.clone().cyan(),
+                        dl.message.from.agent_id.clone().magenta(),
                         reason_str.yellow()
                     );
                 }
@@ -239,7 +239,9 @@ fn show_status(state: &ReplState) {
 fn show_help() {
     eprintln!(
         "\n  {}",
-        "/messaging — Inter-agent messaging inspector".cyan().bold()
+        "/messaging — Inter-agent messaging inspector"
+            .magenta()
+            .bold()
     );
     eprintln!("  {}", "─".repeat(50).dim());
     eprintln!("  {}  Show metrics snapshot", "/messaging".white().bold());

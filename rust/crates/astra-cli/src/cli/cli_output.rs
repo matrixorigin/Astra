@@ -255,11 +255,15 @@ pub fn format_not_found_error(
             .copied()
             .collect::<Vec<_>>()
             .join(", ");
-        eprintln!("    {} {}", "Did you mean:".dim(), suggestion_text.cyan());
+        eprintln!(
+            "    {} {}",
+            "Did you mean:".dim(),
+            suggestion_text.magenta()
+        );
     }
 
     if let Some(cmd) = hint_command {
-        eprintln!("    {} {}", "Try:".dim(), cmd.cyan());
+        eprintln!("    {} {}", "Try:".dim(), cmd.magenta());
     }
 }
 
@@ -282,7 +286,7 @@ pub fn format_invalid_value_error(field: &str, value: &str, valid_options: &[&st
         eprintln!(
             "    {} {}",
             "Valid options:".dim(),
-            valid_options.join(", ").cyan()
+            valid_options.join(", ").magenta()
         );
     }
 }

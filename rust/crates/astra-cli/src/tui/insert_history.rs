@@ -3,10 +3,7 @@ use std::io::{self, Write};
 use crossterm::{
     cursor::MoveTo,
     queue,
-    style::{
-        Attribute, Color as CColor, Colors, Print, SetAttribute, SetBackgroundColor, SetColors,
-        SetForegroundColor,
-    },
+    style::{Attribute, Color as CColor, Colors, Print, SetAttribute, SetColors},
     terminal::{Clear, ClearType},
 };
 use ratatui::backend::Backend;
@@ -97,7 +94,6 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
             if i > 0 {
                 queue!(writer, Print("\r\n"))?;
             }
-            queue!(writer, Clear(ClearType::UntilNewLine))?;
             write_history_line(writer, line)?;
         }
 
@@ -151,7 +147,6 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
 
             for line in &wrapped {
                 queue!(writer, Print("\r\n"))?;
-                queue!(writer, Clear(ClearType::UntilNewLine))?;
                 write_history_line(writer, line)?;
             }
 
@@ -175,30 +170,42 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
 }
 
 fn write_history_line(writer: &mut impl Write, line: &Line<'_>) -> io::Result<()> {
-    // Set line-level colors
-    queue!(
-        writer,
-        SetColors(Colors::new(
-            line.style.fg.map(Into::into).unwrap_or(CColor::Reset),
-            line.style.bg.map(Into::into).unwrap_or(CColor::Reset),
-        ))
-    )?;
+    queue!(writer, Clear(ClearType::UntilNewLine))?;
 
-    // Write spans with style (span overrides line-level style)
+    let mut content_width = 0usize;
     for span in &line.spans {
         let merged = line.style.patch(span.style);
+        content_width += unicode_width::UnicodeWidthStr::width(span.content.as_ref());
         write_styled_span(writer, &span.content, &merged)?;
     }
 
-    // Reset attributes after line
-    queue!(
-        writer,
-        SetForegroundColor(CColor::Reset),
-        SetBackgroundColor(CColor::Reset),
-        SetAttribute(Attribute::Reset),
-    )?;
+    if let Some(bg) = line.style.bg {
+        let term_w = crossterm::terminal::size()
+            .map(|(c, _)| c as usize)
+            .unwrap_or(80);
+        let remaining = term_w.saturating_sub(content_width);
+        if remaining > 0 {
+            let (r, g, b) = color_to_rgb(bg);
+            write!(
+                writer,
+                "\x1b[48;2;{r};{g};{b}m{}\x1b[0m",
+                " ".repeat(remaining)
+            )?;
+        } else {
+            write!(writer, "\x1b[0m")?;
+        }
+    } else {
+        write!(writer, "\x1b[0m")?;
+    }
 
     Ok(())
+}
+
+fn color_to_rgb(color: ratatui::style::Color) -> (u8, u8, u8) {
+    match <ratatui::style::Color as Into<CColor>>::into(color) {
+        CColor::Rgb { r, g, b } => (r, g, b),
+        _ => (55, 55, 60),
+    }
 }
 
 fn write_styled_span(
@@ -206,12 +213,18 @@ fn write_styled_span(
     content: &str,
     style: &ratatui::style::Style,
 ) -> io::Result<()> {
-    // Reset all attributes before each span to prevent color leaking
-    queue!(writer, SetAttribute(Attribute::Reset))?;
+    queue!(
+        writer,
+        SetColors(Colors::new(
+            style.fg.map(Into::into).unwrap_or(CColor::Reset),
+            style.bg.map(Into::into).unwrap_or(CColor::Reset),
+        ))
+    )?;
 
-    // Apply modifiers
     if style.add_modifier.contains(Modifier::BOLD) {
         queue!(writer, SetAttribute(Attribute::Bold))?;
+    } else {
+        queue!(writer, SetAttribute(Attribute::NormalIntensity))?;
     }
     if style.add_modifier.contains(Modifier::DIM) {
         queue!(writer, SetAttribute(Attribute::Dim))?;
@@ -223,15 +236,6 @@ fn write_styled_span(
         queue!(writer, SetAttribute(Attribute::Underlined))?;
     }
 
-    // Apply colors
-    if let Some(fg) = style.fg {
-        queue!(writer, SetForegroundColor(fg.into()))?;
-    }
-    if let Some(bg) = style.bg {
-        queue!(writer, SetBackgroundColor(bg.into()))?;
-    }
-
     queue!(writer, Print(content))?;
-
     Ok(())
 }

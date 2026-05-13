@@ -1196,12 +1196,104 @@ fn resolve_existing_search_path(
 ) -> Result<PathBuf, String> {
     let resolved = crate::fs_ops::resolve_path(workspace_root, requested_path)?;
     if !resolved.exists() {
+        let suggestions = suggest_near_miss_paths(workspace_root, requested_path);
+        let hint = if suggestions.is_empty() {
+            "Use list_dir or glob to discover valid paths.".to_string()
+        } else {
+            format!(
+                "Did you mean one of these?\n{}",
+                suggestions
+                    .iter()
+                    .map(|s| format!("  • {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
         return Err(format!(
-            "Error: path '{}' does not exist. Use list_dir to see available files/directories.",
-            requested_path
+            "Error: path '{requested_path}' does not exist.\n{hint}"
         ));
     }
     Ok(resolved)
+}
+
+/// Suggest up to 3 paths that look similar to `requested_path` by
+/// searching siblings of the deepest existing ancestor. Uses a simple
+/// substring + basename match — no heavy fuzzy-matching dependency.
+fn suggest_near_miss_paths(workspace_root: &Path, requested: &str) -> Vec<String> {
+    let full = workspace_root.join(requested);
+    // Walk up to find the deepest ancestor that exists, but never
+    // escape above workspace_root (security: prevents leaking
+    // /etc, /home, etc. via `../../../` traversals).
+    let mut ancestor = full.as_path();
+    loop {
+        if let Some(parent) = ancestor.parent() {
+            if !parent.starts_with(workspace_root) {
+                return Vec::new();
+            }
+            if parent.exists() {
+                break;
+            }
+            ancestor = parent;
+        } else {
+            return Vec::new();
+        }
+    }
+    let search_dir = ancestor.parent().unwrap_or(workspace_root);
+    if !search_dir.starts_with(workspace_root) {
+        return Vec::new();
+    }
+    let needle = full
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<String> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(search_dir) else {
+        return Vec::new();
+    };
+    // Cap iteration to avoid O(n) scan of huge dirs (node_modules etc.)
+    for entry in entries.flatten().take(500) {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if name.contains(&needle) || needle.contains(&name) {
+            let rel = entry
+                .path()
+                .strip_prefix(workspace_root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| entry.path().to_string_lossy().to_string());
+            candidates.push(rel);
+        }
+        if candidates.len() >= 3 {
+            break;
+        }
+    }
+    // Also try: if the full path minus the last component exists, list
+    // its children and pick ones that substring-match the last component.
+    if candidates.is_empty()
+        && let Some(parent) = full.parent()
+        && parent.starts_with(workspace_root)
+        && parent.exists()
+        && let Ok(entries) = std::fs::read_dir(parent)
+    {
+        for entry in entries.flatten().take(500) {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if name.contains(&needle) || needle.contains(&name) {
+                let rel = entry
+                    .path()
+                    .strip_prefix(workspace_root)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| entry.path().to_string_lossy().to_string());
+                candidates.push(rel);
+            }
+            if candidates.len() >= 3 {
+                break;
+            }
+        }
+    }
+    candidates
 }
 
 fn relative_search_target(workspace_root: &Path, resolved: &Path) -> String {

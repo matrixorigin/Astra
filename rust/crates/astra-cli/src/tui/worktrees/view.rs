@@ -43,7 +43,7 @@ pub(crate) fn render(list: &WorktreeList, area: Rect, buf: &mut Buffer) {
         .title(Line::from(Span::styled(
             format!(" Worktrees ({}) ", list.len()),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(crate::tui::theme::current().accent)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = outer.inner(area);
@@ -118,7 +118,7 @@ fn render_detail(list: &WorktreeList, area: Rect, buf: &mut Buffer) {
     let Some(e) = list.selected_entry() else {
         return;
     };
-    let label = Style::default().fg(Color::Cyan);
+    let label = Style::default().fg(crate::tui::theme::current().accent);
     let dim = Style::default().fg(Color::DarkGray);
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(

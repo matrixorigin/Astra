@@ -9,23 +9,64 @@ use super::terminal_palette::{default_bg, default_fg};
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
+/// Period in seconds for one full hue revolution along the live
+/// gradient gutter painted by `tui::LiveFramedCell`. Centralised so
+/// the live-frame renderer and any future caller (status bars,
+/// secondary accents) share a single tempo.
+pub(crate) const LIVE_GUTTER_PERIOD_SECS: f32 = 3.0;
+
+/// Eagerly initialize the shimmer time origin. Call once near the
+/// top of `run_tui_repl` so any `Instant` captured later by a cell's
+/// `finalize()` is guaranteed to be `>= PROCESS_START`. Without this,
+/// the first cell to finalize before any `elapsed_since_start()` /
+/// `gradient_color_at_t` call would saturate `time_at` to 0 and the
+/// gutter colour would jump on freeze.
+pub(crate) fn init_time_origin() {
+    let _ = PROCESS_START.get_or_init(Instant::now);
+}
+
+/// Stable freeze stamp for cells revived from persistence. Uses the
+/// process time origin (= phase 0) instead of `Instant::now()` so all
+/// resumed cells share a deterministic, launch-independent gutter
+/// hue. Avoids the "every revived cell pinned to launch-time phase"
+/// visual where they would all render the same colour after resume.
+/// Process time origin. Lazy on first call but `init_time_origin()`
+/// is invoked at TUI startup so subsequent reads are pure getters.
+/// Used by `FreezeStamp::revived` to pin all persistence-restored
+/// cells to phase 0 (= deterministic, launch-independent gutter hue).
+pub(crate) fn process_start() -> Instant {
+    *PROCESS_START.get_or_init(Instant::now)
+}
+
 pub(crate) fn elapsed_since_start() -> Duration {
     let start = PROCESS_START.get_or_init(Instant::now);
     start.elapsed()
 }
 
-/// RGB color for a given "position along a border" (0..len) at the
-/// current moment in time. Produces a flowing rainbow-ish gradient
-/// that cycles around the frame — warm pinks → cool blues → back.
-/// Hue advances with time and along the border, giving a "wave
-/// travelling around the frame" effect.
-///
-/// Used by `LiveFramedCell` to color each border character while the
-/// active cell is still streaming.
-pub(crate) fn gradient_color_at(pos: usize, len: usize, period_seconds: f32) -> (u8, u8, u8) {
-    let t = elapsed_since_start().as_secs_f32();
-    // Normalize position to [0, 1) along the border, then add a
-    // time-varying phase so the hue slides along the frame.
+/// Process-relative seconds for a specific `Instant` — same time
+/// basis as [`elapsed_since_start`]. Lets cells stamp a "freeze
+/// moment" at finalize and feed it back into [`gradient_color_at_t`]
+/// so the gradient locks at the exact phase it had on the final
+/// live frame.
+pub(crate) fn time_at(i: Instant) -> f32 {
+    let start = *PROCESS_START.get_or_init(Instant::now);
+    i.saturating_duration_since(start).as_secs_f32()
+}
+
+/// RGB color for a given "position along a border" (0..len) at time
+/// `t` (process-relative seconds, same basis as [`time_at`] /
+/// [`elapsed_since_start`]). Live callers pass `elapsed_since_start()`;
+/// frozen callers pass the cell's `frozen_phase` so the gradient
+/// locks at the exact phase it had on the final live frame instead
+/// of jumping back to t=0. Produces a flowing rainbow-ish gradient
+/// — warm pinks → cool blues → back; hue advances with both `t` and
+/// `pos`, giving a "wave travelling along the bar" effect.
+pub(crate) fn gradient_color_at_t(
+    pos: usize,
+    len: usize,
+    period_seconds: f32,
+    t: f32,
+) -> (u8, u8, u8) {
     let len = len.max(1) as f32;
     let phase = (t / period_seconds).fract();
     let u = ((pos as f32 / len) + phase).fract();
@@ -54,6 +95,61 @@ fn hue_to_rgb(h: f32) -> (u8, u8, u8) {
     let m = 1.0 - c;
     let to_u8 = |v: f32| (((v + m).clamp(0.0, 1.0)) * 255.0) as u8;
     (to_u8(r), to_u8(g), to_u8(b))
+}
+
+#[cfg(test)]
+mod gradient_tests {
+    use super::*;
+
+    /// `gradient_color_at_t` is periodic in `t` with period
+    /// `period_seconds`. Pinning this prevents future "optimisations"
+    /// from accidentally introducing drift between live and frozen
+    /// phases that happen to differ by a full period.
+    ///
+    /// We allow ±1/channel slack: the hue math runs in `f32` and is
+    /// quantised to `u8`, so equivalent phases can land on adjacent
+    /// integer buckets. Exact equality would be testing IEEE 754, not
+    /// the gradient contract.
+    #[test]
+    fn gradient_is_periodic_in_t() {
+        fn close(a: (u8, u8, u8), b: (u8, u8, u8)) -> bool {
+            (a.0 as i16 - b.0 as i16).abs() <= 1
+                && (a.1 as i16 - b.1 as i16).abs() <= 1
+                && (a.2 as i16 - b.2 as i16).abs() <= 1
+        }
+        let period = 3.0_f32;
+        for pos in [0usize, 3, 7] {
+            let a = gradient_color_at_t(pos, 10, period, 0.5);
+            let b = gradient_color_at_t(pos, 10, period, 0.5 + period);
+            let c = gradient_color_at_t(pos, 10, period, 0.5 + 2.0 * period);
+            assert!(
+                close(a, b),
+                "phase wraps at one period (pos={pos}): {a:?} vs {b:?}"
+            );
+            assert!(
+                close(a, c),
+                "phase wraps at two periods (pos={pos}): {a:?} vs {c:?}"
+            );
+        }
+    }
+
+    /// `len = 0` must not panic (defensive `.max(1)` inside).
+    #[test]
+    fn gradient_handles_zero_len() {
+        let _ = gradient_color_at_t(0, 0, 3.0, 1.23);
+    }
+
+    /// Adjacent positions at fixed `t` produce *different* colours —
+    /// otherwise the gutter would be a flat block, not a gradient.
+    /// (Picks two positions far enough apart to dodge u8 quantisation
+    /// at the same hue.)
+    #[test]
+    fn gradient_varies_along_position() {
+        let t = 0.7_f32;
+        let a = gradient_color_at_t(0, 10, 3.0, t);
+        let b = gradient_color_at_t(5, 10, 3.0, t);
+        assert_ne!(a, b);
+    }
 }
 
 pub(crate) fn shimmer_spans(text: &str) -> Vec<Span<'static>> {

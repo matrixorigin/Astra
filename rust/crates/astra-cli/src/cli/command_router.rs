@@ -441,7 +441,7 @@ fn handle_permission_command(arg: &str, state: &mut ReplState) {
             eprintln!(
                 "  {} Permission mode → {}",
                 theme::icon_info(),
-                next.to_string().cyan()
+                next.to_string().magenta()
             );
         }
         "all" => {
@@ -449,7 +449,7 @@ fn handle_permission_command(arg: &str, state: &mut ReplState) {
             eprintln!(
                 "  {} Permission mode → {} (all tools auto-approved)",
                 "⚡".yellow(),
-                "auto".cyan()
+                "auto".magenta()
             );
         }
         "rules" | "status" => {
@@ -462,7 +462,7 @@ fn handle_permission_command(arg: &str, state: &mut ReplState) {
                 eprintln!(
                     "  {} Permission mode → {}",
                     theme::icon_info(),
-                    mode.to_string().cyan()
+                    mode.to_string().magenta()
                 );
             }
             Err(_) => {
@@ -511,9 +511,9 @@ pub(super) async fn execute_cli_command(
                 .map_err(|e| format!("Invalid listen address: {e}"))?;
             eprintln!(
                 "  {} {} on {}",
-                "▸".bold().cyan(),
+                "▸".bold().magenta(),
                 "Starting API server".bold(),
-                addr.to_string().cyan()
+                addr.to_string().magenta()
             );
             astra_runtime::serve(addr)
                 .await
@@ -525,7 +525,7 @@ pub(super) async fn execute_cli_command(
         Some(Command::Message(words)) => {
             let raw_message = words.join(" ");
             let message = apply_system_prompt(&raw_message, system_prompt.as_deref());
-            let (mut creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let session_id = validated_resumable_last_session_id(api, profile.as_deref()).await;
             let mut continuation_messages = session_id
                 .as_deref()
@@ -611,9 +611,7 @@ pub(super) async fn execute_cli_command(
                 Err(e) => return Err(e.error),
             };
             if let Some(ref sid) = sr.session_id {
-                let p = creds.profiles.entry(name).or_default();
-                p.last_session_id = Some(sid.clone());
-                save_credentials(&creds)?;
+                persist_profile_last_session(profile.as_deref(), sid)?;
             }
             Ok(compute_exit_code(&sr))
         }
@@ -622,7 +620,7 @@ pub(super) async fn execute_cli_command(
             eprintln!(
                 "\n{}",
                 "  ── Register a new account ─────────────────────"
-                    .cyan()
+                    .magenta()
                     .bold()
             );
             let username = prompt_or("Username", args.username)?;
@@ -640,7 +638,7 @@ pub(super) async fn execute_cli_command(
             eprintln!(
                 "\n{}",
                 "  ── Login ───────────────────────────────────────"
-                    .cyan()
+                    .magenta()
                     .bold()
             );
             let username = prompt_or("Username", args.username)?;
@@ -661,14 +659,14 @@ pub(super) async fn execute_cli_command(
         }
 
         Some(Command::Refresh) => {
-            let mut creds = load_credentials();
+            let creds = load_credentials();
             let name = profile_name(profile.as_deref(), &creds);
-            let profile = creds
+            let saved_profile = creds
                 .profiles
                 .get(&name)
                 .cloned()
                 .ok_or_else(|| format!("no profile '{name}'"))?;
-            let refresh_token = profile
+            let refresh_token = saved_profile
                 .refresh_token
                 .ok_or_else(|| format!("profile '{name}' has no refresh token"))?;
             let body = api
@@ -680,40 +678,46 @@ pub(super) async fn execute_cli_command(
             let new_access = value
                 .get("access_token")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing access_token".to_string())?;
+                .ok_or_else(|| "missing access_token".to_string())?
+                .to_string();
             let new_refresh = value
                 .get("refresh_token")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing refresh_token".to_string())?;
-            let entry = creds.profiles.entry(name).or_default();
-            entry.access_token = Some(new_access.to_string());
-            entry.refresh_token = Some(new_refresh.to_string());
-            save_credentials(&creds)?;
+                .ok_or_else(|| "missing refresh_token".to_string())?
+                .to_string();
+            mutate_credentials(|creds| {
+                let name = profile_name(profile.as_deref(), creds);
+                let entry = creds.profiles.entry(name).or_default();
+                entry.access_token = Some(new_access.clone());
+                entry.refresh_token = Some(new_refresh.clone());
+            })?;
             println!("  {} {}", theme::icon_ok(), "Token refreshed".green());
             Ok(ExitCode::Success)
         }
 
         Some(Command::Logout) => {
-            let mut creds = load_credentials();
+            let creds = load_credentials();
             let name = profile_name(profile.as_deref(), &creds);
-            let profile = creds
+            let saved_profile = creds
                 .profiles
                 .get(&name)
                 .cloned()
                 .ok_or_else(|| format!("no profile '{name}'"))?;
-            let refresh_token = profile
+            let refresh_token = saved_profile
                 .refresh_token
                 .ok_or_else(|| format!("profile '{name}' has no refresh token"))?;
             let body = api
                 .post_auth_logout_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await
                 .map_err(map_thin_err)?;
-            if let Some(entry) = creds.profiles.get_mut(&name) {
-                entry.access_token = None;
-                entry.refresh_token = None;
-                entry.last_session_id = None;
-            }
-            save_credentials(&creds)?;
+            mutate_credentials(|creds| {
+                let name = profile_name(profile.as_deref(), creds);
+                if let Some(entry) = creds.profiles.get_mut(&name) {
+                    entry.access_token = None;
+                    entry.refresh_token = None;
+                    entry.last_session_id = None;
+                }
+            })?;
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
@@ -967,7 +971,7 @@ pub(super) async fn execute_cli_command(
                 return Ok(ExitCode::Success);
             };
 
-            let (mut creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let session_id = match args.session_id {
                 Some(session_id) => Some(session_id),
                 None => validated_resumable_last_session_id(api, profile.as_deref()).await,
@@ -1101,9 +1105,7 @@ pub(super) async fn execute_cli_command(
 
             // Save session for resumption
             if let Some(sid) = &sr.session_id {
-                let p = creds.profiles.entry(name).or_default();
-                p.last_session_id = Some(sid.clone());
-                save_credentials(&creds)?;
+                persist_profile_last_session(profile.as_deref(), sid)?;
             }
 
             // Drain any background-spawned child agents before
@@ -1797,7 +1799,7 @@ pub(super) async fn run_print_mode(
     };
     let message = apply_system_prompt(&raw_message, system_prompt);
 
-    let (mut creds, name, _, token) = get_profile_and_token(profile)?;
+    let (_, _, _, token) = get_profile_and_token(profile)?;
     let session_id = validated_resumable_last_session_id(api, profile).await;
     let mut continuation_messages = session_id
         .as_deref()
@@ -1861,9 +1863,7 @@ pub(super) async fn run_print_mode(
 
     // Save session for resumption
     if let Some(sid) = &sr.session_id {
-        let p = creds.profiles.entry(name).or_default();
-        p.last_session_id = Some(sid.clone());
-        save_credentials(&creds)?;
+        persist_profile_last_session(profile, sid)?;
     }
 
     let exit_code = compute_exit_code(&sr);
@@ -1894,7 +1894,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
 
     // 1. Version
     let version = env!("CARGO_PKG_VERSION");
-    println!("{}", "Version".bold().cyan());
+    println!("{}", "Version".bold().magenta());
     println!("  {} {}", "Binary:".dim(), version);
     println!(
         "  {} {}",
@@ -1906,13 +1906,13 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     println!();
 
     // 2. API server connectivity
-    println!("{}", "API Server".bold().cyan());
+    println!("{}", "API Server".bold().magenta());
     println!("  {} {}", "URL:".dim(), api.api_origin());
     match api.get_health_text().await {
         Ok(body) => println!(
             "  {} {} {}",
             "Status:".dim(),
-            "✓".green(),
+            theme::icon_ok(),
             format!("Healthy ({})", body.trim()).green()
         ),
         Err(e) => {
@@ -1928,7 +1928,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     println!();
 
     // 3. Authentication
-    println!("{}", "Authentication".bold().cyan());
+    println!("{}", "Authentication".bold().magenta());
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
     println!("  {} {}", "Profile:".dim(), name);
@@ -1946,14 +1946,14 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                         println!(
                             "  {} {} {}",
                             "Status:".dim(),
-                            "✓".green(),
+                            theme::icon_ok(),
                             format!("Logged in as {user}").green()
                         );
                     } else {
                         println!(
                             "  {} {} {}",
                             "Status:".dim(),
-                            "✓".green(),
+                            theme::icon_ok(),
                             "Authenticated".green()
                         );
                     }
@@ -1962,7 +1962,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                     println!(
                         "  {} {} {}",
                         "Status:".dim(),
-                        "⚠".yellow(),
+                        theme::icon_warn(),
                         "Token may be expired".yellow()
                     );
                     issues.push(
@@ -1984,11 +1984,16 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     println!();
 
     // 4. Project config
-    println!("{}", "Project Configuration".bold().cyan());
+    println!("{}", "Project Configuration".bold().magenta());
     let cwd = std::env::current_dir().unwrap_or_default();
     let astra_dir = cwd.join(".astra");
     if astra_dir.is_dir() {
-        println!("  {} {} {}", ".astra/:".dim(), "✓".green(), "Found".green());
+        println!(
+            "  {} {} {}",
+            ".astra/:".dim(),
+            theme::icon_ok(),
+            "Found".green()
+        );
     } else {
         println!("  {} {}", ".astra/:".dim(), "Not found (optional)".dim());
     }
@@ -1996,7 +2001,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     println!();
 
     // 5. MCP configuration
-    println!("{}", "MCP Configuration".bold().cyan());
+    println!("{}", "MCP Configuration".bold().magenta());
     for (scope, path_fn) in &[
         (
             "project",
@@ -2020,7 +2025,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                             println!(
                                 "  {} {} {} in {}",
                                 scope,
-                                "✓".green(),
+                                theme::icon_ok(),
                                 format!("{count} server(s)").green(),
                                 path.display().to_string().dim()
                             );
@@ -2053,7 +2058,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     println!();
 
     // 6. Environment
-    println!("{}", "Environment".bold().cyan());
+    println!("{}", "Environment".bold().magenta());
     println!("  {} {}", "OS:".dim(), std::env::consts::OS);
     println!("  {} {}", "Arch:".dim(), std::env::consts::ARCH);
     if let Ok(shell) = std::env::var("SHELL") {
@@ -2066,7 +2071,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
 
     // Summary
     if issues.is_empty() {
-        println!("{} {}", "✓".green().bold(), "No issues found".green());
+        println!("{} {}", theme::icon_ok().bold(), "No issues found".green());
     } else {
         println!(
             "{} {}:",
@@ -2074,7 +2079,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
             format!("{} issue(s)", issues.len()).yellow().bold()
         );
         for issue in &issues {
-            println!("  {} {}", "⚠".yellow(), issue);
+            println!("  {} {}", theme::icon_warn(), issue);
         }
     }
 }
@@ -2179,7 +2184,7 @@ fn mcp_list(scope: &str) -> Result<(), String> {
 
     if servers.is_empty() {
         println!("  {}", "No MCP servers configured.".dim());
-        println!("  Use {} to add a server.", "astra mcp add".cyan());
+        println!("  Use {} to add a server.", "astra mcp add".magenta());
         return Ok(());
     }
 
@@ -2222,7 +2227,7 @@ fn mcp_list(scope: &str) -> Result<(), String> {
         };
         println!(
             "  {:<20} {:<8} {}",
-            name.as_str().cyan(),
+            name.as_str().magenta(),
             server_type.dim(),
             detail
         );
@@ -2264,8 +2269,8 @@ fn mcp_add(name: &str, command: &str, args: &[String], scope: &str) -> Result<()
     write_mcp_config(&path, &config)?;
     println!(
         "  {} Added '{}' to {}",
-        "✓".green(),
-        name.cyan(),
+        theme::icon_ok(),
+        name.magenta(),
         path.display().to_string().dim()
     );
     Ok(())
@@ -2301,8 +2306,8 @@ fn mcp_add_json(name: &str, json: &str, scope: &str) -> Result<(), String> {
     write_mcp_config(&path, &config)?;
     println!(
         "  {} Added '{}' to {}",
-        "✓".green(),
-        name.cyan(),
+        theme::icon_ok(),
+        name.magenta(),
         path.display().to_string().dim()
     );
     Ok(())
@@ -2328,8 +2333,8 @@ fn mcp_remove(name: &str, scope: &str) -> Result<(), String> {
     write_mcp_config(&path, &config)?;
     println!(
         "  {} Removed '{}' from {}",
-        "✓".green(),
-        name.cyan(),
+        theme::icon_ok(),
+        name.magenta(),
         path.display().to_string().dim()
     );
     Ok(())
@@ -2352,7 +2357,7 @@ fn mcp_get(name: &str) -> Result<(), String> {
             .and_then(|v| v.as_object())
             .and_then(|m| m.get(name))
         {
-            println!("  {}:", name.bold().cyan());
+            println!("  {}:", name.bold().magenta());
             println!("    {} {scope}", "Scope:".dim());
             let server_type = entry
                 .get("type")
@@ -2380,7 +2385,7 @@ fn mcp_get(name: &str) -> Result<(), String> {
                 for (k, v) in env {
                     println!(
                         "      {}={}",
-                        k.as_str().cyan(),
+                        k.as_str().magenta(),
                         v.as_str().unwrap_or(&v.to_string())
                     );
                 }
@@ -2728,11 +2733,11 @@ fn config_list() -> Result<(), String> {
         println!("  {}", "No settings configured.".dim());
         println!(
             "  Use {} to set a value.",
-            "astra config set <key> <value>".cyan()
+            "astra config set <key> <value>".magenta()
         );
         println!("\n  {}:", "Available keys".bold());
         for (key, desc) in KNOWN_SETTINGS {
-            println!("    {}  {}", key.cyan(), desc.dim());
+            println!("    {}  {}", key.magenta(), desc.dim());
         }
         return Ok(());
     }
@@ -2745,7 +2750,7 @@ fn config_list() -> Result<(), String> {
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        println!("  {:<20} {display}", key.as_str().cyan());
+        println!("  {:<20} {display}", key.as_str().magenta());
     }
     println!(
         "\n  {} {}",
@@ -2795,7 +2800,7 @@ fn config_set(key: &str, value: &str) -> Result<(), String> {
 
     settings.insert(key.to_string(), json_value);
     write_settings(&settings)?;
-    println!("  {} Set '{}' = {}", "✓".green(), key.cyan(), value);
+    println!("  {} Set '{}' = {}", theme::icon_ok(), key.magenta(), value);
     Ok(())
 }
 

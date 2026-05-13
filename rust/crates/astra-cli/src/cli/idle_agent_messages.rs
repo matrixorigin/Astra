@@ -87,7 +87,7 @@ pub(crate) fn flush_idle_agent_messages_between_prompts(state: &mut ReplState) {
         let payload = format_idle_agent_message_payload(&message.payload);
         eprintln!(
             "\n  {} {} {}",
-            "mail".cyan(),
+            "mail".magenta(),
             format!("{} -> main", message.from.agent_id).bold(),
             payload
         );

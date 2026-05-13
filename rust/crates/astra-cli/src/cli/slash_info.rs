@@ -128,7 +128,7 @@ fn lsp_backend_label(name: &str) -> &str {
 fn lsp_session_state_summary(session_state: &str) -> String {
     match session_state {
         "running" => format!("{} {}", theme::icon_ok(), "running".green()),
-        "idle" => format!("{} {}", "○".cyan(), "ready".cyan()),
+        "idle" => format!("{} {}", "○".magenta(), "ready".magenta()),
         "workspace_not_detected" => format!("{} {}", "·".dim(), "no workspace".dim()),
         "disabled" => format!("{} {}", "·".dim(), "disabled".dim()),
         "command_missing" => format!("{} {}", "✗".yellow(), "command missing".yellow()),
@@ -143,7 +143,7 @@ fn print_lsp_status_report(parsed: &serde_json::Value) {
         "\n{}",
         "─── LSP Status ───────────────────────────────────────────────"
             .bold()
-            .cyan()
+            .magenta()
     );
 
     let active_backends = parsed
@@ -645,7 +645,7 @@ fn print_turn_journal_list(turns: &[session_journal::JournalEvent]) {
         "\n  {}",
         "─── Journal turns (seq = chronological index) ───────────────"
             .bold()
-            .cyan()
+            .magenta()
     );
     eprintln!(
         "  {:>4} {:>6} {:>8}  {}",
@@ -691,7 +691,7 @@ fn print_turn_journal_list(turns: &[session_journal::JournalEvent]) {
             err_mark
         );
     }
-    eprintln!("  {}", "─".repeat(60).cyan().dim());
+    eprintln!("  {}", "─".repeat(60).magenta().dim());
     eprintln!(
         "{}",
         "  Pick: /turn seq:N or /turn #N  ·  strict id: /turn id:N or /turn @N  ·  legacy: /turn N  ·  relative: /turn -1"
@@ -716,7 +716,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
         "\n  {}",
         format!("─── Turn id {id} trace{seq_note}{err_tag} {sep}")
             .bold()
-            .cyan()
+            .magenta()
     );
 
     if let Some(ref err) = ev.error {
@@ -747,7 +747,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
     if let Some(ttft) = ev.ttft_ms {
         eprintln!(
             "  {} {}ms {}",
-            "TTFT:".cyan(),
+            "TTFT:".magenta(),
             ttft,
             "(time to first token)".dim()
         );
@@ -768,7 +768,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
         };
         eprintln!(
             "  {} {}ms{}  {}",
-            "Context:".cyan(),
+            "Context:".magenta(),
             ctx,
             detail,
             "(prompt assembly)".dim()
@@ -777,12 +777,12 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
     if let Some(ref skills) = ev.selected_skills
         && !skills.is_empty()
     {
-        eprintln!("  {} {}", "Skills:".cyan(), skills.join(", ").cyan());
+        eprintln!("  {} {}", "Skills:".magenta(), skills.join(", ").magenta());
     }
     if let Some(rounds) = ev.llm_rounds {
         eprintln!(
             "  {} {} {}",
-            "LLM rounds:".cyan(),
+            "LLM rounds:".magenta(),
             rounds,
             "(LLM→tool cycles within this turn)".dim()
         );
@@ -799,7 +799,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
     let llm_bar = "█".repeat(llm_bar_len);
     eprintln!(
         "    {:<12} {:>6}ms {:>3}%  {}",
-        "LLM".cyan(),
+        "LLM".magenta(),
         llm_time_ms,
         llm_pct,
         llm_bar.blue()
@@ -828,7 +828,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
             );
             eprintln!(
                 "    {:<12} {:>6}ms {:>3}%  {}{}{}",
-                display.cyan(),
+                display.magenta(),
                 tc.ms,
                 pct,
                 bar,
@@ -876,7 +876,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
                     "    {} {}   selected skills: {}",
                     format!("[{:>5}ms]", offset).dim(),
                     "│ ".dim(),
-                    skills.join(", ").cyan()
+                    skills.join(", ").magenta()
                 );
             }
         }
@@ -991,7 +991,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
                 format!("[{:>5}ms]", tool_offset).dim(),
                 branch.dim(),
                 status,
-                display.cyan(),
+                display.magenta(),
                 io_info.dim(),
                 round_tag.dim(),
                 par_tag.dim(),
@@ -1034,7 +1034,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
     };
     eprintln!(
         "    {:<12} {:>6}ms  {:>3}%  {}",
-        "LLM".cyan(),
+        "LLM".magenta(),
         llm_time_ms,
         llm_pct,
         llm_note
@@ -1047,7 +1047,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
     };
     eprintln!(
         "    {:<12} {:>6}ms  {:>3}%  {}",
-        "Tools".cyan(),
+        "Tools".magenta(),
         tool_time_ms,
         tool_pct,
         tool_note
@@ -1058,10 +1058,10 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
         && ms > 0
     {
         let tps = t_out as f64 / (ms as f64 / 1000.0);
-        eprintln!("    {:<12} {:>6.1} tokens/s", "Throughput".cyan(), tps);
+        eprintln!("    {:<12} {:>6.1} tokens/s", "Throughput".magenta(), tps);
     }
 
-    eprintln!("  {}", "─".repeat(56).cyan().dim());
+    eprintln!("  {}", "─".repeat(56).magenta().dim());
     eprintln!();
 }
 
@@ -1098,7 +1098,7 @@ pub(super) async fn handle_info_command(
                         eprintln!("  {}", format!("Turn {turn_n}").bold());
                         if matches_user {
                             let u = truncate_str(user, 120);
-                            eprintln!("  {} {}", "❯".cyan(), u);
+                            eprintln!("  {} {}", "❯".magenta(), u);
                         }
                         if matches_asst {
                             let a = truncate_str(asst, 120);
@@ -1117,14 +1117,14 @@ pub(super) async fn handle_info_command(
                     "\n{}",
                     "─── Conversation History ─────────────────────────────────────"
                         .bold()
-                        .cyan()
+                        .magenta()
                 );
                 for (i, (user, asst)) in state.history.iter().enumerate() {
                     let turn_n = i + 1;
                     let u = truncate_str(user, 80);
                     let a = truncate_str(asst, 80);
                     eprintln!("  {}", format!("Turn {turn_n}").bold());
-                    eprintln!("  {} {}", "❯".cyan(), u);
+                    eprintln!("  {} {}", "❯".magenta(), u);
                     eprintln!("    {}", a.dim());
                     if i + 1 < state.history.len() {
                         eprintln!();
@@ -1165,7 +1165,7 @@ pub(super) async fn handle_info_command(
                 "\n{}",
                 format!("─── {title} ─────────────────────────────────────────────")
                     .bold()
-                    .cyan()
+                    .magenta()
             );
             for line in result.lines() {
                 eprintln!("  {line}");
@@ -1191,7 +1191,7 @@ pub(super) async fn handle_info_command(
                     "\n{}\n  {}\n",
                     "─── LSP Status ───────────────────────────────────────────────"
                         .bold()
-                        .cyan(),
+                        .magenta(),
                     error.yellow()
                 );
             } else {
@@ -1215,7 +1215,7 @@ pub(super) async fn handle_info_command(
                 "\n{}",
                 format!("─── Review · {review_label} ─────────────────────────────────────")
                     .bold()
-                    .cyan()
+                    .magenta()
             );
             let selector = crate::repl_runtime::create_tool_selector_quiet(api, None);
             let mut pm = PermissionManager::with_project(false, &project_root);
@@ -1365,7 +1365,7 @@ pub(super) async fn handle_info_command(
                 "\n{}",
                 "─── Diagnostics ──────────────────────────────────────────────"
                     .bold()
-                    .cyan()
+                    .magenta()
             );
 
             // Accumulate rows: (ok: bool, label: &str, detail: String)
@@ -1494,7 +1494,7 @@ pub(super) async fn handle_info_command(
             let label_w = rows.iter().map(|(_, l, _)| l.len()).max().unwrap_or(10);
             for (ok, label, detail) in &rows {
                 let icon = if *ok {
-                    "✓".green().to_string()
+                    theme::icon_ok().to_string()
                 } else {
                     "✗".red().to_string()
                 };
@@ -1570,12 +1570,19 @@ pub(super) async fn handle_info_command(
             }
 
             let sep = "─".repeat(38);
-            eprintln!("\n  {}", format!("─── Context Window {sep}").bold().cyan());
+            eprintln!(
+                "\n  {}",
+                format!("─── Context Window {sep}").bold().magenta()
+            );
 
             // ── Identity ──
             let model_display = state.model.clone().unwrap_or_else(|| "default".to_string());
-            eprintln!("  {:<12}  {}", "model".cyan(), model_display.dim());
-            eprintln!("  {:<12}  {}", "turn".cyan(), state.turn.to_string().dim());
+            eprintln!("  {:<12}  {}", "model".magenta(), model_display.dim());
+            eprintln!(
+                "  {:<12}  {}",
+                "turn".magenta(),
+                state.turn.to_string().dim()
+            );
 
             // ── Token usage bar ──
             let est_messages: Vec<serde_json::Value> = state
@@ -1634,19 +1641,19 @@ pub(super) async fn handle_info_command(
                 describe_context_pressure(usage_pct, est_pressure);
             eprintln!(
                 "  {:<12}  {} {}",
-                "status".cyan(),
+                "status".magenta(),
                 status_icon,
                 status_label.bold()
             );
-            eprintln!("  {:<12}  {}", "what it means".cyan(), status_hint.dim());
-            eprintln!("  {:<12}  {bar_display}", "usage".cyan());
+            eprintln!("  {:<12}  {}", "what it means".magenta(), status_hint.dim());
+            eprintln!("  {:<12}  {bar_display}", "usage".magenta());
 
             // ── Breakdown ──
             // System+tools estimate: typically ~5-15% of budget
             let free = limit.saturating_sub(history_tokens);
             eprintln!(
                 "  {:<12}  {}",
-                "history".cyan(),
+                "history".magenta(),
                 format!(
                     "~{}k tokens across {} messages; ~{}k tokens still free",
                     history_tokens / 1000,
@@ -1674,7 +1681,7 @@ pub(super) async fn handle_info_command(
             };
             eprintln!(
                 "  {:<12}  {}",
-                "compaction".cyan(),
+                "compaction".magenta(),
                 format!(
                     "{tier_emoji} {tier_label}  (starts near ~{compact_trigger_k}k; keep {} recent turns)",
                     budget.keep_recent_turns
@@ -1688,7 +1695,7 @@ pub(super) async fn handle_info_command(
             let cache_emoji = if total_cr > 0 { "🟢" } else { "⚪" };
             eprintln!(
                 "  {:<12}  {}",
-                "cache".cyan(),
+                "cache".magenta(),
                 format!(
                     "{cache_emoji} total: read {}k / write {}k",
                     total_cr / 1000,
@@ -1701,24 +1708,28 @@ pub(super) async fn handle_info_command(
             if let Some(ref anchor) = state.continuation_anchor {
                 let parsed = parse_continuation_anchor(anchor);
                 if let Some(task) = parsed.task.as_deref() {
-                    eprintln!("  {:<12}  {}", "task".cyan(), truncate_str(task, 80).dim());
+                    eprintln!(
+                        "  {:<12}  {}",
+                        "task".magenta(),
+                        truncate_str(task, 80).dim()
+                    );
                 }
                 if let Some(direction) = parsed.direction.as_deref() {
                     eprintln!(
                         "  {:<12}  {}",
-                        "direction".cyan(),
+                        "direction".magenta(),
                         truncate_str(direction, 80).dim()
                     );
                 }
                 if parsed.task.is_none() && parsed.direction.is_none() {
                     eprintln!(
                         "  {:<12}  {}",
-                        "focus".cyan(),
+                        "focus".magenta(),
                         truncate_str(anchor, 80).dim()
                     );
                 }
             }
-            eprintln!("  {}", "─".repeat(56).cyan().dim());
+            eprintln!("  {}", "─".repeat(56).magenta().dim());
 
             // Inline last turn's actual component breakdown if available
             if let Some(ref obs) = state.observability_session {
@@ -1728,7 +1739,7 @@ pub(super) async fn handle_info_command(
                     if tb.total_used > 0 {
                         eprintln!(
                             "\n  {}  ({})",
-                            "Last turn actual allocation:".bold().cyan(),
+                            "Last turn actual allocation:".bold().magenta(),
                             trace.turn_id.as_str().dim()
                         );
                         let components: &[(&str, u32)] = &[
@@ -1744,7 +1755,7 @@ pub(super) async fn handle_info_command(
                                 eprintln!(
                                     "    {:<16} {:>6} ({:>2}%)",
                                     format!("{label}:").dim(),
-                                    tokens.to_string().cyan(),
+                                    tokens.to_string().magenta(),
                                     pct
                                 );
                             }
@@ -1760,7 +1771,7 @@ pub(super) async fn handle_info_command(
                         eprintln!(
                             "    {:<16} {} / {} ({})",
                             "total:".dim(),
-                            tb.total_used.to_string().cyan().bold(),
+                            tb.total_used.to_string().magenta().bold(),
                             tb.max_tokens.to_string().dim(),
                             pressure_colored
                         );
@@ -1910,7 +1921,7 @@ pub(super) async fn handle_info_command(
                         eprintln!(
                             "  {} {} {}",
                             format!("{turn_n}").bold(),
-                            "❯".cyan(),
+                            "❯".magenta(),
                             u.dim()
                         );
                     }
@@ -2045,7 +2056,7 @@ fn print_context_explain(trace: &astra_turn_core::context_assembly_trace::Contex
     use astra_turn_core::context_assembly_trace::DecisionType;
 
     let header = format!("─── Context Explain — {} ──────────────────", trace.turn_id);
-    eprintln!("\n{}", header.bold().cyan());
+    eprintln!("\n{}", header.bold().magenta());
 
     let total_tokens = trace.token_budget.total_used;
     let limit = trace.token_budget.max_tokens;
@@ -2056,14 +2067,14 @@ fn print_context_explain(trace: &astra_turn_core::context_assembly_trace::Contex
     };
     eprintln!(
         "  {:<14}  {} tokens used of {} limit ({:.1}%)",
-        "budget".cyan(),
+        "budget".magenta(),
         total_tokens.to_string().dim(),
         limit.to_string().dim(),
         pressure
     );
     eprintln!(
         "  {:<14}  system prompt: {} tokens",
-        "system".cyan(),
+        "system".magenta(),
         trace.system_prompt.total_tokens.to_string().dim()
     );
 
@@ -2072,7 +2083,7 @@ fn print_context_explain(trace: &astra_turn_core::context_assembly_trace::Contex
     let dropped = trace.history.turns_dropped.len();
     eprintln!(
         "  {:<14}  retained={} compressed={} dropped={}",
-        "history".cyan(),
+        "history".magenta(),
         retained.to_string().green(),
         compressed.to_string().yellow(),
         dropped.to_string().red()
@@ -2081,7 +2092,7 @@ fn print_context_explain(trace: &astra_turn_core::context_assembly_trace::Contex
     let memory_selected = trace.memory.memories_selected.len();
     eprintln!(
         "  {:<14}  selected {} memories ({} tokens)",
-        "memory".cyan(),
+        "memory".magenta(),
         memory_selected.to_string().dim(),
         trace.memory.total_tokens.to_string().dim()
     );
@@ -2090,7 +2101,7 @@ fn print_context_explain(trace: &astra_turn_core::context_assembly_trace::Contex
     let tool_tokens: u32 = trace.tools.tools_selected.iter().map(|t| t.tokens).sum();
     eprintln!(
         "  {:<14}  selected {} tools ({} tokens)",
-        "tools".cyan(),
+        "tools".magenta(),
         tools_selected.to_string().dim(),
         tool_tokens.to_string().dim()
     );
@@ -2149,7 +2160,7 @@ fn print_context_breakdown(trace: &astra_turn_core::context_assembly_trace::Cont
             trace.turn_id
         )
         .bold()
-        .cyan()
+        .magenta()
     );
 
     let tb = &trace.token_budget;
@@ -2179,7 +2190,7 @@ fn print_context_breakdown(trace: &astra_turn_core::context_assembly_trace::Cont
         eprintln!(
             "  {:<16} {:>6} ({:>2}%) {}",
             format!("{label}:").dim(),
-            tokens.to_string().cyan(),
+            tokens.to_string().magenta(),
             pct,
             bar.dim()
         );
@@ -2274,7 +2285,7 @@ fn print_context_breakdown(trace: &astra_turn_core::context_assembly_trace::Cont
     eprintln!(
         "\n  {:<16} {} / {} ({}{})",
         "total:".bold().dim(),
-        tb.total_used.to_string().cyan().bold(),
+        tb.total_used.to_string().magenta().bold(),
         tb.max_tokens.to_string().dim(),
         pressure_colored,
         if tb.compression_triggered {

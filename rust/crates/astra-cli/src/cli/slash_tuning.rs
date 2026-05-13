@@ -58,7 +58,7 @@ fn cmd_status<W: Write>(ctx: TuningCommandContext<'_, W>) -> std::io::Result<()>
     let w = ctx.writer;
 
     // Header
-    writeln!(w, "\n{}", "Auto-Tuning System Status".cyan().bold())?;
+    writeln!(w, "\n{}", "Auto-Tuning System Status".magenta().bold())?;
     writeln!(w, "{}", "─".repeat(50).dim())?;
 
     // Enabled status
@@ -75,7 +75,7 @@ fn cmd_status<W: Write>(ctx: TuningCommandContext<'_, W>) -> std::io::Result<()>
     writeln!(
         w,
         "Rules:     {} configured",
-        rules.len().to_string().cyan()
+        rules.len().to_string().magenta()
     )?;
 
     // Active rules (enabled)
@@ -102,7 +102,7 @@ fn cmd_status<W: Write>(ctx: TuningCommandContext<'_, W>) -> std::io::Result<()>
     }
 
     // Current config values (relevant to auto-tuning)
-    writeln!(w, "\n{}", "Current Config Values".cyan())?;
+    writeln!(w, "\n{}", "Current Config Values".magenta())?;
     writeln!(w, "{}", "─".repeat(50).dim())?;
 
     let config = &ctx.runtime_config;
@@ -132,7 +132,7 @@ fn cmd_rules<W: Write>(ctx: TuningCommandContext<'_, W>) -> std::io::Result<()> 
     let w = ctx.writer;
     let rules = ctx.engine.get_rules();
 
-    writeln!(w, "\n{}", "Evolution Rules".cyan().bold())?;
+    writeln!(w, "\n{}", "Evolution Rules".magenta().bold())?;
     writeln!(w, "{}", "─".repeat(70).dim())?;
 
     if rules.is_empty() {
@@ -163,7 +163,7 @@ fn print_rule<W: Write>(w: &mut W, rule: &EvolutionRule) -> std::io::Result<()> 
         w,
         "{} {} {}",
         enabled_color,
-        rule.id.clone().cyan().bold(),
+        rule.id.clone().magenta().bold(),
         if rule.name.is_empty() {
             "".to_string()
         } else {
@@ -341,7 +341,7 @@ fn cmd_feedback<W: Write>(
     let w = ctx.writer;
     let limit: usize = limit.and_then(|s| s.parse().ok()).unwrap_or(10);
 
-    writeln!(w, "\n{}", "Recent Feedback Signals".cyan().bold())?;
+    writeln!(w, "\n{}", "Recent Feedback Signals".magenta().bold())?;
     writeln!(w, "{}", "─".repeat(60).dim())?;
 
     // Note: AutoTuningEngine doesn't expose raw signals directly
@@ -384,7 +384,7 @@ fn cmd_history<W: Write>(
 
     let executions = ctx.engine.get_executions();
 
-    writeln!(w, "\n{}", "Rule Execution History".cyan().bold())?;
+    writeln!(w, "\n{}", "Rule Execution History".magenta().bold())?;
     writeln!(w, "{}", "─".repeat(70).dim())?;
 
     if executions.is_empty() {
@@ -428,7 +428,7 @@ fn print_execution<W: Write>(w: &mut W, exec: &RuleExecution) -> std::io::Result
     let status = if exec.rolled_back {
         "↩ ROLLED BACK".red().to_string()
     } else {
-        "✓".green().to_string()
+        theme::icon_ok().to_string()
     };
 
     writeln!(
@@ -436,7 +436,7 @@ fn print_execution<W: Write>(w: &mut W, exec: &RuleExecution) -> std::io::Result
         "  {} {} ago - {} {}",
         status,
         age.dim(),
-        exec.rule_id.clone().cyan(),
+        exec.rule_id.clone().magenta(),
         format_action(&exec.action).dim()
     )?;
 
@@ -457,7 +457,7 @@ fn cmd_enable<W: Write>(ctx: TuningCommandContext<'_, W>) -> std::io::Result<()>
     writeln!(
         ctx.writer,
         "{} Auto-tuning {}",
-        "✓".green(),
+        theme::icon_ok(),
         "enabled".green().bold()
     )?;
     Ok(())
@@ -483,7 +483,7 @@ fn cmd_cycle<W: Write>(ctx: TuningCommandContext<'_, W>) -> std::io::Result<()> 
         writeln!(
             w,
             "{} Auto-tuning is disabled. Enable with `/tuning enable`.",
-            "⚠".yellow()
+            theme::icon_warn()
         )?;
         return Ok(());
     }
@@ -504,7 +504,7 @@ fn cmd_cycle<W: Write>(ctx: TuningCommandContext<'_, W>) -> std::io::Result<()> 
             writeln!(
                 w,
                 "    - {}: {}",
-                exec.rule_id.clone().cyan(),
+                exec.rule_id.clone().magenta(),
                 format_action(&exec.action)
             )?;
         }
@@ -534,7 +534,11 @@ fn cmd_record<W: Write>(args: &[&str], ctx: TuningCommandContext<'_, W>) -> std:
     let w = ctx.writer;
 
     if args.is_empty() {
-        writeln!(w, "{} Usage: /tuning record <signal_type>", "⚠".yellow())?;
+        writeln!(
+            w,
+            "{} Usage: /tuning record <signal_type>",
+            theme::icon_warn()
+        )?;
         writeln!(w)?;
         writeln!(w, "Signal types:")?;
         writeln!(w, "  success, failure, retry, correction")?;
@@ -589,8 +593,8 @@ fn cmd_record<W: Write>(args: &[&str], ctx: TuningCommandContext<'_, W>) -> std:
     writeln!(
         w,
         "{} Recorded {} signal",
-        "✓".green(),
-        format!("{:?}", signal_type).cyan()
+        theme::icon_ok(),
+        format!("{:?}", signal_type).magenta()
     )?;
 
     Ok(())
@@ -601,7 +605,7 @@ fn cmd_record<W: Write>(args: &[&str], ctx: TuningCommandContext<'_, W>) -> std:
 fn cmd_help<W: Write>(ctx: TuningCommandContext<'_, W>) -> std::io::Result<()> {
     let w = ctx.writer;
 
-    writeln!(w, "\n{}", "Auto-Tuning Commands".cyan().bold())?;
+    writeln!(w, "\n{}", "Auto-Tuning Commands".magenta().bold())?;
     writeln!(w, "{}", "─".repeat(50).dim())?;
     writeln!(w)?;
     writeln!(
@@ -637,7 +641,7 @@ fn cmd_help<W: Write>(ctx: TuningCommandContext<'_, W>) -> std::io::Result<()> {
         "/tuning record <signal>".green()
     )?;
     writeln!(w)?;
-    writeln!(w, "{}", "About Auto-Tuning".cyan())?;
+    writeln!(w, "{}", "About Auto-Tuning".magenta())?;
     writeln!(w, "{}", "─".repeat(50).dim())?;
     writeln!(w)?;
     writeln!(w, "  The auto-tuning system monitors feedback signals and")?;

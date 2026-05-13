@@ -2,14 +2,12 @@
 
 use std::time::Duration;
 
+use crate::chat_stream::edge_executor_instance_id;
+use crate::repl_runtime::{attempt_token_refresh, current_access_token};
 use astra_thin_client::{
     EdgeHeartbeatRequest, EdgeRegisterRequest, ThinClient, ThinClientError,
     edge_register_with_capabilities,
 };
-use crossterm::style::Stylize;
-
-use crate::chat_stream::edge_executor_instance_id;
-use crate::repl_runtime::{attempt_token_refresh, current_access_token};
 
 /// When `ASTRA_EDGE_REGISTRY` is `0`, `false`, or `off`, skip register and heartbeat.
 pub fn edge_cloud_registry_enabled() -> bool {
@@ -147,12 +145,8 @@ pub async fn register_and_start_heartbeat(
             return None;
         }
     };
-    if success {
-        eprintln!(
-            "{}",
-            "  · Edge node registered with cloud (heartbeat in background)".dim()
-        );
-    }
+    // Cloud status is shown in the startup card — no separate line.
+    let _ = success;
     spawn_edge_heartbeat(api.clone(), final_token, profile.map(str::to_owned))
 }
 
@@ -164,11 +158,8 @@ fn is_unauthorized(err: &ThinClientError) -> bool {
     )
 }
 
-fn print_skip_notice(e: &ThinClientError) {
-    eprintln!(
-        "{}",
-        format!("  · Edge registry skipped ({e}). Chat and tools still work.").dim()
-    );
+fn print_skip_notice(_e: &ThinClientError) {
+    // Cloud status shown in startup card — suppress individual notice.
 }
 
 #[cfg(test)]

@@ -29,6 +29,9 @@ pub(crate) struct ReasoningCell {
     started_at: Option<Instant>,
     duration: Option<Duration>,
     ts: Option<String>,
+    /// Stamped at finalize. Lets the active-slot gradient gutter
+    /// pin its phase at the freeze moment.
+    frozen_at: super::FreezeStamp,
 }
 
 impl ReasoningCell {
@@ -39,6 +42,7 @@ impl ReasoningCell {
             started_at: Some(Instant::now()),
             duration: None,
             ts: None,
+            frozen_at: super::FreezeStamp::default(),
         }
     }
 
@@ -51,6 +55,7 @@ impl ReasoningCell {
             started_at: None,
             duration: duration_ms.map(Duration::from_millis),
             ts: None,
+            frozen_at: super::FreezeStamp::default(),
         }
     }
 
@@ -73,6 +78,10 @@ impl ReasoningCell {
                 started_at: None,
                 duration: duration_ms.map(Duration::from_millis),
                 ts,
+                // Resumed from persistence — already settled. See
+                // `FreezeStamp::revived` for the launch-independent
+                // phase rationale.
+                frozen_at: super::FreezeStamp::revived(),
             }),
             _ => None,
         }
@@ -214,6 +223,11 @@ impl HistoryCell for ReasoningCell {
                 self.duration = Some(t.elapsed());
             }
         }
+        self.frozen_at.stamp_now();
+    }
+
+    fn frozen_phase(&self) -> Option<f32> {
+        self.frozen_at.phase()
     }
 
     fn to_persist(&self) -> Option<TurnEvent> {

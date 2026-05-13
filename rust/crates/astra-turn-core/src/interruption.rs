@@ -456,8 +456,18 @@ pub fn classify_error(error: &str) -> Option<(InterruptionKind, ResumeAction)> {
     // because for our UX both cases need user intervention, not a retry.
     let has_token = lower.contains("token");
     let has_expired = lower.contains("expired");
-    if lower.contains("401")
-        || lower.contains("403")
+    // NOTE: bare "401" / "403" substring match is intentionally avoided —
+    // unrelated error payloads (timeouts in ms, byte offsets, body snippets
+    // containing the digits) produced spurious credential-refresh prompts.
+    // We require the status code to appear in an HTTP-shaped phrase.
+    if lower.contains("401 unauthorized")
+        || lower.contains("status: 401")
+        || lower.contains("status code: 401")
+        || lower.contains("http 401")
+        || lower.contains("403 forbidden")
+        || lower.contains("status: 403")
+        || lower.contains("status code: 403")
+        || lower.contains("http 403")
         || lower.contains("forbidden")
         || lower.contains("unauthorized")
         || lower.contains("authentication")

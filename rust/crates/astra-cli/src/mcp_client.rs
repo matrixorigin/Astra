@@ -555,7 +555,7 @@ async fn do_elicitation(
                 eprintln!(
                     "\n  {} {}",
                     "╭─".dim(),
-                    "MCP Elicitation Request".bold().cyan()
+                    "MCP Elicitation Request".bold().magenta()
                 );
                 eprintln!("  {} {message}", "│".dim());
 
@@ -566,7 +566,7 @@ async fn do_elicitation(
                     eprint!(
                         "  {} {}{} ({}): ",
                         "│".dim(),
-                        name.as_str().cyan(),
+                        name.as_str().magenta(),
                         req_marker,
                         type_hint.as_str().dim()
                     );
@@ -650,7 +650,7 @@ async fn do_elicitation(
                 eprintln!(
                     "\n  {} {}",
                     "╭─".dim(),
-                    "MCP Elicitation (URL)".bold().cyan()
+                    "MCP Elicitation (URL)".bold().magenta()
                 );
                 eprintln!("  {} {message}", "│".dim());
                 eprintln!("  {} {} {url}", "│".dim(), "URL:".dim());
@@ -805,8 +805,8 @@ impl McpConnection {
             eprintln!(
                 "  {} MCP tool '{}' on server '{}' timed out after {}s",
                 "✗".red(),
-                name.cyan(),
-                self.name.as_str().cyan(),
+                name.magenta(),
+                self.name.as_str().magenta(),
                 MCP_TOOL_CALL_TIMEOUT_SECS
             );
             ServiceError::Timeout {
@@ -1336,7 +1336,7 @@ impl McpClientManager {
         if !refreshed.is_empty() {
             eprintln!(
                 "  {} Refreshed tool lists for: {}",
-                "↻".cyan(),
+                "↻".magenta(),
                 refreshed.join(", ")
             );
         }
@@ -1355,7 +1355,7 @@ impl McpClientManager {
         if !changed.is_empty() {
             eprintln!(
                 "  {} Prompt lists changed on: {}",
-                "↻".cyan(),
+                "↻".magenta(),
                 changed.join(", ")
             );
         }
@@ -1374,7 +1374,7 @@ impl McpClientManager {
         if !changed.is_empty() {
             eprintln!(
                 "  {} Resources changed on: {}",
-                "↻".cyan(),
+                "↻".magenta(),
                 changed.join(", ")
             );
         }
@@ -1508,7 +1508,7 @@ async fn connect_stdio(
             eprintln!(
                 "  {} MCP server '{}': blocked dangerous env var '{}'",
                 theme::icon_warn(),
-                name.cyan(),
+                name.magenta(),
                 key.as_str().yellow()
             );
             continue;

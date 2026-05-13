@@ -2085,12 +2085,20 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     if let Some(exec) = self.streaming_tool_exec.clone() {
                         exec.discard(request_id).await;
                     }
-                    astra_runtime::turn::skill_tool::execute_skill_inline(
+                    let raw = astra_runtime::turn::skill_tool::execute_skill_inline(
                         resolver.as_ref(),
                         tool,
                         args,
                     )
-                    .await
+                    .await;
+                    // Append `<skill-loaded name="..."/>` so the LLM sees
+                    // the "do not re-invoke" signal. Without this, the
+                    // system-prompt rule "On seeing <skill-loaded/>, follow
+                    // instructions — do not re-invoke" never triggers on the
+                    // CLI edge path, and the LLM loads a second skill
+                    // (session 11825116 regression). Server-side path does
+                    // this in partition_discover_and_execute_skills:1098.
+                    append_skill_loaded_marker(&raw, &dedup_key)
                 } else {
                     "Error: skill resolver not available".to_string()
                 }
@@ -3441,7 +3449,7 @@ impl StreamRenderState {
                     Some((cur, total)) if total > 1 => format!("[{}/{}] ", cur, total),
                     _ => String::new(),
                 };
-                let line = format!("  {} {}{} …", "⬢".cyan(), prefix, styled_desc);
+                let line = format!("  {} {}{} …", theme::icon_running(), prefix, styled_desc);
                 eprintln!("{line}");
                 self.stderr_lines += 1;
             }
@@ -3456,7 +3464,7 @@ impl StreamRenderState {
                 Some((cur, total)) if total > 1 => format!("[{}/{}] ", cur, total),
                 _ => String::new(),
             };
-            let line = format!("  {} {}{} …", "⬢".cyan(), prefix, styled_desc);
+            let line = format!("  {} {}{} …", theme::icon_running(), prefix, styled_desc);
             g.lines.push(line);
             let lines = g.lines.clone();
             g.region.update(lines);
@@ -3478,7 +3486,7 @@ impl StreamRenderState {
         if io::stderr().is_terminal() {
             self.tool_stderr_running = Some(ToolRunningLineSpinner::start(description));
         } else {
-            let line = format!("  {} {} …", "⬢".cyan(), description.dim());
+            let line = format!("  {} {} …", theme::icon_running(), description.dim());
             eprintln!("{line}");
             self.stderr_lines += 1;
         }
@@ -6519,6 +6527,55 @@ pub(super) fn dispatch_turn_event_block(
     apply_sse_render_effects(effects, render, policy);
 }
 
+/// Append `<skill-loaded name="..."/>` to a successful skill result.
+///
+/// The system prompt tells the LLM: "On seeing `<skill-loaded name="..."/>` in
+/// a tool result, follow that skill's instructions — do not re-invoke it."
+/// Without this marker, the LLM doesn't know the skill loaded and may
+/// invoke discover_skills + a second skill in the same turn.
+///
+/// Error results (starting with "Error:") are returned unchanged — the LLM
+/// should be free to retry or switch strategies on failures.
+///
+/// Mirrors the server-side logic in
+/// `runtime::turn::skill_tool::partition_discover_and_execute_skills` (line ~1098).
+fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
+    if result.starts_with("Error:") || result.starts_with("error:") || result.trim().is_empty() {
+        return result.to_string();
+    }
+    // Sanitize: allowlist to a conservative set of filename-safe
+    // characters. A malicious skill registry entry could otherwise
+    // use path-like names (`../evil`) or Unicode line separators
+    // (U+2028 / U+2029, which `is_control` does NOT catch) to
+    // impersonate a different skill in LLM-visible output. Anything
+    // outside the allowlist is replaced with `_`.
+    // The allowlist already rejects every XML-special character
+    // (`<`, `>`, `&`, `"`, `'`) by replacing it with `_`, so no
+    // subsequent XML-escape pass is needed — and adding one would be
+    // dead code that falsely suggests the allowlist is permissive.
+    let safe_name: String = skill_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '/') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // Belt-and-suspenders: make the allowlist's XML-safety guarantee
+    // a runtime invariant, so any future relaxation of the allowlist
+    // that lets an XML-special char slip through trips tests
+    // immediately instead of silently enabling tag breakout.
+    debug_assert!(
+        !safe_name
+            .chars()
+            .any(|c| matches!(c, '<' | '>' | '&' | '"' | '\'')),
+        "allowlist must reject every XML-special character; got {safe_name:?}"
+    );
+    format!("{result}\n\n<skill-loaded name=\"{safe_name}\"/>")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8114,6 +8171,61 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
         assert!(msg.contains("code-review"));
         assert!(msg.contains("already loaded"));
+    }
+
+    // ── CLI skill-loaded marker tests ──────────────────────────────────
+
+    #[test]
+    fn skill_loaded_marker_appended_to_successful_result() {
+        // Regression (session 11825116): the CLI edge path used
+        // `execute_skill_inline` which returned raw skill content
+        // WITHOUT appending `<skill-loaded name="..."/>`. The
+        // system prompt tells the LLM "On seeing <skill-loaded/>,
+        // do not re-invoke" — without the marker, the LLM loaded
+        // a second skill (review-code) after already loading
+        // review-changes, wasting context and confusing itself.
+        //
+        // Fix: `append_skill_loaded_marker` adds the tag to
+        // successful (non-error) results.
+        let raw = "# Skill: review-changes\n\nYou are now executing...";
+        let result = append_skill_loaded_marker(raw, "review-changes");
+        assert!(
+            result.contains("<skill-loaded name=\"review-changes\"/>"),
+            "successful skill result must carry the marker: {result}"
+        );
+        assert!(
+            result.ends_with("<skill-loaded name=\"review-changes\"/>"),
+            "marker must be at the very end so LLM sees it last: {result}"
+        );
+    }
+
+    #[test]
+    fn skill_loaded_marker_not_appended_to_error_result() {
+        // Error results must NOT carry the tag — the LLM should be
+        // free to retry or switch to another skill.
+        let raw = "Error: skill resolver not available";
+        let result = append_skill_loaded_marker(raw, "broken-skill");
+        assert!(
+            !result.contains("<skill-loaded"),
+            "error results must not carry the marker: {result}"
+        );
+    }
+
+    #[test]
+    fn skill_loaded_marker_sanitizes_xml_special_chars() {
+        // XML-special characters (`<`, `>`, `&`, `"`, `'`) are outside
+        // the filename-safe allowlist, so they are replaced with `_`.
+        // This prevents a malicious skill name from breaking out of
+        // the `<skill-loaded name="..."/>` tag entirely.
+        let result = append_skill_loaded_marker("ok", "a<b>&c\"d");
+        assert!(
+            result.contains("a_b__c_d"),
+            "XML special chars must be replaced with `_`: {result}"
+        );
+        assert!(
+            !result.contains('<') || result.matches('<').count() == 1,
+            "only the opening `<skill-loaded` angle bracket may remain: {result}"
+        );
     }
 
     // ── EdgeToolCache unit tests ─────────────────────────────────────────

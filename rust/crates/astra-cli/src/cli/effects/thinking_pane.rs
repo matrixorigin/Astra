@@ -123,7 +123,7 @@ impl ThinkingPreviewPane {
             return;
         }
         let mut lines = Vec::with_capacity(body.len() + 1);
-        lines.push(format!("  {}", header.cyan().dim()));
+        lines.push(format!("  {}", header.magenta().dim()));
         for line in body {
             if line.is_empty() {
                 lines.push(String::new());

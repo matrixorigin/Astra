@@ -41,7 +41,13 @@ fn classify_llm_error(msg: &str) -> astra_core::ErrorKind {
     } else if lower.contains("connect") || lower.contains("transport") || lower.contains("network")
     {
         astra_core::ErrorKind::StreamTransport
-    } else if lower.contains("401") || lower.contains("unauthorized") || lower.contains("api key") {
+    } else if lower.contains("401 unauthorized")
+        || lower.contains("status: 401")
+        || lower.contains("status code: 401")
+        || lower.contains("http 401")
+        || lower.contains("unauthorized")
+        || lower.contains("api key")
+    {
         astra_core::ErrorKind::Auth
     } else if lower.contains("cancelled") || lower.contains("canceled") {
         astra_core::ErrorKind::Cancelled

@@ -828,12 +828,16 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
 pub fn print_text(d: &JournalDigest) {
     use crossterm::style::Stylize;
     println!("  {} {}", "schema_version:".dim(), d.schema_version);
-    println!("  {} {}", "session_id:".dim(), d.session_id.as_str().cyan());
+    println!(
+        "  {} {}",
+        "session_id:".dim(),
+        d.session_id.as_str().magenta()
+    );
     println!("  {} {}", "journal_file:".dim(), d.journal_file);
     println!(
         "  {} non_empty={} malformed={}",
         "journal_lines:".dim(),
-        d.journal_lines_non_empty.to_string().cyan(),
+        d.journal_lines_non_empty.to_string().magenta(),
         if d.journal_lines_malformed > 0 {
             d.journal_lines_malformed.to_string().red().to_string()
         } else {
@@ -841,10 +845,10 @@ pub fn print_text(d: &JournalDigest) {
         }
     );
     let a = &d.aggregates;
-    println!("\n  {}", "Aggregates".bold().cyan());
+    println!("\n  {}", "Aggregates".bold().magenta());
     println!(
         "  turns={} turn_errors={} compacts={} stalls={} errors={}",
-        a.turn_count.to_string().cyan(),
+        a.turn_count.to_string().magenta(),
         a.turn_error_count,
         a.compact_count,
         a.stall_count,
@@ -852,13 +856,13 @@ pub fn print_text(d: &JournalDigest) {
     );
     println!(
         "  tokens_in={} tokens_out={} duration_ms={} tool_calls={} tool_failures={}",
-        a.total_tokens_in.to_string().cyan(),
-        a.total_tokens_out.to_string().cyan(),
+        a.total_tokens_in.to_string().magenta(),
+        a.total_tokens_out.to_string().magenta(),
         a.total_duration_ms,
         a.total_tool_calls,
         a.tool_calls_failed
     );
-    println!("\n  {}", "Averages (per turn)".bold().cyan());
+    println!("\n  {}", "Averages (per turn)".bold().magenta());
     println!(
         "  tokens_in={:.1} tokens_out={:.1} duration_ms={:.1}",
         a.avg_tokens_in, a.avg_tokens_out, a.avg_duration_ms
@@ -870,7 +874,7 @@ pub fn print_text(d: &JournalDigest) {
         );
     }
     if !d.turns.is_empty() {
-        println!("\n  {}", "Turns".bold().cyan());
+        println!("\n  {}", "Turns".bold().magenta());
         println!(
             "  {}",
             format!(
@@ -952,7 +956,7 @@ pub fn print_text(d: &JournalDigest) {
         println!(
             "\n  {} {}",
             "compaction_events:".dim(),
-            d.compaction_events.len().to_string().cyan()
+            d.compaction_events.len().to_string().magenta()
         );
         for e in &d.compaction_events {
             println!(
@@ -970,7 +974,7 @@ pub fn print_text(d: &JournalDigest) {
         println!(
             "\n  {} {}",
             "interruptions:".yellow(),
-            d.interruptions.len().to_string().cyan()
+            d.interruptions.len().to_string().magenta()
         );
         for e in &d.interruptions {
             let step = e
@@ -990,7 +994,7 @@ pub fn print_text(d: &JournalDigest) {
         println!(
             "\n  {} {}",
             "stalls:".yellow(),
-            d.stalls.len().to_string().cyan()
+            d.stalls.len().to_string().magenta()
         );
         for e in &d.stalls {
             println!(
@@ -1005,7 +1009,7 @@ pub fn print_text(d: &JournalDigest) {
         println!(
             "\n  {} {}",
             "turn_errors:".red(),
-            d.turn_errors.len().to_string().cyan()
+            d.turn_errors.len().to_string().magenta()
         );
         for e in &d.turn_errors {
             println!(
@@ -1020,7 +1024,7 @@ pub fn print_text(d: &JournalDigest) {
         println!(
             "\n  {} {}",
             "other_errors:".red(),
-            d.other_errors.len().to_string().cyan()
+            d.other_errors.len().to_string().magenta()
         );
         for e in &d.other_errors {
             println!("    {} {}", e.ts.as_str().dim(), e.detail);
@@ -1620,6 +1624,46 @@ mod tests {
             f.error_preview.contains("missing field"),
             "error_preview should be derived from result_preview when error field is empty: {}",
             f.error_preview
+        );
+    }
+
+    #[test]
+    fn digest_does_not_flag_cross_turn_cache_hits_as_failures() {
+        // Regression guard for session 6d6c1041: cross-turn cache
+        // hits are recorded with `error: "cached_cross_turn"` (an
+        // info tag, not a failure) + a non-empty
+        // `result_preview` starting with "[cached_cross_turn:".
+        // Earlier versions with `result_preview: None` mis-reported
+        // the tool as having returned an empty body and the LLM
+        // hallucinated a `{}`-return bug. Pin both invariants:
+        // - cache hits are NOT counted in `tool_calls_failed`
+        // - `result_body_signals_failure` returns false for the
+        //   tagged preview shape
+        assert!(
+            !result_body_signals_failure(
+                "[cached_cross_turn: reused 2000 bytes — refer to earlier read_file]"
+            ),
+            "cache-hit preview must not trip the failure detector"
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "test-cachehit-00000000-0000-0000-0000-0000000000aa";
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"read_file","ok":true,"ms":0,"error":"cached_cross_turn","output_bytes":2000,"result_preview":"[cached_cross_turn: reused 2000 bytes]","args_preview":"src/lib.rs"},{"name":"bash","ok":true,"ms":5,"result_preview":"ok"}]}"#,
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(
+            d.aggregates.tool_calls_failed, 0,
+            "cross-turn cache hits must not count as failures"
+        );
+        assert!(
+            d.failed_tool_calls.is_empty(),
+            "cross-turn cache hits must not appear in failed_tool_calls"
         );
     }
 

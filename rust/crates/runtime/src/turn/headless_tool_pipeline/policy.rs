@@ -307,6 +307,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         slot.name.clone(),
                         body.len() as u32,
                         args_preview,
+                        Some(&body),
                     ));
                 return HeadlessPipelineStage::ShortCircuit;
             }
@@ -359,6 +360,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     slot.name.clone(),
                     cached.output.len() as u32,
                     args_preview,
+                    Some(&cached.output),
                 ));
             return HeadlessPipelineStage::ShortCircuit;
         }
@@ -415,6 +417,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     slot.name.clone(),
                     cached_output.len() as u32,
                     args_preview,
+                    Some(&cached_output),
                 ));
             agent_warn!(
                 "dedup",
@@ -515,8 +518,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         } = validated;
         if self.ctx.restricted_tools.contains(&execution.name) {
             let err_msg = format!(
-                "Tool '{}' is currently restricted and cannot be executed. \
-                 Use only the tools whose schemas were provided.",
+                "Tool '{}' is currently restricted due to repeated failures in \
+                 this session. The tool itself is not broken — it was blocked \
+                 because previous calls failed (possibly due to argument errors).\n\n\
+                 Workaround: use `bash` to accomplish the same task directly, \
+                 or describe what you need and ask the user to run the command.",
                 execution.name
             );
             emit_blocked_tool_result(

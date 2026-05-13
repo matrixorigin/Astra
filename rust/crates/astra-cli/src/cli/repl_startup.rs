@@ -52,7 +52,7 @@ pub(crate) async fn complete_repl_startup(
         state.pending_recovery = None;
         eprintln!(
             "{}",
-            format!("  Using session {}", truncate_str(&sid, 12)).cyan()
+            format!("  Using session {}", truncate_str(&sid, 12)).magenta()
         );
     }
 
@@ -264,32 +264,9 @@ pub(crate) async fn complete_repl_startup(
     print_repl_banner(profile, state);
     tracer.phase("banner");
 
-    if let Some(ref sid) = state.pending_recovery {
-        let short = truncate_str(sid, 12);
-        eprintln!(
-            "{}",
-            format!(
-                "  ↻ Recoverable session {short} detected for this project. Say continue / resume / 继续 to restore it, or use /resume {short}."
-            )
-            .cyan()
-        );
-        eprintln!();
-    }
+    // Pending recovery is silently retained in state for /resume; no startup banner.
 
-    if let Ok(proxy) = std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY"))
-        && !proxy.is_empty()
-    {
-        eprintln!(
-            "  {}  {} {}",
-            theme::icon_warn(),
-            "HTTP proxy detected:".yellow(),
-            proxy.dim()
-        );
-        eprintln!(
-            "     {}",
-            "Agent bypasses proxy for local calls. For curl: use --noproxy '*'".dim()
-        );
-    }
+    // Proxy info now shown in startup card — no separate line needed.
 
     let mut edge_heartbeat_task: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(ref tok) = current_access_token(profile) {
@@ -314,27 +291,7 @@ pub(crate) async fn complete_repl_startup(
     }
     tracer.phase("multi_agent_runtime");
 
-    // ── Self-brief (passive self-awareness) ─────────────────────────────
-    // Print a one-line identity summary so the user can see, at startup,
-    // what agent version / model / session / skills are live.
-    {
-        let version = env!("CARGO_PKG_VERSION");
-        let model = state.model.as_deref().unwrap_or("<unset>");
-        let session = state
-            .session_id
-            .as_deref()
-            .map(|s| truncate_str(s, 12))
-            .unwrap_or_else(|| "<new>".to_string());
-        let skills = state.unified_skill_registry.len();
-        eprintln!(
-            "  {} {}",
-            theme::icon_ok(),
-            format!(
-                "astra v{version} · model={model} · session={session} · {skills} skills · auto-reflect on · /whoami for details"
-            )
-            .dim()
-        );
-    }
+    // Ready status now conveyed by the startup card — no separate line.
 
     Ok(ReplStartupArtifacts {
         selector,

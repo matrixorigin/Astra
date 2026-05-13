@@ -99,7 +99,7 @@ async fn enrich_with_templates(
     if verbose {
         eprintln!(
             "  {} {}",
-            "⋯".cyan(),
+            "⋯".magenta(),
             "Searching for similar plan templates…".dim()
         );
     }
@@ -109,7 +109,7 @@ async fn enrich_with_templates(
         eprintln!(
             "  {} Found {} learned template{}",
             theme::icon_ok(),
-            format!("{}", templates.len()).cyan(),
+            format!("{}", templates.len()).magenta(),
             if templates.len() == 1 { "" } else { "s" }
         );
         context.prior_templates = templates;
@@ -202,7 +202,7 @@ pub(super) async fn handle_memory_domain_command(
                                         };
                                         eprintln!(
                                             "  {}. {} {}",
-                                            (i + 1).to_string().cyan(),
+                                            (i + 1).to_string().magenta(),
                                             display,
                                             short_id.dim()
                                         );
@@ -253,13 +253,17 @@ pub(super) async fn handle_memory_domain_command(
                                                 content.chars().take(80).collect();
                                             format!("[{mtype}] {preview}")
                                         };
-                                        eprintln!("  {}. {}", (i + 1).to_string().cyan(), display);
+                                        eprintln!(
+                                            "  {}. {}",
+                                            (i + 1).to_string().magenta(),
+                                            display
+                                        );
                                     }
                                     eprintln!(
                                         "  {}",
                                         "────────────────────────────────────────────────".dim()
                                     );
-                                    eprintln!("  {} memories", arr.len().to_string().cyan());
+                                    eprintln!("  {} memories", arr.len().to_string().magenta());
                                 }
                             } else {
                                 print_json_or_raw(&body);
@@ -311,12 +315,12 @@ pub(super) async fn handle_memory_domain_command(
                                                 .send()
                                                 .await;
                                         }
-                                        eprintln!("  {} dismissed: {preview}", "✗".red());
+                                        eprintln!("  {} dismissed: {preview}", theme::icon_err());
                                         dismissed += 1;
                                     }
                                     eprintln!(
                                         "  {} memories dismissed (retrieval score lowered)",
-                                        dismissed.to_string().cyan()
+                                        dismissed.to_string().magenta()
                                     );
                                 }
                             }
@@ -408,7 +412,7 @@ pub(super) async fn handle_memory_domain_command(
                                     eprintln!(
                                         "  {} Forgot memory {}",
                                         theme::icon_ok(),
-                                        memory_id.cyan()
+                                        memory_id.magenta()
                                     );
                                 }
                                 Ok(r) => eprintln!(
@@ -434,7 +438,11 @@ pub(super) async fn handle_memory_domain_command(
                     };
                     match super::edge_tools::memoria::memoria_snapshot_create(&name).await {
                         Ok(_) => {
-                            eprintln!("  {} Snapshot '{}' created", theme::icon_ok(), name.cyan())
+                            eprintln!(
+                                "  {} Snapshot '{}' created",
+                                theme::icon_ok(),
+                                name.magenta()
+                            )
                         }
                         Err(e) => eprintln!("  {} Snapshot failed: {e}", theme::icon_err()),
                     }
@@ -442,7 +450,11 @@ pub(super) async fn handle_memory_domain_command(
                 "rollback" if !sub_arg.is_empty() => {
                     match super::edge_tools::memoria::memoria_snapshot_rollback(sub_arg).await {
                         Ok(_) => {
-                            eprintln!("  {} Rolled back to '{}'", theme::icon_ok(), sub_arg.cyan())
+                            eprintln!(
+                                "  {} Rolled back to '{}'",
+                                theme::icon_ok(),
+                                sub_arg.magenta()
+                            )
                         }
                         Err(e) => eprintln!("  {} Rollback failed: {e}", theme::icon_err()),
                     }
@@ -455,7 +467,11 @@ pub(super) async fn handle_memory_domain_command(
                 "branch" if !sub_arg.is_empty() => {
                     match super::edge_tools::memoria::memoria_branch_create(sub_arg).await {
                         Ok(_) => {
-                            eprintln!("  {} Branch '{}' created", theme::icon_ok(), sub_arg.cyan())
+                            eprintln!(
+                                "  {} Branch '{}' created",
+                                theme::icon_ok(),
+                                sub_arg.magenta()
+                            )
                         }
                         Err(e) => eprintln!("  {} Branch failed: {e}", theme::icon_err()),
                     }
@@ -465,7 +481,7 @@ pub(super) async fn handle_memory_domain_command(
                         Ok(_) => eprintln!(
                             "  {} Switched to branch '{}'",
                             theme::icon_ok(),
-                            sub_arg.cyan()
+                            sub_arg.magenta()
                         ),
                         Err(e) => eprintln!("  {} Checkout failed: {e}", theme::icon_err()),
                     }
@@ -473,7 +489,11 @@ pub(super) async fn handle_memory_domain_command(
                 "merge" if !sub_arg.is_empty() => {
                     match super::edge_tools::memoria::memoria_branch_merge(sub_arg).await {
                         Ok(_) => {
-                            eprintln!("  {} Branch '{}' merged", theme::icon_ok(), sub_arg.cyan())
+                            eprintln!(
+                                "  {} Branch '{}' merged",
+                                theme::icon_ok(),
+                                sub_arg.magenta()
+                            )
                         }
                         Err(e) => eprintln!("  {} Merge failed: {e}", theme::icon_err()),
                     }
@@ -571,7 +591,7 @@ pub(super) async fn handle_memory_domain_command(
                     state.chat_plan_only = true;
                     eprintln!(
                         "  {} Plan-only chat ON — edge tools disabled; model answers with plans only.",
-                        "📋".cyan()
+                        "📋".magenta()
                     );
                     eprintln!(
                         "  {}",
@@ -586,7 +606,10 @@ pub(super) async fn handle_memory_domain_command(
                         return Ok(());
                     }
                     state.chat_plan_only = false;
-                    eprintln!("  {} Plan-only chat OFF — normal agent mode.", "←".cyan());
+                    eprintln!(
+                        "  {} Plan-only chat OFF — normal agent mode.",
+                        "←".magenta()
+                    );
                     return Ok(());
                 }
                 "status" => {
@@ -618,7 +641,7 @@ pub(super) async fn handle_memory_domain_command(
                             eprintln!("  {} Failed to save plan state: {e}", theme::icon_warn());
                         }
                         state.plan_mode = None;
-                        eprintln!("  {} Exited plan mode", "←".cyan());
+                        eprintln!("  {} Exited plan mode", "←".magenta());
                         return Ok(());
                     }
 
@@ -641,8 +664,8 @@ pub(super) async fn handle_memory_domain_command(
                         if let Some(ref ps) = state.plan_mode {
                             eprintln!(
                                 "  {} Restored saved plan: {}",
-                                "↩".cyan(),
-                                ps.goal.as_str().cyan()
+                                "↩".magenta(),
+                                ps.goal.as_str().magenta()
                             );
                             eprintln!();
                             let formatted = format_plan(&ps.plan);
@@ -655,7 +678,7 @@ pub(super) async fn handle_memory_domain_command(
                         state.chat_plan_only = false;
                         state.plan_mode = Some(PlanModeState::new(String::new(), context));
                         plan_interaction::eprint_plan_mode_banner("");
-                        eprintln!("  {} Describe your goal to start planning.", "→".cyan());
+                        eprintln!("  {} Describe your goal to start planning.", "→".magenta());
                     }
                 }
                 "show" => {
@@ -822,7 +845,7 @@ pub(super) async fn handle_memory_domain_command(
                             eprintln!();
                             eprintln!(
                                 "{}  Type 'decompose: {}' to try again.",
-                                "💡".cyan(),
+                                "💡".magenta(),
                                 sub_arg
                             );
                         }
@@ -890,14 +913,14 @@ pub(super) async fn handle_memory_domain_command(
                                 eprintln!();
                                 eprintln!(
                                     "  {} {}",
-                                    "▸".cyan(),
+                                    "▸".magenta(),
                                     format!(
                                         "{} question{} before planning:",
                                         questions.len(),
                                         if questions.len() == 1 { "" } else { "s" }
                                     )
                                     .bold()
-                                    .cyan()
+                                    .magenta()
                                 );
                                 eprintln!();
 
@@ -965,7 +988,11 @@ pub(super) async fn handle_memory_domain_command(
                             let plan = ps.plan.clone();
                             state.plan_mode = Some(ps);
                             eprintln!();
-                            eprintln!("{}  Resumed plan mode for: {}", "📋".yellow(), goal.cyan());
+                            eprintln!(
+                                "{}  Resumed plan mode for: {}",
+                                "📋".yellow(),
+                                goal.magenta()
+                            );
                             eprintln!();
                             if !plan.subtasks.is_empty() {
                                 eprintln!("{}", format_plan(&plan));
@@ -973,7 +1000,7 @@ pub(super) async fn handle_memory_domain_command(
                             eprintln!();
                             eprintln!(
                                 "  {} Commands: 'exit' to leave, 'execute' or 'go' to run",
-                                "💡".cyan()
+                                "💡".magenta()
                             );
                         }
                         Err(_) => {
@@ -1007,7 +1034,7 @@ pub(super) async fn handle_memory_domain_command(
                                         theme::icon_warn()
                                     );
                                 } else {
-                                    eprintln!("\n{}  Cloud Plans", "☁️".cyan());
+                                    eprintln!("\n{}  Cloud Plans", "☁️".magenta());
                                     eprintln!("{}", "─".repeat(50));
                                     for t in &with_plans {
                                         let icon = match t.status {
@@ -1024,7 +1051,7 @@ pub(super) async fn handle_memory_domain_command(
                                             "  {} {} {} [{}] ({} subtasks, {})",
                                             short_id.dim(),
                                             icon,
-                                            t.title.as_str().cyan(),
+                                            t.title.as_str().magenta(),
                                             t.status.as_str(),
                                             subtask_count,
                                             project_type,
@@ -1033,7 +1060,7 @@ pub(super) async fn handle_memory_domain_command(
                                     eprintln!();
                                     eprintln!(
                                         "  {} Use /plan load <id> to restore a cloud plan",
-                                        "💡".cyan()
+                                        "💡".magenta()
                                     );
                                 }
                             }
@@ -1094,8 +1121,8 @@ pub(super) async fn handle_memory_domain_command(
                                         eprintln!();
                                         eprintln!(
                                             "{}  Loaded cloud plan: {} ({})",
-                                            "☁️".cyan(),
-                                            task.title.as_str().cyan(),
+                                            "☁️".magenta(),
+                                            task.title.as_str().magenta(),
                                             short_id.dim()
                                         );
                                         eprintln!();
@@ -1103,7 +1130,7 @@ pub(super) async fn handle_memory_domain_command(
                                         eprintln!();
                                         eprintln!(
                                             "  {} Commands: 'execute' to run, 'exit' to leave plan mode",
-                                            "💡".cyan()
+                                            "💡".magenta()
                                         );
                                     }
                                     None => {
@@ -1114,7 +1141,7 @@ pub(super) async fn handle_memory_domain_command(
                                         );
                                         eprintln!(
                                             "  {} Use /plan cloud to list available plans",
-                                            "💡".cyan()
+                                            "💡".magenta()
                                         );
                                     }
                                 }
@@ -1132,7 +1159,7 @@ pub(super) async fn handle_memory_domain_command(
                     let plans = plan_decompose::list_saved_plans();
                     let templates = plan_decompose::builtin_templates();
                     eprintln!("{}", plan_decompose::format_plan_list(&plans));
-                    eprintln!("  {} Built-in templates:", "📋".cyan());
+                    eprintln!("  {} Built-in templates:", "📋".magenta());
                     for t in &templates {
                         eprintln!(
                             "    • {} — {} [{}]",
@@ -1149,7 +1176,7 @@ pub(super) async fn handle_memory_domain_command(
                     if state.task_service.is_some() {
                         eprintln!(
                             "  {} Use /plan cloud to list cloud-synced plans",
-                            "☁️".cyan()
+                            "☁️".magenta()
                         );
                     }
                 }
@@ -1180,7 +1207,7 @@ pub(super) async fn handle_memory_domain_command(
                             state.plan_mode = Some(ps);
                             eprintln!(
                                 "  {} Entered plan mode. Type 'execute' to run, 'exit' to leave.",
-                                "💡".cyan()
+                                "💡".magenta()
                             );
                         }
                         None => {
@@ -1285,7 +1312,7 @@ pub(super) async fn handle_memory_domain_command(
                                                         Ok(Some(template_id)) => {
                                                             eprintln!(
                                                                 "  {} Template extracted: {} → {}",
-                                                                "📝".cyan(),
+                                                                "📝".magenta(),
                                                                 goal_pattern.dim(),
                                                                 prefix_chars(&template_id, 8)
                                                             );
@@ -1361,13 +1388,13 @@ pub(super) async fn handle_memory_domain_command(
                                         );
                                         eprintln!(
                                             "  {} Complete more plans and rate them to build templates!",
-                                            "💡".cyan()
+                                            "💡".magenta()
                                         );
                                     } else {
                                         eprintln!(
                                             "  {} Recommended templates for: {}",
-                                            "📋".cyan(),
-                                            goal.cyan()
+                                            "📋".magenta(),
+                                            goal.magenta()
                                         );
                                         eprintln!();
                                         for (i, rec) in recommendations.iter().enumerate() {
@@ -1375,7 +1402,7 @@ pub(super) async fn handle_memory_domain_command(
                                                 .repeat((rec.template.success_rate * 5.0) as usize);
                                             eprintln!(
                                                 "  [{}] {} {} ({}x used)",
-                                                (i + 1).to_string().cyan(),
+                                                (i + 1).to_string().magenta(),
                                                 rec.template.goal_pattern,
                                                 stars.yellow(),
                                                 rec.template.use_count
@@ -1395,7 +1422,7 @@ pub(super) async fn handle_memory_domain_command(
                                         eprintln!();
                                         eprintln!(
                                             "  {} Use '/plan use <n>' to apply a template",
-                                            "💡".cyan()
+                                            "💡".magenta()
                                         );
                                     }
                                 }
@@ -1425,8 +1452,8 @@ pub(super) async fn handle_memory_domain_command(
                                 Ok(stats) => {
                                     eprintln!(
                                         "  {} Learning Stats: {}",
-                                        "📊".cyan(),
-                                        pattern.cyan()
+                                        "📊".magenta(),
+                                        pattern.magenta()
                                     );
                                     eprintln!();
                                     eprintln!("  Total tasks:     {}", stats.total_tasks);
@@ -1481,7 +1508,7 @@ pub(super) async fn handle_memory_domain_command(
                             eprintln!("  {} No events recorded yet", "(empty)".dim());
                             eprintln!(
                                 "  {} Events are recorded during plan execution",
-                                "💡".cyan()
+                                "💡".magenta()
                             );
                         } else {
                             eprintln!("{}", ps.timeline.format_display());
@@ -1555,7 +1582,7 @@ pub(super) async fn handle_memory_domain_command(
                             );
                             eprintln!(
                                 "  {} Pause execution first with Ctrl+C, then enter plan mode",
-                                "💡".cyan()
+                                "💡".magenta()
                             );
                         } else {
                             eprintln!(
@@ -1654,7 +1681,7 @@ pub(super) async fn handle_memory_domain_command(
                                     eprintln!();
                                     eprintln!(
                                         "  {} Use '/plan diff {} {}' to see changes",
-                                        "💡".cyan(),
+                                        "💡".magenta(),
                                         old_version,
                                         ps.version_history.current_version
                                     );
@@ -1718,7 +1745,7 @@ pub(super) async fn handle_memory_domain_command(
                     let prompt = decomposition_prompt(sub_arg, &context);
                     eprintln!(
                         "  {} Decomposing and auto-executing: {}",
-                        "🚀".cyan(),
+                        "🚀".magenta(),
                         sub_arg
                     );
 
@@ -1926,11 +1953,11 @@ fn handle_plan_status(state: &ReplState) {
             .filter(|s| s.status == astra_runtime::plan_decompose::TaskStatus::InProgress)
             .count();
 
-        eprintln!("\n{}  Plan Status", "📋".cyan());
+        eprintln!("\n{}  Plan Status", "📋".magenta());
         eprintln!("{}", "─".repeat(45).dim());
 
         if let Some(ref goal) = state.executing_plan_goal {
-            eprintln!("  Goal: {}", goal.as_str().cyan());
+            eprintln!("  Goal: {}", goal.as_str().magenta());
         }
         eprintln!("  Progress: {}%  ({}/{} subtasks done)", pct, done, total);
         if in_progress > 0 {
@@ -1942,11 +1969,13 @@ fn handle_plan_status(state: &ReplState) {
         eprintln!();
         for st in &plan.subtasks {
             let icon = match st.status {
-                astra_runtime::plan_decompose::TaskStatus::Completed => "✓".green().to_string(),
+                astra_runtime::plan_decompose::TaskStatus::Completed => {
+                    theme::icon_ok().to_string()
+                }
                 astra_runtime::plan_decompose::TaskStatus::InProgress => "▶".yellow().to_string(),
                 astra_runtime::plan_decompose::TaskStatus::Pending => "○".dim().to_string(),
                 astra_runtime::plan_decompose::TaskStatus::Paused => "⏸".yellow().to_string(),
-                astra_runtime::plan_decompose::TaskStatus::Failed => "✗".red().to_string(),
+                astra_runtime::plan_decompose::TaskStatus::Failed => theme::icon_err().to_string(),
                 astra_runtime::plan_decompose::TaskStatus::Cancelled => "⊘".dim().to_string(),
             };
             eprintln!("  {} {} [{}]", icon, st.title, st.id.as_str().dim());
@@ -1956,13 +1985,13 @@ fn handle_plan_status(state: &ReplState) {
         if pct < 100 {
             eprintln!(
                 "  {} Type 'continue' to resume or a message to add guidance",
-                "💡".cyan()
+                "💡".magenta()
             );
         }
     } else if let Some(ref ps) = state.plan_mode {
-        eprintln!("\n{}  Plan Mode (editing)", "📋".cyan());
+        eprintln!("\n{}  Plan Mode (editing)", "📋".magenta());
         if !ps.goal.is_empty() {
-            eprintln!("  Goal: {}", ps.goal.as_str().cyan());
+            eprintln!("  Goal: {}", ps.goal.as_str().magenta());
         }
         if !ps.plan.subtasks.is_empty() {
             eprintln!(

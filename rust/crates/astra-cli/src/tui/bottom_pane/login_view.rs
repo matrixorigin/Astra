@@ -146,7 +146,7 @@ impl BottomPaneView for LoginView {
             .title(Line::from(Span::styled(
                 self.mode.title(),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(crate::tui::theme::current().accent)
                     .add_modifier(Modifier::BOLD),
             )));
         let inner = outer.inner(area);
@@ -161,7 +161,7 @@ impl BottomPaneView for LoginView {
                 Span::styled(
                     "▸ ",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(crate::tui::theme::current().accent)
                         .add_modifier(Modifier::BOLD),
                 )
             } else {

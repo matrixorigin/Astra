@@ -43,7 +43,7 @@ pub(super) fn handle_tools_command(state: &ReplState) {
         };
         eprintln!(
             "  {:<20} {:>5} {:>5} {:>7} {:>7} {:>7} {:>6}",
-            p.name.as_str().cyan(),
+            p.name.as_str().magenta(),
             p.call_count,
             p.fail_count,
             p.avg_ms,

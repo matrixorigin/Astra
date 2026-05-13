@@ -12,7 +12,8 @@ use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview
 use astra_turn_core::headless_tool_journal::journal_record_executed_tool_call;
 use astra_turn_core::headless_tool_postprocess::{
     HeadlessCacheableRecordCtx, format_headless_tool_duration,
-    record_headless_cacheable_success_and_semantic_hint, try_write_light_headless_step_checkpoint,
+    record_headless_cacheable_success_and_semantic_hint_if_ok,
+    try_write_light_headless_step_checkpoint,
 };
 use astra_turn_core::headless_tool_status_display::{tool_call_detail, tool_result_summary};
 use astra_turn_core::headless_tool_stderr_lines::{
@@ -169,8 +170,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             self.ctx.idempotency_cache.evict_tools(&READ_ONLY_TOOLS);
         }
 
-        if !is_err && READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
-            record_headless_cacheable_success_and_semantic_hint(
+        if READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
+            // The `_if_ok` helper no-ops on `is_err`, so the outer
+            // guard is redundant — keep the READ_ONLY_TOOLS filter
+            // (tool-name scope) but hand `is_err` to the helper for
+            // the error-branch decision.
+            record_headless_cacheable_success_and_semantic_hint_if_ok(
                 &execution.name,
                 &execution.args,
                 &idem_key,
@@ -181,6 +186,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     step_recorder: self.ctx.step_recorder,
                     semantic_dedup: self.ctx.semantic_dedup,
                 },
+                is_err,
             );
         }
 

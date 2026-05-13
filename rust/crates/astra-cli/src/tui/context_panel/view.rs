@@ -740,7 +740,7 @@ fn turn_detail_lines(t: &TurnDetail, compressed: bool, selected: bool) -> Vec<Li
         Span::styled(
             "▸ ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(crate::tui::theme::current().accent)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
@@ -749,7 +749,7 @@ fn turn_detail_lines(t: &TurnDetail, compressed: bool, selected: bool) -> Vec<Li
     let mut spans: Vec<Span<'static>> = vec![Span::raw("      "), marker.clone(), Span::raw("└ ")];
     let id_style = if selected {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(crate::tui::theme::current().accent)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
@@ -820,7 +820,7 @@ fn append_tools_expanded(out: &mut Vec<Line<'static>>, tools: &[ToolItem], selec
             Span::styled(
                 "▸ ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(crate::tui::theme::current().accent)
                     .add_modifier(Modifier::BOLD),
             )
         } else {
@@ -869,7 +869,7 @@ fn render_tool_drill(out: &mut Vec<Line<'static>>, tools: &[ToolItem], selected_
         Span::styled(
             t.name.clone(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(crate::tui::theme::current().accent)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -925,7 +925,7 @@ fn render_history_drill(out: &mut Vec<Line<'static>>, turns: &[TurnDetail], sele
         Span::styled(
             format!("#{} {}", t.index, t.role),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(crate::tui::theme::current().accent)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -990,7 +990,7 @@ fn render_memory_drill(
         Span::styled(
             format!("{} · {}", m.memory_type, m.source),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(crate::tui::theme::current().accent)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -1025,7 +1025,7 @@ fn render_decision_drill(
         Span::styled(
             d.label.clone(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(crate::tui::theme::current().accent)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -1100,7 +1100,7 @@ fn append_memory_section(
             Span::styled(
                 "▸ ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(crate::tui::theme::current().accent)
                     .add_modifier(Modifier::BOLD),
             )
         } else {
@@ -1116,7 +1116,7 @@ fn append_memory_section(
                     format!("{} · {}", m.memory_type, m.source),
                     if selected {
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(crate::tui::theme::current().accent)
                             .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
@@ -1279,7 +1279,7 @@ fn append_session_section(
         line1.push(Span::raw("  ·  "));
         line1.push(Span::styled(
             format!("model {model}"),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(crate::tui::theme::current().accent),
         ));
     }
     out.push(Line::from(line1));
@@ -1458,7 +1458,7 @@ fn append_decisions_section(
             Span::styled(
                 "▸ ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(crate::tui::theme::current().accent)
                     .add_modifier(Modifier::BOLD),
             )
         } else {
@@ -1466,7 +1466,7 @@ fn append_decisions_section(
         };
         let name_style = if selected {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(crate::tui::theme::current().accent)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -1592,7 +1592,7 @@ fn append_compaction_section(
                 Span::styled(
                     "▸ ",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(crate::tui::theme::current().accent)
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
@@ -1600,7 +1600,7 @@ fn append_compaction_section(
             };
             let name_style = if selected {
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(crate::tui::theme::current().accent)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -1655,7 +1655,7 @@ fn render_compaction_drill(
         Span::styled(
             format!("#{} {}", event.turn_index, event.role),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(crate::tui::theme::current().accent)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -1748,7 +1748,7 @@ fn section_heading_raw(text: &str, focused: bool, expanded: bool) -> Line<'stati
     };
     let style = if focused {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(crate::tui::theme::current().accent)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::BOLD)

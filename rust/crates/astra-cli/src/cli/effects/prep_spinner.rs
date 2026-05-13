@@ -103,7 +103,7 @@ impl PlanAssembleLineSpinner {
         let stop2 = stop.clone();
         let handle = std::thread::spawn(move || {
             let t0 = origin;
-            let icon = format!("{}", ICON_RUNNING.cyan());
+            let icon = format!("{}", ICON_RUNNING.magenta());
             // Chat request prep paints immediately; plan-assemble keeps the delay.
             let skip_delay = matches!(kind, SecStatusLineKind::ChatRequestPrep);
             if !skip_delay {

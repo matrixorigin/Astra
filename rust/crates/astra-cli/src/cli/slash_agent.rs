@@ -118,12 +118,12 @@ fn show_history(ctx: &AgentCommandContext) {
     if delegations.is_empty() {
         eprintln!(
             "\n  {}",
-            "🤝 No delegation history in this session".cyan().bold()
+            "🤝 No delegation history in this session".magenta().bold()
         );
         eprintln!();
         return;
     }
-    eprintln!("\n  {}", "🤝 Delegation History".cyan().bold());
+    eprintln!("\n  {}", "🤝 Delegation History".magenta().bold());
     eprintln!("  {}", "─".repeat(60).dim());
     for entry in &delegations {
         eprintln!(
@@ -141,7 +141,7 @@ fn show_history(ctx: &AgentCommandContext) {
             );
         }
         if let Some(preview) = &entry.aggregated_output_preview {
-            eprintln!("    {}", preview.as_str().cyan());
+            eprintln!("    {}", preview.as_str().magenta());
         }
         for sub_run in &entry.sub_runs {
             eprintln!(
@@ -174,7 +174,10 @@ async fn show_list(ctx: &AgentCommandContext) {
     let delegations = load_recent_delegations(ctx.session_id.as_deref());
 
     if active_agents.is_empty() && completed_agents.is_empty() && delegations.is_empty() {
-        eprintln!("\n  {}", "🤖 No recent agents or delegations".cyan().bold());
+        eprintln!(
+            "\n  {}",
+            "🤖 No recent agents or delegations".magenta().bold()
+        );
         eprintln!(
             "  {}",
             "Use spawn_agent or delegate to start multi-agent work.".dim()
@@ -206,13 +209,13 @@ async fn show_tree(ctx: &AgentCommandContext) {
     if agents.is_empty() && delegations.is_empty() {
         eprintln!(
             "\n  {}",
-            "🌲 No agent or delegation tree available".cyan().bold()
+            "🌲 No agent or delegation tree available".magenta().bold()
         );
         eprintln!();
         return;
     }
 
-    eprintln!("\n  {}", "🌲 Agent Delegation Tree".cyan().bold());
+    eprintln!("\n  {}", "🌲 Agent Delegation Tree".magenta().bold());
     eprintln!("  {}", "─".repeat(60).dim());
 
     if !agents.is_empty() {
@@ -243,7 +246,7 @@ async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
         {
             eprintln!(
                 "\n  {} {}",
-                "🤖 Agent".cyan().bold(),
+                "🤖 Agent".magenta().bold(),
                 state.agent_id.as_str().white().bold()
             );
             eprintln!("  {}", "─".repeat(50).dim());
@@ -251,7 +254,7 @@ async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
             eprintln!(
                 "  {} {}",
                 "Description:".white().bold(),
-                state.description.as_str().cyan()
+                state.description.as_str().magenta()
             );
             eprintln!(
                 "  {} {}",
@@ -292,7 +295,7 @@ async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
                 .unwrap_or_else(|_| "?".to_string());
             eprintln!("  {} {}", "Running for:".white().bold(), elapsed);
 
-            eprintln!("\n  {}", "📊 Metrics".cyan().bold());
+            eprintln!("\n  {}", "📊 Metrics".magenta().bold());
             eprintln!("  {}", "─".repeat(30).dim());
             eprintln!(
                 "  {} {}",
@@ -312,7 +315,7 @@ async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
             );
 
             // Permission summary in status
-            eprintln!("\n  {}", "🔐 Permissions".cyan().bold());
+            eprintln!("\n  {}", "🔐 Permissions".magenta().bold());
             eprintln!("  {}", "─".repeat(30).dim());
             print_permission_summary(&state.permission_summary, &state.metrics);
 
@@ -327,7 +330,7 @@ async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
             .unwrap_or_default();
         eprintln!(
             "\n  {} {}",
-            "🤝 Delegation".cyan().bold(),
+            "🤝 Delegation".magenta().bold(),
             entry.delegation_id.as_str().white().bold()
         );
         eprintln!("  {}", "─".repeat(50).dim());
@@ -358,7 +361,7 @@ async fn show_permissions(ctx: &AgentCommandContext, agent_id: &str) {
         Some(state) => {
             eprintln!(
                 "\n  {} {} {}",
-                "🔐 Permissions for".cyan().bold(),
+                "🔐 Permissions for".magenta().bold(),
                 state.agent_id.as_str().white().bold(),
                 format!("[{}]", state.agent_type).dim()
             );
@@ -371,7 +374,7 @@ async fn show_permissions(ctx: &AgentCommandContext, agent_id: &str) {
                 eprintln!("\n  {}", "📮 Permission Requests".white().bold());
                 eprintln!(
                     "    Sent: {}, Approved: {}, Denied: {}",
-                    state.metrics.permission_requests.to_string().cyan(),
+                    state.metrics.permission_requests.to_string().magenta(),
                     state
                         .metrics
                         .permission_requests_approved
@@ -483,7 +486,7 @@ async fn stop_agent(ctx: &AgentCommandContext, agent_id: &str) {
 
     eprintln!(
         "  {} Shutdown request sent to {}",
-        "✓".green(),
+        theme::icon_ok(),
         agent_id.white().bold()
     );
 }
@@ -493,7 +496,10 @@ async fn stop_agent(ctx: &AgentCommandContext, agent_id: &str) {
 async fn show_watch(ctx: &AgentCommandContext) {
     use std::time::Duration;
 
-    eprintln!("\n  {} Watching agent tree (Ctrl+C to stop)\n", "👁".cyan());
+    eprintln!(
+        "\n  {} Watching agent tree (Ctrl+C to stop)\n",
+        "👁".magenta()
+    );
     eprintln!(
         "  {}",
         "Watch follows live spawned agents; delegations appear through journal-backed lifecycle changes, not per-turn sub-agent output."
@@ -552,7 +558,7 @@ async fn show_logs(ctx: &AgentCommandContext, agent_id: &str) {
 
     eprintln!(
         "\n  {} Streaming logs for {} (Ctrl+C to stop)\n",
-        "📋".cyan(),
+        "📋".magenta(),
         agent_id.white().bold()
     );
 
@@ -595,7 +601,7 @@ fn show_delegation_logs(session_id: Option<&str>, query: &str) -> bool {
     };
     eprintln!(
         "\n  {} {}\n",
-        "📋 Delegation logs for".cyan(),
+        "📋 Delegation logs for".magenta(),
         delegation_id.as_str().white().bold()
     );
     for event in events {
@@ -668,7 +674,7 @@ fn show_delegation_logs(session_id: Option<&str>, query: &str) -> bool {
                     status
                 );
                 if let Some(preview) = output_preview {
-                    eprintln!("      {}", preview.cyan());
+                    eprintln!("      {}", preview.magenta());
                 }
                 if let Some(error) = error {
                     eprintln!("      {}", error.red());
@@ -700,7 +706,7 @@ fn show_delegation_logs(session_id: Option<&str>, query: &str) -> bool {
                     status
                 );
                 if let Some(preview) = preview {
-                    eprintln!("      {}", preview.cyan());
+                    eprintln!("      {}", preview.magenta());
                 }
             }
             _ => {}
@@ -737,8 +743,8 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
         } => {
             format!(
                 "{} Turn {} ({} tools): {}",
-                "◆".cyan(),
-                turn.to_string().as_str().cyan(),
+                "◆".magenta(),
+                turn.to_string().as_str().magenta(),
                 tool_calls_this_turn,
                 activity
             )
@@ -777,7 +783,7 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
             )
         }
         ProgressEventType::ToolExecuting { tool_name, turn } => {
-            format!("🔧 turn={} → {}", turn, tool_name.as_str().cyan())
+            format!("🔧 turn={} → {}", turn, tool_name.as_str().magenta())
         }
         ProgressEventType::LlmCallStarted { turn } => {
             format!("🧠 turn={} {}", turn, "thinking…".dim())
@@ -817,7 +823,7 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
             };
             format!(
                 "▶ 🌲 {} spawned: {}{}",
-                agent_type.as_str().cyan(),
+                agent_type.as_str().magenta(),
                 description,
                 parent_label.dim()
             )
@@ -828,7 +834,7 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
 }
 
 fn show_help() {
-    eprintln!("\n  {}", "🤖 Agent Commands".cyan().bold());
+    eprintln!("\n  {}", "🤖 Agent Commands".magenta().bold());
     eprintln!("  {}", "─".repeat(50).dim());
     eprintln!(
         "  {}  List recent agents and delegations",
@@ -933,7 +939,7 @@ fn is_terminal_agent_status(status: &AgentStatus) -> bool {
 }
 
 fn print_agent_section(title: &str, agents: &[astra_runtime::orchestration::SpawnedAgentInfo]) {
-    eprintln!("\n  {}", title.cyan().bold());
+    eprintln!("\n  {}", title.magenta().bold());
     eprintln!("  {}", "─".repeat(60).dim());
     for agent in agents {
         let elapsed = agent
@@ -953,7 +959,7 @@ fn print_agent_section(title: &str, agents: &[astra_runtime::orchestration::Spaw
                 String::new()
             }
         );
-        eprintln!("    {}", agent.description.as_str().cyan());
+        eprintln!("    {}", agent.description.as_str().magenta());
         if agent.metrics.tool_calls > 0 || agent.metrics.tools_blocked > 0 {
             let mut metrics_parts = vec![];
             if agent.metrics.tool_calls > 0 {
@@ -980,7 +986,7 @@ fn print_agent_section(title: &str, agents: &[astra_runtime::orchestration::Spaw
 }
 
 fn print_delegation_section(entries: &[DelegationHistoryEntry]) {
-    eprintln!("\n  {}", "🤝 Recent Delegations".cyan().bold());
+    eprintln!("\n  {}", "🤝 Recent Delegations".magenta().bold());
     eprintln!("  {}", "─".repeat(60).dim());
     for entry in entries {
         eprintln!(
@@ -1007,7 +1013,7 @@ fn print_delegation_section(entries: &[DelegationHistoryEntry]) {
             );
         }
         if let Some(preview) = &entry.aggregated_output_preview {
-            eprintln!("    {}", preview.as_str().cyan());
+            eprintln!("    {}", preview.as_str().magenta());
         }
     }
 }
@@ -1224,7 +1230,7 @@ fn build_watch_snapshot(
 
 fn print_watch_snapshot(snapshot: &str) {
     eprint!("\x1b[2J\x1b[H");
-    eprintln!("  {}", "🌲 Agent Delegation Tree".cyan().bold());
+    eprintln!("  {}", "🌲 Agent Delegation Tree".magenta().bold());
     eprintln!("  {}", "─".repeat(60).dim());
     eprintln!(
         "  {}",

@@ -8,6 +8,7 @@ name = "astra-admin"
 path = "src/main.rs"
 
 [dependencies]
+astra-credentials.workspace = true
 astra-thin-client.workspace = true
 clap = { version = "4.5.38", features = ["derive"] }
 crossterm = "0.27"
@@ -21,4 +22,5 @@ serde_yaml_ng.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+temp-env = "0.3"
 tempfile = "3"
