@@ -44,6 +44,14 @@ pub(crate) struct PendingApproval {
     /// scopes for unknown-capability tools.
     pub mcp_capability:
         Option<astra_turn_core::permission_engine::ToolCapabilityMetadata>,
+    /// Issue #326 P3 / scenario #39: when the agent runs against a
+    /// remote host (SSH session, dev container, sandbox VM), this
+    /// records the host label so the UI can prefix paths with
+    /// `host:path`. `None` means "local". The label is purely
+    /// display-side; the gate doesn't change behaviour based on
+    /// it (remote-vs-local is the sub-run / capability metadata's
+    /// job).
+    pub host: Option<String>,
 }
 
 impl std::fmt::Debug for PendingApproval {
@@ -72,6 +80,9 @@ pub(crate) struct ApprovalView {
     /// Sub-agent owner, if any. Mirrored from
     /// [`PendingApproval::source_agent`].
     pub source_agent: Option<String>,
+    /// Remote host, if any. Mirrored from
+    /// [`PendingApproval::host`].
+    pub host: Option<String>,
 }
 
 impl From<&PendingApproval> for ApprovalView {
@@ -83,6 +94,7 @@ impl From<&PendingApproval> for ApprovalView {
             detail: p.detail.clone(),
             reason: p.reason.clone(),
             source_agent: p.source_agent.clone(),
+            host: p.host.clone(),
         }
     }
 }
@@ -116,14 +128,16 @@ impl ApprovalQueue {
         reason: String,
         response_tx: oneshot::Sender<ApprovalResponse>,
     ) -> ApprovalId {
-        self.push_with_metadata(tool, header, detail, reason, response_tx, None, None)
+        self.push_with_metadata(tool, header, detail, reason, response_tx, None, None, None)
     }
 
     /// Issue #326 P3 / R1 Major 11: same as [`push`] but lets callers
-    /// attach the [`PendingApproval::source_agent`] and
-    /// [`PendingApproval::mcp_capability`] fields. Used by sub-agent
-    /// permission requests forwarded into the TUI session and by the
-    /// MCP gate when the server provided capability annotations.
+    /// attach the [`PendingApproval::source_agent`],
+    /// [`PendingApproval::mcp_capability`], and
+    /// [`PendingApproval::host`] fields. Used by sub-agent
+    /// permission requests forwarded into the TUI session, the
+    /// MCP gate when the server provided capability annotations,
+    /// and remote-host adapters (SSH, dev container).
     pub fn push_with_metadata(
         &mut self,
         tool: String,
@@ -135,6 +149,7 @@ impl ApprovalQueue {
         mcp_capability: Option<
             astra_turn_core::permission_engine::ToolCapabilityMetadata,
         >,
+        host: Option<String>,
     ) -> ApprovalId {
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
@@ -156,6 +171,7 @@ impl ApprovalQueue {
             buttons,
             source_agent,
             mcp_capability,
+            host,
         });
         // Promote pre-existing entries too — they now share the queue
         // and should expose the batch buttons on their next focus.
@@ -326,6 +342,7 @@ mod tests {
             tx,
             Some("review-subagent".into()),
             None,
+            None,
         );
         let view = q.focused_view().unwrap();
         assert_eq!(view.source_agent.as_deref(), Some("review-subagent"));
@@ -349,11 +366,33 @@ mod tests {
             tx,
             None,
             Some(meta.clone()),
+            None,
         );
         // We can't read the field via ApprovalView (intentional —
         // the view is for display only), but Debug includes the
         // capability presence indicator.
         let entries_dbg = format!("{:?}", &q.entries);
         assert!(entries_dbg.contains("mcp_capability_known: Some(true)"));
+    }
+
+    #[test]
+    fn push_with_metadata_carries_host_to_view() {
+        // Issue #326 P3 / scenario #39: SSH / dev-container
+        // approvals must surface the host so the TUI can prefix
+        // path strings with `host:path`.
+        let mut q = ApprovalQueue::new();
+        let (tx, _rx) = oneshot::channel();
+        q.push_with_metadata(
+            "edit_file".into(),
+            "edit /etc/hosts".into(),
+            None,
+            "write".into(),
+            tx,
+            None,
+            None,
+            Some("ssh:bastion-prod".into()),
+        );
+        let view = q.focused_view().unwrap();
+        assert_eq!(view.host.as_deref(), Some("ssh:bastion-prod"));
     }
 }
