@@ -214,6 +214,81 @@ pub enum RiskTag {
     SandboxExpansion,
 }
 
+/// Issue #326 P5 / R2 Major 5: MCP tool capability metadata.
+///
+/// Carries the standard MCP annotations
+/// (`destructiveHint` / `readOnlyHint` / `openWorldHint`) plus the
+/// origin server name from request to engine. Without this the
+/// gate has no way to distinguish a benign `mcp_jira_list_issues`
+/// (read-only) from a `mcp_jira_delete_project` (catastrophic),
+/// even when the server declares the difference in its tool
+/// schema.
+///
+/// All fields are `Option` because (a) annotations are themselves
+/// optional in the MCP spec, and (b) we want a clear distinction
+/// between "server said this is read-only" and "server didn't
+/// say". The risk-tag emitter treats absent metadata as
+/// [`RiskTag::MCPUnknownCapability`], which downstream UI uses to
+/// disable the persistent-scope buttons.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolCapabilityMetadata {
+    /// MCP `destructiveHint` — true if the server told us the
+    /// tool may delete or otherwise irreversibly affect data.
+    pub destructive_hint: Option<bool>,
+    /// MCP `readOnlyHint` — true if the server told us the tool
+    /// only reads, never writes.
+    pub read_only_hint: Option<bool>,
+    /// MCP `openWorldHint` — true if the tool may interact with
+    /// systems outside the user's machine (network, third-party
+    /// APIs).
+    pub open_world_hint: Option<bool>,
+    /// MCP server identifier (e.g. `"github"`, `"jira"`). Used
+    /// for the `MCP(server="…")` rule grammar slot in P1.5b.
+    pub server_name: Option<String>,
+}
+
+impl ToolCapabilityMetadata {
+    /// Convenience: derive a [`RiskTag`] from the metadata.
+    /// Returns `None` when the metadata explicitly tells us
+    /// "this is read-only" — we don't tag those.
+    #[must_use]
+    pub fn risk_tag(&self) -> Option<RiskTag> {
+        // Explicit read-only → no tag.
+        if matches!(self.read_only_hint, Some(true))
+            && !matches!(self.destructive_hint, Some(true))
+        {
+            return None;
+        }
+        // Explicit destructive → known capability, but the UI
+        // still wants the MCP-specific tag so the prompt header
+        // shows "MCP destructive: ..." rather than just "RUN".
+        if matches!(self.destructive_hint, Some(true)) {
+            return Some(RiskTag::MCPUnknownCapability); // strong tag
+        }
+        // No annotation at all → unknown.
+        if self.destructive_hint.is_none()
+            && self.read_only_hint.is_none()
+            && self.open_world_hint.is_none()
+        {
+            return Some(RiskTag::MCPUnknownCapability);
+        }
+        // Everything else (e.g. only open_world_hint set) → still
+        // route to MCPUnknownCapability for consistency.
+        Some(RiskTag::MCPUnknownCapability)
+    }
+
+    /// True iff the metadata is sufficient to make a confident
+    /// decision (i.e. at least one hint is present). Used by the
+    /// P3 UI to decide whether to show "MCPUnknownCapability"
+    /// banner + disable persistent-scope buttons.
+    #[must_use]
+    pub fn is_known(&self) -> bool {
+        self.destructive_hint.is_some()
+            || self.read_only_hint.is_some()
+            || self.open_world_hint.is_some()
+    }
+}
+
 /// Human-displayable approval prompt — what the engine hands to a
 /// sink when the local rule chain returns `NeedExternal`.
 #[derive(Clone, Debug, PartialEq)]
@@ -343,5 +418,54 @@ mod tests {
         ];
         let unique: std::collections::HashSet<_> = tags.iter().collect();
         assert_eq!(unique.len(), tags.len(), "RiskTag variants must be distinct");
+    }
+
+    // ── Issue #326 P5 / R2 Major 5: MCP capability metadata ──
+
+    #[test]
+    fn mcp_metadata_known_when_any_hint_set() {
+        let meta = ToolCapabilityMetadata {
+            destructive_hint: Some(true),
+            ..Default::default()
+        };
+        assert!(meta.is_known());
+
+        let meta = ToolCapabilityMetadata {
+            read_only_hint: Some(false),
+            ..Default::default()
+        };
+        assert!(meta.is_known());
+    }
+
+    #[test]
+    fn mcp_metadata_unknown_when_no_hints() {
+        let meta = ToolCapabilityMetadata::default();
+        assert!(!meta.is_known());
+        assert_eq!(meta.risk_tag(), Some(RiskTag::MCPUnknownCapability));
+    }
+
+    #[test]
+    fn mcp_metadata_read_only_skips_tag() {
+        let meta = ToolCapabilityMetadata {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            ..Default::default()
+        };
+        // No risk tag for explicit read-only — the engine can
+        // route this through ReadShortCircuit without prompting.
+        assert!(meta.risk_tag().is_none());
+    }
+
+    #[test]
+    fn mcp_metadata_destructive_overrides_read_only() {
+        // Server contradicting itself (read_only=true AND
+        // destructive=true) is suspicious; the destructive flag
+        // wins so the user is asked.
+        let meta = ToolCapabilityMetadata {
+            read_only_hint: Some(true),
+            destructive_hint: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(meta.risk_tag(), Some(RiskTag::MCPUnknownCapability));
     }
 }
