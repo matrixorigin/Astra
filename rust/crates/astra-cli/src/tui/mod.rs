@@ -47,8 +47,12 @@ mod view_stack;
 mod worktrees;
 mod wrapping;
 
+// Crate-level `theme::icon_*` helpers, exposed under a non-shadowing alias
+// because this module already declares an inner `mod theme` (UI palette).
+use crate::theme as cli_theme;
 use app_event::TuiAppEvent;
 use bottom_pane::{BottomPane, BottomPaneAction};
+use crossterm::style::Stylize;
 use history_cell::HistoryCell;
 
 use ratatui::widgets::Clear;
@@ -426,6 +430,15 @@ pub(crate) async fn run_tui(
 
     frame_requester.schedule_frame();
 
+    // Track why we left the TUI loop so finalization knows whether to
+    // print the resume hint and whether to clear `last_session_id`.
+    // Defaults to `Eof` (the BottomPane Quit path: Ctrl-D / ESC at idle
+    // composer). Every other break path reassigns this before breaking.
+    use crate::session_cleanup::SessionExit;
+    let mut exit_reason = SessionExit::Eof;
+
+    let mut shutdown_signal_rx = startup.shutdown_signal_rx.clone();
+
     let result: Result<(), String> = 'main: loop {
         let tick = tokio::time::sleep(Duration::from_millis(50));
         tokio::pin!(tick);
@@ -439,6 +452,21 @@ pub(crate) async fn run_tui(
         }
 
         tokio::select! {
+            // Graceful shutdown on SIGTERM/SIGHUP. The watch sender is
+            // installed by `complete_session_startup`; before any signal
+            // arrives the channel value is `None` and `changed()`
+            // suspends until a real value lands.
+            Ok(()) = shutdown_signal_rx.changed() => {
+                if let Some(signal) = *shutdown_signal_rx.borrow() {
+                    eprintln!(
+                        "\n  {} Received {}. Shutting down gracefully...",
+                        cli_theme::icon_warn(),
+                        signal.label().bold()
+                    );
+                    exit_reason = SessionExit::Shutdown(signal);
+                    break 'main Ok(());
+                }
+            }
             Some(ev) = event_stream.next() => {
                 match ev {
                     TuiEvent::Key(key) => {
@@ -531,7 +559,10 @@ pub(crate) async fn run_tui(
                                     let result = slash_dispatch::dispatch(&text, &mut dctx).await;
                                     match result {
                                         slash_dispatch::SlashResult::Handled => {}
-                                        slash_dispatch::SlashResult::Exit => { break 'main Ok(()); }
+                                        slash_dispatch::SlashResult::Exit => {
+                                            exit_reason = SessionExit::Command;
+                                            break 'main Ok(());
+                                        }
                                         slash_dispatch::SlashResult::Fallback => {
                                             let slash_text = text.clone();
                                             let slash_result = guard.with_restored(|| async {
@@ -542,7 +573,10 @@ pub(crate) async fn run_tui(
                                                 ).await
                                             }).await;
                                             match slash_result {
-                                                Ok(Ok(true)) => { break 'main Ok(()); }
+                                                Ok(Ok(true)) => {
+                                                    exit_reason = SessionExit::Command;
+                                                    break 'main Ok(());
+                                                }
                                                 Ok(Ok(false)) => {}
                                                 Ok(Err(e)) => {
                                                     chat_widget.commit_system(history_cell::system::SystemCell::error(e));
@@ -837,6 +871,23 @@ pub(crate) async fn run_tui(
 
                                     // Auto-send first queued message (will be picked up next iteration)
                                     inject_submit = bottom_pane.take_next_queued();
+
+                                    // `--max-budget`: post-turn cap. Once the
+                                    // cumulative cost crosses the limit, exit
+                                    // with the resume hint so the user can pick
+                                    // the session back up explicitly.
+                                    if state.max_budget_limit > 0.0
+                                        && state.total_session_cost >= state.max_budget_limit
+                                    {
+                                        eprintln!(
+                                            "\n  {} Session budget reached: {} / {} limit. Exiting.",
+                                            cli_theme::icon_warn(),
+                                            crate::slash_stats::format_cost(state.total_session_cost).bold(),
+                                            crate::slash_stats::format_cost(state.max_budget_limit),
+                                        );
+                                        exit_reason = SessionExit::BudgetLimit;
+                                        break 'main Ok(());
+                                    }
                                 }
                             }
                             BottomPaneAction::ViewCompleted { result, reopen } => {
@@ -1132,15 +1183,12 @@ pub(crate) async fn run_tui(
                                         continue;
                                     }
 
-                                    // `/session fork` picker → hand off to
-                                    // the line-mode `/session fork <parent>`
-                                    // pipeline. Calling `fork_local_session`
-                                    // inline here used to leave SessionState in
-                                    // a half-done state (session_id /
-                                    // journal / CSL all still pointed at the
-                                    // parent); the fallback path is the same
-                                    // code the line-mode handler runs
-                                    // through, so it does the full restore.
+                                    // `/session fork` picker → hand off to the
+                                    // `/session fork <parent>` slash router so
+                                    // SessionState (session_id / journal / CSL)
+                                    // gets fully rebound; calling
+                                    // `fork_local_session` inline here would
+                                    // leave it half-rebound to the parent.
                                     if let Some(parent_sid) = name.strip_prefix(slash_dispatch::FORK_PICK_SENTINEL) {
                                         let slash_text = format!("/session fork {parent_sid}");
                                         let slash_result = guard
@@ -1161,6 +1209,7 @@ pub(crate) async fn run_tui(
                                             .await;
                                         match slash_result {
                                             Ok(Ok(true)) => {
+                                                exit_reason = SessionExit::Command;
                                                 break 'main Ok(());
                                             }
                                             Ok(Ok(false)) => {}
@@ -1222,7 +1271,10 @@ pub(crate) async fn run_tui(
                                             ).await
                                         }).await;
                                         match slash_result {
-                                            Ok(Ok(true)) => { break 'main Ok(()); }
+                                            Ok(Ok(true)) => {
+                                                exit_reason = SessionExit::Command;
+                                                break 'main Ok(());
+                                            }
                                             Ok(Ok(false)) => {}
                                             Ok(Err(e)) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::error(e));
@@ -1277,7 +1329,24 @@ pub(crate) async fn run_tui(
                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                                 }
                             }
-                            BottomPaneAction::Interrupt | BottomPaneAction::Quit => { break 'main Ok(()); }
+                            BottomPaneAction::Interrupt => {
+                                // Ctrl-C at idle (no active turn, no pending
+                                // approvals). Treat as "cancel" rather than
+                                // EOF: print the resume hint, leave
+                                // `last_session_id` so the next `astra` run
+                                // reattaches.
+                                exit_reason = SessionExit::Interrupt;
+                                break 'main Ok(());
+                            }
+                            BottomPaneAction::Quit => {
+                                // Ctrl-D / ESC at idle composer. True EOF:
+                                // `exit_reason` already defaults to `Eof`, so
+                                // `last_session_id` is cleared and the next
+                                // `astra` launch starts fresh. The resume hint
+                                // still prints (the session is recoverable
+                                // explicitly via `/resume <id>`).
+                                break 'main Ok(());
+                            }
                             BottomPaneAction::Consumed => {}
                             BottomPaneAction::Escalate(_) => {}
                             BottomPaneAction::ApprovalResolved { .. } => {
@@ -1347,6 +1416,20 @@ pub(crate) async fn run_tui(
         }
     };
     drop(guard);
+
+    // Force the error variant if the loop bailed: error paths must not
+    // print the resume hint (session is in an unclean state) and must
+    // not clear `last_session_id` (so the next `astra` reattaches and
+    // the user can investigate).
+    if result.is_err() {
+        exit_reason = SessionExit::Error;
+    }
+
+    // Run the full session-end pipeline: write session_end to journal,
+    // drain ingestion, trigger Memoria governance/consolidation, extract
+    // L3 lessons, end observability, clear panic guard.
+    crate::session_cleanup::finalize_session_exit(&mut state, profile, exit_reason).await;
+
     result
 }
 
