@@ -1,0 +1,505 @@
+//! Issue #326 P6 / R2 Major 4: three-event audit trail.
+//!
+//! ## Why three events
+//!
+//! Plan v3 §P6 calls out that scenarios #47 / #48 / #50 require
+//! the audit log to answer:
+//!
+//! - "what was evaluated and what did the engine decide?"
+//! - "what did the user choose?"  (Allow / Reject / Always +
+//!   which scope)
+//! - "what got persisted, and to which file, and did the save
+//!   succeed?"
+//!
+//! A single `PermissionEvaluatedEvent` only captures the first
+//! question. R2 Major 4 specifically calls this out as a gap:
+//! exporting the audit log shouldn't say "Yes, it was approved"
+//! without saying "by user X, choosing Always-Project-User-Trusted,
+//! saved to .kiro/permissions.json successfully".
+//!
+//! The three events:
+//!
+//! 1. [`PermissionEvaluatedEvent`] — fires every time the engine
+//!    runs `evaluate_permission`. Payload includes the request,
+//!    the trace, and the engine's decision.
+//!
+//! 2. [`ApprovalResolvedEvent`] — fires once per `NeedExternal`
+//!    decision after the user (or fail-closed sink) responds.
+//!    Payload includes which response variant was picked and
+//!    which scope (if AlwaysAllow).
+//!
+//! 3. [`RulePersistedEvent`] — fires when a rule is written to
+//!    `.kiro/permissions.json` or `~/.astra/permissions.json`.
+//!    Payload includes the file, the new rule, and whether the
+//!    save succeeded.
+//!
+//! ## Local ring buffer (default on)
+//!
+//! Plan v3 §P6 defaults the local ring buffer ON for all three
+//! event types. Previously the design had Allow events
+//! verbose-only; R1 Major 9 / R2 Critical 1 noted that the
+//! `/permissions trace` view is useless without Allow events,
+//! and "verbose only" is a UX trap. Default-on means the local
+//! 1000-entry-per-type ring buffer always has fresh data when
+//! the user invokes `/permissions trace --export`.
+//!
+//! Sensitive value redaction (path prefixes, secret-looking
+//! values) is applied at export time, not at insert time, so the
+//! ring buffer stores the full payload and the user can configure
+//! redaction without losing history.
+
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
+
+use crate::approval_request_key::ApprovalRequestKey;
+use crate::approval_sink::ApprovalResponse;
+use crate::permission_engine::{DecisionSource, RiskTag, RuleOrigin};
+
+/// Global ring-buffer cap per event kind.
+const RING_BUFFER_CAPACITY: usize = 1000;
+
+/// Approval scope — what the user chose when they pressed
+/// Always. Mirrors the AllowScope enum from plan v3 §P3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllowScope {
+    /// One-shot approval; nothing persists.
+    OnceThisCall,
+    /// Auto-approve identical fingerprints for the rest of the
+    /// current LLM round.
+    RestOfTurn,
+    /// Auto-approve identical fingerprints until the session ends.
+    /// Per-fingerprint, NOT a global mode change.
+    RestOfSession,
+    /// Persist a rule to `.kiro/permissions.json` (project file).
+    Project,
+    /// Persist a rule to `~/.astra/permissions.json` (user file).
+    User,
+}
+
+/// Where a persisted rule landed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistTarget {
+    Project,
+    User,
+}
+
+impl From<RuleOrigin> for Option<PersistTarget> {
+    fn from(origin: RuleOrigin) -> Self {
+        match origin {
+            RuleOrigin::Project => Some(PersistTarget::Project),
+            RuleOrigin::User => Some(PersistTarget::User),
+            _ => None,
+        }
+    }
+}
+
+/// Event 1: every `evaluate_permission` invocation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PermissionEvaluatedEvent {
+    /// UNIX-millis at the moment the engine returned.
+    pub timestamp_ms: u64,
+    /// Identifier for cross-event correlation; the resolved /
+    /// persisted events that follow share this id.
+    pub correlation_id: String,
+    /// Request being evaluated.
+    pub request_key: ApprovalRequestKey,
+    /// Decision (`allow` / `deny` / `need_external`).
+    pub decision: String,
+    /// Which step of EVALUATION_ORDER produced the decision.
+    pub source: SourceLabel,
+    /// Risk tags computed during evaluation.
+    pub risk_tags: Vec<RiskTag>,
+    /// Whether the engine had to fall through to the prompt sink.
+    pub need_external: bool,
+}
+
+/// JSON-friendly projection of [`DecisionSource`]. We don't
+/// serialize the whole enum because some variants carry strings
+/// (e.g. `DenyRule { rule, origin }`); the audit format wants a
+/// stable shape.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SourceLabel {
+    pub step: String,
+    pub matched_rule: Option<String>,
+    pub origin: Option<String>,
+}
+
+impl From<&DecisionSource> for SourceLabel {
+    fn from(src: &DecisionSource) -> Self {
+        match src {
+            DecisionSource::SchemaIdentity => Self {
+                step: "schema_identity".into(),
+                matched_rule: None,
+                origin: None,
+            },
+            DecisionSource::DenyRule { rule, origin } => Self {
+                step: "deny_rule".into(),
+                matched_rule: Some(rule.clone()),
+                origin: Some(format!("{origin:?}").to_lowercase()),
+            },
+            DecisionSource::SafetyMiddleware { reason } => Self {
+                step: "safety_middleware".into(),
+                matched_rule: Some(reason.clone()),
+                origin: None,
+            },
+            DecisionSource::GitSafety { violation } => Self {
+                step: "git_safety".into(),
+                matched_rule: Some(violation.clone()),
+                origin: None,
+            },
+            DecisionSource::SensitivePath { path } => Self {
+                step: "sensitive_path".into(),
+                matched_rule: Some(path.clone()),
+                origin: None,
+            },
+            DecisionSource::ExecuteHardDeny { reason } => Self {
+                step: "execute_hard_deny".into(),
+                matched_rule: Some(reason.clone()),
+                origin: None,
+            },
+            DecisionSource::SandboxExpansion => Self {
+                step: "sandbox_expansion".into(),
+                matched_rule: None,
+                origin: None,
+            },
+            DecisionSource::ReadShortCircuit => Self {
+                step: "read_short_circuit".into(),
+                matched_rule: None,
+                origin: None,
+            },
+            DecisionSource::SessionOverride { allowed } => Self {
+                step: "session_override".into(),
+                matched_rule: Some(format!("allowed={allowed}")),
+                origin: None,
+            },
+            DecisionSource::ExplicitApprovalGate { reason } => Self {
+                step: "explicit_approval".into(),
+                matched_rule: Some(reason.clone()),
+                origin: None,
+            },
+            DecisionSource::AllowRule { rule, origin } => Self {
+                step: "allow_rule".into(),
+                matched_rule: Some(rule.clone()),
+                origin: Some(format!("{origin:?}").to_lowercase()),
+            },
+            DecisionSource::Mode { mode } => Self {
+                step: "mode".into(),
+                matched_rule: Some(mode.clone()),
+                origin: None,
+            },
+            DecisionSource::UnmatchedFallback => Self {
+                step: "unmatched_fallback".into(),
+                matched_rule: None,
+                origin: None,
+            },
+        }
+    }
+}
+
+/// Event 2: how the user (or fail-closed sink) resolved the
+/// `NeedExternal` from the engine. Fires at most once per
+/// `Evaluated` event whose `need_external = true`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApprovalResolvedEvent {
+    pub timestamp_ms: u64,
+    pub correlation_id: String,
+    pub request_key: ApprovalRequestKey,
+    pub response: ApprovalResponse,
+    /// `Some(_)` when the response was AlwaysAllow.
+    pub scope: Option<AllowScope>,
+    /// True if the executor's pre-execute revalidation (P5f
+    /// stale-check) confirmed the file/payload hadn't changed
+    /// since approval. Always true for non-edit tools.
+    pub stale_revalidation_passed: bool,
+}
+
+/// Event 3: rule-write attempt (project or user file). Fires
+/// after every `add_allow_rule` / `PermissionSettings::modify`
+/// regardless of success.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RulePersistedEvent {
+    pub timestamp_ms: u64,
+    pub correlation_id: String,
+    pub target: PersistTarget,
+    /// The rule string we tried to persist, in v2 grammar form.
+    pub rule_text: String,
+    /// True iff the on-disk save succeeded.
+    pub saved: bool,
+    /// Failure message when `saved = false`.
+    pub failure_reason: Option<String>,
+}
+
+/// Combined event for export / `/permissions trace`. Each entry
+/// is a tagged variant so the JSONL output is unambiguous.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PermissionAuditEvent {
+    Evaluated(PermissionEvaluatedEvent),
+    Resolved(ApprovalResolvedEvent),
+    Persisted(RulePersistedEvent),
+}
+
+impl PermissionAuditEvent {
+    #[must_use]
+    pub fn correlation_id(&self) -> &str {
+        match self {
+            Self::Evaluated(e) => &e.correlation_id,
+            Self::Resolved(e) => &e.correlation_id,
+            Self::Persisted(e) => &e.correlation_id,
+        }
+    }
+
+    #[must_use]
+    pub fn timestamp_ms(&self) -> u64 {
+        match self {
+            Self::Evaluated(e) => e.timestamp_ms,
+            Self::Resolved(e) => e.timestamp_ms,
+            Self::Persisted(e) => e.timestamp_ms,
+        }
+    }
+}
+
+/// Process-wide ring buffer for permission audit events.
+///
+/// `RING_BUFFER_CAPACITY` entries per kind (3000 total). Default
+/// on; the slash command `/permissions trace --export <file>`
+/// drains the buffer to JSONL.
+pub struct PermissionAuditRing {
+    evaluated: VecDeque<PermissionEvaluatedEvent>,
+    resolved: VecDeque<ApprovalResolvedEvent>,
+    persisted: VecDeque<RulePersistedEvent>,
+}
+
+impl PermissionAuditRing {
+    fn new() -> Self {
+        Self {
+            evaluated: VecDeque::with_capacity(RING_BUFFER_CAPACITY),
+            resolved: VecDeque::with_capacity(RING_BUFFER_CAPACITY),
+            persisted: VecDeque::with_capacity(RING_BUFFER_CAPACITY),
+        }
+    }
+
+    pub fn push_evaluated(&mut self, event: PermissionEvaluatedEvent) {
+        if self.evaluated.len() >= RING_BUFFER_CAPACITY {
+            self.evaluated.pop_front();
+        }
+        self.evaluated.push_back(event);
+    }
+
+    pub fn push_resolved(&mut self, event: ApprovalResolvedEvent) {
+        if self.resolved.len() >= RING_BUFFER_CAPACITY {
+            self.resolved.pop_front();
+        }
+        self.resolved.push_back(event);
+    }
+
+    pub fn push_persisted(&mut self, event: RulePersistedEvent) {
+        if self.persisted.len() >= RING_BUFFER_CAPACITY {
+            self.persisted.pop_front();
+        }
+        self.persisted.push_back(event);
+    }
+
+    /// Drain into a single time-sorted JSONL stream.
+    /// Used by `/permissions trace [--export]`.
+    pub fn snapshot_jsonl(&self) -> Vec<PermissionAuditEvent> {
+        let mut all: Vec<PermissionAuditEvent> = Vec::new();
+        all.extend(
+            self.evaluated
+                .iter()
+                .cloned()
+                .map(PermissionAuditEvent::Evaluated),
+        );
+        all.extend(
+            self.resolved
+                .iter()
+                .cloned()
+                .map(PermissionAuditEvent::Resolved),
+        );
+        all.extend(
+            self.persisted
+                .iter()
+                .cloned()
+                .map(PermissionAuditEvent::Persisted),
+        );
+        all.sort_by_key(PermissionAuditEvent::timestamp_ms);
+        all
+    }
+
+    /// Number of entries currently stored across all three rings.
+    #[must_use]
+    pub fn total_len(&self) -> usize {
+        self.evaluated.len() + self.resolved.len() + self.persisted.len()
+    }
+
+    /// Per-kind counts for the status-line indicator.
+    #[must_use]
+    pub fn counts(&self) -> (usize, usize, usize) {
+        (self.evaluated.len(), self.resolved.len(), self.persisted.len())
+    }
+}
+
+static GLOBAL_RING: OnceLock<Mutex<PermissionAuditRing>> = OnceLock::new();
+
+fn ring() -> &'static Mutex<PermissionAuditRing> {
+    GLOBAL_RING.get_or_init(|| Mutex::new(PermissionAuditRing::new()))
+}
+
+/// Append an [`PermissionEvaluatedEvent`] to the global ring.
+pub fn record_evaluated(event: PermissionEvaluatedEvent) {
+    if let Ok(mut r) = ring().lock() {
+        r.push_evaluated(event);
+    }
+}
+
+/// Append an [`ApprovalResolvedEvent`] to the global ring.
+pub fn record_resolved(event: ApprovalResolvedEvent) {
+    if let Ok(mut r) = ring().lock() {
+        r.push_resolved(event);
+    }
+}
+
+/// Append a [`RulePersistedEvent`] to the global ring.
+pub fn record_persisted(event: RulePersistedEvent) {
+    if let Ok(mut r) = ring().lock() {
+        r.push_persisted(event);
+    }
+}
+
+/// Snapshot the global ring as time-sorted JSONL events.
+#[must_use]
+pub fn snapshot() -> Vec<PermissionAuditEvent> {
+    ring()
+        .lock()
+        .map(|r| r.snapshot_jsonl())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::approval_request_key::ApprovalRequestKey;
+    use uuid::Uuid;
+
+    fn fixture_request() -> ApprovalRequestKey {
+        ApprovalRequestKey {
+            tool: "bash".to_string(),
+            canonical_cwd: std::env::temp_dir(),
+            args_hash: [0; 32],
+            payload_hash: None,
+            source_agent: None,
+            turn_id: Uuid::nil(),
+        }
+    }
+
+    #[test]
+    fn ring_caps_at_capacity() {
+        let mut r = PermissionAuditRing::new();
+        for i in 0..(RING_BUFFER_CAPACITY + 5) {
+            r.push_evaluated(PermissionEvaluatedEvent {
+                timestamp_ms: i as u64,
+                correlation_id: format!("c-{i}"),
+                request_key: fixture_request(),
+                decision: "allow".into(),
+                source: SourceLabel {
+                    step: "mode".into(),
+                    matched_rule: None,
+                    origin: None,
+                },
+                risk_tags: vec![],
+                need_external: false,
+            });
+        }
+        let (e, _, _) = r.counts();
+        assert_eq!(e, RING_BUFFER_CAPACITY);
+        // Oldest entries (0-4) should have been evicted.
+        assert_eq!(r.evaluated.front().unwrap().timestamp_ms, 5);
+    }
+
+    #[test]
+    fn snapshot_sorts_across_kinds_by_timestamp() {
+        let mut r = PermissionAuditRing::new();
+        r.push_evaluated(PermissionEvaluatedEvent {
+            timestamp_ms: 200,
+            correlation_id: "c-1".into(),
+            request_key: fixture_request(),
+            decision: "need_external".into(),
+            source: SourceLabel {
+                step: "mode".into(),
+                matched_rule: None,
+                origin: None,
+            },
+            risk_tags: vec![],
+            need_external: true,
+        });
+        r.push_resolved(ApprovalResolvedEvent {
+            timestamp_ms: 300,
+            correlation_id: "c-1".into(),
+            request_key: fixture_request(),
+            response: ApprovalResponse::AllowOnce,
+            scope: Some(AllowScope::OnceThisCall),
+            stale_revalidation_passed: true,
+        });
+        r.push_persisted(RulePersistedEvent {
+            timestamp_ms: 100,
+            correlation_id: "c-0".into(),
+            target: PersistTarget::Project,
+            rule_text: "Bash(npm test:*)".into(),
+            saved: true,
+            failure_reason: None,
+        });
+
+        let events = r.snapshot_jsonl();
+        let timestamps: Vec<u64> = events.iter().map(PermissionAuditEvent::timestamp_ms).collect();
+        assert_eq!(timestamps, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn jsonl_export_is_self_describing() {
+        let mut r = PermissionAuditRing::new();
+        r.push_evaluated(PermissionEvaluatedEvent {
+            timestamp_ms: 1,
+            correlation_id: "c".into(),
+            request_key: fixture_request(),
+            decision: "allow".into(),
+            source: SourceLabel {
+                step: "mode".into(),
+                matched_rule: None,
+                origin: None,
+            },
+            risk_tags: vec![RiskTag::BashExecute],
+            need_external: false,
+        });
+        let line =
+            serde_json::to_string(&r.snapshot_jsonl().pop().unwrap()).unwrap();
+        // The kind tag must be present so the consumer can route
+        // events without inspecting fields.
+        assert!(line.contains("\"kind\":\"evaluated\""));
+        assert!(line.contains("\"decision\":\"allow\""));
+    }
+
+    #[test]
+    fn allow_scope_serializes_snake_case() {
+        let s = serde_json::to_string(&AllowScope::RestOfSession).unwrap();
+        assert_eq!(s, "\"rest_of_session\"");
+    }
+
+    #[test]
+    fn persist_target_from_rule_origin() {
+        assert_eq!(
+            <RuleOrigin as Into<Option<PersistTarget>>>::into(RuleOrigin::Project),
+            Some(PersistTarget::Project)
+        );
+        assert_eq!(
+            <RuleOrigin as Into<Option<PersistTarget>>>::into(RuleOrigin::User),
+            Some(PersistTarget::User)
+        );
+        assert_eq!(
+            <RuleOrigin as Into<Option<PersistTarget>>>::into(RuleOrigin::Session),
+            None
+        );
+    }
+}

@@ -39,7 +39,8 @@ use crate::permission_engine::{ApprovalPrompt, HardDecision};
 /// `RestOfSession` scope). Global mode changes go through a separate
 /// surface (status line / `/mode auto` slash command), keeping this
 /// enum focused on per-call decisions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApprovalResponse {
     AllowOnce,
     AlwaysAllow,

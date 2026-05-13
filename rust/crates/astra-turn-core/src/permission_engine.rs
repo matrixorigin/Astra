@@ -177,7 +177,8 @@ pub const EVALUATION_ORDER: [EvaluationStep; 12] = [
 /// (`WritesOutsideWorkspace + WorkspaceUntrusted`); the highest
 /// risk colour wins, but the badge label enumerates all matching
 /// tags so users see the full picture.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RiskTag {
     /// Bash + execute kind, no other distinguishing tag. The
     /// "vanilla risk" so even simple commands have a label.
