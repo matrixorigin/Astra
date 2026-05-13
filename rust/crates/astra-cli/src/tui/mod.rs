@@ -241,15 +241,6 @@ fn replay_session_into_widget(
     widget
 }
 
-/// One-shot lookup of the current git branch name via `gix`. Returns
-/// `None` when the cwd isn't a git repo, detached HEAD, or errors.
-fn detect_git_branch() -> Option<String> {
-    let repo = gix::discover(std::env::current_dir().ok()?).ok()?;
-    let head = repo.head().ok()?;
-    let name = head.referent_name()?;
-    Some(name.shorten().to_string())
-}
-
 /// Walk the chat widget's committed history and emit role/text
 /// pairs for the `/context dump` JSON file.  Kept here (rather
 /// than in `cli::context_dump`) because `history_cell` is a
@@ -398,12 +389,9 @@ pub(crate) async fn run_tui_repl(
         ));
     }
 
-    // Seed the current git branch into the status line. One-shot read at
-    // startup — branch changes rarely mid-session; refresh happens on
-    // next launch. Missing/non-git dir is silently ignored.
-    if let Some(branch) = detect_git_branch() {
-        bottom_pane.footer.git_branch = Some(branch);
-    }
+    // Git branch + cwd are seeded by `Footer::new()` and refreshed on
+    // every turn boundary by `BottomPane::set_task_status`, so no
+    // explicit startup probe is needed here.
 
     // ChatWidget owns the scrollback + active cell. If the user
     // entered via `astra -c` / `astra --resume <id>`, replay the

@@ -163,8 +163,20 @@ impl BottomPane {
     }
 
     pub fn set_task_status(&mut self, status: TaskStatus) {
-        self.footer.is_turn_active = status.is_active();
+        let was_active = self.task_status.is_active();
         self.task_status = status;
+        let now_active = self.task_status.is_active();
+        if was_active != now_active {
+            self.footer.is_turn_active = now_active;
+            // Refresh cwd + git branch only on the idle→active edge
+            // (turn start). The active→idle edge would just repeat the
+            // same probe a few seconds later, and intra-turn status
+            // transitions (WaitingModel ↔ ToolExecuting) don't move
+            // the branch. One gix discover per turn is the budget.
+            if now_active {
+                self.footer.refresh_env();
+            }
+        }
     }
 
     pub fn push_view(&mut self, view: Box<dyn BottomPaneView>) {
