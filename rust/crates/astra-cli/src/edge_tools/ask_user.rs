@@ -43,15 +43,15 @@ impl ToolExecutor {
         if let Some(ctx) = context {
             eprintln!("  {}", ctx.dim());
         }
-        eprintln!("  {} {}", "▸".cyan(), question.bold().cyan());
+        eprintln!("  {} {}", "▸".magenta(), question.bold().magenta());
 
         if choices.is_empty() {
             // Free-form input
             eprintln!();
             let prompt = if let Some(def) = default {
-                format!("  {} {} ", format!("[{def}]").dim(), "→".cyan())
+                format!("  {} {} ", format!("[{def}]").dim(), "→".magenta())
             } else {
-                format!("  {} ", "→".cyan())
+                format!("  {} ", "→".magenta())
             };
             eprint!("{}", prompt);
             let _ = io::stderr().flush();
@@ -96,8 +96,8 @@ impl ToolExecutor {
                 if is_default {
                     eprintln!(
                         "  {} {} {}",
-                        "▸".cyan(),
-                        format!("[{num}]").cyan(),
+                        "▸".magenta(),
+                        format!("[{num}]").magenta(),
                         choice.bold()
                     );
                 } else {
@@ -105,7 +105,7 @@ impl ToolExecutor {
                 }
             }
             eprintln!();
-            eprint!("  {} ", "→".cyan());
+            eprint!("  {} ", "→".magenta());
             let _ = io::stderr().flush();
 
             // Try raw mode for single-key selection

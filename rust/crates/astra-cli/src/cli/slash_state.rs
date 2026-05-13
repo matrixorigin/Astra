@@ -954,7 +954,7 @@ fn render_reflect_report(
     // Header
     eprintln!(
         "{}",
-        format!("🔍 Session Diagnosis — {short_sid}").cyan().bold()
+        format!("🔍 Session Diagnosis — {short_sid}").magenta().bold()
     );
     eprintln!("{}", "─────────────────────────────────────".dim());
 
@@ -1131,7 +1131,7 @@ fn render_local_reflect_report(
 
     eprintln!(
         "{}",
-        format!("🔍 Liquid Reflection — {short_sid}").cyan().bold()
+        format!("🔍 Liquid Reflection — {short_sid}").magenta().bold()
     );
     eprintln!("{}", "─────────────────────────────────────".dim());
     eprintln!(

@@ -828,12 +828,12 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
 pub fn print_text(d: &JournalDigest) {
     use crossterm::style::Stylize;
     println!("  {} {}", "schema_version:".dim(), d.schema_version);
-    println!("  {} {}", "session_id:".dim(), d.session_id.as_str().cyan());
+    println!("  {} {}", "session_id:".dim(), d.session_id.as_str().magenta());
     println!("  {} {}", "journal_file:".dim(), d.journal_file);
     println!(
         "  {} non_empty={} malformed={}",
         "journal_lines:".dim(),
-        d.journal_lines_non_empty.to_string().cyan(),
+        d.journal_lines_non_empty.to_string().magenta(),
         if d.journal_lines_malformed > 0 {
             d.journal_lines_malformed.to_string().red().to_string()
         } else {
@@ -841,10 +841,10 @@ pub fn print_text(d: &JournalDigest) {
         }
     );
     let a = &d.aggregates;
-    println!("\n  {}", "Aggregates".bold().cyan());
+    println!("\n  {}", "Aggregates".bold().magenta());
     println!(
         "  turns={} turn_errors={} compacts={} stalls={} errors={}",
-        a.turn_count.to_string().cyan(),
+        a.turn_count.to_string().magenta(),
         a.turn_error_count,
         a.compact_count,
         a.stall_count,
@@ -852,13 +852,13 @@ pub fn print_text(d: &JournalDigest) {
     );
     println!(
         "  tokens_in={} tokens_out={} duration_ms={} tool_calls={} tool_failures={}",
-        a.total_tokens_in.to_string().cyan(),
-        a.total_tokens_out.to_string().cyan(),
+        a.total_tokens_in.to_string().magenta(),
+        a.total_tokens_out.to_string().magenta(),
         a.total_duration_ms,
         a.total_tool_calls,
         a.tool_calls_failed
     );
-    println!("\n  {}", "Averages (per turn)".bold().cyan());
+    println!("\n  {}", "Averages (per turn)".bold().magenta());
     println!(
         "  tokens_in={:.1} tokens_out={:.1} duration_ms={:.1}",
         a.avg_tokens_in, a.avg_tokens_out, a.avg_duration_ms
@@ -870,7 +870,7 @@ pub fn print_text(d: &JournalDigest) {
         );
     }
     if !d.turns.is_empty() {
-        println!("\n  {}", "Turns".bold().cyan());
+        println!("\n  {}", "Turns".bold().magenta());
         println!(
             "  {}",
             format!(
@@ -952,7 +952,7 @@ pub fn print_text(d: &JournalDigest) {
         println!(
             "\n  {} {}",
             "compaction_events:".dim(),
-            d.compaction_events.len().to_string().cyan()
+            d.compaction_events.len().to_string().magenta()
         );
         for e in &d.compaction_events {
             println!(
@@ -970,7 +970,7 @@ pub fn print_text(d: &JournalDigest) {
         println!(
             "\n  {} {}",
             "interruptions:".yellow(),
-            d.interruptions.len().to_string().cyan()
+            d.interruptions.len().to_string().magenta()
         );
         for e in &d.interruptions {
             let step = e
@@ -990,7 +990,7 @@ pub fn print_text(d: &JournalDigest) {
         println!(
             "\n  {} {}",
             "stalls:".yellow(),
-            d.stalls.len().to_string().cyan()
+            d.stalls.len().to_string().magenta()
         );
         for e in &d.stalls {
             println!(
@@ -1005,7 +1005,7 @@ pub fn print_text(d: &JournalDigest) {
         println!(
             "\n  {} {}",
             "turn_errors:".red(),
-            d.turn_errors.len().to_string().cyan()
+            d.turn_errors.len().to_string().magenta()
         );
         for e in &d.turn_errors {
             println!(
@@ -1020,7 +1020,7 @@ pub fn print_text(d: &JournalDigest) {
         println!(
             "\n  {} {}",
             "other_errors:".red(),
-            d.other_errors.len().to_string().cyan()
+            d.other_errors.len().to_string().magenta()
         );
         for e in &d.other_errors {
             println!("    {} {}", e.ts.as_str().dim(), e.detail);

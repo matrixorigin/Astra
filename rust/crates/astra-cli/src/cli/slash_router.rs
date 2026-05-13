@@ -423,7 +423,7 @@ pub(super) async fn handle_slash_command(
                         eprintln!(
                             "  {} Permission mode → {}",
                             theme::icon_info(),
-                            next.to_string().cyan()
+                            next.to_string().magenta()
                         );
                     }
                     "all" => {
@@ -431,7 +431,7 @@ pub(super) async fn handle_slash_command(
                         eprintln!(
                             "  {} Permission mode → {} (all tools auto-approved)",
                             "⚡".yellow(),
-                            "auto".cyan()
+                            "auto".magenta()
                         );
                     }
                     "rules" | "status" => {
@@ -444,7 +444,7 @@ pub(super) async fn handle_slash_command(
                             eprintln!(
                                 "  {} Permission mode → {}",
                                 theme::icon_info(),
-                                mode.to_string().cyan()
+                                mode.to_string().magenta()
                             );
                         }
                         Err(_) => {

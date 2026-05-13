@@ -82,7 +82,7 @@ fn title_line(disco: &SessionDiscovery) -> Line<'static> {
     let mut spans = vec![Span::styled(
         total,
         Style::default()
-            .fg(Color::Cyan)
+            .fg(crate::tui::theme::current().accent)
             .add_modifier(Modifier::BOLD),
     )];
     if !disco.filter().is_empty() {
@@ -187,7 +187,7 @@ fn render_detail(disco: &SessionDiscovery, area: Rect, buf: &mut Buffer) {
     };
 
     let dim = Style::default().fg(Color::DarkGray);
-    let label = Style::default().fg(Color::Cyan);
+    let label = Style::default().fg(crate::tui::theme::current().accent);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(

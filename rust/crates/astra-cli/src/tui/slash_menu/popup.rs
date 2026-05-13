@@ -87,10 +87,10 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
         let padded_name = pad_right(item.name, name_col_width);
         let name_style = if is_selected {
             Style::default()
-                .fg(theme.accent)
+                .fg(ratatui::style::Color::Green)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(theme.accent)
+            Style::default().fg(ratatui::style::Color::Green)
         };
 
         // Compute remaining width for the description column:

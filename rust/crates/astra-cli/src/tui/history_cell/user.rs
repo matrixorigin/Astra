@@ -77,18 +77,12 @@ impl HistoryCell for UserCell {
         let mut lines: Vec<Line<'static>> = Vec::new();
 
         if self.text.is_empty() {
-            // Defensive: empty submits shouldn't reach us (BottomPane
-            // filters them), but if one slips through we render the
-            // prefix alone so the reader isn't greeted by a blank
-            // band with no indicator of what it represents.
             lines.push(Line::from(Span::styled("› ", prefix_style)).style(bg));
         } else {
             for (i, row) in self.text.lines().enumerate() {
                 let prefix = if i == 0 {
                     Span::styled("› ", prefix_style)
                 } else {
-                    // Continuation lines indent to the width of `› `
-                    // so the text column stays aligned.
                     Span::raw("  ")
                 };
                 lines.push(Line::from(vec![prefix, Span::raw(row.to_string())]).style(bg));

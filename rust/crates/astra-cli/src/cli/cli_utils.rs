@@ -375,7 +375,7 @@ pub(super) fn prompt_or(label: &str, existing: Option<String>) -> Result<String,
     if let Some(v) = existing {
         return Ok(v);
     }
-    print!("  {}: ", label.cyan().bold());
+    print!("  {}: ", label.magenta().bold());
     io::stdout().flush().map_err(|e| e.to_string())?;
     let mut val = String::new();
     io::stdin().read_line(&mut val).map_err(|e| e.to_string())?;
@@ -395,7 +395,7 @@ pub(super) fn prompt_password_masked(
     if let Some(v) = existing {
         return Ok(v);
     }
-    print!("  {}: ", label.cyan().bold());
+    print!("  {}: ", label.magenta().bold());
     io::stdout().flush().map_err(|e| e.to_string())?;
     let val = rpassword::read_password().map_err(|e| e.to_string())?;
     let val = val.trim().to_string();
@@ -498,8 +498,8 @@ pub(super) fn interactive_select(
                 } else if is_current {
                     eprint!(
                         "  {} {:<width$}  {}\r\n",
-                        marker.cyan(),
-                        label.as_str().cyan(),
+                        marker.green(),
+                        label.as_str().green(),
                         desc.as_str().dim(),
                         width = max_label,
                     );

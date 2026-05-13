@@ -143,7 +143,7 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
     eprintln!(
         "  {:<16} {}",
         "cwd:".dim(),
-        tilde_path(ws.cwd.as_str()).as_str().cyan()
+        tilde_path(ws.cwd.as_str()).as_str().magenta()
     );
     let git_line = match (&ws.git_branch, &ws.git_head) {
         (Some(b), Some(h)) => format!("{b} @ {h}"),
@@ -151,7 +151,7 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
         (None, Some(h)) => format!("(detached) @ {h}"),
         (None, None) => "(no git at session start)".to_string(),
     };
-    eprintln!("  {:<16} {}", "git:".dim(), git_line.cyan());
+    eprintln!("  {:<16} {}", "git:".dim(), git_line.magenta());
     if let Some(ref root) = ws.git_root
         && root != &ws.cwd
     {
@@ -165,20 +165,20 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
         eprintln!(
             "  {:<16} {}",
             "forked from:".dim(),
-            format!("{p} (turn {} on parent)", ws.forked_at_turn.unwrap_or(0)).cyan()
+            format!("{p} (turn {} on parent)", ws.forked_at_turn.unwrap_or(0)).magenta()
         );
         if let Some(ref n) = ws.fork_note {
-            eprintln!("  {:<16} {}", "fork note:".dim(), n.as_str().cyan());
+            eprintln!("  {:<16} {}", "fork note:".dim(), n.as_str().magenta());
         }
     }
     if let Some(ref c) = ws.correlation_id {
-        eprintln!("  {:<16} {}", "correlation:".dim(), c.as_str().cyan());
+        eprintln!("  {:<16} {}", "correlation:".dim(), c.as_str().magenta());
     }
     if let Some(ref r) = ws.agent_role {
-        eprintln!("  {:<16} {}", "agent role:".dim(), r.as_str().cyan());
+        eprintln!("  {:<16} {}", "agent role:".dim(), r.as_str().magenta());
     }
     let started = ws.created_at.get(..19).unwrap_or(ws.created_at.as_str());
-    eprintln!("  {:<16} {}", "started:".dim(), started.cyan());
+    eprintln!("  {:<16} {}", "started:".dim(), started.magenta());
     let saved = ws.updated_at.get(..19).unwrap_or(ws.updated_at.as_str());
     let ago = rel_updated_label(ws.updated_at.as_str())
         .map(|a| format!(" · {a}"))
@@ -186,10 +186,10 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
     eprintln!(
         "  {:<16} {}{}",
         "last saved:".dim(),
-        saved.cyan(),
+        saved.magenta(),
         ago.dim()
     );
-    eprintln!("  {:<16} {}", "status:".dim(), ws.status.as_str().cyan());
+    eprintln!("  {:<16} {}", "status:".dim(), ws.status.as_str().magenta());
     if let Some(ref sum) = ws.summary {
         eprintln!("  {:<16} {}", "summary:".dim(), ellipsize(sum, 80).dim());
     }
@@ -197,23 +197,23 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
         eprintln!(
             "  {:<16} {} turns · {} prompt + {} completion tokens",
             "logged:".dim(),
-            ws.turn_count.to_string().cyan(),
-            format_u64_grouped(ws.total_tokens_in).as_str().cyan(),
-            format_u64_grouped(ws.total_tokens_out).as_str().cyan(),
+            ws.turn_count.to_string().magenta(),
+            format_u64_grouped(ws.total_tokens_in).as_str().magenta(),
+            format_u64_grouped(ws.total_tokens_out).as_str().magenta(),
         );
     }
     if let Some(ref goal) = ws.plan_goal {
         eprintln!(
             "  {:<16} {}",
             "plan goal:".dim(),
-            ellipsize(goal, 72).cyan()
+            ellipsize(goal, 72).magenta()
         );
     }
     if ws.plan_execution_rounds > 0 {
         eprintln!(
             "  {:<16} {}",
             "plan rounds:".dim(),
-            ws.plan_execution_rounds.to_string().cyan()
+            ws.plan_execution_rounds.to_string().magenta()
         );
     }
     if let Some(ref trace) = ws.last_context_trace {
@@ -239,7 +239,7 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
         eprintln!(
             "  {:<16} {}{}",
             "checkpoints:".dim(),
-            joined.cyan(),
+            joined.magenta(),
             tail.dim()
         );
     }
@@ -436,7 +436,7 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
         "\n{}",
         "─── Session Journals ────────────────────────────"
             .bold()
-            .cyan()
+            .magenta()
     );
     let sort_info = "sorted by recent";
     let filter_info = {
@@ -489,7 +489,7 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
         eprintln!(
             "  {}{}  {}{}",
             num_label.dim(),
-            sid_short.cyan(),
+            sid_short.magenta(),
             entry.hint.as_str().dim(),
             marker.green()
         );
@@ -587,8 +587,8 @@ fn handle_session_switch(sub_arg: &str, state: &mut ReplState) {
 
     eprintln!(
         "\n  {} {}  {}  {} turns",
-        format!("[{num}]").cyan().bold(),
-        short_id.cyan(),
+        format!("[{num}]").magenta().bold(),
+        short_id.magenta(),
         summary.dim(),
         turns
     );
@@ -622,7 +622,7 @@ fn handle_session_switch(sub_arg: &str, state: &mut ReplState) {
     eprintln!(
         "  {} Switched to session {} ({} turns loaded)",
         theme::icon_ok(),
-        short_id.cyan(),
+        short_id.magenta(),
         state.turn
     );
 }
@@ -649,7 +649,7 @@ pub(super) fn resolve_journal_target_session(
             "\n{}",
             "─── Available Sessions ──────────────────────────"
                 .bold()
-                .cyan()
+                .magenta()
         );
         eprintln!(
             "  {}",
@@ -660,8 +660,8 @@ pub(super) fn resolve_journal_target_session(
             let hint = workspace_summary_line(sid);
             eprintln!(
                 "  {}  {}  {}",
-                format!("[{}]", i + 1).cyan().bold(),
-                sid.as_str().cyan(),
+                format!("[{}]", i + 1).magenta().bold(),
+                sid.as_str().magenta(),
                 hint.dim()
             );
         }
@@ -719,9 +719,9 @@ pub(super) async fn handle_session_command(
                 "\n{}",
                 "─── Session ─────────────────────────────────────"
                     .bold()
-                    .cyan()
+                    .magenta()
             );
-            eprintln!("  {:<16} {}", "session_id:".dim(), sid.cyan());
+            eprintln!("  {:<16} {}", "session_id:".dim(), sid.magenta());
             let persisted_ws = (sid != "none")
                 .then(|| session_workspace::read_workspace(sid).ok())
                 .flatten();
@@ -742,37 +742,37 @@ pub(super) async fn handle_session_command(
                 eprintln!();
             }
             eprintln!("  {}", "— this REPL —".dim());
-            eprintln!("  {:<16} {}", "model:".dim(), mdl.cyan());
+            eprintln!("  {:<16} {}", "model:".dim(), mdl.magenta());
             if let Some(ref ws) = persisted_ws {
                 if ws.turn_count != state.turn {
                     eprintln!(
                         "  {:<16} {} repl · {} logged",
                         "turns:".dim(),
-                        state.turn.to_string().cyan(),
-                        ws.turn_count.to_string().cyan()
+                        state.turn.to_string().magenta(),
+                        ws.turn_count.to_string().magenta()
                     );
                 } else {
-                    eprintln!("  {:<16} {}", "turns:".dim(), state.turn.to_string().cyan());
+                    eprintln!("  {:<16} {}", "turns:".dim(), state.turn.to_string().magenta());
                 }
             } else {
-                eprintln!("  {:<16} {}", "turns:".dim(), state.turn.to_string().cyan());
+                eprintln!("  {:<16} {}", "turns:".dim(), state.turn.to_string().magenta());
             }
             eprintln!(
                 "  {:<16} {}",
                 "explain:".dim(),
-                state.explain.to_string().cyan()
+                state.explain.to_string().magenta()
             );
             eprintln!(
                 "  {:<16} {}",
                 "run_id:".dim(),
-                state.run_id.as_deref().unwrap_or("none").cyan()
+                state.run_id.as_deref().unwrap_or("none").magenta()
             );
             if let Some(ref j) = state.journal {
                 let jp = j.path().display().to_string();
                 eprintln!(
                     "  {:<16} {}",
                     "journal:".dim(),
-                    tilde_path(&jp).as_str().cyan()
+                    tilde_path(&jp).as_str().magenta()
                 );
             }
             eprintln!();
@@ -818,9 +818,9 @@ pub(super) async fn handle_session_command(
                     let state_label = if trace_state.enabled { "ON" } else { "OFF" };
                     eprintln!(
                         "  {} Full trace {} for session {}",
-                        icon.cyan(),
-                        state_label.cyan(),
-                        trace_state.session_id.as_str().cyan()
+                        icon.magenta(),
+                        state_label.magenta(),
+                        trace_state.session_id.as_str().magenta()
                     );
                 }
                 Err(err) => eprintln!("  {} {}", theme::icon_err(), err.red()),
@@ -847,7 +847,7 @@ pub(super) async fn handle_session_command(
                     eprintln!(
                         "  {} New session {} (fork of {})",
                         theme::icon_ok(),
-                        new_sid.as_str().cyan(),
+                        new_sid.as_str().magenta(),
                         parent_id.as_str().dim()
                     );
                     eprintln!(
@@ -931,8 +931,8 @@ pub(super) async fn handle_session_command(
                 eprintln!(
                     "  {} Resolved {} → {}",
                     theme::icon_ok(),
-                    sub_arg.cyan(),
-                    target_sid.as_str().cyan()
+                    sub_arg.magenta(),
+                    target_sid.as_str().magenta()
                 );
             }
             match session_journal::read_journal(&target_sid) {
@@ -959,7 +959,7 @@ pub(super) async fn handle_session_command(
                                     "  {} {} session started (model: {})",
                                     ts_short.dim(),
                                     "▶".green(),
-                                    evt.model.as_deref().unwrap_or("default").cyan(),
+                                    evt.model.as_deref().unwrap_or("default").magenta(),
                                 );
                             }
                             session_journal::JournalEventType::Turn => {
@@ -973,7 +973,7 @@ pub(super) async fn handle_session_command(
                                 eprintln!(
                                     "  {} {} T{} {} ({}ms, {}+{} tokens, {} tools)",
                                     ts_short.dim(),
-                                    "●".cyan(),
+                                    "●".magenta(),
                                     evt.turn.unwrap_or(0),
                                     input_preview,
                                     evt.duration_ms.unwrap_or(0),
@@ -1075,7 +1075,7 @@ pub(super) async fn handle_session_command(
                                     ts_short.dim(),
                                     "⚙".dim(),
                                     evt.config_key.as_deref().unwrap_or("?"),
-                                    evt.config_value.as_deref().unwrap_or("?").cyan(),
+                                    evt.config_value.as_deref().unwrap_or("?").magenta(),
                                 );
                             }
                             session_journal::JournalEventType::Error => {
@@ -1239,7 +1239,7 @@ pub(super) async fn handle_session_command(
                                 eprintln!(
                                     "  {} {} T{} plan {}: {} ({}%)",
                                     ts_short.dim(),
-                                    icon.cyan(),
+                                    icon.magenta(),
                                     evt.turn.unwrap_or(0),
                                     action,
                                     subtask,
@@ -1256,7 +1256,7 @@ pub(super) async fn handle_session_command(
                                 eprintln!(
                                     "  {} {} plan edit: {}",
                                     ts_short.dim(),
-                                    "✏".cyan(),
+                                    "✏".magenta(),
                                     action,
                                 );
                             }
@@ -1267,7 +1267,7 @@ pub(super) async fn handle_session_command(
                                     .and_then(|m| m.get("summary"))
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("lifecycle");
-                                eprintln!("  {} {} plan: {}", ts_short.dim(), "📋".cyan(), summary,);
+                                eprintln!("  {} {} plan: {}", ts_short.dim(), "📋".magenta(), summary,);
                             }
                             session_journal::JournalEventType::GoalSteered => {
                                 let source = evt
@@ -1291,7 +1291,7 @@ pub(super) async fn handle_session_command(
                                     eprintln!(
                                         "  {} {} goal steered ({}): {} -> {}",
                                         ts_short.dim(),
-                                        "🎯".cyan(),
+                                        "🎯".magenta(),
                                         source,
                                         previous_goal,
                                         new_goal,
@@ -1300,7 +1300,7 @@ pub(super) async fn handle_session_command(
                                     eprintln!(
                                         "  {} {} goal steered ({}): {}",
                                         ts_short.dim(),
-                                        "🎯".cyan(),
+                                        "🎯".magenta(),
                                         source,
                                         new_goal,
                                     );
@@ -1344,7 +1344,7 @@ pub(super) async fn handle_session_command(
                                     eprintln!(
                                         "  {} {} approval decision: {} → {}",
                                         ts_short.dim(),
-                                        "✓".green(),
+                                        theme::icon_ok(),
                                         tool,
                                         decision,
                                     );
@@ -1352,7 +1352,7 @@ pub(super) async fn handle_session_command(
                                     eprintln!(
                                         "  {} {} approval decision: {} → {} ({})",
                                         ts_short.dim(),
-                                        "✓".green(),
+                                        theme::icon_ok(),
                                         tool,
                                         decision,
                                         reason.dim(),
@@ -1395,7 +1395,7 @@ pub(super) async fn handle_session_command(
                                 eprintln!(
                                     "  {} {} boundary opened: {}",
                                     ts_short.dim(),
-                                    "⟦".cyan(),
+                                    "⟦".magenta(),
                                     label,
                                 );
                             }
@@ -1421,7 +1421,7 @@ pub(super) async fn handle_session_command(
                                 eprintln!(
                                     "  {} {} boundary committed: {}",
                                     ts_short.dim(),
-                                    "✓".green(),
+                                    theme::icon_ok(),
                                     label,
                                 );
                             }
@@ -1466,8 +1466,8 @@ pub(super) async fn handle_session_command(
                                 eprintln!(
                                     "  {} {} fork ← {} {}",
                                     ts_short.dim(),
-                                    "⎇".cyan(),
-                                    parent.cyan(),
+                                    "⎇".magenta(),
+                                    parent.magenta(),
                                     note.dim()
                                 );
                             }
@@ -1508,7 +1508,7 @@ pub(super) async fn handle_session_command(
                                 eprintln!(
                                     "  {} {} delegation started ({}, {} agents)",
                                     ts_short.dim(),
-                                    "⑂".cyan(),
+                                    "⑂".magenta(),
                                     pattern,
                                     count,
                                 );
@@ -1531,7 +1531,7 @@ pub(super) async fn handle_session_command(
                                 eprintln!(
                                     "  {} {} sub-run {} started {}{}",
                                     ts_short.dim(),
-                                    "↳".cyan(),
+                                    "↳".magenta(),
                                     agent,
                                     run.dim(),
                                     retry_of.dim(),
@@ -1555,7 +1555,7 @@ pub(super) async fn handle_session_command(
                                 eprintln!(
                                     "  {} {} sub-run {} → {}",
                                     ts_short.dim(),
-                                    icon.cyan(),
+                                    icon.magenta(),
                                     agent,
                                     status,
                                 );
@@ -1600,7 +1600,7 @@ pub(super) async fn handle_session_command(
                                     .and_then(|v| v.as_str())
                                     .filter(|s| !s.is_empty())
                                 {
-                                    eprintln!("      {}", ellipsize(preview, 120).cyan());
+                                    eprintln!("      {}", ellipsize(preview, 120).magenta());
                                 }
                             }
                             session_journal::JournalEventType::AdaptiveBaselinePromoted => {
@@ -1624,7 +1624,7 @@ pub(super) async fn handle_session_command(
                                 eprintln!(
                                     "  {} {} adaptive baseline {} / {} → {} ({})",
                                     ts_short.dim(),
-                                    "⚙".cyan(),
+                                    "⚙".magenta(),
                                     task_type,
                                     domain,
                                     variant,
@@ -1644,8 +1644,8 @@ pub(super) async fn handle_session_command(
                                 eprintln!(
                                     "  {} {} agent spawned: {} ({})",
                                     ts_short.dim(),
-                                    "┌".cyan(),
-                                    agent.cyan(),
+                                    "┌".magenta(),
+                                    agent.magenta(),
                                     desc,
                                 );
                             }
@@ -1673,7 +1673,7 @@ pub(super) async fn handle_session_command(
                                     "⌁".dim(),
                                     agent.dim(),
                                     run.dim(),
-                                    status.cyan(),
+                                    status.magenta(),
                                     turns,
                                 );
                             }
@@ -1743,7 +1743,7 @@ pub(super) async fn handle_session_command(
                                 eprintln!(
                                     "  {} {} T{} context trace ({} tokens)",
                                     ts_short.dim(),
-                                    "📊".cyan(),
+                                    "📊".magenta(),
                                     evt.turn.unwrap_or(0),
                                     tokens,
                                 );
@@ -1821,7 +1821,7 @@ pub(super) async fn handle_session_command(
                                 eprintln!(
                                     "  {} {} T{} adaptive profile → {} (conf {:.2}, {} config changes)",
                                     ts_short.dim(),
-                                    "⚙".cyan(),
+                                    "⚙".magenta(),
                                     evt.turn.unwrap_or(0),
                                     scenario,
                                     confidence,
@@ -1852,7 +1852,7 @@ pub(super) async fn handle_session_command(
                                     eprintln!(
                                         "  {} {} T{} per-turn adapt: {} changes ({})",
                                         ts_short.dim(),
-                                        "↻".cyan(),
+                                        "↻".magenta(),
                                         evt.turn.unwrap_or(0),
                                         n_changes,
                                         triggers,
@@ -1875,7 +1875,7 @@ pub(super) async fn handle_session_command(
                                 eprintln!(
                                     "  {} {} T{} experiment enrolled: {} → variant {}",
                                     ts_short.dim(),
-                                    "🧪".cyan(),
+                                    "🧪".magenta(),
                                     evt.turn.unwrap_or(0),
                                     exp,
                                     variant,
@@ -2207,8 +2207,8 @@ pub(super) async fn handle_session_command(
                 eprintln!(
                     "  {} Resolved {} → {}",
                     theme::icon_ok(),
-                    session_arg.cyan(),
-                    target_sid.as_str().cyan()
+                    session_arg.magenta(),
+                    target_sid.as_str().magenta()
                 );
             }
 
@@ -2226,7 +2226,7 @@ pub(super) async fn handle_session_command(
                     if traces.is_empty() {
                         eprintln!(
                             "  {} {}",
-                            "ℹ".cyan(),
+                            "ℹ".magenta(),
                             "No context traces in this session. Enable telemetry to record traces."
                                 .dim()
                         );
@@ -2249,7 +2249,7 @@ pub(super) async fn handle_session_command(
                                 let available: Vec<_> =
                                     traces.iter().filter_map(|e| e.turn).collect();
                                 if !available.is_empty() {
-                                    eprintln!("  {} Available turns: {:?}", "ℹ".cyan(), available);
+                                    eprintln!("  {} Available turns: {:?}", "ℹ".magenta(), available);
                                 }
                             }
                         }
@@ -2262,7 +2262,7 @@ pub(super) async fn handle_session_command(
                                 traces.len()
                             )
                             .bold()
-                            .cyan()
+                            .magenta()
                         );
                         for evt in &traces {
                             let ts_short = evt.ts.get(11..19).unwrap_or(&evt.ts);
@@ -2291,7 +2291,7 @@ pub(super) async fn handle_session_command(
                                 "  {} T{:<3} {} tokens · {} tools · {} memories",
                                 ts_short.dim(),
                                 t,
-                                format_u64_grouped(tokens_used).cyan(),
+                                format_u64_grouped(tokens_used).magenta(),
                                 tools_count,
                                 memory_count,
                             );
@@ -2320,8 +2320,8 @@ pub(super) async fn handle_session_command(
                 eprintln!(
                     "  {} Resolved {} → {}",
                     theme::icon_ok(),
-                    sub_arg.cyan(),
-                    target_sid.as_str().cyan()
+                    sub_arg.magenta(),
+                    target_sid.as_str().magenta()
                 );
             }
             match session_journal::read_journal(&target_sid) {
@@ -2379,8 +2379,8 @@ pub(super) async fn handle_session_command(
                 eprintln!(
                     "  {} Resolved {} → {}",
                     theme::icon_ok(),
-                    sub_arg.cyan(),
-                    target_sid.as_str().cyan()
+                    sub_arg.magenta(),
+                    target_sid.as_str().magenta()
                 );
             }
             export_session_markdown(&target_sid);
@@ -2430,7 +2430,7 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
         "\n{}",
         format!("─── Context Assembly Trace (Turn {turn}) ─────────────────")
             .bold()
-            .cyan()
+            .magenta()
     );
 
     // ─── Token Budget ───────────────────────────────────────────────────────
@@ -2451,7 +2451,7 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
         };
         eprintln!(
             "    {} / {} ({pct}%)",
-            format_u64_grouped(total).cyan(),
+            format_u64_grouped(total).magenta(),
             format_u64_grouped(limit).dim()
         );
 
@@ -2474,7 +2474,7 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
     if let Some(sp) = trace.get("system_prompt") {
         eprintln!("\n  {}", "System Prompt".bold());
         let total = sp.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        eprintln!("    Total: {} tokens", format_u64_grouped(total).cyan());
+        eprintln!("    Total: {} tokens", format_u64_grouped(total).magenta());
 
         let base = sp
             .get("base_persona_tokens")
@@ -2630,7 +2630,7 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
 
         eprintln!(
             "    Strategy: {} (confidence: {:.2})",
-            strategy.cyan(),
+            strategy.magenta(),
             confidence
         );
 
@@ -2672,7 +2672,7 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
                 let reasoning = exp.get("reasoning").and_then(|v| v.as_str()).unwrap_or("?");
-                eprintln!("    {} {}", decision.cyan(), reasoning.dim());
+                eprintln!("    {} {}", decision.magenta(), reasoning.dim());
             }
         }
     }
@@ -2945,7 +2945,7 @@ fn export_session_markdown(session_id: &str) {
             let export_path = format!("astra-session-{}.md", now.format("%Y%m%d-%H%M"));
             match std::fs::write(&export_path, &md) {
                 Ok(_) => {
-                    eprintln!("  {} Exported to {}", theme::icon_ok(), export_path.cyan())
+                    eprintln!("  {} Exported to {}", theme::icon_ok(), export_path.magenta())
                 }
                 Err(e) => eprintln!("{}", format!("  ✗ Failed to write: {e}").red()),
             }
@@ -3226,7 +3226,7 @@ fn handle_session_adaptive(_arg: &str, state: &ReplState) {
         "\n{}",
         "─── Adaptive Execution State ─────────────────────"
             .bold()
-            .cyan()
+            .magenta()
     );
 
     // 1. Current scenario + experiment from ObservabilitySession.
@@ -3237,9 +3237,9 @@ fn handle_session_adaptive(_arg: &str, state: &ReplState) {
                 .current_scenario
                 .map(|s| format!("{s:?}"))
                 .unwrap_or_else(|| "none".to_string());
-            eprintln!("  {} Scenario: {}", "▸".cyan(), scenario.bold());
+            eprintln!("  {} Scenario: {}", "▸".magenta(), scenario.bold());
 
-            eprintln!("  {} Config snapshot:", "▸".cyan(),);
+            eprintln!("  {} Config snapshot:", "▸".magenta(),);
             eprintln!(
                 "      token_budget.max_turn_input_tokens = {}",
                 guard.config.token_budget.max_turn_input_tokens
@@ -3296,7 +3296,7 @@ fn handle_session_adaptive(_arg: &str, state: &ReplState) {
             } else {
                 eprintln!(
                     "\n  {} {} adaptive event(s) in journal:",
-                    "▸".cyan(),
+                    "▸".magenta(),
                     adaptive_events.len()
                 );
                 // Show last 10 events.
@@ -3334,7 +3334,7 @@ fn handle_session_adaptive(_arg: &str, state: &ReplState) {
                                 "    {} T{:>2} {} profile → {} (conf {:.2}, {} changes)",
                                 ts.dim(),
                                 turn,
-                                "⚙".cyan(),
+                                "⚙".magenta(),
                                 scenario,
                                 confidence,
                                 n
@@ -3364,7 +3364,7 @@ fn handle_session_adaptive(_arg: &str, state: &ReplState) {
                                 "    {} T{:>2} {} per-turn: {} changes ({})",
                                 ts.dim(),
                                 turn,
-                                "↻".cyan(),
+                                "↻".magenta(),
                                 n,
                                 triggers
                             );
@@ -3386,7 +3386,7 @@ fn handle_session_adaptive(_arg: &str, state: &ReplState) {
                                 "    {} T{:>2} {} enrolled: {} → {}",
                                 ts.dim(),
                                 turn,
-                                "🧪".cyan(),
+                                "🧪".magenta(),
                                 exp,
                                 var
                             );
@@ -3423,7 +3423,7 @@ fn handle_session_adaptive(_arg: &str, state: &ReplState) {
                                 "    {} T{:>2} {} baseline promoted: {} → {}",
                                 ts.dim(),
                                 turn,
-                                "🏆".cyan(),
+                                "🏆".magenta(),
                                 scope,
                                 var
                             );
@@ -3456,7 +3456,7 @@ fn handle_session_drift(arg: &str, state: &ReplState) {
         "\n{}",
         "─── Focus Drift Analysis ─────────────────────────"
             .bold()
-            .cyan()
+            .magenta()
     );
 
     // Collect recent user queries from history (first element of each tuple)
@@ -3687,8 +3687,8 @@ fn handle_session_analyze(arg: &str, state: &ReplState) {
         eprintln!(
             "  {} Resolved {} → {}",
             theme::icon_ok(),
-            effective_arg.cyan(),
-            target_sid.as_str().cyan()
+            effective_arg.magenta(),
+            target_sid.as_str().magenta()
         );
     }
 
@@ -3735,7 +3735,7 @@ fn handle_session_analyze(arg: &str, state: &ReplState) {
         "\n{}",
         format!("─── Session Analysis ({sid_short}) ──────────────────────────")
             .bold()
-            .cyan()
+            .magenta()
     );
 
     let model = ws
@@ -3750,11 +3750,11 @@ fn handle_session_analyze(arg: &str, state: &ReplState) {
     let total_cache_read: u64 = turns.iter().filter_map(|t| t.cache_read_tokens).sum();
     let total_cache_create: u64 = turns.iter().filter_map(|t| t.cache_creation_tokens).sum();
 
-    eprintln!("  {:<16} {}", "model:".dim(), model.cyan());
+    eprintln!("  {:<16} {}", "model:".dim(), model.magenta());
     eprintln!(
         "  {:<16} {} ({} prompt + {} completion)",
         "tokens:".dim(),
-        format_u64_grouped(total_tok_in + total_tok_out).cyan(),
+        format_u64_grouped(total_tok_in + total_tok_out).magenta(),
         format_u64_grouped(total_tok_in),
         format_u64_grouped(total_tok_out),
     );
@@ -3775,8 +3775,8 @@ fn handle_session_analyze(arg: &str, state: &ReplState) {
     eprintln!(
         "  {:<16} {} turns, {} tool calls, {:.1}s total",
         "activity:".dim(),
-        turns.len().to_string().cyan(),
-        total_tools.to_string().cyan(),
+        turns.len().to_string().magenta(),
+        total_tools.to_string().magenta(),
         total_ms as f64 / 1000.0,
     );
     let _ = ws;
@@ -4145,7 +4145,7 @@ fn handle_session_verify(state: &ReplState) {
         "\n{}",
         "─── Sync Health ─────────────────────────────────"
             .bold()
-            .cyan()
+            .magenta()
     );
 
     // Local journal stats
@@ -4176,7 +4176,7 @@ fn handle_session_verify(state: &ReplState) {
     eprintln!(
         "    {:<20} {}",
         "events:".dim(),
-        journal_events.to_string().cyan()
+        journal_events.to_string().magenta()
     );
     eprintln!("    {:<20} {}", "file:".dim(), journal_path.dim());
 
@@ -4189,17 +4189,17 @@ fn handle_session_verify(state: &ReplState) {
             eprintln!(
                 "    {:<20} {}",
                 "received:".dim(),
-                stats.events_received.to_string().cyan()
+                stats.events_received.to_string().magenta()
             );
             eprintln!(
                 "    {:<20} {}",
                 "flushed:".dim(),
-                stats.events_flushed.to_string().cyan()
+                stats.events_flushed.to_string().magenta()
             );
             eprintln!(
                 "    {:<20} {}",
                 "flushes:".dim(),
-                stats.flush_count.to_string().cyan()
+                stats.flush_count.to_string().magenta()
             );
             let overflow = mc.ingestion_overflow_count();
             if lag > 0 {
@@ -4263,13 +4263,13 @@ fn handle_session_verify(state: &ReplState) {
         eprintln!(
             "    {:<20} {} active, {} archived",
             "sessions:".dim(),
-            all_sessions.len().to_string().cyan(),
-            compressed.to_string().cyan()
+            all_sessions.len().to_string().magenta(),
+            compressed.to_string().magenta()
         );
         eprintln!(
             "    {:<20} {}",
             "journal total:".dim(),
-            human_bytes(total_journals).cyan()
+            human_bytes(total_journals).magenta()
         );
     }
 
@@ -4920,7 +4920,7 @@ async fn apply_restored_session(
         if let Some(ref ao_json) = step_restored.approval_overrides {
             state.perm_manager.merge_restored_overrides(ao_json);
         }
-        eprintln!("  {} {}", "↻".cyan(), summary.dim());
+        eprintln!("  {} {}", "↻".magenta(), summary.dim());
     } else if let Ok(Some(heavy)) =
         astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&restored.session_id)
     {
@@ -4940,7 +4940,7 @@ async fn apply_restored_session(
             restored.interruption.as_ref(),
             restored.compaction_state.as_ref(),
         );
-        eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());
+        eprintln!("  {} Restored step checkpoint from cloud", "☁".magenta());
     } else if let Some(ref mc) = state.matrix_runtime {
         let pool = mc.shared_pool().get();
         match astra_services::session_restore::pull_step_checkpoint_from_cloud(
@@ -4965,7 +4965,7 @@ async fn apply_restored_session(
                             heavy.interruption.as_ref(),
                             heavy.compaction_state.as_ref(),
                         );
-                        eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());
+                        eprintln!("  {} Restored step checkpoint from cloud", "☁".magenta());
                     }
                     Ok(None) => {
                         eprintln!(
@@ -5108,7 +5108,7 @@ async fn apply_restored_session(
     eprintln!(
         "  {} Resumed session {} ({}, {} turns, {} checkpoints)",
         theme::icon_ok(),
-        restored.session_id[..8.min(restored.session_id.len())].cyan(),
+        restored.session_id[..8.min(restored.session_id.len())].magenta(),
         source,
         restored.turn_count,
         restored.checkpoint_count,
@@ -5126,7 +5126,7 @@ async fn apply_restored_session(
         let pct = plan.progress_pct();
         eprintln!(
             "  {} Paused plan restored: {}/{} subtasks done ({}%)",
-            "📋".cyan(),
+            "📋".magenta(),
             done,
             total,
             pct,
@@ -5352,7 +5352,7 @@ pub(super) async fn handle_resume_command(
             let plan_badge = if s.has_plan { " 📋" } else { "" };
             eprintln!(
                 "  {}  {}{}  {}",
-                format!("[{}]", s.idx).cyan().bold(),
+                format!("[{}]", s.idx).magenta().bold(),
                 display_truncated,
                 plan_badge,
                 s.age.as_str().dim(),
@@ -5407,8 +5407,8 @@ pub(super) async fn handle_resume_command(
                 eprintln!(
                     "  {} Resolved {} → {}",
                     theme::icon_ok(),
-                    arg.cyan(),
-                    resolved.as_str().cyan()
+                    arg.magenta(),
+                    resolved.as_str().magenta()
                 );
             }
             resolved
@@ -5426,7 +5426,7 @@ pub(super) async fn handle_resume_command(
             "\n{}",
             "─── Session Preview ─────────────────────────────"
                 .bold()
-                .cyan()
+                .magenta()
         );
 
         // Session ID
@@ -5434,7 +5434,7 @@ pub(super) async fn handle_resume_command(
         eprintln!(
             "  {:<14} {}",
             "session:".dim(),
-            format!("{short_id}…").cyan()
+            format!("{short_id}…").magenta()
         );
 
         // Summary/Title
@@ -5458,14 +5458,14 @@ pub(super) async fn handle_resume_command(
             eprintln!(
                 "  {:<14} {} turns",
                 "progress:".dim(),
-                w.turn_count.to_string().cyan()
+                w.turn_count.to_string().magenta()
             );
         } else if peek.is_some() {
             let turns = session_journal::count_turns(&session_id);
             eprintln!(
                 "  {:<14} {} turns",
                 "progress:".dim(),
-                turns.to_string().cyan()
+                turns.to_string().magenta()
             );
         }
 
@@ -5475,14 +5475,14 @@ pub(super) async fn handle_resume_command(
             .map(|w| w.model.clone())
             .or_else(|| peek.as_ref().and_then(|p| p.model.clone()))
             .unwrap_or_else(|| "?".to_string());
-        eprintln!("  {:<14} {}", "model:".dim(), model.cyan());
+        eprintln!("  {:<14} {}", "model:".dim(), model.magenta());
 
         // Cwd + git branch
         if let Some(ref w) = ws {
             eprintln!(
                 "  {:<14} {}",
                 "directory:".dim(),
-                tilde_path(&w.cwd).as_str().cyan()
+                tilde_path(&w.cwd).as_str().magenta()
             );
             if let Some(ref b) = w.git_branch {
                 let head = w
@@ -5493,7 +5493,7 @@ pub(super) async fn handle_resume_command(
                 eprintln!(
                     "  {:<14} {} @ {}",
                     "branch:".dim(),
-                    b.as_str().cyan(),
+                    b.as_str().magenta(),
                     head.dim()
                 );
             }
@@ -5511,7 +5511,7 @@ pub(super) async fn handle_resume_command(
                 "  {:<14} {} {}",
                 "status:".dim(),
                 status_icon,
-                w.status.as_str().cyan()
+                w.status.as_str().magenta()
             );
         }
 

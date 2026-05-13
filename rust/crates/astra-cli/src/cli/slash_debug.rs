@@ -165,7 +165,7 @@ fn print_overview(session_id: &str, turns: &[TurnSummary], checkpoints: &[PathBu
     let short_id = &session_id[..8.min(session_id.len())];
     eprintln!(
         "\n  🔍 session {} ({} turns, {} checkpoints)\n",
-        short_id.cyan(),
+        short_id.magenta(),
         turns.len().to_string().green(),
         checkpoints.len().to_string().dim(),
     );
@@ -276,7 +276,7 @@ fn inspect_turn(
         "\n  {}{} — {} tool calls, {:.1}s, {}→{}tok",
         format!("Turn {turn_n}").bold(),
         journal_tag.dim(),
-        summary.tool_count.to_string().cyan(),
+        summary.tool_count.to_string().magenta(),
         summary.duration_ms as f64 / 1000.0,
         summary.tokens_in.to_string().dim(),
         summary.tokens_out.to_string().dim(),
@@ -289,35 +289,35 @@ fn inspect_turn(
     let has_msgs = view.is_some();
     eprintln!(
         "  {} input    — LLM input ({} only){}",
-        "[1]".cyan(),
+        "[1]".magenta(),
         "delta".green(),
         if has_msgs { "" } else { " (no checkpoint)" }
     );
     eprintln!(
         "  {} output   — LLM response ({})",
-        "[2]".cyan(),
+        "[2]".magenta(),
         "delta".green()
     );
     eprintln!(
         "  {} tools    — tool calls + results ({})",
-        "[3]".cyan(),
+        "[3]".magenta(),
         "delta".green()
     );
     eprintln!(
         "  {} injected — runtime-injected ({})",
-        "[4]".cyan(),
+        "[4]".magenta(),
         "delta".green()
     );
     eprintln!(
         "  {} json     — structured delta dump (pretty) → /tmp",
-        "[5]".cyan()
+        "[5]".magenta()
     );
     eprintln!(
         "  {} full json — entire snapshot after this segment → /tmp",
-        "[7]".cyan()
+        "[7]".magenta()
     );
-    eprintln!("  {} summary  — journal turn summary", "[6]".cyan());
-    eprintln!("  {} fork     — fork session from this turn", "[f]".cyan());
+    eprintln!("  {} summary  — journal turn summary", "[6]".magenta());
+    eprintln!("  {} fork     — fork session from this turn", "[f]".magenta());
 
     loop {
         eprint!("  What to inspect? [1-6, 7, f, b to go back]: ");
@@ -354,14 +354,14 @@ fn show_input(view: Option<&TurnMessagesView>) {
         return;
     }
     let msgs = v.delta.as_slice();
-    eprintln!("\n  {}", "── LLM Input (delta) ──".bold().cyan());
+    eprintln!("\n  {}", "── LLM Input (delta) ──".bold().magenta());
     for m in msgs {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
         if role == "assistant" || role == "tool" {
             continue;
         }
         let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let tag = format!("[{role}]").cyan();
+        let tag = format!("[{role}]").magenta();
         let preview = truncate(content, 300);
         eprintln!("  {tag} {preview}");
     }
@@ -381,7 +381,7 @@ fn show_output(view: Option<&TurnMessagesView>) {
         return;
     }
     let msgs = v.delta.as_slice();
-    eprintln!("\n  {}", "── LLM Output (delta) ──".bold().cyan());
+    eprintln!("\n  {}", "── LLM Output (delta) ──".bold().magenta());
     for m in msgs {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
         if role != "assistant" {
@@ -418,7 +418,7 @@ fn show_output(view: Option<&TurnMessagesView>) {
 }
 
 fn show_tools(view: Option<&TurnMessagesView>, summary: &TurnSummary) {
-    eprintln!("\n  {}", "── Tool Calls ──".bold().cyan());
+    eprintln!("\n  {}", "── Tool Calls ──".bold().magenta());
     // From journal (always available)
     for tc in &summary.tool_calls {
         let status = if tc.ok {
@@ -432,7 +432,7 @@ fn show_tools(view: Option<&TurnMessagesView>, summary: &TurnSummary) {
         );
         eprintln!(
             "  {status} {} {}",
-            display_name.cyan(),
+            display_name.magenta(),
             format!("({}B→{}B)", tc.input_bytes, tc.output_bytes).dim(),
         );
     }
@@ -457,7 +457,7 @@ fn show_tools(view: Option<&TurnMessagesView>, summary: &TurnSummary) {
             let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
             eprintln!(
                 "  {} {}",
-                format!("[{name}]").cyan(),
+                format!("[{name}]").magenta(),
                 truncate(content, 200)
             );
         }
@@ -478,7 +478,7 @@ fn show_injected(view: Option<&TurnMessagesView>) {
         return;
     }
     let msgs = v.delta.as_slice();
-    eprintln!("\n  {}", "── Injected Messages (delta) ──".bold().cyan());
+    eprintln!("\n  {}", "── Injected Messages (delta) ──".bold().magenta());
     let mut found = false;
     for m in msgs {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
@@ -593,7 +593,7 @@ fn file_name_str(p: &Path) -> Option<String> {
 }
 
 fn show_summary(summary: &TurnSummary) {
-    eprintln!("\n  {}", "── Journal Summary ──".bold().cyan());
+    eprintln!("\n  {}", "── Journal Summary ──".bold().magenta());
     eprintln!("  user:     {}", truncate(&summary.user_input, 120));
     eprintln!("  tokens:   {}→{}", summary.tokens_in, summary.tokens_out);
     eprintln!("  duration: {:.1}s", summary.duration_ms as f64 / 1000.0);
@@ -923,12 +923,12 @@ fn show_breakpoints(session_id: &str) {
                 eprintln!("  {}", "(no breakpoints)".dim());
                 return;
             }
-            eprintln!("\n  {}", "── Breakpoints ──".bold().cyan());
+            eprintln!("\n  {}", "── Breakpoints ──".bold().magenta());
             for bp in &index.breakpoints {
                 let short_id = &bp.breakpoint_id[..8.min(bp.breakpoint_id.len())];
                 eprintln!(
                     "  {} turn {} — {} ({})",
-                    short_id.cyan(),
+                    short_id.magenta(),
                     bp.turn_number.to_string().green(),
                     bp.label,
                     bp.created_at.as_str().dim(),
@@ -953,7 +953,7 @@ fn show_composite_snapshots(session_id: &str) {
         "\n  {}",
         format!("─── Composite Snapshots ({}) ───", index.snapshots.len())
             .bold()
-            .cyan()
+            .magenta()
     );
 
     for snap in &index.snapshots {
@@ -961,7 +961,7 @@ fn show_composite_snapshots(session_id: &str) {
         let label = snap.label.as_deref().unwrap_or("-");
         eprintln!(
             "  {} T{:<3} {} [{}]  {}",
-            snap.snapshot_id[..8.min(snap.snapshot_id.len())].cyan(),
+            snap.snapshot_id[..8.min(snap.snapshot_id.len())].magenta(),
             snap.turn,
             label,
             dims.green(),
@@ -994,7 +994,7 @@ fn show_correction_timeline(session_id: &str) {
         return;
     }
 
-    eprintln!("\n  {}", "── Correction Timeline ──".bold().cyan());
+    eprintln!("\n  {}", "── Correction Timeline ──".bold().magenta());
     for evt in &verdicts {
         let turn = evt
             .turn

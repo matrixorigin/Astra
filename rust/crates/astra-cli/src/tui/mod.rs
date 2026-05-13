@@ -168,20 +168,16 @@ fn flush_chat_widget(
     // response's OWN leading and trailing blanks so the reply
     // stacks tight onto the previous flush's `› /cmd`.
     let mut batch: Vec<ratatui::text::Line<'static>> = Vec::new();
-    for (i, cell) in new_cells.iter().enumerate() {
+    for cell in new_cells.iter() {
         batch.extend(cell.display_lines(width));
-        let is_last = i + 1 == new_cells.len();
-        let next_is_response = !is_last && is_response_cell(new_cells[i + 1].as_ref());
         let this_is_slash_user = is_slash_user_cell(cell.as_ref());
         let this_is_response = is_response_cell(cell.as_ref());
 
-        // Skip the trailing blank in two cases:
-        //   1. This cell is a slash UserCell and the next is a
-        //      response — they're a visual pair.
-        //   2. This cell is a response — its reply should stack
-        //      tight onto whatever came next, and nothing in the
-        //      current batch should push air below it.
-        let suppress_blank = (this_is_slash_user && next_is_response) || this_is_response;
+        // Skip the trailing blank when:
+        //   1. This cell is a slash UserCell — always hugs the response
+        //      (response may arrive in same batch or next event).
+        //   2. This cell is a response — stacks tight, no air below.
+        let suppress_blank = this_is_slash_user || this_is_response;
         if !suppress_blank {
             batch.push(ratatui::text::Line::default());
         }

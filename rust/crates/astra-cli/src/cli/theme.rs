@@ -70,8 +70,8 @@ impl ThemeColor {
 pub struct ThemeConfig {
     /// Theme display name
     pub name: String,
-    /// Prompt color (default: cyan)
-    #[serde(default = "default_cyan")]
+    /// Prompt color (default: magenta)
+    #[serde(default = "default_magenta")]
     pub prompt: ThemeColor,
     /// Success messages (default: green)
     #[serde(default = "default_green")]
@@ -82,14 +82,14 @@ pub struct ThemeConfig {
     /// Warning messages (default: yellow)
     #[serde(default = "default_yellow")]
     pub warning: ThemeColor,
-    /// Info/accent color (default: cyan)
-    #[serde(default = "default_cyan")]
+    /// Info/accent color (default: magenta)
+    #[serde(default = "default_magenta")]
     pub info: ThemeColor,
-    /// Section headers (default: cyan)
-    #[serde(default = "default_cyan")]
+    /// Section headers (default: magenta)
+    #[serde(default = "default_magenta")]
     pub section_color: ThemeColor,
-    /// Tool call display (default: blue)
-    #[serde(default = "default_blue")]
+    /// Tool call display (default: magenta)
+    #[serde(default = "default_magenta")]
     pub tool: ThemeColor,
     /// Use bold for headers
     #[serde(default = "default_true")]
@@ -99,8 +99,8 @@ pub struct ThemeConfig {
     pub dim_secondary: bool,
 }
 
-fn default_cyan() -> ThemeColor {
-    ThemeColor::Cyan
+fn default_magenta() -> ThemeColor {
+    ThemeColor::Magenta
 }
 fn default_green() -> ThemeColor {
     ThemeColor::Green
@@ -111,9 +111,6 @@ fn default_red() -> ThemeColor {
 fn default_yellow() -> ThemeColor {
     ThemeColor::Yellow
 }
-fn default_blue() -> ThemeColor {
-    ThemeColor::Blue
-}
 fn default_true() -> bool {
     true
 }
@@ -122,13 +119,13 @@ impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
             name: "default".to_string(),
-            prompt: ThemeColor::Cyan,
+            prompt: ThemeColor::Magenta,
             success: ThemeColor::Green,
             error: ThemeColor::Red,
             warning: ThemeColor::Yellow,
-            info: ThemeColor::Cyan,
-            section_color: ThemeColor::Cyan,
-            tool: ThemeColor::Blue,
+            info: ThemeColor::Magenta,
+            section_color: ThemeColor::Magenta,
+            tool: ThemeColor::Magenta,
             bold_headers: true,
             dim_secondary: true,
         }
@@ -264,8 +261,8 @@ pub fn activate_theme_by_name(name: &str) -> Result<(), String> {
 // tracking for CJK input. ANSI color codes (\x1b[...m) are safe — rustyline
 // treats them as width=0.
 
-/// Default prompt: cyan bold `>`
-pub const PROMPT_DEFAULT: &str = "\x1b[1;36m>\x1b[0m ";
+/// Default prompt: magenta bold `>`
+pub const PROMPT_DEFAULT: &str = "\x1b[1;35m>\x1b[0m ";
 
 /// Plan mode prompt: yellow bold `plan>`
 pub const PROMPT_PLAN: &str = "\x1b[1;33mplan>\x1b[0m ";
@@ -273,8 +270,8 @@ pub const PROMPT_PLAN: &str = "\x1b[1;33mplan>\x1b[0m ";
 /// Paused plan execution prompt: yellow bold `pause>`
 pub const PROMPT_PAUSE: &str = "\x1b[1;33mpause>\x1b[0m ";
 
-/// Background plan running prompt: cyan bold `bg>`
-pub const PROMPT_BG: &str = "\x1b[1;36mbg>\x1b[0m ";
+/// Background plan running prompt: magenta bold `bg>`
+pub const PROMPT_BG: &str = "\x1b[1;35mbg>\x1b[0m ";
 
 /// Chat plan-only mode prompt: yellow bold `plan.`
 pub const PROMPT_PLAN_ONLY: &str = "\x1b[1;33mplan.\x1b[0m ";
@@ -288,9 +285,9 @@ fn styled(text: &str, color: ThemeColor) -> String {
     StyledContent::new(crossterm::style::ContentStyle::new().with(c), text).to_string()
 }
 
-/// Success indicator: ✓ in theme success color
+/// Success indicator: ● in theme success color
 pub fn icon_ok() -> String {
-    styled("✓", current_theme().success)
+    styled("●", current_theme().success)
 }
 
 /// Error indicator: ✗ in theme error color
@@ -306,6 +303,11 @@ pub fn icon_warn() -> String {
 /// Info indicator: ℹ in theme info color
 pub fn icon_info() -> String {
     styled("ℹ", current_theme().info)
+}
+
+/// Running indicator: ○ in theme info color
+pub fn icon_running() -> String {
+    styled("○", current_theme().info)
 }
 
 // ── Semantic text styles ──────────────────────────────────────────────────

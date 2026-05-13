@@ -3449,7 +3449,7 @@ impl StreamRenderState {
                     Some((cur, total)) if total > 1 => format!("[{}/{}] ", cur, total),
                     _ => String::new(),
                 };
-                let line = format!("  {} {}{} …", "⬢".cyan(), prefix, styled_desc);
+                let line = format!("  {} {}{} …", theme::icon_running(), prefix, styled_desc);
                 eprintln!("{line}");
                 self.stderr_lines += 1;
             }
@@ -3464,7 +3464,7 @@ impl StreamRenderState {
                 Some((cur, total)) if total > 1 => format!("[{}/{}] ", cur, total),
                 _ => String::new(),
             };
-            let line = format!("  {} {}{} …", "⬢".cyan(), prefix, styled_desc);
+            let line = format!("  {} {}{} …", theme::icon_running(), prefix, styled_desc);
             g.lines.push(line);
             let lines = g.lines.clone();
             g.region.update(lines);
@@ -3486,7 +3486,7 @@ impl StreamRenderState {
         if io::stderr().is_terminal() {
             self.tool_stderr_running = Some(ToolRunningLineSpinner::start(description));
         } else {
-            let line = format!("  {} {} …", "⬢".cyan(), description.dim());
+            let line = format!("  {} {} …", theme::icon_running(), description.dim());
             eprintln!("{line}");
             self.stderr_lines += 1;
         }

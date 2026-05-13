@@ -1214,7 +1214,7 @@ impl PermissionManager {
                 })
                 .collect::<Vec<_>>()
                 .join(" · ");
-            eprint!("  {} {hint} → ", "▸".cyan());
+            eprint!("  {} {hint} → ", "▸".magenta());
             let _ = io::stderr().flush();
 
             let mut response = String::new();
@@ -1224,19 +1224,19 @@ impl PermissionManager {
         }
     }
 
-    /// Theme for approval Select prompt, matching plan_interaction style.
     fn approval_select_theme() -> inquire::ui::RenderConfig<'static> {
         use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet};
-        let cyan = Color::Rgb {
-            r: 0,
-            g: 200,
+        let magenta = Color::Rgb {
+            r: 200,
+            g: 80,
             b: 200,
         };
         let mut rc = RenderConfig::default_colored();
-        rc.prompt_prefix = inquire::ui::Styled::new("▸").with_fg(cyan);
-        rc.highlighted_option_prefix = inquire::ui::Styled::new("▸").with_fg(cyan);
-        rc.selected_option = Some(StyleSheet::new().with_fg(cyan).with_attr(Attributes::BOLD));
-        rc.answer = StyleSheet::new().with_fg(cyan).with_attr(Attributes::BOLD);
+        rc.prompt_prefix = inquire::ui::Styled::new("▸").with_fg(magenta);
+        rc.highlighted_option_prefix = inquire::ui::Styled::new("▸").with_fg(magenta);
+        rc.selected_option =
+            Some(StyleSheet::new().with_fg(magenta).with_attr(Attributes::BOLD));
+        rc.answer = StyleSheet::new().with_fg(magenta).with_attr(Attributes::BOLD);
         rc
     }
 

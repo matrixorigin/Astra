@@ -261,7 +261,7 @@ pub fn highlight_code_line(line: &str) -> String {
 
     // Highlight keywords (but now strings are already colored, keywords inside won't match)
     let highlighted_code = keyword_re.replace_all(&highlighted_code, |caps: &regex::Captures| {
-        format!("{}", caps[1].cyan())
+        format!("{}", caps[1].magenta())
     });
 
     // Combine parts

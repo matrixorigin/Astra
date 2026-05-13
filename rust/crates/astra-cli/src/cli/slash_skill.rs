@@ -157,19 +157,19 @@ pub(super) async fn handle_skill_command(
                 "\n{}",
                 "─── Skills ──────────────────────────────────────"
                     .bold()
-                    .cyan()
+                    .magenta()
             );
-            eprintln!("  {:<16} {}", "total:".dim(), all.len().to_string().cyan());
-            eprintln!("  {:<16} {}", "local:".dim(), local.to_string().cyan());
-            eprintln!("  {:<16} {}", "bundled:".dim(), bundled.to_string().cyan());
+            eprintln!("  {:<16} {}", "total:".dim(), all.len().to_string().magenta());
+            eprintln!("  {:<16} {}", "local:".dim(), local.to_string().magenta());
+            eprintln!("  {:<16} {}", "bundled:".dim(), bundled.to_string().magenta());
             if mcp > 0 {
-                eprintln!("  {:<16} {}", "mcp:".dim(), mcp.to_string().cyan());
+                eprintln!("  {:<16} {}", "mcp:".dim(), mcp.to_string().magenta());
             }
             if let Some(ref dev) = state.skill_dev {
                 eprintln!(
                     "  {:<16} {} {}",
                     "dev mode:".dim(),
-                    dev.name.as_str().cyan(),
+                    dev.name.as_str().magenta(),
                     "(use /skill dev off to exit)".dim()
                 );
             }
@@ -177,106 +177,106 @@ pub(super) async fn handle_skill_command(
             eprintln!("  {}", "Subcommands:".dim());
             eprintln!(
                 "    {}  {}",
-                "/skill list [filter]".cyan(),
+                "/skill list [filter]".magenta(),
                 "List all skills".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill info <name>".cyan(),
+                "/skill info <name>".magenta(),
                 "Show skill details".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill search <query>".cyan(),
+                "/skill search <query>".magenta(),
                 "Keyword match (name, tags, description, …)".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill surfacing …".cyan(),
+                "/skill surfacing …".magenta(),
                 "Agent catalog: dynamic/min/cap (discover_skills path)".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill new <name>".cyan(),
+                "/skill new <name>".magenta(),
                 "Scaffold a new skill".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill create".cyan(),
+                "/skill create".magenta(),
                 "Auto-generate from session".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill dev <name|off>".cyan(),
+                "/skill dev <name|off>".magenta(),
                 "Enter/exit dev mode".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill test <name>".cyan(),
+                "/skill test <name>".magenta(),
                 "API test or local manifest check (+ hooks)".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill health".cyan(),
+                "/skill health".magenta(),
                 "Skill catalog health (registry + disk)".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill stats".cyan(),
+                "/skill stats".magenta(),
                 "Quality tracker stats".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill feedback <name> +/-".cyan(),
+                "/skill feedback <name> +/-".magenta(),
                 "Record user feedback".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill pin/unpin <name>".cyan(),
+                "/skill pin/unpin <name>".magenta(),
                 "Pin/unpin for priority".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill info <name> --raw".cyan(),
+                "/skill info <name> --raw".magenta(),
                 "Print YAML frontmatter (on-disk)".dim()
             );
             eprintln!();
             eprintln!("  {}", "Marketplace:".dim());
             eprintln!(
                 "    {}  {}",
-                "/skill browse [query]".cyan(),
+                "/skill browse [query]".magenta(),
                 "Browse marketplace".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill install <name>".cyan(),
+                "/skill install <name>".magenta(),
                 "Install from marketplace".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill publish <name>".cyan(),
+                "/skill publish <name>".magenta(),
                 "Publish to marketplace".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill upgrade <name>".cyan(),
+                "/skill upgrade <name>".magenta(),
                 "Upgrade installed skill".dim()
             );
             eprintln!();
             eprintln!("  {}", "Evolution:".dim());
             eprintln!(
                 "    {}  {}",
-                "/skill evolve".cyan(),
+                "/skill evolve".magenta(),
                 "Show evolution status (signals, pending proposals, canaries)".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill evolve approve <id>".cyan(),
+                "/skill evolve approve <id>".magenta(),
                 "Approve a pending proposal or promote an active canary".dim()
             );
             eprintln!(
                 "    {}  {}",
-                "/skill evolve reject <id>".cyan(),
+                "/skill evolve reject <id>".magenta(),
                 "Reject a pending proposal or roll back an active canary".dim()
             );
             eprintln!();
@@ -324,7 +324,7 @@ pub(super) async fn handle_skill_command(
                     let desc = truncate_desc(&m.description, 36);
                     eprintln!(
                         "  {:<26}  {:<10}  {:<8}  {}",
-                        m.name.as_str().cyan(),
+                        m.name.as_str().magenta(),
                         m.version.to_string().dim(),
                         source.dim(),
                         desc
@@ -392,7 +392,7 @@ pub(super) async fn handle_skill_command(
             eprintln!(
                 "\n  {} '{}' {}",
                 "Keyword matches for".dim(),
-                query.cyan(),
+                query.magenta(),
                 "(not vector search)".dim()
             );
             eprintln!("{}", "\u{2500}".repeat(78).dim());
@@ -411,7 +411,7 @@ pub(super) async fn handle_skill_command(
                     eprintln!(
                         "  {} {:<24}  {:<8}  {}",
                         relevance.yellow(),
-                        m.name.as_str().cyan(),
+                        m.name.as_str().magenta(),
                         source.dim(),
                         desc
                     );
@@ -451,7 +451,7 @@ pub(super) async fn handle_skill_command(
                 }
                 eprintln!(
                     "\n  {} results {}",
-                    scored.len().to_string().cyan(),
+                    scored.len().to_string().magenta(),
                     "(showing top 10)".dim()
                 );
             }
@@ -526,7 +526,7 @@ pub(super) async fn handle_skill_command(
                     );
                 }
                 Some(m) => {
-                    eprintln!("\n{}", format!("── {} ──", m.name).bold().cyan());
+                    eprintln!("\n{}", format!("── {} ──", m.name).bold().magenta());
                     eprintln!("  {:<16} {}", "Description:".dim(), m.description);
                     eprintln!("  {:<16} {}", "Version:".dim(), m.version);
                     eprintln!("  {:<16} {}", "Source:".dim(), source_label(&m.source));
@@ -569,7 +569,7 @@ pub(super) async fn handle_skill_command(
                             let required = if arg.required { " (required)" } else { "" };
                             eprintln!(
                                 "    {} {}{}",
-                                arg.name.as_str().cyan(),
+                                arg.name.as_str().magenta(),
                                 arg.description.as_str().dim(),
                                 required.yellow()
                             );
@@ -670,7 +670,7 @@ Follow these steps:
             eprintln!(
                 "  {} Skill scaffolded: {}",
                 "\u{2713}".green(),
-                skill_dir.display().to_string().cyan()
+                skill_dir.display().to_string().magenta()
             );
             match state.unified_skill_registry.discover_all().await {
                 Ok(_) => eprintln!("  {}", "Skill registry refreshed.".dim()),
@@ -695,10 +695,10 @@ Follow these steps:
                 "\n{}",
                 format!("─── Skill test: {name} ───────────────────────────────────────")
                     .bold()
-                    .cyan()
+                    .magenta()
             );
             if !json_args.is_empty() {
-                eprintln!("  Input: {}", json_args.cyan());
+                eprintln!("  Input: {}", json_args.magenta());
             }
 
             // Try API first
@@ -758,7 +758,7 @@ Follow these steps:
                         let yaml = &src[3..3 + end];
                         if let Ok(val) = serde_yaml_ng::from_str::<serde_json::Value>(yaml) {
                             let sname = val.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            eprintln!("  {} {}", "Manifest name:".dim(), sname.cyan());
+                            eprintln!("  {} {}", "Manifest name:".dim(), sname.magenta());
                         }
                         let body = &src[3 + end + 4..];
                         eprintln!("  {} {} chars", "Instruction body:".dim(), body.len());
@@ -863,7 +863,7 @@ Follow these steps:
                 if let Some(ref dev) = state.skill_dev {
                     eprintln!(
                         "  \u{1f527} Currently in skill dev mode: {}",
-                        dev.name.as_str().cyan()
+                        dev.name.as_str().magenta()
                     );
                     eprintln!("  Use /skill dev off to exit.");
                 } else {
@@ -906,7 +906,7 @@ Follow these steps:
             eprintln!(
                 "\n  \u{1f527} {} {}",
                 "Skill dev mode:".bold(),
-                name.cyan().bold()
+                name.magenta().bold()
             );
             eprintln!("  {}", format!("Dir: {}", skill_dir.display()).dim());
             eprintln!("  {}", format!("Source: {src_label}").dim());
@@ -923,7 +923,7 @@ Follow these steps:
                 "\n{}",
                 "─── Skill catalog health ─────────────────────────────────────"
                     .bold()
-                    .cyan()
+                    .magenta()
             );
             // Try API first
             let api_ok = if let Some(tok) = token {
@@ -956,7 +956,7 @@ Follow these steps:
                             let issues = s.get("issues").and_then(|v| v.as_str()).unwrap_or("");
                             eprintln!(
                                 "  {:<26}  {:<10}  {:<8}  {}",
-                                name.cyan(),
+                                name.magenta(),
                                 if registered {
                                     "\u{2713}".green().to_string()
                                 } else {
@@ -1046,7 +1046,7 @@ Follow these steps:
                     };
                     eprintln!(
                         "  {:<22}  {:<10}  {:<8}  {}",
-                        m.name.as_str().cyan(),
+                        m.name.as_str().magenta(),
                         source_label(&m.source).dim(),
                         disk_col,
                         check_col
@@ -1073,7 +1073,7 @@ Follow these steps:
                     eprintln!(
                         "  {} {:<12} {}",
                         marker,
-                        skill.name.as_str().cyan(),
+                        skill.name.as_str().magenta(),
                         skill.description.as_str().dim()
                     );
                 }
@@ -1102,7 +1102,7 @@ Follow these steps:
                     eprintln!(
                         "  {} System skill {} {}",
                         "○".dim(),
-                        name.cyan(),
+                        name.magenta(),
                         "deactivated".dim()
                     );
                 } else if let Some(skill) = available.iter().find(|s| s.name == name) {
@@ -1110,7 +1110,7 @@ Follow these steps:
                     eprintln!(
                         "  {} System skill {} {}",
                         "●".green(),
-                        name.cyan(),
+                        name.magenta(),
                         "activated".green()
                     );
                 } else {
@@ -1178,7 +1178,7 @@ Follow these steps:
                 let name = sub_arg;
                 match tracker.get(name) {
                     Some(entry) => {
-                        eprintln!("\n  Skill: {}", name.cyan());
+                        eprintln!("\n  Skill: {}", name.magenta());
                         eprintln!("  ─────────────────────────");
                         eprintln!("  Invocations:      {}", entry.invocations);
                         eprintln!("  Successes:        {}", entry.successes);
@@ -1236,7 +1236,7 @@ Follow these steps:
                             eprintln!(
                                 "\n  {} '{}' ({} results)",
                                 "Marketplace search:".dim(),
-                                query_str.cyan(),
+                                query_str.magenta(),
                                 resp.total
                             );
                             eprintln!("{}", "\u{2500}".repeat(78).dim());
@@ -1258,7 +1258,7 @@ Follow these steps:
                                         truncate_desc(r.description.as_deref().unwrap_or(""), 30);
                                     eprintln!(
                                         "  {:<24}  {:<8}  {:<10}  {:<6.2}  {}",
-                                        r.skill_name.as_str().cyan(),
+                                        r.skill_name.as_str().magenta(),
                                         r.version.as_str().dim(),
                                         tier.dim(),
                                         r.ranking_score,
@@ -1437,7 +1437,7 @@ Follow these steps:
             // Parse: <skill_name> +/- or <skill_name> up/down or <skill_name> thumbs_up/thumbs_down
             let parts: Vec<&str> = sub_arg.split_whitespace().collect();
             if parts.len() < 2 {
-                eprintln!("  {} Usage: /skill feedback <skill_name> +/-", "⚠".yellow());
+                eprintln!("  {} Usage: /skill feedback <skill_name> +/-", theme::icon_warn());
                 eprintln!("  Examples:");
                 eprintln!("    /skill feedback pdf +     {} thumbs up", "—".dim());
                 eprintln!("    /skill feedback pdf -     {} thumbs down", "—".dim());
@@ -1448,7 +1448,7 @@ Follow these steps:
                 "+" | "+1" | "up" | "thumbs_up" | "good" | "yes" => true,
                 "-" | "-1" | "down" | "thumbs_down" | "bad" | "no" => false,
                 other => {
-                    eprintln!("  {} Unknown feedback type: {}", "✗".red(), other.yellow());
+                    eprintln!("  {} Unknown feedback type: {}", theme::icon_err(), other.yellow());
                     eprintln!("  Use + (positive) or - (negative)");
                     return Ok(());
                 }
@@ -1462,7 +1462,7 @@ Follow these steps:
             eprintln!(
                 "  {} Recorded {} feedback for skill '{}'",
                 emoji,
-                word.cyan(),
+                word.magenta(),
                 skill_name.green()
             );
         }
@@ -1560,7 +1560,7 @@ fn print_skill_directory_raw(name: &str, skill_dir: &std::path::Path) -> Result<
                     "\n{}",
                     format!("─── {name}/SKILL.md frontmatter ────────────────────────────")
                         .bold()
-                        .cyan()
+                        .magenta()
                 );
                 for line in yaml_block.lines() {
                     eprintln!("  {line}");
@@ -1581,7 +1581,7 @@ fn print_skill_directory_raw(name: &str, skill_dir: &std::path::Path) -> Result<
             "\n{}",
             format!("─── {name}/skill.json (legacy) ─────────────────────────────")
                 .bold()
-                .cyan()
+                .magenta()
         );
         for line in pretty.lines() {
             eprintln!("  {line}");
@@ -1986,7 +1986,7 @@ Skill auto-generated from session {session_short}.
     eprintln!(
         "\n  {} Skill '{}' created from session analysis",
         theme::icon_ok(),
-        name.to_string().cyan()
+        name.to_string().magenta()
     );
     eprintln!("  {}", format!("  Path: {}", skill_dir.display()).dim());
     eprintln!(
@@ -2866,7 +2866,7 @@ async fn upload_quality_report(
             "Quality upload:".dim()
         );
     } else if uploaded > 0 {
-        eprintln!("  {} {uploaded} skill reports uploaded.", "✓".green());
+        eprintln!("  {} {uploaded} skill reports uploaded.", theme::icon_ok());
     } else {
         eprintln!(
             "  {}",
@@ -2910,7 +2910,7 @@ async fn install_skill_from_marketplace(
     if installed_names.len() > 1 {
         eprintln!(
             "  {} Installed {} skills total: {}",
-            "✓".green(),
+            theme::icon_ok(),
             installed_names.len(),
             installed_names.join(", ").dim()
         );
@@ -2936,7 +2936,7 @@ fn install_skill_recursive<'a>(
                 "  {} Dependency depth limit ({}) reached for '{}'",
                 theme::icon_warn(),
                 MAX_DEP_INSTALL_DEPTH,
-                name.cyan()
+                name.magenta()
             );
             return;
         }
@@ -2964,7 +2964,7 @@ fn install_skill_recursive<'a>(
                 eprintln!(
                     "  {} '{}' v{} does not satisfy {}, upgrading…",
                     theme::icon_warn(),
-                    skill_name.cyan(),
+                    skill_name.magenta(),
                     existing.version.to_string().dim(),
                     constraint.to_string().yellow()
                 );
@@ -2980,8 +2980,8 @@ fn install_skill_recursive<'a>(
         if depth == 0 {
             eprintln!(
                 "  {} {}{}",
-                "Installing".cyan(),
-                skill_name.cyan().bold(),
+                "Installing".magenta(),
+                skill_name.magenta().bold(),
                 explicit_version
                     .map(|v| format!("@{v}"))
                     .unwrap_or(constraint_label)
@@ -2990,8 +2990,8 @@ fn install_skill_recursive<'a>(
         } else {
             eprintln!(
                 "  {} {}{} (dependency)",
-                "Installing".cyan(),
-                skill_name.cyan(),
+                "Installing".magenta(),
+                skill_name.magenta(),
                 constraint_label.dim()
             );
         }
@@ -3013,7 +3013,7 @@ fn install_skill_recursive<'a>(
                         eprintln!(
                             "  {} Installed '{}' v{} does not satisfy constraint {}",
                             theme::icon_warn(),
-                            skill_name.cyan(),
+                            skill_name.magenta(),
                             m.version.to_string().dim(),
                             constraint.to_string().yellow()
                         );
@@ -3039,7 +3039,7 @@ fn install_skill_recursive<'a>(
                 eprintln!(
                     "  {} {} has {} dependencies",
                     "→".dim(),
-                    skill_name.cyan(),
+                    skill_name.magenta(),
                     skill_deps.len()
                 );
 
@@ -3093,8 +3093,8 @@ async fn install_single_skill(
                     Ok((installed, manifest)) => {
                         eprintln!(
                             "  {} Installed {} v{} to {}",
-                            "✓".green(),
-                            manifest.name.cyan(),
+                            theme::icon_ok(),
+                            manifest.name.magenta(),
                             manifest.version.dim(),
                             installed.display().to_string().dim()
                         );
@@ -3183,8 +3183,8 @@ async fn install_single_skill_legacy(
 
                 eprintln!(
                     "  {} Installed {} v{} to {}",
-                    "✓".green(),
-                    record.skill_name.cyan(),
+                    theme::icon_ok(),
+                    record.skill_name.magenta(),
                     record.version.dim(),
                     install_dir.display().to_string().dim()
                 );
@@ -3234,7 +3234,7 @@ async fn publish_skill_to_marketplace(
             eprintln!(
                 "  {} {}",
                 "✗ Skill not found locally:".yellow(),
-                name.cyan()
+                name.magenta()
             );
             eprintln!(
                 "  {}",
@@ -3257,8 +3257,8 @@ async fn publish_skill_to_marketplace(
 
     eprintln!(
         "  {} {} v{}...",
-        "Publishing".cyan(),
-        name.cyan().bold(),
+        "Publishing".magenta(),
+        name.magenta().bold(),
         manifest.version.to_string().dim()
     );
     let category = default_skill_category(manifest.category.as_deref());
@@ -3288,8 +3288,8 @@ async fn publish_skill_to_marketplace(
                     Ok(_) => {
                         eprintln!(
                             "  {} Published {} v{} ({} bundle)",
-                            "✓".green(),
-                            name.cyan(),
+                            theme::icon_ok(),
+                            name.magenta(),
                             manifest.version.to_string().dim(),
                             format_bytes(bundle_bytes.len() as u64).dim()
                         );
@@ -3341,8 +3341,8 @@ async fn publish_skill_to_marketplace(
         Ok(_) => {
             eprintln!(
                 "  {} Published {} v{} to marketplace.",
-                "✓".green(),
-                name.cyan(),
+                theme::icon_ok(),
+                name.magenta(),
                 manifest.version.to_string().dim()
             );
         }
@@ -3391,7 +3391,7 @@ async fn uninstall_local_skill(name: &str, state: &mut ReplState) {
             eprintln!(
                 "  {} Remove skill '{}' from {}?",
                 theme::icon_warn(),
-                name.cyan(),
+                name.magenta(),
                 dir.display().to_string().dim()
             );
             eprint!("  Confirm [y/N]: ");
@@ -3407,8 +3407,8 @@ async fn uninstall_local_skill(name: &str, state: &mut ReplState) {
                 Ok(()) => {
                     eprintln!(
                         "  {} Removed skill '{}' from {}",
-                        "✓".green(),
-                        name.cyan(),
+                        theme::icon_ok(),
+                        name.magenta(),
                         dir.display().to_string().dim()
                     );
                     // Refresh registry
@@ -3424,7 +3424,7 @@ async fn uninstall_local_skill(name: &str, state: &mut ReplState) {
             eprintln!(
                 "  {} Skill '{}' not found in local paths.",
                 "✗".yellow(),
-                name.cyan()
+                name.magenta()
             );
             eprintln!("  {}", "Searched:".dim());
             for p in &search_paths {
@@ -3466,7 +3466,7 @@ fn pack_skill_bundle(name: &str) {
             eprintln!(
                 "  {} Skill '{}' not found in local paths.",
                 "✗".yellow(),
-                name.cyan()
+                name.magenta()
             );
             return;
         }
@@ -3482,13 +3482,13 @@ fn pack_skill_bundle(name: &str) {
                 .unwrap_or_else(|_| "?".to_string());
             eprintln!(
                 "  {} Packed {} v{} → {} ({})",
-                "✓".green(),
-                manifest.name.cyan(),
+                theme::icon_ok(),
+                manifest.name.magenta(),
                 manifest.version.dim(),
                 path.file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
-                    .cyan()
+                    .magenta()
                     .bold(),
                 size.dim()
             );
@@ -3514,7 +3514,7 @@ async fn unpack_skill_bundle(path_str: &str, state: &mut ReplState) {
 
     let bundle_path = std::path::Path::new(path_str);
     if !bundle_path.exists() {
-        eprintln!("  {} File not found: {}", "✗".yellow(), path_str.cyan());
+        eprintln!("  {} File not found: {}", "✗".yellow(), path_str.magenta());
         return;
     }
 
@@ -3527,8 +3527,8 @@ async fn unpack_skill_bundle(path_str: &str, state: &mut ReplState) {
         Ok((installed, manifest)) => {
             eprintln!(
                 "  {} Unpacked {} v{} to {}",
-                "✓".green(),
-                manifest.name.cyan(),
+                theme::icon_ok(),
+                manifest.name.magenta(),
                 manifest.version.dim(),
                 installed.display().to_string().dim()
             );
@@ -3554,14 +3554,14 @@ fn inspect_skill_bundle(path_str: &str) {
 
     let bundle_path = std::path::Path::new(path_str);
     if !bundle_path.exists() {
-        eprintln!("  {} File not found: {}", "✗".yellow(), path_str.cyan());
+        eprintln!("  {} File not found: {}", "✗".yellow(), path_str.magenta());
         return;
     }
 
     match astra_skills::pack::inspect_bundle(bundle_path) {
         Ok(manifest) => {
             eprintln!("  {}", "Bundle contents:".bold());
-            eprintln!("    Name:        {}", manifest.name.cyan());
+            eprintln!("    Name:        {}", manifest.name.magenta());
             eprintln!("    Version:     {}", manifest.version.dim());
             eprintln!("    Description: {}", manifest.description);
             if let Some(ref author) = manifest.author {
@@ -3701,7 +3701,7 @@ async fn check_skill_updates(name: &str, api: &astra_thin_client::ThinClient, to
                         if remote_ver > local_ver {
                             eprintln!(
                                 "  {} {} → {} {}",
-                                skill_name.cyan(),
+                                skill_name.magenta(),
                                 local_ver.to_string().dim(),
                                 remote_ver.to_string().green(),
                                 "(update available)".green()
@@ -3710,7 +3710,7 @@ async fn check_skill_updates(name: &str, api: &astra_thin_client::ThinClient, to
                         } else {
                             eprintln!(
                                 "  {} {} {}",
-                                skill_name.cyan(),
+                                skill_name.magenta(),
                                 local_ver.to_string().dim(),
                                 "(up to date)".dim()
                             );
@@ -3719,7 +3719,7 @@ async fn check_skill_updates(name: &str, api: &astra_thin_client::ThinClient, to
                     Err(_) => {
                         eprintln!(
                             "  {} {} {}",
-                            skill_name.cyan(),
+                            skill_name.magenta(),
                             local_ver.to_string().dim(),
                             format!("(marketplace version '{remote_str}' unparseable)").yellow()
                         );
@@ -3729,7 +3729,7 @@ async fn check_skill_updates(name: &str, api: &astra_thin_client::ThinClient, to
             (Some((_path, local_ver)), None) => {
                 eprintln!(
                     "  {} {} {}",
-                    skill_name.cyan(),
+                    skill_name.magenta(),
                     local_ver.to_string().dim(),
                     "(not found in marketplace)".dim()
                 );
@@ -3739,7 +3739,7 @@ async fn check_skill_updates(name: &str, api: &astra_thin_client::ThinClient, to
                     eprintln!(
                         "  {} Skill '{}' not found locally.",
                         "✗".yellow(),
-                        skill_name.cyan()
+                        skill_name.magenta()
                     );
                 }
             }
@@ -3751,7 +3751,7 @@ async fn check_skill_updates(name: &str, api: &astra_thin_client::ThinClient, to
     } else {
         eprintln!(
             "\n  {} {} update(s) available. Use '/skill upgrade <name>' to upgrade.",
-            "ℹ".cyan(),
+            "ℹ".magenta(),
             updates_available
         );
     }
@@ -3789,7 +3789,7 @@ async fn upgrade_skill(
             eprintln!(
                 "  {} Skill '{}' not found locally. Use '/skill install {}' first.",
                 "✗".yellow(),
-                skill_name.cyan(),
+                skill_name.magenta(),
                 skill_name
             );
             eprintln!();
@@ -3804,7 +3804,7 @@ async fn upgrade_skill(
             eprintln!(
                 "  {} Skill '{}' not found in marketplace.",
                 "✗".yellow(),
-                skill_name.cyan()
+                skill_name.magenta()
             );
             eprintln!();
             return;
@@ -3827,8 +3827,8 @@ async fn upgrade_skill(
     if remote_ver <= local_ver {
         eprintln!(
             "  {} '{}' is already at v{} (latest).",
-            "✓".green(),
-            skill_name.cyan(),
+            theme::icon_ok(),
+            skill_name.magenta(),
             local_ver
         );
         eprintln!();
@@ -3837,8 +3837,8 @@ async fn upgrade_skill(
 
     eprintln!(
         "  {} Upgrading '{}': {} → {}",
-        "⬆".cyan(),
-        skill_name.cyan(),
+        "⬆".magenta(),
+        skill_name.magenta(),
         local_ver.to_string().dim(),
         remote_ver.to_string().green()
     );
@@ -3925,8 +3925,8 @@ async fn upgrade_all_skills(api: &astra_thin_client::ThinClient, tok: &str, stat
             Some((local_path, local_ver)) if remote_ver > local_ver => {
                 eprintln!(
                     "  {} Upgrading '{}': {} → {}",
-                    "⬆".cyan(),
-                    skill_name.cyan(),
+                    "⬆".magenta(),
+                    skill_name.magenta(),
                     local_ver.to_string().dim(),
                     remote_ver.to_string().green()
                 );
@@ -4002,13 +4002,13 @@ async fn rollback_skill(
                 eprintln!(
                     "  {} Skill '{}' is not installed on the server.",
                     "✗".yellow(),
-                    name.cyan()
+                    name.magenta()
                 );
             } else if msg.contains("400") || msg.contains("No previous version") {
                 eprintln!(
                     "  {} No previous version to rollback to for '{}'.",
                     "✗".yellow(),
-                    name.cyan()
+                    name.magenta()
                 );
             } else {
                 eprintln!("  {} {}", "✗ Rollback failed:".yellow(), msg.dim());
@@ -4021,8 +4021,8 @@ async fn rollback_skill(
     let target_version = &resp.skill_version;
     eprintln!(
         "  {} Rolling back '{}' to v{}",
-        "⬇".cyan(),
-        name.cyan(),
+        "⬇".magenta(),
+        name.magenta(),
         target_version.as_str().dim()
     );
 
@@ -4113,7 +4113,7 @@ async fn browse_marketplace(
                             let desc = truncate_desc(r.description.as_deref().unwrap_or(""), 28);
                             eprintln!(
                                 "  {:<24}  {:<8}  {:<12}  {:<10}  {:<6}  {}",
-                                r.skill_name.as_str().cyan(),
+                                r.skill_name.as_str().magenta(),
                                 r.version.as_str().dim(),
                                 cat.dim(),
                                 tier.dim(),
@@ -4192,7 +4192,7 @@ async fn trending_marketplace(api: &astra_thin_client::ThinClient, token: Option
                             eprintln!(
                                 "  {}  {:<22}  {:<8}  {:<6.2}  {:<8}  {:<7}  {}",
                                 rank_color,
-                                r.skill_name.as_str().cyan(),
+                                r.skill_name.as_str().magenta(),
                                 r.version.as_str().dim(),
                                 r.ranking_score,
                                 r.total_installs,
@@ -4254,13 +4254,13 @@ async fn list_installed_marketplace(api: &astra_thin_client::ThinClient, token: 
                         for inst in &resp.installations {
                             let status_colored = match inst.status.as_str() {
                                 "installed" => inst.status.as_str().green().to_string(),
-                                "upgraded" => inst.status.as_str().cyan().to_string(),
+                                "upgraded" => inst.status.as_str().magenta().to_string(),
                                 "rolled_back" => inst.status.as_str().yellow().to_string(),
                                 _ => inst.status.clone(),
                             };
                             eprintln!(
                                 "  {:<24}  {:<10}  {:<12}  {}",
-                                inst.skill_name.as_str().cyan(),
+                                inst.skill_name.as_str().magenta(),
                                 inst.skill_version.as_str().dim(),
                                 status_colored,
                                 inst.installed_at.as_str().dim()

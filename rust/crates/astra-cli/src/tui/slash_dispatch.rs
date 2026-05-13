@@ -1319,7 +1319,17 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
                 ctx.bottom_pane.push_view(Box::new(view));
             }
         }
-        Err(e) => ctx.show_error(format!("Failed to fetch models: {e}")),
+        Err(e) => {
+            let msg = e.to_string();
+            let short = if msg.contains("401") || msg.contains("Unauthorized") {
+                "Not authorized — try /login first".to_string()
+            } else if msg.contains("connect") || msg.contains("timeout") {
+                "Cannot reach server — check connection".to_string()
+            } else {
+                format!("Failed to fetch models: {}", msg.lines().next().unwrap_or(&msg))
+            };
+            ctx.show_error(short);
+        }
     }
     SlashResult::Handled
 }
@@ -1831,7 +1841,7 @@ fn push_history_info(
 
     let dim = Style::default().fg(Color::DarkGray);
     let bold = Style::default().add_modifier(Modifier::BOLD);
-    let role_user = Style::default().fg(Color::Cyan);
+    let role_user = Style::default().fg(crate::tui::theme::current().accent);
     let role_assistant = Style::default().fg(Color::Green);
 
     let mut lines: Vec<Line<'static>> = Vec::new();

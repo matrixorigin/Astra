@@ -66,19 +66,19 @@ fn show_summary(
         "\n{}",
         "─── Observability Session ───────────────────────"
             .bold()
-            .cyan()
+            .magenta()
     );
 
     // Session info
     eprintln!(
         "  {:<18} {}",
         "session_id:".dim(),
-        state.session_id.as_deref().unwrap_or("none").cyan()
+        state.session_id.as_deref().unwrap_or("none").magenta()
     );
     eprintln!(
         "  {:<18} {}",
         "user_id:".dim(),
-        session_guard.user_id.clone().cyan()
+        session_guard.user_id.clone().magenta()
     );
 
     // Timing
@@ -92,13 +92,13 @@ fn show_summary(
     } else {
         format!("{:.1}s", duration.as_secs_f64())
     };
-    eprintln!("  {:<18} {}", "duration:".dim(), duration_str.cyan());
+    eprintln!("  {:<18} {}", "duration:".dim(), duration_str.magenta());
 
     // Turn count
     eprintln!(
         "  {:<18} {}",
         "turns_tracked:".dim(),
-        session_guard.turn_number.to_string().cyan()
+        session_guard.turn_number.to_string().magenta()
     );
 
     // Turn timings summary
@@ -114,14 +114,14 @@ fn show_summary(
         eprintln!(
             "  {:<18} {}ms avg ({} total)",
             "turn_time:".dim(),
-            avg_ms.to_string().cyan(),
+            avg_ms.to_string().magenta(),
             format!("{}ms", total_ms).dim()
         );
         eprintln!(
             "  {:<18} {}ms LLM · {}ms tools",
             "breakdown:".dim(),
-            llm_ms.to_string().cyan(),
-            tool_ms.to_string().cyan()
+            llm_ms.to_string().magenta(),
+            tool_ms.to_string().magenta()
         );
     }
 
@@ -132,21 +132,21 @@ fn show_summary(
     eprintln!(
         "  {:<18} {}",
         "context_traces:".dim(),
-        session_guard.context_traces.len().to_string().cyan()
+        session_guard.context_traces.len().to_string().magenta()
     );
 
     // Decisions
     eprintln!(
         "  {:<18} {}",
         "decisions:".dim(),
-        session_guard.decision_explanations.len().to_string().cyan()
+        session_guard.decision_explanations.len().to_string().magenta()
     );
 
     // Recent queries for drift
     eprintln!(
         "  {:<18} {}",
         "queries_tracked:".dim(),
-        session_guard.recent_queries.len().to_string().cyan()
+        session_guard.recent_queries.len().to_string().magenta()
     );
 
     if !session_guard.fuzzy_match_events.is_empty() {
@@ -177,12 +177,12 @@ fn show_summary(
         eprintln!(
             "  {:<18} {}",
             "fuzzy_events:".dim(),
-            session_guard.fuzzy_match_events.len().to_string().cyan()
+            session_guard.fuzzy_match_events.len().to_string().magenta()
         );
         eprintln!(
             "  {:<18} {} matched · {} ambiguous · {} misses",
             "fuzzy_stats:".dim(),
-            matched.to_string().cyan(),
+            matched.to_string().magenta(),
             ambiguous.to_string().yellow(),
             not_found.to_string().red()
         );
@@ -192,7 +192,7 @@ fn show_summary(
                 .map(|(strategy, count)| format!("{strategy}:{count}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            eprintln!("  {:<18} {}", "fuzzy_by_strategy:".dim(), strategies.cyan());
+            eprintln!("  {:<18} {}", "fuzzy_by_strategy:".dim(), strategies.magenta());
         }
     }
 
@@ -209,17 +209,17 @@ fn show_summary(
         eprintln!(
             "  {:<18} {}",
             "total_queries:".dim(),
-            profile.stats.total_queries.to_string().cyan()
+            profile.stats.total_queries.to_string().magenta()
         );
         eprintln!(
             "  {:<18} {}",
             "total_tool_calls:".dim(),
-            profile.stats.total_tool_calls.to_string().cyan()
+            profile.stats.total_tool_calls.to_string().magenta()
         );
         eprintln!(
             "  {:<18} {}",
             "avg_session_secs:".dim(),
-            format!("{:.1}", profile.stats.avg_session_duration_secs).cyan()
+            format!("{:.1}", profile.stats.avg_session_duration_secs).magenta()
         );
     }
 
@@ -247,7 +247,7 @@ fn show_turn_timings(
         "\n{}",
         "─── Turn Timings ────────────────────────────────"
             .bold()
-            .cyan()
+            .magenta()
     );
     eprintln!(
         "  {:<6} {:>10} {:>10} {:>10} {:>10}",
@@ -275,7 +275,7 @@ fn show_turn_timings(
 
         eprintln!(
             "  {:<6} {:>10} {:>10} {:>10} {:>10}",
-            format!("T{}", timing.turn).cyan(),
+            format!("T{}", timing.turn).magenta(),
             total_str,
             ctx_str,
             llm_str,
@@ -297,7 +297,7 @@ fn show_drift_analysis(
         "\n{}",
         "─── Focus Drift Analysis ────────────────────────"
             .bold()
-            .cyan()
+            .magenta()
     );
 
     if session_guard.recent_queries.is_empty() {
@@ -345,7 +345,7 @@ fn show_decisions(
         "\n{}",
         "─── Decision History ────────────────────────────"
             .bold()
-            .cyan()
+            .magenta()
     );
 
     for (i, decision) in session_guard.decision_explanations.iter().enumerate() {
@@ -404,7 +404,7 @@ fn show_decisions(
         eprintln!(
             "  {} {} — {} confidence",
             format!("[{}]", i + 1).dim(),
-            type_label.cyan(),
+            type_label.magenta(),
             conf_color
         );
 
@@ -437,25 +437,25 @@ fn show_user_profile(
         "\n{}",
         "─── User Profile ────────────────────────────────"
             .bold()
-            .cyan()
+            .magenta()
     );
-    eprintln!("  {:<20} {}", "user_id:".dim(), user_id.cyan());
+    eprintln!("  {:<20} {}", "user_id:".dim(), user_id.magenta());
     eprintln!();
     eprintln!("  {}", "— Statistics —".dim());
     eprintln!(
         "  {:<20} {}",
         "total_queries:".dim(),
-        profile.stats.total_queries.to_string().cyan()
+        profile.stats.total_queries.to_string().magenta()
     );
     eprintln!(
         "  {:<20} {}",
         "total_tool_calls:".dim(),
-        profile.stats.total_tool_calls.to_string().cyan()
+        profile.stats.total_tool_calls.to_string().magenta()
     );
     eprintln!(
         "  {:<20} {}",
         "avg_session_secs:".dim(),
-        format!("{:.1}", profile.stats.avg_session_duration_secs).cyan()
+        format!("{:.1}", profile.stats.avg_session_duration_secs).magenta()
     );
 
     // Top tools
@@ -465,7 +465,7 @@ fn show_user_profile(
         let mut tools: Vec<_> = profile.stats.tool_usage.iter().collect();
         tools.sort_by(|a, b| b.1.cmp(a.1));
         for (tool, count) in tools.iter().take(5) {
-            eprintln!("    {} {}", format!("{:>4}×", count).cyan(), tool);
+            eprintln!("    {} {}", format!("{:>4}×", count).magenta(), tool);
         }
     }
 
@@ -504,49 +504,49 @@ fn show_help() {
         "\n{}",
         "─── Telemetry Commands ──────────────────────────"
             .bold()
-            .cyan()
+            .magenta()
     );
-    eprintln!("  {}          Show session summary", "/telemetry".cyan());
+    eprintln!("  {}          Show session summary", "/telemetry".magenta());
     eprintln!(
         "  {}    List per-turn timing breakdowns",
-        "/telemetry turns".cyan()
+        "/telemetry turns".magenta()
     );
     eprintln!(
         "  {}    Check focus drift analysis",
-        "/telemetry drift".cyan()
+        "/telemetry drift".magenta()
     );
     eprintln!(
         "  {}  List tool selection decisions",
-        "/telemetry decisions".cyan()
+        "/telemetry decisions".magenta()
     );
     eprintln!(
         "  {}  Show user profile/preferences",
-        "/telemetry profile".cyan()
+        "/telemetry profile".magenta()
     );
     eprintln!();
-    eprintln!("  {}", "── Deep Trace (per-turn detail) ──".bold().cyan());
+    eprintln!("  {}", "── Deep Trace (per-turn detail) ──".bold().magenta());
     eprintln!(
         "  {}  Context assembly for turn N",
-        "/telemetry context [N]".cyan()
+        "/telemetry context [N]".magenta()
     );
     eprintln!(
         "  {}  Hierarchical proportional analysis",
-        "/telemetry context-detail [N]".cyan()
+        "/telemetry context-detail [N]".magenta()
     );
     eprintln!(
         "  {}    Tool selection scoring for turn N",
-        "/telemetry tools [N]".cyan()
+        "/telemetry tools [N]".magenta()
     );
     eprintln!(
         "  {}  History compression for turn N",
-        "/telemetry compression [N]".cyan()
+        "/telemetry compression [N]".magenta()
     );
-    eprintln!("  {}   Token budget evolution", "/telemetry budget".cyan());
+    eprintln!("  {}   Token budget evolution", "/telemetry budget".magenta());
     eprintln!();
-    eprintln!("  {}", "── Session-Level Analysis ──".bold().cyan());
+    eprintln!("  {}", "── Session-Level Analysis ──".bold().magenta());
     eprintln!(
         "  {}  Multi-turn context evolution",
-        "/telemetry session".cyan()
+        "/telemetry session".magenta()
     );
     eprintln!();
     eprintln!(
@@ -595,7 +595,7 @@ fn show_context_trace(
             trace.turn_id
         )
         .bold()
-        .cyan()
+        .magenta()
     );
 
     // ── System Prompt Breakdown ──
@@ -605,23 +605,23 @@ fn show_context_trace(
     eprintln!(
         "    {:<22} {} tokens",
         "base_persona:".dim(),
-        sp.base_persona_tokens.to_string().cyan()
+        sp.base_persona_tokens.to_string().magenta()
     );
     eprintln!(
         "    {:<22} {} tokens",
         "environment:".dim(),
-        sp.environment_tokens.to_string().cyan()
+        sp.environment_tokens.to_string().magenta()
     );
     eprintln!(
         "    {:<22} {} tokens",
         "user_preferences:".dim(),
-        sp.user_preferences_tokens.to_string().cyan()
+        sp.user_preferences_tokens.to_string().magenta()
     );
     if !sp.skills_injected.is_empty() {
         eprintln!(
             "    {:<22} {} skills",
             "skills:".dim(),
-            sp.skills_injected.len().to_string().cyan()
+            sp.skills_injected.len().to_string().magenta()
         );
         for sk in &sp.skills_injected {
             let ver = sk
@@ -632,7 +632,7 @@ fn show_context_trace(
             eprintln!(
                 "      {} {}{} ({} tok) — {}",
                 "•".dim(),
-                sk.skill_name.clone().cyan(),
+                sk.skill_name.clone().magenta(),
                 ver.dim(),
                 sk.tokens,
                 sk.selection_reason.clone().dim()
@@ -643,7 +643,7 @@ fn show_context_trace(
         eprintln!(
             "    {:<22} {} memories",
             "repo_memories:".dim(),
-            sp.repository_memories.len().to_string().cyan()
+            sp.repository_memories.len().to_string().magenta()
         );
         for mem in &sp.repository_memories {
             let preview: String = mem.content_preview.chars().take(50).collect();
@@ -666,7 +666,7 @@ fn show_context_trace(
     eprintln!(
         "    {:<22} {} tokens",
         "total:".bold().dim(),
-        sp.total_tokens.to_string().cyan().bold()
+        sp.total_tokens.to_string().magenta().bold()
     );
 
     // ── Memory Retrieval ──
@@ -682,7 +682,7 @@ fn show_context_trace(
         eprintln!(
             "    {:<22} {} considered → {} selected ({} tok, {}ms)",
             "results:".dim(),
-            mem.candidates_considered.to_string().cyan(),
+            mem.candidates_considered.to_string().magenta(),
             mem.memories_selected.len().to_string().green(),
             mem.total_tokens,
             mem.retrieval_latency_ms
@@ -699,7 +699,7 @@ fn show_context_trace(
                 };
                 eprintln!(
                     "      {} [{:.2}] {:?} {} tok — {}{}",
-                    "✓".green(),
+                    theme::icon_ok(),
                     m.relevance_score,
                     m.source,
                     m.tokens,
@@ -720,7 +720,7 @@ fn show_context_trace(
                 let reason = format_rejection_reason(&m.rejection_reason);
                 eprintln!(
                     "      {} [{:.2}] {} — {}",
-                    "✗".red(),
+                    theme::icon_err(),
                     m.relevance_score,
                     m.memory_id.clone().dim(),
                     reason
@@ -744,7 +744,7 @@ fn show_context_trace(
     eprintln!(
         "    {:<22} {} / {} ({} pressure{})",
         "usage:".dim(),
-        tb.total_used.to_string().cyan(),
+        tb.total_used.to_string().magenta(),
         tb.max_tokens.to_string().dim(),
         pressure_colored,
         if tb.compression_triggered {
@@ -775,7 +775,7 @@ fn show_context_trace(
         eprintln!(
             "    {:<22} {:>6} ({:>2}%) {}",
             format!("{label}:").dim(),
-            tokens.to_string().cyan(),
+            tokens.to_string().magenta(),
             pct,
             bar.dim()
         );
@@ -798,7 +798,7 @@ fn show_context_trace(
             eprintln!(
                 "    {} {} — {} confidence",
                 "•".dim(),
-                type_label.cyan(),
+                type_label.magenta(),
                 conf
             );
             let reasoning: String = exp.reasoning.chars().take(80).collect();
@@ -859,13 +859,13 @@ fn show_tool_trace(
             trace.turn_id
         )
         .bold()
-        .cyan()
+        .magenta()
     );
 
     eprintln!(
         "  {:<22} {}",
         "strategy:".dim(),
-        ts.selection_strategy.clone().cyan()
+        ts.selection_strategy.clone().magenta()
     );
     let conf_str = format!("{:.0}%", ts.selection_confidence * 100.0);
     let conf = if ts.selection_confidence > 0.7 {
@@ -987,13 +987,13 @@ fn show_compression_trace(
             trace.turn_id
         )
         .bold()
-        .cyan()
+        .magenta()
     );
 
     eprintln!(
         "  {:<22} {}",
         "turns_available:".dim(),
-        h.total_turns_available.to_string().cyan()
+        h.total_turns_available.to_string().magenta()
     );
     let ratio_str = format!("{:.0}%", h.compression_ratio * 100.0);
     let ratio = if h.compression_ratio > 0.5 {
@@ -1009,7 +1009,7 @@ fn show_compression_trace(
         "  {:<22} {} → {} ({} saved)",
         "tokens:".dim(),
         h.tokens_before.to_string().dim(),
-        h.tokens_after.to_string().cyan(),
+        h.tokens_after.to_string().magenta(),
         saved.to_string().green()
     );
     eprintln!(
@@ -1028,7 +1028,7 @@ fn show_compression_trace(
             let tool_flag = if t.has_tool_calls { " 🔧" } else { "" };
             eprintln!(
                 "    {} T{:<3} {:>6} tok  {}{}",
-                "✓".green(),
+                theme::icon_ok(),
                 t.turn_index,
                 t.tokens,
                 t.role.clone().dim(),
@@ -1089,7 +1089,7 @@ fn show_compression_trace(
             .map(|t| format!("T{t}"))
             .collect::<Vec<_>>()
             .join(", ");
-        eprintln!("    {} {}", "✗".red(), turns_str.dim());
+        eprintln!("    {} {}", theme::icon_err(), turns_str.dim());
     }
 
     eprintln!();
@@ -1114,7 +1114,7 @@ fn show_budget_evolution(
         "\n{}",
         "─── Token Budget Evolution ─────────────────────"
             .bold()
-            .cyan()
+            .magenta()
     );
 
     // Table header
@@ -1144,7 +1144,7 @@ fn show_budget_evolution(
         let compress_flag = if tb.compression_triggered { " ⚠" } else { "" };
         eprintln!(
             "  {:<6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8}{}",
-            format!("T{}", i + 1).cyan(),
+            format!("T{}", i + 1).magenta(),
             tb.system_prompt_tokens,
             tb.history_tokens,
             tb.memory_tokens,
@@ -1247,12 +1247,12 @@ fn show_context_detail(
             trace.turn_id
         )
         .bold()
-        .cyan()
+        .magenta()
     );
     eprintln!(
         "  {} {} / {} tokens  (pressure: {})",
         "Total:".bold(),
-        tb.total_used.to_string().cyan().bold(),
+        tb.total_used.to_string().magenta().bold(),
         tb.max_tokens.to_string().dim(),
         format_pressure(tb.budget_pressure)
     );
@@ -1264,7 +1264,7 @@ fn show_context_detail(
     eprintln!(
         "  {} {} tokens ({:.1}%)",
         "▸ System Prompt".bold(),
-        tb.system_prompt_tokens.to_string().cyan(),
+        tb.system_prompt_tokens.to_string().magenta(),
         sp_pct
     );
     eprintln!("  {}", proportional_bar(sp_pct, 50));
@@ -1294,7 +1294,7 @@ fn show_context_detail(
         eprintln!(
             "    {:<20} {:>6} tok  {:>5.1}% of system  {:>5.1}% of total  {}",
             format!("{label}:").dim(),
-            tokens.to_string().cyan(),
+            tokens.to_string().magenta(),
             sub_pct,
             global_pct,
             mini_bar(sub_pct, 20)
@@ -1313,7 +1313,7 @@ fn show_context_detail(
             eprintln!(
                 "      {} {}{} — {} tok ({:.1}%)",
                 "•".dim(),
-                sk.skill_name.clone().cyan(),
+                sk.skill_name.clone().magenta(),
                 ver.dim(),
                 sk.tokens,
                 sk_pct
@@ -1350,7 +1350,7 @@ fn show_context_detail(
     eprintln!(
         "  {} {} tokens ({:.1}%)",
         "▸ History".bold(),
-        tb.history_tokens.to_string().cyan(),
+        tb.history_tokens.to_string().magenta(),
         hist_pct
     );
     eprintln!("  {}", proportional_bar(hist_pct, 50));
@@ -1360,7 +1360,7 @@ fn show_context_detail(
             "    {:<20} {} → {} tokens ({:.0}% compression)",
             "compression:".dim(),
             hist.tokens_before.to_string().dim(),
-            hist.tokens_after.to_string().cyan(),
+            hist.tokens_after.to_string().magenta(),
             hist.compression_ratio * 100.0
         );
     }
@@ -1378,7 +1378,7 @@ fn show_context_detail(
         eprintln!(
             "    {:<20} {} tokens across {} turns",
             "retained:".dim(),
-            retained_total.to_string().cyan(),
+            retained_total.to_string().magenta(),
             hist.turns_retained.len()
         );
         for t in hist.turns_retained.iter().take(5) {
@@ -1418,7 +1418,7 @@ fn show_context_detail(
                 "      T{:<3} {} → {} tok ({}) {}",
                 t.turn_index,
                 t.original_tokens.to_string().dim(),
-                t.compressed_tokens.to_string().cyan(),
+                t.compressed_tokens.to_string().magenta(),
                 format_compression_method(&t.compression_method),
                 t.information_lost
                     .first()
@@ -1439,7 +1439,7 @@ fn show_context_detail(
     eprintln!(
         "  {} {} tokens ({:.1}%)",
         "▸ Memory".bold(),
-        tb.memory_tokens.to_string().cyan(),
+        tb.memory_tokens.to_string().magenta(),
         mem_pct
     );
     eprintln!("  {}", proportional_bar(mem_pct, 50));
@@ -1466,7 +1466,7 @@ fn show_context_detail(
             };
             eprintln!(
                 "      {} [{:.2}] {:>4} tok ({:>4.1}%) {:?} {}{}",
-                "✓".green(),
+                theme::icon_ok(),
                 m.relevance_score,
                 m.tokens,
                 m_local_pct,
@@ -1486,7 +1486,7 @@ fn show_context_detail(
     eprintln!(
         "  {} {} tokens ({:.1}%)",
         "▸ Tool Schemas".bold(),
-        tb.tool_schema_tokens.to_string().cyan(),
+        tb.tool_schema_tokens.to_string().magenta(),
         tool_pct
     );
     eprintln!("  {}", proportional_bar(tool_pct, 50));
@@ -1508,7 +1508,7 @@ fn show_context_detail(
             };
             eprintln!(
                 "      {:<22} {:>4} tok ({:>4.1}%)  score: {:.2}",
-                tool.tool_name.clone().cyan(),
+                tool.tool_name.clone().magenta(),
                 tool.tokens,
                 t_local_pct,
                 tool.score
@@ -1522,7 +1522,7 @@ fn show_context_detail(
     eprintln!(
         "  {} {} tokens ({:.1}%)",
         "▸ User Message".bold(),
-        tb.user_message_tokens.to_string().cyan(),
+        tb.user_message_tokens.to_string().magenta(),
         user_pct
     );
     eprintln!("  {}", proportional_bar(user_pct, 50));
@@ -1541,7 +1541,7 @@ fn show_context_detail(
         eprintln!(
             "    {:<18} {:>6} tok  {:>5.1}%  {}",
             format!("{label}:").dim(),
-            tokens.to_string().cyan(),
+            tokens.to_string().magenta(),
             pct,
             proportional_bar(*pct, 30)
         );
@@ -1573,12 +1573,12 @@ fn show_session_analysis(
         "\n{}",
         "─── Session Context Analysis ───────────────────"
             .bold()
-            .cyan()
+            .magenta()
     );
     eprintln!(
         "  {} {} turns analyzed",
         "Turns:".bold(),
-        traces.len().to_string().cyan()
+        traces.len().to_string().magenta()
     );
 
     // ── Per-Turn Timeline ──
@@ -1607,7 +1607,7 @@ fn show_session_analysis(
         };
         eprintln!(
             "    {:<6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8}{}",
-            format!("T{}", i + 1).cyan(),
+            format!("T{}", i + 1).magenta(),
             tb.system_prompt_tokens,
             tb.history_tokens,
             tb.memory_tokens,

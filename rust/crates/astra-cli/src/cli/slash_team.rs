@@ -492,7 +492,7 @@ pub(super) async fn handle_team_command(
                 "\n{}",
                 "─── Team ───────────────────────────────────────"
                     .bold()
-                    .cyan()
+                    .magenta()
             );
             let teams = state.team_registry.list();
             let names = teams
@@ -506,20 +506,20 @@ pub(super) async fn handle_team_command(
                 if names.is_empty() {
                     "(none)".dim().to_string()
                 } else {
-                    names.cyan().to_string()
+                    names.magenta().to_string()
                 }
             );
             eprintln!(
                 "  {:<16} {}",
                 "built-ins:".dim(),
-                "review, research, dev".cyan()
+                "review, research, dev".magenta()
             );
             eprintln!();
             eprintln!("  {}", team_subcommands_hint().dim());
             eprintln!("  {}", "Examples:".dim());
-            eprintln!("    {}", "/team info review".cyan());
-            eprintln!("    {}", "/team run review review the latest diff".cyan());
-            eprintln!("    {}", "/team snapshot dev before-refactor".cyan());
+            eprintln!("    {}", "/team info review".magenta());
+            eprintln!("    {}", "/team run review review the latest diff".magenta());
+            eprintln!("    {}", "/team snapshot dev before-refactor".magenta());
             eprintln!();
         }
 
@@ -536,13 +536,13 @@ pub(super) async fn handle_team_command(
                 "\n{}",
                 "─── Teams ───────────────────────────────────────────────"
                     .bold()
-                    .cyan()
+                    .magenta()
             );
             for t in &teams {
                 let member_names: Vec<_> = t.members.iter().map(|m| m.role.as_str()).collect();
                 eprintln!(
                     "\n  {} {}",
-                    t.name.as_str().cyan().bold(),
+                    t.name.as_str().magenta().bold(),
                     format!("({})", t.description).dim()
                 );
                 if member_names.is_empty() {
@@ -644,7 +644,7 @@ pub(super) async fn handle_team_command(
                     eprintln!(
                         "  {} Team '{}' created. Add members with /team add-member {} <role> <description>",
                         theme::icon_ok(),
-                        name.cyan(),
+                        name.magenta(),
                         name
                     );
                 }
@@ -692,7 +692,7 @@ pub(super) async fn handle_team_command(
                         "  {} Added role '{}' to team '{}'",
                         theme::icon_ok(),
                         role.green(),
-                        team.cyan()
+                        team.magenta()
                     );
                 }
                 Err(e) => eprintln!("  {} {e}", theme::icon_err()),
@@ -707,7 +707,7 @@ pub(super) async fn handle_team_command(
             }
             match state.team_registry.get(name) {
                 Some(t) => {
-                    eprintln!("\n  {} {}", "Team:".bold(), t.name.as_str().cyan().bold());
+                    eprintln!("\n  {} {}", "Team:".bold(), t.name.as_str().magenta().bold());
                     eprintln!("  {} {}", "Description:".dim(), t.description);
                     eprintln!("  {} {}", "Created:".dim(), t.created_at);
                     if let Some(ref coord) = t.coordination {
@@ -732,7 +732,7 @@ pub(super) async fn handle_team_command(
                         eprintln!("\n  {}", "Shared Context:".bold());
                         for (k, v) in &t.shared_context {
                             let preview = truncate_str(v, 60);
-                            eprintln!("    {} = {}", k.as_str().cyan(), preview);
+                            eprintln!("    {} = {}", k.as_str().magenta(), preview);
                         }
                     }
                     eprintln!();
@@ -787,7 +787,7 @@ pub(super) async fn handle_team_command(
                         theme::icon_ok(),
                         key,
                         truncate_str(value, 40),
-                        team.cyan()
+                        team.magenta()
                     );
                 }
                 Err(e) => eprintln!("  {} {e}", theme::icon_err()),
@@ -979,7 +979,7 @@ pub(super) async fn handle_team_command(
                         eprintln!(
                             "  {} Preparing team '{}' ({} members)...",
                             "🔄".dim(),
-                            team_name.cyan(),
+                            team_name.magenta(),
                             member_count
                         );
                     }
@@ -1057,7 +1057,7 @@ pub(super) async fn handle_team_command(
             // Print header
             eprintln!(
                 "\n{}",
-                format!("─── Team Run: {} ───", team_name).bold().cyan()
+                format!("─── Team Run: {} ───", team_name).bold().magenta()
             );
             for m in &cli_team.members {
                 eprintln!(
@@ -1101,7 +1101,7 @@ pub(super) async fn handle_team_command(
                             let prefix = if evt.agent_id.is_empty() {
                                 format!("  [{}] ", tag.dim())
                             } else {
-                                format!("  [{}] {} ", tag.dim(), evt.agent_id.cyan())
+                                format!("  [{}] {} ", tag.dim(), evt.agent_id.magenta())
                             };
                             match evt.style {
                                 HeadlessStderrStyle::Green =>
@@ -1287,14 +1287,14 @@ pub(super) async fn handle_team_command(
                         "green" => eprintln!(
                             "    {} {} {} — {}",
                             status_icon.green(),
-                            ar.agent_id.as_str().cyan(),
+                            ar.agent_id.as_str().magenta(),
                             status_label.dim(),
                             truncate_str(first_line, 72),
                         ),
                         _ => eprintln!(
                             "    {} {} {} — {}",
                             status_icon.red(),
-                            ar.agent_id.as_str().cyan(),
+                            ar.agent_id.as_str().magenta(),
                             status_label.dim(),
                             truncate_str(first_line, 72),
                         ),
@@ -1417,7 +1417,7 @@ pub(super) async fn handle_team_command(
             if registry_entries.is_empty() && store_entries.is_empty() {
                 eprintln!(
                     "\n  📜 No execution history for team '{}'.",
-                    name.cyan().bold()
+                    name.magenta().bold()
                 );
                 eprintln!("  {}", "  Use /team run to execute a task.".dim());
                 return;
@@ -1559,7 +1559,7 @@ pub(super) async fn handle_team_command(
                 "\n  {} Snapshot '{}' created for team '{}'",
                 theme::icon_ok(),
                 snapshot_id.as_str().dim(),
-                name.cyan()
+                name.magenta()
             );
             let dims = composite.dimensions();
             eprintln!("    {} Captured: {}", "📸".dim(), dims.join(", "),);
@@ -1683,7 +1683,7 @@ pub(super) async fn handle_team_command(
 
             eprintln!(
                 "\n  ⏪ Restoring team '{}' from snapshot '{}'...",
-                name.cyan(),
+                name.magenta(),
                 snap.snapshot_id.dim()
             );
             eprintln!("    {} {}", "Label:".dim(), snap.label);
@@ -1748,7 +1748,7 @@ pub(super) async fn handle_team_command(
                 eprintln!("  {} No recent team executions.", "ℹ️ ".dim());
                 return;
             }
-            eprintln!("\n{}", "─── Recent Team Runs ───".bold().cyan());
+            eprintln!("\n{}", "─── Recent Team Runs ───".bold().magenta());
             for e in &entries {
                 let icon = match e.status.as_str() {
                     "completed" => "✅",
@@ -1758,7 +1758,7 @@ pub(super) async fn handle_team_command(
                 eprintln!(
                     "  {} {} {} — {} ({} agents, {}tok)",
                     icon,
-                    e.team_name.as_str().cyan(),
+                    e.team_name.as_str().magenta(),
                     e.status.as_str().dim(),
                     truncate_str(&e.task, 50),
                     e.agent_count,
@@ -1790,7 +1790,7 @@ pub(super) async fn handle_team_command(
                 "\n{}",
                 "─── Agent Types ─────────────────────────────────────────"
                     .bold()
-                    .cyan()
+                    .magenta()
             );
             for def in all.iter() {
                 let tag = if registry.is_custom(&def.agent_type) {
@@ -1798,7 +1798,7 @@ pub(super) async fn handle_team_command(
                 } else {
                     " (builtin)".dim().to_string()
                 };
-                eprintln!("\n  {}{}", def.agent_type.as_str().cyan().bold(), tag,);
+                eprintln!("\n  {}{}", def.agent_type.as_str().magenta().bold(), tag,);
                 eprintln!("    {}", def.description.as_str().dim());
                 eprintln!(
                     "    {} {} | {} {} | {}",

@@ -334,10 +334,10 @@ fn render_subcmd_overlay_header(parent: &str, inner_width: usize) -> String {
     let pad = inner_width.saturating_sub(title_width);
     format!(
         "{}{}{}{}",
-        "╭".cyan(),
-        title.cyan().bold(),
-        "─".repeat(pad).cyan(),
-        "╮".cyan()
+        "╭".dim(),
+        title.magenta().bold(),
+        "─".repeat(pad).dim(),
+        "╮".dim()
     )
 }
 
@@ -350,10 +350,10 @@ fn render_subcmd_overlay_footer(total: usize, inner_width: usize) -> String {
     let pad = inner_width.saturating_sub(summary_width);
     format!(
         "{}{}{}{}",
-        "╰".cyan(),
+        "╰".dim(),
         summary.dim(),
-        "─".repeat(pad).cyan(),
-        "╯".cyan()
+        "─".repeat(pad).dim(),
+        "╯".dim()
     )
 }
 
@@ -424,8 +424,8 @@ pub(super) fn render_subcmd_overlay(parent: &str, filter: Option<&str>) {
         let content = if is_selected {
             format!(
                 "{} {:<command_width$} {}",
-                "❯".cyan().bold(),
-                cmd.cyan().bold(),
+                "❯".magenta().bold(),
+                cmd.magenta().bold(),
                 desc.bold()
             )
         } else {
@@ -433,9 +433,9 @@ pub(super) fn render_subcmd_overlay(parent: &str, filter: Option<&str>) {
         };
         let pad = inner_width.saturating_sub(visible_width(&content));
         let border = if is_selected {
-            "┃".cyan().bold()
+            "┃".magenta().bold()
         } else {
-            "│".cyan().dim()
+            "│".dim()
         };
         println!("{}{}{}{}", border, content, " ".repeat(pad), border);
         printed += 1;
@@ -1027,8 +1027,8 @@ fn slash_overlay_row_content(
     if selected {
         format!(
             "{} {:<command_width$} {}",
-            "❯".cyan().bold(),
-            label.cyan().bold(),
+            "❯".magenta().bold(),
+            label.magenta().bold(),
             desc.bold()
         )
     } else {
@@ -1096,10 +1096,10 @@ fn render_slash_overlay_header(filter: Option<&str>, inner_width: usize) -> Stri
     let pad = inner_width.saturating_sub(title_width);
     format!(
         "{}{}{}{}",
-        "╭".cyan(),
-        title.cyan().bold(),
-        "─".repeat(pad).cyan(),
-        "╮".cyan()
+        "╭".dim(),
+        title.magenta().bold(),
+        "─".repeat(pad).dim(),
+        "╮".dim()
     )
 }
 
@@ -1126,10 +1126,10 @@ fn render_slash_overlay_footer(
     let pad = inner_width.saturating_sub(summary_width);
     format!(
         "{}{}{}{}",
-        "╰".cyan(),
+        "╰".dim(),
         summary.dim(),
-        "─".repeat(pad).cyan(),
-        "╯".cyan()
+        "─".repeat(pad).dim(),
+        "╯".dim()
     )
 }
 
@@ -1137,10 +1137,10 @@ fn render_slash_overlay_context_line(summary: &str, inner_width: usize) -> Strin
     let pad = inner_width.saturating_sub(summary.chars().count());
     format!(
         "{}{}{}{}",
-        "│".cyan().dim(),
+        "│".dim(),
         summary.dim(),
         " ".repeat(pad),
-        "│".cyan().dim()
+        "│".dim()
     )
 }
 
@@ -1156,16 +1156,16 @@ fn render_slash_overlay_row_with_width(
     format!(
         "{}{}{}{}",
         if selected {
-            "┃".cyan().bold()
+            "┃".magenta().bold()
         } else {
-            "│".cyan().dim()
+            "│".dim()
         },
         content,
         " ".repeat(pad),
         if selected {
-            "┃".cyan().bold()
+            "┃".magenta().bold()
         } else {
-            "│".cyan().dim()
+            "│".dim()
         }
     )
 }
@@ -1175,10 +1175,10 @@ fn render_slash_overlay_message_line(message: &str, inner_width: usize) -> Strin
     let pad = inner_width.saturating_sub(message.chars().count());
     format!(
         "{}{}{}{}",
-        "│".cyan().dim(),
+        "│".dim(),
         styled,
         " ".repeat(pad),
-        "│".cyan().dim()
+        "│".dim()
     )
 }
 
@@ -1418,13 +1418,11 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
     eprintln!();
     if let Some(q) = &filter {
         eprintln!(
-            "  {} {} {}",
-            "╭".dim(),
-            format!("Command Palette  ·  filter: {q}").bold(),
-            "╮".dim()
+            "  {}",
+            format!("Command Palette  ·  filter: {q}").bold()
         );
     } else {
-        eprintln!("  {} {} {}", "╭".dim(), "Command Palette".bold(), "╮".dim());
+        eprintln!("  {}", "Command Palette".bold());
     }
     eprintln!("  {}", bar.as_str().dim());
 
@@ -1455,7 +1453,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         }
         if !lines.is_empty() {
             any_results = true;
-            eprintln!("  {} {}", group.icon(), group.title().bold().cyan());
+            eprintln!("  {} {}", group.icon(), group.title().bold().magenta());
             for line in lines {
                 eprintln!("{line}");
             }
@@ -1483,7 +1481,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         }
         if !subcmd_lines.is_empty() {
             any_results = true;
-            eprintln!("  🔍 {}", "Matching Subcommands".bold().cyan());
+            eprintln!("  {}", "Matching Subcommands".bold().magenta());
             for line in subcmd_lines.iter().take(10) {
                 eprintln!("{line}");
             }
@@ -1506,7 +1504,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
     eprintln!("  {}", bar.as_str().dim());
     if filter.is_none() {
         eprintln!(
-            "  💡  {}",
+            "  {}",
             "Type / then start typing to filter  ·  Tab to complete  ·  Enter to run".dim()
         );
     }
@@ -1520,12 +1518,7 @@ pub(super) fn print_keyboard_shortcuts() {
     let bar = "─".repeat(width);
 
     eprintln!();
-    eprintln!(
-        "  {} {} {}",
-        "╭".dim(),
-        "Keyboard Shortcuts".bold(),
-        "╮".dim()
-    );
+    eprintln!("  {}", "Keyboard Shortcuts".bold());
     eprintln!("  {}", bar.as_str().dim());
 
     let shortcuts = [
@@ -1594,7 +1587,7 @@ pub(super) fn print_keyboard_shortcuts() {
         ),
     ];
     for (icon, section, keys) in shortcuts {
-        eprintln!("  {} {}", icon, section.bold().cyan());
+        eprintln!("  {} {}", icon, section.bold().magenta());
         for (key, desc) in keys.iter() {
             eprintln!(
                 "    {}  {}",

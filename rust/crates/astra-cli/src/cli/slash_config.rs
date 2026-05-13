@@ -15,6 +15,8 @@ use crossterm::style::Stylize;
 use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
 
+use super::theme;
+
 static ACTIVE_MODEL_FOR_DISPLAY: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 
 pub(crate) fn set_active_model_for_display(model: Option<String>) {
@@ -92,7 +94,7 @@ pub fn handle_config_command(arg: &str) {
 fn show_config() {
     let config = RuntimeConfig::load();
 
-    println!("\n{}", "Runtime Configuration".bold().cyan());
+    println!("\n{}", "Runtime Configuration".bold().magenta());
     println!("{}", "═".repeat(50).dim());
 
     // Compression settings
@@ -185,7 +187,7 @@ fn show_config() {
             println!(
                 "  effective_for_{}: {} {}",
                 model,
-                effective_budget.to_string().cyan(),
+                effective_budget.to_string().magenta(),
                 "(from model context window)".dim()
             );
         }
@@ -193,7 +195,7 @@ fn show_config() {
             println!(
                 "  effective_for_{}: {} {}",
                 model,
-                effective_budget.to_string().cyan(),
+                effective_budget.to_string().magenta(),
                 "(same as configured)".dim()
             );
         }
@@ -262,7 +264,7 @@ fn show_sources() {
         "\n{}",
         "Configuration Sources (showing non-default values)"
             .bold()
-            .cyan()
+            .magenta()
     );
     println!("{}", "═".repeat(55).dim());
     println!(
@@ -293,7 +295,7 @@ fn show_sources() {
         shown_any = true;
         println!(
             "  • {} = {} [{}]",
-            "compression.max_history_tokens".cyan(),
+            "compression.max_history_tokens".magenta(),
             final_config
                 .compression
                 .max_history_tokens
@@ -310,7 +312,7 @@ fn show_sources() {
         shown_any = true;
         println!(
             "  • {} = {} [{}]",
-            "compression.compression_threshold".cyan(),
+            "compression.compression_threshold".magenta(),
             format!("{:.2}", final_config.compression.compression_threshold).yellow(),
             source_for("ASTRA_COMPRESSION_THRESHOLD")
         );
@@ -321,7 +323,7 @@ fn show_sources() {
         shown_any = true;
         println!(
             "  • {} = {} [{}]",
-            "memory.retrieval_top_k".cyan(),
+            "memory.retrieval_top_k".magenta(),
             final_config.memory.retrieval_top_k.to_string().yellow(),
             source_for("ASTRA_RETRIEVAL_TOP_K")
         );
@@ -334,7 +336,7 @@ fn show_sources() {
         shown_any = true;
         println!(
             "  • {} = {} [{}]",
-            "token_budget.max_turn_input_tokens".cyan(),
+            "token_budget.max_turn_input_tokens".magenta(),
             final_config
                 .token_budget
                 .max_turn_input_tokens
@@ -349,7 +351,7 @@ fn show_sources() {
         shown_any = true;
         println!(
             "  • {} = {} [{}]",
-            "telemetry.capture_context_traces".cyan(),
+            "telemetry.capture_context_traces".magenta(),
             final_config
                 .telemetry
                 .capture_context_traces
@@ -367,7 +369,7 @@ fn show_sources() {
 }
 
 fn show_paths() {
-    println!("\n{}", "Configuration Paths".bold().cyan());
+    println!("\n{}", "Configuration Paths".bold().magenta());
     println!("{}", "═".repeat(50).dim());
 
     // User config
@@ -381,7 +383,7 @@ fn show_paths() {
         "  {} {}",
         user_config.display(),
         if user_exists {
-            "✓".green().to_string()
+            theme::icon_ok().to_string()
         } else {
             "(not found)".dim().to_string()
         }
@@ -398,7 +400,7 @@ fn show_paths() {
         "  {} {}",
         project_config.display(),
         if project_exists {
-            "✓".green().to_string()
+            theme::icon_ok().to_string()
         } else {
             "(not found)".dim().to_string()
         }
@@ -424,7 +426,7 @@ fn show_paths() {
         let value = std::env::var(var).ok();
         println!(
             "  {} → {} {}",
-            var.cyan(),
+            var.magenta(),
             config_path.dim(),
             if let Some(v) = value {
                 format!("= {}", v).green().to_string()
@@ -462,7 +464,7 @@ fn export_config(path: Option<PathBuf>) {
         }
         match std::fs::write(&p, &toml) {
             Ok(_) => {
-                println!("{} Configuration exported to {}", "✓".green(), p.display());
+                println!("{} Configuration exported to {}", theme::icon_ok(), p.display());
             }
             Err(e) => {
                 eprintln!("{}", format!("Failed to write file: {}", e).red());
@@ -481,7 +483,7 @@ fn show_diff() {
 
     println!(
         "\n{}",
-        "Configuration Differences from Defaults".bold().cyan()
+        "Configuration Differences from Defaults".bold().magenta()
     );
     println!("{}", "═".repeat(50).dim());
 
@@ -581,7 +583,7 @@ fn print_help() {
   ASTRA_MAX_HISTORY_TOKENS=50000   Override max history tokens
   ASTRA_CAPTURE_TRACES=1           Enable context assembly traces
 "#,
-        title = "Runtime Configuration Management".bold().cyan(),
+        title = "Runtime Configuration Management".bold().magenta(),
         usage = "Usage:".bold(),
         hierarchy = "Configuration Hierarchy:".bold(),
         examples = "Examples:".bold(),
@@ -666,8 +668,8 @@ fn run_config_edit() {
                 dirty = true;
                 println!(
                     "  {} {} = {}",
-                    "✓".green(),
-                    item.id.clone().cyan(),
+                    theme::icon_ok(),
+                    item.id.clone().magenta(),
                     render_value(&new_value).yellow()
                 );
             }
@@ -698,8 +700,8 @@ fn run_config_edit() {
         Ok(path) => {
             println!(
                 "  {} {}",
-                "✓".green(),
-                format!("Saved to {}", path.display()).cyan()
+                theme::icon_ok(),
+                format!("Saved to {}", path.display()).magenta()
             );
             // Content-addressed put so the saved config lands in the
             // version store and shows up in `astra config version list`.
@@ -713,7 +715,7 @@ fn run_config_edit() {
                     parent: None,
                 };
                 if let Ok(id) = store.put(&working, meta) {
-                    println!("  {}  config version: {}", "·".dim(), id.to_string().cyan());
+                    println!("  {}  config version: {}", "·".dim(), id.to_string().magenta());
                 }
             }
         }

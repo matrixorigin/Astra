@@ -433,7 +433,7 @@ async fn run_chat_repl(
         if let Some(ref dev) = state.skill_dev {
             eprintln!(
                 "  \u{1f527} {}",
-                format!("Skill dev: {}", dev.name).cyan().dim()
+                format!("Skill dev: {}", dev.name).magenta().dim()
             );
         }
         // Single source for "plan run in progress": live handle and/or persisted background flag.
@@ -675,7 +675,7 @@ async fn run_chat_repl(
                     {
                         // Resume paused plan execution
                         eprintln!();
-                        eprintln!("{}  Resuming plan execution...", "▶".cyan());
+                        eprintln!("{}  Resuming plan execution...", "▶".magenta());
                         if let Some(ref handle) = state.plan_handle {
                             let _ = handle.send_command(plan_executor::PlanCommand::Resume {
                                 corrections: if state.plan_execution_corrections.is_empty() {
@@ -711,7 +711,7 @@ async fn run_chat_repl(
                                         state.plan_execution_corrections.push(s);
                                         eprintln!(
                                             "{}  Recorded guidance ({}). It will prefix each upcoming subtask. Type continue when ready.",
-                                            "💡".cyan(),
+                                            "💡".magenta(),
                                             state.plan_execution_corrections.len(),
                                         );
                                     }
@@ -727,7 +727,7 @@ async fn run_chat_repl(
                                                         );
                                                     eprintln!(
                                                         "{}  Rewound from step {} — {} subtask(s) set back to pending. Type continue to resume.",
-                                                        "↩".cyan(),
+                                                        "↩".magenta(),
                                                         idx + 1,
                                                         reset,
                                                     );
@@ -800,7 +800,7 @@ async fn run_chat_repl(
                                     eprintln!(
                                         "{}  Entering plan mode for: {}",
                                         "📋".green(),
-                                        goal_display.cyan()
+                                        goal_display.magenta()
                                     );
                                     eprintln!("{}  Generating plan...", "⋯".dim());
 

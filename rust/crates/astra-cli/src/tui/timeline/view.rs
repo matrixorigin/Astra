@@ -84,7 +84,7 @@ fn title_line(tl: &Timeline) -> Line<'static> {
     Line::from(Span::styled(
         title,
         Style::default()
-            .fg(Color::Cyan)
+            .fg(crate::tui::theme::current().accent)
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -169,7 +169,7 @@ fn render_detail(tl: &Timeline, area: Rect, buf: &mut Buffer) {
         return;
     };
     let dim = Style::default().fg(Color::DarkGray);
-    let label = Style::default().fg(Color::Cyan);
+    let label = Style::default().fg(crate::tui::theme::current().accent);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -273,7 +273,7 @@ fn fmt_tokens_u64(n: u64) -> String {
 fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
     let Some(t) = tl.selected_turn() else { return };
     let dim = Style::default().fg(Color::DarkGray);
-    let label = Style::default().fg(Color::Cyan);
+    let label = Style::default().fg(crate::tui::theme::current().accent);
     let bold = Style::default().add_modifier(Modifier::BOLD);
 
     let title = format!(" Turn {} · trace ", t.turn);
@@ -283,7 +283,7 @@ fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
         .title(Line::from(Span::styled(
             title,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(crate::tui::theme::current().accent)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = outer.inner(area);
@@ -463,7 +463,7 @@ fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
                 Span::styled(format!("    [{:>5}ms] ", tool_offset), dim),
                 Span::styled(branch, dim),
                 Span::styled(format!("{status} "), Style::default().fg(status_color)),
-                Span::styled(display, Style::default().fg(Color::Cyan)),
+                Span::styled(display, Style::default().fg(crate::tui::theme::current().accent)),
                 Span::styled(format!(" {}ms{round_tag}{par_tag}", tc.ms), dim),
             ]));
 

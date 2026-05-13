@@ -724,169 +724,235 @@ fn restore_session_state_from_journal(session_id: &str) -> RestoredSessionState 
     restored
 }
 
-fn random_tips(logged_in: bool) -> [&'static str; 2] {
-    use std::time::SystemTime;
-
-    const TIPS: &[&str] = &[
-        "Type / to browse all commands",
-        "Ctrl+K opens the command picker on an empty line",
-        "Ctrl+R to search command history",
-        "Alt+Enter for multi-line input",
-        "/explain toggles reasoning visibility",
-        "/diff for colored unified git diff; /plan on for plan-only chat (no tools)",
-        "/stats shows session token usage",
-        "/tools shows tool call performance",
-        "/health for tool health dashboard",
-        "/resume to continue a previous session",
-        "/session to see current session info",
-        "/learn to see learning insights",
-        "End a line with \\ to continue on next line",
-        "/diagnostics runs API/binary/auth checks if something feels off",
-        "/sync shows cloud sync status",
-    ];
-
-    const TIPS_NOT_LOGGED_IN: &[&str] = &[
-        "/login to authenticate with existing account",
-        "/register to create a new account",
-        "Most features require login to work",
-    ];
-
-    let pool = if logged_in { TIPS } else { TIPS_NOT_LOGGED_IN };
-    let seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as usize)
-        .unwrap_or(0);
-    let i = seed % pool.len();
-    let j = (i + 1 + seed / pool.len()) % pool.len();
-    // Ensure two different tips
-    let j = if j == i { (i + 1) % pool.len() } else { j };
-    [pool[i], pool[j]]
-}
 
 pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     let creds = load_credentials();
     let pname = profile_name(profile, &creds);
     let p = creds.profiles.get(&pname);
     let logged_in = p.and_then(|p| p.access_token.as_ref()).is_some();
-    let user_display = match (p.and_then(|p| p.username.as_deref()), logged_in) {
-        (Some(name), true) => name.to_string(),
-        (Some(name), false) => format!("{name} (not logged in)"),
-        (None, _) => "not logged in".to_string(),
-    };
-    let session_display = banner_session_display(state);
     let model_display = state.model.as_deref().unwrap_or("auto");
     let version = env!("CARGO_PKG_VERSION");
+    let skills_count = state.unified_skill_registry.len();
 
-    let [tip1, tip2] = random_tips(logged_in);
-    let tip1_plain = format!("  💡 {tip1}");
-    let tip2_plain = format!("  💡 {tip2}");
+    // ── Two-column card layout ─────────────────────────────────────────
+    let term_w = crossterm::terminal::size()
+        .map(|(c, _)| c as usize)
+        .unwrap_or(80)
+        .clamp(60, 120);
 
-    let lines_plain = [
-        format!("  astra  v{version}  powered by MatrixOne"),
-        format!(
-            "  profile: {}  user: {}  model: {}  session: {}",
-            pname, user_display, model_display, session_display
-        ),
-        tip1_plain,
-        tip2_plain,
+    // Layout: │ <left_col> │ <right_col> │
+    // outer border = 2 chars (│...│), divider = 3 chars ( │ ), padding = 2 (spaces inside)
+    let left_col_w = 24;
+    let right_col_w = term_w.saturating_sub(left_col_w + 7); // 7 = │ + sp + │ + sp + │ + sp + │
+    let total_inner = left_col_w + right_col_w + 3; // 3 = " │ " between columns
+
+    let rng = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(42);
+
+    // Logo lines (plain text, will be styled per-row)
+    let logo_plain: &[&str] = &[
+        "",
+        "    ▟██▙",
+        "   ▟█▀▀█▙",
+        "  ▟█▘  ▝█▙",
+        "  ▀▀████▀▀",
+        "    astra",
+        "",
     ];
-    let w = lines_plain
-        .iter()
-        .map(|l| crate::terminal_region::visible_char_width(l))
-        .max()
-        .unwrap_or(60)
-        + 2;
+    let left_footer = format!(" {} · v{} · {}", model_display, version, pname);
 
-    let lines_colored = [
+    // Right column: Vec of (styled_content)
+    let sep_line = "─".repeat(right_col_w);
+    let mut right: Vec<String> = Vec::new();
+    right.push("Tips".bold().to_string());
+    right.push("/help for all commands".dim().to_string());
+    right.push("Ctrl+K command picker".dim().to_string());
+    right.push("Alt+Enter multi-line input".dim().to_string());
+    right.push(sep_line.as_str().dim().to_string());
+    right.push("Status".bold().to_string());
+    right.push(
         format!(
-            "  {}  {}  {}",
-            "astra".cyan().bold(),
-            format!("v{version}").dim(),
-            "powered by MatrixOne".dim()
-        ),
-        format!(
-            "  profile: {}  user: {}  model: {}  session: {}",
-            pname.cyan(),
-            if logged_in {
-                user_display.dim().to_string()
+            "{skills_count} skills · {}",
+            if logged_in { "logged in" } else { "not logged in" }
+        )
+        .dim()
+        .to_string(),
+    );
+    if let Ok(proxy) = std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY")) {
+        if !proxy.is_empty() {
+            let max_proxy = right_col_w.saturating_sub(8);
+            let short = if proxy.len() > max_proxy {
+                format!("{}…", &proxy[..max_proxy.saturating_sub(1)])
             } else {
-                user_display.yellow().to_string()
-            },
-            model_display.cyan(),
-            session_display.as_str().dim(),
-        ),
-        format!("  💡 {}", tip1.dim()),
-        format!("  💡 {}", tip2.dim()),
-    ];
+                proxy
+            };
+            right.push(format!("proxy: {short}").dim().to_string());
+        }
+    }
 
-    let row = |colored: &str, plain_width: usize| {
-        let pad = w.saturating_sub(plain_width);
-        format!("{} {colored}{} {}", "│".cyan(), " ".repeat(pad), "│".cyan())
-    };
+    // Build left column (styled)
+    let mut left: Vec<String> = Vec::new();
+    for line in logo_plain {
+        if line.is_empty() {
+            left.push(String::new());
+        } else if *line == "    astra" {
+            left.push(format!("{}", line.magenta().bold()));
+        } else {
+            left.push(format!("{}", line.magenta()));
+        }
+    }
+    left.push(format!("{}", left_footer.dim()));
 
-    let hr = "─".repeat(w + 2);
+    // Equalize heights
+    let total_rows = left.len().max(right.len());
+    while left.len() < total_rows {
+        left.push(String::new());
+    }
+    while right.len() < total_rows {
+        right.push(String::new());
+    }
+
+    // ── Render helper ────────────────────────────────────────────────────
+    let h_bar = "─".repeat(total_inner + 2);
+    let title_text = format!("astra v{version}");
+    let title_segment = format!("─── {} ", title_text);
+    let header_fill = (total_inner + 2)
+        .saturating_sub(title_segment.chars().count() + 1);
+
+    // Total lines in the card (header + body + footer)
+    let card_lines = 1 + total_rows + 1;
+
+    // Render one frame of the card
+    #[allow(clippy::too_many_arguments)]
+    fn render_banner_frame(
+        left: &[String],
+        right: &[String],
+        title_segment: &str,
+        header_fill: usize,
+        h_bar: &str,
+        total_rows: usize,
+        left_col_w: usize,
+        right_col_w: usize,
+        with_stars: bool,
+        mut rng_seed: u64,
+    ) {
+        use crossterm::style::Stylize;
+        use std::io::Write;
+        let vis_w = crate::terminal_region::visible_char_width;
+        let next = |r: &mut u64| -> u64 {
+            *r ^= *r << 13;
+            *r ^= *r >> 7;
+            *r ^= *r << 17;
+            *r
+        };
+
+        // Header
+        eprintln!(
+            "{}{}{}{}",
+            "╭".dark_grey(),
+            title_segment.dark_grey(),
+            "─".repeat(header_fill).dark_grey(),
+            "╮".dark_grey()
+        );
+        // Body
+        for row in 0..total_rows {
+            let l_vis = vis_w(&left[row]);
+            let l_pad = {
+                let pad = left_col_w.saturating_sub(l_vis);
+                let mut out = String::new();
+                for i in 0..pad {
+                    if with_stars && next(&mut rng_seed) % 100 < 12 && i > 0 && i < pad.saturating_sub(1) {
+                        let stars: &[&str] = &["·", "✦", "✧", "⋆", "˙"];
+                        let s = stars[(next(&mut rng_seed) % stars.len() as u64) as usize];
+                        out.push_str(&format!("{}", s.dark_grey()));
+                    } else {
+                        out.push(' ');
+                    }
+                }
+                out
+            };
+            let r_vis = vis_w(&right[row]);
+            let r_pad = {
+                let pad = right_col_w.saturating_sub(r_vis);
+                let mut out = String::new();
+                for i in 0..pad {
+                    if with_stars && next(&mut rng_seed) % 100 < 8 && i > 0 && i < pad.saturating_sub(1) {
+                        let stars: &[&str] = &["·", "✦", "✧", "⋆", "˙"];
+                        let s = stars[(next(&mut rng_seed) % stars.len() as u64) as usize];
+                        out.push_str(&format!("{}", s.dark_grey()));
+                    } else {
+                        out.push(' ');
+                    }
+                }
+                out
+            };
+            eprintln!(
+                "{} {}{} {} {}{} {}",
+                "│".dark_grey(),
+                left[row],
+                l_pad,
+                "│".dark_grey(),
+                right[row],
+                r_pad,
+                "│".dark_grey(),
+            );
+        }
+        // Footer
+        eprintln!(
+            "{}{}{}",
+            "╰".dark_grey(),
+            h_bar.dark_grey(),
+            "╯".dark_grey()
+        );
+        let _ = std::io::stderr().flush();
+    }
+
+    let animated = crossterm::terminal::size().is_ok()
+        && std::env::var("NO_COLOR").is_err()
+        && std::env::var("CI").is_err()
+        && std::io::stderr().is_terminal();
 
     eprintln!();
-    print_startup_logo();
-    eprintln!("{}", format!("╭{hr}╮").cyan());
-    eprintln!(
-        "{}",
-        row(
-            &lines_colored[0],
-            crate::terminal_region::visible_char_width(&lines_plain[0]),
-        )
-    );
-    eprintln!(
-        "{}",
-        row(
-            &lines_colored[1],
-            crate::terminal_region::visible_char_width(&lines_plain[1]),
-        )
-    );
-    eprintln!("{}", format!("├{hr}┤").cyan().dim());
-    eprintln!(
-        "{}",
-        row(
-            &lines_colored[2],
-            crate::terminal_region::visible_char_width(&lines_plain[2]),
-        )
-    );
-    eprintln!(
-        "{}",
-        row(
-            &lines_colored[3],
-            crate::terminal_region::visible_char_width(&lines_plain[3]),
-        )
-    );
-    eprintln!("{}", format!("╰{hr}╯").cyan());
 
-    // Show active limits (system prompt, max-budget, permission mode)
-    let mut limits = Vec::new();
-    if let Ok(max_turns) = std::env::var("ASTRA_CLI_MAX_TURNS") {
-        limits.push(format!("max-turns: {}", max_turns));
-    }
-    if state.max_budget_limit > 0.0 {
-        limits.push(format!("max-budget: ${:.2}", state.max_budget_limit));
-    }
-    if state.perm_manager.mode() == crate::permission_manager::PermissionMode::Auto {
-        limits.push("permission: auto".to_string());
-    }
-    if !limits.is_empty() {
-        eprintln!(
-            "{}",
-            format!("  ⚙ Active limits: {}", limits.join(" │ "))
-                .yellow()
-                .dim()
+    if animated {
+        use std::time::Duration;
+
+        // Shimmer: 4 frames with different star seeds
+        let seeds = [rng, rng.wrapping_add(7919), rng.wrapping_add(104729), rng.wrapping_add(999983)];
+        for (frame, &seed) in seeds.iter().enumerate() {
+            if frame > 0 {
+                eprint!("\x1b[{}A\r", card_lines);
+            }
+            render_banner_frame(
+                &left, &right, &title_segment, header_fill, &h_bar,
+                total_rows, left_col_w, right_col_w, true, seed,
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Final clean frame
+        eprint!("\x1b[{}A\r", card_lines);
+        render_banner_frame(
+            &left, &right, &title_segment, header_fill, &h_bar,
+            total_rows, left_col_w, right_col_w, false, 0,
+        );
+    } else {
+        render_banner_frame(
+            &left, &right, &title_segment, header_fill, &h_bar,
+            total_rows, left_col_w, right_col_w, false, 0,
         );
     }
 
+    eprintln!();
     eprintln!(
-        "{}",
-        "  Ctrl-C to cancel │ Ctrl+K command picker │ /help for commands │ /quit to exit".dim()
+        "  {}",
+        format!("Using {} · /model to change", model_display).dim()
     );
     eprintln!();
 }
 
+#[cfg(test)]
 fn banner_session_display(state: &ReplState) -> String {
     match state.session_id.as_deref() {
         Some(s) => {
@@ -901,49 +967,6 @@ fn banner_session_display(state: &ReplState) -> String {
     }
 }
 
-fn startup_logo_lines() -> &'static [&'static str] {
-    &[
-        " █████╗ ███████╗████████╗██████╗  █████╗",
-        "██╔══██╗██╔════╝╚══██╔══╝██╔══██╗██╔══██╗",
-        "███████║███████╗   ██║   ██████╔╝███████║",
-        "██╔══██║╚════██║   ██║   ██╔══██╗██╔══██║",
-        "██║  ██║███████║   ██║   ██║  ██║██║  ██║",
-        "╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝",
-    ]
-}
-
-#[cfg(test)]
-fn startup_logo_frames() -> Vec<String> {
-    let lines = startup_logo_lines();
-    (0..lines.len())
-        .map(|end| lines[..=end].join("\n"))
-        .collect()
-}
-
-fn print_startup_logo() {
-    use std::io::Write;
-    use std::time::Duration;
-
-    let logo_lines = startup_logo_lines();
-    let animated = crossterm::terminal::size().is_ok()
-        && std::env::var("NO_COLOR").is_err()
-        && std::env::var("CI").is_err();
-
-    if animated {
-        let delay = Duration::from_millis(28);
-        for line in logo_lines {
-            eprintln!("  {}", line.cyan().bold());
-            let _ = std::io::stderr().flush();
-            std::thread::sleep(delay);
-        }
-        std::thread::sleep(Duration::from_millis(70));
-    } else {
-        for line in logo_lines {
-            eprintln!("  {}", line.cyan().bold());
-        }
-    }
-    eprintln!();
-}
 
 pub(super) fn current_access_token(profile: Option<&str>) -> Option<String> {
     // Gateway injects a pre-validated token — skip file I/O and auth check
@@ -1596,28 +1619,6 @@ mod tests {
         };
         let display = state.model.as_deref().unwrap_or("auto");
         assert_eq!(display, "gpt-5");
-    }
-
-    #[test]
-    fn startup_logo_has_multiple_lines_and_brand_shape() {
-        let lines = startup_logo_lines();
-        assert!(lines.len() >= 5);
-        assert!(lines.iter().all(|line| !line.trim().is_empty()));
-        assert!(lines[0].contains("███"));
-        // Last line should have the bottom corners of the logo
-        assert!(lines.iter().any(|line| line.contains("╚═╝")));
-    }
-
-    #[test]
-    fn startup_logo_frames_progressively_reveal_logo() {
-        let lines = startup_logo_lines();
-        let frames = startup_logo_frames();
-        assert_eq!(frames.len(), lines.len());
-        assert_eq!(frames[0], lines[0]);
-        assert_eq!(frames.last().unwrap(), &lines.join("\n"));
-        for (idx, frame) in frames.iter().enumerate() {
-            assert_eq!(frame.lines().count(), idx + 1);
-        }
     }
 
     // ── R4: persistence contract tests ────────────────────────────────────────

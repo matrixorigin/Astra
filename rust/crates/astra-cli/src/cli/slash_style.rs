@@ -13,7 +13,7 @@ pub(super) fn handle_style_command(arg: &str) {
             for t in theme::builtin_themes() {
                 let marker = if t.name == current { " ◉" } else { "  " };
                 let name = &t.name;
-                eprintln!("  {marker} {}", name.as_str().cyan());
+                eprintln!("  {marker} {}", name.as_str().magenta());
             }
             let user_themes = theme::load_user_themes();
             if !user_themes.is_empty() {
@@ -23,7 +23,7 @@ pub(super) fn handle_style_command(arg: &str) {
                 for t in &user_themes {
                     let marker = if t.name == current { " ◉" } else { "  " };
                     let name = &t.name;
-                    eprintln!("  {marker} {}", name.as_str().cyan());
+                    eprintln!("  {marker} {}", name.as_str().magenta());
                 }
             }
             eprintln!();

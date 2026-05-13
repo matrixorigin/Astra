@@ -112,7 +112,7 @@ pub fn prompt_auto_suggest(reason: &str, timeout: Duration) -> AutoSuggestDecisi
             let _ = write!(
                 stderr,
                 "\r\x1b[2K{}  Enter plan mode? [y/N] ({}s) — ⏎/n to skip ",
-                "💡".cyan(),
+                "💡".magenta(),
                 remaining_secs
             );
             let _ = stderr.flush();
