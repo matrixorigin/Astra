@@ -2702,8 +2702,7 @@ pub(super) fn is_auth_error(error: &str) -> bool {
 /// credential issues that `/login` cannot fix.
 pub(super) fn is_llm_provider_auth_error(error: &str) -> bool {
     let lower = error.to_lowercase();
-    lower.contains("llm provider authentication failed")
-        || lower.contains("[auth] llm provider")
+    lower.contains("llm provider authentication failed") || lower.contains("[auth] llm provider")
 }
 
 fn report_turn_failure(
@@ -2715,9 +2714,7 @@ fn report_turn_failure(
     ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
 ) {
     if is_llm_provider_auth_error(&failure.error) {
-        ui.show_error(
-            "  LLM provider credentials invalid — check model API key configuration.",
-        );
+        ui.show_error("  LLM provider credentials invalid — check model API key configuration.");
     } else if is_auth_error(&failure.error) {
         ui.show_error("  Session expired. Run /login to refresh.");
     } else {

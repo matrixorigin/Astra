@@ -95,11 +95,7 @@ impl PasteBurstDetector {
             self.active = false;
             self.consecutive_fast_chars = 0;
             self.last_flush_time = Some(now);
-            if text.is_empty() {
-                None
-            } else {
-                Some(text)
-            }
+            if text.is_empty() { None } else { Some(text) }
         } else {
             None
         }
