@@ -1347,10 +1347,13 @@ impl render::renderable::Renderable for LiveFramedCell {
         }
 
         // Inner paragraph area: 2 cols reserved for `┃ ` on the left.
+        // `saturating_sub` is defense-in-depth: the `width < 3` guard
+        // above already guarantees `width >= 3`, but a future edit
+        // that loosens the guard mustn't UB here.
         let inner = ratatui::layout::Rect {
             x: area.x + 2,
             y: area.y,
-            width: area.width - 2,
+            width: area.width.saturating_sub(2),
             height: area.height,
         };
 

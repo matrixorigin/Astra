@@ -97,6 +97,61 @@ fn hue_to_rgb(h: f32) -> (u8, u8, u8) {
     (to_u8(r), to_u8(g), to_u8(b))
 }
 
+#[cfg(test)]
+mod gradient_tests {
+    use super::*;
+
+    /// `gradient_color_at_t` is periodic in `t` with period
+    /// `period_seconds`. Pinning this prevents future "optimisations"
+    /// from accidentally introducing drift between live and frozen
+    /// phases that happen to differ by a full period.
+    ///
+    /// We allow ±1/channel slack: the hue math runs in `f32` and is
+    /// quantised to `u8`, so equivalent phases can land on adjacent
+    /// integer buckets. Exact equality would be testing IEEE 754, not
+    /// the gradient contract.
+    #[test]
+    fn gradient_is_periodic_in_t() {
+        fn close(a: (u8, u8, u8), b: (u8, u8, u8)) -> bool {
+            (a.0 as i16 - b.0 as i16).abs() <= 1
+                && (a.1 as i16 - b.1 as i16).abs() <= 1
+                && (a.2 as i16 - b.2 as i16).abs() <= 1
+        }
+        let period = 3.0_f32;
+        for pos in [0usize, 3, 7] {
+            let a = gradient_color_at_t(pos, 10, period, 0.5);
+            let b = gradient_color_at_t(pos, 10, period, 0.5 + period);
+            let c = gradient_color_at_t(pos, 10, period, 0.5 + 2.0 * period);
+            assert!(
+                close(a, b),
+                "phase wraps at one period (pos={pos}): {a:?} vs {b:?}"
+            );
+            assert!(
+                close(a, c),
+                "phase wraps at two periods (pos={pos}): {a:?} vs {c:?}"
+            );
+        }
+    }
+
+    /// `len = 0` must not panic (defensive `.max(1)` inside).
+    #[test]
+    fn gradient_handles_zero_len() {
+        let _ = gradient_color_at_t(0, 0, 3.0, 1.23);
+    }
+
+    /// Adjacent positions at fixed `t` produce *different* colours —
+    /// otherwise the gutter would be a flat block, not a gradient.
+    /// (Picks two positions far enough apart to dodge u8 quantisation
+    /// at the same hue.)
+    #[test]
+    fn gradient_varies_along_position() {
+        let t = 0.7_f32;
+        let a = gradient_color_at_t(0, 10, 3.0, t);
+        let b = gradient_color_at_t(5, 10, 3.0, t);
+        assert_ne!(a, b);
+    }
+}
+
 pub(crate) fn shimmer_spans(text: &str) -> Vec<Span<'static>> {
     let chars: Vec<char> = text.chars().collect();
     if chars.is_empty() {

@@ -83,6 +83,13 @@ pub(crate) trait HistoryCell: Debug + Send + Sync + Any {
     /// `finalize()` ran. `None` while live or for cells that were
     /// never live. Used by the active-slot gradient gutter to lock
     /// its phase on freeze instead of snapping to `t = 0`.
+    ///
+    /// Only the cell types that can occupy the *active slot* —
+    /// today: `AssistantCell`, `ReasoningCell`, `ToolCell` — need to
+    /// override this. Cells that never live in the active slot
+    /// (system, user, approval, turn_summary) can leave the default
+    /// `None`: they don't render through `LiveFramedCell` and the
+    /// gutter never queries them.
     fn frozen_phase(&self) -> Option<f32> {
         None
     }
@@ -116,7 +123,12 @@ pub(crate) trait HistoryCell: Debug + Send + Sync + Any {
 /// one stamping discipline:
 ///   * `stamp_now()` — first-write-wins stamp at finalize / complete.
 ///   * `revived()` — launch-independent sentinel for cells rebuilt
-///     from persistence.
+///     from persistence. Note: revived cells are *settled*, not
+///     active — they render through `display_lines` directly with a
+///     static `┃` marker, not the animated gradient. The stamp
+///     exists so that if a revived cell is ever (incorrectly) routed
+///     through the active slot it still produces a deterministic,
+///     non-flickering hue.
 ///   * `phase()` — feeds `frozen_phase()` via `shimmer::time_at`.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct FreezeStamp(Option<std::time::Instant>);
