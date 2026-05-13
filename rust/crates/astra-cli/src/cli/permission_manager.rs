@@ -277,26 +277,133 @@ pub(super) struct PermissionSettings {
     pub allow_sensitive_path_writes: bool,
 }
 
+/// Outcome of loading a `permissions.json` file.
+///
+/// Carries `settings` (always non-None — a `LoadError` falls back to
+/// `Self::default()`) plus an optional `error` describing what went
+/// wrong so the TUI can show a banner instead of silently dropping a
+/// corrupt file.
+#[derive(Debug)]
+pub struct PermissionSettingsLoadOutcome {
+    pub settings: PermissionSettings,
+    pub error: Option<PermissionSettingsLoadError>,
+}
+
+/// Reasons a `permissions.json` failed to load.
+///
+/// Issue #326 P0: `PermissionSettings::load` used to call
+/// `unwrap_or_default()` on parse errors, silently dropping any rules
+/// in a corrupt file. That meant `deny` rules got lost without warning
+/// and team-shared rule files couldn't be diagnosed. This enum exposes
+/// the failure mode so the TUI can surface it (banner / fallback to
+/// session-only) and headless mode can exit non-zero.
+#[derive(Debug)]
+pub enum PermissionSettingsLoadError {
+    /// File exists but JSON parsing failed. `path` is the file we
+    /// tried to read; `message` is the parser error (line/column when
+    /// `serde_json` provides it).
+    Corrupt { path: PathBuf, message: String },
+    /// File exists but couldn't be read (permission denied, I/O
+    /// error). Stat-level errors (file simply not present) are *not*
+    /// reported here — those are normal first-run conditions.
+    Io { path: PathBuf, source: io::Error },
+}
+
+impl std::fmt::Display for PermissionSettingsLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Corrupt { path, message } => {
+                write!(f, "{} is not valid JSON: {}", path.display(), message)
+            }
+            Self::Io { path, source } => {
+                write!(f, "failed to read {}: {}", path.display(), source)
+            }
+        }
+    }
+}
+
+impl std::error::Error for PermissionSettingsLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
 impl PermissionSettings {
     /// Load from the project-level settings file (`.kiro/permissions.json`).
+    ///
+    /// Backwards-compatible facade: returns the parsed settings, falling
+    /// back to `default()` on any error and emitting a `tracing::warn`.
+    /// New callers that need to surface errors to the user should use
+    /// [`Self::try_load`].
     pub fn load(project_root: &Path) -> Self {
+        let outcome = Self::try_load(project_root);
+        if let Some(err) = &outcome.error {
+            tracing::warn!("permission_manager: {} (falling back to defaults)", err);
+        }
+        outcome.settings
+    }
+
+    /// Load from the project-level settings file, returning both the
+    /// settings (always defaulted on error so the agent stays usable)
+    /// and a structured error for the UI to surface.
+    pub fn try_load(project_root: &Path) -> PermissionSettingsLoadOutcome {
         let path = project_root.join(".kiro").join("permissions.json");
-        match fs::read_to_string(&path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => Self::default(),
+        Self::try_load_inner(&path)
+    }
+
+    fn try_load_inner(path: &Path) -> PermissionSettingsLoadOutcome {
+        match fs::read_to_string(path) {
+            Ok(content) => match serde_json::from_str::<Self>(&content) {
+                Ok(settings) => PermissionSettingsLoadOutcome {
+                    settings,
+                    error: None,
+                },
+                Err(e) => PermissionSettingsLoadOutcome {
+                    settings: Self::default(),
+                    error: Some(PermissionSettingsLoadError::Corrupt {
+                        path: path.to_path_buf(),
+                        message: e.to_string(),
+                    }),
+                },
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => PermissionSettingsLoadOutcome {
+                settings: Self::default(),
+                error: None,
+            },
+            Err(e) => PermissionSettingsLoadOutcome {
+                settings: Self::default(),
+                error: Some(PermissionSettingsLoadError::Io {
+                    path: path.to_path_buf(),
+                    source: e,
+                }),
+            },
         }
     }
 
     /// Load from the user-level settings file (`~/.astra/permissions.json`).
+    ///
+    /// Same backwards-compatible facade as [`Self::load`].
     pub fn load_user() -> Self {
+        let outcome = Self::try_load_user();
+        if let Some(err) = &outcome.error {
+            tracing::warn!("permission_manager: {} (falling back to defaults)", err);
+        }
+        outcome.settings
+    }
+
+    /// Like [`Self::load_user`] but returns the structured error.
+    pub fn try_load_user() -> PermissionSettingsLoadOutcome {
         let Some(home) = dirs::home_dir() else {
-            return Self::default();
+            return PermissionSettingsLoadOutcome {
+                settings: Self::default(),
+                error: None,
+            };
         };
         let path = home.join(".astra").join("permissions.json");
-        match fs::read_to_string(&path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => Self::default(),
-        }
+        Self::try_load_inner(&path)
     }
 
     /// Save to the project-level settings file.
@@ -366,6 +473,12 @@ pub(super) struct PermissionManager {
     /// show a "Failed to save rule" toast and fall back to session-only
     /// behaviour. `None` after a successful save.
     last_save_error: Option<String>,
+    /// Errors encountered when loading project / user `permissions.json`
+    /// at construction time. Surfaced via [`load_errors`] so the TUI
+    /// can show a one-shot banner ("permissions.json corrupt at line N
+    /// — falling back to session-only rules") and headless mode can
+    /// exit 1. Empty when both files loaded cleanly or were absent.
+    load_errors: Vec<PermissionSettingsLoadError>,
 }
 
 impl PermissionManager {
@@ -490,6 +603,7 @@ impl PermissionManager {
             cached_user_deny: Vec::new(),
             inherited: None,
             last_save_error: None,
+            load_errors: Vec::new(),
         }
     }
 
@@ -506,10 +620,19 @@ impl PermissionManager {
 
     /// Create with explicit permission mode and project directory.
     pub(super) fn with_project_mode(mode: PermissionMode, project_root: &Path) -> Self {
-        let settings = PermissionSettings::load(project_root);
+        let project_outcome = PermissionSettings::try_load(project_root);
+        let user_outcome = PermissionSettings::try_load_user();
+        let mut load_errors = Vec::new();
+        if let Some(err) = project_outcome.error {
+            load_errors.push(err);
+        }
+        if let Some(err) = user_outcome.error {
+            load_errors.push(err);
+        }
+        let settings = project_outcome.settings;
         let cached_allow = settings.parsed_allow_rules();
         let cached_deny = settings.parsed_deny_rules();
-        let user_settings = PermissionSettings::load_user();
+        let user_settings = user_outcome.settings;
         let cached_user_allow = user_settings.parsed_allow_rules();
         let cached_user_deny = user_settings.parsed_deny_rules();
         Self {
@@ -528,6 +651,7 @@ impl PermissionManager {
             cached_user_deny,
             inherited: None,
             last_save_error: None,
+            load_errors,
         }
     }
 
@@ -545,10 +669,19 @@ impl PermissionManager {
             astra_runtime::orchestration::PermissionMode::Prompt => PermissionMode::Prompt,
             astra_runtime::orchestration::PermissionMode::Deny => PermissionMode::Deny,
         };
-        let settings = PermissionSettings::load(project_root);
+        let project_outcome = PermissionSettings::try_load(project_root);
+        let user_outcome = PermissionSettings::try_load_user();
+        let mut load_errors = Vec::new();
+        if let Some(err) = project_outcome.error {
+            load_errors.push(err);
+        }
+        if let Some(err) = user_outcome.error {
+            load_errors.push(err);
+        }
+        let settings = project_outcome.settings;
         let cached_allow = settings.parsed_allow_rules();
         let cached_deny = settings.parsed_deny_rules();
-        let user_settings = PermissionSettings::load_user();
+        let user_settings = user_outcome.settings;
         let cached_user_allow = user_settings.parsed_allow_rules();
         let cached_user_deny = user_settings.parsed_deny_rules();
         Self {
@@ -567,6 +700,7 @@ impl PermissionManager {
             cached_user_deny,
             inherited: Some(inherited),
             last_save_error: None,
+            load_errors,
         }
     }
 
@@ -1396,6 +1530,22 @@ impl PermissionManager {
     /// notified, so the next save attempt starts with a clean slate).
     pub fn clear_last_save_error(&mut self) {
         self.last_save_error = None;
+    }
+
+    /// Errors encountered while loading `permissions.json` at construction.
+    ///
+    /// Returns an empty slice when both files loaded cleanly or were
+    /// absent. The TUI consumes this once on startup to render a banner
+    /// and then calls [`clear_load_errors`] so the warning isn't shown
+    /// repeatedly. Headless mode reads this and `exit(1)` if non-empty
+    /// so corrupt rule files don't silently fall back to "no rules".
+    pub fn load_errors(&self) -> &[PermissionSettingsLoadError] {
+        &self.load_errors
+    }
+
+    /// Drop the load-error list (called by the UI after surfacing).
+    pub fn clear_load_errors(&mut self) {
+        self.load_errors.clear();
     }
 
     /// Build a pattern-specific allow rule from a tool name and its arguments.
@@ -2593,6 +2743,66 @@ mod tests {
         let loaded = PermissionSettings::load(dir.path());
         assert_eq!(loaded.allow, vec!["Bash(git:*)"]);
         assert_eq!(loaded.deny, vec!["Bash(rm -rf:*)"]);
+    }
+
+    // ── Issue #326 P0: corrupt permissions.json must surface ────────────────
+
+    #[test]
+    fn try_load_returns_corrupt_for_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        let path = kiro.join("permissions.json");
+        std::fs::write(&path, "{ this is not json").unwrap();
+
+        let outcome = PermissionSettings::try_load(dir.path());
+        assert!(matches!(
+            outcome.error,
+            Some(PermissionSettingsLoadError::Corrupt { .. })
+        ));
+        // Settings still default-out so the agent stays usable.
+        assert!(outcome.settings.allow.is_empty());
+        assert!(outcome.settings.deny.is_empty());
+    }
+
+    #[test]
+    fn try_load_returns_none_for_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = PermissionSettings::try_load(dir.path());
+        assert!(outcome.error.is_none());
+    }
+
+    #[test]
+    fn permission_manager_with_corrupt_project_records_load_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(kiro.join("permissions.json"), "not valid json").unwrap();
+
+        let pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let errors = pm.load_errors();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, PermissionSettingsLoadError::Corrupt { .. })),
+            "load_errors should expose the corrupt-file failure: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_load_facade_still_returns_default_on_corrupt() {
+        // Backwards-compat: existing call sites that use `load()` get
+        // a defaulted settings struct (and a `tracing::warn` they may
+        // or may not be capturing). The new signal is on
+        // `PermissionManager::load_errors()`, not on `load()`.
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(kiro.join("permissions.json"), "garbage").unwrap();
+
+        let settings = PermissionSettings::load(dir.path());
+        assert!(settings.allow.is_empty());
+        assert!(settings.deny.is_empty());
     }
 
     // ── Dangerous file paths ──────────────────────────────────────────────────
