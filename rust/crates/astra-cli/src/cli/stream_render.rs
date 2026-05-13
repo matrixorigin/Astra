@@ -1947,12 +1947,46 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 if let Some(tx) = &self.approval_request_tx {
                     use super::chat_stream::ApprovalResponse;
                     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                    // Issue #326 P3: compute the metadata bundle so
+                    // the TUI card can render the will-save preview,
+                    // risk badge, and (if applicable) compound-
+                    // command split. Senders without this context
+                    // would call ApprovalRequest::bare instead.
+                    let mut metadata =
+                        crate::tui::approval::queue::ApprovalMetadata::default();
+                    // Will-save: what would Always persist? We use
+                    // the same make_allow_rule the post-resolve
+                    // path uses, so the user sees an exact preview
+                    // of what permissions.json will gain.
+                    let will_save =
+                        crate::permission_manager::PermissionManager::make_allow_rule(
+                            &t, args,
+                        );
+                    metadata.will_save_preview = Some(will_save);
+                    // Risk classification: a coarse read-only ↔
+                    // write ↔ execute decision driven by the
+                    // tool's cloud_gated_kind. The full multi-tag
+                    // engine (P3 §risk-tags) lands when the
+                    // shared evaluate_permission goes in; in the
+                    // meantime this single tag still beats no
+                    // tag at all.
+                    let risk_tag = match astra_turn_core::cloud_approval_policy::cloud_gated_tool_kind_with_args(&t, Some(args)) {
+                        Some(astra_turn_core::cloud_approval_policy::CloudGatedToolKind::Execute) => {
+                            astra_turn_core::permission_engine::RiskTag::BashExecute
+                        }
+                        Some(astra_turn_core::cloud_approval_policy::CloudGatedToolKind::Write) => {
+                            astra_turn_core::permission_engine::RiskTag::WritesOutsidePackage
+                        }
+                        _ => astra_turn_core::permission_engine::RiskTag::BashExecute,
+                    };
+                    metadata.risk_tags = vec![risk_tag];
                     let _ = tx.send(super::chat_stream::ApprovalRequest {
                         tool: t.clone(),
                         header,
                         detail,
                         reason,
                         response_tx: resp_tx,
+                        metadata: Some(Box::new(metadata)),
                     });
                     let response = if let Some(token) = self.cancel_token {
                         tokio::select! {
@@ -2168,13 +2202,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     // prompts; header/detail/reason otherwise
                                     // come straight from the permission manager
                                     // so we don't echo the same text thrice.
-                                    let _ = tx.send(super::chat_stream::ApprovalRequest {
-                                        tool: sandbox_tool_key.clone(),
-                                        header: format!("🔒 {header}"),
+                                    let _ = tx.send(super::chat_stream::ApprovalRequest::bare(
+                                        sandbox_tool_key.clone(),
+                                        format!("🔒 {header}"),
                                         detail,
                                         reason,
-                                        response_tx: resp_tx,
-                                    });
+                                        resp_tx,
+                                    ));
                                     let response = if let Some(token) = self.cancel_token {
                                         tokio::select! {
                                             biased;
@@ -2883,13 +2917,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     use super::chat_stream::ApprovalResponse;
                     if let Some(tx) = &self.approval_request_tx {
                         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                        let _ = tx.send(super::chat_stream::ApprovalRequest {
-                            tool: approval_tool.clone(),
+                        let _ = tx.send(super::chat_stream::ApprovalRequest::bare(
+                            approval_tool.clone(),
                             header,
                             detail,
                             reason,
-                            response_tx: resp_tx,
-                        });
+                            resp_tx,
+                        ));
                         let response = if let Some(token) = self.cancel_token {
                             tokio::select! {
                                 biased;

@@ -117,12 +117,41 @@ impl ApprovalResponse {
 
 /// Approval request sent from the SSE stream host to the plan executor / REPL
 /// when a tool requires interactive approval (bypass-immune check).
+///
+/// Issue #326 P3: optional `metadata` carries the source-agent /
+/// host / risk-tag / will-save-preview / base-digest fields the
+/// TUI uses to populate the approval card. Senders that compute
+/// these fields attach them; senders that don't leave the field
+/// `None` and the TUI falls back to the bare card.
 pub struct ApprovalRequest {
     pub tool: String,
     pub header: String,
     pub detail: Option<String>,
     pub reason: String,
     pub response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
+    /// Optional enriched metadata. Stored as `Option<Box<…>>` so
+    /// the empty case stays cheap on the message channel.
+    pub metadata: Option<Box<crate::tui::approval::queue::ApprovalMetadata>>,
+}
+
+impl ApprovalRequest {
+    /// Convenience for senders that don't carry metadata.
+    pub fn bare(
+        tool: String,
+        header: String,
+        detail: Option<String>,
+        reason: String,
+        response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
+    ) -> Self {
+        Self {
+            tool,
+            header,
+            detail,
+            reason,
+            response_tx,
+            metadata: None,
+        }
+    }
 }
 
 pub type ApprovalRequestTx = mpsc::UnboundedSender<ApprovalRequest>;

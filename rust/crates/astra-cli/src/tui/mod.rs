@@ -4,7 +4,7 @@ mod testing;
 mod tests;
 
 mod app_event;
-mod approval;
+pub(crate) mod approval;
 mod bottom_pane;
 mod config_edit_router;
 mod context_panel;
@@ -684,13 +684,28 @@ pub(crate) async fn run_tui(
                                                     // approval card is rendered by BottomPane above the
                                                     // composer so arrow-key focus is visible. Resolve
                                                     // events flush a compact audit line to scrollback.
-                                                    let _id = bottom_pane.enqueue_approval(
-                                                        req.tool,
-                                                        req.header,
-                                                        req.detail,
-                                                        req.reason,
-                                                        req.response_tx,
-                                                    );
+                                                    //
+                                                    // Issue #326 P3: forward the optional metadata
+                                                    // bundle so the card can show risk badges /
+                                                    // will-save preview / source-agent / host chips.
+                                                    let _id = if let Some(metadata) = req.metadata {
+                                                        bottom_pane.enqueue_approval_with_metadata(
+                                                            req.tool,
+                                                            req.header,
+                                                            req.detail,
+                                                            req.reason,
+                                                            req.response_tx,
+                                                            *metadata,
+                                                        )
+                                                    } else {
+                                                        bottom_pane.enqueue_approval(
+                                                            req.tool,
+                                                            req.header,
+                                                            req.detail,
+                                                            req.reason,
+                                                            req.response_tx,
+                                                        )
+                                                    };
                                                     frame_requester.schedule_frame();
                                                     {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);

@@ -307,6 +307,30 @@ impl BottomPane {
         id
     }
 
+    /// Issue #326 P3: enqueue with the full metadata bundle. Used
+    /// by the stream-render gate when it has source_agent / risk
+    /// tags / Will-save preview / host context to attach.
+    pub fn enqueue_approval_with_metadata(
+        &mut self,
+        tool: String,
+        header: String,
+        detail: Option<String>,
+        reason: String,
+        response_tx: oneshot::Sender<ApprovalResponse>,
+        metadata: crate::tui::approval::queue::ApprovalMetadata,
+    ) -> u64 {
+        let id = self.approval_queue.push_with_metadata(
+            tool,
+            header,
+            detail,
+            reason,
+            response_tx,
+            metadata,
+        );
+        self.footer.pending_approvals = self.approval_queue.len();
+        id
+    }
+
     /// Snapshot of pending approvals (safe to pass to rendering code).
     pub fn approval_views(&self) -> Vec<ApprovalView> {
         self.approval_queue.views()
@@ -444,6 +468,22 @@ impl BottomPane {
             true,
         );
         cell.buttons = buttons;
+        // Issue #326 P3: forward the view's metadata so the
+        // approval card renders the source-agent / host /
+        // risk-tag / will-save lines populated by
+        // enqueue_approval_with_metadata.
+        if let Some(agent) = view.source_agent {
+            cell = cell.with_source_agent(agent);
+        }
+        if let Some(host) = view.host {
+            cell = cell.with_host(host);
+        }
+        if !view.risk_tag_labels.is_empty() {
+            cell = cell.with_risk_tag_labels(view.risk_tag_labels);
+        }
+        if let Some(preview) = view.will_save_preview {
+            cell = cell.with_will_save_preview(preview);
+        }
         Some(cell)
     }
 
