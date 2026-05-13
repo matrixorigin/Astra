@@ -174,7 +174,6 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
 fn write_history_line(writer: &mut impl Write, line: &Line<'_>) -> io::Result<()> {
     queue!(writer, Clear(ClearType::UntilNewLine))?;
 
-    // Write spans and track visible width
     let mut content_width = 0usize;
     for span in &line.spans {
         let merged = line.style.patch(span.style);
@@ -182,18 +181,13 @@ fn write_history_line(writer: &mut impl Write, line: &Line<'_>) -> io::Result<()
         write_styled_span(writer, &span.content, &merged)?;
     }
 
-    // Always pad with bg if line has one — fill ENTIRE terminal width with spaces.
     if let Some(bg) = line.style.bg {
         let term_w = crossterm::terminal::size()
             .map(|(c, _)| c as usize)
             .unwrap_or(80);
         let remaining = term_w.saturating_sub(content_width);
         if remaining > 0 {
-            let (r, g, b) = match <ratatui::style::Color as Into<CColor>>::into(bg) {
-                CColor::Rgb { r, g, b } => (r, g, b),
-                _ => (55, 55, 60),
-            };
-            // DEBUG: write a visible marker '|' at the end to confirm this runs
+            let (r, g, b) = color_to_rgb(bg);
             write!(writer, "\x1b[48;2;{r};{g};{b}m{}\x1b[0m", " ".repeat(remaining))?;
         } else {
             write!(writer, "\x1b[0m")?;
@@ -205,13 +199,18 @@ fn write_history_line(writer: &mut impl Write, line: &Line<'_>) -> io::Result<()
     Ok(())
 }
 
+fn color_to_rgb(color: ratatui::style::Color) -> (u8, u8, u8) {
+    match <ratatui::style::Color as Into<CColor>>::into(color) {
+        CColor::Rgb { r, g, b } => (r, g, b),
+        _ => (55, 55, 60),
+    }
+}
+
 fn write_styled_span(
     writer: &mut impl Write,
     content: &str,
     style: &ratatui::style::Style,
 ) -> io::Result<()> {
-    // Set colors (fg + bg together, avoids intermediate Reset that would
-    // nuke the line background painted by EL).
     queue!(
         writer,
         SetColors(Colors::new(
@@ -220,7 +219,6 @@ fn write_styled_span(
         ))
     )?;
 
-    // Apply modifiers additively (no full Reset)
     if style.add_modifier.contains(Modifier::BOLD) {
         queue!(writer, SetAttribute(Attribute::Bold))?;
     } else {
@@ -237,6 +235,5 @@ fn write_styled_span(
     }
 
     queue!(writer, Print(content))?;
-
     Ok(())
 }

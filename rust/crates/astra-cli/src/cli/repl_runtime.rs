@@ -825,19 +825,18 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     let card_lines = 1 + total_rows + 1;
 
     // Render one frame of the card
-    #[allow(clippy::too_many_arguments)]
-    fn render_banner_frame(
-        left: &[String],
-        right: &[String],
-        title_segment: &str,
+    struct BannerLayout<'a> {
+        left: &'a [String],
+        right: &'a [String],
+        title_segment: &'a str,
         header_fill: usize,
-        h_bar: &str,
+        h_bar: &'a str,
         total_rows: usize,
         left_col_w: usize,
         right_col_w: usize,
-        with_stars: bool,
-        mut rng_seed: u64,
-    ) {
+    }
+
+    fn render_banner_frame(layout: &BannerLayout<'_>, with_stars: bool, mut rng_seed: u64) {
         use crossterm::style::Stylize;
         use std::io::Write;
         let vis_w = crate::terminal_region::visible_char_width;
@@ -847,47 +846,44 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
             *r ^= *r << 17;
             *r
         };
+        let BannerLayout {
+            left,
+            right,
+            title_segment,
+            header_fill,
+            h_bar,
+            total_rows,
+            left_col_w,
+            right_col_w,
+        } = layout;
+
+        const STARS: &[&str] = &["·", "✦", "✧", "⋆", "˙"];
+        let starfield_pad = |target: usize, vis: usize, rng: &mut u64, density: u64| -> String {
+            let pad = target.saturating_sub(vis);
+            let mut out = String::new();
+            for i in 0..pad {
+                if with_stars && next(rng) % 100 < density && i > 0 && i < pad.saturating_sub(1) {
+                    let s = STARS[(next(rng) % STARS.len() as u64) as usize];
+                    out.push_str(&format!("{}", s.dark_grey()));
+                } else {
+                    out.push(' ');
+                }
+            }
+            out
+        };
 
         // Header
         eprintln!(
             "{}{}{}{}",
             "╭".dark_grey(),
             title_segment.dark_grey(),
-            "─".repeat(header_fill).dark_grey(),
+            "─".repeat(*header_fill).dark_grey(),
             "╮".dark_grey()
         );
         // Body
-        for row in 0..total_rows {
-            let l_vis = vis_w(&left[row]);
-            let l_pad = {
-                let pad = left_col_w.saturating_sub(l_vis);
-                let mut out = String::new();
-                for i in 0..pad {
-                    if with_stars && next(&mut rng_seed) % 100 < 12 && i > 0 && i < pad.saturating_sub(1) {
-                        let stars: &[&str] = &["·", "✦", "✧", "⋆", "˙"];
-                        let s = stars[(next(&mut rng_seed) % stars.len() as u64) as usize];
-                        out.push_str(&format!("{}", s.dark_grey()));
-                    } else {
-                        out.push(' ');
-                    }
-                }
-                out
-            };
-            let r_vis = vis_w(&right[row]);
-            let r_pad = {
-                let pad = right_col_w.saturating_sub(r_vis);
-                let mut out = String::new();
-                for i in 0..pad {
-                    if with_stars && next(&mut rng_seed) % 100 < 8 && i > 0 && i < pad.saturating_sub(1) {
-                        let stars: &[&str] = &["·", "✦", "✧", "⋆", "˙"];
-                        let s = stars[(next(&mut rng_seed) % stars.len() as u64) as usize];
-                        out.push_str(&format!("{}", s.dark_grey()));
-                    } else {
-                        out.push(' ');
-                    }
-                }
-                out
-            };
+        for row in 0..*total_rows {
+            let l_pad = starfield_pad(*left_col_w, vis_w(&left[row]), &mut rng_seed, 12);
+            let r_pad = starfield_pad(*right_col_w, vis_w(&right[row]), &mut rng_seed, 8);
             eprintln!(
                 "{} {}{} {} {}{} {}",
                 "│".dark_grey(),
@@ -916,32 +912,32 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
 
     eprintln!();
 
+    let layout = BannerLayout {
+        left: &left,
+        right: &right,
+        title_segment: &title_segment,
+        header_fill,
+        h_bar: &h_bar,
+        total_rows,
+        left_col_w,
+        right_col_w,
+    };
+
     if animated {
         use std::time::Duration;
 
-        // Shimmer: 4 frames with different star seeds
         let seeds = [rng, rng.wrapping_add(7919), rng.wrapping_add(104729), rng.wrapping_add(999983)];
         for (frame, &seed) in seeds.iter().enumerate() {
             if frame > 0 {
                 eprint!("\x1b[{}A\r", card_lines);
             }
-            render_banner_frame(
-                &left, &right, &title_segment, header_fill, &h_bar,
-                total_rows, left_col_w, right_col_w, true, seed,
-            );
+            render_banner_frame(&layout, true, seed);
             std::thread::sleep(Duration::from_millis(100));
         }
-        // Final clean frame
         eprint!("\x1b[{}A\r", card_lines);
-        render_banner_frame(
-            &left, &right, &title_segment, header_fill, &h_bar,
-            total_rows, left_col_w, right_col_w, false, 0,
-        );
+        render_banner_frame(&layout, false, 0);
     } else {
-        render_banner_frame(
-            &left, &right, &title_segment, header_fill, &h_bar,
-            total_rows, left_col_w, right_col_w, false, 0,
-        );
+        render_banner_frame(&layout, false, 0);
     }
 
     eprintln!();
