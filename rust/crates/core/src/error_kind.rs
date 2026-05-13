@@ -563,6 +563,7 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
         || lower.contains("malformed")
         || lower.contains("file is too large")
         || lower.contains("old_str not found")
+        || lower.contains("str_replace failed")
         || lower.contains("sandbox")
     {
         return ErrorKind::ToolInvalidArgs;

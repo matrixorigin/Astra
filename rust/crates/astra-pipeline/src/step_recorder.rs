@@ -1307,7 +1307,7 @@ mod tests {
             true,
             7,
             false,
-            "Error: old_str not found in file",
+            "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: old_str not found in file.\nWHY:  The exact byte sequence does not appear in the current file content.\nNEXT: Re-read the target region with read_file, copy the actual bytes into old_str (including indentation), then retry. Diagnostic hints below:\n",
         );
 
         let failed = rec
