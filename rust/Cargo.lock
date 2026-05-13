@@ -170,6 +170,7 @@ dependencies = [
  "derive_more 1.0.0",
  "dirs 6.0.0",
  "dotenvy",
+ "fs2",
  "futures-util",
  "gix",
  "http",

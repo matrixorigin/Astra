@@ -307,6 +307,35 @@ impl std::error::Error for PermissionSettingsLoadError {
     }
 }
 
+/// Errors that can occur during [`PermissionSettings::modify`].
+///
+/// `Load` wraps a parse-time failure surfaced by [`PermissionSettingsLoadError`]
+/// — the lock-and-load step refuses to overwrite a corrupt file
+/// because doing so would silently drop existing rules. `Io` wraps
+/// any I/O failure with a hint about which stage tripped (lockfile
+/// open, flock, save, etc.). `User` is the closure's own error.
+#[derive(Debug)]
+pub enum ModifyError<E> {
+    Load(PermissionSettingsLoadError),
+    Io {
+        stage: &'static str,
+        source: io::Error,
+    },
+    User(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for ModifyError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Load(e) => write!(f, "load failed: {e}"),
+            Self::Io { stage, source } => write!(f, "{stage} failed: {source}"),
+            Self::User(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl<E: std::fmt::Display + std::fmt::Debug> std::error::Error for ModifyError<E> {}
+
 impl PermissionSettings {
     /// Load from the project-level settings file (`.kiro/permissions.json`).
     ///
@@ -388,6 +417,15 @@ impl PermissionSettings {
     /// fsyncs the parent directory. This guarantees that an interrupted
     /// save (SIGINT, crash, OS shutdown) never leaves a partially-written
     /// `permissions.json` on disk.
+    ///
+    /// Issue #326 P5d: also takes a process-wide exclusive `flock`
+    /// on `.kiro/permissions.lock` for the duration of the
+    /// load-merge-save sequence in [`Self::modify`]. Direct callers
+    /// of `save` (i.e. the existing `add_allow_rule` path) get the
+    /// atomic-rename guarantee but skip the lock; they're racy
+    /// against another astra process writing the same file. Use
+    /// `modify` (preferred) when correctness across concurrent
+    /// processes matters.
     pub fn save(&self, project_root: &Path) -> io::Result<()> {
         let dir = project_root.join(".kiro");
         fs::create_dir_all(&dir)?;
@@ -403,6 +441,86 @@ impl PermissionSettings {
             let _ = dir_handle.sync_all();
         }
         Ok(())
+    }
+
+    /// Load → mutate → save with a process-wide exclusive lock.
+    ///
+    /// Issue #326 P5d / R2 Major 1: the previous `add_allow_rule`
+    /// flow (load once at construction → mutate in-memory → save)
+    /// loses concurrent updates: if process A and process B both
+    /// have astra running, both fetch the same baseline, both add
+    /// a rule, and the second save overwrites the first.
+    ///
+    /// `modify` closes that gap by:
+    ///
+    /// 1. Acquiring an exclusive flock on `.kiro/permissions.lock`
+    ///    (blocks until any other process releases).
+    /// 2. Re-reading the JSON file from disk so the closure sees
+    ///    the freshest baseline.
+    /// 3. Calling the user's mutation closure.
+    /// 4. Atomically renaming a fsync'd temp file into place.
+    /// 5. Releasing the flock.
+    ///
+    /// Errors at any stage abort the change. The closure can fail
+    /// fast by returning `Err` and no file is rewritten.
+    pub fn modify<F, E>(project_root: &Path, mutate: F) -> Result<Self, ModifyError<E>>
+    where
+        F: FnOnce(&mut Self) -> Result<(), E>,
+    {
+        use fs2::FileExt;
+
+        let dir = project_root.join(".kiro");
+        fs::create_dir_all(&dir).map_err(|e| ModifyError::Io {
+            stage: "create .kiro/",
+            source: e,
+        })?;
+
+        // Acquire the per-project lock. We use a sibling .lock file
+        // rather than locking permissions.json itself so the lock
+        // survives the rename-replace step.
+        let lock_path = dir.join("permissions.lock");
+        let lock_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| ModifyError::Io {
+                stage: "open lockfile",
+                source: e,
+            })?;
+        lock_file.lock_exclusive().map_err(|e| ModifyError::Io {
+            stage: "acquire flock",
+            source: e,
+        })?;
+
+        // Re-read the file under the lock to pick up any concurrent
+        // writes from sibling processes.
+        let outcome = Self::try_load(project_root);
+        if let Some(err) = outcome.error {
+            // Don't silently overwrite a corrupt file — bail loudly.
+            // The caller decides whether to surface this to the
+            // user as a banner / exit-1.
+            let _ = fs2::FileExt::unlock(&lock_file);
+            return Err(ModifyError::Load(err));
+        }
+        let mut settings = outcome.settings;
+
+        if let Err(user_err) = mutate(&mut settings) {
+            let _ = fs2::FileExt::unlock(&lock_file);
+            return Err(ModifyError::User(user_err));
+        }
+
+        if let Err(e) = settings.save(project_root) {
+            let _ = fs2::FileExt::unlock(&lock_file);
+            return Err(ModifyError::Io {
+                stage: "save",
+                source: e,
+            });
+        }
+
+        let _ = fs2::FileExt::unlock(&lock_file);
+        Ok(settings)
     }
     #[allow(dead_code)] // Used in tests and by with_project
     fn parsed_allow_rules(&self) -> Vec<PermissionRule> {
@@ -2890,6 +3008,101 @@ mod tests {
         let settings = PermissionSettings::load(dir.path());
         assert!(settings.allow.is_empty());
         assert!(settings.deny.is_empty());
+    }
+
+    // ── Issue #326 P5d: PermissionStore (modify with flock) ────────────
+
+    #[test]
+    fn modify_appends_rule_under_lock() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = PermissionSettings::modify(dir.path(), |s| -> Result<(), &'static str> {
+            s.allow.push("Bash(npm test:*)".to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(result.allow, vec!["Bash(npm test:*)"]);
+
+        // Re-load directly to confirm the change actually hit disk.
+        let reloaded = PermissionSettings::load(dir.path());
+        assert_eq!(reloaded.allow, vec!["Bash(npm test:*)"]);
+    }
+
+    #[test]
+    fn modify_picks_up_concurrent_writes() {
+        // Simulate "process A wrote a rule between our load and
+        // save"; modify must re-read the freshest baseline under
+        // the lock so we don't clobber A's rule.
+        let dir = tempfile::tempdir().unwrap();
+
+        // Process A: write a rule first.
+        let mut a = PermissionSettings::default();
+        a.allow.push("Bash(rule-a:*)".to_string());
+        a.save(dir.path()).unwrap();
+
+        // Process B: open a stale baseline by NOT calling load.
+        // Use modify to add a different rule — modify will re-load
+        // under the flock and see rule-a, then add rule-b on top.
+        let result =
+            PermissionSettings::modify(dir.path(), |s| -> Result<(), &'static str> {
+                s.allow.push("Bash(rule-b:*)".to_string());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            result.allow,
+            vec!["Bash(rule-a:*)", "Bash(rule-b:*)"],
+            "modify must merge with the on-disk baseline, not overwrite"
+        );
+    }
+
+    #[test]
+    fn modify_refuses_to_overwrite_corrupt_file() {
+        // If the file on disk is corrupt we MUST NOT silently
+        // overwrite it — that would lose any rules the user is
+        // trying to fix by hand. modify surfaces the error so the
+        // caller (TUI banner / headless exit-1) can deal with it.
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(kiro.join("permissions.json"), "{ not json").unwrap();
+
+        let err = PermissionSettings::modify(dir.path(), |_s| -> Result<(), &'static str> {
+            panic!("closure must not run when load fails")
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ModifyError::Load(PermissionSettingsLoadError::Corrupt { .. })),
+            "expected Load(Corrupt), got {err:?}"
+        );
+
+        // The corrupt file is still on disk — modify did NOT
+        // replace it with default contents.
+        let raw = std::fs::read_to_string(kiro.join("permissions.json")).unwrap();
+        assert_eq!(raw, "{ not json");
+    }
+
+    #[test]
+    fn modify_propagates_user_error_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-write a baseline so we can detect any unexpected change.
+        let mut baseline = PermissionSettings::default();
+        baseline.allow.push("Bash(baseline:*)".to_string());
+        baseline.save(dir.path()).unwrap();
+
+        let err = PermissionSettings::modify(dir.path(), |s| -> Result<(), &'static str> {
+            s.allow.push("Bash(would-be:*)".to_string());
+            Err("user changed their mind")
+        })
+        .unwrap_err();
+        assert!(matches!(err, ModifyError::User("user changed their mind")));
+
+        // File on disk is unchanged.
+        let reloaded = PermissionSettings::load(dir.path());
+        assert_eq!(reloaded.allow, vec!["Bash(baseline:*)"]);
     }
 
     // ── Dangerous file paths ──────────────────────────────────────────────────
