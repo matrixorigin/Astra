@@ -547,4 +547,97 @@ mod tests {
         );
         assert_eq!(highest_risk_color(&["BashExecute".into()]), Color::Cyan);
     }
+
+    // ── Issue #326 P3 / R1 Major 11: snapshot tests at 3 widths ──
+
+    fn render_at(cell: &ApprovalCell, width: u16) -> String {
+        cell.display_lines(width)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn fixture_full() -> ApprovalCell {
+        ApprovalCell::new(
+            42,
+            "bash".into(),
+            "npm test --filter auth".into(),
+            Some("npm test --filter auth -- --verbose".into()),
+            "execute (Prompt mode, no allow rule matches)".into(),
+            true,
+        )
+        .with_risk_tag_labels(vec!["BashExecute".into()])
+        .with_will_save_preview("Bash(npm test:*)")
+    }
+
+    /// Smoke-snapshot the rendered card at three terminal widths
+    /// to lock the visual budget plan v3 §P3 promised: usable on
+    /// 80x24, comfortable on 100x30, breathing-room on 160x40.
+    /// The snapshot is just the textual content (ANSI styling
+    /// stripped), so they're cheap and human-readable.
+    #[test]
+    fn snapshot_full_card_80() {
+        insta::assert_snapshot!("approval_card_80", render_at(&fixture_full(), 80));
+    }
+
+    #[test]
+    fn snapshot_full_card_100() {
+        insta::assert_snapshot!("approval_card_100", render_at(&fixture_full(), 100));
+    }
+
+    #[test]
+    fn snapshot_full_card_160() {
+        insta::assert_snapshot!("approval_card_160", render_at(&fixture_full(), 160));
+    }
+
+    #[test]
+    fn snapshot_card_with_agent_and_host_chips() {
+        // Scenarios #21 (sub-agent) + #39 (remote host)
+        // co-occurrence: header should fit both chips at 80 cols.
+        let cell = fixture_full()
+            .with_source_agent("review-subagent")
+            .with_host("ssh:bastion-prod");
+        insta::assert_snapshot!(
+            "approval_card_agent_and_host_80",
+            render_at(&cell, 80)
+        );
+    }
+
+    #[test]
+    fn snapshot_destructive_card_disables_persistent_scopes_visually() {
+        // Destructive risk + sensitive-path file: the card must
+        // make this read as RED-coded.
+        let cell = ApprovalCell::new(
+            7,
+            "edit_file".into(),
+            "edit /etc/hosts".into(),
+            Some("/etc/hosts".into()),
+            "writes outside workspace".into(),
+            true,
+        )
+        .with_risk_tag_labels(vec![
+            "WritesOutsideWorkspace".into(),
+            "WritesSensitiveFile".into(),
+        ]);
+        insta::assert_snapshot!("approval_card_destructive_80", render_at(&cell, 80));
+    }
+
+    #[test]
+    fn budget_card_height_under_8_lines_at_80() {
+        // The plan promised the card stays under ~8 lines on the
+        // baseline 80x24 terminal so the scrollback isn't
+        // squeezed. Lock that as a budget assertion.
+        let rendered = render_at(&fixture_full(), 80);
+        let lines = rendered.lines().count();
+        assert!(
+            lines <= 9,
+            "approval card grew past budget: {lines} lines for width=80, content:\n{rendered}"
+        );
+    }
 }
