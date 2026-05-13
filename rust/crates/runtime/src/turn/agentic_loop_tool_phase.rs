@@ -975,7 +975,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .collect();
 
     let evo_records_before = state.stall.tool_call_records.len();
-    let tool_results_before = state.tool_results.len();
     {
         let mut term_adapter = HostTerminalAdapter(host);
         let headless_quiet = prep.quiet || state.skill_produced_output;
@@ -1159,7 +1158,13 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         });
     }
 
-    let new_tool_results = state.tool_results[tool_results_before..].to_vec();
+    // `run_agentic_headless_tool_round` resets `state.tool_results` at the
+    // start of every tool round, so after it returns the vector is already the
+    // current round's result set. Do not slice by the pre-round length: a
+    // resumed or retried turn can enter with stale results from a prior round,
+    // the headless round clears them, and using the old index would panic with
+    // `range start index ... out of range`.
+    let new_tool_results = state.tool_results.clone();
     persist_tool_output_batch_for_round(state, &round_tool_calls, &new_tool_results).await;
 
     if let (Some(active), Some(executor)) = (

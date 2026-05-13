@@ -211,6 +211,34 @@ pub async fn build_server_state(
     ));
     let run_engine = crate::server::run_engine::RunEngine::new(run_store)
         .with_projection_store(Arc::clone(&state_projection_store));
+    match run_engine.recover_active_runs().await {
+        Ok(recovered_runs) => {
+            if !recovered_runs.is_empty() {
+                let waiting = recovered_runs
+                    .iter()
+                    .filter(|run| run.status == astra_core::STATUS_WAITING)
+                    .count();
+                let failed = recovered_runs
+                    .iter()
+                    .filter(|run| run.status == astra_core::STATUS_FAILED)
+                    .count();
+                tracing::warn!(
+                    target: "astra_runtime::state_builder",
+                    recovered_total = recovered_runs.len(),
+                    recovered_waiting = waiting,
+                    recovered_failed = failed,
+                    "recovered durable active runs during startup"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                target: "astra_runtime::state_builder",
+                error = %error,
+                "failed to recover durable active runs during startup"
+            );
+        }
+    }
 
     // Wire multi-agent coordination: profile registry + delegation engine.
     let mut profile_registry = astra_services::AgentProfileRegistry::new();

@@ -7,7 +7,9 @@
 //! Run state is held in-memory (`DashMap`) for low-latency queries; events are
 //! buffered per-run so `stream_run()` can replay from any offset.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -15,6 +17,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use axum::Json;
 use axum::http::StatusCode;
+use futures_util::FutureExt;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, RwLock, broadcast, mpsc};
@@ -41,9 +44,9 @@ use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::observability_integration::ObservabilityHub;
 use crate::turn::agentic_loop_host::{
-    AgenticLoopOutcome, AgenticLoopState, CancellationState, ContextTracePersistenceContext,
-    EvaluationPersistenceContext, MessagingState, RequestConstraints, SkillState, StopHookState,
-    run_agentic_loop_with_host,
+    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CancellationState,
+    ContextTracePersistenceContext, EvaluationPersistenceContext, MessagingState,
+    RequestConstraints, SkillState, StopHookState, run_agentic_loop_with_host,
 };
 use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTurnCoreEventWriter,
@@ -66,6 +69,43 @@ use super::server_loop_host::ServerAgenticLoopHostBuilder;
 
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 const LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE: &str = "runtime_llm_trusted_domains";
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+async fn run_agentic_loop_with_host_panic_safe<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) -> Result<AgenticLoopOutcome, astra_core::ClassifiedError> {
+    match AssertUnwindSafe(run_agentic_loop_with_host(host, state))
+        .catch_unwind()
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(payload) => {
+            let message = format!(
+                "agentic loop panicked: {}",
+                panic_payload_message(payload.as_ref())
+            );
+            tracing::error!(
+                target: "astra_runtime::run_lifecycle",
+                error = %message,
+                "agentic loop panic converted to failed run"
+            );
+            Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Unknown,
+                message,
+            ))
+        }
+    }
+}
 
 // ─── Skill wiring for server paths ──────────────────────────────────────────
 
@@ -3235,7 +3275,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
             }
 
-            let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
+            let outcome = run_agentic_loop_with_host_panic_safe(&mut host, &mut loop_state).await;
             let loop_success = outcome.is_ok();
             let (events, final_status, error_msg) =
                 Self::finalize_run_events(outcome, host.take_emitted_events(), &loop_state);
@@ -3564,7 +3604,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
             }
             let _guard = TaskCountGuard(bg_task_count_2);
-            let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
+            let loop_result = run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
             let loop_success = loop_result.is_ok();
 
             // Best-effort post-loop persistence (core events, tool events,
