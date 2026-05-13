@@ -375,7 +375,7 @@ fn credential_patterns() -> &'static [CredentialPattern] {
 
 /// Redact credential/secret patterns in plaintext, replacing matches with
 /// `[REDACTED:<label>]`. Returns the redacted text and the count of redactions.
-fn redact_credentials_in_text(text: &str) -> (String, usize) {
+pub fn redact_credentials_in_text(text: &str) -> (String, usize) {
     let patterns = credential_patterns();
     let mut result = text.to_string();
     let mut total = 0usize;
