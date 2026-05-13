@@ -33,7 +33,7 @@ Open `http://localhost:8000/health` to verify.
 - **`ASTRA_LOG_FORMAT`**: `json` (default when stderr is not a TTY), `pretty`, or `compact`. Unknown values print a one-line warning to stderr and fall back like “unset”.
 - **`ASTRA_SERVICE_NAME`**: optional label on the startup log line.
 - HTTP handlers run inside a per-request span; access lines use target `astra.http.access` and include `request_id` (same value as the `x-request-id` response header). The **`/health`** probe omits that access line to reduce noise (headers and tracing span are unchanged).
-- **`astra` CLI**: set **`ASTRA_DIAGNOSTIC_LOG=1`** for structured logs on stderr, or **`ASTRA_LOG_FILE=/path/to.log`** for JSON lines appended to a file (does not replace interactive REPL output). Equivalent hidden flags: **`--diagnostic-log`**, **`--log-file /path/to.log`** (see `cli_args` module docs for priority vs env).
+- **`astra` CLI**: set **`ASTRA_DIAGNOSTIC_LOG=1`** for structured logs on stderr, or **`ASTRA_LOG_FILE=/path/to.log`** for JSON lines appended to a file (does not replace interactive TUI output). Equivalent hidden flags: **`--diagnostic-log`**, **`--log-file /path/to.log`** (see `cli_args` module docs for priority vs env).
 - **OpenTelemetry (optional)**: build with **`--features otel`** on **`astra-runtime`** (for `astra-server`) or **`astra-edge`** so `astra-logging` links the OTLP exporter. Tracing export turns on when **`ASTRA_OTEL_ENABLED=1`** or **`OTEL_EXPORTER_OTLP_ENDPOINT`** / **`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`** is set to a non-empty value. Use standard OTel variables (**`OTEL_SERVICE_NAME`**, **`OTEL_RESOURCE_ATTRIBUTES`**, **`OTEL_EXPORTER_OTLP_*`**, etc.). The API server stops gracefully on **SIGTERM** or **Ctrl+C** and flushes OTLP batches; **`kill -9`** can drop the last spans.
 
 ### 4. Load Models & Login
@@ -59,7 +59,7 @@ astra        # start interactive chat
 astra chat -m "hello"   # one-shot
 ```
 
-Inside the interactive REPL, type `/` to see all commands. Key ones:
+Inside the TUI, type `/` to see all commands. Key ones:
 
 ```
 /model          switch model

@@ -1,4 +1,4 @@
-use astra_runtime::{pipeline::persistence::ToolHealthEntry, tool_selector::ToolSelector};
+use astra_runtime::pipeline::persistence::ToolHealthEntry;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -145,7 +145,7 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) perm_manager: &'a mut PermissionManager,
     pub(crate) verbose_mode: bool,
     pub(crate) render_policy: super::super::stream_render::RenderPolicy,
-    pub(crate) selector: &'a dyn ToolSelector,
+
     pub(crate) recent_tools: &'a [String],
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
     /// P6 seam: cross-session lessons loaded once at session bootstrap.
@@ -239,7 +239,7 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) task_manager: Option<std::sync::Arc<crate::edge_tools::TaskManager>>,
     /// Current REPL turn number — used to tag journal entries for undo.
     pub(crate) turn_index: u32,
-    /// Pre-loaded CSL messages (from CslManager.load() in repl_turn).
+    /// Pre-loaded CSL messages (from CslManager.load() in chat_turn).
     /// Restored pipeline state from a checkpoint (enables warm-start on resume).
     pub(crate) pipeline_state: Option<serde_json::Value>,
     /// When present, these are used instead of converting history pairs.
@@ -247,7 +247,7 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Extra context appended to the system prompt (gateway injects cron/session context here).
     pub(crate) append_system_prompt: Option<String>,
     /// Background session-memory.md extraction coordinator. Cloned
-    /// from `ReplState::session_memory_extractor`. `None` keeps
+    /// from `SessionState::session_memory_extractor`. `None` keeps
     /// extraction disabled (one-shot `chat -m`, plan subtasks, tests).
     pub(crate) session_memory_extractor:
         Option<std::sync::Arc<astra_runtime::session_memory::MemoryExtractionService>>,
@@ -277,7 +277,7 @@ pub(crate) struct BasicCliChatContext<'a> {
     pub render_md: bool,
     pub verbose_mode: bool,
     pub render_policy: super::super::stream_render::RenderPolicy,
-    pub selector: &'a dyn ToolSelector,
+
     pub unified_skill_registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     pub skill_search: &'a astra_core::SkillSearchSettings,
     /// Optional agent spawner so `astra chat -m` (non-REPL one-shot)
@@ -327,7 +327,7 @@ impl<'a> ChatTurnParams<'a> {
             perm_manager,
             verbose_mode: ctx.verbose_mode,
             render_policy: ctx.render_policy,
-            selector: ctx.selector,
+
             recent_tools: &[],
             tool_health_entries: &[],
             session_lessons: &[],
@@ -382,8 +382,8 @@ mod tests {
     //! spawning not available in this context".
     //!
     //! A full end-to-end test here would require mocking the
-    //! ToolSelector trait (async method with lifetime parameter —
-    //! non-trivial to satisfy), so we instead write a *structural*
+    //! async method with lifetime parameter (non-trivial to satisfy),
+    //! so we instead write a *structural*
     //! regression: verify by AST that the `basic_cli` function
     //! clones `ctx.agent_spawner` into the returned
     //! `ChatTurnParams` (not a hard-coded `None`). The grep is

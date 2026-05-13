@@ -60,8 +60,7 @@ pub(crate) mod storage;
 
 pub(crate) use storage::{
     ensure_core_schema, insert_core_turn_event, insert_tool_turn_event, insert_turn_decision_audit,
-    insert_turn_implicit_feedback, insert_turn_skill_selection, insert_turn_skill_selector_metric,
-    resolve_active_skill_versions, trim_turn_skill_selector_metrics_window,
+    insert_turn_implicit_feedback, insert_turn_skill_selection, resolve_active_skill_versions,
     update_snapshot_llm_ids, update_turn_skill_selection_version,
 };
 
@@ -90,7 +89,6 @@ pub mod self_model;
 pub mod server;
 pub mod session_memory;
 pub mod tool_registry;
-pub mod tool_selector;
 pub mod turn;
 
 // ── Re-exports: core primitives ──────────────────────────────────────────────
@@ -257,8 +255,7 @@ pub use astra_turn_core::contracts::{
     TurnHookDbWriter, TurnImplicitFeedbackRecord, TurnObserverRequest, TurnObserverWorker,
     TurnReflectionLessonRecord, TurnReflectionLessonWriter, TurnReflectionMark,
     TurnReflectionStateStore, TurnSessionActivityWriter, TurnSkillSelectionRecord,
-    TurnSkillSelectorMetricRecord, TurnToolEventPersistPlan, TurnToolEventRecord,
-    TurnToolEventWriter,
+    TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
 };
 
 pub use turn::services::{

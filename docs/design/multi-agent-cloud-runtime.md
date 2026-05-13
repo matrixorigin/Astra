@@ -80,7 +80,7 @@ Agent Decision = f(prompt@version, skill@version, context@snapshot, memory@state
 
 1. **Cross-session learning**: EntityGraph + PatternLibrary + ProgressiveCalibrator persist and evolve across sessions. No competitor does this.
 2. **Edge-cloud architecture**: Tools execute locally (100ms latency), LLM reasoning goes to cloud. Combines Claude Code's privacy with Codex's cloud power.
-3. **Self-improving selection**: ToolQualityTracker biases future selections based on historical outcomes. Production CLI uses TF-IDF tool selection (routing engine, entity graph, patterns) with no extra LLM pre-call; `LlmToolSelector`/`FallbackSelector` remain in `tool_selector.rs` for tests and optional composition.
+3. **Self-improving selection**: ToolQualityTracker biases future outcomes based on historical usage. Production CLI no longer performs a per-turn LLM tool-selection pre-call or uses the removed `tool_selector.rs` composition path.
 4. **Intent-driven context**: Load only task-relevant memory (preference query: ~100 tokens vs full memory: ~2400 tokens). 60% token savings.
 
 ### 2.3 Where We Must Catch Up
@@ -98,12 +98,12 @@ Agent Decision = f(prompt@version, skill@version, context@snapshot, memory@state
 
 ```
 rust/crates/
-├── astra/        # Edge: CLI REPL, 50 tools, thin-client SSE loop (still hosts chat_stream)
-│   ├── main.rs              # Entry point, REPL loop, session management
+├── astra/        # Edge: CLI TUI, 50 tools, thin-client SSE loop (still hosts chat_stream)
+│   ├── main.rs              # Entry point, TUI loop, session management
 │   ├── edge_tools.rs        # 50 tools: bash, file ops, git (gix), code intel, web, memory
 │   ├── cli/
 │   │   ├── chat_stream/     # `mod.rs` + `sse_loop/` (`mod.rs` entry, `agentic_sse_loop`, `agentic_loop_turn`); headless §5.5
-│   │   └── repl_turn.rs     # Single turn execution
+│   │   └── chat_turn.rs     # Single turn execution
 │   └── edge_tools/
 │       ├── code_intel.rs    # 10 tree-sitter AST tools
 │       ├── git_gix.rs       # Pure-Rust git (no binary dependency)
@@ -157,7 +157,7 @@ When the CLI pulls **learning** (versioned snapshot) and/or **preferences** from
 | Field | Meaning |
 |-------|---------|
 | `profile` | Credential profile name (e.g. `default`) |
-| `source` | `repl_startup` (REPL init, after cloud pull + prefs) or `post_login` (after successful `/login` or register→auto-login) |
+| `source` | `session_startup` (session startup init, after cloud pull + prefs) or `post_login` (after successful `/login` or register→auto-login) |
 | `learning_version` | Cloud row version after pull, if any |
 | `learning_snapshot_merged` | Whether a versioned learning snapshot was merged in that pull |
 | `tool_health_rows_from_cloud` | Number of tool-health entries carried in that pull payload |
@@ -168,7 +168,7 @@ When the CLI pulls **learning** (versioned snapshot) and/or **preferences** from
 
 1. **Substantive pull** (reachable and at least one of: learning `version`, non-empty tool health from snapshot, or non-empty preference keys): append with `reachable_empty_ack: false` (requires a **session id** and writable journal).
 2. **`post_login` + reachable + empty**: still append, with **`reachable_empty_ack: true`** — infrequent, ties auth refresh to a successful cloud round-trip.
-3. **`repl_startup` + reachable + empty**: by default **omit** (avoids noise on every REPL open). Opt in with environment variable **`ASTRA_JOURNAL_CLOUD_EMPTY_ACK=1`** to append the same empty-ack marker as in (2).
+3. **`session_startup` + reachable + empty**: by default **omit** (avoids noise on every TUI session open). Opt in with environment variable **`ASTRA_JOURNAL_CLOUD_EMPTY_ACK=1`** to append the same empty-ack marker as in (2).
 
 The human-readable `user_input` line on the event includes `cloud_pull`, profile, version, preference count, and the suffix ` empty_ack` when `reachable_empty_ack` is true (easy `grep`).
 
@@ -234,9 +234,9 @@ Code-level audit reveals **5 components stuck in the wrong layer** that block mu
 
 | Component | Current Layer | Evidence | Should Be | Why It Matters |
 |-----------|--------------|----------|-----------|---------------|
-| **SyncOrchestrator** | `astra` `ReplState` | `main.rs:436` | Cloud service state | CLI session holds cloud sync — can't share across Web/IDE clients |
-| **MatrixOne pool** | `astra` `ReplState` | `main.rs:406` | Service layer | DB connection pool is infrastructure, not CLI concern |
-| **Event ingestion sender** | `astra` `ReplState` | `main.rs:402` | Service layer | Cloud event publishing is not a CLI responsibility |
+| **SyncOrchestrator** | `astra` `SessionState` | `main.rs:436` | Cloud service state | CLI session holds cloud sync — can't share across Web/IDE clients |
+| **MatrixOne pool** | `astra` `SessionState` | `main.rs:406` | Service layer | DB connection pool is infrastructure, not CLI concern |
+| **Event ingestion sender** | `astra` `SessionState` | `main.rs:402` | Service layer | Cloud event publishing is not a CLI responsibility |
 | **LearningAdapter bridge** | `runtime` `sync_adapters.rs` | Bridges `pipeline` learning modules with `services::SyncEngine` | ✅ **Done** (in `runtime`, not `services` — `services` must not depend on `runtime`) | CLI imports `astra_runtime::sync_adapters::*` |
 | **InProcessChatTurnBridge** | `runtime` `turn/bridge_inprocess.rs` | LLM call path | 🟡 **Partial** | Active-model **DB query + decrypt** moved to `services::resolve_active_llm_model`; bridge still holds `MatrixOneSettings` / pool wiring for streaming |
 
@@ -244,7 +244,7 @@ Code-level audit reveals **5 components stuck in the wrong layer** that block mu
 
 | Crate | LOC | Role | Assessment |
 |-------|----:|------|-----------|
-| `astra` | ≈47k (Rust LOC, approximate) | CLI — should be thin | **Still heavy**: `chat_stream`, `ReplState` infra, edge tools; plan/sync adapters moved to `runtime` |
+| `astra` | ≈47k (Rust LOC, approximate) | CLI — should be thin | **Still heavy**: `chat_stream`, `SessionState` infra, edge tools; plan/sync adapters moved to `runtime` |
 | `runtime` | 56,748 | Cognitive engine + HTTP API | Mostly correct; InProcessBridge is the outlier |
 | `services` | 26,441 | Cloud backend | Clean; only depends on `core` |
 | `core` | ~2,000 | Shared config/types | ✅ Correct |
@@ -259,7 +259,7 @@ astra ──▶ runtime ──▶ services ──▶ core
 The graph is correct (no cycles), but `astra` being the **only crate that can bridge runtime↔services** creates a bottleneck: any new client (Web, IDE) would need to duplicate the bridging code or depend on `astra`.
 
 **Two binary targets already exist** (good foundation):
-- `astra` (CLI): `crates/astra-cli/src/main.rs` — 5,198 lines, REPL + edge tools
+- `astra` (CLI): `crates/astra-cli/src/main.rs` — 5,198 lines, TUI + edge tools
 - `astra-server` (API): `crates/runtime/src/main.rs` — 11 lines, pure HTTP server
 
 ---
@@ -291,11 +291,11 @@ The graph is correct (no cycles), but `astra` being the **only crate that can br
 
 ### 4.3 What's Solid and Should Not Change
 
-- **Phase 0 progress (v1.4.52)**: **`sse_loop/`** is two implementation modules + `mod.rs` entry (`stream_chat_sse` → `AgenticSseLoopState` → `run_all_turns` / `agentic_loop_turn`). **`bridge_inprocess`** + **`ChatTurnSseFramer`** share **`SseBlankLineUtf8Buf`** (39). Stall metrics + verdict penalties in **`stall`** (40). **`agentic_turn_ingest`** (41). Post-tool policy + stall preflight in **`agentic_post_tool_policy`** / **`agentic_stall_preflight`** (42); **`AgenticVerdictAuditEvent`** in runtime, CLI **`VerdictEvent`** = type alias. Headless round indexing + flat parse + timeout/unknown-tool helpers in **`headless_tool_assembly`** (43). Reflect hydrate + headless postprocess/journal + semantic hint wrapper (44). Budget pressure + headless step/cache/checkpoint/journal + skill merge (45). Prepare-turn explain + selection context + headless opening/pairs (46). Headless stderr line builders + skill-instruction merge + HTTP error string + `record_plan` helper (47). Ingest snapshot constructor + headless slot resolver + TurnGuard deprioritized merge + domain-hint debug strings for perceive (48). First-hit Memoria/selector/context-assembly ms + first selection report capture in **`agentic_turn_telemetry`**; restricted-name filter + `edge_tools` in **`chat_turn_payload::attach_filtered_edge_tools`** (49). **`prepare_turn_explain_text::explain_stderr_payload_line_pair`** batches restricted + guidance lines for `--explain` stderr (50). **`chat_turn_explain_wire::AgenticChatExplainFlags`** carries `/chat` explain booleans; **`accumulate_selector_token_usage`** on tool-follow-up turns; **`map_ingest_outcome_to_iteration_control`** after stream ingest (51). **`agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools`**; **`chat_turn_api_error::CHAT_TURN_POST_MAX_RETRIES`**; **`map_post_tool_policy_outcome`** (52–53). Skill merge stderr helpers **`skill_instruction_load_failed_message`**, **`skill_instruction_activated_names_csv`** (54). **`agentic_turn_flow`** bundles stall-guard build + stall preflight + returns tool-call list for post-tool policy; **`append_explain_turn_batch`** for explain-turn accumulation; **`chat_turn_http_error_with_compact_body`** pipes raw body through CLI compact (55). **`AgenticExplainUiMode`** + **`AgenticChatExplainFlags::from_explain_ui_mode`** replace local explain mapping in **`agentic_loop_turn`** (56). **`tool_result_semantics::cloud_tool_result_status_label`** for **`POST /tools/result`** `status` from edge output prefixes (57). **`tool_schema_prune::openai_tool_names_from_schemas`** for local tool-name allowlist in **`AgenticSseLoopState::new`** (58). **`stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG`** for the remaining-turn budget error string (59). **`agentic_turn_telemetry`** adds **`format_token_count_compact`**, **`session_id_footer_abbrev`**, **`step_recorder_chat_ephemeral_run_id`** for verbose footer + step run id (60). **`sse_edge_stderr_lines`** for SSE edge stderr copy + thought-duration line (61–62). **`explain_report_lines`** for `--explain` / verdict stderr text; CLI **`explain_reports`** (63). **`edge_executor_id::random_edge_executor_instance_id`** for default §5.5 id (64). **`LearnedContext::task_archetype_payload_token`** for `/chat` learned task hint (65). **`str_preview`** (Unicode **`truncate_str`**, **`prefix_chars`**) and **`headless_tool_status_display`** (`tool_call_detail`, **`tool_result_summary`**) (66). **`agentic_headless_round::run_agentic_headless_tool_round`** + **`HeadlessRoundTerminal`** / **`NoopHeadlessTerminal`**; CLI crossterm adapter in **`agentic_loop_turn`** (67). Remaining: `/chat` payload prep + **`POST /chat/turn`** + live SSE **`consume_turn_sse`** (executor, skills, permissions, stream); multi-turn loop body on server; **`ReplState`** / **`AppState`** infra largely converged on **`MatrixCloudRuntime`**.
+- **Phase 0 progress (v1.4.52)**: **`sse_loop/`** is two implementation modules + `mod.rs` entry (`stream_chat_sse` → `AgenticSseLoopState` → `run_all_turns` / `agentic_loop_turn`). **`bridge_inprocess`** + **`ChatTurnSseFramer`** share **`SseBlankLineUtf8Buf`** (39). Stall metrics + verdict penalties in **`stall`** (40). **`agentic_turn_ingest`** (41). Post-tool policy + stall preflight in **`agentic_post_tool_policy`** / **`agentic_stall_preflight`** (42); **`AgenticVerdictAuditEvent`** in runtime, CLI **`VerdictEvent`** = type alias. Headless round indexing + flat parse + timeout/unknown-tool helpers in **`headless_tool_assembly`** (43). Reflect hydrate + headless postprocess/journal + semantic hint wrapper (44). Budget pressure + headless step/cache/checkpoint/journal + skill merge (45). Prepare-turn explain + selection context + headless opening/pairs (46). Headless stderr line builders + skill-instruction merge + HTTP error string + `record_plan` helper (47). Ingest snapshot constructor + headless slot resolver + TurnGuard deprioritized merge + domain-hint debug strings for perceive (48). First-hit Memoria/selector/context-assembly ms + first selection report capture in **`agentic_turn_telemetry`**; restricted-name filter + `edge_tools` in **`chat_turn_payload::attach_filtered_edge_tools`** (49). **`prepare_turn_explain_text::explain_stderr_payload_line_pair`** batches restricted + guidance lines for `--explain` stderr (50). **`chat_turn_explain_wire::AgenticChatExplainFlags`** carries `/chat` explain booleans; **`accumulate_selector_token_usage`** on tool-follow-up turns; **`map_ingest_outcome_to_iteration_control`** after stream ingest (51). **`agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools`**; **`chat_turn_api_error::CHAT_TURN_POST_MAX_RETRIES`**; **`map_post_tool_policy_outcome`** (52–53). Skill merge stderr helpers **`skill_instruction_load_failed_message`**, **`skill_instruction_activated_names_csv`** (54). **`agentic_turn_flow`** bundles stall-guard build + stall preflight + returns tool-call list for post-tool policy; **`append_explain_turn_batch`** for explain-turn accumulation; **`chat_turn_http_error_with_compact_body`** pipes raw body through CLI compact (55). **`AgenticExplainUiMode`** + **`AgenticChatExplainFlags::from_explain_ui_mode`** replace local explain mapping in **`agentic_loop_turn`** (56). **`tool_result_semantics::cloud_tool_result_status_label`** for **`POST /tools/result`** `status` from edge output prefixes (57). **`tool_schema_prune::openai_tool_names_from_schemas`** for local tool-name allowlist in **`AgenticSseLoopState::new`** (58). **`stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG`** for the remaining-turn budget error string (59). **`agentic_turn_telemetry`** adds **`format_token_count_compact`**, **`session_id_footer_abbrev`**, **`step_recorder_chat_ephemeral_run_id`** for verbose footer + step run id (60). **`sse_edge_stderr_lines`** for SSE edge stderr copy + thought-duration line (61–62). **`explain_report_lines`** for `--explain` / verdict stderr text; CLI **`explain_reports`** (63). **`edge_executor_id::random_edge_executor_instance_id`** for default §5.5 id (64). **`LearnedContext::task_archetype_payload_token`** for `/chat` learned task hint (65). **`str_preview`** (Unicode **`truncate_str`**, **`prefix_chars`**) and **`headless_tool_status_display`** (`tool_call_detail`, **`tool_result_summary`**) (66). **`agentic_headless_round::run_agentic_headless_tool_round`** + **`HeadlessRoundTerminal`** / **`NoopHeadlessTerminal`**; CLI crossterm adapter in **`agentic_loop_turn`** (67). Remaining: `/chat` payload prep + **`POST /chat/turn`** + live SSE **`consume_turn_sse`** (executor, skills, permissions, stream); multi-turn loop body on server; **`SessionState`** / **`AppState`** infra largely converged on **`MatrixCloudRuntime`**.
 - **Local-first journal**: Append-only JSONL is the correct foundation. Fast, crash-safe, auditable.
 - **Sync envelope state machine**: Clean→Dirty→Syncing→Conflict is correct. Extend, don't replace.
 - **DomainAdapter trait**: The trait signature is well-designed. **Learning, Events, Tasks, Templates, and Preferences** now have real [`runtime::sync_adapters`](../../rust/crates/runtime/src/sync_adapters.rs) implementations (see §6.2.1); residual “stub” language in older sections is obsolete for those domains.
-- **Tool selection default path**: TF-IDF + learned context (entity/pattern/calibration) without a per-turn LLM tool-selection call in CLI; optional `FallbackSelector`/`LlmToolSelector` in-library for experiments.
+- **Tool selection default path**: registry-based tool surfacing with learned context (entity/pattern/calibration) and no per-turn LLM tool-selection pre-call in CLI.
 - **LearnedContext flow**: Entity/pattern/calibration/tool hints as "priors, not hard requirements" is correct.
 
 ---
@@ -396,9 +396,9 @@ The current architecture tightly couples the CLI to the agent runtime. Evidence:
 
 1. **`chat_stream/sse_loop/`** in `astra` still hosts the multi-turn LLM interaction loop — stall detection, token budgeting, schema pruning, response guards. **Parallel local tool execution was removed**; the headless path assembles results from SSE `tool_request` / edge callbacks (§5.5). Moving the remaining loop into `runtime` is still open.
 
-2. **`ReplState` in `main.rs:380-447`** holds infrastructure state that belongs in a server:
+2. **`SessionState` in `main.rs:380-447`** holds infrastructure state that belongs in a server:
    ```rust
-   // These fields are in the CLI's REPL state — they should be server-side:
+   // These fields are in the CLI's session state — they should be server-side:
    sync_orchestrator: Option<SyncOrchestrator>,      // cloud sync coordination
    matrixone_pool: Option<Arc<sqlx::Pool<MySql>>>,   // database connection pool
    ingestion_sender: Option<IngestionSender>,         // cloud event publishing
@@ -456,9 +456,9 @@ A **headless cloud runtime** is an agent runtime that has no UI, no local filesy
 | `chat_stream/sse_loop/` core loop | `astra` | `runtime` server handler | Multi-turn orchestration still in CLI crate; headless tool path done | Large |
 | `plan_decompose.rs` | ~~`astra`~~ → **`runtime`** | `runtime` | ✅ **Done** — `runtime/src/plan_decompose.rs` | — |
 | `sync_adapters.rs` | ~~`astra`~~ → **`runtime`** | `runtime` (not `services`: avoids dep cycle) | ✅ **Done** — `runtime/src/sync_adapters.rs` | — |
-| `SyncOrchestrator` construction | `ReplState` (`main.rs:436`) | `AppState` (`state_builder.rs`) | CLI holds cloud sync state | Small |
-| `MatrixOne pool` | `ReplState` (`main.rs:406`) | `AppState` (already has `shared_pool`) | Duplicate pool in CLI | Small |
-| `IngestionSender` | `ReplState` (`main.rs:402`) | Server-side event pipeline | CLI publishes cloud events directly | Small |
+| `SyncOrchestrator` construction | `SessionState` (`main.rs:436`) | `AppState` (`state_builder.rs`) | CLI holds cloud sync state | Small |
+| `MatrixOne pool` | `SessionState` (`main.rs:406`) | `AppState` (already has `shared_pool`) | Duplicate pool in CLI | Small |
+| `IngestionSender` | `SessionState` (`main.rs:402`) | Server-side event pipeline | CLI publishes cloud events directly | Small |
 | `InProcessChatTurnBridge` model SQL | ~~`runtime/turn/`~~ | `services` | ✅ Query/decrypt extracted to `resolve_active_llm_model` | Remaining: pool/settings wiring in bridge |
 | Skill registry + loader | `agentic_loop_turn.rs` (skill text merge) + `sse_loop/mod.rs` entry | `runtime` `SkillService` | Skill loading is cognitive, not CLI | Medium |
 
@@ -473,7 +473,7 @@ A **headless cloud runtime** is an agent runtime that has no UI, no local filesy
 | Build/test loop | `edge_tools/build_test.rs` | Local build toolchain |
 | MCP server connections | `mcp_client.rs` | User's MCP servers |
 | Permission manager | `permission_manager.rs` | Local approval UX |
-| REPL UI + rendering | `repl_ui.rs`, `stream_render.rs` | Terminal rendering |
+| TUI rendering | `tui/`, `stream_render.rs` | Terminal rendering |
 
 #### Open Design Challenges
 
@@ -517,11 +517,11 @@ A precise mapping of every responsibility in the current `astra` CLI to its targ
 | LLM model resolution & API key management | `services::resolve_active_llm_model` | `services` (shared helper) | ✅ Active row + decrypt; bridge calls into services |
 | Chat turn orchestration (stall, budget, guard) | `chat_stream/sse_loop/` + `explain_reports.rs` | `runtime` server handler | Core cognitive loop still in CLI |
 | Tool selection (TF-IDF + LLM) | `runtime` `tool_selector.rs` | `runtime` (stays) | Already server-side ✅ |
-| Session lifecycle (create, restore, checkpoint) | Split: `services` + `main.rs` | `services` (consolidate) | Remove `ReplState` session fields |
+| Session lifecycle (create, restore, checkpoint) | Split: `services` + `main.rs` | `services` (consolidate) | Remove `SessionState` session fields |
 | Task/plan state machine | `services` `task_orchestrator.rs` | `services` (stays) | Already server-side ✅ |
 | Plan decomposition | `runtime` `plan_decompose.rs` | `runtime` | ✅ Moved out of CLI |
 | Learning sync + merge | `runtime` `sync_adapters.rs` | `runtime` (adapter crate layer) | ✅ Moved; uses `services` traits without `services`→`runtime` cycle |
-| Event ingestion | `astra` `ReplState` | `services` (already has `IngestionWorker`) | Remove from CLI |
+| Event ingestion | `astra` `SessionState` | `services` (already has `IngestionWorker`) | Remove from CLI |
 | Memory/skill/context CRUD | `runtime` route handlers | `runtime` (stays) | Already server-side ✅ |
 | Approval workflow | Not implemented | `services` new module | Cloud-resident for multi-client |
 
@@ -539,7 +539,7 @@ A precise mapping of every responsibility in the current `astra` CLI to its targ
 
 | Responsibility | Current Owner | Target Owner | Notes |
 |---------------|--------------|-------------|-------|
-| User input (text, slash commands) | `main.rs` REPL | Thin client | Parse → dispatch to cloud API |
+| User input (text, slash commands) | `main.rs` TUI | Thin client | Parse → dispatch to cloud API |
 | SSE stream rendering | `stream_render.rs` | Thin client | Render cloud events |
 | Session switching | `slash_session.rs` | Thin client → cloud API | Client calls `/sessions/*` |
 | Memory management | `slash_memory.rs` | Thin client → cloud API | Client calls `/memory/*` |
@@ -698,7 +698,7 @@ This is the same protocol as CLI/Web/IDE **thin clients**; the edge differs only
 
 #### 5.5.3 CLI registry and heartbeat environment
 
-After the REPL banner, if silent/auth left a valid access token, [`edge_lifecycle.rs`](../../rust/crates/astra-cli/src/cli/edge_lifecycle.rs) (`register_and_start_heartbeat`) performs a single **`POST /agents/edge`** (typed [`EdgeRegisterRequest`](../../rust/crates/astra-thin-client/src/protocol.rs), same string for `edge_agent_id` and [`X-Astra-Edge-Id`](../../rust/crates/astra-thin-client/src/edge.rs) as `chat_stream`), optional enrichment of `hostname` / `worktree_path` from `HOSTNAME` or `COMPUTERNAME` and `std::env::current_dir()`, then a background loop of **`POST /agents/edge/heartbeat`**. Register failures are non-fatal (dim stderr; chat continues). On REPL exit the heartbeat task is **aborted**.
+After the TUI banner, if silent/auth left a valid access token, [`edge_lifecycle.rs`](../../rust/crates/astra-cli/src/cli/edge_lifecycle.rs) (`register_and_start_heartbeat`) performs a single **`POST /agents/edge`** (typed [`EdgeRegisterRequest`](../../rust/crates/astra-thin-client/src/protocol.rs), same string for `edge_agent_id` and [`X-Astra-Edge-Id`](../../rust/crates/astra-thin-client/src/edge.rs) as `chat_stream`), optional enrichment of `hostname` / `worktree_path` from `HOSTNAME` or `COMPUTERNAME` and `std::env::current_dir()`, then a background loop of **`POST /agents/edge/heartbeat`**. Register failures are non-fatal (dim stderr; chat continues). On TUI exit the heartbeat task is **aborted**.
 
 | Variable | Behavior |
 |----------|----------|
@@ -784,7 +784,7 @@ impl DomainAdapter for EventAdapter {
 
 > **Implementation detail (2026)**: See [`rust/docs/edge-cloud-sync-architecture.md`](../../rust/docs/edge-cloud-sync-architecture.md) §8 for the exact `HybridRestoreService` / Step Protocol / `/resume` layering and file paths (`~/.astra/sessions/…`).
 
-**`astra_services::session_restore::RestoredSession`** (hybrid metadata for the REPL) today covers:
+**`astra_services::session_restore::RestoredSession`** (hybrid metadata for the TUI) today covers:
 
 | Area | Source | Notes |
 |------|--------|--------|
@@ -1778,9 +1778,9 @@ astra Orchestrator
 | Canonical tool arg keys in hints layer | ✅ Done (slice 6) | Small | **`tool_argument_hints`**: only `path` and `command` (no `cmd`, `file_path`, `target_file`); cloud approval path + CLI prompts + journal previews aligned |
 | Extract SSE `data:` JSON line parser | ✅ Done (slice 7) | Small | **`runtime/src/turn/sse_data_lines.rs`** — `drain_sse_data_lines`, `finish_sse_data_buffer`, `parse_sse_data_json_events`; `json_events_from_sse_event_block` (slice 39); `bridge_inprocess` stream + lifecycle contract tests |
 | Extract SSE blank-line event blocks | ✅ Done (slice 8) | Small | **`runtime/src/turn/sse_blocks.rs`** — `drain_complete_sse_event_blocks` (`\n\n` / `\r\n\r\n`); **`SseBlankLineUtf8Buf`** (slice 39) shared by **`ChatTurnSseFramer`** + **`bridge_inprocess`** |
-| Extract chat-turn factual / session heuristics | ✅ Done (slice 9) | Small | **`runtime/src/turn/chat_turn_heuristics.rs`** — `looks_like_factual_query`, `looks_like_live_query_with_context`, `should_force_factual_tool_retry`, `extract_repos_from_memory`, `is_session_not_found_error`; CLI `chat_stream` + `repl_turn` / `command_router` via `main` imports |
+| Extract chat-turn factual / session heuristics | ✅ Done (slice 9) | Small | **`runtime/src/turn/chat_turn_heuristics.rs`** — `looks_like_factual_query`, `looks_like_live_query_with_context`, `should_force_factual_tool_retry`, `extract_repos_from_memory`, `is_session_not_found_error`; CLI `chat_stream` + `chat_turn` / `command_router` via `main` imports |
 | Extract headless tool round assembly (cache list, stall-guard shape, edge output match) | ✅ Done (slice 10) | Small | **`runtime/src/turn/headless_tool_assembly.rs`** — `CACHEABLE_TOOLS`, `EdgeToolRoundRow`, `take_edge_output_for_tool_call`, `tool_calls_for_stall_guard`; CLI `chat_stream` + `EdgeToolRoundEntry` impl in `stream_render` |
-| Extract boost-term → `DomainHint`, REPL history → OpenAI `messages`, stall schema filter | ✅ Done (slice 11) | Small | **`turn/boost_domain_hints.rs`** (`domain_hints_from_boost_terms`); **`turn/chat_history_openai.rs`** (`openai_messages_from_repl_history`); **`tool_schema_prune`** (`filter_tool_schemas_by_excluded_names`); CLI `chat_stream/sse_loop` |
+| Extract boost-term → `DomainHint`, chat history → OpenAI `messages`, stall schema filter | ✅ Done (slice 11) | Small | **`turn/boost_domain_hints.rs`** (`domain_hints_from_boost_terms`); **`turn/chat_history_openai.rs`** (`openai_messages_from_chat_history`); **`tool_schema_prune`** (`filter_tool_schemas_by_excluded_names`); CLI `chat_stream/sse_loop` |
 | Extract `edge_profile` base + selector guidance for `/chat` payload | ✅ Done (slice 12) | Small | **`turn/chat_turn_edge_profile.rs`** (`read_git_branch_abbrev`, `memoria_env_for_edge_profile`, `build_base_edge_profile_value`, `detect_active_system_skills_in_message`); **`tool_registry/selection_edge_hints.rs`** (`top_unpinned_tool_names_from_report`, `apply_selector_hints_to_edge_profile`); CLI `sse_loop` |
 | Extract `/chat` `explain` JSON + compaction-tier → `budget_pressure` | ✅ Done (slice 13) | Tiny | **`turn/chat_turn_explain_wire.rs`** (`chat_turn_explain_field_json`); **`prompts::CompactionTier::budget_pressure`** (`context.rs`); CLI `sse_loop` |
 | Extract response-guard policy + pin invoked tool schemas | ✅ Done (slice 14) | Small | **`turn/response_guard.rs`** (`apply_response_guards`); **`tool_schema_prune::pin_invoked_tool_schemas`**; CLI `sse_loop` |
@@ -1838,12 +1838,12 @@ astra Orchestrator
 | Full headless act round after ingest | ✅ Done (slice 67) | Medium | **`agentic_headless_round::{run_agentic_headless_tool_round, HeadlessRoundTerminal, …}`**; CLI thin adapter |
 | Implement tool execution callback protocol (cloud → edge) | ✅ Core path | Medium | §5.5 `/tools/result`, `tool_request` SSE; `chat_stream` **does not** re-execute tools for that path. |
 | Add `edge_executor_id` to chat turn protocol | ✅ | Small | Thin client + §5.5.2 light edge helpers. |
-| Move `SyncOrchestrator` construction from `ReplState` to `AppState` | ✅ Done | — | **`MatrixCloudRuntime`** bundles `SharedPool` + `IngestionSender` + `SyncOrchestrator`; `ReplState` / `AppState` hold `Option<Arc<MatrixCloudRuntime>>` only (no separate orchestrator field) |
-| Move `IngestionSender` from `ReplState` to server pipeline | ✅ Done | — | Same bundle as row above; journal flush via `enqueue_journal_events` |
-| Remove `matrixone_pool` from `ReplState` (use server `shared_pool`) | ✅ Done | — | Superseded by `MatrixCloudRuntime::shared_pool()`; no `matrixone_pool` field on `ReplState` |
+| Move `SyncOrchestrator` construction from `SessionState` to `AppState` | ✅ Done | — | **`MatrixCloudRuntime`** bundles `SharedPool` + `IngestionSender` + `SyncOrchestrator`; `SessionState` / `AppState` hold `Option<Arc<MatrixCloudRuntime>>` only (no separate orchestrator field) |
+| Move `IngestionSender` from `SessionState` to server pipeline | ✅ Done | — | Same bundle as row above; journal flush via `enqueue_journal_events` |
+| Remove `matrixone_pool` from `SessionState` (use server `shared_pool`) | ✅ Done | — | Superseded by `MatrixCloudRuntime::shared_pool()`; no `matrixone_pool` field on `SessionState` |
 | Refactor `chat_stream/`: cognitive loop → `runtime`, rendering stays CLI | 🟡 In progress | Large | **Slices 1–67** + **`sse_loop/`** (2 child modules + `mod.rs`) + **`runtime/turn/chat_turn_sse_dispatch`**. Remaining: `/chat` prep + turn POST/SSE + multi-turn loop on server |
 
-**Success criteria** (unchanged): `astra` CLI can be deleted and replaced with a ~500-line thin client; **not yet met** — `chat_stream` + `ReplState` infra fields remain.
+**Success criteria** (unchanged): `astra` CLI can be deleted and replaced with a ~500-line thin client; **not yet met** — `chat_stream` + `SessionState` infra fields remain.
 
 **Correction vs older drafts**: `sync_adapters` targets **`runtime`**, not `services`.
 
@@ -1952,7 +1952,7 @@ astra Orchestrator
 | Edge prompt context | `runtime/src/turn/edge_prompt_context.rs` | Workspace/lang detection; `make_args_preview` uses `tool_argument_hints` for path/command (CLI `chat_stream`) | runtime ✅ |
 | Tool schema prune | `runtime/src/turn/tool_schema_prune.rs` | Tiered pruning + `filter_tool_schemas_by_excluded_names` (stall-restricted tools) | runtime ✅ |
 | Boost → domain hints | `runtime/src/turn/boost_domain_hints.rs` | `domain_hints_from_boost_terms` → `DomainHint` for selector | runtime ✅ |
-| REPL → OpenAI messages | `runtime/src/turn/chat_history_openai.rs` | `openai_messages_from_repl_history`, `openai_user_content_message`, `append_openai_user_content_messages` (TurnGuard injections) | runtime ✅ |
+| Chat history → OpenAI messages | `runtime/src/turn/chat_history_openai.rs` | `openai_messages_from_chat_history`, `openai_user_content_message`, `append_openai_user_content_messages` (TurnGuard injections) | runtime ✅ |
 | Chat turn edge profile | `runtime/src/turn/chat_turn_edge_profile.rs` | Git branch, Memoria env, base `edge_profile` JSON, `active_skills` detection | runtime ✅ |
 | Selector → edge hints | `runtime/src/tool_registry/selection_edge_hints.rs` | `apply_selector_hints_to_edge_profile`, `top_unpinned_tool_names_from_report` | runtime ✅ |
 | Chat explain wire | `runtime/src/turn/chat_turn_explain_wire.rs` | `chat_turn_explain_field_json` → `false` / `true` / `"verbose"` | runtime ✅ |

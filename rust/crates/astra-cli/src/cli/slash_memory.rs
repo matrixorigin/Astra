@@ -153,7 +153,7 @@ pub(super) async fn handle_memory_domain_command(
     cmd: &str,
     arg: &str,
     api: &astra_thin_client::ThinClient,
-    state: &mut ReplState,
+    state: &mut SessionState,
     token: Option<&str>,
 ) -> Result<(), String> {
     match cmd {
@@ -1804,7 +1804,7 @@ pub(super) async fn handle_memory_domain_command(
                                     });
                                     let plan_goal = sub_arg.to_string();
                                     state.executing_plan_goal = Some(plan_goal.clone());
-                                    if let Some(change) = super::repl_turn::steer_observability_goal(
+                                    if let Some(change) = super::chat_turn::steer_observability_goal(
                                         state, &plan_goal,
                                     ) {
                                         super::plan_interaction::journal_goal_steering_event(
@@ -1941,7 +1941,7 @@ fn extract_goal_pattern(goal: &str) -> String {
 
 // ─── /plan status|pause helpers ──────────────────────────────────────────────
 
-fn handle_plan_status(state: &ReplState) {
+fn handle_plan_status(state: &SessionState) {
     if let Some(ref plan) = state.executing_plan {
         let pct = plan.progress_pct();
         let total = plan.subtasks.len();
@@ -2010,7 +2010,7 @@ fn handle_plan_status(state: &ReplState) {
     }
 }
 
-fn handle_plan_pause(state: &mut ReplState) {
+fn handle_plan_pause(state: &mut SessionState) {
     if let Some(ref handle) = state.plan_handle {
         match handle.send_command(crate::plan_executor::PlanCommand::Pause) {
             Ok(()) => eprintln!(

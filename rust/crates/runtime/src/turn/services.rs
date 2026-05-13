@@ -206,7 +206,6 @@ impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
     async fn persist(&self, plan: TurnHookDbPersistPlan) -> Result<(), String> {
         if plan.decision_audit.is_none()
             && plan.skill_selection.is_none()
-            && plan.skill_selector_metric.is_none()
             && plan.implicit_feedback.is_none()
         {
             return Ok(());
@@ -243,17 +242,6 @@ impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
                 .await
                 .map_err(|error| error.to_string())?;
             }
-        }
-        if let Some(skill_selector_metric) = plan.skill_selector_metric.as_ref() {
-            insert_turn_skill_selector_metric(&mut tx, skill_selector_metric)
-                .await
-                .map_err(|error| error.to_string())?;
-            trim_turn_skill_selector_metrics_window(
-                &mut tx,
-                astra_turn_core::skill_selector_metrics::SKILL_SELECTOR_RECENT_WINDOW_SIZE,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
         }
         if let Some(implicit_feedback) = plan.implicit_feedback.as_ref() {
             insert_turn_implicit_feedback(&mut tx, implicit_feedback)
@@ -622,7 +610,6 @@ mod tests {
                     context_capture_id: None,
                 }),
                 skill_selection: None,
-                skill_selector_metric: None,
                 implicit_feedback: None,
                 reflection_lesson: None,
                 reflection_mark: None,

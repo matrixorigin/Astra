@@ -184,8 +184,8 @@ struct ExtractedTrainingSample {
     session_id: String,
     quality_score: f64,
     step_count: i64,
-    avg_selector_confidence: Option<f64>,
-    selector_trace_count: i64,
+    avg_confidence: Option<f64>,
+    trace_count: i64,
     quality_updated_at: Option<String>,
     latest_context_trace_at: Option<String>,
 }
@@ -449,7 +449,7 @@ fn render_training_dataset_jsonl(
 
 fn render_training_dataset_csv(dataset: &ExtractedTrainingDataset) -> String {
     let mut lines = vec![
-        "session_id,quality_score,step_count,avg_selector_confidence,selector_trace_count,quality_updated_at,latest_context_trace_at".to_string(),
+        "session_id,quality_score,step_count,avg_confidence,trace_count,quality_updated_at,latest_context_trace_at".to_string(),
     ];
     lines.extend(dataset.samples.iter().map(|sample| {
         [
@@ -457,10 +457,10 @@ fn render_training_dataset_csv(dataset: &ExtractedTrainingDataset) -> String {
             sample.quality_score.to_string(),
             sample.step_count.to_string(),
             sample
-                .avg_selector_confidence
+                .avg_confidence
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
-            sample.selector_trace_count.to_string(),
+            sample.trace_count.to_string(),
             csv_escape(sample.quality_updated_at.as_deref().unwrap_or_default()),
             csv_escape(
                 sample
@@ -1859,8 +1859,8 @@ impl EvaluationService for DatabaseEvaluationService {
             "SELECT qa.target_id AS session_id, \
                     MAX(CAST(qa.score AS DOUBLE)) AS quality_score, \
                     MAX(COALESCE(qa.step_count, 0)) AS step_count, \
-                    AVG({confidence_expr}) AS avg_selector_confidence, \
-                    {trace_count_expr} AS selector_trace_count, \
+                    AVG({confidence_expr}) AS avg_confidence, \
+                    {trace_count_expr} AS trace_count, \
                     DATE_FORMAT(MAX(qa.updated_at), '%Y-%m-%dT%H:%i:%s') AS quality_updated_at, \
                     DATE_FORMAT(MAX(ev.created_at), '%Y-%m-%dT%H:%i:%s') AS latest_context_trace_at \
              FROM eval_quality_assessments qa \
@@ -1900,8 +1900,8 @@ impl EvaluationService for DatabaseEvaluationService {
                 session_id: row.try_get("session_id").unwrap_or_default(),
                 quality_score: row.try_get("quality_score").unwrap_or(0.0),
                 step_count: row.try_get("step_count").unwrap_or(0),
-                avg_selector_confidence: row.try_get("avg_selector_confidence").ok(),
-                selector_trace_count: row.try_get("selector_trace_count").unwrap_or(0),
+                avg_confidence: row.try_get("avg_confidence").ok(),
+                trace_count: row.try_get("trace_count").unwrap_or(0),
                 quality_updated_at: row.try_get("quality_updated_at").ok(),
                 latest_context_trace_at: row.try_get("latest_context_trace_at").ok(),
             })
@@ -2592,8 +2592,8 @@ mod tests {
                 session_id: "sess-1".into(),
                 quality_score: 0.9,
                 step_count: 4,
-                avg_selector_confidence: Some(0.85),
-                selector_trace_count: 2,
+                avg_confidence: Some(0.85),
+                trace_count: 2,
                 quality_updated_at: Some("2026-04-12T00:00:00".into()),
                 latest_context_trace_at: Some("2026-04-12T00:01:00".into()),
             }],

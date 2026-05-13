@@ -794,18 +794,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         state.skills.listing_message = if full.is_empty() {
             None
         } else {
-            // Telemetry: record the shortlist once per session for
-            // observability. Marks every skill visible (no ranking).
             if state.telemetry.initial_skill_selector_shortlist.is_none() {
-                let shortlist = crate::turn::skill_tool::build_skill_selector_shortlist_trace(
-                    &full,
-                    /* open_skill_name */ true,
-                    Default::default(),
-                );
-                if let Some(ref collector) = state.telemetry.turn_trace_collector {
-                    collector.record_skill_selector(shortlist.clone());
-                }
-                state.telemetry.initial_skill_selector_shortlist = Some(shortlist);
+                state.telemetry.initial_skill_selector_shortlist = Some(());
             }
             crate::prompts::build_skill_listing_section(&full).map(|section| {
                 serde_json::json!({

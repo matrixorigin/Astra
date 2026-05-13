@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 /// numeric prefix). UI and JSON dumps show **message delta** (suffix after shared prefix with the
 /// previous heavy snapshot), not the entire accumulated history. If there are fewer heavy files
 /// than journal turns, the latest heavy file is used and a warning is recorded.
-pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
+pub(super) fn handle_debug_command(arg: &str, state: &SessionState) {
     let session_id = if arg.is_empty() {
         match &state.session_id {
             Some(id) => id.clone(),
@@ -99,7 +99,6 @@ pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
                     .count(),
                 tools_used: Vec::new(),
                 tool_calls: Vec::new(),
-                selector_strategy: None,
                 llm_rounds: Vec::new(),
                 interruptions: Vec::new(),
             };
@@ -556,7 +555,6 @@ fn dump_turn_json(
                 "ttft_ms": summary.ttft_ms,
                 "tool_count": summary.tool_count,
                 "tools_used": summary.tools_used,
-                "selector_strategy": summary.selector_strategy,
                 "llm_rounds": summary.llm_rounds.iter().map(|round| serde_json::json!({
                     "round": round.round,
                     "agentic_step": round.agentic_step,
@@ -648,9 +646,6 @@ fn show_summary(summary: &TurnSummary) {
             );
         }
     }
-    if let Some(ref sel) = summary.selector_strategy {
-        eprintln!("  selector: {}", sel);
-    }
     eprintln!();
 }
 
@@ -713,7 +708,6 @@ struct TurnSummary {
     tool_count: usize,
     tools_used: Vec<String>,
     tool_calls: Vec<ToolCallSummary>,
-    selector_strategy: Option<String>,
     llm_rounds: Vec<LlmRoundSummary>,
     interruptions: Vec<InterruptionSummary>,
 }
@@ -812,10 +806,6 @@ fn load_journal_turns(path: &PathBuf) -> Vec<TurnSummary> {
                 })
                 .unwrap_or_default(),
             tool_calls,
-            selector_strategy: v
-                .get("selector_strategy")
-                .and_then(|v| v.as_str())
-                .map(String::from),
             llm_rounds: Vec::new(),
             interruptions: Vec::new(),
         });
@@ -1222,7 +1212,7 @@ mod tests {
         let path = dir.path().join("test.jsonl");
         std::fs::write(&path, concat!(
             r#"{"type":"session_start","ts":"2026-01-01T00:00:00Z","session_id":"s1"}"#, "\n",
-            r#"{"type":"turn","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":1,"user_input":"hello","assistant_output":"hi","tool_count":2,"tokens_in":100,"tokens_out":50,"duration_ms":5000,"tools_selected":[],"tools_used":["bash","grep"],"budget_used":0,"budget_pressure":0.0,"ttft_ms":1000,"context_ms":200,"selector_strategy":"tfidf","selector_ms":10,"memoria_ms":5}"#, "\n",
+            r#"{"type":"turn","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":1,"user_input":"hello","assistant_output":"hi","tool_count":2,"tokens_in":100,"tokens_out":50,"duration_ms":5000,"tools_selected":[],"tools_used":["bash","grep"],"budget_used":0,"budget_pressure":0.0,"ttft_ms":1000,"context_ms":200,"memoria_ms":5}"#, "\n",
         )).unwrap();
         let turns = load_journal_turns(&path);
         assert_eq!(turns.len(), 1);

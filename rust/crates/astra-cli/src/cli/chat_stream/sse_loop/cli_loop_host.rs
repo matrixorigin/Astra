@@ -13,7 +13,6 @@ use std::time::Instant;
 
 use astra_runtime::{
     tool_registry::ToolRegistry,
-    tool_selector::ToolSelector,
     turn::agentic_headless_round::HeadlessStderrStyle,
     turn::agentic_loop_host::{
         AgenticLoopHost, AgenticLoopState, HostTurnResult, TurnInteractionMode,
@@ -53,7 +52,6 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub recent_tools: &'a [String],
     pub project_root: PathBuf,
     pub executor: Arc<ToolExecutor>,
-    pub selector: &'a dyn ToolSelector,
     pub registry: ToolRegistry,
     pub all_schemas: Vec<Value>,
     pub file_context: Vec<String>,
@@ -73,7 +71,7 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub root_send_message_context:
         Option<crate::edge_tools::agent_messaging::SendMessageRuntimeContext>,
     /// REPL turn counter (0-based) for correct turn_id in trace collector.
-    pub repl_turn_index: u32,
+    pub chat_turn_index: u32,
     /// Cross-turn tool output cache for edge-path dedup.
     pub tool_cache: crate::stream_render::EdgeToolCache,
     /// Extra context appended to the system prompt via edge_profile.system_prompt_override.
@@ -171,7 +169,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
         // Preserve the lifecycle-created collector: it may already contain the
         // initial skill selector shortlist for this turn.
-        let turn_id = format!("turn-{}", self.repl_turn_index);
+        let turn_id = format!("turn-{}", self.chat_turn_index);
         let session_id = state.current_session_id.clone().unwrap_or_default();
         if let Some(ref collector) = state.telemetry.turn_trace_collector {
             collector.set_turn_id(turn_id);
@@ -270,7 +268,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             recent_tools: self.recent_tools,
             project_root: self.project_root.as_path(),
             executor: Arc::clone(&self.executor),
-            selector: self.selector,
             registry: &self.registry,
             messages: messages_slice,
             ephemeral_prefix: state.skills.listing_message.as_ref(),
@@ -284,11 +281,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             assembly_start,
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut state.telemetry.first_memoria_ms,
-                first_selector_ms: &mut state.telemetry.first_selector_ms,
-                first_selector_strategy: &mut state.telemetry.first_selector_strategy,
-                first_selector_confidence: &mut state.telemetry.first_selector_confidence,
-                selector_tokens_in: &mut state.telemetry.selector_tokens_in,
-                selector_tokens_out: &mut state.telemetry.selector_tokens_out,
                 first_selection_report: &mut state.telemetry.first_selection_report,
                 first_budget_pressure: &mut state.telemetry.first_budget_pressure,
                 first_context_assembly_ms: &mut state.telemetry.first_context_assembly_ms,
@@ -637,7 +629,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             astra_turn_core::fork_prefix::build_tool_schema_entries(&self.all_schemas);
         let req = astra_turn_core::fork_capture::CaptureRequest {
             parent_run_id,
-            parent_turn_seq: self.repl_turn_index,
+            parent_turn_seq: self.chat_turn_index,
             provider,
             model_id,
             thinking: None,

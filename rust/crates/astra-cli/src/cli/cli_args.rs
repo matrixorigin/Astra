@@ -98,9 +98,6 @@ pub(crate) struct Cli {
     /// Only explicitly provided context (--system-prompt, --add-dir, --mcp-config) is used.
     #[arg(long = "bare")]
     pub bare: bool,
-    /// Enable experimental full-screen TUI (default: classic line-mode REPL)
-    #[arg(long = "tui")]
-    pub tui: bool,
     /// Disable auto-loading of .astra/instructions.md project instructions
     #[arg(long = "no-instructions")]
     pub no_instructions: bool,
@@ -123,7 +120,7 @@ pub(crate) struct Cli {
 #[derive(Subcommand, Debug)]
 #[command(allow_external_subcommands = true)]
 pub(crate) enum Command {
-    /// Start the interactive REPL (default when no args given)
+    /// Start the interactive TUI (default when no args given)
     Interactive,
     /// Start the HTTP API server
     Serve(ServeArgs),
@@ -139,7 +136,7 @@ pub(crate) enum Command {
     Logout,
     /// Check API health
     Health,
-    /// Run a non-REPL chat request
+    /// Run a one-shot chat request
     Chat(ChatArgs),
     /// Replay a recorded session
     Replay(ReplayArgs),
@@ -175,7 +172,7 @@ pub(crate) enum Command {
     Completion(CompletionArgs),
     /// Diagnose installation, config, and connectivity
     Doctor,
-    /// Structured plan without the REPL (scripting / CI)
+    /// Structured plan in non-interactive mode (scripting / CI)
     #[command(subcommand)]
     Plan(PlanCmd),
     /// Team orchestration and shared context management
@@ -214,7 +211,7 @@ pub(crate) enum Command {
 
 /// Subcommands for the standalone `astra context` group.  Mirrors
 /// the TUI's `/context` slash command but works without a running
-/// REPL — useful for forensic replay from a persisted session.
+/// TUI session — useful for forensic replay from a persisted session.
 #[derive(Subcommand, Debug)]
 pub(crate) enum ContextCmd {
     /// Dump a session's context as JSON, or a human-readable

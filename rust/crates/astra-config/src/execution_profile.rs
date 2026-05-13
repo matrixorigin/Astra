@@ -86,7 +86,8 @@ impl ExecutionProfile {
         // `max_tools` (selection count) is left at its user/default value.
         self.config.tool_selection.max_tools_per_turn = strategy.max_tools_per_turn as u32;
 
-        // Wire scenario tool budget into config so it reaches the tool selector.
+        // Preserve the legacy selector-budget field for profile round-tripping.
+        // Runtime ignores it now that selector-based tool surfacing is removed.
         if strategy.tool_budget_tokens > 0 {
             self.config.tool_selection.tool_budget_tokens = strategy.tool_budget_tokens;
         }

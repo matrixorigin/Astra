@@ -1904,12 +1904,9 @@ mod tests {
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
     use astra_turn_core::context_assembly_trace::{
         Alternative, CompressionMethod, ContextAssemblyTrace, DecisionExplanation, DecisionType,
-        HistorySelectionTrace, MemoryInjection, MemoryRejection, MemorySelection, MemorySource,
-        PromptContextSignals, PromptGuidanceSignals, RejectionReason, SkillInjection,
-        SystemPromptBreakdown, TokenBudgetTrace, ToolSelected, TurnCompression, TurnRetention,
-    };
-    use astra_turn_core::skill_selector_metrics::{
-        SkillSelectorShortlistEntry, SkillSelectorShortlistTrace,
+        MemoryInjection, MemoryRejection, MemorySelection, MemorySource, PromptContextSignals,
+        PromptGuidanceSignals, RejectionReason, SkillInjection, SystemPromptBreakdown,
+        TokenBudgetTrace, ToolSelected, TurnCompression, TurnRetention,
     };
 
     fn trace(
@@ -2081,77 +2078,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_with_history_and_shortlist_80x28() {
-        // Mirrors a real runtime trace: the selector recorded a
-        // shortlist (no per-skill tokens) and the compactor trimmed
-        // the history aggressively. Both sections must render.
-        let mut t = trace(102_400, 6_000, 22_000, 0, 6_300, 227);
-        t.skill_selector = Some(SkillSelectorShortlistTrace {
-            open_catalog: false,
-            visible_skill_count: 3,
-            skills: vec![
-                SkillSelectorShortlistEntry {
-                    rank: 1,
-                    skill_name: "review_changes".into(),
-                    aliases: Vec::new(),
-                    description: String::new(),
-                    source: "built-in".into(),
-                    category: None,
-                },
-                SkillSelectorShortlistEntry {
-                    rank: 2,
-                    skill_name: "verify_task".into(),
-                    aliases: Vec::new(),
-                    description: String::new(),
-                    source: "built-in".into(),
-                    category: None,
-                },
-            ],
-            telemetry: Default::default(),
-        });
-        t.history = HistorySelectionTrace {
-            total_turns_available: 8,
-            turns_retained: vec![TurnRetention {
-                turn_index: 0,
-                role: "user".into(),
-                tokens: 300,
-                has_tool_calls: false,
-            }],
-            turns_compressed: vec![TurnCompression {
-                turn_index: 1,
-                role: "assistant".into(),
-                original_tokens: 20_000,
-                compressed_tokens: 5_000,
-                compression_method: CompressionMethod::ReactiveCompact,
-                information_lost: Vec::new(),
-            }],
-            turns_dropped: vec![2, 3],
-            compression_ratio: 0.25,
-            tokens_before: 32_000,
-            tokens_after: 22_000,
-        };
-        t.tools.tools_selected = vec![
-            ToolSelected {
-                tool_name: "bash".into(),
-                score: 0.9,
-                tokens: 189,
-                selection_factors: Vec::new(),
-            },
-            ToolSelected {
-                tool_name: "read_file".into(),
-                score: 0.8,
-                tokens: 152,
-                selection_factors: Vec::new(),
-            },
-        ];
-        let b = ContextBreakdown::from_trace(&t);
-        insta::assert_snapshot!(
-            "context_panel_history_shortlist_80x28",
-            render_panel(&b, 80, 28)
-        );
-    }
-
-    #[test]
     fn build_lines_renders_history_section_when_populated() {
         let mut t = trace(100_000, 2_000, 8_000, 0, 0, 0);
         t.history.total_turns_available = 5;
@@ -2169,40 +2095,6 @@ mod tests {
             .join(" ");
         assert!(text.contains("History"), "history header missing: {text}");
         assert!(text.contains("5 turns"), "turn count missing: {text}");
-    }
-
-    #[test]
-    fn build_lines_renders_shortlist_skills_without_tokens() {
-        let mut t = trace(100_000, 1_000, 1_000, 0, 0, 0);
-        t.skill_selector = Some(SkillSelectorShortlistTrace {
-            open_catalog: false,
-            visible_skill_count: 1,
-            skills: vec![SkillSelectorShortlistEntry {
-                rank: 1,
-                skill_name: "my_skill".into(),
-                aliases: Vec::new(),
-                description: String::new(),
-                source: "built-in".into(),
-                category: None,
-            }],
-            telemetry: Default::default(),
-        });
-        let b = ContextBreakdown::from_trace(&t);
-        let text: String = build_lines(&b, 80)
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(
-            text.contains("shortlist"),
-            "shortlist label missing: {text}"
-        );
-        assert!(text.contains("my_skill"), "skill name missing: {text}");
-        // No fake "0 tokens" noise for shortlist entries.
-        assert!(
-            !text.contains("my_skill   0 tokens"),
-            "shortlist row should not show 0-token count: {text}"
-        );
     }
 
     #[test]

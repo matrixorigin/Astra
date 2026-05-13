@@ -497,10 +497,8 @@ pub struct ToolSelectionConfig {
     #[serde(default = "default_max_tool_schema_tokens")]
     pub max_tool_schema_tokens: u32,
 
-    /// Scenario-driven override for the tool selection token budget.
-    /// 0 = use registry default (800 tokens). Non-zero values override the
-    /// `DEFAULT_TOOL_BUDGET_TOKENS` constant in the tool selector, allowing
-    /// scenarios to allocate more or fewer tokens for dynamic tool schemas.
+    /// Deprecated scenario-driven override for the removed tool selector budget.
+    /// 0 = no override. Retained so older config files continue to deserialize.
     #[serde(default)]
     pub tool_budget_tokens: u32,
 

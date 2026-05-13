@@ -5,7 +5,7 @@ use super::*;
 #[test]
 fn stats_no_active_session_does_not_panic() {
     // state with no session_id → should not panic
-    let state = super::ReplState::default();
+    let state = super::SessionState::default();
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(slash_stats::handle_stats_command("", &state)); // current session mode, no session
@@ -13,7 +13,7 @@ fn stats_no_active_session_does_not_panic() {
 
 #[test]
 fn stats_history_no_sessions_does_not_panic() {
-    let state = super::ReplState::default();
+    let state = super::SessionState::default();
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(slash_stats::handle_stats_command("history", &state));
@@ -73,7 +73,7 @@ fn stats_current_session_reads_journal() {
     assert_eq!(stats.avg_tokens_per_turn, 1350); // (1800+900)/2
 
     // Now verify slash_stats::handle_stats_command doesn't panic with this session
-    let state = super::ReplState {
+    let state = super::SessionState {
         session_id: Some(sid),
         ..Default::default()
     };
@@ -125,7 +125,7 @@ fn stats_history_aggregates_multiple_sessions() {
 
 #[test]
 fn tools_no_active_session_does_not_panic() {
-    let state = super::ReplState::default();
+    let state = super::SessionState::default();
     slash_tools::handle_tools_command(&state);
 }
 
@@ -149,7 +149,7 @@ fn tools_session_with_no_tool_calls_does_not_panic() {
         .unwrap();
     drop(writer);
 
-    let state = super::ReplState {
+    let state = super::SessionState {
         session_id: Some(sid),
         ..Default::default()
     };
@@ -243,7 +243,7 @@ fn tools_reads_tool_calls_from_journal() {
     assert_eq!(profiles[1].error_rate, 0.0);
 
     // Verify slash_tools::handle_tools_command doesn't panic with this data
-    let state = super::ReplState {
+    let state = super::SessionState {
         session_id: Some(sid),
         ..Default::default()
     };

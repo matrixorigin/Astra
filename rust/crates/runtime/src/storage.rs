@@ -7,7 +7,7 @@ use sqlx::{MySql, query};
 
 use astra_turn_core::contracts::{
     TurnCoreEventRecord, TurnDecisionAuditRecord, TurnImplicitFeedbackRecord,
-    TurnSkillSelectionRecord, TurnSkillSelectorMetricRecord, TurnToolEventRecord,
+    TurnSkillSelectionRecord, TurnToolEventRecord,
 };
 use astra_turn_core::hook_plans::SnapshotLinkPlan;
 
@@ -156,65 +156,6 @@ pub(crate) async fn insert_turn_skill_selection(
     .execute(&mut **tx)
     .await?;
     Ok(())
-}
-
-pub(crate) async fn insert_turn_skill_selector_metric(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    record: &TurnSkillSelectorMetricRecord,
-) -> Result<(), sqlx::Error> {
-    let extra_json = record
-        .extra
-        .as_ref()
-        .map(|value| serde_json::to_string(value).unwrap_or_else(|_| "null".into()));
-    query(
-        "INSERT INTO skill_selector_turn_metrics \
-         (event_id, session_id, user_id, turn_number, visible_skill_count, chosen_skill_count, \
-          shortlisted_chosen_count, missed_chosen_count, best_chosen_rank, \
-           selector_tier, elapsed_ms, total_catalog_size, extra, created_at) \
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-    )
-    .bind(&record.event_id)
-    .bind(&record.session_id)
-    .bind(&record.user_id)
-    .bind(record.turn_number)
-    .bind(record.visible_skill_count)
-    .bind(record.chosen_skill_count)
-    .bind(record.shortlisted_chosen_count)
-    .bind(record.missed_chosen_count)
-    .bind(record.best_chosen_rank)
-    .bind(record.selector_tier.as_deref())
-    .bind(record.elapsed_ms)
-    .bind(record.total_catalog_size)
-    .bind(extra_json)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-pub(crate) async fn trim_turn_skill_selector_metrics_window(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    window_size: i64,
-) -> Result<u64, sqlx::Error> {
-    if window_size <= 0 {
-        let result = query("DELETE FROM skill_selector_turn_metrics")
-            .execute(&mut **tx)
-            .await?;
-        return Ok(result.rows_affected());
-    }
-    let result = query(
-        "DELETE FROM skill_selector_turn_metrics \
-         WHERE event_id NOT IN ( \
-             SELECT event_id FROM ( \
-                 SELECT event_id FROM skill_selector_turn_metrics \
-                 ORDER BY created_at DESC, event_id DESC \
-                 LIMIT ? \
-             ) AS recent_skill_selector_metrics \
-         )",
-    )
-    .bind(window_size)
-    .execute(&mut **tx)
-    .await?;
-    Ok(result.rows_affected())
 }
 
 pub(crate) async fn insert_turn_implicit_feedback(

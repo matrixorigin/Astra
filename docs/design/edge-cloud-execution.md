@@ -49,7 +49,7 @@ Three related paths:
 
 1. **Model-facing index** — During `/chat/turn`, the **cloud** assembles context (including a **skill index** slice) from data in MatrixOne and related services. The edge sends messages + tool results; it does not hold the full server-side catalog in memory.
 
-2. **Edge `UnifiedSkillRegistry`** — The interactive CLI (`repl_runtime.rs`) registers **`LocalSkillProvider`** and **`BundledSkillProvider`**, runs **`discover_all()`**, and may add MCP skills. A **`DatabaseSkillProvider`** adapter exists but is **not** part of this default wiring; edge execution of `skill` therefore targets **filesystem/bundled/MCP** definitions unless extended.
+2. **Edge `UnifiedSkillRegistry`** — The interactive CLI (`session_runtime.rs`) registers **`LocalSkillProvider`** and **`BundledSkillProvider`**, runs **`discover_all()`**, and may add MCP skills. A **`DatabaseSkillProvider`** adapter exists but is **not** part of this default wiring; edge execution of `skill` therefore targets **filesystem/bundled/MCP** definitions unless extended.
 
 3. **HTTP catalog** — `GET /skills` (via `ThinClient`) supports slash commands, marketplace version checks, and registration flows. That is **on-demand** over the network, separate from the registry’s **`discover_all()`** cache refresh (e.g. after installing a skill).
 

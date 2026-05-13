@@ -7,7 +7,7 @@ fn eprint_server_not_found(name: &str) {
     eprintln!("  {}", "Use /mcp servers to see connected servers".dim());
 }
 
-pub(super) async fn handle_mcp_command(arg: &str, state: &mut ReplState) -> Result<(), String> {
+pub(super) async fn handle_mcp_command(arg: &str, state: &mut SessionState) -> Result<(), String> {
     let sub = arg.trim();
 
     match sub {
@@ -97,7 +97,7 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &mut ReplState) -> Resu
     Ok(())
 }
 
-async fn show_status(state: &ReplState) {
+async fn show_status(state: &SessionState) {
     let manager = state.mcp_manager.read().await;
     let count = manager.connection_count();
 
@@ -133,7 +133,7 @@ async fn show_status(state: &ReplState) {
     print_server_table(&manager);
 }
 
-async fn show_servers(state: &ReplState) {
+async fn show_servers(state: &SessionState) {
     let manager = state.mcp_manager.read().await;
     let servers = manager.connected_servers();
 
@@ -196,7 +196,7 @@ async fn show_servers(state: &ReplState) {
     }
 }
 
-async fn show_prompts(state: &ReplState) {
+async fn show_prompts(state: &SessionState) {
     let manager = state.mcp_manager.read().await;
 
     if manager.connection_count() == 0 {
@@ -256,7 +256,7 @@ async fn show_prompts(state: &ReplState) {
     }
 }
 
-async fn show_resources(state: &ReplState) {
+async fn show_resources(state: &SessionState) {
     let manager = state.mcp_manager.read().await;
 
     if manager.connection_count() == 0 {
@@ -307,7 +307,7 @@ async fn show_resources(state: &ReplState) {
 }
 
 /// `/mcp resource <server>:<uri>` — read an MCP resource by URI.
-async fn handle_mcp_resource_read(arg: &str, state: &ReplState) {
+async fn handle_mcp_resource_read(arg: &str, state: &SessionState) {
     let rest = arg.trim();
     if rest.is_empty() {
         eprintln!("{}", "  Usage: /mcp resource <server>:<uri>".dim());
@@ -357,7 +357,7 @@ async fn handle_mcp_resource_read(arg: &str, state: &ReplState) {
 }
 
 /// `/mcp subscribe <server>:<uri>` — subscribe to resource updates.
-async fn handle_mcp_subscribe(arg: &str, state: &ReplState) {
+async fn handle_mcp_subscribe(arg: &str, state: &SessionState) {
     let rest = arg.trim();
     if rest.is_empty() {
         eprintln!("{}", "  Usage: /mcp subscribe <server>:<uri>".dim());
@@ -401,7 +401,7 @@ async fn handle_mcp_subscribe(arg: &str, state: &ReplState) {
 }
 
 /// `/mcp unsubscribe <server>:<uri>` — unsubscribe from resource updates.
-async fn handle_mcp_unsubscribe(arg: &str, state: &ReplState) {
+async fn handle_mcp_unsubscribe(arg: &str, state: &SessionState) {
     let rest = arg.trim();
     if rest.is_empty() {
         eprintln!("{}", "  Usage: /mcp unsubscribe <server>:<uri>".dim());
@@ -445,7 +445,7 @@ async fn handle_mcp_unsubscribe(arg: &str, state: &ReplState) {
 }
 
 /// `/mcp log-level <server> <level>` — set logging level for an MCP server.
-async fn handle_mcp_log_level(arg: &str, state: &ReplState) {
+async fn handle_mcp_log_level(arg: &str, state: &SessionState) {
     let parts: Vec<&str> = arg.split_whitespace().collect();
     if parts.len() != 2 {
         eprintln!("{}", "  Usage: /mcp log-level <server> <level>".dim());
@@ -507,7 +507,7 @@ async fn handle_mcp_log_level(arg: &str, state: &ReplState) {
 /// next turn.
 pub(super) async fn handle_mcp_prompt_invoke(
     arg: &str,
-    state: &mut ReplState,
+    state: &mut SessionState,
 ) -> Result<(), String> {
     // arg here is everything after "/mcp" — so it starts with "prompt ..."
     // But the main.rs match on "/mcp prompt" already split: cmd="/mcp", first word consumed
@@ -939,7 +939,7 @@ use super::slash_agent::format_duration;
 /// Handle `/mcp complete <server>:<ref_type>:<name> <arg_name> [partial_value]`
 ///
 /// ref_type is "prompt" or "resource".
-async fn handle_mcp_complete(arg: &str, state: &ReplState) {
+async fn handle_mcp_complete(arg: &str, state: &SessionState) {
     let parts: Vec<&str> = arg.split_whitespace().collect();
     if parts.len() < 2 {
         eprintln!(
@@ -1007,7 +1007,7 @@ async fn handle_mcp_complete(arg: &str, state: &ReplState) {
 }
 
 /// Handle `/mcp ping [server]` — ping one server or all.
-async fn handle_mcp_ping(server: Option<&str>, state: &ReplState) {
+async fn handle_mcp_ping(server: Option<&str>, state: &SessionState) {
     let manager = state.mcp_manager.read().await;
 
     if manager.connection_count() == 0 {

@@ -452,4 +452,4 @@ api/
 - Transparent sandbox (requires MatrixOne kernel: connection-level isolation)
 - Multi-database sandbox support
 - Container pool (pre-warmed containers for sub-100ms cold start)
-- Interactive REPL mode
+- Interactive TUI mode

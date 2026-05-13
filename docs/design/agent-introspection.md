@@ -30,7 +30,7 @@ This is the introspection problem. Without it, agents cannot:
 
 Three converging forces make introspection a first-class concern:
 
-1. **Tool proliferation**. With 50+ skills, progressive disclosure means the agent doesn't even know its full catalog at any given moment. The skill selector picks tools for the LLM — but the LLM has no way to ask "what was available but not selected?"
+1. **Tool proliferation**. With 50+ skills, the agent needs a reliable way to inspect what is installed, which entries are session-visible, and which capabilities are active without relying on stale prompt text.
 
 2. **Edge-cloud split**. The agent's state is distributed: tools live on edge, memory lives on cloud, skill catalog lives in DB. No single component has the full picture. When a user asks "what do you know about me?", the answer requires assembling state from multiple locations.
 
@@ -100,7 +100,7 @@ Introspection has two layers:
 **Static** — baked into the system prompt at session start. The LLM always knows the basics without any tool call:
 - Agent name, role, high-level capabilities
 - Behavioral boundaries (what it should refuse)
-- Available tool categories (not full schemas — that's the skill selector's job)
+- Available tool categories (not full schemas — schemas remain in the tool registry/catalog)
 
 **Dynamic** — queried at runtime via an introspection tool. For questions that depend on current state:
 - Exact tool list with versions
