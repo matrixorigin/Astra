@@ -1706,16 +1706,50 @@ impl PermissionManager {
             self.settings.allow.push(rule.to_string());
             self.cached_allow = self.settings.parsed_allow_rules();
             if let Some(ref root) = self.project_root {
-                if let Err(e) = self.settings.save(root) {
-                    tracing::warn!(
-                        "permission_manager: failed to persist allow rule '{}' to {}: {}",
-                        rule,
-                        root.join(".kiro/permissions.json").display(),
-                        e
-                    );
-                    self.last_save_error = Some(e.to_string());
-                } else {
-                    self.last_save_error = None;
+                let target_path = root.join(".kiro/permissions.json");
+                let save_result = self.settings.save(root);
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let correlation_id = format!("rule-{}-{}", timestamp_ms, rule);
+                match save_result {
+                    Err(e) => {
+                        tracing::warn!(
+                            "permission_manager: failed to persist allow rule '{}' to {}: {}",
+                            rule,
+                            target_path.display(),
+                            e
+                        );
+                        self.last_save_error = Some(e.to_string());
+                        // Issue #326 P6 / R2 Major 4: emit
+                        // RulePersistedEvent on failure so audit
+                        // / `/permissions trace` can show the
+                        // attempt + the error reason.
+                        astra_turn_core::permission_audit::record_persisted(
+                            astra_turn_core::permission_audit::RulePersistedEvent {
+                                timestamp_ms,
+                                correlation_id,
+                                target: astra_turn_core::permission_audit::PersistTarget::Project,
+                                rule_text: rule.to_string(),
+                                saved: false,
+                                failure_reason: Some(e.to_string()),
+                            },
+                        );
+                    }
+                    Ok(()) => {
+                        self.last_save_error = None;
+                        astra_turn_core::permission_audit::record_persisted(
+                            astra_turn_core::permission_audit::RulePersistedEvent {
+                                timestamp_ms,
+                                correlation_id,
+                                target: astra_turn_core::permission_audit::PersistTarget::Project,
+                                rule_text: rule.to_string(),
+                                saved: true,
+                                failure_reason: None,
+                            },
+                        );
+                    }
                 }
             }
         }

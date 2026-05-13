@@ -1979,6 +1979,55 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             ApprovalResponse::Skip | ApprovalResponse::Deny => {}
                         }
                     }
+                    // Issue #326 P6 / R2 Major 4: emit
+                    // ApprovalResolvedEvent so audit can see
+                    // what the user picked. correlation_id ties
+                    // this back to the PermissionEvaluatedEvent
+                    // that produced the prompt (the engine
+                    // wiring populates that side; today we use
+                    // a tool+timestamp scheme).
+                    {
+                        let timestamp_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let correlation_id = format!("approval-{}-{}", timestamp_ms, t);
+                        let cwd = std::env::current_dir().unwrap_or_default();
+                        let request_key =
+                            astra_turn_core::approval_request_key::ApprovalRequestKey::new(
+                                t.clone(),
+                                cwd,
+                                args,
+                                None,
+                                uuid::Uuid::nil(),
+                            );
+                        let core_response = match response {
+                            ApprovalResponse::AllowOnce => {
+                                astra_turn_core::approval_sink::ApprovalResponse::AllowOnce
+                            }
+                            ApprovalResponse::AlwaysAllow => {
+                                astra_turn_core::approval_sink::ApprovalResponse::AlwaysAllow
+                            }
+                            ApprovalResponse::Deny => {
+                                astra_turn_core::approval_sink::ApprovalResponse::Deny
+                            }
+                            ApprovalResponse::Skip => {
+                                astra_turn_core::approval_sink::ApprovalResponse::Skip
+                            }
+                        };
+                        let scope = matches!(response, ApprovalResponse::AlwaysAllow)
+                            .then_some(astra_turn_core::permission_audit::AllowScope::Project);
+                        astra_turn_core::permission_audit::record_resolved(
+                            astra_turn_core::permission_audit::ApprovalResolvedEvent {
+                                timestamp_ms,
+                                correlation_id,
+                                request_key,
+                                response: core_response,
+                                scope,
+                                stale_revalidation_passed: true,
+                            },
+                        );
+                    }
                     response.is_approved()
                 } else if self.render_policy.is_silent() {
                     astra_core::agent_warn!(
