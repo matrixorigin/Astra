@@ -52,6 +52,71 @@ pub(crate) struct PendingApproval {
     /// it (remote-vs-local is the sub-run / capability metadata's
     /// job).
     pub host: Option<String>,
+    /// Issue #326 P3 / R1 Major 7: multi-tag risk classification
+    /// computed by the engine. Empty means "no specific risk
+    /// tags emitted by the engine"; the UI falls back to the
+    /// existing reason text.
+    pub risk_tags: Vec<astra_turn_core::permission_engine::RiskTag>,
+    /// Issue #326 P3: precomputed "Will save" preview — what
+    /// would be persisted if the user pressed Always with the
+    /// default Project scope. The TUI renders this verbatim in
+    /// the approval card so users see exactly what
+    /// `permissions.json` would gain. `None` means the request
+    /// is not eligible for Always (e.g. compound shell command,
+    /// MCP unknown capability).
+    pub will_save_preview: Option<String>,
+}
+
+/// Metadata attached to a [`PendingApproval`] beyond the basic
+/// header/detail/reason. Aggregated into a struct so callers can
+/// extend without churning the whole call signature.
+#[derive(Default, Debug, Clone)]
+pub(crate) struct ApprovalMetadata {
+    pub source_agent: Option<String>,
+    pub mcp_capability:
+        Option<astra_turn_core::permission_engine::ToolCapabilityMetadata>,
+    pub host: Option<String>,
+    pub risk_tags: Vec<astra_turn_core::permission_engine::RiskTag>,
+    pub will_save_preview: Option<String>,
+}
+
+impl ApprovalMetadata {
+    /// Convenience for callers that only want one field.
+    #[must_use]
+    pub fn with_source_agent(mut self, agent: impl Into<String>) -> Self {
+        self.source_agent = Some(agent.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_host(mut self, host: impl Into<String>) -> Self {
+        self.host = Some(host.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_risk_tags(
+        mut self,
+        tags: Vec<astra_turn_core::permission_engine::RiskTag>,
+    ) -> Self {
+        self.risk_tags = tags;
+        self
+    }
+
+    #[must_use]
+    pub fn with_will_save_preview(mut self, preview: impl Into<String>) -> Self {
+        self.will_save_preview = Some(preview.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_mcp_capability(
+        mut self,
+        meta: astra_turn_core::permission_engine::ToolCapabilityMetadata,
+    ) -> Self {
+        self.mcp_capability = Some(meta);
+        self
+    }
 }
 
 impl std::fmt::Debug for PendingApproval {
@@ -64,7 +129,13 @@ impl std::fmt::Debug for PendingApproval {
             .field("reason", &self.reason)
             .field("has_response_tx", &self.response_tx.is_some())
             .field("source_agent", &self.source_agent)
-            .field("mcp_capability_known", &self.mcp_capability.as_ref().map(|m| m.is_known()))
+            .field("host", &self.host)
+            .field("risk_tag_count", &self.risk_tags.len())
+            .field("will_save_preview", &self.will_save_preview)
+            .field(
+                "mcp_capability_known",
+                &self.mcp_capability.as_ref().map(|m| m.is_known()),
+            )
             .finish()
     }
 }
@@ -83,6 +154,13 @@ pub(crate) struct ApprovalView {
     /// Remote host, if any. Mirrored from
     /// [`PendingApproval::host`].
     pub host: Option<String>,
+    /// Risk tags as their snake_case names so the view stays
+    /// `Eq` / `Hash`-friendly (the engine's `RiskTag` enum is
+    /// not currently `Eq`-derived for use as a HashSet key).
+    pub risk_tag_labels: Vec<String>,
+    /// "Will save: …" preview, mirrored from
+    /// [`PendingApproval::will_save_preview`].
+    pub will_save_preview: Option<String>,
 }
 
 impl From<&PendingApproval> for ApprovalView {
@@ -95,6 +173,12 @@ impl From<&PendingApproval> for ApprovalView {
             reason: p.reason.clone(),
             source_agent: p.source_agent.clone(),
             host: p.host.clone(),
+            risk_tag_labels: p
+                .risk_tags
+                .iter()
+                .map(|tag| format!("{tag:?}"))
+                .collect(),
+            will_save_preview: p.will_save_preview.clone(),
         }
     }
 }
@@ -128,16 +212,20 @@ impl ApprovalQueue {
         reason: String,
         response_tx: oneshot::Sender<ApprovalResponse>,
     ) -> ApprovalId {
-        self.push_with_metadata(tool, header, detail, reason, response_tx, None, None, None)
+        self.push_with_metadata(
+            tool,
+            header,
+            detail,
+            reason,
+            response_tx,
+            ApprovalMetadata::default(),
+        )
     }
 
     /// Issue #326 P3 / R1 Major 11: same as [`push`] but lets callers
-    /// attach the [`PendingApproval::source_agent`],
-    /// [`PendingApproval::mcp_capability`], and
-    /// [`PendingApproval::host`] fields. Used by sub-agent
-    /// permission requests forwarded into the TUI session, the
-    /// MCP gate when the server provided capability annotations,
-    /// and remote-host adapters (SSH, dev container).
+    /// attach extended metadata: source agent, MCP capability,
+    /// remote host, risk tags, and a "Will save" preview. See
+    /// [`ApprovalMetadata`] for the shape.
     pub fn push_with_metadata(
         &mut self,
         tool: String,
@@ -145,11 +233,7 @@ impl ApprovalQueue {
         detail: Option<String>,
         reason: String,
         response_tx: oneshot::Sender<ApprovalResponse>,
-        source_agent: Option<String>,
-        mcp_capability: Option<
-            astra_turn_core::permission_engine::ToolCapabilityMetadata,
-        >,
-        host: Option<String>,
+        metadata: ApprovalMetadata,
     ) -> ApprovalId {
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
@@ -169,9 +253,11 @@ impl ApprovalQueue {
             reason,
             response_tx: Some(response_tx),
             buttons,
-            source_agent,
-            mcp_capability,
-            host,
+            source_agent: metadata.source_agent,
+            mcp_capability: metadata.mcp_capability,
+            host: metadata.host,
+            risk_tags: metadata.risk_tags,
+            will_save_preview: metadata.will_save_preview,
         });
         // Promote pre-existing entries too — they now share the queue
         // and should expose the batch buttons on their next focus.
@@ -340,9 +426,7 @@ mod tests {
             None,
             "r".into(),
             tx,
-            Some("review-subagent".into()),
-            None,
-            None,
+            ApprovalMetadata::default().with_source_agent("review-subagent"),
         );
         let view = q.focused_view().unwrap();
         assert_eq!(view.source_agent.as_deref(), Some("review-subagent"));
@@ -364,13 +448,8 @@ mod tests {
             None,
             "r".into(),
             tx,
-            None,
-            Some(meta.clone()),
-            None,
+            ApprovalMetadata::default().with_mcp_capability(meta.clone()),
         );
-        // We can't read the field via ApprovalView (intentional —
-        // the view is for display only), but Debug includes the
-        // capability presence indicator.
         let entries_dbg = format!("{:?}", &q.entries);
         assert!(entries_dbg.contains("mcp_capability_known: Some(true)"));
     }
@@ -388,11 +467,31 @@ mod tests {
             None,
             "write".into(),
             tx,
-            None,
-            None,
-            Some("ssh:bastion-prod".into()),
+            ApprovalMetadata::default().with_host("ssh:bastion-prod"),
         );
         let view = q.focused_view().unwrap();
         assert_eq!(view.host.as_deref(), Some("ssh:bastion-prod"));
+    }
+
+    #[test]
+    fn push_with_metadata_carries_risk_tags_and_will_save() {
+        // Issue #326 P3 / R1 Major 7: risk tags and the will-save
+        // preview must reach the view layer.
+        use astra_turn_core::permission_engine::RiskTag;
+        let mut q = ApprovalQueue::new();
+        let (tx, _rx) = oneshot::channel();
+        q.push_with_metadata(
+            "bash".into(),
+            "npm test".into(),
+            None,
+            "execute".into(),
+            tx,
+            ApprovalMetadata::default()
+                .with_risk_tags(vec![RiskTag::BashExecute])
+                .with_will_save_preview("Bash(npm test:*)"),
+        );
+        let view = q.focused_view().unwrap();
+        assert_eq!(view.risk_tag_labels, vec!["BashExecute"]);
+        assert_eq!(view.will_save_preview.as_deref(), Some("Bash(npm test:*)"));
     }
 }
