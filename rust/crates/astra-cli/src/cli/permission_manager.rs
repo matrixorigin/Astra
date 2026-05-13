@@ -251,6 +251,15 @@ pub(super) struct PermissionSettings {
     /// unless the user sets this to `true` at project or user scope.
     #[serde(default)]
     pub allow_sensitive_path_writes: bool,
+    /// Issue #326 P1.5b / R2 Major 2: grammar version. Files
+    /// without this field (every file written by astra prior to
+    /// this PR) are treated as v1 and parsed leniently. New
+    /// saves stamp `grammar_version = 2` so future readers know
+    /// the file is in the structured-key form
+    /// (`Bash(argv_prefix="…")`). The grammar-v2 parser is
+    /// backward-compatible: v1 strings still parse correctly.
+    #[serde(default)]
+    pub grammar_version: u32,
 }
 
 /// Outcome of loading a `permissions.json` file.
@@ -506,7 +515,31 @@ impl PermissionSettings {
         let dir = project_root.join(".kiro");
         fs::create_dir_all(&dir)?;
         let path = dir.join("permissions.json");
-        let json = serde_json::to_string_pretty(self)?;
+
+        // Issue #326 P1.5b: every save stamps the current
+        // grammar version so the next load knows the file is
+        // structured. We clone-and-stamp so `save` stays
+        // `&self`-compatible with the existing 25 call sites.
+        let mut to_serialize = self.clone();
+        to_serialize.grammar_version =
+            astra_turn_core::permission_rule_grammar::GRAMMAR_VERSION;
+
+        // If this is the first time we're stamping a v2 over a
+        // pre-existing v1 file, write a `.v1.bak.json` sibling
+        // so the user can roll back manually. We skip the
+        // backup if the file doesn't exist yet (brand-new
+        // session / first save) or if it's already at the
+        // current version.
+        if path.exists() && self.grammar_version == 0 {
+            let backup_path = dir.join("permissions.v1.bak.json");
+            if !backup_path.exists() {
+                if let Ok(existing) = fs::read(&path) {
+                    let _ = fs::write(&backup_path, existing);
+                }
+            }
+        }
+
+        let json = serde_json::to_string_pretty(&to_serialize)?;
 
         let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
         std::io::Write::write_all(&mut tmp, json.as_bytes())?;
@@ -602,13 +635,58 @@ impl PermissionSettings {
     fn parsed_allow_rules(&self) -> Vec<PermissionRule> {
         self.allow
             .iter()
-            .map(|s| PermissionRule::parse(s))
+            .map(|s| parse_rule_with_grammar_v2(s))
             .collect()
     }
 
     #[allow(dead_code)] // Used in tests and by with_project
     fn parsed_deny_rules(&self) -> Vec<PermissionRule> {
-        self.deny.iter().map(|s| PermissionRule::parse(s)).collect()
+        self.deny
+            .iter()
+            .map(|s| parse_rule_with_grammar_v2(s))
+            .collect()
+    }
+}
+
+/// Issue #326 P1.5b: parse a rule string by first asking grammar
+/// v2, then falling back to the legacy `PermissionRule::parse`
+/// for any v1 quirks the v2 parser doesn't model. The two
+/// parsers are deliberately overlapping for backward compat —
+/// `Bash(npm:*)` parses cleanly under both.
+///
+/// Concretely:
+/// - v2 success → translate the structured fields back into the
+///   legacy `PermissionRule { tool, pattern }` shape because
+///   downstream code (`PermissionRule::matches`) consumes that
+///   shape. The `argv_prefix` slot becomes the legacy `pattern`
+///   for Bash; `path_glob` becomes pattern for Edit/Read/View.
+///   Other v2 fields (cwd_root, git_branch, domain, capability)
+///   are not yet honoured by the legacy matcher and are passed
+///   to the future engine via the rule grammar's full struct.
+/// - v2 failure → fall back to the legacy parser, which never
+///   fails; this keeps loading robust.
+fn parse_rule_with_grammar_v2(s: &str) -> PermissionRule {
+    use astra_turn_core::permission_rule_grammar::{parse_rule_v2, PermissionRuleV2};
+    let legacy_fallback = || PermissionRule::parse(s);
+    let v2: PermissionRuleV2 = match parse_rule_v2(s) {
+        Ok(v) => v,
+        Err(_) => return legacy_fallback(),
+    };
+    let lower_tool = v2.tool.to_lowercase();
+    let pattern = if !lower_tool.is_empty() && (lower_tool == "bash") {
+        v2.argv_prefix.clone()
+    } else if matches!(lower_tool.as_str(), "edit" | "read" | "view") {
+        v2.path_glob.clone()
+    } else {
+        // For any unmodeled tool family, prefer argv_prefix → path_glob → extra.pattern.
+        v2.argv_prefix
+            .clone()
+            .or_else(|| v2.path_glob.clone())
+            .or_else(|| v2.extra.get("pattern").cloned())
+    };
+    PermissionRule {
+        tool: lower_tool,
+        pattern,
     }
 }
 
@@ -4137,6 +4215,7 @@ mod tests {
             allow: vec!["Bash(cargo:*)".to_string()],
             deny: vec!["Bash(rm:*)".to_string()],
             allow_sensitive_path_writes: false,
+            grammar_version: 0,
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         fs::write(&path, json).unwrap();
