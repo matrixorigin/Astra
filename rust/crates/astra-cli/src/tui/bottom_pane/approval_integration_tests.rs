@@ -109,6 +109,58 @@ fn esc_rejects_focused_approval() {
     assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
 }
 
+// ─── Issue #326 P3 / R2 Major 6: Ctrl+D rejects, bare 'd' does NOT ──
+
+#[test]
+fn ctrl_d_rejects_focused_approval_when_composer_empty() {
+    let mut bp = BottomPane::new();
+    let rx = enqueue(&mut bp, "bash");
+    let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+    let action = bp.handle_key(key);
+    assert!(
+        matches!(action, BottomPaneAction::ApprovalResolved { .. }),
+        "Ctrl+D on focused approval should resolve, got {action:?}"
+    );
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
+}
+
+#[test]
+fn bare_d_reaches_composer_does_not_reject() {
+    // The whole point of P3's "Reject must be explicit": users
+    // mid-typing "do this" must not have their approval
+    // silently rejected when they hit 'd'.
+    let mut bp = BottomPane::new();
+    let _rx = enqueue(&mut bp, "bash");
+    // Press bare 'd' (no modifier).
+    let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+    let action = bp.handle_key(key);
+    // 'd' is consumed by the composer (it ends up in the
+    // input buffer), NOT routed to approval rejection.
+    assert!(
+        !matches!(action, BottomPaneAction::ApprovalResolved { .. }),
+        "bare 'd' must NOT resolve the approval, got {action:?}"
+    );
+    // Approval is still pending.
+    assert_eq!(bp.pending_approval_count(), 1);
+}
+
+#[test]
+fn ctrl_d_with_text_in_composer_does_not_reject() {
+    // Belt-and-braces: even Ctrl+D should not silently kill
+    // the approval if the user is still composing a message
+    // (composer non-empty). They must clear the composer first
+    // or use the explicit Reject button.
+    let mut bp = BottomPane::new();
+    let _rx = enqueue(&mut bp, "bash");
+    type_string(&mut bp, "hello");
+    let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+    let action = bp.handle_key(key);
+    assert!(
+        !matches!(action, BottomPaneAction::ApprovalResolved { .. }),
+        "Ctrl+D with composer text should not reject, got {action:?}"
+    );
+}
+
 // ─── Ctrl+Enter quick accept ─────────────────────────────────────
 
 #[test]

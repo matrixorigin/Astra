@@ -507,8 +507,29 @@ impl BottomPane {
             return BottomPaneAction::Quit;
         }
 
-        // Ctrl+D: empty composer → quit
+        // Ctrl+D: route by context.
+        //
+        // Issue #326 P3 / R2 Major 6: plan v3 §P3 wants Reject to be
+        // an explicit gesture — the "Esc rejects" shortcut from
+        // earlier UI iterations was hostile when an approval popped
+        // up while the user was mid-typing in the composer, because
+        // pressing Esc to dismiss a popup would silently reject
+        // the approval too.
+        //
+        // Routing:
+        // 1. Pending approval + composer empty → Reject focused.
+        //    The composer-empty guard means user typing "do this"
+        //    pressing the wrong key never accidentally rejects;
+        //    Ctrl+D is intentional.
+        // 2. Otherwise composer empty (no approval) → quit.
+        // 3. Composer not empty → consumed (no-op).
         if key.code == KeyCode::Char('d') && ctrl {
+            if self.has_pending_approvals() && self.composer.is_empty() {
+                if let Some(id) = self.reject_focused_approval() {
+                    return BottomPaneAction::ApprovalResolved { id };
+                }
+                return BottomPaneAction::Consumed;
+            }
             if self.composer.is_empty() && self.view_stack.is_empty() {
                 return BottomPaneAction::Quit;
             }
