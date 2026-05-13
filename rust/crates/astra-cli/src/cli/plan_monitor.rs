@@ -236,7 +236,7 @@ fn display_plan_updates_live(
                 (
                     format!(
                         "\n  {} {} {}",
-                        format!("▸ [{index}/{total}]").bold().cyan(),
+                        format!("▸ [{index}/{total}]").bold().magenta(),
                         title.bold(),
                         ""
                     ),
@@ -417,7 +417,7 @@ fn display_plan_updates_live(
                 );
                 if state.plan_mode.is_some() {
                     eprintln!();
-                    eprintln!("{}  {}", "📋".cyan(), "Recovery options:".bold());
+                    eprintln!("{}  {}", "📋".magenta(), "Recovery options:".bold());
                     eprintln!("{}", "    resume      — retry from where it stopped".dim());
                     eprintln!(
                         "{}",
@@ -546,7 +546,7 @@ fn display_plan_updates_live(
                     StreamEvent::ToolStarted { name, description } => {
                         let styled = stream_render::style_tool_description(&name, &description);
                         (
-                            format!("  {} {} …", "⬢".cyan(), styled),
+                            format!("  {} {} …", "⬢".magenta(), styled),
                             PostSpinner::Tool(description),
                         )
                     }

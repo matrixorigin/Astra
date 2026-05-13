@@ -1,12 +1,14 @@
 use ratatui::text::{Line, Span};
 
 pub(crate) fn line_to_static(line: &Line<'_>) -> Line<'static> {
-    Line::from(
+    let mut out = Line::from(
         line.spans
             .iter()
             .map(|s| Span::styled(s.content.to_string(), s.style))
             .collect::<Vec<_>>(),
-    )
+    );
+    out.style = line.style;
+    out
 }
 
 pub(crate) fn push_owned_lines(src: &[Line<'_>], out: &mut Vec<Line<'static>>) {

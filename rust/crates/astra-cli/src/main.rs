@@ -167,8 +167,6 @@ mod slash_skill;
 mod slash_state;
 #[path = "cli/slash_stats.rs"]
 mod slash_stats;
-#[path = "cli/slash_style.rs"]
-mod slash_style;
 #[path = "cli/slash_sync.rs"]
 mod slash_sync;
 #[path = "cli/slash_task.rs"]
@@ -212,11 +210,14 @@ use astra_turn_core::chat_turn_heuristics::{
 };
 use auth_flow::{clear_profile_last_session, do_login, do_register};
 use chat_stream::{ChatTurnParams, stream_chat_sse};
+#[cfg(test)]
+use cli_utils::save_credentials;
 use cli_utils::{
     SessionResumePreflight, clear_profile_last_session_if_matches, compact_or_raw,
-    get_profile_and_token, interactive_select, load_credentials, map_thin_err, prefix_chars,
-    preflight_remote_resume_session, print_json_or_raw, profile_name, prompt_or,
-    prompt_password_masked, resumable_last_session_id, save_credentials, truncate_str, urlencoding,
+    credential_store, get_profile_and_token, interactive_select, load_credentials, map_thin_err,
+    mutate_credentials, persist_profile_last_session, persist_profile_memoria_api_key,
+    prefix_chars, preflight_remote_resume_session, print_json_or_raw, profile_name, prompt_or,
+    prompt_password_masked, resumable_last_session_id, truncate_str, urlencoding,
     validated_resumable_last_session_id,
 };
 use command_router::{ExitCode, execute_cli_command, run_print_mode};

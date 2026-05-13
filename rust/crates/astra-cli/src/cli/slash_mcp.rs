@@ -110,7 +110,10 @@ async fn show_status(state: &SessionState) {
         return;
     }
 
-    eprintln!("{}", format!("  Servers: {count} connected").bold().cyan());
+    eprintln!(
+        "{}",
+        format!("  Servers: {count} connected").bold().magenta()
+    );
     let mut caps = Vec::new();
     if manager.has_sampling() {
         caps.push("sampling");
@@ -150,7 +153,7 @@ async fn show_servers(state: &SessionState) {
                 .map(|d| format_duration(d))
                 .unwrap_or_else(|| "n/a".to_string());
 
-            eprintln!("{}", format!("  ┌─ {name}").bold().cyan());
+            eprintln!("{}", format!("  ┌─ {name}").bold().magenta());
             eprintln!(
                 "  {} {:<8} {}",
                 "│".dim(),
@@ -162,7 +165,7 @@ async fn show_servers(state: &SessionState) {
                 "  {} {:<8} {}",
                 "│".dim(),
                 "Tools:".dim(),
-                tools.len().to_string().cyan()
+                tools.len().to_string().magenta()
             );
 
             if !tools.is_empty() {
@@ -176,7 +179,7 @@ async fn show_servers(state: &SessionState) {
                     eprintln!(
                         "  {}   {} {}",
                         "│".dim(),
-                        tool.name.clone().cyan(),
+                        tool.name.clone().magenta(),
                         short_desc.dim()
                     );
                 }
@@ -215,7 +218,7 @@ async fn show_prompts(state: &SessionState) {
         "{}",
         format!("  Prompts: {} available", prompts.len())
             .bold()
-            .cyan()
+            .magenta()
     );
     eprintln!();
 
@@ -275,7 +278,7 @@ async fn show_resources(state: &SessionState) {
         "{}",
         format!("  Resources: {} available", resources.len())
             .bold()
-            .cyan()
+            .magenta()
     );
     eprintln!();
 
@@ -642,7 +645,7 @@ pub(super) async fn handle_mcp_prompt_invoke(
     if !assistant_text.is_empty() {
         eprintln!(
             "  {} Injected prompt result ({} message{})",
-            "✓".green(),
+            theme::icon_ok(),
             result.messages.len(),
             if result.messages.len() == 1 { "" } else { "s" },
         );
@@ -656,7 +659,7 @@ pub(super) async fn handle_mcp_prompt_invoke(
     } else {
         eprintln!(
             "  {} Injected prompt context ({} message{})",
-            "✓".green(),
+            theme::icon_ok(),
             result.messages.len(),
             if result.messages.len() == 1 { "" } else { "s" },
         );

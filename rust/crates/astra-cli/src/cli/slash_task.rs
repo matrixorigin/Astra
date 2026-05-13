@@ -73,7 +73,7 @@ pub(super) async fn handle_task_command(
                         short_id.dim(),
                         icon,
                         t.title,
-                        status_label.cyan(),
+                        status_label.magenta(),
                         progress,
                     );
                 }
@@ -131,7 +131,7 @@ pub(super) async fn handle_task_command(
                             "\n{}",
                             "─── Task Detail ─────────────────────────────────".bold()
                         );
-                        eprintln!("  {:<12} {}", "id:".dim(), t.task_id.cyan());
+                        eprintln!("  {:<12} {}", "id:".dim(), t.task_id.magenta());
                         eprintln!("  {:<12} {}", "title:".dim(), t.title);
                         let detail_status_label = match t.status {
                             TaskStatus::Completed
@@ -141,7 +141,11 @@ pub(super) async fn handle_task_command(
                             }
                             _ => t.status.as_str(),
                         };
-                        eprintln!("  {:<12} {}", "status:".dim(), detail_status_label.cyan());
+                        eprintln!(
+                            "  {:<12} {}",
+                            "status:".dim(),
+                            detail_status_label.magenta()
+                        );
                         eprintln!("  {:<12} {}%", "progress:".dim(), t.progress_pct);
                         if let Some(ref desc) = t.description {
                             eprintln!("  {:<12} {}", "desc:".dim(), desc);
@@ -247,7 +251,7 @@ pub(super) async fn handle_task_command(
 
             eprintln!(
                 "  {} Background task started: {} ({})",
-                "▶".cyan(),
+                "▶".magenta(),
                 if sub_arg.len() > 50 {
                     format!("{}…", sub_arg.chars().take(50).collect::<String>())
                 } else {
@@ -369,8 +373,8 @@ pub(super) async fn handle_task_command(
                         eprintln!(
                             "\n  {} Background task {} completed. Use /task result {} to view.",
                             theme::icon_ok(),
-                            short.cyan(),
-                            short.cyan()
+                            short.magenta(),
+                            short.magenta()
                         );
                     }
                     Err(e) => {
@@ -378,7 +382,7 @@ pub(super) async fn handle_task_command(
                         eprintln!(
                             "\n  {} Background task {} failed: {}",
                             theme::icon_err(),
-                            short.cyan(),
+                            short.magenta(),
                             e.error.red()
                         );
                     }
@@ -396,7 +400,7 @@ pub(super) async fn handle_task_command(
                             format!("─── Task Result ({short}) ─────────────────────────").bold()
                         );
                         eprintln!("  {:<12} {}", "title:".dim(), t.title);
-                        eprintln!("  {:<12} {}", "status:".dim(), t.status.as_str().cyan());
+                        eprintln!("  {:<12} {}", "status:".dim(), t.status.as_str().magenta());
                         if let Some(ref err) = t.error_message {
                             eprintln!("  {:<12} {}", "error:".dim(), err.as_str().red());
                         }

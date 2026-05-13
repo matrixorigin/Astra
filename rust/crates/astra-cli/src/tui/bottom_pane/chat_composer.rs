@@ -101,6 +101,13 @@ impl ChatComposer {
         self.textarea.is_empty()
     }
 
+    /// True when the user is browsing history (Up/Down navigation).
+    /// Callers use this to suppress popup menus that would capture
+    /// arrow keys and block further history traversal.
+    pub fn is_browsing_history(&self) -> bool {
+        self.history_index.is_some()
+    }
+
     pub fn clear_and_submit(&mut self) -> String {
         let raw = self.textarea.text().to_string();
         let expanded = self.expand_pastes(&raw);

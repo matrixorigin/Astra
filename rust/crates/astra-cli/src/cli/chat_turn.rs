@@ -2588,11 +2588,7 @@ pub(super) fn initialize_journal_pub(state: &mut SessionState, session_id: &str)
 }
 
 pub(super) fn persist_last_session_id(profile: Option<&str>, session_id: &str) {
-    let mut creds = load_credentials();
-    let name = profile_name(profile, &creds);
-    let entry = creds.profiles.entry(name).or_default();
-    entry.last_session_id = Some(session_id.to_string());
-    let _ = save_credentials(&creds);
+    let _ = persist_profile_last_session(profile, session_id);
 }
 
 fn initialize_journal(state: &mut SessionState, session_id: &str) {
@@ -2725,11 +2721,21 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
 
 /// Report a turn failure with enriched partial data from the agentic loop.
 /// Detect 401 / credential-expired errors from a turn failure message.
+///
+/// Matches only auth-shaped phrases. Bare `"401"` substring is intentionally
+/// rejected — it produced false positives whenever an unrelated error message
+/// happened to contain the digits 401 (timeouts in ms, file offsets, body
+/// snippets, etc.), causing spurious "Session expired. Run /login" prompts.
 pub(super) fn is_auth_error(error: &str) -> bool {
     let lower = error.to_lowercase();
-    error.contains("401")
-        || lower.contains("unauthorized")
+    lower.contains("unauthorized")
         || lower.contains("could not validate credentials")
+        || lower.contains("session expired")
+        || lower.contains("token expired")
+        || lower.contains("401 unauthorized")
+        || lower.contains("status: 401")
+        || lower.contains("status code: 401")
+        || lower.contains("http 401")
 }
 
 fn report_turn_failure(

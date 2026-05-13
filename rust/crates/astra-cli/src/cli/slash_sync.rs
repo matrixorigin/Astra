@@ -54,8 +54,8 @@ pub(super) async fn handle_sync_command(arg: &str, state: &SessionState) {
         let state_str = match sync_state {
             astra_services::SyncState::Clean => "✓ clean".green().to_string(),
             astra_services::SyncState::Dirty => "● dirty".yellow().to_string(),
-            astra_services::SyncState::Syncing => "↻ syncing".cyan().to_string(),
-            astra_services::SyncState::Pulling => "↓ pulling".cyan().to_string(),
+            astra_services::SyncState::Syncing => "↻ syncing".magenta().to_string(),
+            astra_services::SyncState::Pulling => "↓ pulling".magenta().to_string(),
             astra_services::SyncState::Conflict { .. } => "⚠ conflict".red().to_string(),
             astra_services::SyncState::Error { retry_count, .. } => {
                 format!("✗ error({})", retry_count).red().to_string()
@@ -64,7 +64,7 @@ pub(super) async fn handle_sync_command(arg: &str, state: &SessionState) {
         let stats = orch.domain_stats(*domain).unwrap_or_default();
         eprintln!(
             "  {:<14} {:<12} {:>8} {:>8} {:>8} {:>8}",
-            format!("{domain}").cyan(),
+            format!("{domain}").magenta(),
             state_str,
             stats.pushes,
             stats.pulls,
@@ -165,7 +165,7 @@ async fn handle_sync_push(state: &SessionState) {
             eprintln!(
                 "  {} {:<14} {} ({}ms)",
                 theme::icon_ok(),
-                format!("{}", r.domain).cyan(),
+                format!("{}", r.domain).magenta(),
                 version_str.dim(),
                 r.duration_ms,
             );
@@ -175,7 +175,7 @@ async fn handle_sync_push(state: &SessionState) {
             eprintln!(
                 "  {} {:<14} {}",
                 theme::icon_err(),
-                format!("{}", r.domain).cyan(),
+                format!("{}", r.domain).magenta(),
                 err.red(),
             );
         }
@@ -246,7 +246,7 @@ async fn handle_sync_pull(state: &SessionState) {
             eprintln!(
                 "  {} {:<14} {}{} ({}ms)",
                 theme::icon_ok(),
-                format!("{}", r.domain).cyan(),
+                format!("{}", r.domain).magenta(),
                 version_str.dim(),
                 merge_str.dim(),
                 r.duration_ms,
@@ -257,7 +257,7 @@ async fn handle_sync_pull(state: &SessionState) {
             eprintln!(
                 "  {} {:<14} {}",
                 theme::icon_err(),
-                format!("{}", r.domain).cyan(),
+                format!("{}", r.domain).magenta(),
                 err.red(),
             );
         }

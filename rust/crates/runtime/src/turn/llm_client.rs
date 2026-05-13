@@ -237,7 +237,13 @@ pub(crate) fn classify_llm_error(msg: &str) -> astra_core::ErrorKind {
     } else if lower.contains("connect") || lower.contains("transport") || lower.contains("network")
     {
         astra_core::ErrorKind::StreamTransport
-    } else if lower.contains("401") || lower.contains("unauthorized") || lower.contains("api key") {
+    } else if lower.contains("401 unauthorized")
+        || lower.contains("status: 401")
+        || lower.contains("status code: 401")
+        || lower.contains("http 401")
+        || lower.contains("unauthorized")
+        || lower.contains("api key")
+    {
         astra_core::ErrorKind::Auth
     } else if lower.contains("cancelled") || lower.contains("canceled") {
         astra_core::ErrorKind::Cancelled
@@ -660,7 +666,11 @@ fn coerce_tool_result_content(content: Option<&Value>) -> String {
         Some(Value::Array(parts)) => {
             let joined = parts
                 .iter()
-                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| part.get("content").and_then(Value::as_str))
+                })
                 .collect::<Vec<_>>()
                 .join("");
             if joined.is_empty() {
@@ -5454,6 +5464,73 @@ mod tests {
             "all array elements preserved: {body}",
         );
         assert_ne!(body, "", "must not collapse to empty string");
+    }
+
+    #[test]
+    fn coerce_tool_result_content_extracts_from_cache_annotated_tool_result_block() {
+        // Regression: wire_cache_annotations rewrites tool message content from
+        // a plain string into `[{type: "tool_result", content: "...", tool_use_id: "...",
+        // cache_control: {...}}]`. The Bedrock body builder calls
+        // `coerce_tool_result_content` which must extract the `content` field,
+        // not return empty string (which makes the model think the tool had no output).
+        let content = json!([{
+            "type": "tool_result",
+            "tool_use_id": "tooluse_abc123",
+            "content": "gh version 2.46.0 (2025-01-13)\nhttps://github.com/cli/cli/releases/tag/v2.46.0",
+            "cache_control": {"type": "ephemeral"},
+        }]);
+        let result = coerce_tool_result_content(Some(&content));
+        assert_eq!(
+            result,
+            "gh version 2.46.0 (2025-01-13)\nhttps://github.com/cli/cli/releases/tag/v2.46.0",
+            "must extract content from tool_result block, got empty or wrong: {result:?}",
+        );
+    }
+
+    #[test]
+    fn bedrock_body_preserves_tool_output_after_cache_annotation() {
+        // End-to-end: simulate the full path where cache annotation rewrites
+        // tool content, then Bedrock body builder processes it.
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "tooluse_abc",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{\"command\":\"gh --version\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tooluse_abc",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tooluse_abc",
+                    "content": "gh version 2.46.0\nhttps://github.com/cli/cli/releases/tag/v2.46.0",
+                    "cache_control": {"type": "ephemeral"},
+                }],
+            }),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-opus-4-7",
+            "bedrock",
+            None,
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let tool_result_content = &body["messages"][1]["content"][0]["toolResult"]["content"][0];
+        let text = tool_result_content
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            text.contains("gh version 2.46.0"),
+            "Bedrock toolResult must contain the actual tool output, got: {text:?}",
+        );
     }
 
     #[test]

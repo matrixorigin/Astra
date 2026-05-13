@@ -126,7 +126,7 @@ pub(crate) async fn start_and_monitor_plan(
 
     eprintln!(
         "  {} {}",
-        "▸".bold().cyan(),
+        "▸".bold().magenta(),
         "Plan executing — Ctrl+C to pause.".bold()
     );
 

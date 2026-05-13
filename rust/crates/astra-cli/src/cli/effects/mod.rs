@@ -105,7 +105,7 @@ pub fn interruptible_sleep(duration: std::time::Duration, stop: &AtomicBool) -> 
 /// Time and braille are placed right after the label (not right-aligned to
 /// the terminal edge), so the line stays compact and readable.
 ///
-/// - `icon`: pre-styled icon string (e.g., `"⬢".cyan()`)
+/// - `icon`: pre-styled icon string (e.g., `"○".magenta()`)
 /// - `label`: description text (rendered dim)
 /// - `time_part`: pre-formatted time string (e.g., `"3s"` or `"12s/~45s"`)
 /// - `frame`: current braille animation character
@@ -123,7 +123,7 @@ pub fn paint_unified_line(icon: &str, label: &str, time_part: &str, frame: char,
     eprint!("\r  {icon} ");
     eprint!("{}", label.dim());
     eprint!("  {}", time_part.dim());
-    eprint!(" {}", format!("{frame}").yellow());
+    eprint!(" {}", format!("{frame}").magenta());
     // Pad trailing spaces to clear any previous longer content
     if content_vis < w {
         eprint!("{}", " ".repeat(w - content_vis));
@@ -132,7 +132,7 @@ pub fn paint_unified_line(icon: &str, label: &str, time_part: &str, frame: char,
 }
 
 /// Standard icon for running operations (tool calls, system states).
-pub const ICON_RUNNING: &str = "⬢";
+pub const ICON_RUNNING: &str = "○";
 
 /// Which kind of spinner is shown in the single "thinking" stderr slot.
 pub enum ThinkingSpinnerKind {

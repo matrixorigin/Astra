@@ -54,10 +54,10 @@ impl Theme {
             is_light: false,
             fg: Color::Reset,
             dim: Color::DarkGray,
-            accent: Color::Cyan,
-            // Subtle blue-grey tint; ~20% of accent over a dark bg.
-            selected_bg: Color::Rgb(27, 44, 56),
-            selected_fg: Color::Rgb(220, 232, 245),
+            accent: Color::Magenta,
+            // Clearly visible grey band for user input (matches Claude Code).
+            selected_bg: Color::Rgb(55, 55, 60),
+            selected_fg: Color::Rgb(232, 220, 245),
             // Soft pink for the assistant-reply gutter (`┃ `) — reads
             // clearly on any dark terminal background while feeling
             // warmer than the previous cyan accent and providing a
@@ -72,24 +72,21 @@ impl Theme {
         }
     }
 
-    /// Preset for light-backgrounded terminals. Swaps selection tints to
-    /// avoid the "white-on-cyan invisible" bug of the old hardcoded path.
+    /// Preset for light-backgrounded terminals.
     pub fn light() -> Self {
         Self {
             is_light: true,
             fg: Color::Reset,
             dim: Color::Gray,
-            accent: Color::Rgb(22, 89, 148), // deep blue
-            selected_bg: Color::Rgb(226, 238, 250),
-            selected_fg: Color::Rgb(17, 24, 35),
-            // Deeper pink on light backgrounds so the gutter stays
-            // legible without washing into white.
-            gutter: Color::Rgb(204, 76, 128),
+            accent: Color::Rgb(148, 40, 148), // deep magenta
+            selected_bg: Color::Rgb(245, 232, 250),
+            selected_fg: Color::Rgb(24, 17, 35),
+            gutter: Color::Rgb(180, 60, 120),
             success: Color::Rgb(22, 115, 46),
             warn: Color::Rgb(135, 89, 0),
             error: Color::Rgb(170, 34, 34),
             quote: Color::Rgb(80, 110, 80),
-            link: Color::Rgb(22, 89, 148),
+            link: Color::Rgb(148, 40, 148),
         }
     }
 

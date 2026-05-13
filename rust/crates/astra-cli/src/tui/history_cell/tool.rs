@@ -56,6 +56,10 @@ pub(crate) struct ToolCell {
     /// breathing animation instead of a line counter).
     pub progress_lines: u64,
     pub progress_bytes: u64,
+    /// Stamped on the live → terminal transition (either
+    /// `complete()` or `finalize()`). Lets the active-slot gradient
+    /// gutter pin its phase at the freeze moment.
+    frozen_at: super::FreezeStamp,
 }
 
 impl ToolCell {
@@ -71,6 +75,7 @@ impl ToolCell {
             ts: None,
             progress_lines: 0,
             progress_bytes: 0,
+            frozen_at: super::FreezeStamp::default(),
         }
     }
 
@@ -109,6 +114,7 @@ impl ToolCell {
         }
         self.output_summary = output_summary;
         self.output = output;
+        self.frozen_at.stamp_now();
     }
 
     #[allow(dead_code)]
@@ -154,6 +160,10 @@ impl ToolCell {
             ts,
             progress_lines: 0,
             progress_bytes: 0,
+            // Resumed from persistence — already settled. See
+            // `FreezeStamp::revived` for the launch-independent
+            // phase rationale.
+            frozen_at: super::FreezeStamp::revived(),
         })
     }
 
@@ -395,6 +405,11 @@ impl HistoryCell for ToolCell {
                 self.duration_ms = Some(self.started_at.elapsed().as_millis() as u64);
             }
         }
+        self.frozen_at.stamp_now();
+    }
+
+    fn frozen_phase(&self) -> Option<f32> {
+        self.frozen_at.phase()
     }
 
     fn to_persist(&self) -> Option<TurnEvent> {

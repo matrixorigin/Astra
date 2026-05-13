@@ -184,7 +184,7 @@ mod tests {
              the three sites still have .clone().",
             [obs(
                 "str_replace",
-                "Error: edit[0] old_str not found. Aborting all edits.",
+                "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: edit[0] old_str not found in policy.rs.\nWHY:  The exact byte sequence does not appear in the current file content.\nNEXT: Re-read the target region with read_file, copy the exact bytes into old_str, then retry.",
             )],
         );
         match v {
@@ -209,7 +209,10 @@ mod tests {
     fn fires_on_silently_skipped_with_real_error_on_the_wire() {
         let v = detect(
             "The edits silently skipped.",
-            [obs("str_replace", "Error: old_str not found")],
+            [obs(
+                "str_replace",
+                "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: old_str not found in file.\nWHY:  The exact byte sequence does not appear in the current file content.\nNEXT: Re-read the target region with read_file, copy the actual bytes into old_str, then retry.",
+            )],
         );
         assert!(matches!(v, TripwireVerdict::Mismatch { .. }));
     }
@@ -242,7 +245,10 @@ mod tests {
         // trip the wire.
         let v = detect(
             "SILENTLY RETURNED {} — something went wrong.",
-            [obs("str_replace", "Error: old_str not found")],
+            [obs(
+                "str_replace",
+                "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: old_str not found in file.\nWHY:  The exact byte sequence does not appear in the current file content.\nNEXT: Re-read with read_file, then retry.",
+            )],
         );
         assert!(matches!(v, TripwireVerdict::Mismatch { .. }));
     }
@@ -271,7 +277,10 @@ mod tests {
         // a ```-fence must not retrigger the wire.
         let v = detect(
             "Earlier the system warned me:\n\n```\nYour prose said 'silently returned {}'.\n```\n\nI'll avoid that phrasing going forward.",
-            [obs("str_replace", "Error: old_str not found")],
+            [obs(
+                "str_replace",
+                "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: old_str not found in file.\nWHY:  The exact byte sequence does not appear in the current file content.\nNEXT: Re-read with read_file, then retry.",
+            )],
         );
         assert_eq!(v, TripwireVerdict::Clean);
     }
@@ -295,7 +304,10 @@ mod tests {
     fn ignores_phrase_inside_blockquote() {
         let v = detect(
             "> last turn: silently returned {}\n\nI won't use that phrasing.",
-            [obs("str_replace", "Error: old_str not found")],
+            [obs(
+                "str_replace",
+                "❌ STR_REPLACE FAILED — FILE NOT MODIFIED\n\nWHAT: old_str not found in file.\nWHY:  The exact byte sequence does not appear in the current file content.\nNEXT: Re-read with read_file, then retry.",
+            )],
         );
         assert_eq!(v, TripwireVerdict::Clean);
     }

@@ -56,7 +56,7 @@ pub(crate) fn render(table: &MysqlTable, nav: &TableNav, area: Rect, buf: &mut B
         .map(|&c| {
             Cell::from(truncate(&table.headers[c], MAX_CELL_WIDTH as usize)).style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(crate::tui::theme::current().accent)
                     .add_modifier(Modifier::BOLD),
             )
         })
@@ -122,7 +122,7 @@ fn title_line(table: &MysqlTable, nav: &TableNav) -> Line<'static> {
             col_label,
         ),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(crate::tui::theme::current().accent)
             .add_modifier(Modifier::BOLD),
     ))
 }

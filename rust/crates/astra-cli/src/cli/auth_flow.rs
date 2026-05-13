@@ -1,23 +1,28 @@
+use super::cli_utils::{CredentialStore, Profile, credential_store};
 use super::*;
 
 pub(super) fn clear_profile_last_session(profile: Option<&str>) -> Result<(), String> {
-    let mut creds = load_credentials();
-    let name = profile_name(profile, &creds);
-    if let Some(entry) = creds.profiles.get_mut(&name) {
-        entry.last_session_id = None;
-    }
-    save_credentials(&creds)
+    credential_store()
+        .mutate(|creds| {
+            let name = profile_name(profile, creds);
+            if let Some(entry) = creds.profiles.get_mut(&name) {
+                entry.last_session_id = None;
+            }
+        })
+        .map_err(|e| e.to_string())
 }
 
 pub(super) fn clear_profile_auth(profile: Option<&str>) -> Result<(), String> {
-    let mut creds = load_credentials();
-    let name = profile_name(profile, &creds);
-    if let Some(entry) = creds.profiles.get_mut(&name) {
-        entry.access_token = None;
-        entry.refresh_token = None;
-        entry.last_session_id = None;
-    }
-    save_credentials(&creds)
+    credential_store()
+        .mutate(|creds| {
+            let name = profile_name(profile, creds);
+            if let Some(entry) = creds.profiles.get_mut(&name) {
+                entry.access_token = None;
+                entry.refresh_token = None;
+                entry.last_session_id = None;
+            }
+        })
+        .map_err(|e| e.to_string())
 }
 
 pub(super) async fn do_login(
@@ -41,16 +46,29 @@ pub(super) async fn do_login(
         .and_then(|v| v.as_str())
         .ok_or("missing refresh_token")?
         .to_string();
-    let mut creds = load_credentials();
-    let name = profile_name(profile, &creds);
-    creds.current_profile = Some(name.clone());
-    let mut updated = creds.profiles.get(&name).cloned().unwrap_or_default();
-    updated.username = Some(username.to_string());
-    updated.access_token = Some(access.clone());
-    updated.refresh_token = Some(refresh);
-    updated.last_session_id = None;
-    creds.profiles.insert(name, updated);
-    save_credentials(&creds)?;
+    let username = username.to_string();
+    let access_clone = access.clone();
+    credential_store()
+        .mutate(|creds| {
+            let name =
+                CredentialStore::resolve_profile_name(profile, creds.current_profile.as_deref());
+            let existing = creds.profiles.get(&name).cloned().unwrap_or_default();
+            let prev_session = if existing.username.as_deref() == Some(&username) {
+                existing.last_session_id
+            } else {
+                None
+            };
+            let updated = Profile {
+                username: Some(username.clone()),
+                access_token: Some(access_clone.clone()),
+                refresh_token: Some(refresh.clone()),
+                last_session_id: prev_session,
+                memoria_api_key: existing.memoria_api_key,
+            };
+            creds.current_profile = Some(name.clone());
+            creds.profiles.insert(name, updated);
+        })
+        .map_err(|e| e.to_string())?;
     Ok(access)
 }
 

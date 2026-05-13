@@ -39,6 +39,12 @@ pub(crate) fn render(tl: &Timeline, area: Rect, buf: &mut Buffer) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+
+    if tl.is_drilled() {
+        render_drill(tl, area, buf);
+        return;
+    }
+
     let outer = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -78,7 +84,7 @@ fn title_line(tl: &Timeline) -> Line<'static> {
     Line::from(Span::styled(
         title,
         Style::default()
-            .fg(Color::Cyan)
+            .fg(crate::tui::theme::current().accent)
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -163,7 +169,7 @@ fn render_detail(tl: &Timeline, area: Rect, buf: &mut Buffer) {
         return;
     };
     let dim = Style::default().fg(Color::DarkGray);
-    let label = Style::default().fg(Color::Cyan);
+    let label = Style::default().fg(crate::tui::theme::current().accent);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -262,6 +268,288 @@ fn fmt_tokens_u64(n: u64) -> String {
     }
 }
 
+// ─── Drill view (full turn trace) ──────────────────────────────────────
+
+fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
+    let Some(t) = tl.selected_turn() else { return };
+    let dim = Style::default().fg(Color::DarkGray);
+    let label = Style::default().fg(crate::tui::theme::current().accent);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+
+    let title = format!(" Turn {} · trace ", t.turn);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(crate::tui::theme::current().accent)
+                .add_modifier(Modifier::BOLD),
+        )));
+    let inner = outer.inner(area);
+    outer.render(area, buf);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Summary
+    if let Some(ms) = t.duration_ms {
+        lines.push(Line::from(vec![
+            Span::styled("  Total    ", label),
+            Span::styled(format!("{:.2}s", ms as f64 / 1000.0), bold),
+        ]));
+    }
+    if let Some(ttft) = t.ttft_ms {
+        lines.push(Line::from(vec![
+            Span::styled("  TTFT     ", label),
+            Span::styled(format!("{ttft}ms"), dim),
+        ]));
+    }
+    if let Some(ctx) = t.context_ms {
+        let mut detail_parts: Vec<String> = Vec::new();
+        if let Some(sel) = t.selector_ms {
+            let strat = t.selector_strategy.as_deref().unwrap_or("?");
+            detail_parts.push(format!("selector: {sel}ms [{strat}]"));
+        }
+        if let Some(m) = t.memoria_ms {
+            detail_parts.push(format!("memoria: {m}ms"));
+        }
+        let detail = if detail_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", detail_parts.join(", "))
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Context  ", label),
+            Span::styled(format!("{ctx}ms{detail}"), dim),
+        ]));
+    }
+    if let Some(ref skills) = t.selected_skills {
+        if !skills.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("  Skills   ", label),
+                Span::styled(skills.join(", "), dim),
+            ]));
+        }
+    }
+    if let Some(rounds) = t.llm_rounds {
+        lines.push(Line::from(vec![
+            Span::styled("  Rounds   ", label),
+            Span::styled(format!("{rounds} LLM→tool cycles"), dim),
+        ]));
+    }
+    if let (Some(tin), Some(tout)) = (t.tokens_in, t.tokens_out) {
+        let sel_note = match (t.selector_tokens_in, t.selector_tokens_out) {
+            (Some(si), Some(so)) if si > 0 || so > 0 => format!(" (+sel: {si}→{so})"),
+            _ => String::new(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Tokens   ", label),
+            Span::styled(format!("{tin} in / {tout} out{sel_note}"), dim),
+        ]));
+    }
+    if let Some(ref model) = t.model {
+        lines.push(Line::from(vec![
+            Span::styled("  Model    ", label),
+            Span::styled(model.clone(), dim),
+        ]));
+    }
+    // Throughput
+    if let (Some(t_out), Some(ms)) = (t.tokens_out, t.duration_ms) {
+        if ms > 0 {
+            let tps = t_out as f64 / (ms as f64 / 1000.0);
+            lines.push(Line::from(vec![
+                Span::styled("  Thruput  ", label),
+                Span::styled(format!("{tps:.1} tokens/s"), dim),
+            ]));
+        }
+    }
+
+    lines.push(Line::default());
+
+    // Timeline bar chart
+    let total_ms = t.duration_ms.unwrap_or(1) as f64;
+    let tool_time_ms = t
+        .total_tool_ms
+        .unwrap_or_else(|| t.tool_calls.iter().map(|tc| tc.ms).sum());
+    let llm_time_ms = t
+        .total_llm_ms
+        .unwrap_or_else(|| t.duration_ms.unwrap_or(0).saturating_sub(tool_time_ms));
+    let bar_width = (inner.width as usize).saturating_sub(24).min(40);
+
+    if bar_width > 4 {
+        lines.push(Line::from(Span::styled("  Timeline", bold)));
+        let llm_pct = (llm_time_ms as f64 / total_ms * 100.0).min(100.0) as usize;
+        let llm_bar_len = (llm_pct * bar_width / 100).max(1);
+        lines.push(Line::from(vec![
+            Span::styled("    LLM      ", label),
+            Span::styled(format!("{:>5}ms {:>3}% ", llm_time_ms, llm_pct), dim),
+            Span::styled("█".repeat(llm_bar_len), Style::default().fg(Color::Blue)),
+        ]));
+
+        for tc in &t.tool_calls {
+            let pct = (tc.ms as f64 / total_ms * 100.0).min(100.0) as usize;
+            let bar_len = (pct * bar_width / 100).max(1);
+            let bar_color = if tc.ok { Color::Green } else { Color::Red };
+            let name: String = tc.name.chars().take(10).collect();
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {:<10} ", name), label),
+                Span::styled(format!("{:>5}ms {:>3}% ", tc.ms, pct), dim),
+                Span::styled("█".repeat(bar_len), Style::default().fg(bar_color)),
+            ]));
+        }
+        lines.push(Line::default());
+    }
+
+    // Trace tree
+    if !t.tool_calls.is_empty() || t.context_ms.is_some() {
+        lines.push(Line::from(Span::styled("  Trace", bold)));
+        let mut offset: u64 = 0;
+
+        if let Some(ctx) = t.context_ms {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    [{:>5}ms] ", offset), dim),
+                Span::styled("├─ ", dim),
+                Span::raw("Context assembly"),
+            ]));
+            offset = ctx;
+        }
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("    [{:>5}ms] ", offset), dim),
+            Span::styled("├─ ", dim),
+            Span::raw("LLM request"),
+        ]));
+        if let Some(ttft) = t.ttft_ms {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    [{:>5}ms] ", offset + ttft), dim),
+                Span::styled("│  ", dim),
+                Span::styled("first token", Style::default().fg(Color::Yellow)),
+            ]));
+        }
+        offset += llm_time_ms;
+        lines.push(Line::from(vec![
+            Span::styled(format!("    [{:>5}ms] ", offset), dim),
+            Span::styled("│  ", dim),
+            Span::styled(format!("LLM complete ({llm_time_ms}ms)"), dim),
+        ]));
+
+        let has_real_offsets = t.tool_calls.iter().any(|tc| tc.start_offset_ms.is_some());
+        for (i, tc) in t.tool_calls.iter().enumerate() {
+            let is_last = i == t.tool_calls.len() - 1;
+            let branch = if is_last { "└─ " } else { "├─ " };
+            let status = if tc.ok { "✓" } else { "✗" };
+            let status_color = if tc.ok { Color::Green } else { Color::Red };
+
+            let tool_offset = if has_real_offsets {
+                tc.start_offset_ms.unwrap_or(offset)
+            } else {
+                offset
+            };
+
+            let round_tag = tc.round.map(|r| format!(" R{r}")).unwrap_or_default();
+            let par_tag = if tc.parallel == Some(true) {
+                " ∥"
+            } else {
+                ""
+            };
+
+            let display = tc
+                .args_preview
+                .as_deref()
+                .map(|a| format!("{} {}", tc.name, a.chars().take(30).collect::<String>()))
+                .unwrap_or_else(|| tc.name.clone());
+
+            lines.push(Line::from(vec![
+                Span::styled(format!("    [{:>5}ms] ", tool_offset), dim),
+                Span::styled(branch, dim),
+                Span::styled(format!("{status} "), Style::default().fg(status_color)),
+                Span::styled(
+                    display,
+                    Style::default().fg(crate::tui::theme::current().accent),
+                ),
+                Span::styled(format!(" {}ms{round_tag}{par_tag}", tc.ms), dim),
+            ]));
+
+            if let Some(ref err) = tc.error {
+                let sub = if is_last { "   " } else { "│  " };
+                let preview: String = err.chars().take(60).collect();
+                lines.push(Line::from(vec![
+                    Span::styled("             ", dim),
+                    Span::styled(sub, dim),
+                    Span::styled(preview, Style::default().fg(Color::Red)),
+                ]));
+            }
+
+            if !has_real_offsets {
+                offset += tc.ms;
+            }
+        }
+    }
+
+    // Breakdown summary
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("  Breakdown", bold)));
+    let llm_pct = if total_ms > 0.0 {
+        (llm_time_ms as f64 / total_ms * 100.0) as u32
+    } else {
+        0
+    };
+    let tool_pct = 100u32.saturating_sub(llm_pct);
+    let llm_note = if llm_pct > 80 { " ← bottleneck" } else { "" };
+    let tool_note = if tool_pct > 80 { " ← bottleneck" } else { "" };
+    lines.push(Line::from(vec![
+        Span::styled("    LLM          ", label),
+        Span::styled(
+            format!("{:>5}ms  {:>3}%{llm_note}", llm_time_ms, llm_pct),
+            dim,
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("    Tools        ", label),
+        Span::styled(
+            format!("{:>5}ms  {:>3}%{tool_note}", tool_time_ms, tool_pct),
+            dim,
+        ),
+    ]));
+
+    // Error
+    if let Some(ref err) = t.error {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            format!("  Error: {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    // User input / assistant output
+    if let Some(ref input) = t.user_input {
+        let preview: String = input.chars().take(200).collect();
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled("  User", label)));
+        for line in preview.lines().take(4) {
+            lines.push(Line::from(Span::styled(format!("    {line}"), dim)));
+        }
+        if input.lines().count() > 4 {
+            lines.push(Line::from(Span::styled("    …", dim)));
+        }
+    }
+    if let Some(ref output) = t.assistant_output {
+        let preview: String = output.chars().take(300).collect();
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled("  Assistant", label)));
+        for line in preview.lines().take(6) {
+            lines.push(Line::from(Span::styled(format!("    {line}"), dim)));
+        }
+        if output.lines().count() > 6 {
+            lines.push(Line::from(Span::styled("    …", dim)));
+        }
+    }
+
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(inner, buf);
+}
+
 /// Truncate an RFC3339 ISO timestamp to `HH:MM:SS`.
 fn short_time(iso: &str) -> String {
     // Find the 'T' separator; take 8 chars after.
@@ -293,6 +581,20 @@ mod tests {
             error: err.map(String::from),
             cumulative_tokens_in: 0,
             cumulative_tokens_out: 0,
+            ttft_ms: None,
+            context_ms: None,
+            selector_ms: None,
+            selector_strategy: None,
+            memoria_ms: None,
+            llm_rounds: None,
+            selected_skills: None,
+            total_tool_ms: None,
+            total_llm_ms: None,
+            tool_calls: Vec::new(),
+            user_input: None,
+            assistant_output: None,
+            selector_tokens_in: None,
+            selector_tokens_out: None,
         }
     }
 

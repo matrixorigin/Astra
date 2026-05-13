@@ -36,11 +36,7 @@ pub(super) async fn handle_state_command(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             if let Some(sid) = &new_sid {
-                let mut creds = load_credentials();
-                let pname = profile_name(profile, &creds);
-                let p = creds.profiles.entry(pname).or_default();
-                p.last_session_id = Some(sid.clone());
-                let _ = save_credentials(&creds);
+                let _ = persist_profile_last_session(profile, sid);
             }
             state.session_id = new_sid.clone();
             state.turn = 0;
@@ -284,8 +280,7 @@ pub(super) async fn handle_state_command(
         }
 
         "/verbose" => {
-            state.verbose_mode = true;
-            eprintln!("  Verbose mode on");
+            eprintln!("  /verbose has been removed. Use /stats for per-turn metrics.");
         }
 
         "/compact" => {
@@ -959,7 +954,9 @@ fn render_reflect_report(
     // Header
     eprintln!(
         "{}",
-        format!("🔍 Session Diagnosis — {short_sid}").cyan().bold()
+        format!("🔍 Session Diagnosis — {short_sid}")
+            .magenta()
+            .bold()
     );
     eprintln!("{}", "─────────────────────────────────────".dim());
 
@@ -1136,7 +1133,9 @@ fn render_local_reflect_report(
 
     eprintln!(
         "{}",
-        format!("🔍 Liquid Reflection — {short_sid}").cyan().bold()
+        format!("🔍 Liquid Reflection — {short_sid}")
+            .magenta()
+            .bold()
     );
     eprintln!("{}", "─────────────────────────────────────".dim());
     eprintln!(

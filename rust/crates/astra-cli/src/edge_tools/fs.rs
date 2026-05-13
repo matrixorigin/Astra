@@ -1,5 +1,6 @@
 use super::*;
 use astra_text_utils::str_preview::truncate_str;
+use astra_tools::fs_ops::str_replace_fail;
 
 /// Check if a path is a UNC path (Windows network path that could leak NTLM credentials).
 fn is_unc_path(path: &str) -> bool {
@@ -790,7 +791,11 @@ impl ToolExecutor {
             None => return "Error: missing 'new_str'".to_string(),
         };
         if old_str == new_str {
-            return "Error: old_str and new_str are identical — no change needed".to_string();
+            return str_replace_fail(
+                "old_str and new_str are identical — no change needed.",
+                "The replacement is a no-op; the file would be unchanged.",
+                "Provide a new_str that actually differs from old_str, or skip the edit.",
+            );
         }
         let dry_run = args
             .get("dry_run")
@@ -828,9 +833,12 @@ impl ToolExecutor {
                     astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED,
                     astra_runtime::observability_integration::FuzzyMatchOutcome::Ambiguous,
                 );
-                return format!(
-                    "Error: old_str found {norm_count} times (after normalizing curly quotes) — must be unique.\n\
-                     Hint: Add more surrounding context to old_str to make it unique.\n"
+                return str_replace_fail(
+                    &format!(
+                        "old_str found {norm_count} times (after normalizing curly quotes) — must be unique."
+                    ),
+                    "Multiple curly-quote-normalized occurrences match; cannot pick one safely.",
+                    "Add more surrounding context to old_str to make it unique, or set replace_all=true.",
                 );
             }
 
@@ -935,10 +943,12 @@ impl ToolExecutor {
                     astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED,
                     astra_runtime::observability_integration::FuzzyMatchOutcome::Ambiguous,
                 );
-                return format!(
-                    "Error: old_str matches {norm_count} occurrences after normalizing curly quotes, \
-                     but the file contains mixed curly quote forms. \
-                     Cannot safely replace_all with inconsistent quoting styles."
+                return str_replace_fail(
+                    &format!(
+                        "old_str matches {norm_count} occurrences after normalizing curly quotes."
+                    ),
+                    "The file contains mixed curly quote forms; replace_all cannot safely apply with inconsistent quoting styles.",
+                    "Normalize the file's quote style first, or pass an old_str that matches the exact bytes you want to replace.",
                 );
             }
             self.record_fuzzy_match_event(
@@ -1814,8 +1824,10 @@ impl ToolExecutor {
                 None => return format!("Error: edit[{i}] missing 'new_str'"),
             };
             if old_str == new_str {
-                return format!(
-                    "Error: edit[{i}] old_str and new_str are identical — no change needed"
+                return str_replace_fail(
+                    &format!("edit[{i}] old_str and new_str are identical — no change needed."),
+                    "The replacement is a no-op; the file would be unchanged. Aborting all edits.",
+                    "Provide a new_str that actually differs from old_str, or remove the edit from the batch.",
                 );
             }
             let count = working.matches(old_str).count();
@@ -1863,18 +1875,28 @@ impl ToolExecutor {
                         continue;
                     }
                     None => {
-                        return format!(
-                            "Error: edit[{i}] old_str not found. Aborting all edits.\n{}",
-                            str_replace_not_found_hint(&working, old_str)
+                        let mut out = str_replace_fail(
+                            &format!("edit[{i}] old_str not found. Aborting all edits."),
+                            "The exact byte sequence does not appear in the current file content (after applying prior edits in this batch).",
+                            "Re-read the target region with read_file, copy the actual bytes into old_str (including indentation), then retry. Diagnostic hints below:",
                         );
+                        out.push('\n');
+                        out.push_str(&str_replace_not_found_hint(&working, old_str));
+                        return out;
                     }
                 }
             }
             if count > 1 {
-                return format!(
-                    "Error: edit[{i}] old_str matches {count} times (must be unique). Aborting all edits.\n{}",
-                    str_replace_ambiguous_hint(&working, old_str, count)
+                let mut out = str_replace_fail(
+                    &format!(
+                        "edit[{i}] old_str matches {count} times (must be unique). Aborting all edits."
+                    ),
+                    "Multiple exact occurrences match; the edit is ambiguous and cannot apply safely.",
+                    "Add more surrounding context to old_str to make it unique, or split the edit. Diagnostic hints below:",
                 );
+                out.push('\n');
+                out.push_str(&str_replace_ambiguous_hint(&working, old_str, count));
+                return out;
             }
             if i == 0 {
                 first_edit_start_byte = working.find(old_str);
@@ -2626,12 +2648,23 @@ fn append_str_replace_cli_unified_diff(out: &mut String, before: &str, after: &s
 }
 
 // ─── str_replace fuzzy matching ─────────────────────────────────────────────
+//
+// The canonical structured failure banner lives in `astra-tools::fs_ops::str_replace_fail`.
+// All `str_replace` / `multi_edit` failure paths in this CLI module route through that
+// helper so downstream matchers (hallucination tripwire, step recorder, tool result
+// semantics) can rely on a single sentinel: `❌ STR_REPLACE FAILED — FILE NOT MODIFIED`.
+// The "old_str not found" path additionally appends diagnostic hints below.
 
 /// When old_str not found, try to find close matches and report locations.
 fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let old_lines: Vec<&str> = old_str.lines().collect();
-    let mut msg = String::from("Error: old_str not found in file.\n");
+    let mut msg = str_replace_fail(
+        "old_str not found in file.",
+        "The exact byte sequence does not appear in the current file content.",
+        "Re-read the target region with read_file, copy the actual bytes into old_str (including indentation), then retry. Diagnostic hints below:",
+    );
+    msg.push('\n');
 
     // Strategy 1: Try whitespace-normalized match
     let normalized_old = normalize_ws(old_str);
@@ -2716,7 +2749,12 @@ fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
 
 /// When old_str found multiple times, show locations.
 fn str_replace_ambiguous_hint(content: &str, old_str: &str, count: usize) -> String {
-    let mut msg = format!("Error: old_str found {count} times — must be unique.\n");
+    let mut msg = str_replace_fail(
+        &format!("old_str found {count} times — must be unique."),
+        "Multiple exact occurrences match; the edit is ambiguous and cannot apply safely.",
+        "Add more surrounding context to old_str to make it unique, or set replace_all=true. Locations below:",
+    );
+    msg.push('\n');
     // Find line numbers of each occurrence
     let lines: Vec<&str> = content.lines().collect();
     let first_line = old_str.lines().next().unwrap_or("");
@@ -3142,7 +3180,7 @@ type Handler interface {
         let content = "fn hello() {}\n";
         let old_str = "completely_nonexistent_text";
         let msg = str_replace_not_found_hint(content, old_str);
-        assert!(msg.contains("Error"), "should be error: {msg}");
+        assert!(msg.contains("FAILED"), "should be error: {msg}");
         assert!(
             msg.contains("read_file") || msg.contains("Hint"),
             "should give guidance: {msg}"
@@ -3193,7 +3231,7 @@ type Handler interface {
             "new_str": "fn replaced() {}"
         }));
         assert!(
-            result2.contains("Error"),
+            result2.contains("FAILED"),
             "truly different should be error: {result2}"
         );
         assert!(result2.contains("Hint"), "should have hints: {result2}");
@@ -3398,7 +3436,7 @@ type Handler interface {
             "replace_all": true
         }));
         assert!(
-            result.contains("Error"),
+            result.contains("FAILED"),
             "should error on mixed curly-quote forms: {result}"
         );
         assert!(

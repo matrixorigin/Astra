@@ -4,6 +4,21 @@
 
 use std::sync::Arc;
 
+/// Detail record for one tool call within a turn (mirrors journal's `ToolCallRecord`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ToolCallDetail {
+    pub name: String,
+    pub ok: bool,
+    pub ms: u64,
+    pub error: Option<String>,
+    pub input_bytes: Option<u32>,
+    pub output_bytes: Option<u32>,
+    pub args_preview: Option<String>,
+    pub start_offset_ms: Option<u64>,
+    pub parallel: Option<bool>,
+    pub round: Option<u32>,
+}
+
 /// A single turn's worth of journal metadata rendered in the timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TimelineTurn {
@@ -21,6 +36,21 @@ pub(crate) struct TimelineTurn {
     pub cumulative_tokens_in: u64,
     /// Cumulative total tokens out (including this turn).
     pub cumulative_tokens_out: u64,
+    // ── Trace detail (populated from journal observability fields) ──
+    pub ttft_ms: Option<u64>,
+    pub context_ms: Option<u64>,
+    pub selector_ms: Option<u64>,
+    pub selector_strategy: Option<String>,
+    pub selector_tokens_in: Option<u64>,
+    pub selector_tokens_out: Option<u64>,
+    pub memoria_ms: Option<u64>,
+    pub llm_rounds: Option<u32>,
+    pub selected_skills: Option<Vec<String>>,
+    pub total_tool_ms: Option<u64>,
+    pub total_llm_ms: Option<u64>,
+    pub tool_calls: Vec<ToolCallDetail>,
+    pub user_input: Option<String>,
+    pub assistant_output: Option<String>,
 }
 
 impl TimelineTurn {
@@ -64,8 +94,34 @@ impl TurnSource for JournalTurnSource {
         };
         events
             .into_iter()
-            .filter(|e| matches!(e.event_type, JournalEventType::Turn))
+            .filter(|e| {
+                matches!(
+                    e.event_type,
+                    JournalEventType::Turn | JournalEventType::TurnError
+                )
+            })
             .filter_map(|e| {
+                let tool_calls = e
+                    .tool_calls
+                    .as_ref()
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .map(|tc| ToolCallDetail {
+                                name: tc.name.clone(),
+                                ok: tc.ok,
+                                ms: tc.ms,
+                                error: tc.error.clone(),
+                                input_bytes: tc.input_bytes,
+                                output_bytes: tc.output_bytes,
+                                args_preview: tc.args_preview.clone(),
+                                start_offset_ms: tc.start_offset_ms,
+                                parallel: tc.parallel,
+                                round: tc.round,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Some(TimelineTurn {
                     turn: e.turn?,
                     started_at: e.ts.clone(),
@@ -79,6 +135,20 @@ impl TurnSource for JournalTurnSource {
                     error: e.error.clone(),
                     cumulative_tokens_in: 0,
                     cumulative_tokens_out: 0,
+                    ttft_ms: e.ttft_ms,
+                    context_ms: e.context_ms,
+                    selector_ms: e.selector_ms,
+                    selector_strategy: e.selector_strategy.clone(),
+                    selector_tokens_in: e.selector_tokens_in,
+                    selector_tokens_out: e.selector_tokens_out,
+                    memoria_ms: e.memoria_ms,
+                    llm_rounds: e.llm_rounds,
+                    selected_skills: e.selected_skills.clone(),
+                    total_tool_ms: e.total_tool_ms,
+                    total_llm_ms: e.total_llm_ms,
+                    tool_calls,
+                    user_input: e.user_input.clone(),
+                    assistant_output: e.assistant_output.clone(),
                 })
             })
             .collect()
@@ -110,6 +180,7 @@ pub(crate) struct Timeline {
     source: Arc<dyn TurnSource>,
     turns: Vec<TimelineTurn>,
     selected: usize,
+    drilled: bool,
 }
 
 impl std::fmt::Debug for Timeline {
@@ -141,6 +212,7 @@ impl Timeline {
             source,
             turns,
             selected: 0,
+            drilled: false,
         }
     }
 
@@ -184,6 +256,20 @@ impl Timeline {
             return;
         }
         self.selected = (self.selected + 1) % self.turns.len();
+    }
+
+    pub fn is_drilled(&self) -> bool {
+        self.drilled
+    }
+
+    pub fn enter_drill(&mut self) {
+        if !self.turns.is_empty() {
+            self.drilled = true;
+        }
+    }
+
+    pub fn exit_drill(&mut self) {
+        self.drilled = false;
     }
 
     pub fn grand_total_tokens_in(&self) -> u64 {

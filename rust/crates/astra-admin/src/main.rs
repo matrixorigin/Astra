@@ -200,18 +200,22 @@ async fn main() -> Result<(), String> {
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| "missing refresh_token".to_string())?
                 .to_string();
-            let mut creds = load_credentials();
-            let name = profile_name(cli.profile.as_deref(), &creds);
-            creds.current_profile = Some(name.clone());
-            creds.profiles.insert(
-                name,
-                Profile {
-                    username: Some(username),
-                    access_token: Some(access),
-                    refresh_token: Some(refresh),
-                },
-            );
-            save_credentials(&creds)?;
+            let cli_profile = cli.profile.clone();
+            credentials::store()
+                .mutate(|creds| {
+                    let name = profile_name(cli_profile.as_deref(), creds);
+                    creds.current_profile = Some(name.clone());
+                    creds.profiles.insert(
+                        name,
+                        Profile {
+                            username: Some(username),
+                            access_token: Some(access),
+                            refresh_token: Some(refresh),
+                            ..Default::default()
+                        },
+                    );
+                })
+                .map_err(|e| e.to_string())?;
             println!("logged in");
             Ok(())
         }
@@ -239,7 +243,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Command::Refresh => {
-            let mut creds = load_credentials();
+            let creds = load_credentials();
             let name = profile_name(cli.profile.as_deref(), &creds);
             let profile = creds
                 .profiles
@@ -258,20 +262,27 @@ async fn main() -> Result<(), String> {
             let new_access = value
                 .get("access_token")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing access_token".to_string())?;
+                .ok_or_else(|| "missing access_token".to_string())?
+                .to_string();
             let new_refresh = value
                 .get("refresh_token")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing refresh_token".to_string())?;
-            let entry = creds.profiles.entry(name).or_default();
-            entry.access_token = Some(new_access.to_string());
-            entry.refresh_token = Some(new_refresh.to_string());
-            save_credentials(&creds)?;
+                .ok_or_else(|| "missing refresh_token".to_string())?
+                .to_string();
+            let cli_profile = cli.profile.clone();
+            credentials::store()
+                .mutate(|creds| {
+                    let name = profile_name(cli_profile.as_deref(), creds);
+                    let entry = creds.profiles.entry(name).or_default();
+                    entry.access_token = Some(new_access.clone());
+                    entry.refresh_token = Some(new_refresh.clone());
+                })
+                .map_err(|e| e.to_string())?;
             println!("token refreshed");
             Ok(())
         }
         Command::Logout => {
-            let mut creds = load_credentials();
+            let creds = load_credentials();
             let name = profile_name(cli.profile.as_deref(), &creds);
             let profile = creds
                 .profiles
@@ -285,11 +296,16 @@ async fn main() -> Result<(), String> {
                 .post_auth_logout_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await
                 .map_err(map_thin_err)?;
-            if let Some(entry) = creds.profiles.get_mut(&name) {
-                entry.access_token = None;
-                entry.refresh_token = None;
-            }
-            save_credentials(&creds)?;
+            let cli_profile = cli.profile.clone();
+            credentials::store()
+                .mutate(|creds| {
+                    let name = profile_name(cli_profile.as_deref(), creds);
+                    if let Some(entry) = creds.profiles.get_mut(&name) {
+                        entry.access_token = None;
+                        entry.refresh_token = None;
+                    }
+                })
+                .map_err(|e| e.to_string())?;
             print_json_or_raw(&body);
             Ok(())
         }

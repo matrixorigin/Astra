@@ -4,11 +4,6 @@
 //! - Colors are easy to change or theme
 //! - Non-TTY environments can disable colors in one place
 //! - Readline prompts use only ASCII text (ANSI codes are safe for cursor math)
-//!
-//! ## Custom Themes
-//!
-//! Users can define custom themes in `~/.astra/styles/<name>.yaml`. The `/style`
-//! command switches between built-in and user-defined themes at runtime.
 
 #![allow(dead_code)]
 
@@ -70,8 +65,8 @@ impl ThemeColor {
 pub struct ThemeConfig {
     /// Theme display name
     pub name: String,
-    /// Prompt color (default: cyan)
-    #[serde(default = "default_cyan")]
+    /// Prompt color (default: magenta)
+    #[serde(default = "default_magenta")]
     pub prompt: ThemeColor,
     /// Success messages (default: green)
     #[serde(default = "default_green")]
@@ -82,14 +77,14 @@ pub struct ThemeConfig {
     /// Warning messages (default: yellow)
     #[serde(default = "default_yellow")]
     pub warning: ThemeColor,
-    /// Info/accent color (default: cyan)
-    #[serde(default = "default_cyan")]
+    /// Info/accent color (default: magenta)
+    #[serde(default = "default_magenta")]
     pub info: ThemeColor,
-    /// Section headers (default: cyan)
-    #[serde(default = "default_cyan")]
+    /// Section headers (default: magenta)
+    #[serde(default = "default_magenta")]
     pub section_color: ThemeColor,
-    /// Tool call display (default: blue)
-    #[serde(default = "default_blue")]
+    /// Tool call display (default: magenta)
+    #[serde(default = "default_magenta")]
     pub tool: ThemeColor,
     /// Use bold for headers
     #[serde(default = "default_true")]
@@ -99,8 +94,8 @@ pub struct ThemeConfig {
     pub dim_secondary: bool,
 }
 
-fn default_cyan() -> ThemeColor {
-    ThemeColor::Cyan
+fn default_magenta() -> ThemeColor {
+    ThemeColor::Magenta
 }
 fn default_green() -> ThemeColor {
     ThemeColor::Green
@@ -111,9 +106,6 @@ fn default_red() -> ThemeColor {
 fn default_yellow() -> ThemeColor {
     ThemeColor::Yellow
 }
-fn default_blue() -> ThemeColor {
-    ThemeColor::Blue
-}
 fn default_true() -> bool {
     true
 }
@@ -122,13 +114,13 @@ impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
             name: "default".to_string(),
-            prompt: ThemeColor::Cyan,
+            prompt: ThemeColor::Magenta,
             success: ThemeColor::Green,
             error: ThemeColor::Red,
             warning: ThemeColor::Yellow,
-            info: ThemeColor::Cyan,
-            section_color: ThemeColor::Cyan,
-            tool: ThemeColor::Blue,
+            info: ThemeColor::Magenta,
+            section_color: ThemeColor::Magenta,
+            tool: ThemeColor::Magenta,
             bold_headers: true,
             dim_secondary: true,
         }
@@ -150,113 +142,6 @@ pub fn current_theme() -> ThemeConfig {
         .clone()
 }
 
-/// Get the current theme name.
-pub fn current_theme_name() -> String {
-    active_theme()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .name
-        .clone()
-}
-
-/// Set the active theme.
-pub fn set_theme(theme: ThemeConfig) {
-    *active_theme().write().unwrap_or_else(|e| e.into_inner()) = theme;
-}
-
-/// List available built-in themes.
-pub fn builtin_themes() -> Vec<ThemeConfig> {
-    vec![
-        ThemeConfig::default(),
-        ThemeConfig {
-            name: "minimal".to_string(),
-            prompt: ThemeColor::White,
-            success: ThemeColor::White,
-            error: ThemeColor::Red,
-            warning: ThemeColor::Yellow,
-            info: ThemeColor::White,
-            section_color: ThemeColor::White,
-            tool: ThemeColor::White,
-            bold_headers: true,
-            dim_secondary: true,
-        },
-        ThemeConfig {
-            name: "colorful".to_string(),
-            prompt: ThemeColor::Magenta,
-            success: ThemeColor::Green,
-            error: ThemeColor::Red,
-            warning: ThemeColor::Yellow,
-            info: ThemeColor::Cyan,
-            section_color: ThemeColor::Blue,
-            tool: ThemeColor::Magenta,
-            bold_headers: true,
-            dim_secondary: false,
-        },
-        ThemeConfig {
-            name: "high-contrast".to_string(),
-            prompt: ThemeColor::White,
-            success: ThemeColor::Green,
-            error: ThemeColor::Red,
-            warning: ThemeColor::Yellow,
-            info: ThemeColor::White,
-            section_color: ThemeColor::White,
-            tool: ThemeColor::Yellow,
-            bold_headers: true,
-            dim_secondary: false,
-        },
-    ]
-}
-
-/// Load user themes from `~/.astra/styles/`.
-pub fn load_user_themes() -> Vec<ThemeConfig> {
-    let dir = match dirs::home_dir() {
-        Some(h) => h.join(".astra").join("styles"),
-        None => return Vec::new(),
-    };
-    if !dir.is_dir() {
-        return Vec::new();
-    }
-    let mut themes = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path
-                .extension()
-                .is_some_and(|ext| ext == "yaml" || ext == "yml")
-            {
-                if let Ok(contents) = std::fs::read_to_string(&path) {
-                    match serde_yaml_ng::from_str::<ThemeConfig>(&contents) {
-                        Ok(theme) => themes.push(theme),
-                        Err(e) => {
-                            eprintln!("  ⚠ Failed to parse theme {}: {e}", path.display());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    themes
-}
-
-/// Find and activate a theme by name (searches built-in first, then user).
-pub fn activate_theme_by_name(name: &str) -> Result<(), String> {
-    // Check built-in
-    for t in builtin_themes() {
-        if t.name.eq_ignore_ascii_case(name) {
-            set_theme(t);
-            return Ok(());
-        }
-    }
-    // Check user themes
-    for t in load_user_themes() {
-        if t.name.eq_ignore_ascii_case(name) {
-            set_theme(t);
-            return Ok(());
-        }
-    }
-    Err(format!("Theme '{name}' not found"))
-}
-
 // ── Readline prompts ──────────────────────────────────────────────────────
 //
 // IMPORTANT: Prompt TEXT must be ASCII-only. Unicode characters with ambiguous
@@ -264,8 +149,8 @@ pub fn activate_theme_by_name(name: &str) -> Result<(), String> {
 // tracking for CJK input. ANSI color codes (\x1b[...m) are safe — rustyline
 // treats them as width=0.
 
-/// Default prompt: cyan bold `>`
-pub const PROMPT_DEFAULT: &str = "\x1b[1;36m>\x1b[0m ";
+/// Default prompt: magenta bold `>`
+pub const PROMPT_DEFAULT: &str = "\x1b[1;35m>\x1b[0m ";
 
 /// Plan mode prompt: yellow bold `plan>`
 pub const PROMPT_PLAN: &str = "\x1b[1;33mplan>\x1b[0m ";
@@ -273,8 +158,8 @@ pub const PROMPT_PLAN: &str = "\x1b[1;33mplan>\x1b[0m ";
 /// Paused plan execution prompt: yellow bold `pause>`
 pub const PROMPT_PAUSE: &str = "\x1b[1;33mpause>\x1b[0m ";
 
-/// Background plan running prompt: cyan bold `bg>`
-pub const PROMPT_BG: &str = "\x1b[1;36mbg>\x1b[0m ";
+/// Background plan running prompt: magenta bold `bg>`
+pub const PROMPT_BG: &str = "\x1b[1;35mbg>\x1b[0m ";
 
 /// Chat plan-only mode prompt: yellow bold `plan.`
 pub const PROMPT_PLAN_ONLY: &str = "\x1b[1;33mplan.\x1b[0m ";
@@ -288,9 +173,9 @@ fn styled(text: &str, color: ThemeColor) -> String {
     StyledContent::new(crossterm::style::ContentStyle::new().with(c), text).to_string()
 }
 
-/// Success indicator: ✓ in theme success color
+/// Success indicator: ● in theme success color
 pub fn icon_ok() -> String {
-    styled("✓", current_theme().success)
+    styled("●", current_theme().success)
 }
 
 /// Error indicator: ✗ in theme error color
@@ -306,6 +191,11 @@ pub fn icon_warn() -> String {
 /// Info indicator: ℹ in theme info color
 pub fn icon_info() -> String {
     styled("ℹ", current_theme().info)
+}
+
+/// Running indicator: ○ in theme info color
+pub fn icon_running() -> String {
+    styled("○", current_theme().info)
 }
 
 // ── Semantic text styles ──────────────────────────────────────────────────
@@ -458,30 +348,6 @@ mod tests {
         assert!(!icon_ok().is_empty());
         assert!(!icon_err().is_empty());
         assert!(!icon_warn().is_empty());
-    }
-
-    #[test]
-    fn builtin_themes_all_have_names() {
-        let themes = builtin_themes();
-        assert!(themes.len() >= 4);
-        for t in &themes {
-            assert!(!t.name.is_empty());
-        }
-    }
-
-    #[test]
-    fn activate_and_read_theme() {
-        // Switch to high-contrast
-        activate_theme_by_name("high-contrast").unwrap();
-        assert_eq!(current_theme_name(), "high-contrast");
-        // Switch back to default
-        activate_theme_by_name("default").unwrap();
-        assert_eq!(current_theme_name(), "default");
-    }
-
-    #[test]
-    fn activate_unknown_theme_returns_error() {
-        assert!(activate_theme_by_name("nonexistent").is_err());
     }
 
     #[test]

@@ -56,7 +56,7 @@ impl BottomPaneView for BusyView {
             .border_style(Style::default().fg(Color::DarkGray))
             .title(Line::from(Span::styled(
                 self.title.clone(),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(crate::tui::theme::current().accent),
             )));
         let inner = outer.inner(area);
         outer.render(area, buf);

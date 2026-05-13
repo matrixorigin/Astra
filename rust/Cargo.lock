@@ -123,6 +123,7 @@ dependencies = [
 name = "astra-admin-cli"
 version = "0.1.0"
 dependencies = [
+ "astra-credentials",
  "astra-thin-client",
  "clap",
  "crossterm 0.27.0",
@@ -133,6 +134,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "temp-env",
  "tempfile",
  "tokio",
 ]
@@ -143,6 +145,7 @@ version = "0.1.0"
 dependencies = [
  "astra-config",
  "astra-core",
+ "astra-credentials",
  "astra-harness",
  "astra-learning",
  "astra-logging",
@@ -254,6 +257,19 @@ dependencies = [
  "temp-env",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "astra-credentials"
+version = "0.1.0"
+dependencies = [
+ "dirs 6.0.0",
+ "fs2",
+ "serde",
+ "serde_json",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

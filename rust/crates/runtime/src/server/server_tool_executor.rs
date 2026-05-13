@@ -4226,7 +4226,7 @@ esac
                 }),
             )
             .await;
-        assert!(result.contains("found 2 times"));
+        assert!(result.contains("2 times"));
     }
 
     #[tokio::test]

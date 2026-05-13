@@ -67,7 +67,7 @@ impl BottomPaneView for HistoryView {
 
         let dim = Style::default().fg(Color::DarkGray);
         let bold = Style::default().add_modifier(Modifier::BOLD);
-        let cyan = Style::default().fg(Color::Cyan);
+        let cyan = Style::default().fg(crate::tui::theme::current().accent);
         let mut y = area.y;
 
         // Title

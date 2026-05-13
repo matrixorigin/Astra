@@ -461,7 +461,7 @@ impl ConfigEditView {
     fn render_list(&self, area: Rect, buf: &mut Buffer) {
         let dim = Style::default().fg(Color::DarkGray);
         let sel_style = Style::default()
-            .fg(Color::Cyan)
+            .fg(crate::tui::theme::current().accent)
             .add_modifier(Modifier::BOLD);
 
         let mut y = area.y;
@@ -660,7 +660,7 @@ impl InnerEditor for BoolEditor {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let hint = Style::default().fg(Color::DarkGray);
         let sel = Style::default()
-            .fg(Color::Cyan)
+            .fg(crate::tui::theme::current().accent)
             .add_modifier(Modifier::BOLD);
         let mut lines = vec![Line::from(Span::styled(
             format!("  ▶ {} ", self.label),
@@ -822,7 +822,7 @@ impl InnerEditor for NumberEditor {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let hint = Style::default().fg(Color::DarkGray);
         let val_style = Style::default()
-            .fg(Color::Cyan)
+            .fg(crate::tui::theme::current().accent)
             .add_modifier(Modifier::BOLD);
         let mut lines = vec![
             Line::from(Span::styled(
@@ -926,7 +926,7 @@ impl InnerEditor for EnumEditor {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let hint = Style::default().fg(Color::DarkGray);
         let sel = Style::default()
-            .fg(Color::Cyan)
+            .fg(crate::tui::theme::current().accent)
             .add_modifier(Modifier::BOLD);
         let mut lines = vec![Line::from(Span::styled(
             format!("  ▶ {} ", self.label),
@@ -1097,7 +1097,7 @@ fn render_save_prompt(p: &SavePrompt, area: Rect, buf: &mut Buffer) {
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::DarkGray);
     let sel = Style::default()
-        .fg(Color::Cyan)
+        .fg(crate::tui::theme::current().accent)
         .add_modifier(Modifier::BOLD);
 
     let rows: [(&str, String); 4] = [
@@ -1146,7 +1146,7 @@ fn render_preview(original: &RuntimeConfig, working: &RuntimeConfig, area: Rect,
     let dim = Style::default().fg(Color::DarkGray);
     let before = Style::default().fg(Color::DarkGray);
     let after = Style::default()
-        .fg(Color::Cyan)
+        .fg(crate::tui::theme::current().accent)
         .add_modifier(Modifier::BOLD);
 
     let before_cat = build_settings_catalog(original);

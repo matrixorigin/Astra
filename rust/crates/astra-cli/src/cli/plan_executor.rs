@@ -220,9 +220,9 @@ impl PlanOutputSink for StderrSink {
     ) {
         eprintln!(
             "\n{}  {}\n{}  {} {}",
-            "◆".cyan(),
+            "◆".magenta(),
             progress_bar.dim(),
-            format!("▶ [{index}/{total}]").bold().cyan(),
+            format!("▶ [{index}/{total}]").bold().magenta(),
             title.bold(),
             format!("[{id}]{group_label}").dim(),
         );
@@ -237,7 +237,7 @@ impl PlanOutputSink for StderrSink {
             theme::icon_ok(),
             "Done:".bold(),
             title.bold(),
-            format!("({pct}%)").cyan(),
+            format!("({pct}%)").magenta(),
             elapsed_str.dim()
         );
     }
@@ -293,7 +293,7 @@ impl PlanOutputSink for StderrSink {
             "\n{}  {} at {}% — blocked: {}  {}",
             "⏸".yellow(),
             "Plan paused".bold().yellow(),
-            format!("{pct}").cyan(),
+            format!("{pct}").magenta(),
             blocked_ids.bold(),
             format!("({})", super::format_duration_short(elapsed)).dim(),
         );
@@ -301,7 +301,7 @@ impl PlanOutputSink for StderrSink {
 
     fn parallel_info(&self, parts: &[String]) {
         if !parts.is_empty() {
-            eprintln!("\n{}  {}", "║".cyan(), parts.join(" · "));
+            eprintln!("\n{}  {}", "║".magenta(), parts.join(" · "));
         }
     }
 
@@ -319,15 +319,15 @@ impl PlanOutputSink for StderrSink {
     }
 
     fn step_proceeding(&self) {
-        eprintln!("  {}  Proceeding…", "→".cyan());
+        eprintln!("  {}  Proceeding…", "→".magenta());
     }
 
     fn interrupted_pause(&self, pct: u32, remaining: usize) {
         eprintln!(
             "\n{}  Plan paused (Ctrl+C). {}% done, {} subtasks remaining.",
             "⏸".yellow(),
-            pct.to_string().cyan(),
-            remaining.to_string().cyan()
+            pct.to_string().magenta(),
+            remaining.to_string().magenta()
         );
         eprintln!(
             "{}  (Interrupt is not sent to the model; this subtask is still in progress.)",
@@ -481,6 +481,11 @@ pub struct PlanExecutorHandle {
 ///
 /// Returns `(handle, update_tx, cmd_rx)`:
 /// Errors that indicate authentication/credential failure — retrying is pointless.
+///
+/// NOTE: bare `"401"` substring match is intentionally avoided — unrelated
+/// payloads (timeouts in ms, byte offsets, body snippets containing the
+/// digits) produced spurious credential-refresh prompts. Require the status
+/// code to appear in an HTTP-shaped phrase.
 fn is_credential_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("could not validate credentials")
@@ -488,7 +493,11 @@ fn is_credential_error(msg: &str) -> bool {
         || lower.contains("unauthorized")
         || lower.contains("authentication failed")
         || lower.contains("token expired")
-        || lower.contains("401")
+        || lower.contains("session expired")
+        || lower.contains("401 unauthorized")
+        || lower.contains("status: 401")
+        || lower.contains("status code: 401")
+        || lower.contains("http 401")
 }
 
 /// Pick the `plan_progress` action for end-of-plan emission.

@@ -60,7 +60,7 @@ fn show_profile(ctx: &ProfileCommandContext<'_>) {
     let profile = ctx.profile_manager.get_profile(ctx.user_id);
     let prefs = &profile.preferences;
 
-    eprintln!("\n  {}", "👤 User Profile".cyan().bold());
+    eprintln!("\n  {}", "👤 User Profile".magenta().bold());
     eprintln!("  {}", "─".repeat(50).dim());
 
     eprintln!("  User ID: {}", ctx.user_id.dim());
@@ -70,27 +70,27 @@ fn show_profile(ctx: &ProfileCommandContext<'_>) {
     eprintln!("\n  {}", "Preferences:".bold());
     eprintln!(
         "    Verbosity: {}",
-        format_verbosity(prefs.verbosity).cyan()
+        format_verbosity(prefs.verbosity).magenta()
     );
     eprintln!(
         "    Language: {}",
-        prefs.language_style.language.clone().cyan()
+        prefs.language_style.language.clone().magenta()
     );
     eprintln!(
         "    Formality: {}",
-        format_formality(prefs.language_style.formality).cyan()
+        format_formality(prefs.language_style.formality).magenta()
     );
     eprintln!(
         "    Response Length: {}",
-        format_response_length(prefs.response_length).cyan()
+        format_response_length(prefs.response_length).magenta()
     );
     eprintln!(
         "    Code Comments: {}",
-        format_code_comments(prefs.language_style.code_comments).cyan()
+        format_code_comments(prefs.language_style.code_comments).magenta()
     );
     eprintln!(
         "    Emoji Usage: {}",
-        format_emoji_usage(prefs.language_style.emoji_usage).cyan()
+        format_emoji_usage(prefs.language_style.emoji_usage).magenta()
     );
     eprintln!(
         "    Technical Jargon: {}",
@@ -127,7 +127,7 @@ fn show_profile(ctx: &ProfileCommandContext<'_>) {
             profile.active_experiments.len()
         );
         for exp_id in &profile.active_experiments {
-            eprintln!("    • {}", exp_id.clone().cyan());
+            eprintln!("    • {}", exp_id.clone().magenta());
         }
     }
 
@@ -156,13 +156,17 @@ fn edit_preference(ctx: &ProfileCommandContext<'_>, key: &str, value: &str) {
             }
             eprintln!(
                 "  {} Verbosity set to: {}",
-                "✓".green(),
-                format_verbosity(prefs.verbosity).cyan()
+                theme::icon_ok(),
+                format_verbosity(prefs.verbosity).magenta()
             );
         }
         "language" | "lang" => {
             prefs.language_style.language = value.to_string();
-            eprintln!("  {} Language set to: {}", "✓".green(), value.cyan());
+            eprintln!(
+                "  {} Language set to: {}",
+                theme::icon_ok(),
+                value.magenta()
+            );
         }
         "formality" | "f" => {
             match value_lower.as_str() {
@@ -179,8 +183,8 @@ fn edit_preference(ctx: &ProfileCommandContext<'_>, key: &str, value: &str) {
             }
             eprintln!(
                 "  {} Formality set to: {}",
-                "✓".green(),
-                format_formality(prefs.language_style.formality).cyan()
+                theme::icon_ok(),
+                format_formality(prefs.language_style.formality).magenta()
             );
         }
         "response_length" | "length" | "len" => {
@@ -198,8 +202,8 @@ fn edit_preference(ctx: &ProfileCommandContext<'_>, key: &str, value: &str) {
             }
             eprintln!(
                 "  {} Response length set to: {}",
-                "✓".green(),
-                format_response_length(prefs.response_length).cyan()
+                theme::icon_ok(),
+                format_response_length(prefs.response_length).magenta()
             );
         }
         "comments" | "code_comments" => {
@@ -223,8 +227,8 @@ fn edit_preference(ctx: &ProfileCommandContext<'_>, key: &str, value: &str) {
             }
             eprintln!(
                 "  {} Code comments set to: {}",
-                "✓".green(),
-                format_code_comments(prefs.language_style.code_comments).cyan()
+                theme::icon_ok(),
+                format_code_comments(prefs.language_style.code_comments).magenta()
             );
         }
         "emoji" => {
@@ -243,8 +247,8 @@ fn edit_preference(ctx: &ProfileCommandContext<'_>, key: &str, value: &str) {
             }
             eprintln!(
                 "  {} Emoji usage set to: {}",
-                "✓".green(),
-                format_emoji_usage(prefs.language_style.emoji_usage).cyan()
+                theme::icon_ok(),
+                format_emoji_usage(prefs.language_style.emoji_usage).magenta()
             );
         }
         "jargon" | "technical" => {
@@ -258,23 +262,23 @@ fn edit_preference(ctx: &ProfileCommandContext<'_>, key: &str, value: &str) {
             }
             eprintln!(
                 "  {} Technical jargon set to: {}",
-                "✓".green(),
+                theme::icon_ok(),
                 if prefs.language_style.technical_jargon {
-                    "yes".cyan()
+                    "yes".magenta()
                 } else {
-                    "no".cyan()
+                    "no".magenta()
                 }
             );
         }
         "prompt" | "suffix" => {
             if value.is_empty() || value_lower == "none" || value_lower == "clear" {
                 prefs.custom_prompt_suffix = None;
-                eprintln!("  {} Custom prompt suffix cleared", "✓".green());
+                eprintln!("  {} Custom prompt suffix cleared", theme::icon_ok());
             } else {
                 prefs.custom_prompt_suffix = Some(value.to_string());
                 eprintln!(
                     "  {} Custom prompt suffix set to: {}",
-                    "✓".green(),
+                    theme::icon_ok(),
                     value.dim()
                 );
             }
@@ -299,7 +303,7 @@ fn edit_preference(ctx: &ProfileCommandContext<'_>, key: &str, value: &str) {
 fn show_scenario(ctx: &ProfileCommandContext<'_>) {
     let profile = ctx.profile_manager.get_profile(ctx.user_id);
 
-    eprintln!("\n  {}", "🎯 Scenario Detection".cyan().bold());
+    eprintln!("\n  {}", "🎯 Scenario Detection".magenta().bold());
     eprintln!("  {}", "─".repeat(50).dim());
 
     match profile.current_scenario {
@@ -328,7 +332,7 @@ fn show_scenario(ctx: &ProfileCommandContext<'_>) {
 
             eprintln!("\n  {}", "Recommended Tools:".bold());
             for tool in scenario.recommended_tools() {
-                eprintln!("    • {}", tool.cyan());
+                eprintln!("    • {}", tool.magenta());
             }
         }
         None => {
@@ -347,7 +351,7 @@ fn show_stats(ctx: &ProfileCommandContext<'_>) {
     let profile = ctx.profile_manager.get_profile(ctx.user_id);
     let stats = &profile.stats;
 
-    eprintln!("\n  {}", "📊 Usage Statistics".cyan().bold());
+    eprintln!("\n  {}", "📊 Usage Statistics".magenta().bold());
     eprintln!("  {}", "─".repeat(50).dim());
 
     eprintln!("  Total Sessions: {}", stats.total_sessions);
@@ -366,7 +370,7 @@ fn show_stats(ctx: &ProfileCommandContext<'_>) {
         for (tool, count) in stats.top_tools(10) {
             let bar_len = (count as f64 / stats.total_tool_calls.max(1) as f64 * 20.0) as usize;
             let bar = "█".repeat(bar_len);
-            eprintln!("    {:20} {:4} {}", tool, count, bar.cyan());
+            eprintln!("    {:20} {:4} {}", tool, count, bar.magenta());
         }
     }
 
@@ -375,7 +379,7 @@ fn show_stats(ctx: &ProfileCommandContext<'_>) {
         let mut scenarios: Vec<_> = stats.scenario_frequency.iter().collect();
         scenarios.sort_by(|a, b| b.1.cmp(a.1));
         for (scenario, count) in scenarios.iter().take(5) {
-            eprintln!("    {} ({}x)", (*scenario).clone().cyan(), count);
+            eprintln!("    {} ({}x)", (*scenario).clone().magenta(), count);
         }
     }
 
@@ -386,7 +390,7 @@ fn show_tools(ctx: &ProfileCommandContext<'_>) {
     let profile = ctx.profile_manager.get_profile(ctx.user_id);
     let prefs = &profile.preferences;
 
-    eprintln!("\n  {}", "🔧 Tool Preferences".cyan().bold());
+    eprintln!("\n  {}", "🔧 Tool Preferences".magenta().bold());
     eprintln!("  {}", "─".repeat(50).dim());
 
     if prefs.preferred_tools.is_empty() && prefs.blocked_tools.is_empty() {
@@ -399,14 +403,14 @@ fn show_tools(ctx: &ProfileCommandContext<'_>) {
         if !prefs.preferred_tools.is_empty() {
             eprintln!("  {}", "Preferred (boosted):".bold());
             for tool in &prefs.preferred_tools {
-                eprintln!("    {} {}", "▲".green(), tool.clone().cyan());
+                eprintln!("    {} {}", "▲".green(), tool.clone().magenta());
             }
         }
 
         if !prefs.blocked_tools.is_empty() {
             eprintln!("\n  {}", "Blocked (never used):".bold());
             for tool in &prefs.blocked_tools {
-                eprintln!("    {} {}", "✗".red(), tool.clone().dim());
+                eprintln!("    {} {}", theme::icon_err(), tool.clone().dim());
             }
         }
     }
@@ -416,7 +420,7 @@ fn show_tools(ctx: &ProfileCommandContext<'_>) {
     if !stats.tool_usage.is_empty() {
         eprintln!("\n  {}", "Most Used:".bold());
         for (tool, count) in stats.top_tools(5) {
-            eprintln!("    {} ({}x)", tool.cyan(), count);
+            eprintln!("    {} ({}x)", tool.magenta(), count);
         }
     }
 
@@ -426,7 +430,7 @@ fn show_tools(ctx: &ProfileCommandContext<'_>) {
 fn show_experiments(ctx: &ProfileCommandContext<'_>) {
     let profile = ctx.profile_manager.get_profile(ctx.user_id);
 
-    eprintln!("\n  {}", "🧪 Experiment Enrollment".cyan().bold());
+    eprintln!("\n  {}", "🧪 Experiment Enrollment".magenta().bold());
     eprintln!("  {}", "─".repeat(50).dim());
 
     if profile.active_experiments.is_empty() {
@@ -441,7 +445,7 @@ fn show_experiments(ctx: &ProfileCommandContext<'_>) {
             profile.active_experiments.len()
         );
         for exp_id in &profile.active_experiments {
-            eprintln!("    • {}", exp_id.clone().cyan());
+            eprintln!("    • {}", exp_id.clone().magenta());
         }
     }
 
@@ -452,39 +456,45 @@ fn reset_profile(ctx: &ProfileCommandContext<'_>) {
     let new_profile = UserProfile::new(ctx.user_id);
     ctx.profile_manager.update_profile(new_profile);
 
-    eprintln!("  {} Profile reset to defaults.", "✓".green());
+    eprintln!("  {} Profile reset to defaults.", theme::icon_ok());
 }
 
 fn show_help() {
     eprintln!(
         "\n  {}",
-        "👤 /profile - User Profile Management".cyan().bold()
+        "👤 /profile - User Profile Management".magenta().bold()
     );
     eprintln!("  {}", "─".repeat(55).dim());
 
     eprintln!("\n  {}", "Subcommands:".bold());
     eprintln!(
         "    {}",
-        "/profile               Show current profile".cyan()
-    );
-    eprintln!("    {}", "/profile edit <k> <v>  Edit a preference".cyan());
-    eprintln!(
-        "    {}",
-        "/profile scenario      Show detected scenario".cyan()
+        "/profile               Show current profile".magenta()
     );
     eprintln!(
         "    {}",
-        "/profile stats         Show usage statistics".cyan()
+        "/profile edit <k> <v>  Edit a preference".magenta()
     );
     eprintln!(
         "    {}",
-        "/profile tools         Show tool preferences".cyan()
+        "/profile scenario      Show detected scenario".magenta()
     );
     eprintln!(
         "    {}",
-        "/profile experiments   Show experiment enrollment".cyan()
+        "/profile stats         Show usage statistics".magenta()
     );
-    eprintln!("    {}", "/profile reset         Reset to defaults".cyan());
+    eprintln!(
+        "    {}",
+        "/profile tools         Show tool preferences".magenta()
+    );
+    eprintln!(
+        "    {}",
+        "/profile experiments   Show experiment enrollment".magenta()
+    );
+    eprintln!(
+        "    {}",
+        "/profile reset         Reset to defaults".magenta()
+    );
 
     eprintln!("\n  {}", "Editable Preferences:".bold());
     eprintln!("    {} quiet|normal|verbose|debug", "verbosity".green());

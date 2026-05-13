@@ -63,7 +63,7 @@ impl ToolRunningLineSpinner {
             _ => truncate_cli_status_detail(&description, w.saturating_sub(16).max(30)),
         };
         let t0 = Instant::now();
-        let icon = format!("{}", ICON_RUNNING.cyan());
+        let icon = format!("{}", ICON_RUNNING.magenta());
 
         paint_unified_line(&icon, &label, "0s", SPINNER_FRAMES[0], w);
 
@@ -130,9 +130,9 @@ impl ToolStdoutLineAnim {
                     let frame = SPINNER_FRAMES[0];
                     g.lines[idx] = format!(
                         "  {} {} {}",
-                        "⬢".cyan(),
+                        ICON_RUNNING.magenta(),
                         description,
-                        format!("{frame}").yellow()
+                        format!("{frame}").magenta()
                     );
                     let lines = g.lines.clone();
                     g.region.update(lines);
@@ -152,9 +152,9 @@ impl ToolStdoutLineAnim {
                 spin_idx += 1;
                 g.lines[idx] = format!(
                     "  {} {} {}",
-                    "⬢".cyan(),
+                    ICON_RUNNING.magenta(),
                     description,
-                    format!("{frame}").yellow()
+                    format!("{frame}").magenta()
                 );
                 let lines = g.lines.clone();
                 g.region.update(lines);

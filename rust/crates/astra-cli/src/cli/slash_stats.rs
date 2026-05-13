@@ -53,7 +53,7 @@ pub(super) async fn handle_stats_command(arg: &str, state: &SessionState) {
                 let model = s.model.as_deref().unwrap_or("?");
                 eprintln!(
                     "  {} {:>3} turns  {:>6}+{:<6} tok  {:>3} tools  {} err  {}",
-                    short.cyan(),
+                    short.magenta(),
                     s.turn_count,
                     s.total_tokens_in,
                     s.total_tokens_out,
@@ -117,10 +117,10 @@ pub(super) async fn handle_stats_command(arg: &str, state: &SessionState) {
             eprintln!(
                 "  {:<14} {}",
                 "session:".dim(),
-                sid[..8.min(sid.len())].cyan()
+                sid[..8.min(sid.len())].magenta()
             );
             if let Some(ref m) = stats.model {
-                eprintln!("  {:<14} {}", "model:".dim(), m.as_str().cyan());
+                eprintln!("  {:<14} {}", "model:".dim(), m.as_str().magenta());
             }
             eprintln!("  {:<14} {}", "turns:".dim(), stats.turn_count);
             eprintln!(
@@ -229,7 +229,7 @@ pub(super) fn handle_cost_command(arg: &str, state: &SessionState) {
                 "─── Per-Turn Cost Breakdown ─────────────────────".bold()
             );
             if let Some(ref m) = state.model {
-                eprintln!("  {:<14} {}", "model:".dim(), m.as_str().cyan());
+                eprintln!("  {:<14} {}", "model:".dim(), m.as_str().magenta());
             }
             eprintln!(
                 "  {:<14} ${:.4}/1k prompt, ${:.4}/1k completion",
@@ -337,7 +337,7 @@ pub(super) fn handle_cost_command(arg: &str, state: &SessionState) {
                     let model = stats.model.as_deref().unwrap_or("?");
                     eprintln!(
                         "  {} {:>3} turns  {:>6}+{:<6} tok  {}  {}",
-                        short.cyan(),
+                        short.magenta(),
                         stats.turn_count,
                         stats.total_tokens_in,
                         stats.total_tokens_out,
@@ -376,11 +376,11 @@ pub(super) fn handle_cost_command(arg: &str, state: &SessionState) {
                 eprintln!(
                     "  {:<14} {}",
                     "session:".dim(),
-                    sid[..8.min(sid.len())].cyan()
+                    sid[..8.min(sid.len())].magenta()
                 );
             }
             if let Some(ref m) = state.model {
-                eprintln!("  {:<14} {}", "model:".dim(), m.as_str().cyan());
+                eprintln!("  {:<14} {}", "model:".dim(), m.as_str().magenta());
             }
             eprintln!(
                 "  {:<14} ${:.4}/1k prompt, ${:.4}/1k completion",

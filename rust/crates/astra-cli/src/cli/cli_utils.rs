@@ -1,77 +1,38 @@
 use super::*;
 
-#[derive(Debug, Serialize, Deserialize, Default)]
-pub(super) struct CredentialsFile {
-    pub(super) current_profile: Option<String>,
-    pub(super) profiles: HashMap<String, Profile>,
-}
+pub(super) use astra_credentials::{CredentialStore, CredentialsFile, Profile};
 
-#[derive(Clone, Serialize, Deserialize, Default)]
-pub(super) struct Profile {
-    pub(super) username: Option<String>,
-    pub(super) access_token: Option<String>,
-    pub(super) refresh_token: Option<String>,
-    pub(super) last_session_id: Option<String>,
-    pub(super) memoria_api_key: Option<String>,
-}
-
-impl std::fmt::Debug for Profile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Profile")
-            .field("username", &self.username)
-            .field("access_token", &self.access_token.as_ref().map(|_| "***"))
-            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "***"))
-            .field("last_session_id", &self.last_session_id)
-            .field(
-                "memoria_api_key",
-                &self.memoria_api_key.as_ref().map(|_| "***"),
-            )
-            .finish()
-    }
+pub(super) fn credential_store() -> CredentialStore {
+    CredentialStore::new()
 }
 
 pub(super) fn credentials_path() -> PathBuf {
-    // Allow tests to override the credentials path via env var to avoid polluting real credentials.
-    if let Ok(dir) = std::env::var("ASTRA_CLI_CREDENTIALS_DIR") {
-        return PathBuf::from(dir).join("credentials.json");
-    }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".astra")
-        .join("credentials.json")
+    credential_store().path().clone()
 }
 
-/// Fetch relevant memories from Memoria synchronously and return as a string for context injection.
-/// Returns empty string if Memoria is not configured or unavailable.
 pub(super) fn load_credentials() -> CredentialsFile {
-    let path = credentials_path();
-    let Ok(content) = fs::read_to_string(path) else {
-        return CredentialsFile::default();
-    };
-    serde_json::from_str(&content).unwrap_or_default()
+    credential_store().load().unwrap_or_default()
 }
 
+#[cfg(test)]
 pub(super) fn save_credentials(data: &CredentialsFile) -> Result<(), String> {
-    let path = credentials_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let body = serde_json::to_string_pretty(data).map_err(|e| e.to_string())?;
-    fs::write(&path, body).map_err(|e| e.to_string())?;
-    // Restrict to owner-only (0o600) — credentials contain tokens and secrets
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    let store = credential_store();
+    store
+        .mutate(|d| {
+            *d = data.clone();
+        })
+        .map_err(|e| e.to_string())
+}
+
+pub(super) fn mutate_credentials<F, R>(f: F) -> Result<R, String>
+where
+    F: FnOnce(&mut CredentialsFile) -> R,
+{
+    credential_store().mutate(f).map_err(|e| e.to_string())
 }
 
 pub(super) fn profile_name(cli_profile: Option<&str>, data: &CredentialsFile) -> String {
-    cli_profile
-        .map(ToString::to_string)
-        .or_else(|| data.current_profile.clone())
-        .unwrap_or_else(|| "default".to_string())
+    CredentialStore::resolve_profile_name(cli_profile, data.current_profile.as_deref())
 }
 
 pub(super) fn get_profile_and_token(
@@ -121,17 +82,39 @@ pub(super) fn clear_profile_last_session_if_matches(
     cli_profile: Option<&str>,
     session_id: &str,
 ) -> Result<bool, String> {
-    let mut creds = load_credentials();
-    let name = profile_name(cli_profile, &creds);
-    let Some(entry) = creds.profiles.get_mut(&name) else {
-        return Ok(false);
-    };
-    if entry.last_session_id.as_deref() != Some(session_id) {
-        return Ok(false);
-    }
-    entry.last_session_id = None;
-    save_credentials(&creds)?;
-    Ok(true)
+    mutate_credentials(|creds| {
+        let name = profile_name(cli_profile, creds);
+        let Some(entry) = creds.profiles.get_mut(&name) else {
+            return false;
+        };
+        if entry.last_session_id.as_deref() != Some(session_id) {
+            return false;
+        }
+        entry.last_session_id = None;
+        true
+    })
+}
+
+pub(super) fn persist_profile_last_session(
+    cli_profile: Option<&str>,
+    session_id: &str,
+) -> Result<(), String> {
+    mutate_credentials(|creds| {
+        let name = profile_name(cli_profile, creds);
+        let entry = creds.profiles.entry(name).or_default();
+        entry.last_session_id = Some(session_id.to_string());
+    })
+}
+
+pub(super) fn persist_profile_memoria_api_key(
+    cli_profile: Option<&str>,
+    api_key: &str,
+) -> Result<(), String> {
+    mutate_credentials(|creds| {
+        let name = profile_name(cli_profile, creds);
+        let entry = creds.profiles.entry(name).or_default();
+        entry.memoria_api_key = Some(api_key.to_string());
+    })
 }
 
 pub(super) async fn preflight_remote_resume_session(
@@ -392,7 +375,7 @@ pub(super) fn prompt_or(label: &str, existing: Option<String>) -> Result<String,
     if let Some(v) = existing {
         return Ok(v);
     }
-    print!("  {}: ", label.cyan().bold());
+    print!("  {}: ", label.magenta().bold());
     io::stdout().flush().map_err(|e| e.to_string())?;
     let mut val = String::new();
     io::stdin().read_line(&mut val).map_err(|e| e.to_string())?;
@@ -412,7 +395,7 @@ pub(super) fn prompt_password_masked(
     if let Some(v) = existing {
         return Ok(v);
     }
-    print!("  {}: ", label.cyan().bold());
+    print!("  {}: ", label.magenta().bold());
     io::stdout().flush().map_err(|e| e.to_string())?;
     let val = rpassword::read_password().map_err(|e| e.to_string())?;
     let val = val.trim().to_string();
@@ -515,8 +498,8 @@ pub(super) fn interactive_select(
                 } else if is_current {
                     eprint!(
                         "  {} {:<width$}  {}\r\n",
-                        marker.cyan(),
-                        label.as_str().cyan(),
+                        marker.green(),
+                        label.as_str().green(),
                         desc.as_str().dim(),
                         width = max_label,
                     );
@@ -877,6 +860,56 @@ mod tests {
     }
 
     #[test]
+    fn persist_profile_last_session_updates_only_target_field() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                username: Some("user".to_string()),
+                access_token: Some("tok".to_string()),
+                refresh_token: Some("ref".to_string()),
+                memoria_api_key: Some("mem-key".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        persist_profile_last_session(None, "sess-new").unwrap();
+
+        let creds = load_credentials();
+        let profile = &creds.profiles["default"];
+        assert_eq!(profile.last_session_id.as_deref(), Some("sess-new"));
+        assert_eq!(profile.memoria_api_key.as_deref(), Some("mem-key"));
+        assert_eq!(profile.access_token.as_deref(), Some("tok"));
+        assert_eq!(profile.refresh_token.as_deref(), Some("ref"));
+    }
+
+    #[test]
+    fn persist_profile_memoria_api_key_updates_only_target_field() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                username: Some("user".to_string()),
+                last_session_id: Some("sess-old".to_string()),
+                access_token: Some("tok".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        persist_profile_memoria_api_key(None, "mem-new").unwrap();
+
+        let creds = load_credentials();
+        let profile = &creds.profiles["default"];
+        assert_eq!(profile.memoria_api_key.as_deref(), Some("mem-new"));
+        assert_eq!(profile.last_session_id.as_deref(), Some("sess-old"));
+        assert_eq!(profile.access_token.as_deref(), Some("tok"));
+    }
+
+    #[test]
     fn session_is_not_resumable_after_clean_end() {
         let (_tmp, _guard) = isolated_sessions_dir();
         let sid = format!("test-ended-{}", uuid::Uuid::new_v4());
@@ -1118,8 +1151,8 @@ mod tests {
     fn test_credentials_file_permissions() {
         let _creds_guard = crate::tests::isolate_credentials();
         let creds = CredentialsFile {
-            current_profile: Some("default".into()),
-            profiles: HashMap::new(),
+            current_profile: Some("default".to_string()),
+            ..Default::default()
         };
         save_credentials(&creds).unwrap();
 
