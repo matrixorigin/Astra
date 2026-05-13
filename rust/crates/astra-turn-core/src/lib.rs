@@ -118,6 +118,7 @@ pub mod approval_base_digest;
 pub mod approval_fingerprint;
 pub mod approval_request_key;
 pub mod approval_sink;
+pub mod permission_cwd_root;
 pub mod permission_engine;
 pub mod permission_path_glob;
 pub mod permission_rule_grammar;
