@@ -18,6 +18,10 @@ use std::collections::HashSet;
 ///
 /// Shared between parent and child agents; child inherits parent's mode
 /// unless explicitly overridden with a more restrictive mode.
+///
+/// Issue #326 P0 / R1 Minor 5: `BypassSafety` is the domain-type name
+/// for what the UI displays as "YOLO". The persistent API uses the
+/// explicit, non-slang name; UI labels are free to be terse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
@@ -28,6 +32,12 @@ pub enum PermissionMode {
     Prompt,
     /// Deny all write/execute tools without prompting (CI/headless mode).
     Deny,
+    /// Skip every approval prompt — opt-in only via `--yolo` /
+    /// `--mode bypass-safety` / `/yolo` slash command. Bypass-immune
+    /// hard-deny rules still fire (the catastrophic-command circuit
+    /// breaker, sensitive-path protections, git destructive guard);
+    /// this is "skip prompts", not "skip every check".
+    BypassSafety,
 }
 
 impl std::fmt::Display for PermissionMode {
@@ -36,6 +46,7 @@ impl std::fmt::Display for PermissionMode {
             Self::Auto => write!(f, "auto"),
             Self::Prompt => write!(f, "prompt"),
             Self::Deny => write!(f, "deny"),
+            Self::BypassSafety => write!(f, "bypass-safety"),
         }
     }
 }
@@ -47,8 +58,9 @@ impl std::str::FromStr for PermissionMode {
             "auto" => Ok(Self::Auto),
             "prompt" => Ok(Self::Prompt),
             "deny" => Ok(Self::Deny),
+            "bypass-safety" | "bypass_safety" | "yolo" => Ok(Self::BypassSafety),
             _ => Err(format!(
-                "invalid permission mode '{s}': expected auto, prompt, or deny"
+                "invalid permission mode '{s}': expected auto, prompt, deny, or bypass-safety (alias: yolo)"
             )),
         }
     }

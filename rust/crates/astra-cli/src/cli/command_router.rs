@@ -436,6 +436,9 @@ fn handle_permission_command(arg: &str, state: &mut ReplState) {
                 PermissionMode::Prompt => PermissionMode::Auto,
                 PermissionMode::Auto => PermissionMode::Deny,
                 PermissionMode::Deny => PermissionMode::Prompt,
+                // BypassSafety doesn't participate in the Shift+Tab cycle
+                // (issue #326 P0 / R1 Minor 5). Cycling out returns to Prompt.
+                PermissionMode::BypassSafety => PermissionMode::Prompt,
             };
             state.perm_manager.set_mode(next);
             eprintln!(

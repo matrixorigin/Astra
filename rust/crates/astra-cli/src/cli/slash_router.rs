@@ -414,6 +414,11 @@ pub(super) async fn handle_slash_command(
                             PermissionMode::Prompt => PermissionMode::Auto,
                             PermissionMode::Auto => PermissionMode::Deny,
                             PermissionMode::Deny => PermissionMode::Prompt,
+                            // Issue #326 P0 / R1 Minor 5: BypassSafety
+                            // is opt-in only via /yolo + --yolo, never
+                            // entered via cycling. Cycling out of it
+                            // returns to the safe default (Prompt).
+                            PermissionMode::BypassSafety => PermissionMode::Prompt,
                         };
                         state.perm_manager.set_mode(next);
                         eprintln!(

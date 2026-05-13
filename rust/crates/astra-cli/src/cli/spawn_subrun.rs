@@ -453,6 +453,9 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     astra_runtime::orchestration::PermissionMode::Auto => "auto".to_string(),
                     astra_runtime::orchestration::PermissionMode::Prompt => "prompt".to_string(),
                     astra_runtime::orchestration::PermissionMode::Deny => "deny".to_string(),
+                    astra_runtime::orchestration::PermissionMode::BypassSafety => {
+                        "bypass-safety".to_string()
+                    }
                 };
                 (
                     Some(PermissionSummary {

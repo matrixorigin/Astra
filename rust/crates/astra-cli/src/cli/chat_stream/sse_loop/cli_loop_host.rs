@@ -115,7 +115,11 @@ fn derive_turn_interaction_mode(
         // or silent contexts silently demoted Auto → NonInteractive,
         // which in turn disabled the nudge-suppression gate the user
         // opted into.
-        PermissionMode::Auto => TurnInteractionMode::Auto,
+        //
+        // BypassSafety (YOLO) behaves like Auto for interaction-mode
+        // purposes — both skip prompts and let the agent run. Issue
+        // #326 P0 / R1 Minor 5.
+        PermissionMode::Auto | PermissionMode::BypassSafety => TurnInteractionMode::Auto,
         // Prompt requires user interaction; if we can't actually prompt
         // (no tty, alternate approval channel, silenced UI), fall back
         // to NonInteractive so callers don't block on a human.

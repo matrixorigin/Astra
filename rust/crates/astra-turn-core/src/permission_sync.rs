@@ -283,8 +283,12 @@ impl PermissionRequestHandler {
 
         // Check mode
         match ctx.mode() {
-            PermissionMode::Auto => {
-                // Auto-approve and optionally add rule
+            PermissionMode::Auto | PermissionMode::BypassSafety => {
+                // Auto / BypassSafety: approve at this layer. Bypass-immune
+                // safety guards (catastrophic-command circuit breaker,
+                // sensitive-path checks) live earlier in the pipeline; by
+                // the time we reach the permission_sync layer those have
+                // already had their say. Issue #326 P0 / R1 Minor 5.
                 let response = if let Some(ref rule_str) = request.suggested_rule {
                     PermissionResponse::approve()
                         .with_update(PermissionUpdate::allow(PermissionRule::parse(rule_str)))

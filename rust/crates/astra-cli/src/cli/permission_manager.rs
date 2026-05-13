@@ -150,6 +150,9 @@ fn content_aware_fingerprint(
 }
 
 /// Permission mode controls how tool approval decisions are handled.
+///
+/// Issue #326 P0 / R1 Minor 5: `BypassSafety` is the domain-type
+/// name for what the UI displays as "YOLO".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum PermissionMode {
     /// Auto-approve all tools (except bypass-immune safety checks).
@@ -158,6 +161,10 @@ pub(super) enum PermissionMode {
     Prompt,
     /// Deny all write/execute tools without prompting (CI/headless mode).
     Deny,
+    /// YOLO — skip every approval prompt. Bypass-immune hard-deny
+    /// rules still fire (catastrophic-command circuit breaker,
+    /// sensitive-path protections, git destructive guard).
+    BypassSafety,
 }
 
 impl std::str::FromStr for PermissionMode {
@@ -167,8 +174,9 @@ impl std::str::FromStr for PermissionMode {
             "auto" => Ok(Self::Auto),
             "prompt" => Ok(Self::Prompt),
             "deny" => Ok(Self::Deny),
+            "bypass-safety" | "bypass_safety" | "yolo" => Ok(Self::BypassSafety),
             _ => Err(format!(
-                "invalid permission mode '{s}': expected auto, prompt, or deny"
+                "invalid permission mode '{s}': expected auto, prompt, deny, or bypass-safety (alias: yolo)"
             )),
         }
     }
@@ -180,6 +188,7 @@ impl std::fmt::Display for PermissionMode {
             Self::Auto => write!(f, "auto"),
             Self::Prompt => write!(f, "prompt"),
             Self::Deny => write!(f, "deny"),
+            Self::BypassSafety => write!(f, "bypass-safety"),
         }
     }
 }
@@ -668,6 +677,9 @@ impl PermissionManager {
             astra_runtime::orchestration::PermissionMode::Auto => PermissionMode::Auto,
             astra_runtime::orchestration::PermissionMode::Prompt => PermissionMode::Prompt,
             astra_runtime::orchestration::PermissionMode::Deny => PermissionMode::Deny,
+            astra_runtime::orchestration::PermissionMode::BypassSafety => {
+                PermissionMode::BypassSafety
+            }
         };
         let project_outcome = PermissionSettings::try_load(project_root);
         let user_outcome = PermissionSettings::try_load_user();
@@ -750,6 +762,7 @@ impl PermissionManager {
             PermissionMode::Auto => RuntimePermissionMode::Auto,
             PermissionMode::Prompt => RuntimePermissionMode::Prompt,
             PermissionMode::Deny => RuntimePermissionMode::Deny,
+            PermissionMode::BypassSafety => RuntimePermissionMode::BypassSafety,
         };
 
         let mut inherited = self
@@ -803,7 +816,9 @@ impl PermissionManager {
         if explicit {
             match self.mode {
                 PermissionMode::Deny => return ApprovalDecision::Deny,
-                PermissionMode::Auto => return ApprovalDecision::Allow,
+                PermissionMode::Auto | PermissionMode::BypassSafety => {
+                    return ApprovalDecision::Allow;
+                }
                 PermissionMode::Prompt => {}
             }
             eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
@@ -828,7 +843,9 @@ impl PermissionManager {
             };
         }
         match self.mode {
-            PermissionMode::Auto => return ApprovalDecision::Allow,
+            PermissionMode::Auto | PermissionMode::BypassSafety => {
+                return ApprovalDecision::Allow;
+            }
             PermissionMode::Deny => return ApprovalDecision::Deny,
             PermissionMode::Prompt => {}
         }
@@ -1088,14 +1105,18 @@ impl PermissionManager {
 
         if Self::cloud_approval_is_explicit(approval_kind) {
             return match self.mode {
-                PermissionMode::Auto => Some(ApprovalDecision::Allow),
+                PermissionMode::Auto | PermissionMode::BypassSafety => {
+                    Some(ApprovalDecision::Allow)
+                }
                 PermissionMode::Deny => Some(ApprovalDecision::Deny),
                 PermissionMode::Prompt => None,
             };
         }
 
         match self.mode {
-            PermissionMode::Auto => return Some(ApprovalDecision::Allow),
+            PermissionMode::Auto | PermissionMode::BypassSafety => {
+                return Some(ApprovalDecision::Allow);
+            }
             PermissionMode::Deny => return Some(ApprovalDecision::Deny),
             PermissionMode::Prompt => {}
         }
@@ -1701,7 +1722,7 @@ impl PermissionManager {
 
         // Step 7: Permission mode determines final action.
         match self.mode {
-            PermissionMode::Auto => return true,
+            PermissionMode::Auto | PermissionMode::BypassSafety => return true,
             PermissionMode::Deny => {
                 let (header, _) = Self::format_tool_display(name, args);
                 eprintln!("  {}", format!("  ✗ {header} — blocked").red());
@@ -1832,7 +1853,7 @@ impl PermissionManager {
                 };
             }
             return match self.mode {
-                PermissionMode::Auto => PermissionDecision::Allow,
+                PermissionMode::Auto | PermissionMode::BypassSafety => PermissionDecision::Allow,
                 PermissionMode::Deny => {
                     PermissionDecision::Deny("Sandbox expansion denied (deny mode)".into())
                 }
@@ -1909,13 +1930,13 @@ impl PermissionManager {
         // unless the operator has flipped the opt-in).
         if let Some(warning) = Self::check_dangerous_path(name, args) {
             match self.mode {
-                PermissionMode::Auto => {
+                PermissionMode::Auto | PermissionMode::BypassSafety => {
                     let opted_in = self.settings.allow_sensitive_path_writes
                         || self.user_settings.allow_sensitive_path_writes;
                     if opted_in {
                         astra_core::agent_warn!(
                             "permission",
-                            "Auto mode allowed write to sensitive path (opt-in): tool={name} warning={warning}"
+                            "Auto/BypassSafety mode allowed write to sensitive path (opt-in): tool={name} warning={warning}"
                         );
                         return PermissionDecision::Allow;
                     }
@@ -1991,7 +2012,9 @@ impl PermissionManager {
                         "Explicit approval required (deny mode)".into(),
                     );
                 }
-                PermissionMode::Auto => return PermissionDecision::Allow,
+                PermissionMode::Auto | PermissionMode::BypassSafety => {
+                    return PermissionDecision::Allow;
+                }
                 PermissionMode::Prompt => {}
             }
             let (header, detail) = Self::format_tool_display(name, args);
@@ -2010,7 +2033,7 @@ impl PermissionManager {
 
         // Step 7: Permission mode.
         match self.mode {
-            PermissionMode::Auto => PermissionDecision::Allow,
+            PermissionMode::Auto | PermissionMode::BypassSafety => PermissionDecision::Allow,
             PermissionMode::Deny => PermissionDecision::Deny("Denied by mode".into()),
             PermissionMode::Prompt => {
                 // Check denial limits before prompting.

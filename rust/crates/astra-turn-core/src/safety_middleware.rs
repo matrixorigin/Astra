@@ -507,13 +507,112 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
     check_shell_command_safety_with_mode(command, TrustMode::Strict)
 }
 
+/// Catastrophic command circuit breaker — bypass-immune, not configurable.
+///
+/// Issue #326 P0 / R1 Major 6: even in YOLO / `PermissionMode::BypassSafety`
+/// mode (where the user has explicitly opted into "skip every approval"),
+/// these specific patterns must still be denied. They are unrecoverable
+/// (delete the user's home, the whole disk, fork-bomb the machine).
+///
+/// The allowlist here is intentionally **tiny and not configurable**.
+/// Extending it requires a code change + review; users cannot bypass it
+/// via env vars, settings files, or YOLO mode.
+#[must_use]
+pub fn catastrophic_command_reason(command: &str) -> Option<String> {
+    // Normalize: trim, lowercase, collapse whitespace runs to a single
+    // space so `rm  -rf  /` matches the same pattern as `rm -rf /`.
+    let normalized: String = command
+        .trim()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+
+    // rm -rf rooted at / or $HOME or ~ → catastrophic
+    // We match conservatively: only flag rm with an -rf-style flag
+    // that targets a top-level path, so `rm -rf ./build/` is fine.
+    let rm_targets_root = [
+        // exact "rm -rf /" or with trailing /
+        "rm -rf /",
+        "rm -fr /",
+        "rm -r -f /",
+        "rm -f -r /",
+        // glob expansion of /
+        "rm -rf /*",
+        "rm -fr /*",
+        // home-equivalent paths
+        "rm -rf ~",
+        "rm -fr ~",
+        "rm -rf ~/",
+        "rm -fr ~/",
+        "rm -rf $home",
+        "rm -fr $home",
+        "rm -rf ${home}",
+        "rm -fr ${home}",
+    ];
+    for pattern in rm_targets_root {
+        if normalized == pattern || normalized.starts_with(&format!("{pattern} ")) {
+            return Some(format!(
+                "catastrophic command refused (circuit breaker): `{command}` would delete the entire root or home directory; \
+                 this check is not configurable and cannot be bypassed even by --yolo / PermissionMode::BypassSafety"
+            ));
+        }
+    }
+
+    // Fork bomb `:(){ :|: & };:` (and bash variants).
+    if normalized.contains(":(){") && normalized.contains(":|:") {
+        return Some(format!(
+            "catastrophic command refused (circuit breaker): `{command}` is a fork bomb"
+        ));
+    }
+
+    // Raw block-device write — `dd of=/dev/sd*` / `dd of=/dev/disk*` /
+    // `dd of=/dev/nvme*`. Wipes the disk.
+    if normalized.starts_with("dd ") || normalized.contains(" dd ") {
+        for prefix in ["of=/dev/sd", "of=/dev/disk", "of=/dev/nvme", "of=/dev/hd"] {
+            if normalized.contains(prefix) {
+                return Some(format!(
+                    "catastrophic command refused (circuit breaker): `{command}` writes raw bytes to a block device"
+                ));
+            }
+        }
+    }
+
+    // mkfs against /dev/sd* / /dev/nvme* / /dev/disk* — formats the disk.
+    if normalized.starts_with("mkfs") || normalized.contains(" mkfs") {
+        for prefix in ["/dev/sd", "/dev/disk", "/dev/nvme", "/dev/hd"] {
+            if normalized.contains(prefix) {
+                return Some(format!(
+                    "catastrophic command refused (circuit breaker): `{command}` formats a block device"
+                ));
+            }
+        }
+    }
+
+    None
+}
+
 /// Shell-obfuscation guard with explicit [`TrustMode`].
 ///
 /// See [`TrustMode`] for the exact contract. In [`TrustMode::Trusted`],
 /// rule 4 (unsafe command substitution) is skipped; every other rule still
 /// fires so prompt-injection defenses remain intact.
+///
+/// **Issue #326 P0 / R1 Major 6 — circuit breaker (rule 0)**:
+/// `is_catastrophic_command` matches a fixed allowlist of "you cannot
+/// undo this" patterns (`rm -rf /`, `rm -rf $HOME`, `rm -rf ~`,
+/// `rm -rf /*`, fork bombs, `dd of=/dev/sda`). It runs **before** any
+/// trust-mode-relaxed rules so a YOLO/`BypassSafety` mode still cannot
+/// execute it. The list is intentionally tiny and not configurable.
 #[must_use]
 pub fn check_shell_command_safety_with_mode(command: &str, mode: TrustMode) -> Option<String> {
+    // 0. Catastrophic command circuit breaker — bypass-immune, not
+    //    configurable. Even YOLO mode (PermissionMode::BypassSafety)
+    //    cannot disable this.
+    if let Some(reason) = catastrophic_command_reason(command) {
+        return Some(reason);
+    }
+
     // 1. Indirect expansion ${!...} — dynamically constructs variable names
     if command.contains("${!") {
         return Some(
@@ -1688,6 +1787,102 @@ pub fn check_sql_safety(sql: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── Issue #326 P0 / R1 Major 6: catastrophic command circuit breaker ──
+
+    #[test]
+    fn circuit_breaker_blocks_rm_rf_root() {
+        for cmd in [
+            "rm -rf /",
+            "rm -fr /",
+            "rm -r -f /",
+            "rm  -rf  /",
+            "rm -rf /*",
+        ] {
+            let reason = catastrophic_command_reason(cmd);
+            assert!(
+                reason.is_some(),
+                "circuit breaker must reject `{cmd}` but returned None"
+            );
+            assert!(
+                reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("circuit breaker"),
+                "reason must mention circuit breaker, got: {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn circuit_breaker_blocks_rm_rf_home() {
+        for cmd in ["rm -rf ~", "rm -rf ~/", "rm -rf $HOME", "rm -rf ${HOME}"] {
+            assert!(
+                catastrophic_command_reason(cmd).is_some(),
+                "circuit breaker must reject `{cmd}`"
+            );
+        }
+    }
+
+    #[test]
+    fn circuit_breaker_does_not_block_safe_rm() {
+        for cmd in [
+            "rm -rf ./build",
+            "rm -rf target/debug",
+            "rm /tmp/foo",
+            "rm -rf node_modules",
+            "rm -rf $(mktemp -d)",
+        ] {
+            assert!(
+                catastrophic_command_reason(cmd).is_none(),
+                "circuit breaker must not block safe rm: `{cmd}`"
+            );
+        }
+    }
+
+    #[test]
+    fn circuit_breaker_blocks_fork_bomb() {
+        let reason = catastrophic_command_reason(":(){ :|:& };:");
+        assert!(reason.is_some(), "fork bomb must be rejected");
+        assert!(reason.unwrap().contains("fork bomb"));
+    }
+
+    #[test]
+    fn circuit_breaker_blocks_dd_to_block_device() {
+        for cmd in [
+            "dd if=/dev/zero of=/dev/sda",
+            "dd if=/dev/zero of=/dev/disk0",
+            "dd if=/dev/random of=/dev/nvme0n1 bs=1M",
+        ] {
+            assert!(
+                catastrophic_command_reason(cmd).is_some(),
+                "dd to block device must be rejected: `{cmd}`"
+            );
+        }
+        // dd to a regular file is fine.
+        assert!(
+            catastrophic_command_reason("dd if=/dev/zero of=/tmp/zeros bs=1M count=1").is_none()
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_blocks_mkfs_block_device() {
+        assert!(catastrophic_command_reason("mkfs.ext4 /dev/sda1").is_some());
+        assert!(catastrophic_command_reason("mkfs /dev/disk2").is_some());
+        // mkfs without a block device target → not flagged here (would
+        // be rejected by missing-arg, not the circuit breaker).
+        assert!(catastrophic_command_reason("mkfs --help").is_none());
+    }
+
+    #[test]
+    fn circuit_breaker_runs_before_trust_mode_relaxation() {
+        // YOLO / Trusted mode must still see catastrophic commands
+        // refused. Rule 0 in check_shell_command_safety_with_mode
+        // fires before any trust-mode-relaxed rules.
+        let trusted = check_shell_command_safety_with_mode("rm -rf /", TrustMode::Trusted);
+        assert!(trusted.is_some());
+        assert!(trusted.unwrap().contains("circuit breaker"));
+    }
 
     #[test]
     fn sql_safety_blocks_commented_multi_statement() {
