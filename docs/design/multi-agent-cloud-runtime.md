@@ -1980,7 +1980,7 @@ astra Orchestrator
 | Server builder | `runtime/src/server/state_builder.rs` | Pipeline learning writer, bridge wiring | runtime ✅ |
 | Router | `runtime/src/server/router_builder.rs` | 50+ HTTP routes, the thin client API surface | runtime ✅ |
 | Edge §5.5 callbacks | `runtime/src/server/edge_callback_handlers.rs` | `/tools/result`, `/approval/respond`, `/agents/edge*` | runtime ✅ |
-| Web proxy | `web/app/api/backend/[...path]/route.ts` | Server-side proxy, httpOnly cookie auth | web ✅ |
+| Web BFF runtime client | `web/lib/runtime-client/`, `web/app/api/*` typed route handlers | Server-side SDK client, httpOnly cookie auth, no generic browser-visible runtime proxy | web ✅ |
 | Thin client (§5.5) | `astra-thin-client/src/{paths,protocol,client}.rs` | Shared HTTP+SSE; CLI and future clients | ✅ |
 | Light edge (§5.5.2) | `astra-thin-client/src/edge.rs` | `edge_executor_id` helpers, capability preset, `X-Astra-Edge-Id` | ✅ |
 

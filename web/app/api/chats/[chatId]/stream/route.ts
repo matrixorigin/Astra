@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { PATH_CHAT_STREAM, type RuntimeArtifactResponse } from '@astra/sdk';
 import { requireRuntimeUser } from '@/lib/api/auth-guard';
 import {
   beginStreamingMessage,
@@ -6,7 +7,11 @@ import {
   resolveBackendModelName,
   updateStreamingAssistantMessage,
 } from '@/lib/api/web-store';
-import { getRuntimeConfig } from '@/lib/runtime-config';
+import {
+  WebRuntimeClient,
+  readRuntimeErrorDetail,
+  requireRuntimeClient,
+} from '@/lib/runtime-client';
 import type { ChatArtifactRef, SendMessageRequest } from '@/lib/api/types';
 
 const encoder = new TextEncoder();
@@ -33,10 +38,6 @@ function eventFromSseFrame(frame: string) {
   }
 }
 
-function messageFromResponseStatus(response: Response) {
-  return `${response.status} ${response.statusText}`;
-}
-
 function normalizedActiveSkills(skills?: string[]) {
   if (!Array.isArray(skills)) {
     return [];
@@ -45,19 +46,6 @@ function normalizedActiveSkills(skills?: string[]) {
     left.localeCompare(right)
   ));
 }
-
-type RuntimeArtifactResponse = {
-  artifact_id?: string;
-  artifact_kind?: string;
-  source?: string | null;
-  content?: unknown;
-  metadata?: Record<string, unknown> | null;
-  created_at?: string | null;
-};
-
-type RuntimeArtifactListResponse = {
-  artifacts?: RuntimeArtifactResponse[];
-};
 
 function stringField(value: unknown) {
   return typeof value === 'string' && value.trim() ? value : null;
@@ -121,22 +109,8 @@ function artifactFromRuntime(artifact: RuntimeArtifactResponse): ChatArtifactRef
   };
 }
 
-async function fetchSessionArtifacts(
-  apiUrl: string,
-  accessToken: string,
-  sessionId: string,
-) {
-  const url = new URL(`/sessions/${encodeURIComponent(sessionId)}/artifacts`, apiUrl);
-  url.searchParams.set('limit', '50');
-  const response = await fetch(url.toString(), {
-    headers: { Authorization: `Bearer ${accessToken}` },
-    cache: 'no-store',
-  });
-  if (!response.ok) {
-    const detail = await readErrorDetail(response);
-    throw new Error(`Failed to load artifacts for session ${sessionId}: ${detail}`);
-  }
-  const body = (await response.json()) as RuntimeArtifactListResponse;
+async function fetchSessionArtifacts(client: WebRuntimeClient, sessionId: string) {
+  const body = await client.sdk.listSessionArtifacts(sessionId, { limit: 50 });
   return (body.artifacts ?? [])
     .map(artifactFromRuntime)
     .filter((artifact): artifact is ChatArtifactRef => Boolean(artifact));
@@ -218,14 +192,7 @@ function splitThinkingTags(text: string) {
 }
 
 async function readErrorDetail(response: Response) {
-  let detail = messageFromResponseStatus(response);
-  try {
-    const body = (await response.json()) as { detail?: string; error?: string };
-    detail = body.detail ?? body.error ?? detail;
-  } catch {
-    // Preserve HTTP status text when the server returned a non-JSON body.
-  }
-  return detail;
+  return readRuntimeErrorDetail(response);
 }
 
 export async function POST(
@@ -256,27 +223,26 @@ export async function POST(
     return NextResponse.json({ error: 'chat not found' }, { status: 404 });
   }
 
-  const config = await getRuntimeConfig();
-  if (config.mode !== 'live' || !config.apiUrl || !config.accessToken) {
+  let runtime: WebRuntimeClient;
+  try {
+    runtime = await requireRuntimeClient({
+      auth: 'required',
+      operation: 'stream web chat turn',
+    });
+  } catch {
     updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
       content: 'Runtime authentication is required.',
       status: 'failed',
     });
     return NextResponse.json({ error: 'AUTH_REQUIRED' }, { status: 401 });
   }
-  const apiUrl = config.apiUrl;
-  const accessToken = config.accessToken;
 
-  const model = await resolveBackendModelName(config, body.options?.model);
+  const model = await resolveBackendModelName(runtime, body.options?.model);
   const activeSkills = normalizedActiveSkills(body.options?.activeSkills);
   const sessionId = started.sessionId;
   const knownArtifactIds = new Set<string>();
   try {
-    const existingArtifacts = await fetchSessionArtifacts(
-      apiUrl,
-      accessToken,
-      sessionId,
-    );
+    const existingArtifacts = await fetchSessionArtifacts(runtime, sessionId);
     for (const artifact of existingArtifacts) {
       knownArtifactIds.add(artifact.id);
     }
@@ -288,13 +254,11 @@ export async function POST(
     });
     return NextResponse.json({ error: message }, { status: 502 });
   }
-  const backendResponse = await fetch(new URL('/chat/stream', apiUrl).toString(), {
+  const backendResponse = await runtime.fetchResponse(PATH_CHAT_STREAM, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${accessToken}`,
-    },
-    body: JSON.stringify({
+    auth: 'required',
+    operation: 'stream web chat turn',
+    json: {
       message: body.content,
       session_id: sessionId,
       model,
@@ -307,8 +271,7 @@ export async function POST(
           ? { mode: 'adaptive', effort: 'high' }
           : { mode: 'off' },
       },
-    }),
-    cache: 'no-store',
+    },
   });
 
   if (!backendResponse.ok || !backendResponse.body) {
@@ -491,11 +454,8 @@ export async function POST(
         }
 
         if (lastStatus === 'complete') {
-          const artifacts = (await fetchSessionArtifacts(
-            apiUrl,
-            accessToken,
-            sessionId,
-          )).filter((artifact) => !knownArtifactIds.has(artifact.id));
+          const artifacts = (await fetchSessionArtifacts(runtime, sessionId))
+            .filter((artifact) => !knownArtifactIds.has(artifact.id));
           if (artifacts.length > 0) {
             updateStreamingAssistantMessage(ownerUserId, chatId, started.assistantMessage.id, {
               artifacts,

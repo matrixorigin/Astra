@@ -244,6 +244,22 @@ Web UI MVP items:
    download action for the stored artifact bytes. The proxy filters the mixed
    artifact table to user-facing `publish_artifact` rows so restore/debug
    artifacts are not shown as chat attachments.
+10. Web runtime communication boundary: runtime protocol remains REST + SSE +
+    JSON. The Web app now routes server-side runtime calls through
+    `web/lib/runtime-client`, which centralizes API URL resolution, bearer
+    auth, token refresh, JSON parsing, and structured runtime errors. This is
+    step 1 of the JS SDK refactor plan tracked in
+    `WEB-RUNTIME-CLIENT-TODO.md`. The first stabilization pass also moves
+    Web-used runtime path helpers and response DTOs for sessions, transcript,
+    artifacts, models, skills, auth, and chat responses into `@astra/sdk`, with
+    matching Rust ThinClient path helpers where applicable. Shared HTTP helper
+    behavior such as error parsing, header merging, JSON method checks, and JWT
+    subject extraction is also owned by `@astra/sdk`; the Web BFF keeps
+    Next-specific cookie/session behavior local. Stable Web BFF operations now
+    call SDK high-level methods for raw session create/read/list/update,
+    transcript pagination, artifact listing, model listing, skill catalog
+    listing, and non-streaming chat run creation; raw response handling remains
+    local for SSE proxying.
 
 Incremental v1 UI additions:
 

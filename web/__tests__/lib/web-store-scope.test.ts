@@ -13,6 +13,8 @@ function jsonResponse(body: unknown, status = 200) {
     status,
     statusText: status >= 200 && status < 300 ? 'OK' : 'Error',
     json: jest.fn().mockResolvedValue(body),
+    text: jest.fn().mockResolvedValue(JSON.stringify(body)),
+    headers: new Headers({ 'content-type': 'application/json' }),
   };
 }
 

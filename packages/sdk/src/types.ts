@@ -114,6 +114,8 @@ export type UsageEvent = {
 
 export type TurnCompleteEvent = {
   type: 'turn_complete';
+  /** Some runtime paths include final visible assistant text on turn completion. */
+  assistant_text?: string;
   followup_suggestion?: string;
 };
 
@@ -383,7 +385,7 @@ export type AstraClientConfig = {
   pathPrefix?: string;
   accessToken?: string;
   refreshToken?: string;
-  onTokenRefresh?: (tokens: { accessToken: string; refreshToken: string }) => void;
+  onTokenRefresh?: (tokens: { accessToken: string; refreshToken: string }) => void | Promise<void>;
   headers?: Record<string, string>;
 };
 
@@ -448,14 +450,119 @@ export type SessionInfo = {
   agentId?: string | null;
 };
 
+// ─── Runtime wire response DTOs ───────────────────────────────────
+
+export type RuntimeChatResponse = {
+  session_id: string;
+  run_id: string;
+  status: string;
+};
+
+export type RuntimeSessionResponse = {
+  session_id: string;
+  user_id?: string;
+  agent_id?: string | null;
+  title?: string | null;
+  metadata?: Record<string, unknown>;
+  status?: string;
+  event_count?: number;
+  created_at: string;
+  updated_at?: string | null;
+  ended_at?: string | null;
+};
+
+export type RuntimeSessionListResponse = {
+  sessions: RuntimeSessionResponse[];
+  total?: number;
+  limit?: number;
+  offset?: number;
+};
+
+export type RuntimeSessionCreateBody = {
+  agent_id?: string | null;
+  title?: string | null;
+  metadata?: Record<string, unknown>;
+};
+
+export type RuntimeSessionUpdateBody = {
+  title?: string | null;
+  metadata?: Record<string, unknown>;
+  status?: string;
+};
+
+export type RuntimeSessionListParams = {
+  limit?: number;
+  offset?: number;
+};
+
+export type RuntimeTranscriptItemResponse = {
+  session_id: string;
+  item_seq: number;
+  run_id?: string | null;
+  role: string;
+  content: string;
+  reasoning?: string | null;
+  reasoning_status?: string | null;
+  created_at?: string;
+};
+
+export type RuntimeTranscriptResponse = {
+  session_id: string;
+  items: RuntimeTranscriptItemResponse[];
+  next_before_seq?: number | null;
+  has_more?: boolean;
+};
+
+export type RuntimeTranscriptParams = {
+  before_seq?: number;
+  limit?: number;
+};
+
+export type RuntimeModelListItem = {
+  model_id?: string;
+  name?: string;
+  provider?: string;
+  description?: string | null;
+  is_active?: boolean;
+  context_window?: number;
+  max_completion_tokens?: number | null;
+  architecture?: string | null;
+  thinking_capability?: string | Record<string, unknown> | null;
+};
+
+export type RuntimeModelListResponse =
+  | RuntimeModelListItem[]
+  | {
+      items?: RuntimeModelListItem[];
+      models?: RuntimeModelListItem[];
+    };
+
+export type RuntimeArtifactResponse = {
+  artifact_id?: string;
+  artifact_kind?: string;
+  source?: string | null;
+  content?: unknown;
+  metadata?: Record<string, unknown> | null;
+  created_at?: string | null;
+};
+
+export type RuntimeArtifactListResponse = {
+  artifacts?: RuntimeArtifactResponse[];
+};
+
+export type RuntimeArtifactListParams = {
+  limit?: number;
+  offset?: number;
+};
+
 // ─── Auth Types ────────────────────────────────────────────────────
 
 /** Login / refresh token payload (`AuthTokenResponse` on the server). */
 export type AuthResult = {
   access_token: string;
   refresh_token: string;
-  token_type: string;
-  expires_in: number;
+  token_type?: string;
+  expires_in?: number;
   /** Set on `register` (`AuthRegisterResponse`). */
   user_id?: string;
   username?: string;
@@ -494,6 +601,28 @@ export type SkillInfo = {
   name: string;
   description: string;
   status: string;
+};
+
+export type RuntimeSkillListItem = {
+  skill_id?: string;
+  skill_name?: string;
+  version?: string;
+  description?: string | null;
+  source?: string | null;
+  category?: string | null;
+  status?: string | null;
+};
+
+export type RuntimeSkillListResponse = {
+  skills?: RuntimeSkillListItem[];
+  total?: number;
+  limit?: number;
+  offset?: number;
+};
+
+export type RuntimeSkillListParams = {
+  limit?: number;
+  offset?: number;
 };
 
 /** JSON body for `POST /skills` — matches services `RegisterSkillRequest`. */

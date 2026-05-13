@@ -132,6 +132,31 @@ describe('AstraClient — Sessions', () => {
     expect(result.createdAt).toBe('2025-01-01T00:00:00');
   });
 
+  test('createRuntimeSession returns raw runtime payload', async () => {
+    const raw = {
+      session_id: 's1',
+      user_id: 'u1',
+      agent_id: null,
+      title: 'T',
+      status: 'active',
+      event_count: 0,
+      created_at: '2025-01-01T00:00:00',
+      updated_at: '2025-01-01T00:00:00',
+      ended_at: null,
+      metadata: { source: 'web_v1' },
+    };
+    globalThis.fetch = mockFetch(200, raw);
+
+    const result = await createClient().createRuntimeSession({
+      agent_id: null,
+      title: 'T',
+      metadata: { source: 'web_v1' },
+    });
+    expect(result.metadata?.source).toBe('web_v1');
+    const body = JSON.parse((globalThis.fetch as jest.Mock).mock.calls[0][1].body);
+    expect(body.metadata.source).toBe('web_v1');
+  });
+
   test('getSession', async () => {
     const raw = {
       session_id: 's2',
@@ -152,6 +177,24 @@ describe('AstraClient — Sessions', () => {
     expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain('/sessions/s2');
   });
 
+  test('getRuntimeSession returns raw metadata', async () => {
+    globalThis.fetch = mockFetch(200, {
+      session_id: 's2',
+      user_id: 'u1',
+      agent_id: null,
+      title: null,
+      status: 'active',
+      event_count: 1,
+      created_at: '2025-01-01T00:00:00',
+      updated_at: null,
+      ended_at: null,
+      metadata: { current_model: 'm1' },
+    });
+
+    const result = await createClient().getRuntimeSession('s2');
+    expect(result.metadata?.current_model).toBe('m1');
+  });
+
   test('listSessions', async () => {
     globalThis.fetch = mockFetch(200, {
       sessions: [],
@@ -161,6 +204,20 @@ describe('AstraClient — Sessions', () => {
     });
     const result = await createClient().listSessions();
     expect(Array.isArray(result)).toBe(true);
+  });
+
+  test('listRuntimeSessions preserves pagination envelope', async () => {
+    globalThis.fetch = mockFetch(200, {
+      sessions: [],
+      total: 3,
+      limit: 2,
+      offset: 1,
+    });
+    const result = await createClient().listRuntimeSessions({ limit: 2, offset: 1 });
+    expect(result.total).toBe(3);
+    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0] as string;
+    expect(url).toContain('limit=2');
+    expect(url).toContain('offset=1');
   });
 
   test('deleteSession', async () => {
@@ -355,6 +412,47 @@ describe('AstraClient — Session lifecycle and reflect', () => {
     expect(call[0]).toContain('/sessions/sx');
   });
 
+  test('updateRuntimeSession returns raw runtime payload', async () => {
+    globalThis.fetch = mockFetch(200, {
+      ...sessWire,
+      status: 'archived',
+      metadata: { current_model: 'm2' },
+    });
+    const result = await createClient().updateRuntimeSession('sx', {
+      status: 'archived',
+      metadata: { current_model: 'm2' },
+    });
+    expect(result.status).toBe('archived');
+    expect(result.metadata?.current_model).toBe('m2');
+    const body = JSON.parse((globalThis.fetch as jest.Mock).mock.calls[0][1].body);
+    expect(body.status).toBe('archived');
+  });
+
+  test('getSessionTranscript builds transcript query', async () => {
+    globalThis.fetch = mockFetch(200, {
+      session_id: 'sx',
+      items: [],
+      next_before_seq: null,
+      has_more: false,
+    });
+    const result = await createClient().getSessionTranscript('sx', { before_seq: 10, limit: 5 });
+    expect(result.items).toEqual([]);
+    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0] as string;
+    expect(url).toContain('/sessions/sx/transcript');
+    expect(url).toContain('before_seq=10');
+    expect(url).toContain('limit=5');
+  });
+
+  test('listSessionArtifacts builds artifacts query', async () => {
+    globalThis.fetch = mockFetch(200, { artifacts: [] });
+    const result = await createClient().listSessionArtifacts('sx', { limit: 50, offset: 5 });
+    expect(result.artifacts).toEqual([]);
+    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0] as string;
+    expect(url).toContain('/sessions/sx/artifacts');
+    expect(url).toContain('limit=50');
+    expect(url).toContain('offset=5');
+  });
+
   test('closeSession', async () => {
     globalThis.fetch = mockFetch(200, sessWire);
     await createClient().closeSession('sx');
@@ -484,6 +582,29 @@ describe('AstraClient — Memory', () => {
 
 // ─── Skills ─────────────────────────────────────────────────────────
 
+describe('AstraClient — Models', () => {
+  test('listModels accepts array payloads', async () => {
+    globalThis.fetch = mockFetch(200, [
+      { name: 'm1', provider: 'p1', is_active: true },
+      null,
+    ]);
+
+    const result = await createClient().listModels();
+    expect(result).toHaveLength(1);
+    expect(result[0].name).toBe('m1');
+    expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain('/models');
+  });
+
+  test('listModels accepts envelope payloads', async () => {
+    globalThis.fetch = mockFetch(200, {
+      models: [{ model_id: 'm2', provider: 'p2' }],
+    });
+
+    const result = await createClient().listModels();
+    expect(result[0].model_id).toBe('m2');
+  });
+});
+
 describe('AstraClient — Skills', () => {
   test('listSkills', async () => {
     globalThis.fetch = mockFetch(200, {
@@ -505,6 +626,33 @@ describe('AstraClient — Skills', () => {
     expect(result[0].id).toBe('id1');
     expect(result[0].name).toBe('bash');
     expect((globalThis.fetch as jest.Mock).mock.calls[0][0]).toContain('/skills');
+  });
+
+  test('listRuntimeSkills preserves pagination envelope', async () => {
+    globalThis.fetch = mockFetch(200, {
+      skills: [
+        {
+          skill_id: 'id2',
+          skill_name: 'web-search',
+          version: '2',
+          description: 'Search the web',
+          source: 'database',
+          category: 'research',
+          status: 'published',
+        },
+      ],
+      total: 11,
+      limit: 1,
+      offset: 10,
+    });
+
+    const result = await createClient().listRuntimeSkills({ limit: 1, offset: 10 });
+    expect(result.total).toBe(11);
+    expect(result.skills?.[0]?.source).toBe('database');
+    const url = (globalThis.fetch as jest.Mock).mock.calls[0][0] as string;
+    expect(url).toContain('/skills');
+    expect(url).toContain('limit=1');
+    expect(url).toContain('offset=10');
   });
 });
 

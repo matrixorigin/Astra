@@ -21,6 +21,20 @@ import type {
   PublishSkillBody,
   RunListResponse,
   RunStatus,
+  RuntimeChatResponse,
+  RuntimeArtifactListParams,
+  RuntimeArtifactListResponse,
+  RuntimeModelListItem,
+  RuntimeModelListResponse,
+  RuntimeSessionCreateBody,
+  RuntimeSessionListParams,
+  RuntimeSkillListResponse,
+  RuntimeSkillListParams,
+  RuntimeSessionListResponse,
+  RuntimeSessionResponse,
+  RuntimeSessionUpdateBody,
+  RuntimeTranscriptParams,
+  RuntimeTranscriptResponse,
   SessionActivityResponse,
   SessionAuditSummary,
   SessionInfo,
@@ -51,6 +65,7 @@ import {
   PATH_MEMORY_RETRIEVE,
   PATH_MEMORY_SEARCH,
   PATH_MEMORY_STORE,
+  PATH_MODELS,
   PATH_RUNS,
   PATH_SESSIONS,
   PATH_SKILLS,
@@ -71,11 +86,13 @@ import {
   eventsSessionPath,
   joinApiPath,
   sessionActivityPath,
+  sessionArtifactsPath,
   sessionAuditSummaryPath,
   sessionCancelPath,
   sessionClosePath,
   sessionPath,
   sessionResumePath,
+  sessionTranscriptPath,
   skillPath,
   skillUnpublishPath,
   taskLeaseClaimPath,
@@ -84,61 +101,10 @@ import {
   taskLeaseRenewPath,
 } from './paths';
 import { SSEClient, parseSseDataEvents } from './sse-client';
+import { headersInitToRecord, readAstraErrorDetail } from './http';
 
-/** `Headers` or undici/VM instances where `instanceof Headers` is unreliable. */
-function isWebHeadersObject(h: unknown): h is Headers {
-  if (h == null || typeof h !== 'object' || Array.isArray(h)) return false;
-  if (h instanceof Headers) return true;
-  return (
-    'append' in h &&
-    'forEach' in h &&
-    typeof (h as Headers).forEach === 'function' &&
-    typeof (h as Headers).append === 'function'
-  );
-}
-
-/** Merge `RequestInit.headers` into a plain record (handles `Headers` and `[string, string][]`). */
-function mergeHeadersInit(
-  base: Record<string, string>,
-  initHeaders?: HeadersInit,
-): Record<string, string> {
-  if (initHeaders == null) return { ...base };
-  if (Array.isArray(initHeaders)) {
-    const out = { ...base };
-    for (const [k, v] of initHeaders) {
-      out[k] = v;
-    }
-    return out;
-  }
-  if (isWebHeadersObject(initHeaders)) {
-    const out = { ...base };
-    initHeaders.forEach((value, key) => {
-      out[key] = value;
-    });
-    return out;
-  }
-  return { ...base, ...(initHeaders as Record<string, string>) };
-}
-
-type SessionWire = {
-  session_id: string;
-  user_id?: string;
-  agent_id?: string | null;
-  title?: string | null;
-  status?: string;
-  event_count?: number;
-  created_at: string;
-  updated_at?: string | null;
-  ended_at?: string | null;
-  metadata?: Record<string, unknown>;
-};
-
-type SessionListWire = {
-  sessions: SessionWire[];
-  total: number;
-  limit: number;
-  offset: number;
-};
+type SessionWire = RuntimeSessionResponse;
+type SessionListWire = RuntimeSessionListResponse;
 
 type RunStatusWire = {
   run_id: string;
@@ -155,26 +121,7 @@ type RunListWire = {
   offset: number;
 };
 
-type ChatResponseWire = {
-  session_id: string;
-  run_id: string;
-  status: string;
-};
-
-type SkillListItemWire = {
-  skill_id: string;
-  skill_name: string;
-  version: string;
-  description?: string | null;
-  status?: string | null;
-};
-
-type SkillListWire = {
-  skills: SkillListItemWire[];
-  total: number;
-  limit: number;
-  offset: number;
-};
+type ChatResponseWire = RuntimeChatResponse;
 
 function normalizeSession(w: SessionWire): SessionInfo {
   return {
@@ -337,7 +284,7 @@ export class AstraClient {
       const data = (await res.json()) as AuthResult;
       this.accessToken = data.access_token;
       this.refreshTokenValue = data.refresh_token;
-      this.config.onTokenRefresh?.({
+      await this.config.onTokenRefresh?.({
         accessToken: data.access_token,
         refreshToken: data.refresh_token,
       });
@@ -371,7 +318,7 @@ export class AstraClient {
     const url = this.apiPath(path);
     let res = await fetch(url, {
       ...init,
-      headers: mergeHeadersInit(this.buildHeaders(init), init?.headers),
+      headers: headersInitToRecord(this.buildHeaders(init), init?.headers),
     });
 
     if (res.status === 401) {
@@ -379,13 +326,13 @@ export class AstraClient {
       if (refreshed) {
         res = await fetch(url, {
           ...init,
-          headers: mergeHeadersInit(this.buildHeaders(init), init?.headers),
+          headers: headersInitToRecord(this.buildHeaders(init), init?.headers),
         });
       }
     }
 
     if (!res.ok) {
-      const body = await res.text().catch(() => '');
+      const body = await readAstraErrorDetail(res);
       throw new AstraApiError(res.status, body, path);
     }
 
@@ -407,15 +354,17 @@ export class AstraClient {
     }
   }
 
-  async post<T>(path: string, body?: unknown): Promise<T> {
+  async post<T>(path: string, body?: unknown, init?: RequestInit): Promise<T> {
     return this.fetch<T>(path, {
+      ...init,
       method: 'POST',
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   }
 
-  async put<T>(path: string, body?: unknown): Promise<T> {
+  async put<T>(path: string, body?: unknown, init?: RequestInit): Promise<T> {
     return this.fetch<T>(path, {
+      ...init,
       method: 'PUT',
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
@@ -436,14 +385,33 @@ export class AstraClient {
     return normalizeSession(raw);
   }
 
+  /** Raw runtime session creation for clients that need metadata/status fields. */
+  async createRuntimeSession(body: RuntimeSessionCreateBody = {}): Promise<RuntimeSessionResponse> {
+    return this.post<RuntimeSessionResponse>(PATH_SESSIONS, body);
+  }
+
   async getSession(sessionId: string): Promise<SessionInfo> {
     const raw = await this.fetch<SessionWire>(sessionPath(sessionId));
     return normalizeSession(raw);
   }
 
+  /** Raw runtime session read for clients that need metadata/status fields. */
+  async getRuntimeSession(sessionId: string): Promise<RuntimeSessionResponse> {
+    return this.fetch<RuntimeSessionResponse>(sessionPath(sessionId));
+  }
+
   async listSessions(): Promise<SessionInfo[]> {
     const raw = await this.fetch<SessionListWire>(PATH_SESSIONS);
     return raw.sessions.map(normalizeSession);
+  }
+
+  /** Raw runtime session list for clients that need pagination and metadata. */
+  async listRuntimeSessions(params: RuntimeSessionListParams = {}): Promise<RuntimeSessionListResponse> {
+    const q = buildQueryString({
+      ...(params.limit !== undefined ? { limit: params.limit } : {}),
+      ...(params.offset !== undefined ? { offset: params.offset } : {}),
+    });
+    return this.fetch<RuntimeSessionListResponse>(`${PATH_SESSIONS}${q}`);
   }
 
   async deleteSession(sessionId: string): Promise<void> {
@@ -463,6 +431,36 @@ export class AstraClient {
     if (body.status !== undefined) wire.status = body.status;
     const raw = await this.put<SessionWire>(sessionPath(sessionId), wire);
     return normalizeSession(raw);
+  }
+
+  /** Raw runtime session update for clients that need metadata/status fields. */
+  async updateRuntimeSession(
+    sessionId: string,
+    body: RuntimeSessionUpdateBody,
+  ): Promise<RuntimeSessionResponse> {
+    return this.put<RuntimeSessionResponse>(sessionPath(sessionId), body);
+  }
+
+  async getSessionTranscript(
+    sessionId: string,
+    params: RuntimeTranscriptParams = {},
+  ): Promise<RuntimeTranscriptResponse> {
+    const q = buildQueryString({
+      ...(params.before_seq !== undefined ? { before_seq: params.before_seq } : {}),
+      ...(params.limit !== undefined ? { limit: params.limit } : {}),
+    });
+    return this.fetch<RuntimeTranscriptResponse>(`${sessionTranscriptPath(sessionId)}${q}`);
+  }
+
+  async listSessionArtifacts(
+    sessionId: string,
+    params: RuntimeArtifactListParams = {},
+  ): Promise<RuntimeArtifactListResponse> {
+    const q = buildQueryString({
+      ...(params.limit !== undefined ? { limit: params.limit } : {}),
+      ...(params.offset !== undefined ? { offset: params.offset } : {}),
+    });
+    return this.fetch<RuntimeArtifactListResponse>(`${sessionArtifactsPath(sessionId)}${q}`);
   }
 
   /** `POST /sessions/{id}/close` */
@@ -565,8 +563,8 @@ export class AstraClient {
   // ─── Runs ──────────────────────────────────────────────────────────
 
   /** Non-streaming chat turn — `POST /chat`. */
-  async createRun(request: ChatRequest): Promise<RunStatus> {
-    const raw = await this.post<ChatResponseWire>(PATH_CHAT, chatRequestToWire(request));
+  async createRun(request: ChatRequest, init?: RequestInit): Promise<RunStatus> {
+    const raw = await this.post<ChatResponseWire>(PATH_CHAT, chatRequestToWire(request), init);
     return {
       runId: raw.run_id,
       sessionId: raw.session_id,
@@ -612,7 +610,7 @@ export class AstraClient {
     }
 
     if (!res.ok) {
-      const body = await res.text().catch(() => '');
+      const body = await readAstraErrorDetail(res);
       throw new AstraApiError(res.status, body, path);
     }
 
@@ -668,16 +666,40 @@ export class AstraClient {
     await this.post(PATH_MEMORY_PURGE, { topic });
   }
 
+  // ─── Models ─────────────────────────────────────────────────────────
+
+  async listModels(): Promise<RuntimeModelListItem[]> {
+    const payload = await this.fetch<RuntimeModelListResponse>(PATH_MODELS);
+    if (Array.isArray(payload)) {
+      return payload.filter((model): model is RuntimeModelListItem => (
+        Boolean(model) && typeof model === 'object'
+      ));
+    }
+    const items = payload.items ?? payload.models ?? [];
+    return items.filter((model): model is RuntimeModelListItem => (
+      Boolean(model) && typeof model === 'object'
+    ));
+  }
+
   // ─── Skills ─────────────────────────────────────────────────────────
 
+  /** Raw runtime skill catalog list for clients that need pagination/source/category metadata. */
+  async listRuntimeSkills(params: RuntimeSkillListParams = {}): Promise<RuntimeSkillListResponse> {
+    const q = buildQueryString({
+      ...(params.limit !== undefined ? { limit: params.limit } : {}),
+      ...(params.offset !== undefined ? { offset: params.offset } : {}),
+    });
+    return this.fetch<RuntimeSkillListResponse>(`${PATH_SKILLS}${q}`);
+  }
+
   async listSkills(): Promise<SkillInfo[]> {
-    const raw = await this.fetch<SkillListWire>(PATH_SKILLS);
-    return raw.skills.map((s) => ({
-      id: s.skill_id,
-      name: s.skill_name,
+    const raw = await this.listRuntimeSkills();
+    return (raw.skills ?? []).map((s) => ({
+      id: s.skill_id ?? s.skill_name ?? '',
+      name: s.skill_name ?? s.skill_id ?? '',
       description: s.description ?? '',
       status: s.status ?? s.version ?? '',
-    }));
+    })).filter((s) => s.name.length > 0);
   }
 
   /** `POST /skills` — register a skill draft (returns `SkillRecord`, HTTP 201). */

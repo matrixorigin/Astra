@@ -1,24 +1,8 @@
 import { requestJson, toQuery } from '@/lib/api/request';
 import type { SkillListResponse, SkillSummary } from '@/lib/api/types';
+import type { RuntimeSkillListItem, RuntimeSkillListResponse } from '@astra/sdk';
 
-type BackendSkill = {
-  skill_id?: string;
-  skill_name?: string;
-  version?: string;
-  description?: string | null;
-  source?: string | null;
-  category?: string | null;
-  status?: string | null;
-};
-
-type BackendSkillListResponse = {
-  skills?: BackendSkill[];
-  total?: number;
-  limit?: number;
-  offset?: number;
-};
-
-function toSkillSummary(skill: BackendSkill): SkillSummary | null {
+function toSkillSummary(skill: RuntimeSkillListItem): SkillSummary | null {
   const name = skill.skill_name?.trim();
   if (!name) {
     return null;
@@ -36,8 +20,8 @@ function toSkillSummary(skill: BackendSkill): SkillSummary | null {
 }
 
 export async function listSkills(params: { limit?: number; offset?: number } = {}) {
-  const payload = await requestJson<BackendSkillListResponse>(
-    `/api/backend/skills${toQuery({
+  const payload = await requestJson<RuntimeSkillListResponse>(
+    `/api/skills${toQuery({
       limit: params.limit ?? 100,
       offset: params.offset ?? 0,
     })}`,

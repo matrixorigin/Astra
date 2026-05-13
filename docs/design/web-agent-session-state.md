@@ -1003,6 +1003,25 @@ only differ in credential storage: CLI writes the selected profile in
 a token-producing operation for both clients, so neither CLI nor Web should
 perform a second login after a successful register response.
 
+Client protocol libraries are implementation details over the same runtime
+contract. The contract remains REST + SSE + JSON. CLI uses the Rust
+`astra_thin_client`; Web uses a Next.js BFF plus the internal
+`web/lib/runtime-client` boundary for API URL resolution, bearer auth, token
+refresh, JSON parsing, and runtime error context. The planned JS SDK is the
+TypeScript client for this contract, not a replacement for the protocol, and it
+must not make CLI depend on JavaScript. Public runtime paths and Web-used wire
+response DTOs, including session, transcript, artifact, model, skill, auth, and
+chat-run payloads, are owned by `@astra/sdk` and mirrored in the Rust ThinClient
+where applicable; the Web app should import those contracts instead of
+redeclaring backend payload shapes. Shared HTTP helper behavior such as error
+body parsing, header merging, JSON-capable method checks, and JWT subject
+extraction also lives in `@astra/sdk`; the Web BFF should keep only
+Next-specific cookie/session behavior locally. Web server routes should prefer
+SDK high-level methods for stable operations such as raw session
+create/read/list/update, transcript pagination, artifact listing, model listing,
+skill catalog listing, and non-streaming chat run creation. Direct raw response handling remains
+appropriate where the BFF must proxy an open SSE stream.
+
 Shared LLM turn flow:
 
 ```text

@@ -1,4 +1,22 @@
-import { getRuntimeConfig, type RuntimeConfig } from '@/lib/runtime-config';
+import type { RuntimeConfig } from '@/lib/runtime-config';
+import {
+  buildQueryString,
+  chatRunStreamPath,
+  parseSseDataEvents,
+  type RuntimeSessionListResponse,
+  type RuntimeSessionResponse,
+  type RuntimeTranscriptItemResponse,
+  type RuntimeTranscriptResponse,
+  type StreamEvent,
+} from '@astra/sdk';
+import {
+  RuntimeClientError,
+  WebRuntimeClient,
+  getRuntimeClient,
+  readRuntimeErrorDetail,
+  requireRuntimeClient,
+  runtimeErrorDetail,
+} from '@/lib/runtime-client';
 import type {
   ChatDetail,
   ChatListResponse,
@@ -39,52 +57,6 @@ const AGENT_RESPONSE_TIMEOUT_MS = 30_000;
 const AGENT_STREAM_TIMEOUT_MS = 180_000;
 const LEGACY_LOCAL_CHAT_IDS = new Set(['chat-web-agent-notes']);
 
-type BackendChatResponse = {
-  session_id?: string;
-  run_id?: string;
-  status?: string;
-};
-
-type BackendSessionResponse = {
-  session_id?: string;
-  user_id?: string;
-  title?: string | null;
-  metadata?: Record<string, unknown>;
-  status?: string;
-  created_at?: string;
-  updated_at?: string | null;
-};
-
-type BackendSessionListResponse = {
-  sessions?: BackendSessionResponse[];
-  total?: number;
-  limit?: number;
-  offset?: number;
-};
-
-type BackendTranscriptItemResponse = {
-  session_id?: string;
-  item_seq?: number;
-  run_id?: string | null;
-  role?: string;
-  content?: string;
-  reasoning?: string | null;
-  reasoning_status?: string | null;
-  created_at?: string;
-};
-
-type BackendTranscriptResponse = {
-  session_id?: string;
-  items?: BackendTranscriptItemResponse[];
-  next_before_seq?: number | null;
-  has_more?: boolean;
-};
-
-type BackendModelListItem = {
-  model_id?: string;
-  name?: string;
-};
-
 type StreamResult = {
   assistantText: string;
   error?: string;
@@ -92,15 +64,8 @@ type StreamResult = {
   nextOffset?: number;
 };
 
-class RuntimeHttpError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-    readonly statusText: string,
-  ) {
-    super(message);
-    this.name = 'RuntimeHttpError';
-  }
+function runtimeOperationError(operation: string, error: unknown) {
+  return new Error(`${operation}: ${runtimeErrorDetail(error)}`);
 }
 
 declare global {
@@ -797,11 +762,11 @@ function metadataString(metadata: Record<string, unknown> | undefined, key: stri
   return typeof value === 'string' && value.trim() ? value : null;
 }
 
-function isWebSession(session: BackendSessionResponse): boolean {
+function isWebSession(session: RuntimeSessionResponse): boolean {
   return metadataString(session.metadata, 'source') === 'web_v1';
 }
 
-function chatRecordFromBackendSession(session: BackendSessionResponse, existing?: ChatRecord): ChatRecord | null {
+function chatRecordFromBackendSession(session: RuntimeSessionResponse, existing?: ChatRecord): ChatRecord | null {
   if (!session.session_id || !isWebSession(session)) {
     return null;
   }
@@ -831,34 +796,24 @@ function chatRecordFromBackendSession(session: BackendSessionResponse, existing?
 }
 
 async function syncBackendSessions(ownerUserId: string): Promise<void> {
-  const config = await getRuntimeConfig();
-  if (config.mode !== 'live' || !config.apiUrl || !config.accessToken) {
+  const client = await getRuntimeClient({
+    auth: 'required',
+    operation: `sync persisted sessions for user ${ownerUserId}`,
+  });
+  if (!client) {
     return;
   }
 
   const limit = 200;
-  const url = new URL('/sessions', config.apiUrl);
-  url.searchParams.set('limit', String(limit));
-  url.searchParams.set('offset', '0');
-
-  const response = await fetch(url.toString(), {
-    headers: {
-      Authorization: `Bearer ${config.accessToken}`,
-    },
-    cache: 'no-store',
-  });
-  if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`;
-    try {
-      const body = (await response.json()) as { detail?: string; error?: string };
-      detail = body.detail ?? body.error ?? detail;
-    } catch {
-      // Preserve the HTTP status.
-    }
-    throw new Error(`Cannot sync persisted sessions for user ${ownerUserId}: ${detail}`);
+  let parsed: RuntimeSessionListResponse;
+  try {
+    parsed = await client.sdk.listRuntimeSessions({ limit, offset: 0 });
+  } catch (error) {
+    throw runtimeOperationError(
+      `Cannot sync persisted sessions for user ${ownerUserId}`,
+      error,
+    );
   }
-
-  const parsed = (await response.json()) as BackendSessionListResponse;
   const sessions = Array.isArray(parsed.sessions) ? parsed.sessions : [];
   const store = getStore(ownerUserId);
   const byId = new Map(store.chats.map((chat) => [chat.id, chat]));
@@ -880,7 +835,7 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
   store.chats.sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt));
 }
 
-function transcriptItemToMessage(chatId: string, item: BackendTranscriptItemResponse): ChatMessage | null {
+function transcriptItemToMessage(chatId: string, item: RuntimeTranscriptItemResponse): ChatMessage | null {
   if (
     typeof item.item_seq !== 'number' ||
     typeof item.role !== 'string' ||
@@ -916,31 +871,23 @@ async function syncBackendTranscript(ownerUserId: string, chatId: string): Promi
     return;
   }
 
-  const config = await getRuntimeConfig();
-  if (config.mode !== 'live' || !config.apiUrl || !config.accessToken) {
+  const client = await getRuntimeClient({
+    auth: 'required',
+    operation: `sync persisted transcript for session ${chatId}`,
+  });
+  if (!client) {
     return;
   }
 
-  const url = new URL(`/sessions/${encodeURIComponent(chatId)}/transcript`, config.apiUrl);
-  url.searchParams.set('limit', '200');
-  const response = await fetch(url.toString(), {
-    headers: {
-      Authorization: `Bearer ${config.accessToken}`,
-    },
-    cache: 'no-store',
-  });
-  if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`;
-    try {
-      const body = (await response.json()) as { detail?: string; error?: string };
-      detail = body.detail ?? body.error ?? detail;
-    } catch {
-      // Preserve the HTTP status.
-    }
-    throw new Error(`Cannot sync persisted transcript for session ${chatId}: ${detail}`);
+  let parsed: RuntimeTranscriptResponse;
+  try {
+    parsed = await client.sdk.getSessionTranscript(chatId, { limit: 200 });
+  } catch (error) {
+    throw runtimeOperationError(
+      `Cannot sync persisted transcript for session ${chatId}`,
+      error,
+    );
   }
-
-  const parsed = (await response.json()) as BackendTranscriptResponse;
   const messages = (parsed.items ?? [])
     .map((item) => transcriptItemToMessage(chatId, item))
     .filter((message): message is ChatMessage => Boolean(message));
@@ -958,48 +905,25 @@ async function createBackendSession(params: {
   projectId: string | null;
   model: string;
 }): Promise<{ sessionId: string }> {
-  const config = await getRuntimeConfig();
-  if (config.mode !== 'live' || !config.apiUrl) {
-    throw new Error('Cannot create persisted session: runtime API is not configured.');
-  }
-  if (!config.accessToken) {
-    throw new Error('Cannot create persisted session: runtime authentication is missing.');
-  }
-
-  const response = await fetch(
-    new URL('/sessions', config.apiUrl).toString(),
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${config.accessToken}`,
+  const client = await requireRuntimeClient({
+    auth: 'required',
+    operation: 'create persisted session',
+  });
+  let parsed: RuntimeSessionResponse;
+  try {
+    parsed = await client.sdk.createRuntimeSession({
+      agent_id: null,
+      title: params.title,
+      metadata: {
+        source: 'web_v1',
+        project_id: params.projectId,
+        initial_model: params.model,
+        current_model: params.model,
       },
-      body: JSON.stringify({
-        agent_id: null,
-        title: params.title,
-        metadata: {
-          source: 'web_v1',
-          project_id: params.projectId,
-          initial_model: params.model,
-          current_model: params.model,
-        },
-      }),
-      cache: 'no-store',
-    },
-  );
-
-  if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`;
-    try {
-      const body = (await response.json()) as { detail?: string; error?: string };
-      detail = body.detail ?? body.error ?? detail;
-    } catch {
-      // Preserve the HTTP status.
-    }
-    throw new Error(`Cannot create persisted session: ${detail}`);
+    });
+  } catch (error) {
+    throw runtimeOperationError('Cannot create persisted session', error);
   }
-
-  const parsed = (await response.json()) as BackendSessionResponse;
   if (!parsed.session_id) {
     throw new Error('Cannot create persisted session: runtime response did not include session_id.');
   }
@@ -1008,34 +932,14 @@ async function createBackendSession(params: {
 }
 
 async function deleteBackendSession(chat: ChatRecord): Promise<void> {
-  const config = await getRuntimeConfig();
-  if (config.mode !== 'live' || !config.apiUrl) {
-    throw new Error('Cannot delete persisted session: runtime API is not configured.');
-  }
-  if (!config.accessToken) {
-    throw new Error('Cannot delete persisted session: runtime authentication is missing.');
-  }
-
-  const response = await fetch(
-    new URL(`/sessions/${encodeURIComponent(chat.id)}`, config.apiUrl).toString(),
-    {
-      method: 'DELETE',
-      headers: {
-        Authorization: `Bearer ${config.accessToken}`,
-      },
-      cache: 'no-store',
-    },
-  );
-
-  if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`;
-    try {
-      const body = (await response.json()) as { detail?: string; error?: string };
-      detail = body.detail ?? body.error ?? detail;
-    } catch {
-      // Preserve the HTTP status.
-    }
-    throw new Error(`Cannot delete persisted session ${chat.id}: ${detail}`);
+  const client = await requireRuntimeClient({
+    auth: 'required',
+    operation: `delete persisted session ${chat.id}`,
+  });
+  try {
+    await client.sdk.deleteSession(chat.id);
+  } catch (error) {
+    throw runtimeOperationError(`Cannot delete persisted session ${chat.id}`, error);
   }
 }
 
@@ -1043,36 +947,14 @@ async function updateBackendSessionArchive(
   chat: ChatRecord,
   archived: boolean,
 ): Promise<void> {
-  const config = await getRuntimeConfig();
-  if (config.mode !== 'live' || !config.apiUrl) {
-    throw new Error('Cannot archive persisted session: runtime API is not configured.');
-  }
-  if (!config.accessToken) {
-    throw new Error('Cannot archive persisted session: runtime authentication is missing.');
-  }
-
-  const response = await fetch(
-    new URL(`/sessions/${encodeURIComponent(chat.id)}`, config.apiUrl).toString(),
-    {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${config.accessToken}`,
-      },
-      body: JSON.stringify({ status: archived ? 'archived' : 'active' }),
-      cache: 'no-store',
-    },
-  );
-
-  if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`;
-    try {
-      const body = (await response.json()) as { detail?: string; error?: string };
-      detail = body.detail ?? body.error ?? detail;
-    } catch {
-      // Preserve the HTTP status.
-    }
-    throw new Error(`Cannot update persisted session ${chat.id}: ${detail}`);
+  const client = await requireRuntimeClient({
+    auth: 'required',
+    operation: `update persisted session ${chat.id} archive state`,
+  });
+  try {
+    await client.sdk.updateRuntimeSession(chat.id, { status: archived ? 'archived' : 'active' });
+  } catch (error) {
+    throw runtimeOperationError(`Cannot update persisted session ${chat.id}`, error);
   }
 }
 
@@ -1080,58 +962,29 @@ async function updateBackendSessionModel(
   chat: ChatRecord,
   model: string,
 ): Promise<void> {
-  const config = await getRuntimeConfig();
-  if (config.mode !== 'live' || !config.apiUrl) {
-    throw new Error('Cannot update persisted session model: runtime API is not configured.');
-  }
-  if (!config.accessToken) {
-    throw new Error('Cannot update persisted session model: runtime authentication is missing.');
-  }
-
-  const sessionUrl = new URL(`/sessions/${encodeURIComponent(chat.id)}`, config.apiUrl).toString();
-  const current = await fetch(sessionUrl, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${config.accessToken}`,
-    },
-    cache: 'no-store',
+  const client = await requireRuntimeClient({
+    auth: 'required',
+    operation: `update persisted session ${chat.id} model`,
   });
-  if (!current.ok) {
-    let detail = `${current.status} ${current.statusText}`;
-    try {
-      const body = (await current.json()) as { detail?: string; error?: string };
-      detail = body.detail ?? body.error ?? detail;
-    } catch {
-      // Preserve the HTTP status.
-    }
-    throw new Error(`Cannot read persisted session ${chat.id} before model update: ${detail}`);
+  let parsed: RuntimeSessionResponse;
+  try {
+    parsed = await client.sdk.getRuntimeSession(chat.id);
+  } catch (error) {
+    throw runtimeOperationError(
+      `Cannot read persisted session ${chat.id} before model update`,
+      error,
+    );
   }
 
-  const parsed = (await current.json()) as BackendSessionResponse;
   const metadata = {
     ...(parsed.metadata ?? {}),
     current_model: model,
   };
 
-  const response = await fetch(sessionUrl, {
-    method: 'PUT',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.accessToken}`,
-    },
-    body: JSON.stringify({ metadata }),
-    cache: 'no-store',
-  });
-
-  if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`;
-    try {
-      const body = (await response.json()) as { detail?: string; error?: string };
-      detail = body.detail ?? body.error ?? detail;
-    } catch {
-      // Preserve the HTTP status.
-    }
-    throw new Error(`Cannot update persisted session ${chat.id} model: ${detail}`);
+  try {
+    await client.sdk.updateRuntimeSession(chat.id, { metadata });
+  } catch (error) {
+    throw runtimeOperationError(`Cannot update persisted session ${chat.id} model`, error);
   }
 }
 
@@ -1205,54 +1058,37 @@ async function callBackendAgent(params: {
   const timeout = setTimeout(() => controller.abort(), AGENT_RESPONSE_TIMEOUT_MS);
 
   try {
-    const config = await getRuntimeConfig();
-    if (config.mode !== 'live' || !config.apiUrl) {
-      throw new Error(config.message);
-    }
-    const model = await resolveBackendModelName(config, params.model);
+    const client = await requireRuntimeClient({
+      auth: 'optional',
+      operation: 'start web chat turn',
+    });
+    const model = await resolveBackendModelName(client, params.model);
     const activeSkills = normalizedActiveSkills(params.activeSkills);
 
-    const response = await fetch(new URL('/chat', config.apiUrl).toString(), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(config.accessToken ? { Authorization: `Bearer ${config.accessToken}` } : {}),
-      },
-      body: JSON.stringify({
+    const run = await client.sdk.createRun(
+      {
         message: params.text,
-        session_id: params.sessionId,
+        sessionId: params.sessionId,
         model,
-        allow_skills: activeSkills.length ? activeSkills : undefined,
+        allowSkills: activeSkills.length ? activeSkills : undefined,
         context: {
           source: 'web_v1',
           edge_profile: activeSkills.length ? { active_skills: activeSkills } : undefined,
         },
-      }),
-      cache: 'no-store',
-      signal: controller.signal,
-    });
-
-    if (!response.ok) {
-      let detail = `${response.status} ${response.statusText}`;
-      try {
-        const body = (await response.json()) as { detail?: string; error?: string };
-        detail = body.detail ?? body.error ?? detail;
-      } catch {
-        // Preserve status text when the server returns a non-JSON error body.
-      }
-      throw new RuntimeHttpError(detail, response.status, response.statusText);
-    }
-
-    const parsed = (await response.json()) as BackendChatResponse;
-    if (parsed.run_id) {
-      const streamed = await readRunStream(config, parsed.run_id);
+      },
+      {
+        signal: controller.signal,
+      },
+    );
+    if (run.runId) {
+      const streamed = await readRunStream(client, run.runId);
       if (streamed.error) {
         throw new Error(streamed.error);
       }
       if (streamed.assistantText.trim()) {
         return {
           ok: true,
-          sessionId: parsed.session_id,
+          sessionId: run.sessionId,
           assistantText: streamed.assistantText.trim(),
         };
       }
@@ -1260,9 +1096,9 @@ async function callBackendAgent(params: {
 
     return {
       ok: true,
-      sessionId: parsed.session_id,
+      sessionId: run.sessionId,
       assistantText:
-        parsed.run_id
+        run.runId
           ? 'Astra completed the run without returning visible text.'
           : 'The run was accepted by Astra.',
     };
@@ -1270,10 +1106,8 @@ async function callBackendAgent(params: {
     const message =
       error instanceof Error && error.name === 'AbortError'
         ? `timed out after ${AGENT_RESPONSE_TIMEOUT_MS / 1000}s`
-        : error instanceof Error
-          ? error.message
-          : 'unknown error';
-    const prefix = error instanceof RuntimeHttpError
+        : runtimeErrorDetail(error, 'unknown error');
+    const prefix = error instanceof RuntimeClientError
       ? 'Astra runtime rejected the request'
       : 'I could not reach the Astra runtime from the web UI';
     return {
@@ -1285,11 +1119,7 @@ async function callBackendAgent(params: {
   }
 }
 
-async function readRunStream(config: RuntimeConfig, runId: string): Promise<StreamResult> {
-  if (!config.apiUrl || !config.accessToken) {
-    return { assistantText: '', error: 'Missing runtime authentication' };
-  }
-
+async function readRunStream(client: WebRuntimeClient, runId: string): Promise<StreamResult> {
   const startedAt = Date.now();
   let nextOffset = 0;
   let assistantText = '';
@@ -1300,29 +1130,17 @@ async function readRunStream(config: RuntimeConfig, runId: string): Promise<Stre
     const timeout = setTimeout(() => controller.abort(), remainingMs);
 
     try {
-      const response = await fetch(
-        new URL(
-          `/chat/runs/${encodeURIComponent(runId)}/stream?last_index=${nextOffset}`,
-          config.apiUrl,
-        ).toString(),
+      const response = await client.fetchResponse(
+        `${chatRunStreamPath(runId)}${buildQueryString({ last_index: nextOffset })}`,
         {
-          headers: {
-            Authorization: `Bearer ${config.accessToken}`,
-          },
-          cache: 'no-store',
+          auth: 'required',
+          operation: `stream run ${runId}`,
           signal: controller.signal,
         },
       );
 
       if (!response.ok) {
-        let detail = `${response.status} ${response.statusText}`;
-        try {
-          const body = (await response.json()) as { detail?: string; error?: string };
-          detail = body.detail ?? body.error ?? detail;
-        } catch {
-          // Preserve status text when body is not JSON.
-        }
-        return { assistantText, error: detail };
+        return { assistantText, error: await readRuntimeErrorDetail(response) };
       }
 
       const parsed = parseRunSseText(await response.text());
@@ -1368,63 +1186,49 @@ function parseRunSseText(text: string): StreamResult {
   let finished = false;
   let nextOffset = 0;
 
-  const dataLines = text
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith('data:'))
-    .map((line) => line.slice(5).trim())
-    .filter((line) => line && line !== '[DONE]');
+  for (const event of parseSseDataEvents(text.replace(/\r\n/g, '\n'))) {
+    const record = event as StreamEvent & Record<string, unknown>;
+    const type = typeof record.type === 'string' ? record.type : '';
+    if (typeof record.index === 'number' && Number.isFinite(record.index)) {
+      nextOffset = Math.max(nextOffset, Math.trunc(record.index) + 1);
+    }
 
-  for (const line of dataLines) {
-    try {
-      const event = JSON.parse(line) as Record<string, unknown>;
-      const type = typeof event.type === 'string' ? event.type : '';
-      if (typeof event.index === 'number' && Number.isFinite(event.index)) {
-        nextOffset = Math.max(nextOffset, Math.trunc(event.index) + 1);
-      }
-
-      if (type === 'text_delta' && typeof event.content === 'string') {
-        assistantText += event.content;
-      } else if (type === 'text_done' && typeof event.full_text === 'string') {
-        finalText = event.full_text;
-      } else if (type === 'turn_complete' && typeof event.assistant_text === 'string') {
-        finalText = event.assistant_text;
-      } else if (type === 'error' && typeof event.message === 'string') {
-        error = event.message;
-      } else if (
-        type === 'run_finished' &&
-        event.status === 'failed' &&
-        typeof event.error === 'string'
-      ) {
-        error = event.error;
-        finished = true;
-      } else if (type === 'run_finished') {
-        finished = true;
-      }
-    } catch {
-      // Ignore malformed SSE frames.
+    if (type === 'text_delta' && typeof record.content === 'string') {
+      assistantText += record.content;
+    } else if (type === 'text_done' && typeof record.full_text === 'string') {
+      finalText = record.full_text;
+    } else if (type === 'turn_complete' && typeof record.assistant_text === 'string') {
+      finalText = record.assistant_text;
+    } else if (type === 'error' && typeof record.message === 'string') {
+      error = record.message;
+    } else if (
+      type === 'run_finished' &&
+      record.status === 'failed' &&
+      typeof record.error === 'string'
+    ) {
+      error = record.error;
+      finished = true;
+    } else if (type === 'run_finished') {
+      finished = true;
     }
   }
 
   return { assistantText: finalText || assistantText, error, finished, nextOffset };
 }
 
-export async function resolveBackendModelName(config: RuntimeConfig, model?: string) {
-  if (!model || !config.apiUrl || !config.accessToken) {
+export async function resolveBackendModelName(runtime: RuntimeConfig | WebRuntimeClient, model?: string) {
+  if (!model) {
     return model;
   }
 
   try {
-    const response = await fetch(new URL('/models', config.apiUrl).toString(), {
-      headers: {
-        Authorization: `Bearer ${config.accessToken}`,
-      },
-      cache: 'no-store',
-    });
-    if (!response.ok) {
+    const client = runtime instanceof WebRuntimeClient
+      ? runtime
+      : new WebRuntimeClient(runtime);
+    if (!client.config.accessToken) {
       return model;
     }
-
-    const models = (await response.json()) as BackendModelListItem[];
+    const models = await client.sdk.listModels();
     const matched = models.find((item) => item.model_id === model || item.name === model);
     return matched?.name ?? model;
   } catch {

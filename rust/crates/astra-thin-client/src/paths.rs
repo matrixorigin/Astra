@@ -35,6 +35,21 @@ pub fn session_close(id: &str) -> String {
 }
 
 #[inline]
+pub fn session_state(id: &str) -> String {
+    format!("/sessions/{id}/state")
+}
+
+#[inline]
+pub fn session_transcript(id: &str) -> String {
+    format!("/sessions/{id}/transcript")
+}
+
+#[inline]
+pub fn session_artifacts(id: &str) -> String {
+    format!("/sessions/{id}/artifacts")
+}
+
+#[inline]
 pub fn session_replay(id: &str) -> String {
     format!("/sessions/{id}/replay")
 }
@@ -53,6 +68,15 @@ pub fn session_artifact_latest(session_id: &str, artifact_kind: &str) -> Option<
     Some(format!(
         "/sessions/{session_id}/artifacts/latest/{artifact_kind}"
     ))
+}
+
+/// Returns `None` if `artifact_id` contains path-unsafe characters.
+#[inline]
+pub fn session_artifact(session_id: &str, artifact_id: &str) -> Option<String> {
+    if !is_safe_path_segment(artifact_id) {
+        return None;
+    }
+    Some(format!("/sessions/{session_id}/artifacts/{artifact_id}"))
 }
 
 /// Returns `None` if `artifact_id` contains path-unsafe characters.
@@ -141,6 +165,11 @@ pub fn model(name: &str) -> String {
     format!("/models/{name}")
 }
 
+#[inline]
+pub fn model_check(model_name: &str) -> String {
+    format!("/models/{model_name}/check")
+}
+
 pub const SKILLS: &str = "/skills";
 
 #[inline]
@@ -221,11 +250,6 @@ pub const ADMIN_PROMPTS_OPTIMIZE: &str = "/admin/prompts/optimize";
 pub const ADMIN_FEEDBACK_STATS: &str = "/admin/feedback/stats";
 pub const ADMIN_FEEDBACK_EXPORT: &str = "/admin/feedback/export";
 pub const ADMIN_CONFIG: &str = "/admin/config";
-
-#[inline]
-pub fn model_check(model_name: &str) -> String {
-    format!("/models/{model_name}/check")
-}
 
 #[inline]
 pub fn admin_config_key(key: &str) -> String {
@@ -379,6 +403,21 @@ mod tests {
     }
 
     #[test]
+    fn session_state_path() {
+        assert_eq!(session_state("s1"), "/sessions/s1/state");
+    }
+
+    #[test]
+    fn session_transcript_path() {
+        assert_eq!(session_transcript("s1"), "/sessions/s1/transcript");
+    }
+
+    #[test]
+    fn session_artifacts_path() {
+        assert_eq!(session_artifacts("s1"), "/sessions/s1/artifacts");
+    }
+
+    #[test]
     fn session_replay_path() {
         assert_eq!(session_replay("s1"), "/sessions/s1/replay");
     }
@@ -399,6 +438,10 @@ mod tests {
     #[test]
     fn session_artifact_download_path() {
         assert_eq!(
+            session_artifact("s1", "a1"),
+            Some("/sessions/s1/artifacts/a1".to_string())
+        );
+        assert_eq!(
             session_artifact_download("s1", "a1"),
             Some("/sessions/s1/artifacts/a1/download".to_string())
         );
@@ -416,6 +459,7 @@ mod tests {
 
     #[test]
     fn session_artifact_download_rejects_path_traversal() {
+        assert_eq!(session_artifact("s1", "../secret"), None);
         assert_eq!(session_artifact_download("s1", "../secret"), None);
         assert_eq!(session_artifact_download("s1", "a%2Fb"), None);
     }
