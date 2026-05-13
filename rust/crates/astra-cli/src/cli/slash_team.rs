@@ -518,7 +518,10 @@ pub(super) async fn handle_team_command(
             eprintln!("  {}", team_subcommands_hint().dim());
             eprintln!("  {}", "Examples:".dim());
             eprintln!("    {}", "/team info review".magenta());
-            eprintln!("    {}", "/team run review review the latest diff".magenta());
+            eprintln!(
+                "    {}",
+                "/team run review review the latest diff".magenta()
+            );
             eprintln!("    {}", "/team snapshot dev before-refactor".magenta());
             eprintln!();
         }
@@ -707,7 +710,11 @@ pub(super) async fn handle_team_command(
             }
             match state.team_registry.get(name) {
                 Some(t) => {
-                    eprintln!("\n  {} {}", "Team:".bold(), t.name.as_str().magenta().bold());
+                    eprintln!(
+                        "\n  {} {}",
+                        "Team:".bold(),
+                        t.name.as_str().magenta().bold()
+                    );
                     eprintln!("  {} {}", "Description:".dim(), t.description);
                     eprintln!("  {} {}", "Created:".dim(), t.created_at);
                     if let Some(ref coord) = t.coordination {

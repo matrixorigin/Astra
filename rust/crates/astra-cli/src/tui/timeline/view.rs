@@ -463,7 +463,10 @@ fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
                 Span::styled(format!("    [{:>5}ms] ", tool_offset), dim),
                 Span::styled(branch, dim),
                 Span::styled(format!("{status} "), Style::default().fg(status_color)),
-                Span::styled(display, Style::default().fg(crate::tui::theme::current().accent)),
+                Span::styled(
+                    display,
+                    Style::default().fg(crate::tui::theme::current().accent),
+                ),
                 Span::styled(format!(" {}ms{round_tag}{par_tag}", tc.ms), dim),
             ]));
 

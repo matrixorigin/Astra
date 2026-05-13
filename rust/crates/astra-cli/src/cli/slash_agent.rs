@@ -174,7 +174,10 @@ async fn show_list(ctx: &AgentCommandContext) {
     let delegations = load_recent_delegations(ctx.session_id.as_deref());
 
     if active_agents.is_empty() && completed_agents.is_empty() && delegations.is_empty() {
-        eprintln!("\n  {}", "🤖 No recent agents or delegations".magenta().bold());
+        eprintln!(
+            "\n  {}",
+            "🤖 No recent agents or delegations".magenta().bold()
+        );
         eprintln!(
             "  {}",
             "Use spawn_agent or delegate to start multi-agent work.".dim()
@@ -493,7 +496,10 @@ async fn stop_agent(ctx: &AgentCommandContext, agent_id: &str) {
 async fn show_watch(ctx: &AgentCommandContext) {
     use std::time::Duration;
 
-    eprintln!("\n  {} Watching agent tree (Ctrl+C to stop)\n", "👁".magenta());
+    eprintln!(
+        "\n  {} Watching agent tree (Ctrl+C to stop)\n",
+        "👁".magenta()
+    );
     eprintln!(
         "  {}",
         "Watch follows live spawned agents; delegations appear through journal-backed lifecycle changes, not per-turn sub-agent output."

@@ -162,7 +162,11 @@ fn edit_preference(ctx: &ProfileCommandContext<'_>, key: &str, value: &str) {
         }
         "language" | "lang" => {
             prefs.language_style.language = value.to_string();
-            eprintln!("  {} Language set to: {}", theme::icon_ok(), value.magenta());
+            eprintln!(
+                "  {} Language set to: {}",
+                theme::icon_ok(),
+                value.magenta()
+            );
         }
         "formality" | "f" => {
             match value_lower.as_str() {
@@ -467,7 +471,10 @@ fn show_help() {
         "    {}",
         "/profile               Show current profile".magenta()
     );
-    eprintln!("    {}", "/profile edit <k> <v>  Edit a preference".magenta());
+    eprintln!(
+        "    {}",
+        "/profile edit <k> <v>  Edit a preference".magenta()
+    );
     eprintln!(
         "    {}",
         "/profile scenario      Show detected scenario".magenta()
@@ -484,7 +491,10 @@ fn show_help() {
         "    {}",
         "/profile experiments   Show experiment enrollment".magenta()
     );
-    eprintln!("    {}", "/profile reset         Reset to defaults".magenta());
+    eprintln!(
+        "    {}",
+        "/profile reset         Reset to defaults".magenta()
+    );
 
     eprintln!("\n  {}", "Editable Preferences:".bold());
     eprintln!("    {} quiet|normal|verbose|debug", "verbosity".green());

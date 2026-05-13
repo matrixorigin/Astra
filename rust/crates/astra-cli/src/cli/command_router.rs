@@ -1997,7 +1997,12 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     let cwd = std::env::current_dir().unwrap_or_default();
     let astra_dir = cwd.join(".astra");
     if astra_dir.is_dir() {
-        println!("  {} {} {}", ".astra/:".dim(), theme::icon_ok(), "Found".green());
+        println!(
+            "  {} {} {}",
+            ".astra/:".dim(),
+            theme::icon_ok(),
+            "Found".green()
+        );
     } else {
         println!("  {} {}", ".astra/:".dim(), "Not found (optional)".dim());
     }

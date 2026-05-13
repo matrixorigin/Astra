@@ -253,7 +253,11 @@ pub(super) async fn handle_memory_domain_command(
                                                 content.chars().take(80).collect();
                                             format!("[{mtype}] {preview}")
                                         };
-                                        eprintln!("  {}. {}", (i + 1).to_string().magenta(), display);
+                                        eprintln!(
+                                            "  {}. {}",
+                                            (i + 1).to_string().magenta(),
+                                            display
+                                        );
                                     }
                                     eprintln!(
                                         "  {}",
@@ -434,7 +438,11 @@ pub(super) async fn handle_memory_domain_command(
                     };
                     match super::edge_tools::memoria::memoria_snapshot_create(&name).await {
                         Ok(_) => {
-                            eprintln!("  {} Snapshot '{}' created", theme::icon_ok(), name.magenta())
+                            eprintln!(
+                                "  {} Snapshot '{}' created",
+                                theme::icon_ok(),
+                                name.magenta()
+                            )
                         }
                         Err(e) => eprintln!("  {} Snapshot failed: {e}", theme::icon_err()),
                     }
@@ -442,7 +450,11 @@ pub(super) async fn handle_memory_domain_command(
                 "rollback" if !sub_arg.is_empty() => {
                     match super::edge_tools::memoria::memoria_snapshot_rollback(sub_arg).await {
                         Ok(_) => {
-                            eprintln!("  {} Rolled back to '{}'", theme::icon_ok(), sub_arg.magenta())
+                            eprintln!(
+                                "  {} Rolled back to '{}'",
+                                theme::icon_ok(),
+                                sub_arg.magenta()
+                            )
                         }
                         Err(e) => eprintln!("  {} Rollback failed: {e}", theme::icon_err()),
                     }
@@ -455,7 +467,11 @@ pub(super) async fn handle_memory_domain_command(
                 "branch" if !sub_arg.is_empty() => {
                     match super::edge_tools::memoria::memoria_branch_create(sub_arg).await {
                         Ok(_) => {
-                            eprintln!("  {} Branch '{}' created", theme::icon_ok(), sub_arg.magenta())
+                            eprintln!(
+                                "  {} Branch '{}' created",
+                                theme::icon_ok(),
+                                sub_arg.magenta()
+                            )
                         }
                         Err(e) => eprintln!("  {} Branch failed: {e}", theme::icon_err()),
                     }
@@ -473,7 +489,11 @@ pub(super) async fn handle_memory_domain_command(
                 "merge" if !sub_arg.is_empty() => {
                     match super::edge_tools::memoria::memoria_branch_merge(sub_arg).await {
                         Ok(_) => {
-                            eprintln!("  {} Branch '{}' merged", theme::icon_ok(), sub_arg.magenta())
+                            eprintln!(
+                                "  {} Branch '{}' merged",
+                                theme::icon_ok(),
+                                sub_arg.magenta()
+                            )
                         }
                         Err(e) => eprintln!("  {} Merge failed: {e}", theme::icon_err()),
                     }
@@ -586,7 +606,10 @@ pub(super) async fn handle_memory_domain_command(
                         return Ok(());
                     }
                     state.chat_plan_only = false;
-                    eprintln!("  {} Plan-only chat OFF — normal agent mode.", "←".magenta());
+                    eprintln!(
+                        "  {} Plan-only chat OFF — normal agent mode.",
+                        "←".magenta()
+                    );
                     return Ok(());
                 }
                 "status" => {
@@ -965,7 +988,11 @@ pub(super) async fn handle_memory_domain_command(
                             let plan = ps.plan.clone();
                             state.plan_mode = Some(ps);
                             eprintln!();
-                            eprintln!("{}  Resumed plan mode for: {}", "📋".yellow(), goal.magenta());
+                            eprintln!(
+                                "{}  Resumed plan mode for: {}",
+                                "📋".yellow(),
+                                goal.magenta()
+                            );
                             eprintln!();
                             if !plan.subtasks.is_empty() {
                                 eprintln!("{}", format_plan(&plan));
@@ -1942,7 +1969,9 @@ fn handle_plan_status(state: &ReplState) {
         eprintln!();
         for st in &plan.subtasks {
             let icon = match st.status {
-                astra_runtime::plan_decompose::TaskStatus::Completed => theme::icon_ok().to_string(),
+                astra_runtime::plan_decompose::TaskStatus::Completed => {
+                    theme::icon_ok().to_string()
+                }
                 astra_runtime::plan_decompose::TaskStatus::InProgress => "▶".yellow().to_string(),
                 astra_runtime::plan_decompose::TaskStatus::Pending => "○".dim().to_string(),
                 astra_runtime::plan_decompose::TaskStatus::Paused => "⏸".yellow().to_string(),

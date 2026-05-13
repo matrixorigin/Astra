@@ -464,7 +464,11 @@ fn export_config(path: Option<PathBuf>) {
         }
         match std::fs::write(&p, &toml) {
             Ok(_) => {
-                println!("{} Configuration exported to {}", theme::icon_ok(), p.display());
+                println!(
+                    "{} Configuration exported to {}",
+                    theme::icon_ok(),
+                    p.display()
+                );
             }
             Err(e) => {
                 eprintln!("{}", format!("Failed to write file: {}", e).red());
@@ -715,7 +719,11 @@ fn run_config_edit() {
                     parent: None,
                 };
                 if let Ok(id) = store.put(&working, meta) {
-                    println!("  {}  config version: {}", "·".dim(), id.to_string().magenta());
+                    println!(
+                        "  {}  config version: {}",
+                        "·".dim(),
+                        id.to_string().magenta()
+                    );
                 }
             }
         }

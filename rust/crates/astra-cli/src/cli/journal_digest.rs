@@ -828,7 +828,11 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
 pub fn print_text(d: &JournalDigest) {
     use crossterm::style::Stylize;
     println!("  {} {}", "schema_version:".dim(), d.schema_version);
-    println!("  {} {}", "session_id:".dim(), d.session_id.as_str().magenta());
+    println!(
+        "  {} {}",
+        "session_id:".dim(),
+        d.session_id.as_str().magenta()
+    );
     println!("  {} {}", "journal_file:".dim(), d.journal_file);
     println!(
         "  {} non_empty={} malformed={}",

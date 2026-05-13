@@ -255,7 +255,11 @@ pub fn format_not_found_error(
             .copied()
             .collect::<Vec<_>>()
             .join(", ");
-        eprintln!("    {} {}", "Did you mean:".dim(), suggestion_text.magenta());
+        eprintln!(
+            "    {} {}",
+            "Did you mean:".dim(),
+            suggestion_text.magenta()
+        );
     }
 
     if let Some(cmd) = hint_command {

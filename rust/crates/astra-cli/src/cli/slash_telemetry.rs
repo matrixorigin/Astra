@@ -139,7 +139,11 @@ fn show_summary(
     eprintln!(
         "  {:<18} {}",
         "decisions:".dim(),
-        session_guard.decision_explanations.len().to_string().magenta()
+        session_guard
+            .decision_explanations
+            .len()
+            .to_string()
+            .magenta()
     );
 
     // Recent queries for drift
@@ -192,7 +196,11 @@ fn show_summary(
                 .map(|(strategy, count)| format!("{strategy}:{count}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            eprintln!("  {:<18} {}", "fuzzy_by_strategy:".dim(), strategies.magenta());
+            eprintln!(
+                "  {:<18} {}",
+                "fuzzy_by_strategy:".dim(),
+                strategies.magenta()
+            );
         }
     }
 
@@ -524,7 +532,10 @@ fn show_help() {
         "/telemetry profile".magenta()
     );
     eprintln!();
-    eprintln!("  {}", "── Deep Trace (per-turn detail) ──".bold().magenta());
+    eprintln!(
+        "  {}",
+        "── Deep Trace (per-turn detail) ──".bold().magenta()
+    );
     eprintln!(
         "  {}  Context assembly for turn N",
         "/telemetry context [N]".magenta()
@@ -541,7 +552,10 @@ fn show_help() {
         "  {}  History compression for turn N",
         "/telemetry compression [N]".magenta()
     );
-    eprintln!("  {}   Token budget evolution", "/telemetry budget".magenta());
+    eprintln!(
+        "  {}   Token budget evolution",
+        "/telemetry budget".magenta()
+    );
     eprintln!();
     eprintln!("  {}", "── Session-Level Analysis ──".bold().magenta());
     eprintln!(

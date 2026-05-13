@@ -317,7 +317,10 @@ fn inspect_turn(
         "[7]".magenta()
     );
     eprintln!("  {} summary  — journal turn summary", "[6]".magenta());
-    eprintln!("  {} fork     — fork session from this turn", "[f]".magenta());
+    eprintln!(
+        "  {} fork     — fork session from this turn",
+        "[f]".magenta()
+    );
 
     loop {
         eprint!("  What to inspect? [1-6, 7, f, b to go back]: ");

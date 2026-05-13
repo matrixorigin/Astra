@@ -1570,12 +1570,19 @@ pub(super) async fn handle_info_command(
             }
 
             let sep = "─".repeat(38);
-            eprintln!("\n  {}", format!("─── Context Window {sep}").bold().magenta());
+            eprintln!(
+                "\n  {}",
+                format!("─── Context Window {sep}").bold().magenta()
+            );
 
             // ── Identity ──
             let model_display = state.model.clone().unwrap_or_else(|| "default".to_string());
             eprintln!("  {:<12}  {}", "model".magenta(), model_display.dim());
-            eprintln!("  {:<12}  {}", "turn".magenta(), state.turn.to_string().dim());
+            eprintln!(
+                "  {:<12}  {}",
+                "turn".magenta(),
+                state.turn.to_string().dim()
+            );
 
             // ── Token usage bar ──
             let est_messages: Vec<serde_json::Value> = state
@@ -1701,7 +1708,11 @@ pub(super) async fn handle_info_command(
             if let Some(ref anchor) = state.continuation_anchor {
                 let parsed = parse_continuation_anchor(anchor);
                 if let Some(task) = parsed.task.as_deref() {
-                    eprintln!("  {:<12}  {}", "task".magenta(), truncate_str(task, 80).dim());
+                    eprintln!(
+                        "  {:<12}  {}",
+                        "task".magenta(),
+                        truncate_str(task, 80).dim()
+                    );
                 }
                 if let Some(direction) = parsed.direction.as_deref() {
                     eprintln!(

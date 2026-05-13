@@ -644,7 +644,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
-
         // ── Instructions — subcommand menu or direct action ─────────
         "/instructions" => {
             use crate::tui::bottom_pane::info_view::InfoView;
@@ -1324,7 +1323,10 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
             } else if msg.contains("connect") || msg.contains("timeout") {
                 "Cannot reach server — check connection".to_string()
             } else {
-                format!("Failed to fetch models: {}", msg.lines().next().unwrap_or(&msg))
+                format!(
+                    "Failed to fetch models: {}",
+                    msg.lines().next().unwrap_or(&msg)
+                )
             };
             ctx.show_error(short);
         }

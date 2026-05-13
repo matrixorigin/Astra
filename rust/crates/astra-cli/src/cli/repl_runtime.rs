@@ -724,7 +724,6 @@ fn restore_session_state_from_journal(session_id: &str) -> RestoredSessionState 
     restored
 }
 
-
 pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     let creds = load_credentials();
     let pname = profile_name(profile, &creds);
@@ -775,7 +774,11 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     right.push(
         format!(
             "{skills_count} skills · {}",
-            if logged_in { "logged in" } else { "not logged in" }
+            if logged_in {
+                "logged in"
+            } else {
+                "not logged in"
+            }
         )
         .dim()
         .to_string(),
@@ -907,12 +910,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
             );
         }
         // Footer
-        eprintln!(
-            "{}{}{}",
-            "╰".grey(),
-            h_bar.grey(),
-            "╯".grey()
-        );
+        eprintln!("{}{}{}", "╰".grey(), h_bar.grey(), "╯".grey());
         let _ = std::io::stderr().flush();
     }
 
@@ -938,7 +936,12 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     if animated {
         use std::time::Duration;
 
-        let seeds = [rng, rng.wrapping_add(7919), rng.wrapping_add(104729), rng.wrapping_add(999983)];
+        let seeds = [
+            rng,
+            rng.wrapping_add(7919),
+            rng.wrapping_add(104729),
+            rng.wrapping_add(999983),
+        ];
         for (frame, &seed) in seeds.iter().enumerate() {
             if frame > 0 {
                 eprint!("\x1b[{}A\r", card_lines);
@@ -974,7 +977,6 @@ fn banner_session_display(state: &ReplState) -> String {
         None => "new".to_string(),
     }
 }
-
 
 pub(super) fn current_access_token(profile: Option<&str>) -> Option<String> {
     // Gateway injects a pre-validated token — skip file I/O and auth check

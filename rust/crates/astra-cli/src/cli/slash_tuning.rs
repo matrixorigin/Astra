@@ -534,7 +534,11 @@ fn cmd_record<W: Write>(args: &[&str], ctx: TuningCommandContext<'_, W>) -> std:
     let w = ctx.writer;
 
     if args.is_empty() {
-        writeln!(w, "{} Usage: /tuning record <signal_type>", theme::icon_warn())?;
+        writeln!(
+            w,
+            "{} Usage: /tuning record <signal_type>",
+            theme::icon_warn()
+        )?;
         writeln!(w)?;
         writeln!(w, "Signal types:")?;
         writeln!(w, "  success, failure, retry, correction")?;

@@ -142,7 +142,6 @@ pub fn current_theme() -> ThemeConfig {
         .clone()
 }
 
-
 // ── Readline prompts ──────────────────────────────────────────────────────
 //
 // IMPORTANT: Prompt TEXT must be ASCII-only. Unicode characters with ambiguous
@@ -350,7 +349,6 @@ mod tests {
         assert!(!icon_err().is_empty());
         assert!(!icon_warn().is_empty());
     }
-
 
     #[test]
     fn theme_aware_functions_produce_output() {

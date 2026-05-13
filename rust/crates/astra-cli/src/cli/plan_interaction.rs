@@ -452,8 +452,14 @@ fn plan_select_theme() -> inquire::ui::RenderConfig<'static> {
     let mut rc = RenderConfig::default_colored();
     rc.prompt_prefix = inquire::ui::Styled::new("▸").with_fg(magenta);
     rc.highlighted_option_prefix = inquire::ui::Styled::new("▸").with_fg(magenta);
-    rc.selected_option = Some(StyleSheet::new().with_fg(magenta).with_attr(Attributes::BOLD));
-    rc.answer = StyleSheet::new().with_fg(magenta).with_attr(Attributes::BOLD);
+    rc.selected_option = Some(
+        StyleSheet::new()
+            .with_fg(magenta)
+            .with_attr(Attributes::BOLD),
+    );
+    rc.answer = StyleSheet::new()
+        .with_fg(magenta)
+        .with_attr(Attributes::BOLD);
     rc
 }
 

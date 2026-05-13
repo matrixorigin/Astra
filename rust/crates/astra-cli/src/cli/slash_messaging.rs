@@ -239,7 +239,9 @@ fn show_status(state: &ReplState) {
 fn show_help() {
     eprintln!(
         "\n  {}",
-        "/messaging — Inter-agent messaging inspector".magenta().bold()
+        "/messaging — Inter-agent messaging inspector"
+            .magenta()
+            .bold()
     );
     eprintln!("  {}", "─".repeat(50).dim());
     eprintln!("  {}  Show metrics snapshot", "/messaging".white().bold());

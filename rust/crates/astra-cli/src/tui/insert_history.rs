@@ -3,9 +3,7 @@ use std::io::{self, Write};
 use crossterm::{
     cursor::MoveTo,
     queue,
-    style::{
-        Attribute, Color as CColor, Colors, Print, SetAttribute, SetColors,
-    },
+    style::{Attribute, Color as CColor, Colors, Print, SetAttribute, SetColors},
     terminal::{Clear, ClearType},
 };
 use ratatui::backend::Backend;
@@ -188,7 +186,11 @@ fn write_history_line(writer: &mut impl Write, line: &Line<'_>) -> io::Result<()
         let remaining = term_w.saturating_sub(content_width);
         if remaining > 0 {
             let (r, g, b) = color_to_rgb(bg);
-            write!(writer, "\x1b[48;2;{r};{g};{b}m{}\x1b[0m", " ".repeat(remaining))?;
+            write!(
+                writer,
+                "\x1b[48;2;{r};{g};{b}m{}\x1b[0m",
+                " ".repeat(remaining)
+            )?;
         } else {
             write!(writer, "\x1b[0m")?;
         }

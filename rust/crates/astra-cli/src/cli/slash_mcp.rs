@@ -110,7 +110,10 @@ async fn show_status(state: &ReplState) {
         return;
     }
 
-    eprintln!("{}", format!("  Servers: {count} connected").bold().magenta());
+    eprintln!(
+        "{}",
+        format!("  Servers: {count} connected").bold().magenta()
+    );
     let mut caps = Vec::new();
     if manager.has_sampling() {
         caps.push("sampling");

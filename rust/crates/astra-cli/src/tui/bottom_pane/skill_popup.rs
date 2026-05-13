@@ -139,7 +139,10 @@ impl SkillPopup {
                 Line::from(vec![
                     Span::raw("  "),
                     Span::raw(padded_name),
-                    Span::styled(format!("{tag} "), Style::default().fg(crate::tui::theme::current().accent)),
+                    Span::styled(
+                        format!("{tag} "),
+                        Style::default().fg(crate::tui::theme::current().accent),
+                    ),
                     Span::styled(desc, dim),
                 ])
             };

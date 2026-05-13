@@ -1173,13 +1173,7 @@ fn render_slash_overlay_row_with_width(
 fn render_slash_overlay_message_line(message: &str, inner_width: usize) -> String {
     let styled = message.yellow().to_string();
     let pad = inner_width.saturating_sub(message.chars().count());
-    format!(
-        "{}{}{}{}",
-        "│".dim(),
-        styled,
-        " ".repeat(pad),
-        "│".dim()
-    )
+    format!("{}{}{}{}", "│".dim(), styled, " ".repeat(pad), "│".dim())
 }
 
 /// Move selection and return the newly selected command name.
@@ -1417,10 +1411,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
     // Header
     eprintln!();
     if let Some(q) = &filter {
-        eprintln!(
-            "  {}",
-            format!("Command Palette  ·  filter: {q}").bold()
-        );
+        eprintln!("  {}", format!("Command Palette  ·  filter: {q}").bold());
     } else {
         eprintln!("  {}", "Command Palette".bold());
     }
@@ -3053,13 +3044,7 @@ mod tests {
                 "/logout",
                 "/memory-setup",
             ],
-            &[
-                "/diagnostics",
-                "/lsp",
-                "/allow",
-                "/yolo",
-                "/instructions",
-            ],
+            &["/diagnostics", "/lsp", "/allow", "/yolo", "/instructions"],
         ];
         let known: std::collections::HashSet<&str> = COMMANDS.iter().map(|m| m.name).collect();
         for group in groups {

@@ -344,7 +344,11 @@ pub fn display_verification_report(report: &SubtaskVerificationReport) {
 pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
     let task_id = durable.contract.task_id.clone();
 
-    eprintln!("\n  {} {}", "●".magenta(), "Running global verification...".dim());
+    eprintln!(
+        "\n  {} {}",
+        "●".magenta(),
+        "Running global verification...".dim()
+    );
 
     // Show what will be checked
     for c in &durable.contract.global_verification {
@@ -530,11 +534,7 @@ pub(super) fn display_delivery_report(report: &TaskDeliveryReport) {
     // ─── Global Verification ─────────────────────────────────────────────────
     if !report.global_verification.is_empty() {
         eprintln!("  {}", separator.as_str().dim());
-        eprintln!(
-            "  Global checks: {}/{}",
-            global_passed,
-            global_total,
-        );
+        eprintln!("  Global checks: {}/{}", global_passed, global_total,);
         for r in &report.global_verification {
             let icon = if r.passed { "●" } else { "✗" };
             let styled = if r.passed {

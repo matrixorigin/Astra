@@ -752,10 +752,18 @@ pub(super) async fn handle_session_command(
                         ws.turn_count.to_string().magenta()
                     );
                 } else {
-                    eprintln!("  {:<16} {}", "turns:".dim(), state.turn.to_string().magenta());
+                    eprintln!(
+                        "  {:<16} {}",
+                        "turns:".dim(),
+                        state.turn.to_string().magenta()
+                    );
                 }
             } else {
-                eprintln!("  {:<16} {}", "turns:".dim(), state.turn.to_string().magenta());
+                eprintln!(
+                    "  {:<16} {}",
+                    "turns:".dim(),
+                    state.turn.to_string().magenta()
+                );
             }
             eprintln!(
                 "  {:<16} {}",
@@ -1267,7 +1275,12 @@ pub(super) async fn handle_session_command(
                                     .and_then(|m| m.get("summary"))
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("lifecycle");
-                                eprintln!("  {} {} plan: {}", ts_short.dim(), "📋".magenta(), summary,);
+                                eprintln!(
+                                    "  {} {} plan: {}",
+                                    ts_short.dim(),
+                                    "📋".magenta(),
+                                    summary,
+                                );
                             }
                             session_journal::JournalEventType::GoalSteered => {
                                 let source = evt
@@ -2249,7 +2262,11 @@ pub(super) async fn handle_session_command(
                                 let available: Vec<_> =
                                     traces.iter().filter_map(|e| e.turn).collect();
                                 if !available.is_empty() {
-                                    eprintln!("  {} Available turns: {:?}", "ℹ".magenta(), available);
+                                    eprintln!(
+                                        "  {} Available turns: {:?}",
+                                        "ℹ".magenta(),
+                                        available
+                                    );
                                 }
                             }
                         }
@@ -2945,7 +2962,11 @@ fn export_session_markdown(session_id: &str) {
             let export_path = format!("astra-session-{}.md", now.format("%Y%m%d-%H%M"));
             match std::fs::write(&export_path, &md) {
                 Ok(_) => {
-                    eprintln!("  {} Exported to {}", theme::icon_ok(), export_path.magenta())
+                    eprintln!(
+                        "  {} Exported to {}",
+                        theme::icon_ok(),
+                        export_path.magenta()
+                    )
                 }
                 Err(e) => eprintln!("{}", format!("  ✗ Failed to write: {e}").red()),
             }

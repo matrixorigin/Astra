@@ -141,7 +141,11 @@ pub(super) async fn handle_task_command(
                             }
                             _ => t.status.as_str(),
                         };
-                        eprintln!("  {:<12} {}", "status:".dim(), detail_status_label.magenta());
+                        eprintln!(
+                            "  {:<12} {}",
+                            "status:".dim(),
+                            detail_status_label.magenta()
+                        );
                         eprintln!("  {:<12} {}%", "progress:".dim(), t.progress_pct);
                         if let Some(ref desc) = t.description {
                             eprintln!("  {:<12} {}", "desc:".dim(), desc);

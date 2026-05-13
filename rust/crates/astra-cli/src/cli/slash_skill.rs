@@ -159,9 +159,17 @@ pub(super) async fn handle_skill_command(
                     .bold()
                     .magenta()
             );
-            eprintln!("  {:<16} {}", "total:".dim(), all.len().to_string().magenta());
+            eprintln!(
+                "  {:<16} {}",
+                "total:".dim(),
+                all.len().to_string().magenta()
+            );
             eprintln!("  {:<16} {}", "local:".dim(), local.to_string().magenta());
-            eprintln!("  {:<16} {}", "bundled:".dim(), bundled.to_string().magenta());
+            eprintln!(
+                "  {:<16} {}",
+                "bundled:".dim(),
+                bundled.to_string().magenta()
+            );
             if mcp > 0 {
                 eprintln!("  {:<16} {}", "mcp:".dim(), mcp.to_string().magenta());
             }
@@ -1437,7 +1445,10 @@ Follow these steps:
             // Parse: <skill_name> +/- or <skill_name> up/down or <skill_name> thumbs_up/thumbs_down
             let parts: Vec<&str> = sub_arg.split_whitespace().collect();
             if parts.len() < 2 {
-                eprintln!("  {} Usage: /skill feedback <skill_name> +/-", theme::icon_warn());
+                eprintln!(
+                    "  {} Usage: /skill feedback <skill_name> +/-",
+                    theme::icon_warn()
+                );
                 eprintln!("  Examples:");
                 eprintln!("    /skill feedback pdf +     {} thumbs up", "—".dim());
                 eprintln!("    /skill feedback pdf -     {} thumbs down", "—".dim());
@@ -1448,7 +1459,11 @@ Follow these steps:
                 "+" | "+1" | "up" | "thumbs_up" | "good" | "yes" => true,
                 "-" | "-1" | "down" | "thumbs_down" | "bad" | "no" => false,
                 other => {
-                    eprintln!("  {} Unknown feedback type: {}", theme::icon_err(), other.yellow());
+                    eprintln!(
+                        "  {} Unknown feedback type: {}",
+                        theme::icon_err(),
+                        other.yellow()
+                    );
                     eprintln!("  Use + (positive) or - (negative)");
                     return Ok(());
                 }
