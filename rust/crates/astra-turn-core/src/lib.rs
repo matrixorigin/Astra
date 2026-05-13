@@ -115,6 +115,7 @@ pub mod xml_tool_call_fallback;
 // Phase 15: turn leaf modules + cloud session modules
 pub mod action_compensation;
 pub mod approval_base_digest;
+pub mod approval_batch_group;
 pub mod approval_fingerprint;
 pub mod approval_request_key;
 pub mod approval_sink;
