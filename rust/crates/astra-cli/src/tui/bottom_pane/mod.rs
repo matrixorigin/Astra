@@ -8,6 +8,7 @@ pub(crate) mod history_view;
 pub(crate) mod info_view;
 pub(crate) mod list_selection_view;
 pub(crate) mod login_view;
+pub(crate) mod paste_burst;
 pub(crate) mod session_picker_view;
 pub(crate) mod skill_popup;
 pub(crate) mod table_view;
@@ -758,6 +759,8 @@ impl BottomPane {
         if let Some(view) = self.active_view_mut() {
             view.pre_draw_tick(now);
         }
+        // Flush paste burst buffer when idle timeout expires.
+        self.composer.flush_paste_burst();
     }
 
     /// True when something in the bottom pane is currently animating and
