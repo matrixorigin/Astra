@@ -4,20 +4,18 @@ pub(super) struct StateCommandContext<'a> {
     pub(super) api: &'a astra_thin_client::ThinClient,
     pub(super) profile: Option<&'a str>,
     pub(super) token: Option<&'a str>,
-    pub(super) selector: &'a dyn tool_selector::ToolSelector,
 }
 
 pub(super) async fn handle_state_command(
     cmd: &str,
     arg: &str,
     ctx: StateCommandContext<'_>,
-    state: &mut ReplState,
+    state: &mut SessionState,
 ) -> Result<(), String> {
     let StateCommandContext {
         api,
         profile,
         token,
-        selector,
     } = ctx;
     match cmd {
         "/clear" => {
@@ -331,7 +329,7 @@ pub(super) async fn handle_state_command(
                     perm_manager: &mut auto_pm,
                     verbose_mode: false,
                     render_policy: crate::stream_render::RenderPolicy::Silent,
-                    selector,
+
                     recent_tools: &[],
                     tool_health_entries: &[],
                     session_lessons: &[],
@@ -451,7 +449,7 @@ pub(super) async fn handle_state_command(
                             perm_manager: &mut auto_pm2,
                             verbose_mode: false,
                             render_policy: crate::stream_render::RenderPolicy::Silent,
-                            selector,
+
                             recent_tools: &[],
                             tool_health_entries: &[],
                             session_lessons: &[],
@@ -549,7 +547,7 @@ pub(super) async fn handle_state_command(
                                     perm_manager: &mut auto_pm3,
                                     verbose_mode: false,
                                     render_policy: crate::stream_render::RenderPolicy::Silent,
-                                    selector,
+
                                     recent_tools: &[],
                                     tool_health_entries: &[],
                                     session_lessons: &[],
@@ -679,7 +677,7 @@ pub(super) async fn handle_state_command(
                 let anchor = if compact_no_memoria {
                     None
                 } else {
-                    crate::repl_turn::fetch_compact_memory_anchor_snippet(
+                    crate::chat_turn::fetch_compact_memory_anchor_snippet(
                         api,
                         tok,
                         state.session_id.as_deref(),
@@ -687,7 +685,7 @@ pub(super) async fn handle_state_command(
                     )
                     .await
                 };
-                let assistant_text = crate::repl_turn::compact_assistant_message(
+                let assistant_text = crate::chat_turn::compact_assistant_message(
                     trimmed_count,
                     &summary,
                     anchor.as_deref(),
@@ -869,12 +867,12 @@ fn is_local_reflect_report(report: &serde_json::Value) -> bool {
 
 /// Render a compact diff view of what the agent has learned this session
 /// vs the last cloud-synced baseline. Auto-populated — reads directly
-/// from `ReplState` without any new plumbing.
+/// from `SessionState` without any new plumbing.
 ///
 /// Output enumerates tool-health entries whose failure rate, call count,
 /// or presence changed since last sync. When nothing changed (e.g. fresh
 /// session) the output is an explicit "no delta" line.
-pub(super) fn render_reflect_diff(state: &super::repl_state::ReplState) -> String {
+pub(super) fn render_reflect_diff(state: &super::session_state::SessionState) -> String {
     use std::collections::HashMap;
     use std::fmt::Write;
 
@@ -1270,7 +1268,7 @@ mod tests {
 
     #[test]
     fn render_reflect_diff_reports_no_delta_on_fresh_session() {
-        let state = super::super::repl_state::ReplState::default();
+        let state = super::super::session_state::SessionState::default();
         let out = super::render_reflect_diff(&state);
         assert!(out.contains("reflect diff"), "header present: {out}");
         assert!(
@@ -1282,7 +1280,7 @@ mod tests {
     #[test]
     fn render_reflect_diff_surfaces_new_and_drifting_tools() {
         use astra_turn_core::tool_health_persistence::ToolHealthEntry;
-        let mut state = super::super::repl_state::ReplState::default();
+        let mut state = super::super::session_state::SessionState::default();
         // Baseline had "grep" at 10 calls / 10% fail.
         state.synced_tool_health_entries = vec![ToolHealthEntry {
             name: "grep".into(),
@@ -1352,9 +1350,9 @@ mod tests {
 
     // ── /undo tests ──
 
-    /// Helper: build a ReplState with N fake turns in history.
-    fn state_with_turns(n: usize) -> ReplState {
-        let mut state = ReplState::default();
+    /// Helper: build a SessionState with N fake turns in history.
+    fn state_with_turns(n: usize) -> SessionState {
+        let mut state = SessionState::default();
         for i in 0..n {
             state
                 .history
@@ -1481,7 +1479,7 @@ mod tests {
 
     #[test]
     fn undo_turn_preview_truncation() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let long_msg = "a".repeat(100);
         state.history.push((long_msg.clone(), "resp".to_string()));
         state.turn = 1;

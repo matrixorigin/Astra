@@ -1,17 +1,17 @@
-use super::{ReplState, StreamResult};
+use super::{SessionState, StreamResult};
 pub(crate) use astra_turn_core::followup_suggestion::FollowupSuggestion;
 #[cfg(test)]
 use astra_turn_core::followup_suggestion::FollowupSuggestionKind;
 
 pub(crate) fn suggest_followup(
     line: &str,
-    state: &ReplState,
+    state: &SessionState,
     result: &StreamResult,
 ) -> Option<FollowupSuggestion> {
     let trimmed = line.trim();
     if trimmed.is_empty()
         || trimmed.starts_with('/')
-        || super::repl_turn::is_short_continuation_prompt(trimmed)
+        || super::chat_turn::is_short_continuation_prompt(trimmed)
         || state.plan_mode.is_some()
         || state.executing_plan.is_some()
         || state.plan_handle.is_some()
@@ -32,8 +32,8 @@ pub(crate) fn suggest_followup(
 mod tests {
     use super::*;
 
-    fn base_state() -> ReplState {
-        ReplState::default()
+    fn base_state() -> SessionState {
+        SessionState::default()
     }
 
     fn base_result(tools_used: Vec<&str>, full_text: &str) -> StreamResult {
@@ -59,12 +59,7 @@ mod tests {
             last_heavy_checkpoint: None,
             ttft_ms: None,
             context_ms: None,
-            selector_strategy: None,
-            selector_ms: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
             memoria_ms: None,
-            selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,

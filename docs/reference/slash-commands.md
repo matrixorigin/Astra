@@ -1,10 +1,10 @@
-# REPL Slash Commands Reference
+# Slash Commands Reference
 
-Complete reference for slash commands available in the `astra interactive` REPL.
+Complete reference for slash commands available in the `astra` TUI.
 
 ## Overview
 
-The REPL supports 62 slash commands organized into 9 groups. Type `/help` to see all available commands, or `/help keys` for keyboard shortcuts.
+astra supports 62 slash commands organized into 9 groups. Type `/help` to see all available commands, or `/help keys` for keyboard shortcuts.
 
 ## Command Groups
 
@@ -79,7 +79,7 @@ Resume a previous session.
 ```
 
 ### `/exit`, `/quit`
-Exit the REPL.
+Exit astra.
 
 ---
 
@@ -478,7 +478,7 @@ Generate a bug report.
 |-----|--------|
 | `Tab` | Command/subcommand completion |
 | `Ctrl+C` | Cancel current input |
-| `Ctrl+D` | Exit REPL |
+| `Ctrl+D` | Exit astra |
 | `Up/Down` | History navigation |
 | `Ctrl+R` | Reverse history search |
 | `Ctrl+L` | Clear screen |

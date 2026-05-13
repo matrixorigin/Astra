@@ -10,7 +10,7 @@ V2 修复了 Ctrl-C 无响应、JSON 解析脆弱等 P0/P1 问题，但遗留了
 | # | 问题 | 类型 |
 |---|------|------|
 | B1 | `should_suggest_plan_mode` 误判分析型问题为可执行 plan | bug |
-| B2 | auto-suggest 使用阻塞 `stdin().read_line`，卡死 REPL | bug/UX |
+| B2 | auto-suggest 使用阻塞 `stdin().read_line`，卡死 TUI | bug/UX |
 | B3 | `is_resume_command` 单 token 过激匹配（`go`/`next`/`继续`） | bug |
 | B4 | `recover_plan_for_resume` 对空 plan 误报 AllCompleted | bug |
 | B5 | `progress_pct` 空 subtasks 返回 100% | bug |
@@ -103,7 +103,7 @@ pub struct ResearchQuestion {
   → PlanModeState::clear_saved_state()  // 清理持久化文件
   → state.executing_plan = Some(plan)   // 后台执行状态
   → spawn_plan_executor(ctx, selector)  // 后台 tokio task
-  → REPL 回到普通 chat
+  → TUI 回到普通 chat
 ```
 
 用户可用 `/plan status` 查看后台进度。进度通过 `flush_plan_updates_between_prompts` 在每次 prompt 间渲染。
@@ -260,5 +260,5 @@ make format && make check && make test-offline
 - `plan_monitor::tests::plan_error_journal_has_stage_and_error_field`
 - `plan_monitor::tests::plan_paused_journal_has_stage_elapsed_ms_and_items`
 - `plan_monitor::tests::cancel_journal_has_stage_cancelled`
-- `repl_runtime::tests::maybe_restore_pending_plan_mode_activates_saved_plan`
-- `repl_runtime::tests::maybe_restore_pending_plan_mode_rejects_workspace_mismatch`
+- `session_runtime::tests::maybe_restore_pending_plan_mode_activates_saved_plan`
+- `session_runtime::tests::maybe_restore_pending_plan_mode_rejects_workspace_mismatch`

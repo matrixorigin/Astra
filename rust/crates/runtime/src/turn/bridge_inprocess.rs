@@ -673,47 +673,6 @@ fn tool_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
         .collect()
 }
 
-fn attach_skill_selector_metric_to_hook_payload(
-    hook_payload: &mut Map<String, Value>,
-    _llm_messages: &[Value],
-    tool_calls: &[Value],
-    skill_selector_shortlist: Option<&Value>,
-) {
-    let Some(session_id) = hook_payload.get("session_id").and_then(Value::as_str) else {
-        return;
-    };
-    let Some(user_id) = hook_payload.get("user_id").and_then(Value::as_str) else {
-        return;
-    };
-    let Some(turn_number) = hook_payload.get("turn_count").and_then(Value::as_i64) else {
-        return;
-    };
-    let Some(shortlist) =
-        skill_selector_shortlist.and_then(parse_skill_selector_shortlist_trace_value)
-    else {
-        return;
-    };
-    let selected_skills = crate::turn::skill_tool::selected_skill_names_from_tool_calls(tool_calls);
-    let Some(metric) = crate::turn::skill_tool::build_turn_skill_selector_metric_record(
-        session_id,
-        user_id,
-        turn_number,
-        Some(&shortlist),
-        &selected_skills,
-    ) else {
-        return;
-    };
-    if let Ok(metric_value) = serde_json::to_value(metric) {
-        hook_payload.insert("skill_selector_metric".to_string(), metric_value);
-    }
-}
-
-fn parse_skill_selector_shortlist_trace_value(
-    value: &Value,
-) -> Option<astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace> {
-    serde_json::from_value(value.clone()).ok()
-}
-
 fn filter_round_edge_tools(edge_tools: &[Value], restricted_tools: &HashSet<String>) -> Vec<Value> {
     if restricted_tools.is_empty() {
         return edge_tools.to_vec();
@@ -924,7 +883,7 @@ impl InProcessChatTurnBridge {
             .get("round_index")
             .and_then(Value::as_i64)
             .unwrap_or(0) as u32;
-        let skill_selector_shortlist = payload.get("skill_selector_shortlist").cloned();
+
         let _agent_id = payload
             .get("agent_id")
             .and_then(Value::as_str)
@@ -1760,12 +1719,10 @@ impl InProcessChatTurnBridge {
                 round_index,
                 &dynamic_sections,
             );
-            // Phase-6/8: compute the session-stable `<deferred_tools>` and
-            // `<available_skills>` blocks from the current surface so the
-            // LLM can discover non-pinned capabilities via
-            // `tool_search(select:NAME)`. Both blocks live in
-            // `CacheScope::Session` inside `bind_project_context`, so a
-            // change flips the cache once then stabilizes.
+            // Compute session-stable skill context. Selector-based
+            // `<deferred_tools>` was removed; skills are surfaced through the
+            // full `<available_skills>` catalog in `CacheScope::Session`, so a
+            // catalog change flips the cache once then stabilizes.
             //
             // `ToolSurfaceConfig` honours the user's `runtime.tool_surface`
             // TOML: pinned_tools additive over defaults; `-name` removes a
@@ -1774,13 +1731,8 @@ impl InProcessChatTurnBridge {
             let surface_cfg = astra_config::runtime_config::RuntimeConfig::cached()
                 .tool_surface
                 .clone();
-            let deferred_block_str = {
-                use crate::tool_registry::surface::ToolSurface;
-                let surface = ToolSurface::build(edge_tools.clone(), &surface_cfg, &[]);
-                crate::prompts::build_deferred_tools_section(&surface)
-                    .map(|s| s.text)
-                    .unwrap_or_default()
-            };
+            let deferred_block_str = String::new();
+            let _ = surface_cfg;
             let skill_block_str = String::new();
             let pipeline_outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome(
                 &tool_names,
@@ -3434,12 +3386,6 @@ impl InProcessChatTurnBridge {
                     false, // run_implicit_feedback = false → triggers feedback
                     false, // run_reflection_learning = false → triggers reflection
                 );
-                attach_skill_selector_metric_to_hook_payload(
-                    &mut hook_payload,
-                    &llm_messages,
-                    &all_round_tool_calls,
-                    skill_selector_shortlist.as_ref(),
-                );
                 if is_correction_turn {
                     hook_payload.insert(
                         "is_correction".to_string(),
@@ -4196,147 +4142,6 @@ mod tests {
                 "empty input must yield empty output for {prov}/{model}",
             );
         }
-    }
-
-    #[test]
-    fn attach_skill_selector_metric_uses_structured_shortlist() {
-        let request_messages = vec![json!({
-            "role": "user",
-            "content": "deploy the service"
-        })];
-        let tool_calls = vec![json!({
-            "id": "call-1",
-            "type": "function",
-            "function": {
-                "name": "skill",
-                "arguments": "{\"skill_name\":\"deploy\"}"
-            }
-        })];
-        let llm_messages = vec![request_messages[0].clone()];
-        let shortlist = json!({
-            "open_catalog": true,
-            "visible_skill_count": 2,
-            "skills": [
-                {
-                    "rank": 1,
-                    "skill_name": "build",
-                    "aliases": [],
-                    "description": "Build artifacts",
-                    "source": "test"
-                },
-                {
-                    "rank": 2,
-                    "skill_name": "deploy",
-                    "aliases": [],
-                    "description": "Deploy the service",
-                    "source": "test"
-                }
-            ],
-            "telemetry": {
-                "selector_tier": "lexical",
-                "elapsed_ms": 1,
-                "total_catalog_size": 2
-            }
-        });
-        let mut hook_payload = astra_turn_core::tail_persist::build_turn_hook_args(
-            "user-1",
-            "session-1",
-            &request_messages,
-            &[],
-            "",
-            &tool_calls,
-            None,
-            None,
-            None,
-            Some("parent-1"),
-            7,
-            None,
-            false,
-            false,
-            false,
-            false,
-        );
-
-        attach_skill_selector_metric_to_hook_payload(
-            &mut hook_payload,
-            &llm_messages,
-            &tool_calls,
-            Some(&shortlist),
-        );
-
-        let metric = hook_payload
-            .get("skill_selector_metric")
-            .cloned()
-            .expect("metric should be attached");
-        assert_eq!(metric["turn_number"], 7);
-        assert_eq!(metric["visible_skill_count"], 2);
-        assert_eq!(metric["best_chosen_rank"], 2);
-    }
-
-    #[test]
-    fn attach_skill_selector_metric_prefers_payload_shortlist_telemetry() {
-        let tool_calls = vec![json!({
-            "id": "call-1",
-            "type": "function",
-            "function": {
-                "name": "skill",
-                "arguments": "{\"skill_name\":\"deploy\"}"
-            }
-        })];
-        let llm_messages = vec![json!({
-            "role": "system",
-            "content": "<available_skills>\n<skill>\n  <name>deploy</name>\n  <description>Deploy the service</description>\n</skill>\n</available_skills>"
-        })];
-        let shortlist = serde_json::json!({
-            "open_catalog": true,
-            "visible_skill_count": 1,
-            "skills": [{
-                "rank": 1,
-                "skill_name": "deploy",
-                "aliases": [],
-                "description": "Deploy the service",
-                "source": "test"
-            }],
-            "telemetry": {
-                "selector_tier": "embedding",
-                "elapsed_ms": 42,
-                "total_catalog_size": 1000,
-                "extra": {"ranked_pool": 100}
-            }
-        });
-        let mut hook_payload = astra_turn_core::tail_persist::build_turn_hook_args(
-            "user-1",
-            "session-1",
-            &[],
-            &[],
-            "",
-            &tool_calls,
-            None,
-            None,
-            None,
-            Some("parent-1"),
-            7,
-            None,
-            false,
-            false,
-            false,
-            false,
-        );
-
-        attach_skill_selector_metric_to_hook_payload(
-            &mut hook_payload,
-            &llm_messages,
-            &tool_calls,
-            Some(&shortlist),
-        );
-
-        let metric = hook_payload
-            .get("skill_selector_metric")
-            .expect("metric should be attached");
-        assert_eq!(metric["selector_tier"], "embedding");
-        assert_eq!(metric["elapsed_ms"], 42);
-        assert_eq!(metric["total_catalog_size"], 1000);
-        assert_eq!(metric["extra"]["ranked_pool"], 100);
     }
 
     #[test]

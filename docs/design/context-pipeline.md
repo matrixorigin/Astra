@@ -721,7 +721,7 @@ pub struct EmergentContext {
 
     /// Attachment-style context from tool execution side-effects.
     /// Types: edited_text_file, skill_discovery, queued_command,
-    /// memory, mcp_resources, deferred_tools.
+    /// memory, mcp_resources.
     /// Cap: 16 attachments per turn.
     pub attachments: Vec<EmergentItem<Attachment>>,
 }
@@ -1462,7 +1462,7 @@ impl ContextPipeline {
 
 **Alert routing**: Alerts are not exceptions — they don't stop the pipeline. They flow to:
 1. **Trace log** (always) — every alert is part of the turn's trace record
-2. **Session UI** (Warning+) — surfaced in the REPL or admin dashboard
+2. **Session UI** (Warning+) — surfaced in the TUI or admin dashboard
 3. **Telemetry** (Error) — sent to observability backend for aggregation
 4. **Auto-recovery** (Error, specific rules) — Recovery loop alert triggers automatic escalation in the next Plan phase
 

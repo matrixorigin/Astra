@@ -8,7 +8,7 @@
 use super::*;
 
 /// Handle `/messaging [subcommand]` command.
-pub(super) fn handle_messaging_command(arg: &str, state: &ReplState) {
+pub(super) fn handle_messaging_command(arg: &str, state: &SessionState) {
     let parts: Vec<&str> = arg.split_whitespace().collect();
     let subcmd = parts.first().copied().unwrap_or("");
 
@@ -26,7 +26,7 @@ pub(super) fn handle_messaging_command(arg: &str, state: &ReplState) {
     }
 }
 
-fn show_metrics(state: &ReplState) {
+fn show_metrics(state: &SessionState) {
     // Check if we have messaging metrics in the shared runtime.
     if let Some(ref metrics) = state.messaging_metrics {
         let snap = metrics.snapshot();
@@ -126,7 +126,7 @@ fn show_metrics(state: &ReplState) {
     }
 }
 
-fn show_dlq(state: &ReplState) {
+fn show_dlq(state: &SessionState) {
     if let Some(ref dlq) = state.dead_letter_queue {
         let rt = tokio::runtime::Handle::try_current();
         if let Ok(rt) = rt {
@@ -203,7 +203,7 @@ fn show_dlq(state: &ReplState) {
     }
 }
 
-fn show_status(state: &ReplState) {
+fn show_status(state: &SessionState) {
     eprintln!("\n  {}", "📬 Mailbox Status".blue().bold());
     eprintln!("  {}", "─".repeat(40).dim());
 

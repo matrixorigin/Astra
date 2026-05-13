@@ -694,7 +694,6 @@ mod error_recovery_integration {
 
 mod chat_stream_turnguard_e2e {
     use astra_runtime::pipeline::persistence::ToolHealthEntry;
-    use astra_runtime::tool_selector::ToolSelector;
     use astra_runtime::turn::result_quality::ResultQuality;
     use astra_turn_core::tool_health::ToolHealthTracker;
     use astra_turn_core::turn_guard::{TurnGuard, TurnVerdict, VerdictSeverity};
@@ -1500,89 +1499,6 @@ mod chat_stream_turnguard_e2e {
 
     // ── Cross-session health restore → selector-level exclusion ──
 
-    /// Full lifecycle: session 1 deprioritizes a tool → export → session 2 restores →
-    /// deprioritized tool appears in restricted_tools → TfIdfSelector excludes it.
-    #[tokio::test]
-    async fn cross_session_deprioritized_tool_excluded_from_selector() {
-        use astra_runtime::tool_registry::ToolRegistry;
-        use astra_runtime::tool_selector::{SelectionContext, TfIdfSelector};
-
-        // --- Session 1: tool fails and gets deprioritized ---
-        let mut guard1 = TurnGuard::new();
-        for _ in 0..8 {
-            guard1.record_tool_result("github_ci_status", "Error: API rate limit exceeded");
-        }
-        assert!(
-            guard1.health.is_deprioritized("github_ci_status"),
-            "8 consecutive failures should deprioritize"
-        );
-
-        // Export health state (would be persisted to disk/cloud)
-        let exported = guard1.health.export();
-        assert!(
-            !exported.is_empty(),
-            "export should include the deprioritized tool"
-        );
-        let ci_entry = exported
-            .iter()
-            .find(|e| e.name == "github_ci_status")
-            .unwrap();
-        assert!(ci_entry.failure_rate >= 0.7, "failure rate should be high");
-
-        // --- Session 2: restore from exported health ---
-        let tracker2 = ToolHealthTracker::from_entries(&exported);
-        let guard2 = TurnGuard::with_health(tracker2);
-        assert!(
-            guard2.health.is_deprioritized("github_ci_status"),
-            "restored tracker should start with tool deprioritized"
-        );
-
-        // Proactive seeding: deprioritized_tools → restricted_tools (mirrors chat_stream.rs)
-        let restricted: Vec<String> = guard2
-            .health
-            .deprioritized_tools()
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert!(restricted.contains(&"github_ci_status".to_string()));
-
-        // TfIdfSelector should exclude the restricted tool
-        let schemas: Vec<serde_json::Value> = astra_runtime::tool_registry::TOOL_CATALOG
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": {"type": "object", "properties": {}}
-                    }
-                })
-            })
-            .collect();
-        let registry = ToolRegistry::new(schemas);
-        let selector = TfIdfSelector::new(registry);
-        let ctx = SelectionContext {
-            query: "check github CI status for latest commit",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 1200,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: restricted,
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-        let result = selector.select(&ctx).await;
-        assert!(
-            !result.tool_names.contains(&"github_ci_status".to_string()),
-            "deprioritized tool from prior session should be excluded: {:?}",
-            result.tool_names
-        );
-    }
-
     /// Cross-session restore with low failure rate does NOT deprioritize (benefit of doubt).
     #[test]
     fn cross_session_low_failure_rate_not_deprioritized() {
@@ -1666,101 +1582,6 @@ mod chat_stream_turnguard_e2e {
             !restricted.contains(&"github_list_prs".to_string()),
             "rehabilitated tool should not be in restricted list"
         );
-    }
-
-    /// Multiple tools with mixed health: only the truly unreliable ones are restricted.
-    #[tokio::test]
-    async fn cross_session_mixed_health_selective_exclusion() {
-        use astra_runtime::tool_registry::ToolRegistry;
-        use astra_runtime::tool_selector::{SelectionContext, TfIdfSelector};
-
-        let entries = vec![
-            ToolHealthEntry {
-                name: "github_ci_status".to_string(),
-                total_calls: 10,
-                total_failures: 9,
-                failure_rate: 0.9,
-                last_updated_epoch: 0,
-                recent_outcomes: vec![],
-            },
-            ToolHealthEntry {
-                name: "github_list_prs".to_string(),
-                total_calls: 15,
-                total_failures: 2,
-                failure_rate: 0.133,
-                last_updated_epoch: 0,
-                recent_outcomes: vec![],
-            },
-            ToolHealthEntry {
-                name: "git_log".to_string(),
-                total_calls: 20,
-                total_failures: 0,
-                failure_rate: 0.0,
-                last_updated_epoch: 0,
-                recent_outcomes: vec![],
-            },
-        ];
-        let tracker = ToolHealthTracker::from_entries(&entries);
-        let guard = TurnGuard::with_health(tracker);
-
-        let restricted: Vec<String> = guard
-            .health
-            .deprioritized_tools()
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        // Only github_ci_status should be restricted (90% failure, 10 calls)
-        assert!(
-            restricted.contains(&"github_ci_status".to_string()),
-            "90% failure tool should be restricted"
-        );
-        assert!(
-            !restricted.contains(&"github_list_prs".to_string()),
-            "13% failure tool should NOT be restricted"
-        );
-        assert!(
-            !restricted.contains(&"git_log".to_string()),
-            "0% failure tool should NOT be restricted"
-        );
-
-        // Selector proof: query that matches all three GitHub tools
-        let schemas: Vec<serde_json::Value> = astra_runtime::tool_registry::TOOL_CATALOG
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": {"type": "object", "properties": {}}
-                    }
-                })
-            })
-            .collect();
-        let registry = ToolRegistry::new(schemas);
-        let selector = TfIdfSelector::new(registry);
-        let ctx = SelectionContext {
-            query: "show github PR status and CI",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 1200,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: restricted,
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-        let result = selector.select(&ctx).await;
-        assert!(
-            !result.tool_names.contains(&"github_ci_status".to_string()),
-            "high-failure tool excluded from selection: {:?}",
-            result.tool_names
-        );
-        // github_list_prs should still be available (if it scores high enough)
-        // git_log should still be available (if it scores high enough)
     }
 
     /// Export → import round-trip preserves failure statistics accurately.

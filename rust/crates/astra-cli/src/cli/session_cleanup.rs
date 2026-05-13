@@ -1,6 +1,6 @@
 //! Session finalization.
 //!
-//! This module handles cleanup tasks when a REPL session ends:
+//! This module handles cleanup tasks when an interactive session ends:
 //! - Writing session end journal events
 //! - Finalizing workspace state
 //! - Ending observability sessions
@@ -11,15 +11,83 @@
 //! stored in Memoria as L3 durable memory (Session Memory Protocol §6.2).
 
 use astra_services::session_journal;
+use crossterm::style::Stylize;
 use std::time::Duration;
 
-use super::ReplState;
+use super::SessionState;
+use super::auth_flow::clear_profile_last_session;
+use super::chat_turn::enqueue_ingestion_pub;
+use super::cli_utils::prefix_chars;
 use super::edge_tools;
-use super::repl_turn::enqueue_ingestion_pub;
-use super::session_guard::clear_panic_guard;
+use super::session_guard::{ShutdownSignal, clear_panic_guard};
 
-/// Finalize a REPL session: journal end event, persist state, extract learnings.
-pub(super) async fn finalize_session(state: &mut ReplState) {
+/// Why the interactive session is exiting. Drives two user-visible
+/// decisions in `finalize_session_exit`:
+///   * whether to print the "Session … saved. To resume: …" hint
+///   * whether to clear `last_session_id` from the credentials file
+///     (so the next `astra` launch does NOT auto-resume into this sid)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionExit {
+    /// User typed `/exit` / `/quit` (or any slash command that returned
+    /// the exit sentinel).
+    Command,
+    /// Ctrl-D / ESC at idle composer — true EOF. The user is walking
+    /// away from this session intentionally, so clear `last_session_id`.
+    Eof,
+    /// Ctrl-C at idle. Treated like a "cancel" rather than EOF: the
+    /// session is saved (and resumable via the hint) but
+    /// `last_session_id` stays put so a plain `astra` reattaches.
+    Interrupt,
+    /// `--max-budget` reached during a turn.
+    BudgetLimit,
+    /// SIGTERM / SIGHUP received.
+    Shutdown(ShutdownSignal),
+    /// The TUI loop bailed with an error (terminal draw failure, etc.).
+    /// Session stays addressable so the user can investigate and
+    /// `astra` reattaches on next launch.
+    Error,
+}
+
+/// Run the full session-end pipeline and the user-visible exit bits
+/// (resume hint, `last_session_id` reset on EOF).
+pub(crate) async fn finalize_session_exit(
+    state: &mut SessionState,
+    profile: Option<&str>,
+    reason: SessionExit,
+) {
+    finalize_session(state).await;
+
+    if should_show_resume_hint(reason)
+        && state.turn > 0
+        && let Some(ref sid) = state.session_id
+    {
+        let short = prefix_chars(sid, 8);
+        eprintln!(
+            "{}",
+            format!("  Session {short}… saved. To resume: /resume {sid}").dim()
+        );
+    }
+
+    if should_clear_last_session_id(reason) && state.session_id.is_some() {
+        let _ = clear_profile_last_session(profile);
+    }
+}
+
+fn should_show_resume_hint(reason: SessionExit) -> bool {
+    // Error path skips the hint: the loop crashed, so we don't want to
+    // imply the session is in a clean resumable state.
+    !matches!(reason, SessionExit::Error)
+}
+
+fn should_clear_last_session_id(reason: SessionExit) -> bool {
+    // Only true EOF clears the persisted "last session". Ctrl-C, `/exit`,
+    // budget cap, signals, and errors all leave it alone so the next
+    // `astra` launch reattaches.
+    matches!(reason, SessionExit::Eof)
+}
+
+/// Finalize a session: journal end event, persist state, extract learnings.
+pub(super) async fn finalize_session(state: &mut SessionState) {
     // 0. Drain any background session-memory extraction worker still in
     //    flight from the final turn, then forget per-session debounce
     //    state so the service doesn't leak it. Without the drain, the
@@ -183,4 +251,39 @@ pub(super) async fn finalize_session(state: &mut ReplState) {
     }
     // 6. Clear panic guard
     clear_panic_guard();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_hint_is_shown_for_graceful_exit_paths() {
+        assert!(should_show_resume_hint(SessionExit::Command));
+        assert!(should_show_resume_hint(SessionExit::Eof));
+        assert!(should_show_resume_hint(SessionExit::Interrupt));
+        assert!(should_show_resume_hint(SessionExit::BudgetLimit));
+        assert!(should_show_resume_hint(SessionExit::Shutdown(
+            ShutdownSignal::Sigterm
+        )));
+        assert!(should_show_resume_hint(SessionExit::Shutdown(
+            ShutdownSignal::Sighup
+        )));
+        assert!(!should_show_resume_hint(SessionExit::Error));
+    }
+
+    #[test]
+    fn only_eof_clears_last_session_id() {
+        assert!(should_clear_last_session_id(SessionExit::Eof));
+        assert!(!should_clear_last_session_id(SessionExit::Interrupt));
+        assert!(!should_clear_last_session_id(SessionExit::Command));
+        assert!(!should_clear_last_session_id(SessionExit::BudgetLimit));
+        assert!(!should_clear_last_session_id(SessionExit::Shutdown(
+            ShutdownSignal::Sigterm
+        )));
+        assert!(!should_clear_last_session_id(SessionExit::Shutdown(
+            ShutdownSignal::Sighup
+        )));
+        assert!(!should_clear_last_session_id(SessionExit::Error));
+    }
 }

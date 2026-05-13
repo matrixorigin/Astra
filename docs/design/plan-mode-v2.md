@@ -99,7 +99,7 @@ pub enum GenerateOutcome {
 
 /// 可取消的 plan 生成。
 ///
-/// 在 REPL 调用侧:
+/// 在 TUI 调用侧:
 /// ```
 /// let cancel = CancellationToken::new();
 /// tokio::select! {

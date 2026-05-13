@@ -5,7 +5,7 @@ use crate::{current_access_token, initialize_multi_agent_runtime, post_auth_clou
 async fn refresh_auth_runtime(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    state: &mut super::ReplState,
+    state: &mut super::SessionState,
 ) {
     if let Some(token) = current_access_token(profile) {
         clear_auth_runtime(state);
@@ -13,14 +13,14 @@ async fn refresh_auth_runtime(
     }
 }
 
-fn clear_auth_runtime(state: &mut super::ReplState) {
+fn clear_auth_runtime(state: &mut super::SessionState) {
     state.delegation_engine = None;
     state.agent_spawner = None;
     state.root_mailbox = None;
     state.pending_idle_agent_messages.clear();
 }
 
-fn clear_local_auth_state(profile: Option<&str>, state: &mut super::ReplState) {
+fn clear_local_auth_state(profile: Option<&str>, state: &mut super::SessionState) {
     let _ = crate::auth_flow::clear_profile_auth(profile);
     clear_auth_runtime(state);
 }
@@ -30,7 +30,7 @@ pub(super) async fn handle_account_command(
     arg: &str,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    state: &mut super::ReplState,
+    state: &mut super::SessionState,
 ) -> Result<(), String> {
     match cmd {
         "/register" => {
@@ -118,7 +118,7 @@ mod tests {
         super::save_credentials(&creds).unwrap();
 
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let mut state = super::ReplState::default();
+        let mut state = super::SessionState::default();
         let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
             std::sync::Arc::new(astra_messaging::InProcessTransport::new()),
             std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new()),
@@ -150,7 +150,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_auth_runtime_drops_multi_agent_runtime() {
-        let mut state = super::ReplState::default();
+        let mut state = super::SessionState::default();
         state.delegation_engine = Some(std::sync::Arc::new(
             astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
                 std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -217,7 +217,7 @@ mod tests {
         );
         super::save_credentials(&creds).unwrap();
 
-        let mut state = super::ReplState::default();
+        let mut state = super::SessionState::default();
         state.delegation_engine = Some(std::sync::Arc::new(
             astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
                 std::sync::Arc::new(tokio::sync::RwLock::new(

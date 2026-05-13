@@ -2,7 +2,7 @@
 use super::*;
 
 #[cfg(feature = "harness")]
-pub(super) fn handle_inspect_command(arg: &str, state: &ReplState) {
+pub(super) fn handle_inspect_command(arg: &str, state: &SessionState) {
     use astra_harness::SnapshotSink;
 
     let snapshot = match state.harness_sink.latest() {
@@ -111,7 +111,7 @@ pub(super) fn format_snapshot_summary(s: &astra_harness::RuntimeSnapshot) -> Str
 }
 
 #[cfg(not(feature = "harness"))]
-pub(super) fn handle_inspect_command(_arg: &str, _state: &ReplState) {
+pub(super) fn handle_inspect_command(_arg: &str, _state: &SessionState) {
     eprintln!(
         "{}",
         "  Harness feature is disabled. Rebuild with `--features harness` to enable /inspect."
@@ -195,7 +195,7 @@ fn print_tools(s: &astra_harness::RuntimeSnapshot) {
 }
 
 #[cfg(feature = "harness")]
-fn print_history(state: &ReplState, n: usize) {
+fn print_history(state: &SessionState, n: usize) {
     use astra_harness::SnapshotSink;
 
     let history = state.harness_sink.history(n);
@@ -234,7 +234,7 @@ fn print_history(state: &ReplState, n: usize) {
 }
 
 #[cfg(feature = "harness")]
-fn print_diff(state: &ReplState) {
+fn print_diff(state: &SessionState) {
     use astra_harness::{SnapshotDiff, SnapshotSink};
 
     let history = state.harness_sink.history(2);
@@ -314,7 +314,7 @@ fn format_tokens(n: u64) -> String {
 }
 
 #[cfg(feature = "harness")]
-fn print_trace(state: &ReplState) {
+fn print_trace(state: &SessionState) {
     let trace = match state.harness_trace.read() {
         Ok(t) => t,
         Err(_) => {
@@ -359,7 +359,7 @@ fn print_trace(state: &ReplState) {
 }
 
 #[cfg(feature = "harness")]
-fn print_forensics(state: &ReplState) {
+fn print_forensics(state: &SessionState) {
     let trace = match state.harness_trace.read() {
         Ok(t) => t,
         Err(_) => {
@@ -426,7 +426,7 @@ fn print_forensics(state: &ReplState) {
 }
 
 #[cfg(feature = "harness")]
-fn export_trace(state: &ReplState, path_arg: &str) {
+fn export_trace(state: &SessionState, path_arg: &str) {
     let trace = match state.harness_trace.read() {
         Ok(t) => t,
         Err(_) => {

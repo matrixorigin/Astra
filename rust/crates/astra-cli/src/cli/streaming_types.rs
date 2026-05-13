@@ -98,17 +98,8 @@ pub(crate) struct StreamResult {
     pub(crate) ttft_ms: Option<u64>,
     /// Context assembly time in milliseconds.
     pub(crate) context_ms: Option<u64>,
-    /// Tool selection strategy used.
-    pub(crate) selector_strategy: Option<String>,
-    /// Tool selection time in milliseconds (subset of context_ms).
-    pub(crate) selector_ms: Option<u64>,
-    /// LLM tokens consumed by tool selector (0 if TF-IDF only).
-    pub(crate) selector_tokens_in: u64,
-    pub(crate) selector_tokens_out: u64,
     /// Memoria search time in milliseconds (subset of context_ms).
     pub(crate) memoria_ms: Option<u64>,
-    /// First tool-selection confidence (0.0–1.0) from the agentic loop prep pass.
-    pub(crate) selector_confidence: Option<f64>,
     /// Routing domain label for this user line (filled in REPL when writing the journal row).
     pub(crate) routing_domain_hint: Option<String>,
     /// Entity graph skipped learning: success with tools but no routing domain.

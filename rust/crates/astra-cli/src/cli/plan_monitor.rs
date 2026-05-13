@@ -5,7 +5,7 @@ use crate::cli_formatting;
 use crate::durable_bridge;
 use crate::effects;
 use crate::plan_executor;
-use crate::repl_state::ReplState;
+use crate::session_state::SessionState;
 use crate::stream_render;
 use crate::streaming_md;
 use crate::theme;
@@ -101,7 +101,7 @@ pub(crate) fn format_duration_short(d: std::time::Duration) -> String {
 
 /// Emit a structured plan-lifecycle journal event with common counters.
 ///
-/// Takes individual field refs instead of `&ReplState` so callers inside
+/// Takes individual field refs instead of `&SessionState` so callers inside
 /// `while let Some(update) = handle.try_recv()` (which holds a mutable
 /// borrow on `state.plan_handle`) can still call this without conflicting.
 fn emit_plan_lifecycle_event(
@@ -164,7 +164,7 @@ impl PlanSpinner {
 /// `eprintln!`. Returns the monitor outcome so the caller can decide
 /// whether to keep polling.
 fn display_plan_updates_live(
-    state: &mut ReplState,
+    state: &mut SessionState,
     plan_spinner: &mut Option<PlanSpinner>,
     current_subtask_tag: &mut String,
 ) -> PlanMonitorOutcome {
@@ -746,8 +746,8 @@ fn display_plan_updates_live(
     outcome
 }
 
-/// Push latest plan progress to [`ReplState::task_service`] for `/task list`.
-pub(crate) async fn sync_plan_run_task_progress(state: &mut ReplState) {
+/// Push latest plan progress to [`SessionState::task_service`] for `/task list`.
+pub(crate) async fn sync_plan_run_task_progress(state: &mut SessionState) {
     let Some(ref tid) = state.plan_run_task_id else {
         return;
     };
@@ -762,7 +762,7 @@ pub(crate) async fn sync_plan_run_task_progress(state: &mut ReplState) {
 }
 
 /// Terminal sync: `/task list` stays `pending` unless we mark the row completed here.
-pub(crate) async fn finalize_plan_run_task_after_executor(state: &mut ReplState) {
+pub(crate) async fn finalize_plan_run_task_after_executor(state: &mut SessionState) {
     let Some(tid) = state.plan_run_task_id.clone() else {
         return;
     };
@@ -790,7 +790,7 @@ pub(crate) async fn finalize_plan_run_task_after_executor(state: &mut ReplState)
 }
 
 /// Returns `true` when the executor sent a terminal event (`PlanCompleted` / `PlanError`).
-pub(crate) fn flush_plan_updates_between_prompts(state: &mut ReplState) -> bool {
+pub(crate) fn flush_plan_updates_between_prompts(state: &mut SessionState) -> bool {
     if state.plan_handle.is_none() {
         return false;
     }
@@ -806,7 +806,7 @@ pub(crate) fn flush_plan_updates_between_prompts(state: &mut ReplState) -> bool 
 
 /// Clear REPL state when the plan update channel closed without `PlanCompleted` / `PlanError`.
 /// Emits structured journal events so the failure is observable in telemetry.
-fn cleanup_orphan_plan_executor(state: &mut ReplState, plan_spinner: &mut Option<PlanSpinner>) {
+fn cleanup_orphan_plan_executor(state: &mut SessionState, plan_spinner: &mut Option<PlanSpinner>) {
     if let Some(s) = plan_spinner.take() {
         s.stop_clear();
     }
@@ -842,7 +842,7 @@ fn cleanup_orphan_plan_executor(state: &mut ReplState, plan_spinner: &mut Option
                 done,
             );
             let _ = journal.append(&event);
-            super::repl_turn::enqueue_ingestion_pub(state, &event);
+            super::chat_turn::enqueue_ingestion_pub(state, &event);
         }
         // 2. interruption_recorded for the crash
         let interruption = astra_services::session_journal::JournalEvent::interruption_recorded(
@@ -855,7 +855,7 @@ fn cleanup_orphan_plan_executor(state: &mut ReplState, plan_spinner: &mut Option
             }),
         );
         let _ = journal.append(&interruption);
-        super::repl_turn::enqueue_ingestion_pub(state, &interruption);
+        super::chat_turn::enqueue_ingestion_pub(state, &interruption);
     }
 
     state.executing_plan = None;
@@ -874,7 +874,7 @@ fn cleanup_orphan_plan_executor(state: &mut ReplState, plan_spinner: &mut Option
 /// Replaces the old "fire and forget" background model: the user cannot type
 /// at the prompt while a plan is running. First Ctrl+C sends Pause; a second
 /// Ctrl-C within two seconds sends Cancel. Approval prompts are read from stdin inline.
-pub(crate) async fn run_blocking_plan_monitor(state: &mut ReplState) {
+pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
     let mut plan_spinner: Option<PlanSpinner> = None;
     let mut current_subtask_tag = state.current_plan_subtask_id.clone().unwrap_or_default();
     let mut last_ctrl_c: Option<std::time::Instant> = None;
@@ -997,7 +997,7 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut ReplState) {
 
 /// Apply a single trailing update from the plan executor channel.
 /// Called when draining remaining messages after PlanCompleted/PlanError.
-fn apply_trailing_update(update: plan_executor::PlanUpdate, state: &mut ReplState) {
+fn apply_trailing_update(update: plan_executor::PlanUpdate, state: &mut SessionState) {
     use plan_executor::PlanUpdate;
     match update {
         PlanUpdate::HistoryEntry {
@@ -1044,7 +1044,7 @@ fn apply_trailing_update(update: plan_executor::PlanUpdate, state: &mut ReplStat
 /// Update all in-memory plan copies so background execution stays observable
 /// after plan mode exits.
 fn sync_subtask_status(
-    state: &mut ReplState,
+    state: &mut SessionState,
     subtask_id: &str,
     status: astra_services::task_orchestrator::TaskStatus,
 ) {
@@ -1067,7 +1067,7 @@ mod tests {
 
     #[test]
     fn flush_plan_updates_syncs_status_into_executing_plan() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.executing_plan = Some(TaskPlan {
             subtasks: vec![SubtaskPlan {
                 id: "s1".into(),
@@ -1126,7 +1126,7 @@ mod tests {
     fn plan_completed_journal_has_stage_and_elapsed_ms() {
         let sid = format!("test-plan-completed-{}", std::process::id());
         let (writer, path) = make_test_journal(&sid);
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.journal = Some(writer);
         state.executing_plan = Some(TaskPlan {
             subtasks: vec![SubtaskPlan {
@@ -1164,7 +1164,7 @@ mod tests {
     fn plan_error_journal_has_stage_and_error_field() {
         let sid = format!("test-plan-error-{}", std::process::id());
         let (writer, path) = make_test_journal(&sid);
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.journal = Some(writer);
         state.executing_plan = Some(TaskPlan {
             subtasks: vec![SubtaskPlan {
@@ -1200,7 +1200,7 @@ mod tests {
     fn plan_paused_journal_has_stage_elapsed_ms_and_items() {
         let sid = format!("test-plan-paused-{}", std::process::id());
         let (writer, path) = make_test_journal(&sid);
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.journal = Some(writer);
         state.executing_plan = Some(TaskPlan {
             subtasks: vec![

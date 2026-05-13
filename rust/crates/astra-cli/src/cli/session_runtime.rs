@@ -1,20 +1,20 @@
 use super::*;
 
-pub(super) fn create_tool_selector(
+pub(super) fn create_pipeline_modules(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
-    create_tool_selector_with_quality(api, profile, None, None)
+) -> PipelineModules {
+    create_pipeline_modules_inner(api, profile, true)
 }
 
-pub(super) fn create_tool_selector_quiet(
+pub(crate) fn create_pipeline_modules_quiet(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
-    create_tool_selector_with_quality_internal(api, profile, None, None, false)
+) -> PipelineModules {
+    create_pipeline_modules_inner(api, profile, false)
 }
 
-/// Shared runtime modules created during tool-selector construction.
+/// Shared runtime modules created during pipeline construction.
 ///
 /// Holds the unified skill registry, MCP client manager, and skill-watcher
 /// handle so the REPL can wire them into its shared state after startup.
@@ -27,53 +27,13 @@ pub(super) struct PipelineModules {
     pub _skill_watcher: Option<astra_runtime::skills::watcher::SkillWatcherHandle>,
 }
 
-pub(super) fn create_tool_selector_with_quality(
+fn create_pipeline_modules_inner(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    quality_tracker: Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
-    confidence_calibrator: Option<
-        std::sync::Arc<astra_turn_core::routing_metrics::ConfidenceCalibrator>,
-    >,
-) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
-    create_tool_selector_with_quality_internal(
-        api,
-        profile,
-        quality_tracker,
-        confidence_calibrator,
-        true,
-    )
-}
-
-fn create_tool_selector_with_quality_internal(
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    quality_tracker: Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
-    confidence_calibrator: Option<
-        std::sync::Arc<astra_turn_core::routing_metrics::ConfidenceCalibrator>,
-    >,
     _announce_skills: bool,
-) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
-    let all_schemas =
-        astra_runtime::capabilities::cli_local_tool_schemas(edge_tools::all_tool_schemas(), vec![]);
-    // spawn_agent, get_agent_result, send_message are now consolidated into
-    // the `agent` tool schema (actions: spawn, get_result, send_message).
-    // Individual schemas kept only for backward compat in the executor dispatch.
-    // The `skill` tool is dynamically injected by the agentic loop
-    // (skill_tool::skill_tool_schema) based on discovered skills each turn.
-    let mut registry = tool_registry::ToolRegistry::new(all_schemas);
-
-    // Load skill manifests from skills/ directory and register plugin tools
-    let mut plugin_registry = tool_registry::PluginRegistry::new();
-    manifest_loader::load_skills_directory(&mut plugin_registry);
-    registry.register_plugins(&plugin_registry);
-
-    let mut tfidf = tool_selector::TfIdfSelector::new(registry);
-    if let Some(qt) = quality_tracker {
-        tfidf = tfidf.with_quality_tracker(qt);
-    }
-    if let Some(cal) = confidence_calibrator {
-        tfidf = tfidf.with_confidence_calibrator(cal);
-    }
+) -> PipelineModules {
+    // Selector removed — tool schemas are now sent in full to the LLM each turn
+    // via edge_tools::all_tool_schemas(). No registry/selector state to build here.
 
     // Initialize the local CLI capability catalog.
     //
@@ -185,37 +145,11 @@ fn create_tool_selector_with_quality_internal(
         .and_then(|p| p.access_token.as_ref())
         .cloned();
 
-    let modules = PipelineModules {
+    PipelineModules {
         unified_skill_registry,
         mcp_manager,
         _skill_watcher: skill_watcher,
-    };
-
-    // TF-IDF selector only — no LLM-based tool selection.
-    // The previous FallbackSelector(LLM, TfIdf) added an extra LLM API call per turn
-    // just to pick tools, adding 10-80s latency depending on the model. TF-IDF is
-    // fast (<1ms), deterministic, and works well for all common query patterns.
-    // Skill activation is handled by the `skill` tool in the agentic loop.
-    let selector: Box<dyn tool_selector::ToolSelector> = Box::new(tfidf);
-
-    (selector, modules)
-}
-
-/// Tool selector for background plan execution.
-///
-/// Uses TF-IDF selector only — no LLM-based tool selection (same as foreground REPL).
-pub(crate) fn create_background_plan_selector(
-    _ctx: &crate::plan_executor::BackgroundPlanContext,
-) -> Box<dyn tool_selector::ToolSelector> {
-    let all_schemas =
-        astra_runtime::capabilities::cli_local_tool_schemas(edge_tools::all_tool_schemas(), vec![]);
-    let mut registry = tool_registry::ToolRegistry::new(all_schemas);
-    let mut plugin_registry = tool_registry::PluginRegistry::new();
-    manifest_loader::load_skills_directory(&mut plugin_registry);
-    registry.register_plugins(&plugin_registry);
-
-    let tfidf = tool_selector::TfIdfSelector::new(registry);
-    Box::new(tfidf)
+    }
 }
 
 /// Quick check whether the server has at least one LLM model configured.
@@ -444,30 +378,11 @@ pub(super) async fn attempt_token_refresh(
     }
 }
 
-pub(super) fn build_repl_editor() -> Result<(Editor<ReplHelper, FileHistory>, PathBuf), String> {
-    let hist_path = history_path();
-    if let Some(parent) = hist_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let config = Config::builder()
-        .completion_type(CompletionType::List)
-        .build();
-    let mut editor: Editor<ReplHelper, FileHistory> =
-        Editor::with_config(config).map_err(|e| e.to_string())?;
-    editor.set_helper(Some(ReplHelper));
-    editor.bind_sequence(
-        RlEvent::Any,
-        RlEventHandler::Conditional(Box::new(SlashStartCompleteHandler)),
-    );
-    let _ = editor.load_history(&hist_path);
-    Ok((editor, hist_path))
-}
-
-pub(crate) fn initialize_repl_state(
+pub(crate) fn initialize_session_state(
     profile: Option<&str>,
     initial_model: Option<&str>,
-) -> ReplState {
-    let mut state = ReplState::default();
+) -> SessionState {
+    let mut state = SessionState::default();
     state.pending_recovery = detect_pending_recovery_session(profile);
     state.pending_plan_resume_digest = detect_pending_plan_resume_digest();
     if let Some(m) = initial_model {
@@ -503,7 +418,7 @@ pub(crate) fn initialize_repl_state(
             .unwrap_or_else(|| "anonymous".to_string());
         state.observability_session = Some(hub.start_session(&user_id, "pending"));
         // Apply any adaptive state stashed during workspace restore.
-        super::repl_turn::apply_pending_adaptive_state(&mut state);
+        super::chat_turn::apply_pending_adaptive_state(&mut state);
     }
 
     // Restore persisted feedback aggregator state (if any)
@@ -573,7 +488,7 @@ fn should_refresh_pending_plan_context(path: &std::path::Path) -> bool {
         })
 }
 
-pub(crate) fn maybe_restore_pending_plan_mode(line: &str, state: &mut ReplState) -> bool {
+pub(crate) fn maybe_restore_pending_plan_mode(line: &str, state: &mut SessionState) -> bool {
     if state.plan_mode.is_some()
         || state.executing_plan.is_some()
         || state.plan_handle.is_some()
@@ -722,7 +637,7 @@ fn restore_session_state_from_journal(session_id: &str) -> RestoredSessionState 
     restored
 }
 
-pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
+pub(super) fn print_session_banner(profile: Option<&str>, state: &SessionState) {
     let creds = load_credentials();
     let pname = profile_name(profile, &creds);
     let p = creds.profiles.get(&pname);
@@ -912,6 +827,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
         let _ = std::io::stderr().flush();
     }
 
+    use std::io::IsTerminal;
     let animated = crossterm::terminal::size().is_ok()
         && std::env::var("NO_COLOR").is_err()
         && std::env::var("CI").is_err()
@@ -962,7 +878,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
 }
 
 #[cfg(test)]
-fn banner_session_display(state: &ReplState) -> String {
+fn banner_session_display(state: &SessionState) -> String {
     match state.session_id.as_deref() {
         Some(s) => {
             let short = prefix_chars(s, 8);
@@ -1329,7 +1245,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_repl_state_skips_cleanly_ended_session() {
+    fn initialize_session_state_skips_cleanly_ended_session() {
         let (_tmp, _g) = isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
 
@@ -1368,7 +1284,7 @@ mod tests {
         );
         save_credentials(&creds).unwrap();
 
-        let state = initialize_repl_state(None, Some("gpt-5"));
+        let state = initialize_session_state(None, Some("gpt-5"));
         assert_eq!(state.session_id, None);
         assert_eq!(state.pending_recovery, None);
         assert!(state.history.is_empty());
@@ -1376,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_repl_state_records_project_scoped_pending_recovery() {
+    fn initialize_session_state_records_project_scoped_pending_recovery() {
         let (_tmp, _g) = isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
 
@@ -1436,7 +1352,7 @@ mod tests {
         );
         save_credentials(&creds).unwrap();
 
-        let state = initialize_repl_state(None, Some("gpt-5"));
+        let state = initialize_session_state(None, Some("gpt-5"));
         assert_eq!(state.session_id, None);
         assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
         assert!(state.history.is_empty());
@@ -1444,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_repl_state_ignores_pending_recovery_from_other_project() {
+    fn initialize_session_state_ignores_pending_recovery_from_other_project() {
         let (_tmp, _g) = isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
 
@@ -1490,7 +1406,7 @@ mod tests {
         );
         save_credentials(&creds).unwrap();
 
-        let state = initialize_repl_state(None, Some("gpt-5"));
+        let state = initialize_session_state(None, Some("gpt-5"));
         assert_eq!(state.session_id, None);
         assert_eq!(state.pending_recovery, None);
         assert!(state.history.is_empty());
@@ -1498,7 +1414,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_repl_state_detects_pending_plan_resume_digest() {
+    fn initialize_session_state_detects_pending_plan_resume_digest() {
         let (_tmp, _g) = isolated_sessions_dir();
         let _creds_guard = isolate_credentials();
         let home = tempdir().unwrap();
@@ -1522,7 +1438,7 @@ mod tests {
             .save_to_file(&astra_runtime::plan_decompose::PlanModeState::state_path())
             .unwrap();
 
-        let state = initialize_repl_state(None, Some("gpt-5"));
+        let state = initialize_session_state(None, Some("gpt-5"));
         let digest = state.pending_plan_resume_digest.expect("resume digest");
         assert!(digest.contains("Fix auth middleware"), "{digest}");
         assert!(digest.contains("Patch token validation"), "{digest}");
@@ -1553,9 +1469,9 @@ mod tests {
             .save_to_file(&astra_runtime::plan_decompose::PlanModeState::state_path())
             .unwrap();
 
-        let mut state = ReplState {
+        let mut state = SessionState {
             pending_plan_resume_digest: Some("[plan-resume] goal=\"Ship plan resume\"".into()),
-            ..ReplState::default()
+            ..SessionState::default()
         };
         assert!(maybe_restore_pending_plan_mode(
             "please @resume-plan",
@@ -1589,13 +1505,13 @@ mod tests {
 
     #[test]
     fn session_display_shows_new_for_none() {
-        let state = ReplState::default();
+        let state = SessionState::default();
         assert_eq!(banner_session_display(&state), "new");
     }
 
     #[test]
     fn session_display_shows_truncated_id_for_fresh_session() {
-        let state = ReplState {
+        let state = SessionState {
             session_id: Some("abcdef12-3456-7890".to_string()),
             ..Default::default()
         };
@@ -1604,7 +1520,7 @@ mod tests {
 
     #[test]
     fn session_display_shows_resumed_for_restored_session() {
-        let state = ReplState {
+        let state = SessionState {
             session_id: Some("abcdef12-3456-7890".to_string()),
             turn: 3,
             ..Default::default()
@@ -1614,14 +1530,14 @@ mod tests {
 
     #[test]
     fn model_display_shows_auto_when_none() {
-        let state = ReplState::default();
+        let state = SessionState::default();
         let display = state.model.as_deref().unwrap_or("auto");
         assert_eq!(display, "auto");
     }
 
     #[test]
     fn model_display_shows_actual_name_when_set() {
-        let state = ReplState {
+        let state = SessionState {
             model: Some("gpt-5".to_string()),
             ..Default::default()
         };
@@ -1662,11 +1578,11 @@ mod tests {
             .save_to_file(&astra_runtime::plan_decompose::PlanModeState::state_path())
             .unwrap();
 
-        let mut state = ReplState {
+        let mut state = SessionState {
             pending_plan_resume_digest: Some(
                 "[plan-resume] goal=\"goal from other workspace\"".into(),
             ),
-            ..ReplState::default()
+            ..SessionState::default()
         };
         // Should refuse to restore because the saved plan's root != current cwd.
         let restored = maybe_restore_pending_plan_mode("please @resume-plan", &mut state);

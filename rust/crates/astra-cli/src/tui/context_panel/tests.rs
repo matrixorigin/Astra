@@ -9,9 +9,6 @@ use astra_turn_core::context_assembly_trace::{
     PromptContextSignals, PromptGuidanceSignals, RejectionReason, SkillInjection,
     SystemPromptBreakdown, TokenBudgetTrace, ToolSelected, TurnCompression, TurnRetention,
 };
-use astra_turn_core::skill_selector_metrics::{
-    SkillSelectorShortlistEntry, SkillSelectorShortlistTrace,
-};
 
 fn trace(max: u32, sys: u32, hist: u32, mem: u32, tools: u32, user: u32) -> ContextAssemblyTrace {
     let total = sys + hist + mem + tools + user;
@@ -266,79 +263,6 @@ fn skills_sorted_desc_by_tokens() {
     let b = ContextBreakdown::from_trace(&t);
     let names: Vec<&str> = b.skills.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, vec!["huge", "tiny"]);
-}
-
-// ─── Skill-selector fallback ──────────────────────────────────────
-
-#[test]
-fn skills_fall_back_to_selector_shortlist_when_no_injected_tokens() {
-    // Runtime recorded a selector shortlist but never populated
-    // `skills_injected` with per-skill token counts. The panel
-    // should still show the shortlist names so the user knows
-    // which skills were considered.
-    let mut t = trace(100_000, 1_000, 1_000, 0, 0, 0);
-    t.skill_selector = Some(SkillSelectorShortlistTrace {
-        open_catalog: false,
-        visible_skill_count: 2,
-        skills: vec![
-            SkillSelectorShortlistEntry {
-                rank: 1,
-                skill_name: "review_changes".into(),
-                aliases: Vec::new(),
-                description: "Review code changes".into(),
-                source: "built-in".into(),
-                category: None,
-            },
-            SkillSelectorShortlistEntry {
-                rank: 2,
-                skill_name: "verify_task".into(),
-                aliases: Vec::new(),
-                description: "Verify task completion".into(),
-                source: "built-in".into(),
-                category: None,
-            },
-        ],
-        telemetry: Default::default(),
-    });
-    let b = ContextBreakdown::from_trace(&t);
-    let names: Vec<&str> = b.skills.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["review_changes", "verify_task"]);
-    assert!(
-        b.skills.iter().all(|s| s.tokens == 0),
-        "shortlist fallback carries no token counts",
-    );
-}
-
-#[test]
-fn injected_skills_take_precedence_over_shortlist_fallback() {
-    // When both present, the rich `skills_injected` data wins.
-    let mut t = trace(100_000, 1_000, 1_000, 0, 0, 0);
-    t.system_prompt = SystemPromptBreakdown {
-        skills_injected: vec![SkillInjection {
-            skill_name: "real_skill".into(),
-            skill_version: None,
-            tokens: 400,
-            selection_reason: String::new(),
-        }],
-        ..SystemPromptBreakdown::default()
-    };
-    t.skill_selector = Some(SkillSelectorShortlistTrace {
-        open_catalog: false,
-        visible_skill_count: 1,
-        skills: vec![SkillSelectorShortlistEntry {
-            rank: 1,
-            skill_name: "fallback_only".into(),
-            aliases: Vec::new(),
-            description: String::new(),
-            source: "built-in".into(),
-            category: None,
-        }],
-        telemetry: Default::default(),
-    });
-    let b = ContextBreakdown::from_trace(&t);
-    let names: Vec<&str> = b.skills.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["real_skill"]);
-    assert_eq!(b.skills[0].tokens, 400);
 }
 
 // ─── History summary ───────────────────────────────────────────────

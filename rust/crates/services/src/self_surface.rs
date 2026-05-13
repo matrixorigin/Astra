@@ -1327,9 +1327,7 @@ fn decision_from_event(event: &JournalEvent) -> Option<DecisionRecord> {
     let selected_skills = event.selected_skills.clone().unwrap_or_default();
     let has_decision = !selected_tools.is_empty()
         || !selected_skills.is_empty()
-        || event.selection_trace.is_some()
-        || event.selector_strategy.is_some()
-        || event.selector_confidence.is_some();
+        || event.selection_trace.is_some();
     if !has_decision {
         return None;
     }
@@ -1358,13 +1356,11 @@ fn decision_from_event(event: &JournalEvent) -> Option<DecisionRecord> {
             .selection_trace
             .as_ref()
             .map(|trace| trace.strategy.clone())
-            .or_else(|| event.selector_strategy.clone())
             .unwrap_or_else(|| "unknown".to_string()),
         confidence: event
             .selection_trace
             .as_ref()
             .map(|trace| trace.confidence)
-            .or(event.selector_confidence)
             .unwrap_or_default(),
         selected_tools,
         selected_skills,
@@ -2228,10 +2224,6 @@ mod tests {
                 plan_subtask_id: None,
                 ttft_ms: None,
                 context_ms: None,
-                selector_strategy: Some("tfidf".to_string()),
-                selector_ms: None,
-                selector_tokens_in: None,
-                selector_tokens_out: None,
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
                 memoria_ms: None,
@@ -2240,7 +2232,6 @@ mod tests {
                 edge_policy: None,
                 selection_trace: None,
                 context_assembly_trace: None,
-                selector_confidence: Some(0.7),
                 routing_domain_hint: Some("code".to_string()),
                 entity_learn_skipped_no_domain: false,
                 round: None,

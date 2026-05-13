@@ -136,8 +136,6 @@ pub struct TurnDetail {
     pub duration_ms: u64,
     pub ttft_ms: Option<u64>,
     pub context_ms: Option<u64>,
-    pub selector_ms: Option<u64>,
-    pub selector_strategy: Option<String>,
     pub budget_pressure: Option<f64>,
     pub tools_selected: Vec<String>,
     pub tools_used: Vec<String>,
@@ -1024,11 +1022,6 @@ impl SessionAuditService for DatabaseSessionAuditService {
                 .unwrap_or(0),
             ttft_ms: meta.get("ttft_ms").and_then(|v| v.as_u64()),
             context_ms: meta.get("context_ms").and_then(|v| v.as_u64()),
-            selector_ms: meta.get("selector_ms").and_then(|v| v.as_u64()),
-            selector_strategy: meta
-                .get("selector_strategy")
-                .and_then(|v| v.as_str())
-                .map(String::from),
             budget_pressure: meta.get("budget_pressure").and_then(|v| v.as_f64()),
             tools_selected,
             tools_used,

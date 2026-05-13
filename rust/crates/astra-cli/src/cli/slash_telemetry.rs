@@ -7,7 +7,7 @@ use super::*;
 /// - `turns`      List per-turn timing breakdowns
 /// - `drift`      Check focus drift analysis
 /// - `decisions`  List tool selection decisions with confidence
-pub(super) fn handle_telemetry_command(arg: &str, state: &ReplState) {
+pub(super) fn handle_telemetry_command(arg: &str, state: &SessionState) {
     let (sub_cmd, sub_arg) = match arg.find(char::is_whitespace) {
         Some(pos) => (arg[..pos].trim(), arg[pos..].trim()),
         None => (arg.trim(), ""),
@@ -56,7 +56,7 @@ fn show_summary(
     session: &std::sync::Arc<
         std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
     >,
-    state: &ReplState,
+    state: &SessionState,
 ) {
     use astra_runtime::observability_integration::FuzzyMatchOutcome;
 
@@ -297,7 +297,7 @@ fn show_drift_analysis(
     session: &std::sync::Arc<
         std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
     >,
-    _state: &ReplState,
+    _state: &SessionState,
 ) {
     let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
 
@@ -436,7 +436,7 @@ fn show_decisions(
 
 fn show_user_profile(
     hub: &std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>,
-    state: &ReplState,
+    state: &SessionState,
 ) {
     let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
     let profile = hub.profiles().get_profile(user_id);

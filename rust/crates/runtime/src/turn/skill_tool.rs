@@ -43,7 +43,6 @@ use crate::skills::manifest::{
     EffortLevel, ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind,
 };
 use crate::skills::traits::{SkillExecutionContext, SkillExecutor};
-use crate::turn::skill_selector;
 
 // ─── Skill resolution types (re-exported from astra_skills) ──────────────────
 
@@ -166,6 +165,9 @@ pub const DISCOVER_SKILLS_TOOL_NAME: &str = "discover_skills";
 
 /// Max skills returned from a single `discover_skills` call.
 const DISCOVER_SKILLS_MAX_RESULTS: usize = 8;
+const LARGE_SKILL_CATALOG_WARNING_THRESHOLD: usize = 50;
+static LARGE_SKILL_CATALOG_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
+static IGNORED_SKILL_SEARCH_SETTINGS_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
 
 // `DEFAULT_SKILL_LISTING_BUDGET` was removed — its only consumer,
 // `format_skills_within_budget`, is now test-only scaffolding that no
@@ -294,64 +296,45 @@ fn format_skills_within_budget(
     (entries, all_names)
 }
 
-/// Pick a small relevant subset for the current user message when dynamic surfacing applies.
-///
-/// Returns the picked skills plus optional selector telemetry. Telemetry is `None`
-/// only when the full catalog is used and the selector is bypassed.
-pub fn select_skills_for_turn(
-    all_skills: &[SkillToolInfo],
-    user_message: &str,
-    quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
-    pinned_skills: Option<&HashSet<String>>,
-    cfg: &SkillSearchSettings,
-) -> (
-    Vec<SkillToolInfo>,
-    Option<astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry>,
-) {
-    if cfg.use_full_catalog(all_skills.len()) {
-        return (
-            all_skills.to_vec(),
-            Some(full_catalog_selector_telemetry(all_skills.len(), cfg)),
-        );
+pub fn warn_if_full_skill_catalog_surface_is_large(skill_count: usize) {
+    if skill_count > LARGE_SKILL_CATALOG_WARNING_THRESHOLD {
+        LARGE_SKILL_CATALOG_WARNING_EMITTED.get_or_init(|| {
+            tracing::warn!(
+                skill_count,
+                threshold = LARGE_SKILL_CATALOG_WARNING_THRESHOLD,
+                "skill selector removed; full skill catalog is surfaced"
+            );
+        });
     }
-
-    let mut picked: Vec<SkillToolInfo> = Vec::new();
-    let mut picked_names: HashSet<String> = HashSet::new();
-    if let Some(pinned) = pinned_skills {
-        for s in all_skills {
-            if pinned.contains(&s.name) {
-                picked_names.insert(s.name.clone());
-                picked.push(s.clone());
-            }
-        }
-    }
-
-    let filtered: Vec<SkillToolInfo> = all_skills
-        .iter()
-        .filter(|s| !picked_names.contains(&s.name))
-        .cloned()
-        .collect();
-    let (selected_indices, telemetry) =
-        skill_selector::select_skill_indices(&filtered, user_message, quality_tracker, cfg);
-    for idx in selected_indices {
-        if picked.len() >= cfg.effective_surface_cap() {
-            break;
-        }
-        if let Some(skill) = filtered.get(idx)
-            && picked_names.insert(skill.name.clone())
-        {
-            picked.push(skill.clone());
-        }
-    }
-
-    if picked.len() >= cfg.effective_surface_cap() {
-        picked.truncate(cfg.effective_surface_cap());
-    }
-
-    (picked, Some(telemetry))
 }
 
-/// Skills visible this session: auto-surface ∪ user-pinned ∪ previously discovered.
+fn warn_if_selector_removed_surface_has_risks(skill_count: usize, cfg: &SkillSearchSettings) {
+    warn_if_full_skill_catalog_surface_is_large(skill_count);
+    if cfg != &SkillSearchSettings::default() {
+        IGNORED_SKILL_SEARCH_SETTINGS_WARNING_EMITTED.get_or_init(|| {
+            tracing::warn!(
+                dynamic_surface = cfg.dynamic_surface,
+                min_catalog_size = cfg.min_catalog_size,
+                surface_cap = cfg.surface_cap,
+                "SkillSearchSettings are ignored because skill selector surfacing was removed"
+            );
+        });
+    }
+}
+
+/// Selector removed: always returns the full catalog.
+pub fn select_skills_for_turn(
+    all_skills: &[SkillToolInfo],
+    _user_message: &str,
+    _quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
+    _pinned_skills: Option<&HashSet<String>>,
+    cfg: &SkillSearchSettings,
+) -> Vec<SkillToolInfo> {
+    warn_if_selector_removed_surface_has_risks(all_skills.len(), cfg);
+    all_skills.to_vec()
+}
+
+/// Skills visible this session after merging previously discovered entries.
 pub fn merge_discovered_skills_into_visible(
     base: Vec<SkillToolInfo>,
     all_skills: &[SkillToolInfo],
@@ -388,77 +371,18 @@ fn filter_already_invoked_skills(
         .collect()
 }
 
-/// Visible skills + whether dynamic surfacing is active (open `skill_name` + `discover_skills`)
-/// + selector telemetry.
+/// Selector removed: always returns the full catalog with invoked-skill filtering.
 pub fn visible_skills_for_host_turn(
     full: &[SkillToolInfo],
-    user_message: &str,
-    quality_tracker: &crate::skills::quality::SkillQualityTracker,
-    pinned: &HashSet<String>,
-    discovered: &HashSet<String>,
+    _user_message: &str,
+    _quality_tracker: &crate::skills::quality::SkillQualityTracker,
+    _pinned: &HashSet<String>,
+    _discovered: &HashSet<String>,
     invoked: &HashMap<String, InvokedSkill>,
     cfg: &SkillSearchSettings,
-) -> (
-    Vec<SkillToolInfo>,
-    bool,
-    Option<astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry>,
-) {
-    if cfg.use_full_catalog(full.len()) {
-        let filtered = filter_already_invoked_skills(full.to_vec(), invoked);
-        return (
-            filtered,
-            false,
-            Some(full_catalog_selector_telemetry(full.len(), cfg)),
-        );
-    }
-    let (base, telemetry) =
-        select_skills_for_turn(full, user_message, Some(quality_tracker), Some(pinned), cfg);
-    let visible = merge_discovered_skills_into_visible(base, full, discovered);
-    let filtered = filter_already_invoked_skills(visible, invoked);
-    (filtered, true, telemetry)
-}
-
-fn full_catalog_selector_telemetry(
-    skill_count: usize,
-    cfg: &SkillSearchSettings,
-) -> astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry {
-    astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry {
-        selector_tier: Some("full_catalog".to_string()),
-        elapsed_ms: Some(0),
-        total_catalog_size: Some(skill_count as i64),
-        extra: Some(serde_json::json!({
-            "reason": "full_catalog_bypass",
-            "dynamic_surface": cfg.dynamic_surface,
-            "min_catalog_size": cfg.min_catalog_size,
-            "surface_cap": cfg.surface_cap,
-        })),
-    }
-}
-
-pub fn build_skill_selector_shortlist_trace(
-    visible: &[SkillToolInfo],
-    open_catalog: bool,
-    telemetry: Option<astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry>,
-) -> astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace {
-    astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace {
-        open_catalog,
-        visible_skill_count: i32::try_from(visible.len()).unwrap_or(i32::MAX),
-        skills: visible
-            .iter()
-            .enumerate()
-            .map(|(idx, skill)| {
-                astra_turn_core::skill_selector_metrics::SkillSelectorShortlistEntry {
-                    rank: i32::try_from(idx + 1).unwrap_or(i32::MAX),
-                    skill_name: skill.name.clone(),
-                    aliases: skill.aliases.clone(),
-                    description: format_skill_description(skill),
-                    source: format!("{:?}", skill.source).to_lowercase(),
-                    category: skill.category.clone(),
-                }
-            })
-            .collect(),
-        telemetry: telemetry.unwrap_or_default(),
-    }
+) -> Vec<SkillToolInfo> {
+    warn_if_selector_removed_surface_has_risks(full.len(), cfg);
+    filter_already_invoked_skills(full.to_vec(), invoked)
 }
 
 /// Lowercased canonical names and aliases — used to filter `discover_skills` results.
@@ -520,19 +444,26 @@ pub fn is_discover_skills_call(tool_call: &Value) -> bool {
 }
 
 /// Run discovery; returns assistant-facing text and canonical names to merge into session state.
+/// Selector removed — returns all not-yet-excluded skills (capped) without ranking.
 pub fn execute_discover_skills(
-    query: &str,
+    _query: &str,
     catalog: &[SkillToolInfo],
     mut excluded_lowercase: HashSet<String>,
-    quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
+    _quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
 ) -> (String, Vec<String>) {
-    let candidate_indices = skill_selector::discover_skill_indices(
-        catalog,
-        query,
-        &excluded_lowercase,
-        quality_tracker,
-        DISCOVER_SKILLS_MAX_RESULTS,
-    );
+    let candidate_indices: Vec<usize> = catalog
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            !excluded_lowercase.contains(&s.name.to_lowercase())
+                && !s
+                    .aliases
+                    .iter()
+                    .any(|a| excluded_lowercase.contains(&a.to_lowercase()))
+        })
+        .map(|(idx, _)| idx)
+        .take(DISCOVER_SKILLS_MAX_RESULTS)
+        .collect();
     if candidate_indices.is_empty() {
         return (
             "No additional skills matched that query. Try different keywords, or proceed with general tools.".to_string(),
@@ -663,35 +594,6 @@ pub fn selected_skill_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String>
         .filter(|tool_call| is_skill_call(tool_call))
         .filter_map(extract_skill_name)
         .collect()
-}
-
-pub fn build_turn_skill_selector_metric_record(
-    session_id: &str,
-    user_id: &str,
-    turn_number: i64,
-    shortlist: Option<&astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace>,
-    chosen_skills: &[String],
-) -> Option<astra_turn_core::contracts::TurnSkillSelectorMetricRecord> {
-    let shortlist = shortlist?;
-    let computed = astra_turn_core::skill_selector_metrics::compute_skill_selector_metric(
-        shortlist,
-        chosen_skills,
-    )?;
-    Some(astra_turn_core::contracts::TurnSkillSelectorMetricRecord {
-        event_id: uuid::Uuid::now_v7().to_string(),
-        session_id: session_id.to_string(),
-        user_id: user_id.to_string(),
-        turn_number,
-        visible_skill_count: computed.visible_skill_count,
-        chosen_skill_count: computed.chosen_skill_count,
-        shortlisted_chosen_count: computed.shortlisted_chosen_count,
-        missed_chosen_count: computed.missed_chosen_count,
-        best_chosen_rank: computed.best_chosen_rank,
-        selector_tier: computed.telemetry.selector_tier.clone(),
-        elapsed_ms: computed.telemetry.elapsed_ms,
-        total_catalog_size: computed.telemetry.total_catalog_size,
-        extra: computed.telemetry.extra.clone(),
-    })
 }
 
 /// Execute a skill tool call from the SSE edge handler.
@@ -2164,6 +2066,7 @@ mod tests {
         let skills = vec![
             SkillToolInfo {
                 name: "review-changes".into(),
+                aliases: vec!["review".into()],
                 description: "Review local changes".into(),
                 source: SkillSourceKind::Bundled,
                 ..Default::default()
@@ -2182,7 +2085,7 @@ mod tests {
             },
         ];
         let invoked = HashMap::from([(
-            "review-changes".to_string(),
+            "review".to_string(),
             InvokedSkill {
                 name: "review-changes".into(),
                 content: "# Skill: review-changes".into(),
@@ -2191,7 +2094,7 @@ mod tests {
             },
         )]);
 
-        let (visible, _open_skill_name, _telemetry) = visible_skills_for_host_turn(
+        let visible = visible_skills_for_host_turn(
             &skills,
             "review local changes",
             &crate::skills::quality::SkillQualityTracker::default(),
@@ -2203,12 +2106,52 @@ mod tests {
 
         assert!(
             !visible.iter().any(|skill| skill.name == "review-changes"),
-            "already-invoked skill should be omitted from the surfaced catalog"
+            "already-invoked skill should be omitted when invoked by alias"
         );
         assert!(
             visible.iter().any(|skill| skill.name == "analyze-session")
                 || visible.iter().any(|skill| skill.name == "test-writer"),
             "catalog should keep alternate skills visible after omission"
+        );
+    }
+
+    #[test]
+    fn select_skills_for_turn_returns_full_catalog_despite_selector_settings() {
+        let skills = vec![
+            SkillToolInfo {
+                name: "alpha".into(),
+                description: "First skill".into(),
+                ..Default::default()
+            },
+            SkillToolInfo {
+                name: "beta".into(),
+                description: "Second skill".into(),
+                ..Default::default()
+            },
+            SkillToolInfo {
+                name: "gamma".into(),
+                description: "Third skill".into(),
+                ..Default::default()
+            },
+        ];
+        let cfg = SkillSearchSettings {
+            dynamic_surface: true,
+            min_catalog_size: 1,
+            surface_cap: 1,
+        };
+
+        let selected = select_skills_for_turn(
+            &skills,
+            "only beta seems relevant",
+            None,
+            Some(&HashSet::from(["beta".to_string()])),
+            &cfg,
+        );
+
+        assert_eq!(
+            selected.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "beta", "gamma"],
+            "selector removal must preserve the full catalog in source order"
         );
     }
 
@@ -2249,7 +2192,7 @@ mod tests {
             ),
         ]);
 
-        let (visible, _open_skill_name, _telemetry) = visible_skills_for_host_turn(
+        let visible = visible_skills_for_host_turn(
             &skills,
             "review local changes",
             &crate::skills::quality::SkillQualityTracker::default(),
@@ -2282,6 +2225,42 @@ mod tests {
         assert!(text.contains("hidden-deploy"), "{text}");
         assert_eq!(names, vec!["hidden-deploy".to_string()]);
     }
+
+    #[test]
+    fn discover_skills_respects_cap_and_excludes_names_and_aliases() {
+        let mut catalog = vec![
+            SkillToolInfo {
+                name: "already-visible".into(),
+                aliases: vec!["visible-alias".into()],
+                description: "Already surfaced".into(),
+                ..Default::default()
+            },
+            SkillToolInfo {
+                name: "blocked-by-alias".into(),
+                aliases: vec!["alias-blocked".into()],
+                description: "Should be excluded via alias".into(),
+                ..Default::default()
+            },
+        ];
+        for idx in 0..(DISCOVER_SKILLS_MAX_RESULTS + 3) {
+            catalog.push(SkillToolInfo {
+                name: format!("candidate-{idx}"),
+                aliases: vec![format!("candidate-alias-{idx}")],
+                description: format!("Candidate skill {idx}"),
+                ..Default::default()
+            });
+        }
+
+        let excluded = HashSet::from(["already-visible".to_string(), "alias-blocked".to_string()]);
+        let (text, names) = execute_discover_skills("anything", &catalog, excluded, None);
+
+        assert_eq!(names.len(), DISCOVER_SKILLS_MAX_RESULTS);
+        assert!(!names.iter().any(|name| name == "already-visible"));
+        assert!(!names.iter().any(|name| name == "blocked-by-alias"));
+        assert!(names.iter().all(|name| name.starts_with("candidate-")));
+        assert!(text.contains("candidate-0"), "{text}");
+    }
+
     #[tokio::test]
     async fn partition_runs_discover_before_skill() {
         let resolver = stub_resolver();
@@ -5484,93 +5463,6 @@ Normal.
         assert_eq!(
             selected_skill_names_from_tool_calls(&tool_calls),
             vec!["alpha".to_string(), "beta".to_string()]
-        );
-    }
-
-    #[test]
-    fn build_turn_skill_selector_metric_record_uses_initial_shortlist() {
-        let shortlist = build_skill_selector_shortlist_trace(
-            &[
-                SkillToolInfo {
-                    name: "alpha".into(),
-                    description: "first".into(),
-                    ..Default::default()
-                },
-                SkillToolInfo {
-                    name: "beta".into(),
-                    description: "second".into(),
-                    aliases: vec!["beta-alt".into()],
-                    ..Default::default()
-                },
-            ],
-            true,
-            None,
-        );
-
-        let metric = build_turn_skill_selector_metric_record(
-            "sess-1",
-            "user-1",
-            7,
-            Some(&shortlist),
-            &[
-                "beta-alt".to_string(),
-                "outside".to_string(),
-                "beta".to_string(),
-            ],
-        )
-        .expect("metric should exist");
-
-        assert_eq!(metric.turn_number, 7);
-        assert_eq!(metric.visible_skill_count, 2);
-        assert_eq!(metric.chosen_skill_count, 2);
-        assert_eq!(metric.shortlisted_chosen_count, 1);
-        assert_eq!(metric.missed_chosen_count, 1);
-        assert_eq!(metric.best_chosen_rank, Some(2));
-    }
-
-    #[test]
-    fn full_catalog_bypass_records_selector_telemetry() {
-        let cfg = SkillSearchSettings {
-            dynamic_surface: false,
-            min_catalog_size: 8,
-            surface_cap: 20,
-        };
-        let skills = vec![
-            SkillToolInfo {
-                name: "alpha".into(),
-                description: "first".into(),
-                ..Default::default()
-            },
-            SkillToolInfo {
-                name: "beta".into(),
-                description: "second".into(),
-                ..Default::default()
-            },
-        ];
-
-        let (visible, open_catalog, telemetry) = visible_skills_for_host_turn(
-            &skills,
-            "use beta",
-            &crate::skills::quality::SkillQualityTracker::default(),
-            &HashSet::new(),
-            &HashSet::new(),
-            &HashMap::new(),
-            &cfg,
-        );
-
-        assert_eq!(visible.len(), 2);
-        assert!(!open_catalog);
-        let telemetry = telemetry.expect("full-catalog bypass telemetry should be present");
-        assert_eq!(telemetry.selector_tier.as_deref(), Some("full_catalog"));
-        assert_eq!(telemetry.total_catalog_size, Some(2));
-        assert_eq!(telemetry.elapsed_ms, Some(0));
-        assert_eq!(
-            telemetry
-                .extra
-                .as_ref()
-                .and_then(|extra| extra.get("reason"))
-                .and_then(serde_json::Value::as_str),
-            Some("full_catalog_bypass")
         );
     }
 

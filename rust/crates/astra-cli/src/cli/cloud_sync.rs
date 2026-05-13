@@ -13,8 +13,8 @@ use astra_services::state_sync::{MatrixOneSyncService, StateSyncService, pref_ke
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use crossterm::style::Stylize;
 
-use super::repl_turn::enqueue_ingestion_pub;
-use super::{ExplainMode, ReplState};
+use super::chat_turn::enqueue_ingestion_pub;
+use super::{ExplainMode, SessionState};
 
 /// Result from cloud pull attempt at session start.
 pub(super) struct CloudPullResult {
@@ -70,7 +70,7 @@ async fn drain_ephemeral_audit(
 
 /// Pull user preferences from cloud at session start.
 /// Merges cloud preferences into local state (cloud-wins). Returns keys merged (for journal audit).
-pub(super) async fn try_cloud_pull_preferences(state: &mut ReplState) -> Vec<String> {
+pub(super) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<String> {
     let pool = match try_connect_matrixone().await {
         Some(p) => p,
         None => return Vec::new(),
@@ -131,7 +131,7 @@ pub(super) async fn try_cloud_pull_preferences(state: &mut ReplState) -> Vec<Str
 }
 
 /// Push user preferences to cloud at session end.
-pub(super) async fn try_cloud_push_preferences(state: &ReplState) {
+pub(super) async fn try_cloud_push_preferences(state: &SessionState) {
     let pool = match try_connect_matrixone().await {
         Some(p) => p,
         None => return,
@@ -160,7 +160,7 @@ pub(super) async fn try_cloud_push_preferences(state: &ReplState) {
 
 // ═══════════════════════════════════════════ Journal Helpers ═══════════════════════
 
-/// When set to `1`, `repl_startup` also journals a sync marker if MatrixOne was reachable but
+/// When set to `1`, `session_startup` also journals a sync marker if MatrixOne was reachable but
 /// returned no preferences (audit / connectivity proof).
 pub(super) const ASTRA_JOURNAL_CLOUD_EMPTY_ACK: &str = "ASTRA_JOURNAL_CLOUD_EMPTY_ACK";
 
@@ -193,7 +193,7 @@ pub(super) fn should_append_cloud_pull_journal(
 }
 
 pub(super) fn append_cloud_pull_sync_journal(
-    state: &ReplState,
+    state: &SessionState,
     profile: &str,
     source: &str,
     pull: &CloudPullResult,
@@ -223,7 +223,7 @@ pub(super) fn append_cloud_pull_sync_journal(
 }
 
 /// Re-sync preferences from cloud after authentication.
-pub(crate) async fn post_auth_cloud_resync(profile: Option<&str>, state: &mut ReplState) {
+pub(crate) async fn post_auth_cloud_resync(profile: Option<&str>, state: &mut SessionState) {
     let profile_name = profile.unwrap_or("default");
     let pull = try_cloud_pull(profile_name).await;
     let pref_keys = try_cloud_pull_preferences(state).await;

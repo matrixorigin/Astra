@@ -6,14 +6,13 @@ use astra_services::session_workspace::{ContextTraceBudgetSignal, ContextTraceTo
 
 use super::*;
 
-pub(super) struct ReplTurnContext<'a> {
+pub(super) struct TurnContext<'a> {
     pub(super) api: &'a astra_thin_client::ThinClient,
     pub(super) profile: Option<&'a str>,
-    pub(super) selector: &'a dyn tool_selector::ToolSelector,
 }
 
 /// Enqueue a journal event for async cloud ingestion (if matrix runtime is available).
-fn enqueue_ingestion(state: &ReplState, event: &session_journal::JournalEvent) {
+fn enqueue_ingestion(state: &SessionState, event: &session_journal::JournalEvent) {
     let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
     if let Some(mc) = state.matrix_runtime.as_ref() {
         mc.enqueue_journal_events(user_id, event);
@@ -21,7 +20,7 @@ fn enqueue_ingestion(state: &ReplState, event: &session_journal::JournalEvent) {
 }
 
 /// Public wrapper for enqueue_ingestion — used by main.rs for session_end.
-pub(super) fn enqueue_ingestion_pub(state: &ReplState, event: &session_journal::JournalEvent) {
+pub(super) fn enqueue_ingestion_pub(state: &SessionState, event: &session_journal::JournalEvent) {
     enqueue_ingestion(state, event);
 }
 
@@ -183,8 +182,8 @@ enum TurnAttempt {
 pub(super) async fn handle_chat_input(
     line: String,
     current_token: Option<&str>,
-    state: &mut ReplState,
-    ctx: ReplTurnContext<'_>,
+    state: &mut SessionState,
+    ctx: TurnContext<'_>,
 ) -> Result<(), String> {
     handle_chat_input_with_ui(
         line,
@@ -199,8 +198,8 @@ pub(super) async fn handle_chat_input(
 pub(super) async fn handle_chat_input_with_ui(
     line: String,
     current_token: Option<&str>,
-    state: &mut ReplState,
-    ctx: ReplTurnContext<'_>,
+    state: &mut SessionState,
+    ctx: TurnContext<'_>,
     ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
 ) -> Result<(), String> {
     let token = match current_token {
@@ -260,15 +259,7 @@ pub(super) async fn handle_chat_input_with_ui(
         TurnAttempt::Completed(result) => match *result {
             Ok(result) => {
                 state.last_turn_interrupted = false;
-                apply_turn_success_async(
-                    state,
-                    ctx.selector,
-                    ctx.profile,
-                    &line,
-                    result,
-                    turn_start,
-                )
-                .await;
+                apply_turn_success_async(state, ctx.profile, &line, result, turn_start).await;
                 return Ok(());
             }
             Err(failure) => {
@@ -307,7 +298,6 @@ pub(super) async fn handle_chat_input_with_ui(
                             Ok(result) => {
                                 apply_turn_success_async(
                                     state,
-                                    ctx.selector,
                                     ctx.profile,
                                     &line,
                                     result,
@@ -334,8 +324,9 @@ pub(super) async fn handle_chat_input_with_ui(
                 // ── 401 auth error: attempt silent token refresh + retry ──
                 if is_auth_error(&failure.error) {
                     ui.show_warning("  Token expired, attempting refresh…");
-                    if repl_runtime::attempt_token_refresh(ctx.api, ctx.profile).await {
-                        if let Some(new_token) = repl_runtime::current_access_token(ctx.profile) {
+                    if session_runtime::attempt_token_refresh(ctx.api, ctx.profile).await {
+                        if let Some(new_token) = session_runtime::current_access_token(ctx.profile)
+                        {
                             ui.show_info(&format!(
                                 "  {} Token refreshed, retrying…",
                                 crate::theme::icon_ok()
@@ -357,7 +348,6 @@ pub(super) async fn handle_chat_input_with_ui(
                                     Ok(result) => {
                                         apply_turn_success_async(
                                             state,
-                                            ctx.selector,
                                             ctx.profile,
                                             &line,
                                             result,
@@ -392,7 +382,10 @@ pub(super) async fn handle_chat_input_with_ui(
     Ok(())
 }
 
-pub(super) fn consume_plan_resume_if_matches(state: &mut ReplState, line: &str) -> Option<String> {
+pub(super) fn consume_plan_resume_if_matches(
+    state: &mut SessionState,
+    line: &str,
+) -> Option<String> {
     astra_runtime::plan::plan_resume::message_signals_resume(line)
         .then(|| state.pending_plan_resume_digest.take())
         .flatten()
@@ -414,7 +407,7 @@ fn apply_resume_context(
 
 pub(super) fn build_effective_line(
     line: &str,
-    state: &ReplState,
+    state: &SessionState,
     ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
 ) -> String {
     let mut effective_line = if let Some(ref dev) = state.skill_dev {
@@ -536,7 +529,7 @@ fn contains_any_token(haystack: &str, tokens: &[&str]) -> bool {
 /// Run the lesson checkpointer against the current session signals.
 /// If new lessons are produced, fire-and-forget write them to both
 /// agent_lessons (local) and Memoria (L3). Never blocks the turn.
-fn maybe_checkpoint_lessons(state: &mut ReplState) {
+fn maybe_checkpoint_lessons(state: &mut SessionState) {
     let summary = match state
         .observability_session
         .as_ref()
@@ -595,7 +588,7 @@ async fn filter_lessons_by_relevance(
     matrix_runtime: Option<&std::sync::Arc<astra_runtime::MatrixCloudRuntime>>,
 ) -> Vec<astra_runtime::self_model::LessonHint> {
     let params = match matrix_runtime {
-        Some(rt) => rt.resolve_selector_model().await,
+        Some(rt) => rt.resolve_memory_model().await,
         None => None,
     };
     let Some(params) = params else {
@@ -619,7 +612,7 @@ async fn filter_lessons_by_relevance(
         .collect()
 }
 
-fn should_bootstrap_lessons(state: &ReplState) -> bool {
+fn should_bootstrap_lessons(state: &SessionState) -> bool {
     !state.session_lessons_loaded
 }
 
@@ -807,7 +800,7 @@ fn summarize_event_anchor_artifacts(event: Option<&session_journal::JournalEvent
 }
 
 fn build_continuation_anchor(
-    state: &ReplState,
+    state: &SessionState,
     line: &str,
     result: &StreamResult,
 ) -> Option<String> {
@@ -835,7 +828,7 @@ fn build_continuation_anchor(
     }
 }
 
-pub(super) fn rebuild_continuation_anchor_from_state(state: &mut ReplState) {
+pub(super) fn rebuild_continuation_anchor_from_state(state: &mut SessionState) {
     state.last_response = state.history.last().map(|(_, assistant)| assistant.clone());
 
     let Some((user_line, assistant_text)) = state.history.last() else {
@@ -877,8 +870,8 @@ pub(super) fn history_as_messages(history: &[(String, String)]) -> Vec<serde_jso
 }
 
 async fn run_chat_turn(
-    state: &mut ReplState,
-    ctx: &ReplTurnContext<'_>,
+    state: &mut SessionState,
+    ctx: &TurnContext<'_>,
     token: &str,
     message: &str,
     session_id: Option<&str>,
@@ -895,10 +888,10 @@ async fn run_chat_turn(
     // Memoria is the single source of truth for lessons (Session Memory
     // Protocol L3). agent_lessons table is no longer used for bootstrap.
     if should_bootstrap_lessons(state) {
-        // Resolve selector model on first bootstrap (cached for future turns).
-        if state.selector_model_params.is_none() {
+        // Resolve memory model on first bootstrap (cached for future turns).
+        if state.memory_model_params.is_none() {
             if let Some(ref rt) = state.matrix_runtime {
-                state.selector_model_params = rt.resolve_selector_model().await;
+                state.memory_model_params = rt.resolve_memory_model().await;
             }
         }
 
@@ -953,7 +946,6 @@ async fn run_chat_turn(
             perm_manager: &mut state.perm_manager,
             verbose_mode: state.verbose_mode,
             render_policy: state.tui_render_policy.unwrap_or(crate::stream_render::RenderPolicy::Stream),
-            selector: ctx.selector,
             recent_tools: &state.recent_tools,
             tool_health_entries: &state.tool_health_entries,
             session_lessons: &state.session_lessons,
@@ -1033,7 +1025,7 @@ async fn run_chat_turn(
 /// gate, stash the first diagnosis in `state.latest_skill_diagnosis` for
 /// the next turn's prompt. Lazily creates the handler on first use so
 /// sessions that never trigger anything pay no cost.
-async fn maybe_run_auto_invoke(state: &mut ReplState) {
+async fn maybe_run_auto_invoke(state: &mut SessionState) {
     // Snapshot signals under a scoped read lock so we don't hold the
     // observability lock across the await on maybe_fire.
     let signals = match state.observability_session.as_ref() {
@@ -1178,10 +1170,10 @@ fn build_history_text(full_text: &str, records: &[session_journal::ToolCallRecor
 /// After `state.turn` has been incremented: journal turn row, workspace + checkpoints,
 /// stall/verdict/step sidecars. Shared by normal chat and plan-only LLM turns.
 fn commit_turn_journal_workspace_and_sidecars(
-    state: &mut ReplState,
+    state: &mut SessionState,
     line: &str,
     result: &StreamResult,
-    learning_snap: &ReplTurnLearningSnapshot,
+    learning_snap: &TurnLearningSnapshot,
     turn_start: Instant,
 ) {
     // Capture stall flag before entering the journal borrow scope.
@@ -1217,11 +1209,7 @@ fn commit_turn_journal_workspace_and_sidecars(
         .with_plan_subtask(state.current_plan_subtask_id.as_deref())
         .with_ttft(result.ttft_ms)
         .with_context_time(result.context_ms)
-        .with_selector_strategy(result.selector_strategy.clone())
-        .with_selector_time(result.selector_ms)
-        .with_selector_tokens(result.selector_tokens_in, result.selector_tokens_out)
-        .with_selector_learning_telemetry(
-            result.selector_confidence,
+        .with_routing_telemetry(
             result.routing_domain_hint.clone(),
             result.entity_learn_skipped_no_domain,
         )
@@ -1582,17 +1570,17 @@ fn merge_interruption_metadata(
 }
 
 /// Routing + turn quality for journal fields and `ToolSelector::record_outcome`.
-pub(super) struct ReplTurnLearningSnapshot {
+pub(super) struct TurnLearningSnapshot {
     pub routing: astra_turn_core::routing_engine::RoutingDecision,
     pub eval: astra_runtime::pipeline::evaluation::TurnEvaluation,
 }
 
-pub(super) fn analyze_repl_turn_learning(
+pub(super) fn analyze_chat_turn_learning(
     line: &str,
     turn: u32,
     recent_tools: &[String],
     result: &StreamResult,
-) -> ReplTurnLearningSnapshot {
+) -> TurnLearningSnapshot {
     use astra_runtime::pipeline::evaluation::{
         TurnEvaluationTelemetry, current_evaluation_thresholds,
         evaluate_tool_call_records_with_thresholds_and_telemetry,
@@ -1645,29 +1633,10 @@ pub(super) fn analyze_repl_turn_learning(
         },
     );
 
-    ReplTurnLearningSnapshot { routing, eval }
+    TurnLearningSnapshot { routing, eval }
 }
 
-fn record_selector_turn_outcome(
-    selector: &dyn tool_selector::ToolSelector,
-    line: &str,
-    result: &StreamResult,
-    snap: &ReplTurnLearningSnapshot,
-    prev_assistant_text: Option<&str>,
-) {
-    let signal = astra_turn_types::detect_implicit_feedback_signal(line, prev_assistant_text);
-    let was_corrected = matches!(signal.signal_type.as_str(), "correction" | "frustration");
-    selector.record_outcome(
-        line,
-        &result.tools_used,
-        snap.routing.task_type,
-        snap.routing.domain_hint,
-        snap.eval.success,
-        snap.eval.quality,
-        was_corrected,
-        None,
-    );
-}
+// record_selector_turn_outcome removed — tool selector no longer exists.
 
 /// Test-only sync variant of `apply_turn_success`. Production code paths must
 /// use [`apply_turn_success_async`] so the LLM-driven skill-improvement path
@@ -1675,20 +1644,18 @@ fn record_selector_turn_outcome(
 /// test fixtures working without pulling a tokio runtime into every assertion.
 #[cfg(test)]
 fn apply_turn_success(
-    state: &mut ReplState,
-    selector: &dyn tool_selector::ToolSelector,
+    state: &mut SessionState,
     profile: Option<&str>,
     line: &str,
     result: StreamResult,
     turn_start: Instant,
 ) {
-    apply_turn_success_sync(state, selector, profile, line, result, turn_start);
+    apply_turn_success_sync(state, profile, line, result, turn_start);
     check_skill_improvement_inner(state);
 }
 
 async fn apply_turn_success_async(
-    state: &mut ReplState,
-    selector: &dyn tool_selector::ToolSelector,
+    state: &mut SessionState,
     profile: Option<&str>,
     line: &str,
     mut result: StreamResult,
@@ -1696,7 +1663,7 @@ async fn apply_turn_success_async(
 ) {
     let final_messages = std::mem::take(&mut result.final_messages);
     let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
-    apply_turn_success_sync(state, selector, profile, line, result, turn_start);
+    apply_turn_success_sync(state, profile, line, result, turn_start);
 
     // Persist CSL via CslManager.
     let turn = state.turn;
@@ -1739,7 +1706,7 @@ async fn apply_turn_success_async(
             .memory_extractor
             .maybe_extract(super::memory_extraction::ExtractionContext {
                 turn: extraction_turn,
-                selector_params: state.selector_model_params.as_ref(),
+                memory_model_params: state.memory_model_params.as_ref(),
                 user_message: line,
                 assistant_response: state.last_response.as_deref().unwrap_or(""),
                 tools_used: &tools_used,
@@ -1752,7 +1719,7 @@ async fn apply_turn_success_async(
     // Started outcomes are journaled when drain() completes (session end).
     match &outcome {
         super::memory_extraction::ExtractionOutcome::SkippedMainWrote
-        | super::memory_extraction::ExtractionOutcome::SkippedNoSelector
+        | super::memory_extraction::ExtractionOutcome::SkippedNoModel
         | super::memory_extraction::ExtractionOutcome::SkippedBusy { .. }
         | super::memory_extraction::ExtractionOutcome::Error(_) => {
             // Use the centralized builder so variant-specific fields
@@ -1788,8 +1755,7 @@ async fn apply_turn_success_async(
 }
 
 fn apply_turn_success_sync(
-    state: &mut ReplState,
-    selector: &dyn tool_selector::ToolSelector,
+    state: &mut SessionState,
     profile: Option<&str>,
     line: &str,
     result: StreamResult,
@@ -1853,11 +1819,9 @@ fn apply_turn_success_sync(
     state.continuation_anchor = build_continuation_anchor(state, line, &result);
     state.pending_followup_suggestion =
         crate::followup_suggestion::suggest_followup(line, state, &result);
-    if let Some(suggestion) = state.pending_followup_suggestion.as_ref() {
-        super::repl_ui::set_followup_prompt_hint(Some(suggestion.text.clone()));
-    } else {
-        super::repl_ui::clear_followup_prompt_hint();
-    }
+    // Followup hint rendering used to live in the line-mode REPL prompt
+    // (`repl_ui::set_followup_prompt_hint`); the TUI consumes
+    // `state.pending_followup_suggestion` directly.
 
     // New user input invalidates redo stack (history diverged)
     state.redo_stack.clear();
@@ -1874,7 +1838,7 @@ fn apply_turn_success_sync(
         state.tool_health_entries = result.tool_health_export.clone();
     }
 
-    let learning_snap = analyze_repl_turn_learning(line, state.turn, &state.recent_tools, &result);
+    let learning_snap = analyze_chat_turn_learning(line, state.turn, &state.recent_tools, &result);
     let mut result = result;
     let routing_domain = learning_snap
         .routing
@@ -1886,15 +1850,6 @@ fn apply_turn_success_sync(
     result.set_repl_learning_journal_fields(routing_domain, entity_skipped);
 
     commit_turn_journal_workspace_and_sidecars(state, line, &result, &learning_snap, turn_start);
-    // Previous assistant response = second-to-last history entry (last is current turn,
-    // already pushed above). Used to detect if the user is correcting the prior response.
-    let prev_assistant_text = state
-        .history
-        .len()
-        .checked_sub(2)
-        .and_then(|i| state.history.get(i))
-        .map(|(_, resp)| resp.as_str());
-    record_selector_turn_outcome(selector, line, &result, &learning_snap, prev_assistant_text);
 
     // ── Post-turn status line ────────────────────────────────────────────
     print_turn_status_line(state, &result, turn_start);
@@ -1918,7 +1873,7 @@ fn apply_turn_success_sync(
     }
 }
 
-fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: Instant) {
+fn print_turn_status_line(state: &SessionState, result: &StreamResult, turn_start: Instant) {
     // In TUI mode, suppress line-mode status output — TUI has its own footer
     if state.tui_render_policy.is_some() {
         return;
@@ -2082,7 +2037,7 @@ pub(crate) trait SkillImproveLlm: Send + Sync {
 ///    and record a structured proposal.
 /// 5. Otherwise fall back to the heuristic append ("Recent user feedback"
 ///    section) via [`check_skill_improvement_inner`].
-async fn check_skill_improvement_async(state: &mut ReplState) {
+async fn check_skill_improvement_async(state: &mut SessionState) {
     // LLM-driven skill improvement previously used CloudLlmJudge::from_env; after env cleanup
     // it falls through to the heuristic append path below. TODO: wire a server-proxy LLM client
     // here if skill auto-rewrite becomes a priority again.
@@ -2119,7 +2074,7 @@ async fn check_skill_improvement_async(state: &mut ReplState) {
 /// an `Ok(false)` "inapplicable, please retry via heuristic" path without a
 /// breaking signature change. At the moment no code path returns `Ok(false)`.
 pub(crate) async fn try_llm_skill_improvement(
-    state: &mut ReplState,
+    state: &mut SessionState,
     llm: &dyn SkillImproveLlm,
 ) -> Result<bool, String> {
     if !state.skill_improvement_tracker.should_analyze(state.turn) {
@@ -2290,7 +2245,7 @@ fn extract_csl_fields_from_result(result: &StreamResult) -> CslCheckpointFields 
 /// the previous CSL state. Fields from `cp` that are `None` fall back to
 /// `prev_state`, so the no-checkpoint path preserves previously persisted values.
 fn build_full_session_state_compact(
-    state: &ReplState,
+    state: &SessionState,
     cp: CslCheckpointFields,
     prev_state: &astra_turn_core::conversation_log::SessionStateCompact,
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
@@ -2328,7 +2283,7 @@ fn build_full_session_state_compact(
 ///
 /// After every N user turns (TURN_BATCH_SIZE), checks whether the recent conversation
 /// contains corrections or improvements for any active filesystem skill.
-fn check_skill_improvement(state: &mut ReplState, _line: &str, _result: &StreamResult) {
+fn check_skill_improvement(state: &mut SessionState, _line: &str, _result: &StreamResult) {
     check_skill_improvement_inner(state);
 }
 
@@ -2388,7 +2343,7 @@ fn trim_feedback_sections(content: &str, keep: usize) -> String {
 
 /// Body of `check_skill_improvement`, extracted so it can be unit-tested
 /// without requiring a full `StreamResult`.
-fn check_skill_improvement_inner(state: &mut ReplState) {
+fn check_skill_improvement_inner(state: &mut SessionState) {
     if !state.skill_improvement_tracker.should_analyze(state.turn) {
         return;
     }
@@ -2581,7 +2536,7 @@ fn check_skill_improvement_inner(state: &mut ReplState) {
     state.skill_improvement_tracker.mark_analyzed(state.turn);
 }
 
-pub(super) fn initialize_journal_pub(state: &mut ReplState, session_id: &str) {
+pub(super) fn initialize_journal_pub(state: &mut SessionState, session_id: &str) {
     initialize_journal(state, session_id);
 }
 
@@ -2589,7 +2544,7 @@ pub(super) fn persist_last_session_id(profile: Option<&str>, session_id: &str) {
     let _ = persist_profile_last_session(profile, session_id);
 }
 
-fn initialize_journal(state: &mut ReplState, session_id: &str) {
+fn initialize_journal(state: &mut SessionState, session_id: &str) {
     let target_path = session_journal::journal_file_path(session_id);
     let already_attached = state
         .journal
@@ -2737,7 +2692,7 @@ pub(super) fn is_auth_error(error: &str) -> bool {
 }
 
 fn report_turn_failure(
-    state: &mut ReplState,
+    state: &mut SessionState,
     profile: Option<&str>,
     line: &str,
     failure: &crate::TurnFailure,
@@ -2820,7 +2775,7 @@ fn report_turn_failure(
 
 /// Copy plan / durable-task fields from REPL into workspace before checkpointing.
 fn sync_plan_fields_to_workspace(
-    state: &ReplState,
+    state: &SessionState,
     ws: &mut astra_services::session_workspace::WorkspaceMetadata,
 ) {
     ws.executing_plan_json = state
@@ -2842,7 +2797,7 @@ fn sync_plan_fields_to_workspace(
 
 /// Sync session state fields to workspace for resume capability.
 fn sync_session_state_to_workspace(
-    state: &ReplState,
+    state: &SessionState,
     ws: &mut astra_services::session_workspace::WorkspaceMetadata,
 ) {
     ws.pinned_skills = state.pinned_skills.iter().cloned().collect();
@@ -2865,7 +2820,7 @@ pub(super) struct GoalSteeringChange {
 }
 
 pub(super) fn steer_observability_goal(
-    _state: &mut ReplState,
+    _state: &mut SessionState,
     _goal: &str,
 ) -> Option<GoalSteeringChange> {
     None
@@ -2874,7 +2829,7 @@ pub(super) fn steer_observability_goal(
 /// Apply persisted adaptive engine state to a newly created ObservabilitySession.
 /// Called when pending_adaptive_state was stashed during workspace restore and the
 /// ObservabilitySession is now available to receive it.
-pub(super) fn apply_pending_adaptive_state(state: &mut ReplState) {
+pub(super) fn apply_pending_adaptive_state(state: &mut SessionState) {
     let adaptive = match state.pending_adaptive_state.take() {
         Some(a) => a,
         None => return,
@@ -2907,14 +2862,14 @@ pub(super) fn apply_pending_adaptive_state(state: &mut ReplState) {
     }
 }
 
-fn latest_context_trace_signal(state: &ReplState) -> Option<ContextTraceSignal> {
+fn latest_context_trace_signal(state: &SessionState) -> Option<ContextTraceSignal> {
     let obs = state.observability_session.as_ref()?;
     let guard = obs.read().ok()?;
     astra_runtime::observability_integration::latest_context_trace_signal(&guard)
 }
 
 fn sync_context_trace_to_workspace(
-    state: &ReplState,
+    state: &SessionState,
     ws: &mut astra_services::session_workspace::WorkspaceMetadata,
 ) {
     ws.last_context_trace = latest_context_trace_signal(state);
@@ -2934,7 +2889,7 @@ fn next_step_checkpoint_number(sid: &str) -> Result<u32, String> {
 
 /// Build heavy step checkpoint from current REPL history (OpenAI-style messages).
 fn build_manual_heavy_step_checkpoint(
-    state: &ReplState,
+    state: &SessionState,
     sid: &str,
 ) -> astra_pipeline::step_protocol::StepCheckpoint {
     use astra_pipeline::step_protocol::{
@@ -2988,7 +2943,7 @@ fn build_manual_heavy_step_checkpoint(
         consecutive_context_window_errors: 0,
         compaction_state: None,
         pipeline_state: None,
-        // Step 2b: stamp the pointer from ReplState so this checkpoint
+        // Step 2b: stamp the pointer from SessionState so this checkpoint
         // records exactly which version of the runtime config the
         // session ran under at the time it was written.
         config_version_id: state.config_version_id.clone(),
@@ -3034,7 +2989,7 @@ fn persist_manual_heavy_and_composite(
 
 /// After heavy JSON exists: bump workspace checkpoint list, write markdown, journal, ingestion, `workspace.yaml`.
 fn persist_manual_session_checkpoint_layer(
-    state: &ReplState,
+    state: &SessionState,
     journal: &session_journal::JournalWriter,
     sid: &str,
     ws: &mut astra_services::session_workspace::WorkspaceMetadata,
@@ -3103,7 +3058,7 @@ fn persist_manual_session_checkpoint_layer(
 
 /// Queue session + step checkpoint uploads (best-effort; errors only in logs).
 fn spawn_manual_checkpoint_cloud_uploads(
-    state: &ReplState,
+    state: &SessionState,
     sid: &str,
     session_cp: &astra_services::session_checkpoint::Checkpoint,
     next_step: u32,
@@ -3174,8 +3129,8 @@ impl ManualCheckpointSummary {
     }
 }
 
-pub(super) fn create_manual_repl_checkpoint(
-    state: &mut ReplState,
+pub(super) fn create_manual_checkpoint(
+    state: &mut SessionState,
     label_arg: &str,
 ) -> Result<ManualCheckpointSummary, String> {
     let sid = state
@@ -3283,7 +3238,7 @@ mod tests {
         ws.total_tokens_out = 5;
         astra_services::session_workspace::write_workspace(&ws).unwrap();
 
-        let mut state = ReplState {
+        let mut state = SessionState {
             model: Some("gpt-5".to_string()),
             ..Default::default()
         };
@@ -3329,7 +3284,7 @@ mod tests {
         ws.status = "completed".to_string();
         astra_services::session_workspace::write_workspace(&ws).unwrap();
 
-        let mut state = ReplState {
+        let mut state = SessionState {
             model: Some("gpt-5".to_string()),
             ..Default::default()
         };
@@ -3399,13 +3354,13 @@ mod tests {
             .append(&session_journal::JournalEvent::cloud_pull_sync_marker(
                 Some(&sid),
                 "default",
-                "repl_startup",
+                "session_startup",
                 &["blocked_tools".to_string()],
                 false,
             ))
             .unwrap();
 
-        let mut state = ReplState {
+        let mut state = SessionState {
             model: Some("gpt-5".to_string()),
             ..Default::default()
         };
@@ -3429,7 +3384,7 @@ mod tests {
 
     #[test]
     fn sync_plan_fields_copies_repl_into_workspace() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.executing_plan_goal = Some("goal-x".to_string());
         state.plan_execution_rounds = 9;
         state.plan_execution_corrections = vec!["note".to_string()];
@@ -3444,8 +3399,8 @@ mod tests {
 
     #[test]
     fn apply_pending_adaptive_state_requeues_when_lock_is_poisoned() {
-        let mut state = ReplState::default();
-        state.pending_adaptive_state = Some(super::repl_state::PersistedAdaptiveState {
+        let mut state = SessionState::default();
+        state.pending_adaptive_state = Some(super::session_state::PersistedAdaptiveState {
             last_scenario_change_turn: Some(3),
             last_token_budget_direction: 1,
             last_token_budget_change_turn: Some(2),
@@ -3467,7 +3422,7 @@ mod tests {
 
     #[test]
     fn sync_context_trace_copies_latest_trace_into_workspace() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let mut obs =
             astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-trace");
         obs.context_traces
@@ -3593,7 +3548,7 @@ mod tests {
         });
         astra_services::session_workspace::write_workspace(&ws).unwrap();
 
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.model = Some("new-model".into());
         initialize_journal(&mut state, sid);
 
@@ -3631,7 +3586,7 @@ mod tests {
 
     #[test]
     fn manual_heavy_checkpoint_maps_history_to_openai_messages() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.history.push(("u1".into(), "a1".into()));
         state.history.push(("u2".into(), "a2".into()));
         state.recent_tools = vec!["bash".to_string()];
@@ -3658,7 +3613,7 @@ mod tests {
     fn persist_manual_heavy_and_composite_writes_heavy_and_index() {
         let (_tmp, _g) = isolated_sessions_dir();
         let sid = "sess-heavy-idx";
-        let state = ReplState::default();
+        let state = SessionState::default();
         let step_cp = build_manual_heavy_step_checkpoint(&state, sid);
 
         let heavy_path =
@@ -3681,7 +3636,7 @@ mod tests {
         astra_services::session_workspace::write_workspace(&ws).unwrap();
 
         let journal = session_journal::JournalWriter::new(&sid).unwrap();
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.history.push(("hi".into(), "hello".into()));
         state.recent_tools = vec!["read_file".to_string()];
 
@@ -3708,7 +3663,7 @@ mod tests {
 
     #[test]
     fn spawn_manual_cloud_uploads_no_panic_without_matrix() {
-        let state = ReplState::default();
+        let state = SessionState::default();
         let cp = astra_services::session_checkpoint::Checkpoint {
             number: 1,
             turn: 1,
@@ -3725,7 +3680,7 @@ mod tests {
     }
 
     #[test]
-    fn create_manual_repl_checkpoint_returns_compact_summary() {
+    fn create_manual_checkpoint_returns_compact_summary() {
         let (_tmp, _g) = isolated_sessions_dir();
         let sid = uuid::Uuid::new_v4().to_string();
         let journal = session_journal::JournalWriter::new(&sid).unwrap();
@@ -3734,7 +3689,7 @@ mod tests {
         ws.turn_count = 3;
         astra_services::session_workspace::write_workspace(&ws).unwrap();
 
-        let mut state = ReplState {
+        let mut state = SessionState {
             session_id: Some(sid.clone()),
             journal: Some(journal),
             model: Some("test-model".to_string()),
@@ -3742,7 +3697,7 @@ mod tests {
         };
         state.history.push(("hi".into(), "hello".into()));
 
-        let summary = create_manual_repl_checkpoint(&mut state, "").unwrap();
+        let summary = create_manual_checkpoint(&mut state, "").unwrap();
         assert_eq!(summary.headline(), "Checkpoint #1 saved (turn 3)");
         assert!(summary.checkpoint_path.exists());
         assert!(summary.heavy_path.exists());
@@ -3778,12 +3733,12 @@ mod tests {
 
     #[test]
     fn build_effective_line_injects_anchor_for_short_continue() {
-        let state = ReplState {
+        let state = SessionState {
             continuation_anchor: Some(
                 "Latest user task: debug Chinese input drops\nLatest assistant direction: inspect prompt redraw path"
                     .to_string(),
             ),
-            ..ReplState::default()
+            ..SessionState::default()
         };
 
         let effective = build_effective_line("继续", &state, &mut crate::ui_adapter::LineUiAdapter);
@@ -3805,12 +3760,12 @@ mod tests {
 
     #[test]
     fn build_effective_line_injects_attachment_for_low_information_repair_followup() {
-        let state = ReplState {
+        let state = SessionState {
             continuation_anchor: Some(
                 "Latest user task: review commit aa1f419b\nLatest assistant summary:\n## Review\nP5 still blocks large merges"
                     .to_string(),
             ),
-            ..ReplState::default()
+            ..SessionState::default()
         };
 
         let effective =
@@ -3823,9 +3778,9 @@ mod tests {
 
     #[test]
     fn build_effective_line_leaves_normal_prompt_untouched() {
-        let state = ReplState {
+        let state = SessionState {
             continuation_anchor: Some("Latest user task: debug Chinese input drops".to_string()),
-            ..ReplState::default()
+            ..SessionState::default()
         };
 
         let effective = build_effective_line(
@@ -3839,9 +3794,9 @@ mod tests {
 
     #[test]
     fn consume_plan_resume_if_matches_requires_resume_signal() {
-        let mut state = ReplState {
+        let mut state = SessionState {
             pending_plan_resume_digest: Some("[plan-resume] goal=\"Fix auth\"".to_string()),
-            ..ReplState::default()
+            ..SessionState::default()
         };
 
         assert!(consume_plan_resume_if_matches(&mut state, "tell me a joke").is_none());
@@ -3853,9 +3808,9 @@ mod tests {
 
     #[test]
     fn consume_plan_resume_if_matches_consumes_digest_on_explicit_tag() {
-        let mut state = ReplState {
+        let mut state = SessionState {
             pending_plan_resume_digest: Some("[plan-resume] goal=\"Fix auth\"".to_string()),
-            ..ReplState::default()
+            ..SessionState::default()
         };
 
         let digest = consume_plan_resume_if_matches(&mut state, "please @resume-plan");
@@ -3885,12 +3840,12 @@ mod tests {
         )
         .unwrap();
 
-        let state = ReplState {
+        let state = SessionState {
             skill_dev: Some(super::super::SkillDevState {
                 name: "test-skill".to_string(),
                 dir: skill_dir,
             }),
-            ..ReplState::default()
+            ..SessionState::default()
         };
 
         let effective = build_effective_line(
@@ -3910,12 +3865,12 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join("SKILL.md"), "---\nname: evolving\n---\nV1").unwrap();
 
-        let state = ReplState {
+        let state = SessionState {
             skill_dev: Some(super::super::SkillDevState {
                 name: "evolving".to_string(),
                 dir: skill_dir.clone(),
             }),
-            ..ReplState::default()
+            ..SessionState::default()
         };
 
         let turn1 = build_effective_line("check", &state, &mut crate::ui_adapter::LineUiAdapter);
@@ -3936,12 +3891,12 @@ mod tests {
 
     #[test]
     fn build_effective_line_skill_dev_missing_file_falls_through() {
-        let state = ReplState {
+        let state = SessionState {
             skill_dev: Some(super::super::SkillDevState {
                 name: "ghost".to_string(),
                 dir: std::path::PathBuf::from("/nonexistent/path/ghost"),
             }),
-            ..ReplState::default()
+            ..SessionState::default()
         };
 
         let effective =
@@ -3956,12 +3911,12 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join("SKILL.md"), "").unwrap();
 
-        let state = ReplState {
+        let state = SessionState {
             skill_dev: Some(super::super::SkillDevState {
                 name: "empty-skill".to_string(),
                 dir: skill_dir,
             }),
-            ..ReplState::default()
+            ..SessionState::default()
         };
 
         let effective =
@@ -3981,12 +3936,12 @@ mod tests {
         )
         .unwrap();
 
-        let state = ReplState {
+        let state = SessionState {
             skill_dev: Some(super::super::SkillDevState {
                 name: "custom-loc".to_string(),
                 dir: skill_dir.clone(),
             }),
-            ..ReplState::default()
+            ..SessionState::default()
         };
 
         let effective = build_effective_line("x", &state, &mut crate::ui_adapter::LineUiAdapter);
@@ -4009,14 +3964,14 @@ mod tests {
         )
         .unwrap();
 
-        let state = ReplState {
+        let state = SessionState {
             skill_dev: Some(super::super::SkillDevState {
                 name: "combo".to_string(),
                 dir: skill_dir,
             }),
             active_system_skills: vec![prompts::builtin_concise_skill()],
             continuation_anchor: Some("Previous task: fix auth".to_string()),
-            ..ReplState::default()
+            ..SessionState::default()
         };
 
         // Short continuation prompt triggers all three layers
@@ -4031,8 +3986,8 @@ mod tests {
     // ── Cost tracking & status line logic tests ──────────────────────────
 
     #[test]
-    fn repl_state_accumulates_cache_tokens_across_turns() {
-        let mut state = ReplState::default();
+    fn session_state_accumulates_cache_tokens_across_turns() {
+        let mut state = SessionState::default();
         // Simulate first turn
         state.total_prompt_tokens += 1000;
         state.total_completion_tokens += 500;
@@ -4103,7 +4058,7 @@ mod tests {
 
     #[test]
     fn session_cost_accumulation() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.cached_pricing = astra_services::models::PricingData {
             prompt: 3.0,             // $3/1K prompt tokens
             completion: 15.0,        // $15/1K completion tokens
@@ -4178,14 +4133,14 @@ mod tests {
         assert!(history[0].1.contains("Rust Pin<T>"));
 
         // Phase 4: Verify continuation anchor still works on short prompt
-        let state = ReplState {
+        let state = SessionState {
             continuation_anchor: Some(
                 "Latest user task: debug lifetime in tokio::spawn\n\
                  Latest assistant direction: add 'static bound to closure"
                     .to_string(),
             ),
             history,
-            ..ReplState::default()
+            ..SessionState::default()
         };
 
         let effective = build_effective_line("继续", &state, &mut crate::ui_adapter::LineUiAdapter);
@@ -4281,12 +4236,7 @@ mod tests {
             last_heavy_checkpoint: None,
             ttft_ms: None,
             context_ms: None,
-            selector_strategy: None,
-            selector_ms: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
             memoria_ms: None,
-            selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
@@ -4296,11 +4246,6 @@ mod tests {
             final_messages: Vec::new(),
             background_agent_results: Vec::new(),
         }
-    }
-
-    fn test_selector() -> tool_selector::TfIdfSelector {
-        let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
-        tool_selector::TfIdfSelector::new(registry)
     }
 
     fn tool_call_record(
@@ -4325,7 +4270,7 @@ mod tests {
     }
 
     #[test]
-    fn analyze_repl_turn_learning_flags_llm_round_churn() {
+    fn analyze_chat_turn_learning_flags_llm_round_churn() {
         let llm_round_event = |round: u32, tokens_in: u64| {
             let mut event = session_journal::JournalEvent::base_public(
                 session_journal::JournalEventType::LlmRound,
@@ -4361,7 +4306,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let learning = analyze_repl_turn_learning("review local changes", 2, &[], &result);
+        let learning = analyze_chat_turn_learning("review local changes", 2, &[], &result);
         assert!(
             learning.eval.signals.iter().any(|signal| matches!(
                 signal,
@@ -4399,22 +4344,17 @@ mod tests {
     #[serial_test::serial]
     fn apply_turn_success_sets_prompt_hint_for_followup() {
         let (_tmp, _g) = isolated_sessions_dir();
-        super::repl_ui::clear_followup_prompt_hint();
 
-        let selector = test_selector();
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let mut result = stub_stream_result("Updated the code.");
         result.tools_used = vec!["str_replace".to_string()];
 
-        apply_turn_success(
-            &mut state,
-            &selector,
-            None,
-            "fix the bug",
-            result,
-            Instant::now(),
-        );
+        apply_turn_success(&mut state, None, "fix the bug", result, Instant::now());
 
+        // The follow-up suggestion is exposed on `state` for the TUI
+        // to render; the original assertion against the line-mode
+        // prompt hint (`super::repl_ui::prompt_inline_hint`) is gone
+        // along with the line-mode REPL itself.
         assert_eq!(
             state
                 .pending_followup_suggestion
@@ -4422,19 +4362,13 @@ mod tests {
                 .map(|suggestion| suggestion.text.as_str()),
             Some("run the tests")
         );
-        assert_eq!(
-            super::repl_ui::prompt_inline_hint(""),
-            Some("run the tests".to_string())
-        );
-
-        super::repl_ui::clear_followup_prompt_hint();
     }
 
     #[test]
     fn report_turn_failure_persists_filtered_partial_metrics() {
         let (_tmp, _g) = isolated_sessions_dir();
         let sid = format!("test-turn-failure-{}", uuid::Uuid::new_v4());
-        let mut state = ReplState {
+        let mut state = SessionState {
             journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
             session_id: Some(sid.clone()),
             model: Some("gpt-5".into()),
@@ -4489,7 +4423,7 @@ mod tests {
     fn commit_turn_persists_turn_evaluation_event() {
         let (_tmp, _g) = isolated_sessions_dir();
         let sid = format!("test-turn-eval-{}", uuid::Uuid::new_v4());
-        let mut state = ReplState {
+        let mut state = SessionState {
             journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
             session_id: Some(sid.clone()),
             model: Some("gpt-5".into()),
@@ -4516,7 +4450,7 @@ mod tests {
         }];
 
         let learning =
-            analyze_repl_turn_learning("git status", state.turn, &state.recent_tools, &result);
+            analyze_chat_turn_learning("git status", state.turn, &state.recent_tools, &result);
         commit_turn_journal_workspace_and_sidecars(
             &mut state,
             "git status",
@@ -4545,7 +4479,7 @@ mod tests {
     fn interrupted_success_turn_is_marked_partial_in_journal() {
         let (_tmp, _g) = isolated_sessions_dir();
         let sid = format!("test-turn-partial-{}", uuid::Uuid::new_v4());
-        let mut state = ReplState {
+        let mut state = SessionState {
             journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
             session_id: Some(sid.clone()),
             model: Some("gpt-5".into()),
@@ -4563,7 +4497,7 @@ mod tests {
         }));
         result.tool_calls_count = 3;
 
-        let learning = analyze_repl_turn_learning("continue", state.turn, &[], &result);
+        let learning = analyze_chat_turn_learning("continue", state.turn, &[], &result);
         commit_turn_journal_workspace_and_sidecars(
             &mut state,
             "continue",
@@ -4607,7 +4541,7 @@ mod tests {
     fn interrupted_turn_replay_persists_observability_and_context_trace() {
         let (_tmp, _g) = isolated_sessions_dir();
         let sid = format!("test-turn-replay-{}", uuid::Uuid::new_v4());
-        let mut state = ReplState {
+        let mut state = SessionState {
             journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
             session_id: Some(sid.clone()),
             model: Some("gpt-5".into()),
@@ -4654,7 +4588,7 @@ mod tests {
             }),
         ));
 
-        let learning = analyze_repl_turn_learning("continue", state.turn, &[], &result);
+        let learning = analyze_chat_turn_learning("continue", state.turn, &[], &result);
         commit_turn_journal_workspace_and_sidecars(
             &mut state,
             "continue",
@@ -4712,10 +4646,8 @@ mod tests {
     #[serial_test::serial]
     fn apply_turn_success_clears_stale_prompt_hint_when_suppressed() {
         let (_tmp, _g) = isolated_sessions_dir();
-        super::repl_ui::set_followup_prompt_hint(Some("stale hint".to_string()));
 
-        let selector = test_selector();
-        let mut state = ReplState {
+        let mut state = SessionState {
             plan_mode: Some(plan_decompose::PlanModeState::new(
                 "goal".to_string(),
                 plan_decompose::ProjectContext::default(),
@@ -4724,19 +4656,12 @@ mod tests {
         };
         let result = stub_stream_result("Plan updated.");
 
-        apply_turn_success(
-            &mut state,
-            &selector,
-            None,
-            "continue",
-            result,
-            Instant::now(),
-        );
+        apply_turn_success(&mut state, None, "continue", result, Instant::now());
 
+        // Follow-up suggestion is suppressed in plan mode; the legacy
+        // line-mode prompt hint check (`prompt_inline_hint`) is gone
+        // with the rest of `repl_ui`.
         assert!(state.pending_followup_suggestion.is_none());
-        assert_eq!(super::repl_ui::prompt_inline_hint(""), None);
-
-        super::repl_ui::clear_followup_prompt_hint();
     }
 
     /// Verifies build_continuation_anchor keeps a bounded, multi-line attachment.
@@ -4748,7 +4673,7 @@ mod tests {
             "b".repeat(300)
         );
 
-        let state = ReplState::default();
+        let state = SessionState::default();
         let mut result = stub_stream_result(&long_assistant);
         result.tools_used = vec!["read_file".into(), "str_replace".into()];
         result.tool_call_records = vec![session_journal::ToolCallRecord {
@@ -4793,9 +4718,9 @@ mod tests {
     /// Verifies that when user input is empty, the previous anchor is preserved.
     #[test]
     fn continuation_anchor_preserves_on_empty_input() {
-        let state = ReplState {
+        let state = SessionState {
             continuation_anchor: Some("Previous anchor content".to_string()),
-            ..ReplState::default()
+            ..SessionState::default()
         };
         let result = stub_stream_result("new response");
 
@@ -4808,7 +4733,7 @@ mod tests {
     /// Verifies history integrity after failed turn is excluded.
     #[test]
     fn failed_turn_excluded_from_history_preserves_continuity() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
 
         // Turn 1: success
         state.history.push((
@@ -4873,7 +4798,7 @@ mod tests {
 
     // ─── E2E: skill improvement closed loop ─────────────────────────────
     // Seeds a tempdir filesystem skill, injects a user correction into
-    // ReplState.history, and calls `check_skill_improvement_inner` to verify:
+    // SessionState.history, and calls `check_skill_improvement_inner` to verify:
     //   1. SKILL.md on disk now contains a "Recent user feedback" section.
     //   2. ImprovementTracker.pending_proposal is populated.
     //   3. Tracker advanced past `should_analyze`.
@@ -4900,9 +4825,9 @@ mod tests {
         registry.load("my-skill").await.unwrap();
         assert_eq!(registry.len(), 1);
 
-        // 3. Wire up a ReplState with the registry, a correction message
+        // 3. Wire up a SessionState with the registry, a correction message
         //    in history, and a turn count past the batch threshold.
-        let mut state = ReplState {
+        let mut state = SessionState {
             unified_skill_registry: std::sync::Arc::new(registry),
             history: vec![(
                 "no, that's wrong — please do it differently next time".to_string(),
@@ -4969,7 +4894,7 @@ mod tests {
         registry.discover_all().await.unwrap();
         registry.load("my-skill").await.unwrap();
 
-        let mut state = ReplState {
+        let mut state = SessionState {
             unified_skill_registry: std::sync::Arc::new(registry),
             history: vec![(
                 "hello, please add a feature".to_string(),
@@ -5029,7 +4954,7 @@ mod tests {
         registry.discover_all().await.unwrap();
         registry.load("my-skill").await.unwrap();
 
-        let mut state = ReplState {
+        let mut state = SessionState {
             unified_skill_registry: std::sync::Arc::new(registry),
             history: vec![(
                 "no, don't greet twice — skip the greeting on follow-ups".to_string(),
@@ -5100,7 +5025,7 @@ mod tests {
         registry.discover_all().await.unwrap();
         registry.load("my-skill").await.unwrap();
 
-        let mut state = ReplState {
+        let mut state = SessionState {
             unified_skill_registry: std::sync::Arc::new(registry),
             history: vec![("no, that's wrong".to_string(), "sorry".to_string())],
             turn: astra_skills::improvement::TURN_BATCH_SIZE + 1,
@@ -5142,7 +5067,7 @@ mod tests {
         registry.discover_all().await.unwrap();
         registry.load("my-skill").await.unwrap();
 
-        let mut state = ReplState {
+        let mut state = SessionState {
             unified_skill_registry: std::sync::Arc::new(registry),
             history: vec![(
                 "no, that's wrong, do it differently".to_string(),
@@ -5801,7 +5726,7 @@ mod tests {
 
     #[test]
     fn no_checkpoint_preserves_blocked_tools_from_prev_state() {
-        let state = &ReplState {
+        let state = &SessionState {
             recent_tools: vec!["read_file".into()],
             ..Default::default()
         };
@@ -5833,7 +5758,7 @@ mod tests {
 
     #[test]
     fn no_checkpoint_preserves_approval_overrides_from_prev_state() {
-        let state = &ReplState::default();
+        let state = &SessionState::default();
         let prev = astra_turn_core::conversation_log::SessionStateCompact {
             approval_overrides: Some(serde_json::json!({"tool": "bash", "approved": true})),
             ..Default::default()
@@ -5860,7 +5785,7 @@ mod tests {
 
     #[test]
     fn no_checkpoint_preserves_delegation_from_prev_state() {
-        let state = &ReplState::default();
+        let state = &SessionState::default();
         let delegation = astra_turn_core::conversation_log::DelegationCompact {
             id: "d1".into(),
             pattern: "review".into(),
@@ -5892,7 +5817,7 @@ mod tests {
 
     #[test]
     fn no_checkpoint_preserves_compaction_tracker_from_prev_state() {
-        let state = &ReplState::default();
+        let state = &SessionState::default();
         let prev = astra_turn_core::conversation_log::SessionStateCompact {
             compaction_tracker: Some(serde_json::json!({"version": 3})),
             ..Default::default()
@@ -5919,7 +5844,7 @@ mod tests {
 
     #[test]
     fn checkpoint_path_overrides_prev_state() {
-        let state = &ReplState {
+        let state = &SessionState {
             recent_tools: vec!["exec".into()],
             ..Default::default()
         };
@@ -5971,7 +5896,7 @@ mod tests {
 
     #[test]
     fn checkpoint_explicitly_clears_fields() {
-        let state = &ReplState::default();
+        let state = &SessionState::default();
         let prev = astra_turn_core::conversation_log::SessionStateCompact {
             blocked_tools: vec!["bash".into()],
             approval_overrides: Some(serde_json::json!({"tool": "bash"})),
@@ -6019,7 +5944,7 @@ mod tests {
 
     #[test]
     fn no_checkpoint_preserves_interruption_from_prev_state() {
-        let state = &ReplState::default();
+        let state = &SessionState::default();
         let prev = astra_turn_core::conversation_log::SessionStateCompact {
             interruption: Some(serde_json::json!({"kind": "budget_exhausted"})),
             ..Default::default()
@@ -6048,7 +5973,7 @@ mod tests {
 
     #[test]
     fn should_bootstrap_lessons_true_on_fresh_state() {
-        let state = ReplState::default();
+        let state = SessionState::default();
         assert!(
             should_bootstrap_lessons(&state),
             "fresh state should bootstrap from Memoria"
@@ -6057,7 +5982,7 @@ mod tests {
 
     #[test]
     fn should_bootstrap_lessons_skips_when_already_loaded() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         state.session_lessons_loaded = true;
         assert!(
             !should_bootstrap_lessons(&state),
@@ -6069,7 +5994,7 @@ mod tests {
 
     #[test]
     fn filter_lessons_uses_matrix_runtime_not_env_vars() {
-        let source = include_str!("repl_turn.rs");
+        let source = include_str!("chat_turn.rs");
         // Exclude the test module itself (everything after #[cfg(test)])
         let prod_code = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
         let selector_prefix = "ASTRA_SELECTOR";
@@ -6081,9 +6006,9 @@ mod tests {
 
     #[test]
     fn filter_lessons_resolves_via_matrix_runtime() {
-        let source = include_str!("repl_turn.rs");
+        let source = include_str!("chat_turn.rs");
         assert!(
-            source.contains("resolve_selector_model"),
+            source.contains("resolve_memory_model"),
             "filter_lessons_by_relevance should resolve model from matrix_runtime"
         );
         assert!(
@@ -6093,11 +6018,11 @@ mod tests {
     }
 
     #[test]
-    fn selector_model_params_cached_in_repl_state() {
-        let state = ReplState::default();
+    fn memory_model_params_cached_in_session_state() {
+        let state = SessionState::default();
         assert!(
-            state.selector_model_params.is_none(),
-            "selector_model_params should start as None"
+            state.memory_model_params.is_none(),
+            "memory_model_params should start as None"
         );
     }
 
@@ -6107,7 +6032,7 @@ mod tests {
     async fn auto_invoke_noop_when_signals_are_zero() {
         // No observability, no signals → handler should not even be
         // instantiated; latest_skill_diagnosis must stay None.
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         assert!(state.auto_invoke_handler.is_none());
         assert!(state.latest_skill_diagnosis.is_none());
 
@@ -6126,7 +6051,7 @@ mod tests {
         // analyze_session. The SyntheticSkillDiagnosisExecutor produces a valid
         // diagnosis block. The run must stash it into
         // state.latest_skill_diagnosis for the next turn.
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let session = std::sync::Arc::new(std::sync::RwLock::new(
             astra_runtime::observability_integration::ObservabilitySession::new_simple(
                 "p8-turn-end",
@@ -6160,7 +6085,7 @@ mod tests {
         // second must be silenced by the gate's 60s cooldown. The cached
         // handler is what makes this work — if we re-created it each turn
         // the cooldown state would be lost.
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let session = std::sync::Arc::new(std::sync::RwLock::new(
             astra_runtime::observability_integration::ObservabilitySession::new_simple(
                 "p8-cooldown",
@@ -6197,7 +6122,7 @@ mod tests {
         // Setup: session with 3 stalls → auto-invoke fires → diagnosis
         // activated with success_criteria. Then simulate stall count
         // staying flat (criterion "session_stalls_delta <= 0" satisfied).
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let session = std::sync::Arc::new(std::sync::RwLock::new(
             astra_runtime::observability_integration::ObservabilitySession::new_simple(
                 "r1-tracker",
@@ -6247,7 +6172,7 @@ mod tests {
 
     #[tokio::test]
     async fn diagnosis_criteria_start_at_zero() {
-        let state = ReplState::default();
+        let state = SessionState::default();
         assert_eq!(state.diagnosis_criteria_met, 0);
         assert_eq!(state.diagnosis_criteria_failed, 0);
     }
