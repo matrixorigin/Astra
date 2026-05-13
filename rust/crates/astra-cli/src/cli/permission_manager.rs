@@ -14,6 +14,62 @@ use astra_turn_core::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_primary_detail,
 };
 
+/// Issue #326 P1.5 / R1 Major 5 / scenario #26: extract the
+/// "subcommand prefix" from a shell command so a user's "Always
+/// allow" decision binds to the precise subcommand and not the
+/// bare program.
+///
+/// Examples:
+///
+/// - `npm test`                       → `npm test`
+/// - `npm test --verbose`             → `npm test`
+/// - `npm run deploy`                 → `npm run deploy`
+/// - `npm run deploy:prod -- --foo`   → `npm run deploy:prod`
+/// - `git push origin main --force`   → `git push`
+/// - `git commit -m 'fix'`            → `git commit`
+/// - `cargo test --lib`               → `cargo test`
+/// - `bash -c 'rm -rf'`               → `bash` (bash -c is a wrapper;
+///                                            we don't want to bake
+///                                            "all bash -c invocations"
+///                                            into a project rule)
+///
+/// We stop at: the first flag (`-x` / `--x`), the first shell
+/// metacharacter (`|`, `;`, `&&`, `>`, `<`), or after at most three
+/// tokens (program + 2 sub-tokens) — three is enough for `npm run
+/// deploy:prod` while still being precise.
+///
+/// Returns the empty string when the command is empty.
+#[must_use]
+pub(super) fn normalized_argv_prefix(cmd: &str) -> String {
+    const MAX_PREFIX_TOKENS: usize = 3;
+    const SHELL_METACHARS: &[&str] = &[
+        "|", ";", "&&", "||", ">", "<", ">>", "<<", "&",
+    ];
+
+    let mut tokens = Vec::new();
+    for raw in cmd.split_whitespace() {
+        if SHELL_METACHARS.iter().any(|m| *m == raw) {
+            break;
+        }
+        // Split-style flags (`--foo=bar`) and regular flags both stop
+        // the prefix.
+        if raw.starts_with('-') {
+            break;
+        }
+        tokens.push(raw);
+        if tokens.len() >= MAX_PREFIX_TOKENS {
+            break;
+        }
+    }
+
+    // For wrapper-style invocations (`bash -c '...'`) we'd
+    // continue past `bash` if `-c` weren't a flag — but it IS a
+    // flag, so the loop already stops at `bash`. For naked
+    // `bash` (no -c) the prefix is just `bash`, which is what we
+    // want.
+    tokens.join(" ")
+}
+
 /// Classify a permission-denial reason and emit a short, actionable
 /// **safe-alternative** hint the agent can act on. The runtime never
 /// decides *what* the model should do instead — it just surfaces a
@@ -1535,13 +1591,29 @@ impl PermissionManager {
     }
 
     /// Build a pattern-specific allow rule from a tool name and its arguments.
-    /// For execute tools (bash/shell), extracts the first command word to produce
-    /// `Bash(cargo:*)` instead of bare `bash` (which would match everything).
-    /// For write tools, returns the bare tool name (already scoped by nature).
+    ///
+    /// Issue #326 P1.5 / R1 Major 5 / scenario #26: this used to take
+    /// only the first whitespace-separated word, so a user pressing
+    /// "Always" on `npm test` would persist `Bash(npm:*)` and silently
+    /// allow `npm run deploy:prod` thereafter. Same bug for `git
+    /// commit` getting saved as `Bash(git:*)` (allowing `git push
+    /// --force`).
+    ///
+    /// The fix is to save the **normalized argv prefix**: keep the
+    /// program plus the leading non-flag tokens (the subcommand
+    /// chain) up to the first flag (`-x`), the first redirect (`|`,
+    /// `>`, `;`, `&&`), or the first token whose role is "argument
+    /// data" rather than "subcommand". For `npm test --verbose` we
+    /// keep `npm test`; for `git push origin main --force` we keep
+    /// `git push`. The prefix is a sub-string of the original
+    /// command so it always parses cleanly.
+    ///
+    /// For non-bash tools (write_file etc.) we still return the bare
+    /// tool name; those are already scoped by nature.
     pub(super) fn make_allow_rule(name: &str, args: &serde_json::Value) -> String {
         if let Some(cmd) = command_hint_from_args(args) {
-            let first_word = cmd.split_whitespace().next().unwrap_or("");
-            if !first_word.is_empty() {
+            let prefix = normalized_argv_prefix(&cmd);
+            if !prefix.is_empty() {
                 // Capitalize tool name for readability: bash → Bash
                 let cap = {
                     let mut c = name.chars();
@@ -1550,7 +1622,7 @@ impl PermissionManager {
                         Some(f) => f.to_uppercase().to_string() + c.as_str(),
                     }
                 };
-                return format!("{cap}({first_word}:*)");
+                return format!("{cap}({prefix}:*)");
             }
         }
         name.to_string()
@@ -3455,10 +3527,54 @@ mod tests {
     // ── Security: make_allow_rule generates pattern-specific rules ───────────
 
     #[test]
-    fn make_allow_rule_bash_generates_pattern() {
+    fn make_allow_rule_bash_keeps_subcommand() {
+        // Issue #326 P1.5 / R1 Major 5: previously this saved
+        // `Bash(cargo:*)`, which would silently allow `cargo
+        // uninstall --no-confirm`. We now keep the subcommand.
         let args = serde_json::json!({"command": "cargo test --release"});
         let rule = PermissionManager::make_allow_rule("bash", &args);
-        assert_eq!(rule, "Bash(cargo:*)");
+        assert_eq!(rule, "Bash(cargo test:*)");
+    }
+
+    #[test]
+    fn make_allow_rule_npm_does_not_overpermissive_to_npm_deploy() {
+        // Scenario #26: a user pressing Always on `npm test` MUST
+        // NOT silently authorize `npm run deploy`.
+        let test_args = serde_json::json!({"command": "npm test"});
+        let test_rule_str = PermissionManager::make_allow_rule("bash", &test_args);
+        assert_eq!(test_rule_str, "Bash(npm test:*)");
+
+        let test_rule = PermissionRule::parse(&test_rule_str);
+        // npm test (and variants with flags) → still allowed
+        assert!(test_rule.matches("bash", Some("npm test")));
+        assert!(test_rule.matches("bash", Some("npm test --verbose")));
+        assert!(test_rule.matches("bash", Some("npm test -- --grep auth")));
+
+        // npm run deploy → MUST NOT be allowed
+        assert!(
+            !test_rule.matches("bash", Some("npm run deploy")),
+            "Bash(npm test:*) must not match `npm run deploy`"
+        );
+        assert!(
+            !test_rule.matches("bash", Some("npm run deploy:prod")),
+            "Bash(npm test:*) must not match `npm run deploy:prod`"
+        );
+    }
+
+    #[test]
+    fn make_allow_rule_git_keeps_subcommand_so_push_does_not_share_commit_rule() {
+        // Pressing Always on `git commit -m 'fix'` should not
+        // authorize `git push --force`.
+        let commit_args = serde_json::json!({"command": "git commit -m 'fix'"});
+        let commit_rule_str = PermissionManager::make_allow_rule("bash", &commit_args);
+        assert_eq!(commit_rule_str, "Bash(git commit:*)");
+
+        let commit_rule = PermissionRule::parse(&commit_rule_str);
+        assert!(commit_rule.matches("bash", Some("git commit -m 'fix'")));
+        assert!(
+            !commit_rule.matches("bash", Some("git push --force origin main")),
+            "git commit Allow must not authorize git push --force"
+        );
     }
 
     #[test]
@@ -3473,6 +3589,32 @@ mod tests {
         let args = serde_json::json!({"command": ""});
         let rule = PermissionManager::make_allow_rule("bash", &args);
         assert_eq!(rule, "bash");
+    }
+
+    #[test]
+    fn make_allow_rule_stops_at_pipe_or_redirect() {
+        // Compound commands: don't bake the pipe target into the rule.
+        let args = serde_json::json!({"command": "cargo test | tee log.txt"});
+        let rule = PermissionManager::make_allow_rule("bash", &args);
+        assert_eq!(rule, "Bash(cargo test:*)");
+
+        let args = serde_json::json!({"command": "ls -la > /tmp/out"});
+        let rule = PermissionManager::make_allow_rule("bash", &args);
+        assert_eq!(rule, "Bash(ls:*)");
+
+        let args = serde_json::json!({"command": "true && rm -rf"});
+        let rule = PermissionManager::make_allow_rule("bash", &args);
+        assert_eq!(rule, "Bash(true:*)");
+    }
+
+    #[test]
+    fn make_allow_rule_caps_at_three_tokens() {
+        // For deeply-nested subcommands, three tokens is enough to
+        // distinguish `npm run deploy:prod` from `npm run test:unit`.
+        let args = serde_json::json!({"command": "kubectl apply -f deployment.yaml"});
+        let rule = PermissionManager::make_allow_rule("bash", &args);
+        // -f stops the prefix, so we get `kubectl apply`.
+        assert_eq!(rule, "Bash(kubectl apply:*)");
     }
 
     // ── Security: word-boundary matching prevents false positives ────────────
