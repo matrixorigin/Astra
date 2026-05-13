@@ -2679,7 +2679,14 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
 /// rejected — it produced false positives whenever an unrelated error message
 /// happened to contain the digits 401 (timeouts in ms, file offsets, body
 /// snippets, etc.), causing spurious "Session expired. Run /login" prompts.
+///
+/// Excludes LLM provider auth failures — those indicate the upstream
+/// model credentials (Bedrock/Anthropic API key) are invalid, not the
+/// astra session token. Refreshing `/login` won't help for those.
 pub(super) fn is_auth_error(error: &str) -> bool {
+    if is_llm_provider_auth_error(error) {
+        return false;
+    }
     let lower = error.to_lowercase();
     lower.contains("unauthorized")
         || lower.contains("could not validate credentials")
@@ -2691,6 +2698,14 @@ pub(super) fn is_auth_error(error: &str) -> bool {
         || lower.contains("http 401")
 }
 
+/// Detect LLM provider authentication failures — upstream Bedrock/Anthropic
+/// credential issues that `/login` cannot fix.
+pub(super) fn is_llm_provider_auth_error(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("llm provider authentication failed")
+        || lower.contains("[auth] llm provider")
+}
+
 fn report_turn_failure(
     state: &mut SessionState,
     profile: Option<&str>,
@@ -2699,7 +2714,11 @@ fn report_turn_failure(
     turn_start: Instant,
     ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
 ) {
-    if is_auth_error(&failure.error) {
+    if is_llm_provider_auth_error(&failure.error) {
+        ui.show_error(
+            "  LLM provider credentials invalid — check model API key configuration.",
+        );
+    } else if is_auth_error(&failure.error) {
         ui.show_error("  Session expired. Run /login to refresh.");
     } else {
         ui.show_error(&format!(

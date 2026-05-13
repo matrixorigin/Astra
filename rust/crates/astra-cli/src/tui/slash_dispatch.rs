@@ -1324,17 +1324,49 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
                 || lower.contains("status code: 401")
                 || lower.contains("http 401")
                 || lower.contains("unauthorized");
-            let short = if is_auth {
-                "Not authorized — try /login first".to_string()
+            if is_auth {
+                // Attempt silent token refresh + retry once.
+                if crate::session_runtime::attempt_token_refresh(ctx.api, ctx.profile).await {
+                    let fresh = crate::session_runtime::current_access_token(ctx.profile);
+                    if let Ok(models) =
+                        crate::slash_router::fetch_model_list(ctx.api, fresh.as_deref()).await
+                    {
+                        let current_raw = ctx.state.model.clone().unwrap_or_default();
+                        let current_base = current_raw
+                            .split_once("-thinking:")
+                            .map(|(b, _)| b.to_string())
+                            .unwrap_or(current_raw);
+                        let items: Vec<SelectionItem> = models
+                            .into_iter()
+                            .map(|m| {
+                                let is_current = m == current_base;
+                                SelectionItem {
+                                    name: m,
+                                    description: None,
+                                    is_current,
+                                }
+                            })
+                            .collect();
+                        if items.is_empty() {
+                            ctx.show_info("No models available".into());
+                        } else {
+                            let view =
+                                ListSelectionView::new(items, Some("Select model:".into()))
+                                    .with_result_prefix(MODEL_PICK_SENTINEL);
+                            ctx.bottom_pane.push_view(Box::new(view));
+                        }
+                        return SlashResult::Handled;
+                    }
+                }
+                ctx.show_error("Not authorized — try /login first".into());
             } else if msg.contains("connect") || msg.contains("timeout") {
-                "Cannot reach server — check connection".to_string()
+                ctx.show_error("Cannot reach server — check connection".into());
             } else {
-                format!(
+                ctx.show_error(format!(
                     "Failed to fetch models: {}",
                     msg.lines().next().unwrap_or(&msg)
-                )
-            };
-            ctx.show_error(short);
+                ));
+            }
         }
     }
     SlashResult::Handled
