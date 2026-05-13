@@ -2719,11 +2719,21 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
 
 /// Report a turn failure with enriched partial data from the agentic loop.
 /// Detect 401 / credential-expired errors from a turn failure message.
+///
+/// Matches only auth-shaped phrases. Bare `"401"` substring is intentionally
+/// rejected — it produced false positives whenever an unrelated error message
+/// happened to contain the digits 401 (timeouts in ms, file offsets, body
+/// snippets, etc.), causing spurious "Session expired. Run /login" prompts.
 pub(super) fn is_auth_error(error: &str) -> bool {
     let lower = error.to_lowercase();
-    error.contains("401")
-        || lower.contains("unauthorized")
+    lower.contains("unauthorized")
         || lower.contains("could not validate credentials")
+        || lower.contains("session expired")
+        || lower.contains("token expired")
+        || lower.contains("401 unauthorized")
+        || lower.contains("status: 401")
+        || lower.contains("status code: 401")
+        || lower.contains("http 401")
 }
 
 fn report_turn_failure(

@@ -7,8 +7,8 @@
 
 use crate::command_registry;
 use crate::repl_state::ReplState;
-use crate::tui::bottom_pane::BottomPane;
 use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
+use crate::tui::bottom_pane::BottomPane;
 use crate::tui::history_cell::system::SystemCell;
 use crate::tui::terminal::TerminalGuard;
 
@@ -481,7 +481,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         // ── Worktrees (TUI-native) ──────────────────────────────────
         "/worktrees" => {
             use crate::tui::bottom_pane::worktrees_view::WorktreesView;
-            use crate::tui::worktrees::{WorktreeList, parse};
+            use crate::tui::worktrees::{parse, WorktreeList};
 
             // `git worktree list --porcelain` on a blocking thread.
             let porcelain = tokio::task::spawn_blocking(|| {
@@ -1318,7 +1318,13 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
         }
         Err(e) => {
             let msg = e.to_string();
-            let short = if msg.contains("401") || msg.contains("Unauthorized") {
+            let lower = msg.to_lowercase();
+            let is_auth = lower.contains("401 unauthorized")
+                || lower.contains("status: 401")
+                || lower.contains("status code: 401")
+                || lower.contains("http 401")
+                || lower.contains("unauthorized");
+            let short = if is_auth {
                 "Not authorized — try /login first".to_string()
             } else if msg.contains("connect") || msg.contains("timeout") {
                 "Cannot reach server — check connection".to_string()

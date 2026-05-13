@@ -10,10 +10,10 @@ use astra_core::agent_warn;
 use serde_json::Value;
 
 use crate::chat_turn_heuristics::{
-    TaskExecutionProfile, openai_factual_tool_retry_user_message, should_force_factual_tool_retry,
+    openai_factual_tool_retry_user_message, should_force_factual_tool_retry, TaskExecutionProfile,
 };
 use crate::chat_turn_sse_dispatch::ChatTurnSseAccum;
-use crate::interaction_types::{TurnInteractionPolicy, tool_counts_as_factual_evidence};
+use crate::interaction_types::{tool_counts_as_factual_evidence, TurnInteractionPolicy};
 use crate::response_guard::apply_response_guards;
 use crate::tool_call_shape::tool_call_name;
 use astra_pipeline::step_recorder::StepRecorder;
@@ -41,7 +41,13 @@ fn classify_llm_error(msg: &str) -> astra_core::ErrorKind {
     } else if lower.contains("connect") || lower.contains("transport") || lower.contains("network")
     {
         astra_core::ErrorKind::StreamTransport
-    } else if lower.contains("401") || lower.contains("unauthorized") || lower.contains("api key") {
+    } else if lower.contains("401 unauthorized")
+        || lower.contains("status: 401")
+        || lower.contains("status code: 401")
+        || lower.contains("http 401")
+        || lower.contains("unauthorized")
+        || lower.contains("api key")
+    {
         astra_core::ErrorKind::Auth
     } else if lower.contains("cancelled") || lower.contains("canceled") {
         astra_core::ErrorKind::Cancelled
@@ -759,12 +765,10 @@ mod tests {
         assert_eq!(pack.messages.len(), 1, "nudge message should be injected");
         let nudge = &pack.messages[0];
         assert_eq!(nudge["role"], "user");
-        assert!(
-            nudge["content"]
-                .as_str()
-                .unwrap()
-                .contains("Runtime correction"),
-        );
+        assert!(nudge["content"]
+            .as_str()
+            .unwrap()
+            .contains("Runtime correction"),);
     }
 
     #[test]

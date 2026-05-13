@@ -481,6 +481,11 @@ pub struct PlanExecutorHandle {
 ///
 /// Returns `(handle, update_tx, cmd_rx)`:
 /// Errors that indicate authentication/credential failure — retrying is pointless.
+///
+/// NOTE: bare `"401"` substring match is intentionally avoided — unrelated
+/// payloads (timeouts in ms, byte offsets, body snippets containing the
+/// digits) produced spurious credential-refresh prompts. Require the status
+/// code to appear in an HTTP-shaped phrase.
 fn is_credential_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("could not validate credentials")
@@ -488,7 +493,11 @@ fn is_credential_error(msg: &str) -> bool {
         || lower.contains("unauthorized")
         || lower.contains("authentication failed")
         || lower.contains("token expired")
-        || lower.contains("401")
+        || lower.contains("session expired")
+        || lower.contains("401 unauthorized")
+        || lower.contains("status: 401")
+        || lower.contains("status code: 401")
+        || lower.contains("http 401")
 }
 
 /// Pick the `plan_progress` action for end-of-plan emission.
