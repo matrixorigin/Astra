@@ -78,6 +78,15 @@ pub(crate) trait HistoryCell: Debug + Send + Sync + Any {
     /// that have no transient state.
     fn finalize(&mut self) {}
 
+    /// Process-relative seconds (same basis as
+    /// `tui::shimmer::elapsed_since_start`) at the moment
+    /// `finalize()` ran. `None` while live or for cells that were
+    /// never live. Used by the active-slot gradient gutter to lock
+    /// its phase on freeze instead of snapping to `t = 0`.
+    fn frozen_phase(&self) -> Option<f32> {
+        None
+    }
+
     /// Turn this cell into a durable persistence record. Returning
     /// `None` marks the cell as ephemeral — it renders but is not
     /// written to the transcript JSONL (e.g. an in-flight status

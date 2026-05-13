@@ -9,23 +9,54 @@ use super::terminal_palette::{default_bg, default_fg};
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
+/// Eagerly initialize the shimmer time origin. Call once near the
+/// top of `run_tui_repl` so any `Instant` captured later by a cell's
+/// `finalize()` is guaranteed to be `>= PROCESS_START`. Without this,
+/// the first cell to finalize before any `elapsed_since_start()` /
+/// `gradient_color_at` call would saturate `time_at` to 0 and the
+/// gutter colour would jump on freeze.
+pub(crate) fn init_time_origin() {
+    let _ = PROCESS_START.get_or_init(Instant::now);
+}
+
 pub(crate) fn elapsed_since_start() -> Duration {
     let start = PROCESS_START.get_or_init(Instant::now);
     start.elapsed()
 }
 
+/// Process-relative seconds for a specific `Instant` — same time
+/// basis as [`elapsed_since_start`]. Lets cells stamp a "freeze
+/// moment" at finalize and feed it back into [`gradient_color_at_t`]
+/// so the gradient locks at the exact phase it had on the final
+/// live frame.
+pub(crate) fn time_at(i: Instant) -> f32 {
+    let start = *PROCESS_START.get_or_init(Instant::now);
+    i.saturating_duration_since(start).as_secs_f32()
+}
+
 /// RGB color for a given "position along a border" (0..len) at the
 /// current moment in time. Produces a flowing rainbow-ish gradient
-/// that cycles around the frame — warm pinks → cool blues → back.
-/// Hue advances with time and along the border, giving a "wave
-/// travelling around the frame" effect.
-///
-/// Used by `LiveFramedCell` to color each border character while the
-/// active cell is still streaming.
+/// — warm pinks → cool blues → back. Hue advances with time and
+/// along the border, giving a "wave travelling along the bar" effect.
 pub(crate) fn gradient_color_at(pos: usize, len: usize, period_seconds: f32) -> (u8, u8, u8) {
-    let t = elapsed_since_start().as_secs_f32();
-    // Normalize position to [0, 1) along the border, then add a
-    // time-varying phase so the hue slides along the frame.
+    gradient_color_at_t(
+        pos,
+        len,
+        period_seconds,
+        elapsed_since_start().as_secs_f32(),
+    )
+}
+
+/// Same as [`gradient_color_at`] but takes the time component
+/// explicitly, so callers can lock the phase at a snapshot moment
+/// (e.g. when a streaming cell finalizes — pin `t = freeze_phase` so
+/// the gradient stops in place instead of jumping back to t=0).
+pub(crate) fn gradient_color_at_t(
+    pos: usize,
+    len: usize,
+    period_seconds: f32,
+    t: f32,
+) -> (u8, u8, u8) {
     let len = len.max(1) as f32;
     let phase = (t / period_seconds).fract();
     let u = ((pos as f32 / len) + phase).fract();
