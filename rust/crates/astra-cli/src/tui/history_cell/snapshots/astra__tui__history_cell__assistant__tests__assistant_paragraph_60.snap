@@ -1,7 +1,8 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/assistant.rs
+assertion_line: 920
 expression: "render(&c, 60, 5)"
 ---
-┃ Here is the plan:
-┃ • step one
-┃ • step two
+█ Here is the plan:
+█ • step one
+█ • step two
