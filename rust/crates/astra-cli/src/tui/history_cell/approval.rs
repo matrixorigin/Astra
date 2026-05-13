@@ -30,6 +30,27 @@ use super::HistoryCell;
 use crate::tui::approval::ButtonRow;
 use crate::tui::turn_event::TurnEvent;
 
+/// Issue #326 P3 / R1 Major 7: pick the most-alarming colour
+/// from the risk tag list. Order is fixed (worst-first) so the
+/// badge is stable across renders.
+fn highest_risk_color(labels: &[String]) -> Color {
+    let critical = ["WritesSensitiveFile", "GitDestructive", "WritesOutsideWorkspace", "CredentialAccess"];
+    let high = ["NetworkExfiltration", "SqlDestructive", "MCPUnknownCapability", "WorkspaceUntrusted"];
+    let medium = ["WritesOutsidePackage", "SandboxExpansion"];
+    if labels.iter().any(|l| critical.contains(&l.as_str())) {
+        return Color::Red;
+    }
+    if labels.iter().any(|l| high.contains(&l.as_str())) {
+        return Color::LightRed;
+    }
+    if labels.iter().any(|l| medium.contains(&l.as_str())) {
+        return Color::Yellow;
+    }
+    // BashExecute and other "vanilla" tags fall through to a
+    // softer colour so the screen isn't shouting on every prompt.
+    Color::Cyan
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ApprovalCell {
     pub id: u64,
@@ -39,6 +60,22 @@ pub(crate) struct ApprovalCell {
     pub reason: String,
     pub focused: bool,
     pub buttons: ButtonRow,
+    /// Issue #326 P3 / R1 Major 7: risk classification for the
+    /// badge line. Each tag becomes a coloured chip in the
+    /// header. Empty = no badge displayed.
+    pub risk_tag_labels: Vec<String>,
+    /// Issue #326 P3: precomputed "Will save" preview. Renders
+    /// as a separate line `Will save: <rule>` so the user sees
+    /// exactly what permissions.json would gain before pressing
+    /// Always.
+    pub will_save_preview: Option<String>,
+    /// Issue #326 P3 / R1 Major 11 / scenarios #21-#25: agent
+    /// that issued the request. Renders as `[agent: <id>]` chip
+    /// next to the header.
+    pub source_agent: Option<String>,
+    /// Issue #326 P3 / scenario #39: remote host label rendered
+    /// as `host:` prefix on the detail block.
+    pub host: Option<String>,
 }
 
 impl ApprovalCell {
@@ -58,6 +95,10 @@ impl ApprovalCell {
             reason,
             focused,
             buttons: ButtonRow::primary(),
+            risk_tag_labels: Vec::new(),
+            will_save_preview: None,
+            source_agent: None,
+            host: None,
         }
     }
 
@@ -80,7 +121,39 @@ impl ApprovalCell {
             reason,
             focused,
             buttons: ButtonRow::primary_with_batch(),
+            risk_tag_labels: Vec::new(),
+            will_save_preview: None,
+            source_agent: None,
+            host: None,
         }
+    }
+
+    /// Issue #326 P3: builder for the approval card's display
+    /// metadata. Threading these through positionally would
+    /// churn every call site; a builder keeps the API local to
+    /// the few places that compute risk/will_save/agent.
+    #[must_use]
+    pub fn with_risk_tag_labels(mut self, labels: Vec<String>) -> Self {
+        self.risk_tag_labels = labels;
+        self
+    }
+
+    #[must_use]
+    pub fn with_will_save_preview(mut self, preview: impl Into<String>) -> Self {
+        self.will_save_preview = Some(preview.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_source_agent(mut self, agent: impl Into<String>) -> Self {
+        self.source_agent = Some(agent.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_host(mut self, host: impl Into<String>) -> Self {
+        self.host = Some(host.into());
+        self
     }
 
     /// Move button focus — only honoured when this cell itself is focused.
@@ -155,8 +228,8 @@ impl HistoryCell for ApprovalCell {
         let mut lines = Vec::new();
 
         // ── Top border with embedded title ────────────────────────
-        //     ╭─ ⏸ bash wants to run ─────────────────────────
-        let top_border = Line::from(vec![
+        //     ╭─ ⏸ bash wants to run ─[agent:foo]─[ssh:host]──
+        let mut top_spans = vec![
             Span::styled("╭─ ".to_string(), accent_style),
             Span::styled("⏸ ".to_string(), accent_style),
             Span::styled(
@@ -164,13 +237,43 @@ impl HistoryCell for ApprovalCell {
                 accent_style.add_modifier(Modifier::BOLD),
             ),
             Span::styled(" ".to_string(), accent_style),
-        ]);
-        lines.push(top_border);
+        ];
+        if let Some(agent) = &self.source_agent {
+            top_spans.push(Span::styled(
+                format!("[agent: {agent}] "),
+                muted.add_modifier(Modifier::ITALIC),
+            ));
+        }
+        if let Some(host) = &self.host {
+            top_spans.push(Span::styled(
+                format!("[{host}] "),
+                muted.add_modifier(Modifier::ITALIC),
+            ));
+        }
+        lines.push(Line::from(top_spans));
 
         // Body rows use a vertical accent bar on the left so the
         // card reads as one visual block, not a heap of bullet
         // points. Mirrors Cursor's inline tool cards.
         let bar = Span::styled("│ ".to_string(), accent_style);
+
+        // Risk badge row (issue #326 P3 / R1 Major 7).
+        if !self.risk_tag_labels.is_empty() {
+            let risk_color = highest_risk_color(&self.risk_tag_labels);
+            let risk_style = Style::default()
+                .fg(risk_color)
+                .add_modifier(Modifier::BOLD);
+            let badges = self
+                .risk_tag_labels
+                .iter()
+                .map(|t| format!("⚑ {t}"))
+                .collect::<Vec<_>>()
+                .join("  ");
+            lines.push(Line::from(vec![
+                bar.clone(),
+                Span::styled(badges, risk_style),
+            ]));
+        }
 
         // Optional detail (first 3 lines — bumped from 2 so a
         // multi-line bash command isn't mystery-truncated).
@@ -190,6 +293,20 @@ impl HistoryCell for ApprovalCell {
                 bar.clone(),
                 Span::styled("⚠ ".to_string(), muted),
                 Span::styled(self.reason.clone(), muted),
+            ]));
+        }
+
+        // Will-save preview (issue #326 P3): users see exactly
+        // what permissions.json would gain before pressing
+        // Always.
+        if let Some(preview) = &self.will_save_preview {
+            lines.push(Line::from(vec![
+                bar.clone(),
+                Span::styled("Will save: ".to_string(), muted),
+                Span::styled(
+                    preview.clone(),
+                    body_style.add_modifier(Modifier::BOLD),
+                ),
             ]));
         }
 
@@ -313,5 +430,121 @@ mod tests {
     fn never_persists() {
         let cell = ApprovalCell::new(1, "t".into(), "h".into(), None, "r".into(), true);
         assert!(cell.to_persist().is_none());
+    }
+
+    // ── Issue #326 P3 enrichment: risk badge / will-save / agent / host ──
+
+    #[test]
+    fn renders_risk_tag_badge_when_present() {
+        let cell = ApprovalCell::new(
+            1,
+            "bash".into(),
+            "rm -rf /tmp".into(),
+            Some("rm -rf /tmp/scratch".into()),
+            "execute".into(),
+            true,
+        )
+        .with_risk_tag_labels(vec!["BashExecute".into(), "WritesOutsidePackage".into()]);
+        let rendered = render(&cell);
+        assert!(
+            rendered.contains("⚑ BashExecute"),
+            "risk tag chip should appear, got:\n{rendered}"
+        );
+        assert!(rendered.contains("⚑ WritesOutsidePackage"));
+    }
+
+    #[test]
+    fn renders_will_save_preview_when_present() {
+        let cell = ApprovalCell::new(
+            1,
+            "bash".into(),
+            "npm test".into(),
+            None,
+            "execute".into(),
+            true,
+        )
+        .with_will_save_preview("Bash(npm test:*)");
+        let rendered = render(&cell);
+        assert!(
+            rendered.contains("Will save: Bash(npm test:*)"),
+            "expected Will save preview line, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn renders_source_agent_chip_in_header() {
+        let cell = ApprovalCell::new(
+            1,
+            "bash".into(),
+            "npm test".into(),
+            None,
+            "".into(),
+            true,
+        )
+        .with_source_agent("review-subagent");
+        let rendered = render(&cell);
+        assert!(
+            rendered.contains("[agent: review-subagent]"),
+            "expected [agent: …] chip, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn renders_remote_host_chip_in_header() {
+        let cell = ApprovalCell::new(
+            1,
+            "edit_file".into(),
+            "edit /etc/hosts".into(),
+            None,
+            "".into(),
+            true,
+        )
+        .with_host("ssh:bastion-prod");
+        let rendered = render(&cell);
+        assert!(
+            rendered.contains("[ssh:bastion-prod]"),
+            "expected [host:] chip, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn omits_optional_lines_when_unset() {
+        // Default cell has no risk tags / will-save / agent /
+        // host, and should not render those lines.
+        let cell = ApprovalCell::new(
+            1,
+            "bash".into(),
+            "h".into(),
+            None,
+            "r".into(),
+            true,
+        );
+        let rendered = render(&cell);
+        assert!(!rendered.contains("⚑ "), "no risk badge expected");
+        assert!(!rendered.contains("Will save:"), "no will-save row expected");
+        assert!(!rendered.contains("[agent:"), "no agent chip expected");
+    }
+
+    #[test]
+    fn highest_risk_color_picks_red_for_critical() {
+        // Pure unit test on the colour-picker so a future CSS
+        // refactor doesn't downgrade catastrophic tags into the
+        // "vanilla" shade.
+        assert_eq!(
+            highest_risk_color(&[
+                "BashExecute".into(),
+                "WritesSensitiveFile".into(),
+            ]),
+            Color::Red
+        );
+        assert_eq!(
+            highest_risk_color(&["GitDestructive".into()]),
+            Color::Red
+        );
+        assert_eq!(
+            highest_risk_color(&["NetworkExfiltration".into()]),
+            Color::LightRed
+        );
+        assert_eq!(highest_risk_color(&["BashExecute".into()]), Color::Cyan);
     }
 }
