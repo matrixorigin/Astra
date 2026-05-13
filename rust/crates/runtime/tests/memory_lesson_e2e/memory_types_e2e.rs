@@ -328,19 +328,26 @@ fn signal_lessons_use_strict_quality_gate() {
 // ── 10. Journal event structure ─────────────────────────────────────────
 
 #[test]
-fn memory_extraction_journal_event_structure() {
-    let evt = astra_services::session_journal::JournalEvent::memory_extraction(
+fn session_memory_extraction_journal_event_structure() {
+    let breadcrumbs = astra_services::session_journal::SessionMemoryExtractionBreadcrumbs {
+        messages_count: Some(7),
+        selector_model: Some("test-selector".to_string()),
+        attempt: Some(1),
+    };
+    let evt = astra_services::session_journal::JournalEvent::session_memory_extraction(
         Some("sess-42"),
         3,
-        "extracted",
-        2,
-        &["feedback".into(), "project".into()],
         1200,
+        astra_services::session_journal::SessionMemoryExtractionOutcome::Extracted {
+            source: astra_services::session_journal::SessionMemoryExtractionSource::Llm,
+            bytes_written: 2048,
+        },
+        &breadcrumbs,
     );
 
     assert_eq!(
         evt.event_type,
-        astra_services::session_journal::JournalEventType::MemoryExtraction
+        astra_services::session_journal::JournalEventType::SessionMemoryExtraction
     );
     assert_eq!(evt.turn, Some(3));
     assert_eq!(evt.duration_ms, Some(1200));
@@ -348,23 +355,28 @@ fn memory_extraction_journal_event_structure() {
 
     let meta = evt.metadata.as_ref().unwrap();
     assert_eq!(meta["outcome"], "extracted");
-    assert_eq!(meta["memories_saved"], 2);
-    let cats = meta["categories"].as_array().unwrap();
-    assert_eq!(cats.len(), 2);
+    assert_eq!(meta["source"], "llm");
+    assert_eq!(meta["bytes_written"], 2048);
+    assert_eq!(meta["messages_count"], 7);
+    assert_eq!(meta["selector_model"], "test-selector");
+    assert_eq!(meta["attempt"], 1);
 }
 
 #[test]
-fn memory_extraction_journal_event_skipped() {
-    let evt = astra_services::session_journal::JournalEvent::memory_extraction(
+fn session_memory_extraction_journal_event_skipped() {
+    let breadcrumbs =
+        astra_services::session_journal::SessionMemoryExtractionBreadcrumbs::default();
+    let evt = astra_services::session_journal::JournalEvent::session_memory_extraction(
         Some("sess-42"),
         5,
-        "skipped_main_wrote",
         0,
-        &[],
-        0,
+        astra_services::session_journal::SessionMemoryExtractionOutcome::Skipped {
+            reason: astra_services::session_journal::SessionMemoryExtractionSkipReason::NoGrowth,
+        },
+        &breadcrumbs,
     );
 
     let meta = evt.metadata.as_ref().unwrap();
-    assert_eq!(meta["outcome"], "skipped_main_wrote");
-    assert_eq!(meta["memories_saved"], 0);
+    assert_eq!(meta["outcome"], "skipped");
+    assert_eq!(meta["reason"], "no_growth");
 }

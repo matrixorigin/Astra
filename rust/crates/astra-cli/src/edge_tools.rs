@@ -1342,6 +1342,142 @@ impl ToolExecutor {
         out
     }
 
+    // ── Memory suppress ────────────────────────────────────────────────────────
+
+    /// Suppress a Memoria `memory_id` for the active session.
+    ///
+    /// `memory_id` is the exact id shown by memory recall/search results.
+    /// The optional `reason` is written to the session journal. Suppression
+    /// only affects prompt injection for this session; it does not delete the
+    /// memory from Memoria.
+    fn suppress_memory(&self, args: &Value) -> String {
+        let memory_id = args.get("memory_id").and_then(Value::as_str).unwrap_or("");
+        if memory_id.is_empty() {
+            return "Error: missing required parameter `memory_id`.".to_string();
+        }
+        let session_id = match self.active_session_id() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return "Error: no active session.".to_string(),
+        };
+        let reason = args.get("reason").and_then(Value::as_str);
+        astra_tools::memoria::MemoriaClient::suppress_memory(&session_id, memory_id);
+        let turn = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&session_id) {
+            let _ = writer.append(
+                &astra_services::session_journal::JournalEvent::memory_suppressed(
+                    Some(&session_id),
+                    turn,
+                    memory_id,
+                    reason,
+                ),
+            );
+        }
+        format!(
+            "Memory `{mid}` suppressed for this session. It will not be injected in future turns.",
+            mid = memory_id
+        )
+    }
+
+    /// Remove a Memoria `memory_id` from the active session suppress list.
+    fn unsuppress_memory(&self, args: &Value) -> String {
+        let memory_id = args.get("memory_id").and_then(Value::as_str).unwrap_or("");
+        if memory_id.is_empty() {
+            return "Error: missing required parameter `memory_id`.".to_string();
+        }
+        let session_id = match self.active_session_id() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return "Error: no active session.".to_string(),
+        };
+        astra_tools::memoria::MemoriaClient::unsuppress_memory(&session_id, memory_id);
+        format!("Memory `{mid}` unsuppressed.", mid = memory_id)
+    }
+
+    /// List Memoria `memory_id` values suppressed in the active session.
+    fn list_suppressed_memories(&self) -> String {
+        let session_id = match self.active_session_id() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return "Error: no active session.".to_string(),
+        };
+        let suppressed = astra_tools::memoria::MemoriaClient::suppressed_snapshot(&session_id);
+        if suppressed.is_empty() {
+            return "No memories are suppressed in this session.".to_string();
+        }
+        let mut out = format!("## Suppressed memories ({} total)\n", suppressed.len());
+        for id in &suppressed {
+            out.push_str(&format!("- {id}\n"));
+        }
+        out
+    }
+
+    // ── Context release ──────────────────────────────────────────────────────────
+
+    /// Release one or more tool results from future LLM context.
+    ///
+    /// `tool_call_id` accepts a string or array of strings copied from tool
+    /// result metadata. Released results remain in the journal, but their
+    /// content is replaced with a short stub before the next LLM request.
+    fn release_context(&self, args: &Value) -> String {
+        let session_id = match self.active_session_id() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return "Error: no active session.".to_string(),
+        };
+        // Accept single ID or array of IDs
+        let ids: Vec<String> = if let Some(arr) = args.get("tool_call_id").and_then(Value::as_array)
+        {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        } else if let Some(id) = args.get("tool_call_id").and_then(Value::as_str) {
+            vec![id.to_string()]
+        } else {
+            return "Error: missing required parameter `tool_call_id` (string or array)."
+                .to_string();
+        };
+        if ids.is_empty() {
+            return "Error: `tool_call_id` must not be empty.".to_string();
+        }
+        for id in &ids {
+            astra_tools::memoria::MemoriaClient::release_context(&session_id, id);
+        }
+        let turn = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&session_id) {
+            let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let _ = writer.append(
+                &astra_services::session_journal::JournalEvent::context_released(
+                    Some(&session_id),
+                    turn,
+                    &id_refs,
+                ),
+            );
+        }
+        format!(
+            "Released {} tool result(s). They will be stubbed on the next LLM call.",
+            ids.len()
+        )
+    }
+
+    /// List tool_call_id values marked for context release in this session.
+    fn list_released_context(&self) -> String {
+        let session_id = match self.active_session_id() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return "Error: no active session.".to_string(),
+        };
+        let released = astra_tools::memoria::MemoriaClient::released_snapshot(&session_id);
+        if released.is_empty() {
+            return "No tool results are released in this session.".to_string();
+        }
+        let mut out = format!("## Released context ({} tool_call_ids)\n", released.len());
+        for id in &released {
+            out.push_str(&format!("- {id}\n"));
+        }
+        out
+    }
+
     // ── Env tool: environment variable management ─────────────────────────────
 
     /// Environment variable management tool — delegated to `env_tools` module.
@@ -1416,6 +1552,9 @@ impl ToolExecutor {
             }
             "session_memory" | "session-memory" | "memory" | "extraction" | "extractions" => {
                 return self.render_session_memory_introspect();
+            }
+            "errors" | "tool_errors" | "failures" => {
+                return astra_turn_core::introspect::render_errors(&snap);
             }
             "all" => {
                 return astra_turn_core::introspect::render_all(&snap);
@@ -1526,14 +1665,18 @@ impl ToolExecutor {
                         .retrieved_memories
                         .iter()
                         .map(|m| {
-                            format!(
-                                "{}[{}]{}",
-                                m.memory_type,
-                                // Truncate id to 8 chars so the line
-                                // doesn't balloon with UUIDs.
-                                m.memory_id.chars().take(8).collect::<String>(),
-                                m.score.map(|s| format!("={s:.2}")).unwrap_or_default(),
-                            )
+                            let id_short: String = m.memory_id.chars().take(8).collect();
+                            let score_s = m.score.map(|s| format!("={s:.2}")).unwrap_or_default();
+                            let content_s = m
+                                .content_preview
+                                .as_deref()
+                                .map(|c| {
+                                    let short: String =
+                                        c.replace('\n', " ").chars().take(60).collect();
+                                    format!(" \"{short}\"")
+                                })
+                                .unwrap_or_default();
+                            format!("{}[{}]{}{}", m.memory_type, id_short, score_s, content_s,)
                         })
                         .collect::<Vec<_>>()
                         .join(", ");
@@ -2099,7 +2242,12 @@ impl ToolExecutor {
                         "timeline" => self.render_session_timeline(args),
                         "summary" => self.render_session_summary(),
                         "history" => self.render_session_history(args),
-                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, timeline, summary, history".to_string(),
+                        "suppress_memory" => self.suppress_memory(args),
+                        "unsuppress_memory" => self.unsuppress_memory(args),
+                        "list_suppressed" => self.list_suppressed_memories(),
+                        "release_context" => self.release_context(args),
+                        "list_released" => self.list_released_context(),
+                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, timeline, summary, history, suppress_memory(memory_id, reason?), unsuppress_memory(memory_id), list_suppressed, release_context(tool_call_id|string[]), list_released".to_string(),
                         other => format!("Unknown session action: '{other}'"),
                     }
                 }
@@ -3592,6 +3740,7 @@ mod tests {
                 memory_id: "abcdef12-3456".into(),
                 memory_type: "working".into(),
                 score: Some(0.71),
+                content_preview: Some("Uses PostgreSQL for primary storage".into()),
             }],
             narrative_sections_kept: vec!["Task Specification".into()],
         });

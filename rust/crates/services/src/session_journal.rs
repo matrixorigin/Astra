@@ -787,9 +787,6 @@ pub enum JournalEventType {
     AgentTerminated,
     /// Subtask or plan verification completed (acceptance-criteria gate result).
     VerificationCompleted,
-    /// A composite snapshot was taken — captures references to session state,
-    /// data snapshot, memory snapshot, git commit, etc.
-    CompositeSnapshot,
     /// Plan was edited (subtask added/removed/reordered, goal changed).
     PlanEdit,
     /// Plan lifecycle event (created, completed, abandoned, replanned).
@@ -816,14 +813,10 @@ pub enum JournalEventType {
     AdaptiveScenarioApplied,
     /// Per-turn micro-adaptation adjusted config values.
     AdaptivePerTurnApplied,
-    /// Experiment enrollment — session assigned to an experiment variant.
-    AdaptiveExperimentEnrolled,
     /// Tuning rule evaluated and triggered a config change.
     AdaptiveTuningRuleTriggered,
     /// A structured interruption was recorded (budget exhaustion, rate limit, cancel, etc.).
     InterruptionRecorded,
-    /// Low or very-low selector confidence diagnosed (tier, reasons, fallback action).
-    ConfidenceDiagnosisRecorded,
     /// Compaction retry completed — records tier, tokens freed, and per-layer breakdown.
     CompactionRetry,
     /// One LLM→tools round within a turn (observability Phase 1).
@@ -832,10 +825,8 @@ pub enum JournalEventType {
     LlmRequestFull,
     /// Full LLM response payload for a single attempt within a round.
     LlmResponseFull,
-    /// Background memory extraction agent completed (extracted, skipped, or errored).
-    MemoryExtraction,
     /// Background session-memory (session-memory.md) extraction completed.
-    /// Distinct from `MemoryExtraction` (Memoria memories): this event
+    /// Distinct from legacy Memoria memory extraction: this event
     /// describes a single atomic rewrite of the session-memory L1
     /// artifact, not a Memoria store.
     SessionMemoryExtraction,
@@ -845,6 +836,10 @@ pub enum JournalEventType {
     PipelineAlert,
     /// Context pipeline compaction audit (what was dropped/cleared, why).
     PipelineCompactionAudit,
+    /// Agent suppressed a memory from injection for the rest of the session.
+    MemorySuppressed,
+    /// Agent released a tool result from context (early eviction).
+    ContextReleased,
 }
 
 /// Why the gate rejected a session-memory extraction attempt.
@@ -1628,10 +1623,10 @@ fn is_recovery_activity_event(event_type: &JournalEventType) -> bool {
             | JournalEventType::AdaptiveBaselinePromoted
             | JournalEventType::AdaptiveScenarioApplied
             | JournalEventType::AdaptivePerTurnApplied
-            | JournalEventType::AdaptiveExperimentEnrolled
             | JournalEventType::AdaptiveTuningRuleTriggered
-            | JournalEventType::ConfidenceDiagnosisRecorded
             | JournalEventType::CompactionRetry
+            | JournalEventType::MemorySuppressed
+            | JournalEventType::ContextReleased
     )
 }
 
@@ -2903,24 +2898,6 @@ impl JournalEvent {
         evt
     }
 
-    /// Composite snapshot taken — records references to state dimensions.
-    pub fn composite_snapshot(
-        session_id: Option<&str>,
-        turn: u32,
-        snapshot_id: &str,
-        label: Option<&str>,
-        components: &[&str],
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::CompositeSnapshot, session_id);
-        evt.turn = Some(turn);
-        evt.metadata = Some(serde_json::json!({
-            "snapshot_id": snapshot_id,
-            "label": label,
-            "components": components,
-        }));
-        evt
-    }
-
     /// Delegation started event — emitted when a delegation group is spawned.
     pub fn delegation_started(
         session_id: Option<&str>,
@@ -3241,24 +3218,6 @@ impl JournalEvent {
         evt
     }
 
-    /// Experiment enrollment — session assigned to a variant.
-    pub fn adaptive_experiment_enrolled(
-        session_id: Option<&str>,
-        turn: u32,
-        experiment_id: &str,
-        variant_id: &str,
-        experiment_name: &str,
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::AdaptiveExperimentEnrolled, session_id);
-        evt.turn = Some(turn);
-        evt.metadata = Some(serde_json::json!({
-            "experiment_id": experiment_id,
-            "variant_id": variant_id,
-            "experiment_name": experiment_name,
-        }));
-        evt
-    }
-
     /// Tuning rule triggered — emitted when an evolution rule fires and
     /// modifies runtime config.
     pub fn adaptive_tuning_rule_triggered(
@@ -3310,22 +3269,6 @@ impl JournalEvent {
         evt
     }
 
-    /// Record a confidence diagnosis (emitted only for actionable tiers).
-    pub fn confidence_diagnosis_recorded(
-        session_id: Option<&str>,
-        turn: u32,
-        confidence: f64,
-        diagnosis_json: serde_json::Value,
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::ConfidenceDiagnosisRecorded, session_id);
-        evt.turn = Some(turn);
-        evt.metadata = Some(serde_json::json!({
-            "confidence": confidence,
-            "confidence_diagnosis": diagnosis_json,
-        }));
-        evt
-    }
-
     /// Build a compaction retry telemetry event.
     ///
     /// Emitted after a successful compaction retry to capture operational metrics:
@@ -3358,49 +3301,9 @@ impl JournalEvent {
         evt
     }
 
-    pub fn memory_extraction(
-        session_id: Option<&str>,
-        turn: u32,
-        outcome: &str,
-        memories_saved: usize,
-        categories: &[String],
-        duration_ms: u64,
-    ) -> Self {
-        Self::memory_extraction_ex(
-            session_id,
-            turn,
-            outcome,
-            memories_saved,
-            categories,
-            duration_ms,
-            false,
-        )
-    }
-
-    pub fn memory_extraction_ex(
-        session_id: Option<&str>,
-        turn: u32,
-        outcome: &str,
-        memories_saved: usize,
-        categories: &[String],
-        duration_ms: u64,
-        prefix_reused: bool,
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::MemoryExtraction, session_id);
-        evt.turn = Some(turn);
-        evt.duration_ms = Some(duration_ms);
-        evt.metadata = Some(serde_json::json!({
-            "outcome": outcome,
-            "memories_saved": memories_saved,
-            "categories": categories,
-            "prefix_reused": prefix_reused,
-        }));
-        evt
-    }
-
     /// Session-memory (session-memory.md) extraction outcome event.
     ///
-    /// Distinct from [`JournalEvent::memory_extraction`] (Memoria memories).
+    /// Distinct from the legacy Memoria memory-extraction event.
     /// Metadata is a flat, self-describing object driven by the
     /// [`SessionMemoryExtractionOutcome`] enum.
     pub fn session_memory_extraction(
@@ -3450,6 +3353,32 @@ impl JournalEvent {
         let mut evt = Self::base(JournalEventType::PipelineCompactionAudit, session_id);
         evt.turn = Some(turn);
         evt.metadata = Some(event_payload);
+        evt
+    }
+
+    /// Agent suppressed a memory from being injected for the session.
+    pub fn memory_suppressed(
+        session_id: Option<&str>,
+        turn: u32,
+        memory_id: &str,
+        reason: Option<&str>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::MemorySuppressed, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(serde_json::json!({
+            "memory_id": memory_id,
+            "reason": reason,
+        }));
+        evt
+    }
+
+    /// Agent released a tool result from context (early eviction).
+    pub fn context_released(session_id: Option<&str>, turn: u32, tool_call_ids: &[&str]) -> Self {
+        let mut evt = Self::base(JournalEventType::ContextReleased, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(serde_json::json!({
+            "tool_call_ids": tool_call_ids,
+        }));
         evt
     }
 }
@@ -4175,6 +4104,98 @@ mod tests {
         assert_eq!(
             metadata.get("new_goal").and_then(|value| value.as_str()),
             Some("new goal")
+        );
+    }
+
+    #[test]
+    fn journal_event_memory_suppressed_serializes_and_round_trips() {
+        let evt = JournalEvent::memory_suppressed(
+            Some("sid-suppress"),
+            5,
+            "mem-abc123",
+            Some("stale, not relevant to current task"),
+        );
+        assert_eq!(evt.event_type, JournalEventType::MemorySuppressed);
+        assert_eq!(evt.turn, Some(5));
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("\"type\":\"memory_suppressed\""));
+        assert!(json.contains("\"memory_id\":\"mem-abc123\""));
+        assert!(json.contains("stale, not relevant"));
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.event_type, JournalEventType::MemorySuppressed);
+        assert_eq!(parsed.turn, Some(5));
+        let metadata = parsed.metadata.expect("metadata");
+        assert_eq!(
+            metadata.get("memory_id").and_then(|v| v.as_str()),
+            Some("mem-abc123")
+        );
+        assert_eq!(
+            metadata.get("reason").and_then(|v| v.as_str()),
+            Some("stale, not relevant to current task")
+        );
+    }
+
+    #[test]
+    fn journal_event_memory_suppressed_with_null_reason() {
+        let evt = JournalEvent::memory_suppressed(Some("sid-s2"), 3, "mem-xyz", None);
+        let json = serde_json::to_string(&evt).unwrap();
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        let metadata = parsed.metadata.expect("metadata");
+        assert_eq!(
+            metadata.get("memory_id").and_then(|v| v.as_str()),
+            Some("mem-xyz")
+        );
+        assert!(metadata.get("reason").unwrap().is_null());
+    }
+
+    #[test]
+    fn journal_event_context_released_serializes_and_round_trips() {
+        let evt = JournalEvent::context_released(
+            Some("sid-release"),
+            7,
+            &["call_001", "call_002", "call_003"],
+        );
+        assert_eq!(evt.event_type, JournalEventType::ContextReleased);
+        assert_eq!(evt.turn, Some(7));
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("\"type\":\"context_released\""));
+        assert!(json.contains("call_001"));
+        assert!(json.contains("call_002"));
+        assert!(json.contains("call_003"));
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.event_type, JournalEventType::ContextReleased);
+        assert_eq!(parsed.turn, Some(7));
+        let metadata = parsed.metadata.expect("metadata");
+        let ids = metadata
+            .get("tool_call_ids")
+            .and_then(|v| v.as_array())
+            .expect("tool_call_ids array");
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0].as_str(), Some("call_001"));
+    }
+
+    #[test]
+    fn journal_event_context_released_empty_ids() {
+        let evt = JournalEvent::context_released(Some("sid-r2"), 1, &[]);
+        let json = serde_json::to_string(&evt).unwrap();
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        let metadata = parsed.metadata.expect("metadata");
+        let ids = metadata
+            .get("tool_call_ids")
+            .and_then(|v| v.as_array())
+            .expect("tool_call_ids array");
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn is_recovery_activity_excludes_memory_suppressed_and_context_released() {
+        assert!(
+            !is_recovery_activity_event(&JournalEventType::MemorySuppressed),
+            "MemorySuppressed should NOT be recovery activity"
+        );
+        assert!(
+            !is_recovery_activity_event(&JournalEventType::ContextReleased),
+            "ContextReleased should NOT be recovery activity"
         );
     }
 
@@ -7152,8 +7173,8 @@ mod observability_serde_tests {
 
     #[test]
     fn git_snapshot_on_non_turn_event_works() {
-        // git_snapshot can be attached to any event type (e.g., CompositeSnapshot).
-        let ev = JournalEvent::base_public(JournalEventType::CompositeSnapshot, Some("s"))
+        // git_snapshot can be attached to any event type (e.g., SyncMarker).
+        let ev = JournalEvent::base_public(JournalEventType::SyncMarker, Some("s"))
             .with_git_snapshot(Some("1111aaaa".to_string()), Some("release".to_string()));
         let json = serde_json::to_string(&ev).unwrap();
         let deser: JournalEvent = serde_json::from_str(&json).unwrap();

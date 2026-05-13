@@ -442,7 +442,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
     ToolMeta {
         name: "session",
-        description: "Session state and lifecycle operations: config, prioritize, deprioritize, set_goal, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep, tool_search.",
+        description: "Session state and lifecycle operations: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, timeline, summary, history, suppress_memory(memory_id), unsuppress_memory(memory_id), list_suppressed, release_context(tool_call_id|string[]), list_released.",
         triggers: &[
             "config",
             "adjust",
@@ -455,6 +455,9 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "ask",
             "sleep",
             "search tools",
+            "suppress",
+            "unsuppress",
+            "release",
             "压缩",
             "目标",
             "配置",

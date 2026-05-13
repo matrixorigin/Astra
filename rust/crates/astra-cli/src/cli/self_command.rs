@@ -547,7 +547,6 @@ fn focused_recent_event_previews(
             JournalEventType::Turn,
             JournalEventType::AdaptiveScenarioApplied,
             JournalEventType::AdaptivePerTurnApplied,
-            JournalEventType::AdaptiveExperimentEnrolled,
         ],
         "history" => &[
             JournalEventType::Turn,
@@ -557,7 +556,6 @@ fn focused_recent_event_previews(
             JournalEventType::DriftDetected,
             JournalEventType::AdaptiveScenarioApplied,
             JournalEventType::AdaptivePerTurnApplied,
-            JournalEventType::AdaptiveExperimentEnrolled,
             JournalEventType::VerificationCompleted,
         ],
         _ => &[
@@ -568,7 +566,6 @@ fn focused_recent_event_previews(
             JournalEventType::DriftDetected,
             JournalEventType::AdaptiveScenarioApplied,
             JournalEventType::AdaptivePerTurnApplied,
-            JournalEventType::AdaptiveExperimentEnrolled,
         ],
     };
     recent_event_previews(events, journal_limit.clamp(1, 12), event_types)
@@ -721,7 +718,6 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::AgentSpawned => "agent_spawned",
         JournalEventType::AgentTerminated => "agent_terminated",
         JournalEventType::VerificationCompleted => "verification_completed",
-        JournalEventType::CompositeSnapshot => "composite_snapshot",
         JournalEventType::PlanEdit => "plan_edit",
         JournalEventType::PlanLifecycle => "plan_lifecycle",
         JournalEventType::GoalSteered => "goal_steered",
@@ -735,19 +731,18 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::DriftDetected => "drift_detected",
         JournalEventType::AdaptiveScenarioApplied => "adaptive_scenario_applied",
         JournalEventType::AdaptivePerTurnApplied => "adaptive_per_turn_applied",
-        JournalEventType::AdaptiveExperimentEnrolled => "adaptive_experiment_enrolled",
         JournalEventType::AdaptiveTuningRuleTriggered => "adaptive_tuning_rule_triggered",
         JournalEventType::InterruptionRecorded => "interruption_recorded",
-        JournalEventType::ConfidenceDiagnosisRecorded => "confidence_diagnosis_recorded",
         JournalEventType::CompactionRetry => "compaction_retry",
         JournalEventType::LlmRound => "llm_round",
         JournalEventType::LlmRequestFull => "llm_request_full",
         JournalEventType::LlmResponseFull => "llm_response_full",
-        JournalEventType::MemoryExtraction => "memory_extraction",
         JournalEventType::SessionMemoryExtraction => "session_memory_extraction",
         JournalEventType::PipelineFeedback => "pipeline_feedback",
         JournalEventType::PipelineAlert => "pipeline_alert",
         JournalEventType::PipelineCompactionAudit => "pipeline_compaction_audit",
+        JournalEventType::MemorySuppressed => "memory_suppressed",
+        JournalEventType::ContextReleased => "context_released",
     }
     .to_string()
 }
