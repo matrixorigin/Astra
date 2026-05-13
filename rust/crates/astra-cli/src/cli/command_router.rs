@@ -1814,10 +1814,29 @@ pub(super) async fn run_print_mode(
         .as_deref()
         .and_then(load_session_messages_for_continuation);
     let selector = create_tool_selector(api, profile);
+    // Issue #326 P0 / R1 Major 2: print mode (headless `astra -p`) is
+    // non-interactive — there is no TUI to ask for approvals. We force
+    // `auto_approve = true` (= PermissionMode::Auto) here. The
+    // bypass-immune deny rules (sensitive paths, git-destructive,
+    // execute hard-deny, sandbox circuit breaker) still fire in Auto
+    // mode, so this is **not** a YOLO bypass; it's just "don't pop
+    // a non-existent prompt". If a tool genuinely requires
+    // NeedApproval (e.g. compensation prompts after a denial), the
+    // gate fans out to silent-fail-closed in stream_render.rs (line
+    // ~1983), surfacing the deny reason to the LLM instead of hanging.
     let mut pm = PermissionManager::with_project(
-        true, // print mode is headless, always auto-approve
+        true,
         &std::env::current_dir().unwrap_or_default(),
     );
+    // Surface load_errors as exit-1: a corrupt project permissions.json
+    // in CI must not silently fall back to "no rules" (issue #326 P0
+    // task #12 / scenario #34).
+    if !pm.load_errors().is_empty() {
+        for err in pm.load_errors() {
+            eprintln!("astra: {err}");
+        }
+        return Ok(ExitCode::ToolFailure);
+    }
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
 
