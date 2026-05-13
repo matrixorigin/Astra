@@ -336,6 +336,82 @@ impl<E: std::fmt::Display> std::fmt::Display for ModifyError<E> {
 
 impl<E: std::fmt::Display + std::fmt::Debug> std::error::Error for ModifyError<E> {}
 
+/// How aggressively a permission settings file should be applied.
+///
+/// Issue #326 P5b / R1 Critical 3 / R2 Major 7: not every entry
+/// point should treat project-level rules the same way. A user's
+/// own TUI session in a trusted workspace can apply both `allow`
+/// and `deny` rules; a sub-run spawned from headless mode in an
+/// unfamiliar workspace must apply `deny` rules (so a malicious
+/// project file can't escalate the child agent) but ignore
+/// `allow` rules (so it can't grant the child capabilities the
+/// parent never asked about).
+///
+/// All entry points pass one of these variants when constructing
+/// a [`PermissionManager`]; corrupt files surface as
+/// [`PermissionSettingsLoadError`] regardless, but how the
+/// effective rule set is shaped after parse depends on the policy.
+#[derive(Clone, Debug)]
+pub enum PermissionLoadPolicy {
+    /// Trusted interactive: load both allow and deny rules from
+    /// the project file. Used by `astra` / `astra --tui` when the
+    /// workspace is in the trust ledger (P5b).
+    InteractiveTrusted,
+    /// Untrusted interactive: parse the project file (so corrupt
+    /// JSON still surfaces) but apply ONLY deny rules.
+    /// `allow_sensitive_path_writes` and similar opt-in flags are
+    /// also ignored. The user can promote to trusted later via
+    /// the TUI's "Trust this workspace" prompt.
+    InteractiveUntrusted,
+    /// Headless / sub-run: never apply project allow rules, even
+    /// in trusted workspaces. Headless callers (`astra exec`,
+    /// `astra -p`, plan-executor, skill-subrun, delegate-subrun)
+    /// can't show a trust prompt and shouldn't silently inherit
+    /// project allowlists. Deny rules still apply so a project
+    /// can still TIGHTEN restrictions for sub-runs, just not
+    /// loosen them.
+    HeadlessSafe,
+    /// Test / debug entry point: full apply, no trust check.
+    TrustAll,
+}
+
+impl PermissionLoadPolicy {
+    /// Whether project-level `allow_*` rules and the
+    /// `allow_sensitive_path_writes` flag should be honoured.
+    #[must_use]
+    pub fn applies_project_allow(&self) -> bool {
+        matches!(self, Self::InteractiveTrusted | Self::TrustAll)
+    }
+
+    /// Whether project-level `deny_*` rules should be honoured.
+    /// All variants except a hypothetical "completely untrusted"
+    /// answer yes — denying is always safe.
+    #[must_use]
+    pub fn applies_project_deny(&self) -> bool {
+        true
+    }
+}
+
+/// Filter a parsed [`PermissionSettings`] through a load policy.
+///
+/// Returns the effective settings the manager should keep
+/// in-memory. Allow rules are stripped for non-trusted policies;
+/// deny rules and other safety opt-ins are preserved (deny is
+/// always safe to apply).
+#[must_use]
+pub fn apply_load_policy(
+    raw: PermissionSettings,
+    policy: &PermissionLoadPolicy,
+) -> PermissionSettings {
+    let mut effective = raw;
+    if !policy.applies_project_allow() {
+        effective.allow.clear();
+        effective.allow_sensitive_path_writes = false;
+    }
+    // Deny rules always survive.
+    effective
+}
+
 impl PermissionSettings {
     /// Load from the project-level settings file (`.kiro/permissions.json`).
     ///
@@ -714,6 +790,25 @@ impl PermissionManager {
 
     /// Create with explicit permission mode and project directory.
     pub(super) fn with_project_mode(mode: PermissionMode, project_root: &Path) -> Self {
+        // Default to InteractiveTrusted for backwards compat. New
+        // code paths should prefer `with_load_policy` so the trust
+        // posture is explicit at the call site.
+        Self::with_load_policy(mode, project_root, &PermissionLoadPolicy::InteractiveTrusted)
+    }
+
+    /// Issue #326 P5b / R1 Critical 3 / R2 Major 7: construct a
+    /// permission manager with an explicit load policy.
+    ///
+    /// All entry points that have a meaningful trust signal (TUI
+    /// trust ledger, headless mode, sub-run) should use this and
+    /// pass the matching [`PermissionLoadPolicy`]. The policy
+    /// shapes which parts of the on-disk file end up in the
+    /// effective rule set.
+    pub(super) fn with_load_policy(
+        mode: PermissionMode,
+        project_root: &Path,
+        policy: &PermissionLoadPolicy,
+    ) -> Self {
         let project_outcome = PermissionSettings::try_load(project_root);
         let user_outcome = PermissionSettings::try_load_user();
         let mut load_errors = Vec::new();
@@ -723,7 +818,10 @@ impl PermissionManager {
         if let Some(err) = user_outcome.error {
             load_errors.push(err);
         }
-        let settings = project_outcome.settings;
+        // Apply the trust-aware filter to the project file. User-level
+        // rules come from the user's own home dir and are always
+        // honoured (they don't carry workspace-trust risk).
+        let settings = apply_load_policy(project_outcome.settings, policy);
         let cached_allow = settings.parsed_allow_rules();
         let cached_deny = settings.parsed_deny_rules();
         let user_settings = user_outcome.settings;
@@ -3103,6 +3201,106 @@ mod tests {
         // File on disk is unchanged.
         let reloaded = PermissionSettings::load(dir.path());
         assert_eq!(reloaded.allow, vec!["Bash(baseline:*)"]);
+    }
+
+    // ── Issue #326 P5b: PermissionLoadPolicy ──────────────────────────
+
+    #[test]
+    fn load_policy_headless_safe_drops_project_allow_keeps_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(
+            kiro.join("permissions.json"),
+            r#"{
+                "allow": ["Bash(curl:*)"],
+                "deny": ["Bash(rm -rf:*)"]
+            }"#,
+        )
+        .unwrap();
+
+        let pm = PermissionManager::with_load_policy(
+            PermissionMode::Auto,
+            dir.path(),
+            &PermissionLoadPolicy::HeadlessSafe,
+        );
+        // Project allow rules dropped — sub-run can't be granted
+        // capabilities the parent never asked about.
+        assert!(pm.settings.allow.is_empty(), "HeadlessSafe must drop project allow");
+        // Project deny rules preserved — a project can still tighten
+        // sub-run restrictions.
+        assert_eq!(pm.settings.deny, vec!["Bash(rm -rf:*)"]);
+    }
+
+    #[test]
+    fn load_policy_interactive_untrusted_drops_allow_keeps_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(
+            kiro.join("permissions.json"),
+            r#"{
+                "allow": ["Bash(rm:*)"],
+                "deny": ["Edit(/etc/**)"],
+                "allow_sensitive_path_writes": true
+            }"#,
+        )
+        .unwrap();
+
+        let pm = PermissionManager::with_load_policy(
+            PermissionMode::Prompt,
+            dir.path(),
+            &PermissionLoadPolicy::InteractiveUntrusted,
+        );
+        assert!(pm.settings.allow.is_empty());
+        assert_eq!(pm.settings.deny, vec!["Edit(/etc/**)"]);
+        assert!(
+            !pm.settings.allow_sensitive_path_writes,
+            "untrusted must zero allow_sensitive_path_writes"
+        );
+    }
+
+    #[test]
+    fn load_policy_interactive_trusted_loads_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(
+            kiro.join("permissions.json"),
+            r#"{
+                "allow": ["Bash(npm test:*)"],
+                "deny": ["Bash(rm -rf:*)"],
+                "allow_sensitive_path_writes": true
+            }"#,
+        )
+        .unwrap();
+
+        let pm = PermissionManager::with_load_policy(
+            PermissionMode::Prompt,
+            dir.path(),
+            &PermissionLoadPolicy::InteractiveTrusted,
+        );
+        assert_eq!(pm.settings.allow, vec!["Bash(npm test:*)"]);
+        assert_eq!(pm.settings.deny, vec!["Bash(rm -rf:*)"]);
+        assert!(pm.settings.allow_sensitive_path_writes);
+    }
+
+    #[test]
+    fn load_policy_corrupt_file_still_surfaces_through_headless_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(kiro.join("permissions.json"), "{ bad").unwrap();
+
+        let pm = PermissionManager::with_load_policy(
+            PermissionMode::Auto,
+            dir.path(),
+            &PermissionLoadPolicy::HeadlessSafe,
+        );
+        assert!(
+            !pm.load_errors().is_empty(),
+            "corrupt project file must surface even under HeadlessSafe"
+        );
     }
 
     // ── Dangerous file paths ──────────────────────────────────────────────────
