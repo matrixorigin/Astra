@@ -7,15 +7,18 @@ use serde::{Deserialize, Serialize};
 /// on dual-stack systems, causing connection failures.
 pub const DEFAULT_MEMORIA_URL: &str = "http://127.0.0.1:8100";
 
-/// Tunable skill catalog surfacing: capped per-turn listing plus `discover_skills` when the
-/// catalog is larger than `min_catalog_size` and `dynamic_surface` is enabled.
+/// Legacy skill catalog surfacing knobs.
+///
+/// Selector-based capped surfacing was removed; runtime now surfaces the full
+/// skill catalog and ignores these values. The struct remains for wire/config
+/// compatibility with clients that still send `skill_search`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillSearchSettings {
-    /// When true and skill count exceeds `min_catalog_size`, use a capped surface + discovery tool.
+    /// Deprecated: ignored after selector removal.
     pub dynamic_surface: bool,
-    /// Below or equal to this count, every skill is listed (no discovery path).
+    /// Deprecated: ignored after selector removal.
     pub min_catalog_size: usize,
-    /// Max skills in the auto-surfaced subset when dynamic mode applies.
+    /// Deprecated: ignored after selector removal.
     pub surface_cap: usize,
 }
 
@@ -30,13 +33,13 @@ impl Default for SkillSearchSettings {
 }
 
 impl SkillSearchSettings {
-    /// When true, expose the full catalog (enum listing, no `discover_skills` for this size).
+    /// Compatibility helper for old callers; runtime now always exposes the full catalog.
     #[inline]
     pub fn use_full_catalog(&self, skill_count: usize) -> bool {
         !self.dynamic_surface || skill_count <= self.min_catalog_size
     }
 
-    /// Maximum surfaced skills after selector confidence logic is applied.
+    /// Compatibility helper for old callers; runtime ignores the returned cap.
     #[inline]
     pub fn effective_surface_cap(&self) -> usize {
         self.surface_cap.clamp(5, 20)

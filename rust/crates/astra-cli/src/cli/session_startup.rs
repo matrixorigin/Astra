@@ -7,13 +7,14 @@ use session_guard::{
 use session_runtime::PipelineModules;
 
 pub(crate) struct SessionStartupArtifacts {
-    pub selector: Box<dyn tool_selector::ToolSelector>,
     pub pipeline_modules: PipelineModules,
     pub edge_heartbeat_task: Option<tokio::task::JoinHandle<()>>,
     pub skill_quality_path: std::path::PathBuf,
     pub pinned_skills_path: std::path::PathBuf,
     pub shutdown_signal_rx: tokio::sync::watch::Receiver<Option<session_guard::ShutdownSignal>>,
 }
+
+// Note: `selector` field was removed — tool selection is now handled by the LLM directly.
 
 async fn prune_stale_pending_recovery(
     api: &astra_thin_client::ThinClient,
@@ -148,15 +149,10 @@ pub(crate) async fn complete_session_startup(
     let quality_tracker_for_save = quality_tracker.clone();
     state.tool_quality_tracker = Some(quality_tracker_for_save);
     // Session-scoped confidence calibrator: thresholds adapt to correction rates
-    let confidence_calibrator =
+    let _confidence_calibrator =
         std::sync::Arc::new(astra_turn_core::routing_metrics::ConfidenceCalibrator::default());
-    let (selector, pipeline_modules) = create_tool_selector_with_quality(
-        api,
-        profile,
-        Some(quality_tracker),
-        Some(confidence_calibrator),
-    );
-    tracer.phase("tool_selector");
+    let pipeline_modules = session_runtime::create_pipeline_modules(api, profile);
+    tracer.phase("pipeline_modules");
 
     // Load cross-session tool-health state from local files.
     let profile_name = profile.unwrap_or("default");
@@ -247,7 +243,7 @@ pub(crate) async fn complete_session_startup(
     );
 
     if let Some(token) = current_access_token(profile) {
-        let has_models = check_server_has_models(api, &token).await;
+        let has_models = session_runtime::check_server_has_models(api, &token).await;
         if !has_models {
             state.model = Some("⚠ none".to_string());
         }
@@ -294,7 +290,6 @@ pub(crate) async fn complete_session_startup(
     // Ready status now conveyed by the startup card — no separate line.
 
     Ok(SessionStartupArtifacts {
-        selector,
         pipeline_modules,
         edge_heartbeat_task,
         skill_quality_path,

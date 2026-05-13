@@ -4,7 +4,6 @@ pub(super) struct StateCommandContext<'a> {
     pub(super) api: &'a astra_thin_client::ThinClient,
     pub(super) profile: Option<&'a str>,
     pub(super) token: Option<&'a str>,
-    pub(super) selector: &'a dyn tool_selector::ToolSelector,
 }
 
 pub(super) async fn handle_state_command(
@@ -17,7 +16,6 @@ pub(super) async fn handle_state_command(
         api,
         profile,
         token,
-        selector,
     } = ctx;
     match cmd {
         "/clear" => {
@@ -331,7 +329,7 @@ pub(super) async fn handle_state_command(
                     perm_manager: &mut auto_pm,
                     verbose_mode: false,
                     render_policy: crate::stream_render::RenderPolicy::Silent,
-                    selector,
+
                     recent_tools: &[],
                     tool_health_entries: &[],
                     session_lessons: &[],
@@ -451,7 +449,7 @@ pub(super) async fn handle_state_command(
                             perm_manager: &mut auto_pm2,
                             verbose_mode: false,
                             render_policy: crate::stream_render::RenderPolicy::Silent,
-                            selector,
+
                             recent_tools: &[],
                             tool_health_entries: &[],
                             session_lessons: &[],
@@ -549,7 +547,7 @@ pub(super) async fn handle_state_command(
                                     perm_manager: &mut auto_pm3,
                                     verbose_mode: false,
                                     render_policy: crate::stream_render::RenderPolicy::Silent,
-                                    selector,
+
                                     recent_tools: &[],
                                     tool_health_entries: &[],
                                     session_lessons: &[],

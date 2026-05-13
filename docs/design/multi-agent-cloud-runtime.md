@@ -80,7 +80,7 @@ Agent Decision = f(prompt@version, skill@version, context@snapshot, memory@state
 
 1. **Cross-session learning**: EntityGraph + PatternLibrary + ProgressiveCalibrator persist and evolve across sessions. No competitor does this.
 2. **Edge-cloud architecture**: Tools execute locally (100ms latency), LLM reasoning goes to cloud. Combines Claude Code's privacy with Codex's cloud power.
-3. **Self-improving selection**: ToolQualityTracker biases future selections based on historical outcomes. Production CLI uses TF-IDF tool selection (routing engine, entity graph, patterns) with no extra LLM pre-call; `LlmToolSelector`/`FallbackSelector` remain in `tool_selector.rs` for tests and optional composition.
+3. **Self-improving selection**: ToolQualityTracker biases future outcomes based on historical usage. Production CLI no longer performs a per-turn LLM tool-selection pre-call or uses the removed `tool_selector.rs` composition path.
 4. **Intent-driven context**: Load only task-relevant memory (preference query: ~100 tokens vs full memory: ~2400 tokens). 60% token savings.
 
 ### 2.3 Where We Must Catch Up
@@ -295,7 +295,7 @@ The graph is correct (no cycles), but `astra` being the **only crate that can br
 - **Local-first journal**: Append-only JSONL is the correct foundation. Fast, crash-safe, auditable.
 - **Sync envelope state machine**: Clean→Dirty→Syncing→Conflict is correct. Extend, don't replace.
 - **DomainAdapter trait**: The trait signature is well-designed. **Learning, Events, Tasks, Templates, and Preferences** now have real [`runtime::sync_adapters`](../../rust/crates/runtime/src/sync_adapters.rs) implementations (see §6.2.1); residual “stub” language in older sections is obsolete for those domains.
-- **Tool selection default path**: TF-IDF + learned context (entity/pattern/calibration) without a per-turn LLM tool-selection call in CLI; optional `FallbackSelector`/`LlmToolSelector` in-library for experiments.
+- **Tool selection default path**: registry-based tool surfacing with learned context (entity/pattern/calibration) and no per-turn LLM tool-selection pre-call in CLI.
 - **LearnedContext flow**: Entity/pattern/calibration/tool hints as "priors, not hard requirements" is correct.
 
 ---

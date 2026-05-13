@@ -147,12 +147,11 @@ pub struct PipelineModules {
     pub _skill_watcher: Option<SkillWatcherHandle>,      // Hot-reload watcher
 }
 
-fn create_tool_selector(api, profile) -> (Box<dyn ToolSelector>, PipelineModules) {
+fn create_pipeline_modules(api, profile) -> PipelineModules {
     // 1. Load all tool schemas
     // 2. Create PluginRegistry and load skill manifests
     // 3. Register plugins with ToolRegistry
-    // 4. Create TfIdfSelector with quality tracking
-    // 5. Wire up pipeline learning modules
+    // 4. Wire up pipeline learning modules
 }
 ```
 

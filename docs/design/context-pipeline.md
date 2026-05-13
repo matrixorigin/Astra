@@ -721,7 +721,7 @@ pub struct EmergentContext {
 
     /// Attachment-style context from tool execution side-effects.
     /// Types: edited_text_file, skill_discovery, queued_command,
-    /// memory, mcp_resources, deferred_tools.
+    /// memory, mcp_resources.
     /// Cap: 16 attachments per turn.
     pub attachments: Vec<EmergentItem<Attachment>>,
 }

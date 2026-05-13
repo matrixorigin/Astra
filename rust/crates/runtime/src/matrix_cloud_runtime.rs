@@ -219,9 +219,9 @@ impl MatrixCloudRuntime {
         self.memory_extraction_service.clone()
     }
 
-    /// Resolve the cheapest selector-tagged model from the registry.
+    /// Resolve the cheapest memory-tagged model from the registry.
     /// Returns `None` if no encryptor is configured or resolution fails.
-    pub async fn resolve_selector_model(&self) -> Option<crate::memory_relevance::LlmConnParams> {
+    pub async fn resolve_memory_model(&self) -> Option<crate::memory_relevance::LlmConnParams> {
         let enc = self.encryptor.as_ref()?;
         let settings = self.shared_pool.settings();
         let pool = self.shared_pool.get();
@@ -580,26 +580,26 @@ mod tests {
             "MatrixCloudRuntime must expose with_encryptor builder method"
         );
         assert!(
-            source.contains("fn resolve_selector_model"),
-            "MatrixCloudRuntime must expose resolve_selector_model for memory relevance"
+            source.contains("fn resolve_memory_model"),
+            "MatrixCloudRuntime must expose resolve_memory_model for memory relevance"
         );
     }
 
     #[test]
-    fn resolve_selector_model_requires_encryptor() {
+    fn resolve_memory_model_requires_encryptor() {
         let source = include_str!("matrix_cloud_runtime.rs");
         assert!(
             source.contains("let enc = self.encryptor.as_ref()?;"),
-            "resolve_selector_model must early-return None when encryptor is missing"
+            "resolve_memory_model must early-return None when encryptor is missing"
         );
     }
 
     #[test]
-    fn resolve_selector_model_returns_llm_conn_params() {
+    fn resolve_memory_model_returns_llm_conn_params() {
         let source = include_str!("matrix_cloud_runtime.rs");
         assert!(
             source.contains("crate::memory_relevance::LlmConnParams"),
-            "resolve_selector_model must return LlmConnParams from memory_relevance module"
+            "resolve_memory_model must return LlmConnParams from memory_relevance module"
         );
     }
 }

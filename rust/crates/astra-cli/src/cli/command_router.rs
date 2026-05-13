@@ -383,7 +383,7 @@ async fn execute_repl_bridge_command(
     }
     maybe_load_project_instructions(&mut state);
 
-    let (_selector, pipeline_modules) = create_tool_selector(api, profile);
+    let pipeline_modules = create_pipeline_modules(api, profile);
     state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
@@ -528,7 +528,7 @@ pub(super) async fn execute_cli_command(
             let mut continuation_messages = session_id
                 .as_deref()
                 .and_then(load_session_messages_for_continuation);
-            let selector = create_tool_selector(api, profile.as_deref());
+            let _pipeline = create_pipeline_modules(api, profile.as_deref());
             let mut pm = PermissionManager::with_project(
                 auto_approve,
                 &std::env::current_dir().unwrap_or_default(),
@@ -545,7 +545,6 @@ pub(super) async fn execute_cli_command(
                 render_md: terminal::size().is_ok(),
                 verbose_mode: true,
                 render_policy: crate::stream_render::RenderPolicy::Stream,
-                selector: &*selector.0,
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 skill_search: &skill_search,
                 // Non-Chat (Message-style) path — legacy single-shot
@@ -987,7 +986,7 @@ pub(super) async fn execute_cli_command(
                 .as_deref()
                 .and_then(load_session_messages_for_continuation);
             let is_tty = terminal::size().is_ok();
-            let selector = create_tool_selector(api, profile.as_deref());
+            let _pipeline = create_pipeline_modules(api, profile.as_deref());
             let mut pm = {
                 let project_root = std::env::current_dir().unwrap_or_default();
                 if let Some(ref mode_str) = args.permission_mode {
@@ -1072,7 +1071,6 @@ pub(super) async fn execute_cli_command(
                 render_md,
                 verbose_mode: !quiet,
                 render_policy,
-                selector: &*selector.0,
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 skill_search: &skill_search,
                 agent_spawner: Some(one_shot_spawner),
@@ -1149,10 +1147,6 @@ pub(super) async fn execute_cli_command(
                 if let Some(obj) = json_output.as_object_mut() {
                     obj.insert("ttft_ms".to_string(), serde_json::json!(sr.ttft_ms));
                     obj.insert("context_ms".to_string(), serde_json::json!(sr.context_ms));
-                    obj.insert(
-                        "selector_strategy".to_string(),
-                        serde_json::json!(sr.selector_strategy),
-                    );
                     obj.insert(
                         "background_agent_results".to_string(),
                         serde_json::json!(
@@ -1810,7 +1804,7 @@ pub(super) async fn run_print_mode(
     let mut continuation_messages = session_id
         .as_deref()
         .and_then(load_session_messages_for_continuation);
-    let selector = create_tool_selector(api, profile);
+    let _pipeline = create_pipeline_modules(api, profile);
     let mut pm = PermissionManager::with_project(
         true, // print mode is headless, always auto-approve
         &std::env::current_dir().unwrap_or_default(),
@@ -1828,7 +1822,6 @@ pub(super) async fn run_print_mode(
         render_md: false,
         verbose_mode: false,
         render_policy: crate::stream_render::RenderPolicy::Silent,
-        selector: &*selector.0,
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
         skill_search: &skill_search,
         agent_spawner: None,
@@ -3247,12 +3240,7 @@ mod exit_code_tests {
             last_heavy_checkpoint: None,
             ttft_ms: None,
             context_ms: None,
-            selector_strategy: None,
-            selector_ms: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
             memoria_ms: None,
-            selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
@@ -3535,12 +3523,7 @@ mod final_json_output_tests {
             last_heavy_checkpoint: None,
             ttft_ms: None,
             context_ms: None,
-            selector_strategy: None,
-            selector_ms: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
             memoria_ms: None,
-            selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,

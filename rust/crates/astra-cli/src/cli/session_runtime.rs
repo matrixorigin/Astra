@@ -1,20 +1,20 @@
 use super::*;
 
-pub(super) fn create_tool_selector(
+pub(super) fn create_pipeline_modules(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
-    create_tool_selector_with_quality(api, profile, None, None)
+) -> PipelineModules {
+    create_pipeline_modules_inner(api, profile, true)
 }
 
-pub(super) fn create_tool_selector_quiet(
+pub(crate) fn create_pipeline_modules_quiet(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
-    create_tool_selector_with_quality_internal(api, profile, None, None, false)
+) -> PipelineModules {
+    create_pipeline_modules_inner(api, profile, false)
 }
 
-/// Shared runtime modules created during tool-selector construction.
+/// Shared runtime modules created during pipeline construction.
 ///
 /// Holds the unified skill registry, MCP client manager, and skill-watcher
 /// handle so the REPL can wire them into its shared state after startup.
@@ -27,52 +27,13 @@ pub(super) struct PipelineModules {
     pub _skill_watcher: Option<astra_runtime::skills::watcher::SkillWatcherHandle>,
 }
 
-pub(super) fn create_tool_selector_with_quality(
+fn create_pipeline_modules_inner(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    quality_tracker: Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
-    confidence_calibrator: Option<
-        std::sync::Arc<astra_turn_core::routing_metrics::ConfidenceCalibrator>,
-    >,
-) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
-    create_tool_selector_with_quality_internal(
-        api,
-        profile,
-        quality_tracker,
-        confidence_calibrator,
-        true,
-    )
-}
-
-fn create_tool_selector_with_quality_internal(
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    quality_tracker: Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
-    confidence_calibrator: Option<
-        std::sync::Arc<astra_turn_core::routing_metrics::ConfidenceCalibrator>,
-    >,
     _announce_skills: bool,
-) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
-    let all_schemas = edge_tools::all_tool_schemas();
-    // spawn_agent, get_agent_result, send_message are now consolidated into
-    // the `agent` tool schema (actions: spawn, get_result, send_message).
-    // Individual schemas kept only for backward compat in the executor dispatch.
-    // The `skill` tool is dynamically injected by the agentic loop
-    // (skill_tool::skill_tool_schema) based on discovered skills each turn.
-    let mut registry = tool_registry::ToolRegistry::new(all_schemas);
-
-    // Load skill manifests from skills/ directory and register plugin tools
-    let mut plugin_registry = tool_registry::PluginRegistry::new();
-    manifest_loader::load_skills_directory(&mut plugin_registry);
-    registry.register_plugins(&plugin_registry);
-
-    let mut tfidf = tool_selector::TfIdfSelector::new(registry);
-    if let Some(qt) = quality_tracker {
-        tfidf = tfidf.with_quality_tracker(qt);
-    }
-    if let Some(cal) = confidence_calibrator {
-        tfidf = tfidf.with_confidence_calibrator(cal);
-    }
+) -> PipelineModules {
+    // Selector removed — tool schemas are now sent in full to the LLM each turn
+    // via edge_tools::all_tool_schemas(). No registry/selector state to build here.
 
     // Initialize unified skill registry with providers (priority: Local > Bundled)
     let mut unified_skill_registry = astra_runtime::skills::UnifiedSkillRegistry::new();
@@ -199,25 +160,7 @@ fn create_tool_selector_with_quality_internal(
     // just to pick tools, adding 10-80s latency depending on the model. TF-IDF is
     // fast (<1ms), deterministic, and works well for all common query patterns.
     // Skill activation is handled by the `skill` tool in the agentic loop.
-    let selector: Box<dyn tool_selector::ToolSelector> = Box::new(tfidf);
-
-    (selector, modules)
-}
-
-/// Tool selector for background plan execution.
-///
-/// Uses TF-IDF selector only — no LLM-based tool selection (same as foreground REPL).
-pub(crate) fn create_background_plan_selector(
-    _ctx: &crate::plan_executor::BackgroundPlanContext,
-) -> Box<dyn tool_selector::ToolSelector> {
-    let all_schemas = edge_tools::all_tool_schemas();
-    let mut registry = tool_registry::ToolRegistry::new(all_schemas);
-    let mut plugin_registry = tool_registry::PluginRegistry::new();
-    manifest_loader::load_skills_directory(&mut plugin_registry);
-    registry.register_plugins(&plugin_registry);
-
-    let tfidf = tool_selector::TfIdfSelector::new(registry);
-    Box::new(tfidf)
+    modules
 }
 
 /// Quick check whether the server has at least one LLM model configured.

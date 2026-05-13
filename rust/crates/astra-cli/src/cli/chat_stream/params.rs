@@ -1,4 +1,4 @@
-use astra_runtime::{pipeline::persistence::ToolHealthEntry, tool_selector::ToolSelector};
+use astra_runtime::pipeline::persistence::ToolHealthEntry;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -145,7 +145,7 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) perm_manager: &'a mut PermissionManager,
     pub(crate) verbose_mode: bool,
     pub(crate) render_policy: super::super::stream_render::RenderPolicy,
-    pub(crate) selector: &'a dyn ToolSelector,
+
     pub(crate) recent_tools: &'a [String],
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
     /// P6 seam: cross-session lessons loaded once at session bootstrap.
@@ -277,7 +277,7 @@ pub(crate) struct BasicCliChatContext<'a> {
     pub render_md: bool,
     pub verbose_mode: bool,
     pub render_policy: super::super::stream_render::RenderPolicy,
-    pub selector: &'a dyn ToolSelector,
+
     pub unified_skill_registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     pub skill_search: &'a astra_core::SkillSearchSettings,
     /// Optional agent spawner so `astra chat -m` (non-REPL one-shot)
@@ -327,7 +327,7 @@ impl<'a> ChatTurnParams<'a> {
             perm_manager,
             verbose_mode: ctx.verbose_mode,
             render_policy: ctx.render_policy,
-            selector: ctx.selector,
+
             recent_tools: &[],
             tool_health_entries: &[],
             session_lessons: &[],
@@ -382,8 +382,8 @@ mod tests {
     //! spawning not available in this context".
     //!
     //! A full end-to-end test here would require mocking the
-    //! ToolSelector trait (async method with lifetime parameter —
-    //! non-trivial to satisfy), so we instead write a *structural*
+    //! async method with lifetime parameter (non-trivial to satisfy),
+    //! so we instead write a *structural*
     //! regression: verify by AST that the `basic_cli` function
     //! clones `ctx.agent_spawner` into the returned
     //! `ChatTurnParams` (not a hard-coded `None`). The grep is

@@ -7,7 +7,7 @@
 use crate::durable_bridge;
 use crate::plan_executor;
 use crate::plan_interaction;
-use crate::session_runtime::create_background_plan_selector;
+
 use crate::session_state::SessionState;
 use crate::theme;
 use crossterm::style::Stylize;
@@ -88,13 +88,6 @@ fn take_plan_context(
     })
 }
 
-/// Create a `Box<dyn ToolSelector>` for the background plan executor.
-fn create_background_selector(
-    ctx: &plan_executor::BackgroundPlanContext,
-) -> Box<dyn astra_runtime::tool_selector::ToolSelector> {
-    create_background_plan_selector(ctx)
-}
-
 /// Spawns a background plan executor, then **blocks the caller** in
 /// [`crate::plan_monitor::run_blocking_plan_monitor`] until the run pauses, finishes,
 /// or the user hits Ctrl+C (per monitor behavior).
@@ -120,8 +113,7 @@ pub(crate) async fn start_and_monitor_plan(
     ensure_durable_task_state(state, Some(api), current_token).await;
 
     let ctx = take_plan_context(state, api, current_token, profile)?;
-    let selector = create_background_selector(&ctx);
-    let handle = plan_executor::spawn_plan_executor(ctx, selector);
+    let handle = plan_executor::spawn_plan_executor(ctx);
     state.plan_handle = Some(handle);
 
     eprintln!(

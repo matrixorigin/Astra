@@ -32,8 +32,7 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
-    let selector = tool_selector::TfIdfSelector::new(registry);
+    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
@@ -52,7 +51,6 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         perm_manager: &mut pm,
         verbose_mode: false,
         render_policy: crate::stream_render::RenderPolicy::Silent,
-        selector: &selector,
         recent_tools: &[],
         tool_health_entries: &[],
         session_lessons: &[],
@@ -128,8 +126,7 @@ async fn stream_chat_sse_simple_text_response() {
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
-    let selector = tool_selector::TfIdfSelector::new(registry);
+    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
@@ -147,7 +144,6 @@ async fn stream_chat_sse_simple_text_response() {
         perm_manager: &mut pm,
         verbose_mode: false,
         render_policy: crate::stream_render::RenderPolicy::Silent,
-        selector: &selector,
         recent_tools: &[],
         tool_health_entries: &[],
         session_lessons: &[],
@@ -225,8 +221,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
-    let selector = tool_selector::TfIdfSelector::new(registry);
+    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
@@ -245,7 +240,6 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         perm_manager: &mut pm,
         verbose_mode: false,
         render_policy: crate::stream_render::RenderPolicy::Silent,
-        selector: &selector,
         recent_tools: &[],
         tool_health_entries: &[],
         session_lessons: &[],
@@ -310,8 +304,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
-    let selector = tool_selector::TfIdfSelector::new(registry);
+    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
     let tracker =
         std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
@@ -347,7 +340,6 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             perm_manager: &mut pm,
             verbose_mode: false,
             render_policy: crate::stream_render::RenderPolicy::Silent,
-            selector: &selector,
             recent_tools: &[],
             tool_health_entries: &[],
             session_lessons: &[],
@@ -414,8 +406,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
-    let selector = tool_selector::TfIdfSelector::new(registry);
+    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
     let tracker =
         std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
@@ -441,7 +432,6 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         perm_manager: &mut pm,
         verbose_mode: false,
         render_policy: crate::stream_render::RenderPolicy::Silent,
-        selector: &selector,
         recent_tools: &[],
         tool_health_entries: &[],
         session_lessons: &[],
@@ -544,8 +534,7 @@ async fn stream_chat_sse_api_error_propagated() {
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
-    let selector = tool_selector::TfIdfSelector::new(registry);
+    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
@@ -563,7 +552,6 @@ async fn stream_chat_sse_api_error_propagated() {
         perm_manager: &mut pm,
         verbose_mode: false,
         render_policy: crate::stream_render::RenderPolicy::Silent,
-        selector: &selector,
         recent_tools: &[],
         tool_health_entries: &[],
         session_lessons: &[],
@@ -642,8 +630,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
         );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
-    let selector = tool_selector::TfIdfSelector::new(registry);
+    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true); // auto-approve
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
@@ -661,7 +648,6 @@ async fn stream_chat_sse_with_tool_call_loop() {
         perm_manager: &mut pm,
         verbose_mode: false,
         render_policy: crate::stream_render::RenderPolicy::Silent,
-        selector: &selector,
         recent_tools: &[],
         tool_health_entries: &[],
         session_lessons: &[],
@@ -763,8 +749,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
-    let selector = tool_selector::TfIdfSelector::new(registry);
+    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
@@ -782,7 +767,6 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         perm_manager: &mut pm,
         verbose_mode: false,
         render_policy: crate::stream_render::RenderPolicy::Silent,
-        selector: &selector,
         recent_tools: &[],
         tool_health_entries: &[],
         session_lessons: &[],
@@ -927,8 +911,7 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
         );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
-    let selector = tool_selector::TfIdfSelector::new(registry);
+    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
@@ -946,7 +929,6 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
         perm_manager: &mut pm,
         verbose_mode: false,
         render_policy: crate::stream_render::RenderPolicy::Silent,
-        selector: &selector,
         recent_tools: &[],
         tool_health_entries: &[],
         session_lessons: &[],

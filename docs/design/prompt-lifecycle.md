@@ -372,7 +372,7 @@ Key changes:
 3. Budget control applies to the **merged** set
 4. Audit trail covers **all** tool selections, not just cloud skills
 
-This means: when the user asks "fix the bug in auth.go", the skill selector considers `read_file` (edge), `knowledge_search` (cloud), and `db_query` (MCP) in the same semantic retrieval pass, and picks the best combination within budget.
+This means: when the user asks "fix the bug in auth.go", the registry can consider `read_file` (edge), `knowledge_search` (cloud), and `db_query` (MCP) from the same catalog surface, with skill instructions exposed through the session-scoped `<available_skills>` listing.
 
 ### Edge Tool Metadata Enrichment
 

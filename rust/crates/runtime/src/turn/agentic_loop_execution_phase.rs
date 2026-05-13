@@ -302,8 +302,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 // calling tools (observed: session 36500dd9 round 13 kept
                 // using bash/read_file despite the message). Adding every
                 // valid tool to `restricted_tools` flips the phase1 promise
-                // from aspirational to enforced: the CLI-side tool selector
-                // filters these out before the next payload is built, so the
+                // from aspirational to enforced: the payload builder filters
+                // these out before the next request is built, so the
                 // model physically cannot emit another tool call this round.
                 for name in host.valid_tool_names() {
                     state.restricted_tools.insert(name.clone());
@@ -2414,57 +2414,6 @@ fn record_tool_selection(
     turn_result: &HostTurnResult,
     turn_index: usize,
 ) {
-    // Feed confidence trend tracker with latest selector confidence.
-    if let Some(conf) = state.telemetry.first_selector_confidence {
-        let floor_loop = state.confidence_trend.record(conf);
-
-        // Compute diagnosis from available signals.
-        let query_tokens = state.message.split_whitespace().count();
-        let dynamic_tools = turn_result.edge_tool_round.len();
-        let diagnosis = astra_turn_core::confidence_contract::ConfidenceDiagnosis::diagnose(
-            conf,
-            dynamic_tools,     // signal_count proxy
-            dynamic_tools > 0, // task_type_known proxy
-            0,                 // memory_hint_count: not available here
-            0,                 // file_context_count: not available here
-            false,             // disambiguation: not available here
-            query_tokens,
-        );
-
-        if floor_loop {
-            tracing::warn!(
-                streak = state.confidence_trend.floor_streak(),
-                avg = %format!("{:.2}", state.confidence_trend.average_confidence()),
-                "confidence-floor loop detected"
-            );
-        } else if diagnosis.is_actionable() {
-            tracing::info!(
-                tier = diagnosis.tier.label(),
-                confidence = %format!("{:.2}", conf),
-                "low-confidence tool selection"
-            );
-        }
-
-        state.last_confidence_diagnosis = Some(diagnosis);
-
-        // Emit journal event for actionable (low/very-low) confidence diagnoses.
-        if let Some(ref diag) = state.last_confidence_diagnosis {
-            if diag.is_actionable() {
-                if let Some(ref sid) = state.current_session_id {
-                    if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
-                        let evt = astra_services::session_journal::JournalEvent::confidence_diagnosis_recorded(
-                            Some(sid),
-                            turn_index as u32,
-                            conf,
-                            diag.to_json(),
-                        );
-                        let _ = writer.append(&evt);
-                    }
-                }
-            }
-        }
-    }
-
     if let Some(session) = &state.telemetry.observability_session {
         let selected_tools: Vec<String> = turn_result
             .edge_tool_round
@@ -2511,15 +2460,11 @@ fn record_tool_selection(
             .collect();
         collector.record_tool_selection(
             &selected_tools,
-            state
-                .telemetry
-                .first_selector_strategy
-                .as_deref()
-                .unwrap_or("unknown"),
-            state.telemetry.first_selector_confidence.unwrap_or(0.0),
+            "llm",
+            0.0,
             &[],
             state.telemetry.all_tools_used.len() as u32,
-            state.telemetry.first_selector_ms.unwrap_or(0),
+            0,
         );
     }
 }

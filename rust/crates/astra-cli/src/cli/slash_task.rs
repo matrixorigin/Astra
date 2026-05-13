@@ -276,8 +276,8 @@ pub(super) async fn handle_task_command(
                 let mut perm_manager = PermissionManager::with_project(true, &workspace_root);
                 let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
-                // Create a fresh tool selector for the background task
-                let (selector, _modules) = create_tool_selector_quiet(&api_clone, None);
+                let _modules =
+                    crate::session_runtime::create_pipeline_modules_quiet(&api_clone, None);
 
                 let result = stream_chat_sse(ChatTurnParams {
                     api: &api_clone,
@@ -293,7 +293,6 @@ pub(super) async fn handle_task_command(
                     perm_manager: &mut perm_manager,
                     verbose_mode: false,
                     render_policy: crate::stream_render::RenderPolicy::Silent,
-                    selector: &*selector,
                     recent_tools: &[],
                     tool_health_entries: &[],
                     session_lessons: &[],

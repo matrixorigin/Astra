@@ -26,7 +26,7 @@ use std::{
 use astra_core::SharedPool;
 #[cfg(test)]
 use astra_runtime::plan_decompose;
-use astra_runtime::{prompts, tool_registry, tool_selector};
+use astra_runtime::{prompts, tool_registry};
 use astra_services::session_journal;
 use clap::Parser;
 use crossterm::{
@@ -231,9 +231,8 @@ use chat_turn::create_manual_checkpoint;
 #[cfg(test)]
 use chat_turn::{TurnContext, handle_chat_input};
 use session_runtime::{
-    check_server_has_models, create_tool_selector, create_tool_selector_quiet,
-    create_tool_selector_with_quality, current_access_token, initialize_session_state,
-    print_session_banner, try_silent_auth,
+    create_pipeline_modules, current_access_token, initialize_session_state, print_session_banner,
+    try_silent_auth,
 };
 use slash_account::handle_account_command;
 use slash_bug::handle_bug_command;
@@ -803,25 +802,15 @@ mod tests {
         );
         let base = spawn_mock(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-            edge_tools::all_tool_schemas(),
-        ));
         let mut state = SessionState {
             session_id: Some("old-sess".to_string()),
             turn: 5,
             history: vec![("q".to_string(), "a".to_string())],
             ..Default::default()
         };
-        let exit = handle_slash_command(
-            "/clear",
-            &api,
-            None,
-            &mut state,
-            Some("fake-token"),
-            &selector,
-        )
-        .await
-        .unwrap();
+        let exit = handle_slash_command("/clear", &api, None, &mut state, Some("fake-token"))
+            .await
+            .unwrap();
         assert!(!exit);
         assert_eq!(state.session_id.as_deref(), Some("new-sess-42"));
         assert_eq!(state.turn, 0);
@@ -831,11 +820,8 @@ mod tests {
     #[tokio::test]
     async fn slash_model_with_arg_sets_model() {
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-            edge_tools::all_tool_schemas(),
-        ));
         let mut state = SessionState::default();
-        let exit = handle_slash_command("/model gpt-4o", &api, None, &mut state, None, &selector)
+        let exit = handle_slash_command("/model gpt-4o", &api, None, &mut state, None)
             .await
             .unwrap();
         assert!(!exit);
@@ -845,11 +831,8 @@ mod tests {
     #[tokio::test]
     async fn slash_exit_returns_true() {
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-            edge_tools::all_tool_schemas(),
-        ));
         let mut state = SessionState::default();
-        let exit = handle_slash_command("/exit", &api, None, &mut state, None, &selector)
+        let exit = handle_slash_command("/exit", &api, None, &mut state, None)
             .await
             .unwrap();
         assert!(exit);
@@ -865,32 +848,19 @@ mod tests {
     #[tokio::test]
     async fn slash_unknown_command_does_not_crash() {
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-            edge_tools::all_tool_schemas(),
-        ));
         let mut state = SessionState::default();
-        let exit = handle_slash_command(
-            "/nonexistent_command_xyz",
-            &api,
-            None,
-            &mut state,
-            None,
-            &selector,
-        )
-        .await
-        .unwrap();
+        let exit = handle_slash_command("/nonexistent_command_xyz", &api, None, &mut state, None)
+            .await
+            .unwrap();
         assert!(!exit);
     }
 
     #[tokio::test]
     async fn slash_health_does_not_crash_empty() {
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-            edge_tools::all_tool_schemas(),
-        ));
         let mut state = SessionState::default();
         // No health entries — should print "no data" gracefully
-        let exit = handle_slash_command("/health", &api, None, &mut state, None, &selector)
+        let exit = handle_slash_command("/health", &api, None, &mut state, None)
             .await
             .unwrap();
         assert!(!exit);
@@ -899,9 +869,6 @@ mod tests {
     #[tokio::test]
     async fn slash_health_with_entries_does_not_crash() {
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-            edge_tools::all_tool_schemas(),
-        ));
         let mut state = SessionState {
             tool_health_entries: vec![
                 astra_turn_core::tool_health_persistence::ToolHealthEntry {
@@ -923,7 +890,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let exit = handle_slash_command("/health", &api, None, &mut state, None, &selector)
+        let exit = handle_slash_command("/health", &api, None, &mut state, None)
             .await
             .unwrap();
         assert!(!exit);
@@ -932,9 +899,6 @@ mod tests {
     #[tokio::test]
     async fn slash_health_detail_mode() {
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-            edge_tools::all_tool_schemas(),
-        ));
         let mut state = SessionState {
             tool_health_entries: vec![astra_turn_core::tool_health_persistence::ToolHealthEntry {
                 name: "bash".into(),
@@ -946,7 +910,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let exit = handle_slash_command("/health detail", &api, None, &mut state, None, &selector)
+        let exit = handle_slash_command("/health detail", &api, None, &mut state, None)
             .await
             .unwrap();
         assert!(!exit);
@@ -1697,13 +1661,10 @@ total_tokens_out: 500
     #[tokio::test]
     async fn slash_health_offline_shows_cloud_section() {
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-            edge_tools::all_tool_schemas(),
-        ));
         let mut state = SessionState::default();
         // No matrix runtime — should show "Offline" in cloud section
         assert!(state.matrix_runtime.is_none());
-        let exit = handle_slash_command("/health", &api, None, &mut state, None, &selector)
+        let exit = handle_slash_command("/health", &api, None, &mut state, None)
             .await
             .unwrap();
         assert!(!exit);

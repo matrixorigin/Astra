@@ -173,24 +173,21 @@ async fn slash_explain_toggles_state() {
     let api =
         astra_thin_client::ThinClient::new("http://127.0.0.1:8000", None).expect("test API URL");
     let mut state = SessionState::default();
-    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-        edge_tools::all_tool_schemas(),
-    ));
     assert_eq!(state.explain, ExplainMode::Off);
 
-    let should_exit = handle_slash_command("/explain", &api, None, &mut state, None, &selector)
+    let should_exit = handle_slash_command("/explain", &api, None, &mut state, None)
         .await
         .expect("slash command should succeed");
     assert!(!should_exit);
     assert_eq!(state.explain, ExplainMode::On);
 
-    let should_exit = handle_slash_command("/explain", &api, None, &mut state, None, &selector)
+    let should_exit = handle_slash_command("/explain", &api, None, &mut state, None)
         .await
         .expect("slash command should succeed");
     assert!(!should_exit);
     assert_eq!(state.explain, ExplainMode::Verbose);
 
-    let should_exit = handle_slash_command("/explain", &api, None, &mut state, None, &selector)
+    let should_exit = handle_slash_command("/explain", &api, None, &mut state, None)
         .await
         .expect("slash command should succeed");
     assert!(!should_exit);

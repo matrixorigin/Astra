@@ -753,18 +753,10 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
         );
     }
     if let Some(ctx) = ev.context_ms {
-        let mut parts = Vec::new();
-        if let Some(sel) = ev.selector_ms {
-            let strat = ev.selector_strategy.as_deref().unwrap_or("?");
-            parts.push(format!("selector: {}ms [{}]", sel, strat));
-        }
-        if let Some(m) = ev.memoria_ms {
-            parts.push(format!("memoria: {}ms", m));
-        }
-        let detail = if parts.is_empty() {
-            String::new()
+        let detail = if let Some(m) = ev.memoria_ms {
+            format!(" (memoria: {}ms)", m)
         } else {
-            format!(" ({})", parts.join(", "))
+            String::new()
         };
         eprintln!(
             "  {} {}ms{}  {}",
@@ -859,26 +851,15 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
                 mem
             );
         }
-        if let Some(sel) = ev.selector_ms {
-            let strat = ev.selector_strategy.as_deref().unwrap_or("unknown");
+        if let Some(ref skills) = ev.selected_skills
+            && !skills.is_empty()
+        {
             eprintln!(
-                "    {} {}   tool selection ({}ms, {}){}",
+                "    {} {}   selected skills: {}",
                 format!("[{:>5}ms]", offset).dim(),
                 "│ ".dim(),
-                sel,
-                strat,
-                if sel > 3000 { "  ← slow" } else { "" }
+                skills.join(", ").magenta()
             );
-            if let Some(ref skills) = ev.selected_skills
-                && !skills.is_empty()
-            {
-                eprintln!(
-                    "    {} {}   selected skills: {}",
-                    format!("[{:>5}ms]", offset).dim(),
-                    "│ ".dim(),
-                    skills.join(", ").magenta()
-                );
-            }
         }
         offset = ctx;
         eprintln!(
@@ -904,18 +885,11 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
         );
     }
     if let Some(t_in) = ev.tokens_in {
-        let sel_note = match (ev.selector_tokens_in, ev.selector_tokens_out) {
-            (Some(si), Some(so)) if si > 0 || so > 0 => {
-                format!(" (+selector: {}→{})", si, so)
-            }
-            _ => String::new(),
-        };
         eprintln!(
-            "    {}    {} input: {} tokens{}",
+            "    {}    {} input: {} tokens",
             " ".repeat(8),
             "│".dim(),
             t_in.to_string().dim(),
-            sel_note.dim()
         );
     }
     // Show TTFT inline
@@ -1217,7 +1191,8 @@ pub(super) async fn handle_info_command(
                     .bold()
                     .magenta()
             );
-            let selector = crate::session_runtime::create_tool_selector_quiet(api, None);
+            let _pipeline_modules =
+                crate::session_runtime::create_pipeline_modules_quiet(api, None);
             let mut pm = PermissionManager::with_project(false, &project_root);
             let turn_start = std::time::Instant::now();
             let sr = stream_chat_sse(ChatTurnParams {
@@ -1234,7 +1209,6 @@ pub(super) async fn handle_info_command(
                 perm_manager: &mut pm,
                 verbose_mode: state.verbose_mode,
                 render_policy: crate::stream_render::RenderPolicy::Stream,
-                selector: &*selector.0,
                 recent_tools: &state.recent_tools,
                 tool_health_entries: &state.tool_health_entries,
                 session_lessons: &state.session_lessons,
@@ -1323,9 +1297,6 @@ pub(super) async fn handle_info_command(
                 )
                 .with_ttft(sr.ttft_ms)
                 .with_context_time(sr.context_ms)
-                .with_selector_strategy(sr.selector_strategy)
-                .with_selector_time(sr.selector_ms)
-                .with_selector_tokens(sr.selector_tokens_in, sr.selector_tokens_out)
                 .with_memoria_time(sr.memoria_ms);
                 turn_event.llm_rounds = sr.llm_rounds;
                 turn_event.total_tool_ms = Some(tool_ms);

@@ -64,7 +64,6 @@ pub(crate) async fn handle_slash_command(
     profile: Option<&str>,
     state: &mut SessionState,
     token: Option<&str>,
-    selector: &dyn tool_selector::ToolSelector,
 ) -> Result<bool, String> {
     let mut parts = line.splitn(2, ' ');
     let raw_cmd = parts.next().unwrap_or("");
@@ -504,7 +503,6 @@ pub(crate) async fn handle_slash_command(
                     api,
                     profile,
                     token,
-                    selector,
                 },
                 state,
             )

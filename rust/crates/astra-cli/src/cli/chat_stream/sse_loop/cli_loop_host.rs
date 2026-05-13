@@ -13,7 +13,6 @@ use std::time::Instant;
 
 use astra_runtime::{
     tool_registry::ToolRegistry,
-    tool_selector::ToolSelector,
     turn::agentic_headless_round::HeadlessStderrStyle,
     turn::agentic_loop_host::{
         AgenticLoopHost, AgenticLoopState, HostTurnResult, TurnInteractionMode,
@@ -53,7 +52,6 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub recent_tools: &'a [String],
     pub project_root: PathBuf,
     pub executor: Arc<ToolExecutor>,
-    pub selector: &'a dyn ToolSelector,
     pub registry: ToolRegistry,
     pub all_schemas: Vec<Value>,
     pub file_context: Vec<String>,
@@ -270,7 +268,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             recent_tools: self.recent_tools,
             project_root: self.project_root.as_path(),
             executor: Arc::clone(&self.executor),
-            selector: self.selector,
             registry: &self.registry,
             messages: messages_slice,
             ephemeral_prefix: state.skills.listing_message.as_ref(),
@@ -284,11 +281,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             assembly_start,
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut state.telemetry.first_memoria_ms,
-                first_selector_ms: &mut state.telemetry.first_selector_ms,
-                first_selector_strategy: &mut state.telemetry.first_selector_strategy,
-                first_selector_confidence: &mut state.telemetry.first_selector_confidence,
-                selector_tokens_in: &mut state.telemetry.selector_tokens_in,
-                selector_tokens_out: &mut state.telemetry.selector_tokens_out,
                 first_selection_report: &mut state.telemetry.first_selection_report,
                 first_budget_pressure: &mut state.telemetry.first_budget_pressure,
                 first_context_assembly_ms: &mut state.telemetry.first_context_assembly_ms,

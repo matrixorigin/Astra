@@ -482,9 +482,6 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
 
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-        edge_tools::all_tool_schemas(),
-    ));
 
     handle_chat_input(
         "继续".to_string(),
@@ -493,7 +490,6 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
         TurnContext {
             api: &api,
             profile: None,
-            selector: &selector,
         },
     )
     .await
@@ -643,9 +639,6 @@ async fn crash_recovery_low_information_repair_followup_rebuilds_attachment() {
 
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-        edge_tools::all_tool_schemas(),
-    ));
 
     handle_chat_input(
         "修复?".to_string(),
@@ -654,7 +647,6 @@ async fn crash_recovery_low_information_repair_followup_rebuilds_attachment() {
         TurnContext {
             api: &api,
             profile: None,
-            selector: &selector,
         },
     )
     .await

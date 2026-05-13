@@ -11,25 +11,15 @@ async fn slash_clear_creates_new_session() {
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-        edge_tools::all_tool_schemas(),
-    ));
     let mut state = SessionState {
         session_id: Some("old-sess".to_string()),
         turn: 5,
         history: vec![("q".to_string(), "a".to_string())],
         ..Default::default()
     };
-    let exit = handle_slash_command(
-        "/clear",
-        &api,
-        None,
-        &mut state,
-        Some("fake-token"),
-        &selector,
-    )
-    .await
-    .unwrap();
+    let exit = handle_slash_command("/clear", &api, None, &mut state, Some("fake-token"))
+        .await
+        .unwrap();
     assert!(!exit);
     assert_eq!(state.session_id.as_deref(), Some("new-sess-42"));
     assert_eq!(state.turn, 0);
@@ -39,11 +29,8 @@ async fn slash_clear_creates_new_session() {
 #[tokio::test]
 async fn slash_model_with_arg_sets_model() {
     let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-        edge_tools::all_tool_schemas(),
-    ));
     let mut state = SessionState::default();
-    let exit = handle_slash_command("/model gpt-4o", &api, None, &mut state, None, &selector)
+    let exit = handle_slash_command("/model gpt-4o", &api, None, &mut state, None)
         .await
         .unwrap();
     assert!(!exit);
@@ -53,11 +40,8 @@ async fn slash_model_with_arg_sets_model() {
 #[tokio::test]
 async fn slash_exit_returns_true() {
     let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-        edge_tools::all_tool_schemas(),
-    ));
     let mut state = SessionState::default();
-    let exit = handle_slash_command("/exit", &api, None, &mut state, None, &selector)
+    let exit = handle_slash_command("/exit", &api, None, &mut state, None)
         .await
         .unwrap();
     assert!(exit);
@@ -72,32 +56,19 @@ async fn slash_exit_returns_true() {
 #[tokio::test]
 async fn slash_unknown_command_does_not_crash() {
     let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-        edge_tools::all_tool_schemas(),
-    ));
     let mut state = SessionState::default();
-    let exit = handle_slash_command(
-        "/nonexistent_command_xyz",
-        &api,
-        None,
-        &mut state,
-        None,
-        &selector,
-    )
-    .await
-    .unwrap();
+    let exit = handle_slash_command("/nonexistent_command_xyz", &api, None, &mut state, None)
+        .await
+        .unwrap();
     assert!(!exit);
 }
 
 #[tokio::test]
 async fn slash_health_does_not_crash_empty() {
     let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-        edge_tools::all_tool_schemas(),
-    ));
     let mut state = SessionState::default();
     // No health entries — should print "no data" gracefully
-    let exit = handle_slash_command("/health", &api, None, &mut state, None, &selector)
+    let exit = handle_slash_command("/health", &api, None, &mut state, None)
         .await
         .unwrap();
     assert!(!exit);
@@ -106,17 +77,14 @@ async fn slash_health_does_not_crash_empty() {
 #[tokio::test]
 async fn slash_lsp_status_does_not_crash() {
     let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-        edge_tools::all_tool_schemas(),
-    ));
     let mut state = SessionState::default();
 
-    let exit = handle_slash_command("/lsp", &api, None, &mut state, None, &selector)
+    let exit = handle_slash_command("/lsp", &api, None, &mut state, None)
         .await
         .unwrap();
     assert!(!exit);
 
-    let exit = handle_slash_command("/lsp status", &api, None, &mut state, None, &selector)
+    let exit = handle_slash_command("/lsp status", &api, None, &mut state, None)
         .await
         .unwrap();
     assert!(!exit);
@@ -125,9 +93,6 @@ async fn slash_lsp_status_does_not_crash() {
 #[tokio::test]
 async fn slash_health_with_entries_does_not_crash() {
     let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-        edge_tools::all_tool_schemas(),
-    ));
     let mut state = SessionState {
         tool_health_entries: vec![
             astra_turn_core::tool_health_persistence::ToolHealthEntry {
@@ -149,7 +114,7 @@ async fn slash_health_with_entries_does_not_crash() {
         ],
         ..Default::default()
     };
-    let exit = handle_slash_command("/health", &api, None, &mut state, None, &selector)
+    let exit = handle_slash_command("/health", &api, None, &mut state, None)
         .await
         .unwrap();
     assert!(!exit);
@@ -158,9 +123,6 @@ async fn slash_health_with_entries_does_not_crash() {
 #[tokio::test]
 async fn slash_health_detail_mode() {
     let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-        edge_tools::all_tool_schemas(),
-    ));
     let mut state = SessionState {
         tool_health_entries: vec![astra_turn_core::tool_health_persistence::ToolHealthEntry {
             name: "bash".into(),
@@ -172,7 +134,7 @@ async fn slash_health_detail_mode() {
         }],
         ..Default::default()
     };
-    let exit = handle_slash_command("/health detail", &api, None, &mut state, None, &selector)
+    let exit = handle_slash_command("/health detail", &api, None, &mut state, None)
         .await
         .unwrap();
     assert!(!exit);

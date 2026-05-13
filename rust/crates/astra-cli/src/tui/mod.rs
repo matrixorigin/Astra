@@ -537,7 +537,7 @@ pub(crate) async fn run_tui(
                                                 let token = crate::session_runtime::current_access_token(profile);
                                                 crate::slash_router::handle_slash_command(
                                                     &slash_text, api, profile, &mut state,
-                                                    token.as_deref(), &*startup.selector,
+                                                    token.as_deref(),
                                                 ).await
                                             }).await;
                                             match slash_result {
@@ -589,7 +589,7 @@ pub(crate) async fn run_tui(
                                     state.tui_stream_event_tx = Some(turn_tx);
 
                                     let turn_result = {
-                                        let ctx = crate::chat_turn::TurnContext { api, profile, selector: &*startup.selector };
+                                        let ctx = crate::chat_turn::TurnContext { api, profile };
                                         let token = crate::session_runtime::current_access_token(profile);
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
                                         let fut = crate::chat_turn::handle_chat_input_with_ui(text, token.as_deref(), &mut state, ctx, &mut tui_ui);
@@ -1170,7 +1170,6 @@ pub(crate) async fn run_tui(
                                                     profile,
                                                     &mut state,
                                                     tok.as_deref(),
-                                                    &*startup.selector,
                                                 )
                                                 .await
                                             })
@@ -1235,7 +1234,7 @@ pub(crate) async fn run_tui(
                                             let token = crate::session_runtime::current_access_token(profile);
                                             crate::slash_router::handle_slash_command(
                                                 &slash_text, api, profile, &mut state,
-                                                token.as_deref(), &*startup.selector,
+                                                token.as_deref(),
                                             ).await
                                         }).await;
                                         match slash_result {

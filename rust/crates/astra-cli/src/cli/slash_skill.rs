@@ -8,7 +8,7 @@ fn default_skill_category(category: Option<&str>) -> String {
         .to_string()
 }
 
-// ── Catalog surfacing (SkillSearchSettings → agent context; was /skill-search) ──
+// ── Legacy catalog surfacing (SkillSearchSettings → agent context; was /skill-search) ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SkillSurfacingCmd {
@@ -21,7 +21,7 @@ enum SkillSurfacingCmd {
 
 fn format_skill_surfacing_line(settings: &astra_core::SkillSearchSettings) -> String {
     format!(
-        "dynamic={}, min_catalog_size={}, surface_cap={}",
+        "dynamic={}, min_catalog_size={}, surface_cap={} (legacy; runtime surfaces the full catalog)",
         settings.dynamic_surface, settings.min_catalog_size, settings.surface_cap
     )
 }
@@ -201,7 +201,7 @@ pub(super) async fn handle_skill_command(
             eprintln!(
                 "    {}  {}",
                 "/skill surfacing …".magenta(),
-                "Agent catalog: dynamic/min/cap (discover_skills path)".dim()
+                "Legacy dynamic/min/cap settings (ignored by runtime)".dim()
             );
             eprintln!(
                 "    {}  {}",

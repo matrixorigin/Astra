@@ -131,12 +131,6 @@ pub struct TurnRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub selector_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selector_strategy: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selector_confidence: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_domain_hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entity_learn_skipped_no_domain: Option<bool>,
@@ -604,13 +598,6 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     duration_ms: ev.duration_ms,
                     ttft_ms: ev.ttft_ms,
                     context_ms: ev.context_ms,
-                    selector_ms: ev.selector_ms,
-                    selector_strategy: ev.selector_strategy.clone(),
-                    selector_confidence: if matches!(focus, DigestFocus::All) {
-                        ev.selector_confidence
-                    } else {
-                        None
-                    },
                     routing_domain_hint: if matches!(focus, DigestFocus::All) {
                         ev.routing_domain_hint.clone()
                     } else {

@@ -45,7 +45,7 @@ pub async fn run_extraction(
     _turn_number: usize,
     _current_tokens: usize,
     _current_memory: &str,
-    _selector_params: Option<&LlmConnParams>,
+    _memory_model_params: Option<&LlmConnParams>,
     _llm_timeout: Duration,
     _max_output_tokens: usize,
 ) -> ExtractionArtifacts {

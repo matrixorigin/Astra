@@ -65,21 +65,11 @@ test-group = "integration_e2e"
 filter = "test(/spawn_plan_executor_/)"
 test-group = "plan_executor_e2e"
 
-# Tests that need per-test MatrixOne databases (CREATE + DROP DATABASE)
-# serialise to avoid parallel DROP contention.
-[[profile.strict-online.overrides]]
-filter = """
-test(/selector_metric_e2e_trims_global_window_to_recent_rows/)
- or test(/persist_server_loop_hook_events_e2e_persists_selector_metric/)
-"""
-test-group = "db_scoped_trim"
-
 # Heavy online integration binaries share a 2-wide cap.
 [[profile.strict-online.overrides]]
 filter = """
 package(astra-plan) and binary(plan_repository_db_it)
  or package(astra-runtime) and binary(system_matrix_http_e2e)
- or package(astra-runtime) and binary(selector_metrics_db_e2e)
  or test(/migration_dedupe_removes_duplicate_attempt_tuples/)
 """
 test-group = "integration_e2e"

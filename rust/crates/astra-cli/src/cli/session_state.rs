@@ -155,8 +155,8 @@ pub(crate) struct SessionState {
     pub tool_health_entries: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     /// Last successfully synced tool health snapshot, used to compute deltas.
     pub synced_tool_health_entries: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
-    /// Cross-session quality tracker shared with the tool selector so REPL
-    /// save path can export cumulative per-tool selection/quality counters.
+    /// Cross-session tool quality tracker so the REPL save path can export
+    /// cumulative per-tool selection/quality counters.
     pub tool_quality_tracker:
         Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
     /// Plan-only chat (`/plan on`): normal REPL turns omit edge tools; model plans without executing.
@@ -291,9 +291,9 @@ pub(crate) struct SessionState {
     /// recorded this session to prevent double-recording.
     pub lesson_checkpointer: astra_runtime::lesson_checkpoint::LessonCheckpointer,
 
-    /// Resolved selector model connection parameters (cached at first use).
+    /// Resolved memory model connection parameters (cached at first use).
     /// Used for memory relevance filtering with the cheapest model from the registry.
-    pub selector_model_params: Option<astra_runtime::memory_relevance::LlmConnParams>,
+    pub memory_model_params: Option<astra_runtime::memory_relevance::LlmConnParams>,
     /// Background memory extraction agent.
     pub memory_extractor: super::memory_extraction::MemoryExtractor,
     /// Background session-memory.md extraction coordinator. Cloned
@@ -503,7 +503,7 @@ impl Default for SessionState {
             session_lessons: Vec::new(),
             session_lessons_loaded: false,
             lesson_checkpointer: astra_runtime::lesson_checkpoint::LessonCheckpointer::new(),
-            selector_model_params: None,
+            memory_model_params: None,
             memory_extractor: super::memory_extraction::MemoryExtractor::new(),
             session_memory_extractor: None,
             auto_invoke_handler: None,

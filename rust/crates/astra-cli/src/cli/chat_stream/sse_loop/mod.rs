@@ -341,9 +341,7 @@ pub(crate) async fn stream_chat_sse(
     let mcp_plugin_schemas = all_schemas.1.clone();
     let all_schemas = all_schemas.0;
     // Install MCP schemas on the edge executor so `tool_search(select:NAME)`
-    // can resolve plugin tools for deferred activation. Without this, the
-    // LLM sees MCP tools in `<deferred_tools>` but cannot pull their
-    // schemas.
+    // can resolve plugin tool schemas by name.
     executor.set_plugin_schemas(mcp_plugin_schemas);
     let mut registry = ToolRegistry::new(all_schemas.clone());
     // G3: when a DynamicAgentSpawner is wired, force-pin spawn_agent's
@@ -488,7 +486,6 @@ pub(crate) async fn stream_chat_sse(
         recent_tools: p.recent_tools,
         project_root: project_root.clone(),
         executor: std::sync::Arc::new(executor),
-        selector: p.selector,
         registry,
         all_schemas,
         file_context,
@@ -658,11 +655,6 @@ pub(crate) async fn stream_chat_sse(
             first_budget_pressure: 0.0,
             first_context_assembly_ms: None,
             first_memoria_ms: None,
-            first_selector_ms: None,
-            first_selector_strategy: None,
-            first_selector_confidence: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
             all_selected_skills: Vec::new(),
             initial_skill_selector_shortlist: None,
             observability_session: p.observability_session.clone(),
@@ -899,11 +891,6 @@ pub(crate) async fn stream_chat_sse(
         last_heavy_checkpoint: state.stall.last_heavy_checkpoint,
         ttft_ms: state.telemetry.first_ttft_ms,
         context_ms: state.telemetry.first_context_assembly_ms,
-        selector_strategy: state.telemetry.first_selector_strategy,
-        selector_ms: state.telemetry.first_selector_ms,
-        selector_confidence: state.telemetry.first_selector_confidence,
-        selector_tokens_in: state.telemetry.selector_tokens_in,
-        selector_tokens_out: state.telemetry.selector_tokens_out,
         memoria_ms: state.telemetry.first_memoria_ms,
         routing_domain_hint: None,
         entity_learn_skipped_no_domain: false,

@@ -988,7 +988,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use astra_runtime::plan_decompose;
-use astra_runtime::tool_selector::ToolSelector;
 use astra_services::session_journal;
 use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
@@ -1174,15 +1173,12 @@ pub(super) struct BackgroundPlanContext {
 /// Returns a [`PlanExecutorHandle`] for the REPL to poll for updates and
 /// send commands. The `TaskPlan` is moved into the spawned task and will
 /// be returned via `PlanUpdate::PlanCompleted` when execution finishes.
-pub(super) fn spawn_plan_executor(
-    ctx: BackgroundPlanContext,
-    selector: Box<dyn ToolSelector>,
-) -> PlanExecutorHandle {
+pub(super) fn spawn_plan_executor(ctx: BackgroundPlanContext) -> PlanExecutorHandle {
     let (handle, update_tx, cmd_rx) = create_plan_channels();
 
     tokio::spawn(async move {
         let mut ctx = ctx;
-        plan_executor_task(&mut ctx, selector, update_tx, cmd_rx).await;
+        plan_executor_task(&mut ctx, update_tx, cmd_rx).await;
         cleanup_plan_root_mailbox(&mut ctx).await;
     });
 
@@ -1216,7 +1212,6 @@ async fn cleanup_plan_root_mailbox(ctx: &mut BackgroundPlanContext) {
 /// `PlanUpdate::PlanError`.
 async fn plan_executor_task(
     ctx: &mut BackgroundPlanContext,
-    selector: Box<dyn ToolSelector>,
     update_tx: tokio::sync::mpsc::UnboundedSender<PlanUpdate>,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<PlanCommand>,
 ) {
@@ -1716,7 +1711,6 @@ async fn plan_executor_task(
                     perm_manager: &mut perm_manager,
                     verbose_mode: false,
                     render_policy: crate::stream_render::RenderPolicy::Silent,
-                    selector: &*selector,
                     recent_tools: &ctx.recent_tools,
                     tool_health_entries: &ctx.tool_health_entries,
                     session_lessons: &[],
@@ -1803,11 +1797,7 @@ async fn plan_executor_task(
                         .with_budget_pressure(result.budget_pressure)
                         .with_ttft(result.ttft_ms)
                         .with_context_time(result.context_ms)
-                        .with_selector_strategy(result.selector_strategy.clone())
-                        .with_selector_time(result.selector_ms)
-                        .with_selector_tokens(result.selector_tokens_in, result.selector_tokens_out)
-                        .with_selector_learning_telemetry(
-                            result.selector_confidence,
+                        .with_routing_telemetry(
                             result.routing_domain_hint.clone(),
                             result.entity_learn_skipped_no_domain,
                         )
@@ -2259,7 +2249,6 @@ async fn plan_executor_task(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_runtime::tool_selector::SelectionContext;
 
     fn test_background_plan_context() -> BackgroundPlanContext {
         let mut reg = astra_runtime::skills::UnifiedSkillRegistry::new();
@@ -2446,27 +2435,8 @@ mod tests {
         _assert_send::<BackgroundPlanContext>();
     }
 
-    #[tokio::test]
-    async fn background_selector_without_pipeline_modules_still_selects() {
-        let ctx = test_background_plan_context();
-        let selector = crate::session_runtime::create_background_plan_selector(&ctx);
-        let sel_ctx = SelectionContext {
-            query: "list files in current directory",
-            turn_count: 1,
-            recent_tools: &[],
-            budget_tokens: 800,
-            boost_terms: vec![],
-            budget_pressure: 0.0,
-            memory_domain_hints: vec![],
-            restricted_tools: vec![],
-            file_context: vec![],
-            outcome_bias: std::collections::HashMap::new(),
-            previous_confidence_fallback: None,
-        };
-        let res = selector.select(&sel_ctx).await;
-        assert!(!res.tool_names.is_empty());
-        assert!(!res.failed);
-    }
+    // Test `background_selector_without_pipeline_modules_still_selects` removed:
+    // tool selector has been deleted — tool schemas are sent in full each turn.
 
     #[test]
     fn turn_retry_counts_increments_correctly() {
@@ -2668,12 +2638,7 @@ mod tests {
             last_heavy_checkpoint: None,
             ttft_ms: None,
             context_ms: None,
-            selector_strategy: None,
-            selector_ms: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
             memoria_ms: None,
-            selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
@@ -3052,8 +3017,6 @@ All acceptance checks pass:
 
     #[tokio::test]
     async fn spawn_plan_executor_marks_browser_subtask_failed_in_real_turn_flow() {
-        use astra_runtime::tool_registry::ToolRegistry;
-        use astra_runtime::tool_selector::TfIdfSelector;
         use tokio::time::{Duration, Instant, sleep};
 
         let mock = super::super::mock_llm::MockLlmServer::start(
@@ -3076,10 +3039,7 @@ All acceptance checks pass:
             notes: None,
         };
 
-        let selector: Box<dyn astra_runtime::tool_selector::ToolSelector> = Box::new(
-            TfIdfSelector::new(ToolRegistry::new(crate::edge_tools::all_tool_schemas())),
-        );
-        let mut handle = spawn_plan_executor(ctx, selector);
+        let mut handle = spawn_plan_executor(ctx);
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut saw_browser_report = false;
@@ -3138,8 +3098,6 @@ All acceptance checks pass:
 
     #[tokio::test]
     async fn spawn_plan_executor_tags_real_turn_event_with_subtask_id() {
-        use astra_runtime::tool_registry::ToolRegistry;
-        use astra_runtime::tool_selector::TfIdfSelector;
         use tokio::time::{Duration, Instant, sleep};
 
         let mock = super::super::mock_llm::MockLlmServer::start(
@@ -3160,10 +3118,7 @@ All acceptance checks pass:
             notes: None,
         };
 
-        let selector: Box<dyn astra_runtime::tool_selector::ToolSelector> = Box::new(
-            TfIdfSelector::new(ToolRegistry::new(crate::edge_tools::all_tool_schemas())),
-        );
-        let mut handle = spawn_plan_executor(ctx, selector);
+        let mut handle = spawn_plan_executor(ctx);
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut saw_tagged_turn = false;
 
@@ -3199,8 +3154,6 @@ All acceptance checks pass:
 
     #[tokio::test]
     async fn spawn_plan_executor_tags_real_turn_error_event_with_subtask_id() {
-        use astra_runtime::tool_registry::ToolRegistry;
-        use astra_runtime::tool_selector::TfIdfSelector;
         use tokio::time::{Duration, Instant, sleep};
 
         let mock = super::super::mock_llm::MockLlmServer::start(
@@ -3221,10 +3174,7 @@ All acceptance checks pass:
             notes: None,
         };
 
-        let selector: Box<dyn astra_runtime::tool_selector::ToolSelector> = Box::new(
-            TfIdfSelector::new(ToolRegistry::new(crate::edge_tools::all_tool_schemas())),
-        );
-        let mut handle = spawn_plan_executor(ctx, selector);
+        let mut handle = spawn_plan_executor(ctx);
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut saw_tagged_turn_error = false;
 
@@ -3261,8 +3211,6 @@ All acceptance checks pass:
 
     #[tokio::test]
     async fn spawn_plan_executor_emits_compact_history_entries_between_subtasks() {
-        use astra_runtime::tool_registry::ToolRegistry;
-        use astra_runtime::tool_selector::TfIdfSelector;
         use tokio::time::{Duration, Instant, sleep};
 
         let mock = super::super::mock_llm::MockLlmServer::start(
@@ -3295,10 +3243,7 @@ All acceptance checks pass:
             notes: None,
         };
 
-        let selector: Box<dyn astra_runtime::tool_selector::ToolSelector> = Box::new(
-            TfIdfSelector::new(ToolRegistry::new(crate::edge_tools::all_tool_schemas())),
-        );
-        let mut handle = spawn_plan_executor(ctx, selector);
+        let mut handle = spawn_plan_executor(ctx);
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut compact_history: Option<(String, String)> = None;
 
@@ -3708,12 +3653,7 @@ All acceptance checks pass:
             last_heavy_checkpoint: None,
             ttft_ms: Some(1500),
             context_ms: Some(220),
-            selector_strategy: Some("tfidf".into()),
-            selector_ms: Some(18),
-            selector_tokens_in: 777,
-            selector_tokens_out: 33,
             memoria_ms: Some(12),
-            selector_confidence: Some(0.42),
             routing_domain_hint: Some("frontend".into()),
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
@@ -3745,11 +3685,7 @@ All acceptance checks pass:
         .with_budget_pressure(result.budget_pressure)
         .with_ttft(result.ttft_ms)
         .with_context_time(result.context_ms)
-        .with_selector_strategy(result.selector_strategy.clone())
-        .with_selector_time(result.selector_ms)
-        .with_selector_tokens(result.selector_tokens_in, result.selector_tokens_out)
-        .with_selector_learning_telemetry(
-            result.selector_confidence,
+        .with_routing_telemetry(
             result.routing_domain_hint.clone(),
             result.entity_learn_skipped_no_domain,
         )
@@ -3777,12 +3713,7 @@ All acceptance checks pass:
         assert_eq!(turn_evt.cache_read_tokens, Some(17));
         assert_eq!(turn_evt.cache_creation_tokens, Some(9));
         assert_eq!(turn_evt.context_ms, Some(220));
-        assert_eq!(turn_evt.selector_strategy.as_deref(), Some("tfidf"));
-        assert_eq!(turn_evt.selector_ms, Some(18));
-        assert_eq!(turn_evt.selector_tokens_in, Some(777));
-        assert_eq!(turn_evt.selector_tokens_out, Some(33));
         assert_eq!(turn_evt.memoria_ms, Some(12));
-        assert_eq!(turn_evt.selector_confidence, Some(0.42));
         assert_eq!(turn_evt.routing_domain_hint.as_deref(), Some("frontend"));
         assert_eq!(turn_evt.total_tool_ms, Some(30));
         assert_eq!(turn_evt.total_llm_ms, Some(1970));

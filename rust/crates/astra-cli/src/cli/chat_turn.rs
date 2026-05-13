@@ -9,7 +9,6 @@ use super::*;
 pub(super) struct TurnContext<'a> {
     pub(super) api: &'a astra_thin_client::ThinClient,
     pub(super) profile: Option<&'a str>,
-    pub(super) selector: &'a dyn tool_selector::ToolSelector,
 }
 
 /// Enqueue a journal event for async cloud ingestion (if matrix runtime is available).
@@ -260,15 +259,7 @@ pub(super) async fn handle_chat_input_with_ui(
         TurnAttempt::Completed(result) => match *result {
             Ok(result) => {
                 state.last_turn_interrupted = false;
-                apply_turn_success_async(
-                    state,
-                    ctx.selector,
-                    ctx.profile,
-                    &line,
-                    result,
-                    turn_start,
-                )
-                .await;
+                apply_turn_success_async(state, ctx.profile, &line, result, turn_start).await;
                 return Ok(());
             }
             Err(failure) => {
@@ -307,7 +298,6 @@ pub(super) async fn handle_chat_input_with_ui(
                             Ok(result) => {
                                 apply_turn_success_async(
                                     state,
-                                    ctx.selector,
                                     ctx.profile,
                                     &line,
                                     result,
@@ -358,7 +348,6 @@ pub(super) async fn handle_chat_input_with_ui(
                                     Ok(result) => {
                                         apply_turn_success_async(
                                             state,
-                                            ctx.selector,
                                             ctx.profile,
                                             &line,
                                             result,
@@ -599,7 +588,7 @@ async fn filter_lessons_by_relevance(
     matrix_runtime: Option<&std::sync::Arc<astra_runtime::MatrixCloudRuntime>>,
 ) -> Vec<astra_runtime::self_model::LessonHint> {
     let params = match matrix_runtime {
-        Some(rt) => rt.resolve_selector_model().await,
+        Some(rt) => rt.resolve_memory_model().await,
         None => None,
     };
     let Some(params) = params else {
@@ -899,10 +888,10 @@ async fn run_chat_turn(
     // Memoria is the single source of truth for lessons (Session Memory
     // Protocol L3). agent_lessons table is no longer used for bootstrap.
     if should_bootstrap_lessons(state) {
-        // Resolve selector model on first bootstrap (cached for future turns).
-        if state.selector_model_params.is_none() {
+        // Resolve memory model on first bootstrap (cached for future turns).
+        if state.memory_model_params.is_none() {
             if let Some(ref rt) = state.matrix_runtime {
-                state.selector_model_params = rt.resolve_selector_model().await;
+                state.memory_model_params = rt.resolve_memory_model().await;
             }
         }
 
@@ -957,7 +946,6 @@ async fn run_chat_turn(
             perm_manager: &mut state.perm_manager,
             verbose_mode: state.verbose_mode,
             render_policy: state.tui_render_policy.unwrap_or(crate::stream_render::RenderPolicy::Stream),
-            selector: ctx.selector,
             recent_tools: &state.recent_tools,
             tool_health_entries: &state.tool_health_entries,
             session_lessons: &state.session_lessons,
@@ -1221,11 +1209,7 @@ fn commit_turn_journal_workspace_and_sidecars(
         .with_plan_subtask(state.current_plan_subtask_id.as_deref())
         .with_ttft(result.ttft_ms)
         .with_context_time(result.context_ms)
-        .with_selector_strategy(result.selector_strategy.clone())
-        .with_selector_time(result.selector_ms)
-        .with_selector_tokens(result.selector_tokens_in, result.selector_tokens_out)
-        .with_selector_learning_telemetry(
-            result.selector_confidence,
+        .with_routing_telemetry(
             result.routing_domain_hint.clone(),
             result.entity_learn_skipped_no_domain,
         )
@@ -1652,26 +1636,7 @@ pub(super) fn analyze_chat_turn_learning(
     TurnLearningSnapshot { routing, eval }
 }
 
-fn record_selector_turn_outcome(
-    selector: &dyn tool_selector::ToolSelector,
-    line: &str,
-    result: &StreamResult,
-    snap: &TurnLearningSnapshot,
-    prev_assistant_text: Option<&str>,
-) {
-    let signal = astra_turn_types::detect_implicit_feedback_signal(line, prev_assistant_text);
-    let was_corrected = matches!(signal.signal_type.as_str(), "correction" | "frustration");
-    selector.record_outcome(
-        line,
-        &result.tools_used,
-        snap.routing.task_type,
-        snap.routing.domain_hint,
-        snap.eval.success,
-        snap.eval.quality,
-        was_corrected,
-        None,
-    );
-}
+// record_selector_turn_outcome removed — tool selector no longer exists.
 
 /// Test-only sync variant of `apply_turn_success`. Production code paths must
 /// use [`apply_turn_success_async`] so the LLM-driven skill-improvement path
@@ -1680,19 +1645,17 @@ fn record_selector_turn_outcome(
 #[cfg(test)]
 fn apply_turn_success(
     state: &mut SessionState,
-    selector: &dyn tool_selector::ToolSelector,
     profile: Option<&str>,
     line: &str,
     result: StreamResult,
     turn_start: Instant,
 ) {
-    apply_turn_success_sync(state, selector, profile, line, result, turn_start);
+    apply_turn_success_sync(state, profile, line, result, turn_start);
     check_skill_improvement_inner(state);
 }
 
 async fn apply_turn_success_async(
     state: &mut SessionState,
-    selector: &dyn tool_selector::ToolSelector,
     profile: Option<&str>,
     line: &str,
     mut result: StreamResult,
@@ -1700,7 +1663,7 @@ async fn apply_turn_success_async(
 ) {
     let final_messages = std::mem::take(&mut result.final_messages);
     let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
-    apply_turn_success_sync(state, selector, profile, line, result, turn_start);
+    apply_turn_success_sync(state, profile, line, result, turn_start);
 
     // Persist CSL via CslManager.
     let turn = state.turn;
@@ -1743,7 +1706,7 @@ async fn apply_turn_success_async(
             .memory_extractor
             .maybe_extract(super::memory_extraction::ExtractionContext {
                 turn: extraction_turn,
-                selector_params: state.selector_model_params.as_ref(),
+                memory_model_params: state.memory_model_params.as_ref(),
                 user_message: line,
                 assistant_response: state.last_response.as_deref().unwrap_or(""),
                 tools_used: &tools_used,
@@ -1756,7 +1719,7 @@ async fn apply_turn_success_async(
     // Started outcomes are journaled when drain() completes (session end).
     match &outcome {
         super::memory_extraction::ExtractionOutcome::SkippedMainWrote
-        | super::memory_extraction::ExtractionOutcome::SkippedNoSelector
+        | super::memory_extraction::ExtractionOutcome::SkippedNoModel
         | super::memory_extraction::ExtractionOutcome::SkippedBusy { .. }
         | super::memory_extraction::ExtractionOutcome::Error(_) => {
             // Use the centralized builder so variant-specific fields
@@ -1793,7 +1756,6 @@ async fn apply_turn_success_async(
 
 fn apply_turn_success_sync(
     state: &mut SessionState,
-    selector: &dyn tool_selector::ToolSelector,
     profile: Option<&str>,
     line: &str,
     result: StreamResult,
@@ -1888,15 +1850,6 @@ fn apply_turn_success_sync(
     result.set_repl_learning_journal_fields(routing_domain, entity_skipped);
 
     commit_turn_journal_workspace_and_sidecars(state, line, &result, &learning_snap, turn_start);
-    // Previous assistant response = second-to-last history entry (last is current turn,
-    // already pushed above). Used to detect if the user is correcting the prior response.
-    let prev_assistant_text = state
-        .history
-        .len()
-        .checked_sub(2)
-        .and_then(|i| state.history.get(i))
-        .map(|(_, resp)| resp.as_str());
-    record_selector_turn_outcome(selector, line, &result, &learning_snap, prev_assistant_text);
 
     // ── Post-turn status line ────────────────────────────────────────────
     print_turn_status_line(state, &result, turn_start);
@@ -4283,12 +4236,7 @@ mod tests {
             last_heavy_checkpoint: None,
             ttft_ms: None,
             context_ms: None,
-            selector_strategy: None,
-            selector_ms: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
             memoria_ms: None,
-            selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
@@ -4298,11 +4246,6 @@ mod tests {
             final_messages: Vec::new(),
             background_agent_results: Vec::new(),
         }
-    }
-
-    fn test_selector() -> tool_selector::TfIdfSelector {
-        let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
-        tool_selector::TfIdfSelector::new(registry)
     }
 
     fn tool_call_record(
@@ -4402,19 +4345,11 @@ mod tests {
     fn apply_turn_success_sets_prompt_hint_for_followup() {
         let (_tmp, _g) = isolated_sessions_dir();
 
-        let selector = test_selector();
         let mut state = SessionState::default();
         let mut result = stub_stream_result("Updated the code.");
         result.tools_used = vec!["str_replace".to_string()];
 
-        apply_turn_success(
-            &mut state,
-            &selector,
-            None,
-            "fix the bug",
-            result,
-            Instant::now(),
-        );
+        apply_turn_success(&mut state, None, "fix the bug", result, Instant::now());
 
         // The follow-up suggestion is exposed on `state` for the TUI
         // to render; the original assertion against the line-mode
@@ -4712,7 +4647,6 @@ mod tests {
     fn apply_turn_success_clears_stale_prompt_hint_when_suppressed() {
         let (_tmp, _g) = isolated_sessions_dir();
 
-        let selector = test_selector();
         let mut state = SessionState {
             plan_mode: Some(plan_decompose::PlanModeState::new(
                 "goal".to_string(),
@@ -4722,14 +4656,7 @@ mod tests {
         };
         let result = stub_stream_result("Plan updated.");
 
-        apply_turn_success(
-            &mut state,
-            &selector,
-            None,
-            "continue",
-            result,
-            Instant::now(),
-        );
+        apply_turn_success(&mut state, None, "continue", result, Instant::now());
 
         // Follow-up suggestion is suppressed in plan mode; the legacy
         // line-mode prompt hint check (`prompt_inline_hint`) is gone
@@ -6081,7 +6008,7 @@ mod tests {
     fn filter_lessons_resolves_via_matrix_runtime() {
         let source = include_str!("chat_turn.rs");
         assert!(
-            source.contains("resolve_selector_model"),
+            source.contains("resolve_memory_model"),
             "filter_lessons_by_relevance should resolve model from matrix_runtime"
         );
         assert!(
@@ -6091,11 +6018,11 @@ mod tests {
     }
 
     #[test]
-    fn selector_model_params_cached_in_session_state() {
+    fn memory_model_params_cached_in_session_state() {
         let state = SessionState::default();
         assert!(
-            state.selector_model_params.is_none(),
-            "selector_model_params should start as None"
+            state.memory_model_params.is_none(),
+            "memory_model_params should start as None"
         );
     }
 

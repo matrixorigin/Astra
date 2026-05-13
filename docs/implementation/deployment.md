@@ -25,7 +25,7 @@ astra-engine/
 │   ├── agent/              # ChatLoop, Planner (PAOR), AgentManager
 │   ├── events/             # EventLogger, SessionManager, causal chains
 │   ├── context/            # ContextManager, prompts, embeddings, scorer
-│   ├── skills/             # SkillRegistry, selector, auditable selector
+│   ├── skills/             # SkillRegistry and skill execution
 │   ├── llm/                # LLMClient, providers, router, rate limiter
 │   ├── sandbox/            # Sandbox (clone), Branch (diff/merge)
 │   ├── replay/             # TimeMachine, SemanticDiff (session replay via api/services/replay_service)
@@ -64,6 +64,18 @@ ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=8000 astra-server
 ```
 
 Features: structured JSON logging, JWT auth, rate limiting (60 req/min), health checks, Prometheus metrics.
+
+## Skill Selector Removal Rollout
+
+The Rust runtime no longer uses the legacy skill selector. Skills are surfaced
+through the full session-scoped `<available_skills>` catalog; `SkillSearchSettings`
+is retained only for API/config compatibility and is ignored by runtime
+surfacing.
+
+Before rollout, update dashboards and alerts that read selector telemetry. The
+runtime no longer writes `skill_selector_turn_metrics`; existing production
+tables should be retained or archived by deployment tooling if historical
+analysis is still required.
 
 ## Docker
 

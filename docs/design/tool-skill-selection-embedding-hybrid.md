@@ -1,6 +1,6 @@
 # Tool / Skill 选择：TF-IDF + Embedding 混合与可进化配置
 
-> **Status**: Planned — not implemented  
+> **Status**: Superseded — selector-based skill surfacing was removed; keep this only as historical design context.
 > **Last updated**: 2026-04-21
 
 ## 修订记录

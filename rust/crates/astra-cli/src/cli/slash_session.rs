@@ -1989,7 +1989,12 @@ pub(super) async fn handle_session_command(
                                 );
                             }
                             session_journal::JournalEventType::ConfidenceDiagnosisRecorded => {
-                                let conf = evt.selector_confidence.unwrap_or(0.0);
+                                let conf = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("confidence"))
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0);
                                 let tier = evt
                                     .metadata
                                     .as_ref()
@@ -4119,26 +4124,6 @@ fn handle_session_analyze(arg: &str, state: &SessionState) {
         "avg turn latency:".dim(),
         avg_turn_ms as f64 / 1000.0,
     );
-
-    // Tool selection strategy distribution
-    let mut strategy_counts: std::collections::HashMap<String, u32> =
-        std::collections::HashMap::new();
-    for evt in &turns {
-        if let Some(ref strat) = evt.selector_strategy {
-            *strategy_counts.entry(strat.clone()).or_insert(0) += 1;
-        }
-    }
-    if !strategy_counts.is_empty() {
-        let strat_parts: Vec<String> = strategy_counts
-            .iter()
-            .map(|(s, c)| format!("{s}×{c}"))
-            .collect();
-        eprintln!(
-            "  {:<24} {}",
-            "tool selection:".dim(),
-            strat_parts.join(", "),
-        );
-    }
 
     // Budget pressure distribution
     let pressures: Vec<f64> = turns.iter().filter_map(|e| e.budget_pressure).collect();

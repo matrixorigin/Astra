@@ -1012,8 +1012,6 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
         "duration_ms": 987,
         "ttft_ms": 42,
         "context_ms": 18,
-        "selector_ms": 7,
-        "selector_strategy": "ranked",
         "budget_pressure": 0.25,
         "tool_calls": [
             {"name": "bash", "ok": true, "ms": 123}
@@ -1096,8 +1094,6 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
     assert_eq!(detail.duration_ms, 987);
     assert_eq!(detail.ttft_ms, Some(42));
     assert_eq!(detail.context_ms, Some(18));
-    assert_eq!(detail.selector_ms, Some(7));
-    assert_eq!(detail.selector_strategy.as_deref(), Some("ranked"));
     assert_eq!(detail.budget_pressure, Some(0.25));
     assert_eq!(
         detail.tools_selected,
