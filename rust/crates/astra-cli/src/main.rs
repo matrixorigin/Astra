@@ -225,6 +225,8 @@ mod tool_safety_guard;
 mod tui;
 #[path = "cli/ui_adapter.rs"]
 mod ui_adapter;
+#[path = "cli/workspace_trust.rs"]
+mod workspace_trust;
 
 use agent_runtime::initialize_multi_agent_runtime;
 use astra_turn_core::chat_turn_heuristics::{
