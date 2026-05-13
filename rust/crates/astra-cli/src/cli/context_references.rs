@@ -625,7 +625,14 @@ fn resolve_path(target: &str, cwd: &Path) -> Result<PathBuf, String> {
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        cwd.join(path)
+        // Anchor relative references to the canonical working directory when
+        // possible. On macOS, temp/workspace paths often enter through
+        // `/var/...` while `canonicalize()` reports `/private/var/...`; using
+        // the canonical root here keeps later containment checks stable for
+        // non-existent files without weakening the traversal guard.
+        cwd.canonicalize()
+            .unwrap_or_else(|_| lexical_normalize(cwd))
+            .join(path)
     };
     Ok(lexical_normalize(&joined))
 }

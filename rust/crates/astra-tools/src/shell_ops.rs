@@ -1646,6 +1646,10 @@ fn normalize_search_ignore_pattern(pattern: &str) -> Result<String, String> {
 }
 
 fn should_ignore_search_path(path: &str, rules: &[SearchIgnoreRule]) -> bool {
+    if is_default_search_excluded_path(path) {
+        return true;
+    }
+
     let mut ignored = false;
     for rule in rules {
         if glob_matches_path(&rule.pattern, path) {
@@ -1653,6 +1657,11 @@ fn should_ignore_search_path(path: &str, rules: &[SearchIgnoreRule]) -> bool {
         }
     }
     ignored
+}
+
+fn is_default_search_excluded_path(path: &str) -> bool {
+    path.split('/')
+        .any(|component| DEFAULT_SEARCH_EXCLUDE_DIRS.contains(&component))
 }
 
 async fn load_gitignored_search_paths(

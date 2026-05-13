@@ -3241,6 +3241,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             "event_type": "run_finished",
                             "data": {"total_prompt_tokens": 0, "total_completion_tokens": 0}
                         }));
+                        run.live_tx = None;
                     }
                     // Clean up channels for this run.
                     bg_approval_channels.lock().await.remove(&bg_run_id);
@@ -3293,11 +3294,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if run.status == RunStatus::Cancelled {
                     persist_terminal_state = false;
                     merge_cancelled_run_events(run, events);
+                    if final_status != RunStatus::Waiting {
+                        run.live_tx = None;
+                    }
                     flush_turn_observability(&mut loop_state, &bg_session_id, true);
                 } else {
                     run.events.extend(events);
                     if run.status.try_transition(&final_status).is_ok() {
                         run.status = final_status;
+                    }
+                    if run.status != RunStatus::Waiting {
+                        run.live_tx = None;
                     }
                 }
             }
@@ -3630,11 +3637,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if run.status == RunStatus::Cancelled {
                     persist_terminal_state = false;
                     merge_cancelled_run_events(run, all_events);
+                    if final_status != RunStatus::Waiting {
+                        run.live_tx = None;
+                    }
                     flush_turn_observability(&mut state, &bg_session_id, true);
                 } else {
                     run.events.extend(all_events);
                     if run.status.try_transition(&final_status).is_ok() {
                         run.status = final_status.clone();
+                    }
+                    if run.status != RunStatus::Waiting {
+                        run.live_tx = None;
                     }
                     flush_turn_observability(&mut state, &bg_session_id, false);
                 }
