@@ -91,13 +91,10 @@ fn display_sync_status_no_crash_full_data() {
 #[tokio::test]
 async fn slash_health_offline_shows_cloud_section() {
     let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-        edge_tools::all_tool_schemas(),
-    ));
-    let mut state = ReplState::default();
+    let mut state = SessionState::default();
     // No matrix runtime — should show "Offline" in cloud section
     assert!(state.matrix_runtime.is_none());
-    let exit = handle_slash_command("/health", &api, None, &mut state, None, &selector)
+    let exit = handle_slash_command("/health", &api, None, &mut state, None)
         .await
         .unwrap();
     assert!(!exit);
@@ -147,7 +144,7 @@ fn should_append_cloud_pull_journal_post_login_reachable_empty() {
 
 #[serial_test::serial]
 #[test]
-fn should_append_cloud_pull_journal_repl_startup_empty_without_env() {
+fn should_append_cloud_pull_journal_session_startup_empty_without_env() {
     unsafe {
         std::env::remove_var(super::ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
     }
@@ -157,13 +154,13 @@ fn should_append_cloud_pull_journal_repl_startup_empty_without_env() {
     assert!(!should_append_cloud_pull_journal(
         &pull,
         &[],
-        "repl_startup"
+        "session_startup"
     ));
 }
 
 #[serial_test::serial]
 #[test]
-fn should_append_repl_startup_when_empty_ack_env_set() {
+fn should_append_session_startup_when_empty_ack_env_set() {
     let pull = CloudPullResult {
         cloud_reachable: true,
     };
@@ -173,12 +170,16 @@ fn should_append_repl_startup_when_empty_ack_env_set() {
     assert!(!should_append_cloud_pull_journal(
         &pull,
         &[],
-        "repl_startup"
+        "session_startup"
     ));
     unsafe {
         std::env::set_var(super::ASTRA_JOURNAL_CLOUD_EMPTY_ACK, "1");
     }
-    assert!(should_append_cloud_pull_journal(&pull, &[], "repl_startup"));
+    assert!(should_append_cloud_pull_journal(
+        &pull,
+        &[],
+        "session_startup"
+    ));
     unsafe {
         std::env::remove_var(super::ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
     }
@@ -189,14 +190,14 @@ fn append_cloud_pull_sync_journal_skips_without_session_id() {
     let pull = CloudPullResult {
         cloud_reachable: true,
     };
-    let state = ReplState::default();
-    append_cloud_pull_sync_journal(&state, "default", "repl_startup", &pull, &[]);
+    let state = SessionState::default();
+    append_cloud_pull_sync_journal(&state, "default", "session_startup", &pull, &[]);
 }
 
 #[test]
 fn append_cloud_pull_sync_journal_writes_sync_marker_jsonl() {
     let sid = format!("test-cloud-pull-journal-{}", uuid::Uuid::new_v4());
-    let state = ReplState {
+    let state = SessionState {
         session_id: Some(sid.clone()),
         ..Default::default()
     };
@@ -204,7 +205,7 @@ fn append_cloud_pull_sync_journal_writes_sync_marker_jsonl() {
         cloud_reachable: true,
     };
     let prefs = vec!["explain_mode".to_string()];
-    append_cloud_pull_sync_journal(&state, "work", "repl_startup", &pull, &prefs);
+    append_cloud_pull_sync_journal(&state, "work", "session_startup", &pull, &prefs);
     let events = session_journal::read_journal(&sid).expect("read journal");
     assert_eq!(events.len(), 1);
     assert_eq!(
@@ -227,7 +228,7 @@ fn append_cloud_pull_sync_journal_writes_sync_marker_jsonl() {
 #[test]
 fn append_cloud_pull_post_login_reachable_empty_writes_marker() {
     let sid = format!("test-cloud-pull-empty-{}", uuid::Uuid::new_v4());
-    let state = ReplState {
+    let state = SessionState {
         session_id: Some(sid.clone()),
         ..Default::default()
     };
@@ -266,7 +267,7 @@ async fn try_cloud_pull_preferences_is_noop_without_matrixone() {
     unsafe {
         std::env::remove_var("MATRIXONE_HOST");
     }
-    let mut state = ReplState::default();
+    let mut state = SessionState::default();
     // Should not panic (was the original bug)
     let keys = try_cloud_pull_preferences(&mut state).await;
     assert!(keys.is_empty());
@@ -277,7 +278,7 @@ async fn try_cloud_push_preferences_is_noop_without_matrixone() {
     unsafe {
         std::env::remove_var("MATRIXONE_HOST");
     }
-    let state = ReplState::default();
+    let state = SessionState::default();
     // Should not panic (was the original bug)
     try_cloud_push_preferences(&state).await;
 }

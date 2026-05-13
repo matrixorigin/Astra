@@ -1018,12 +1018,12 @@ fn permission_mode_roundtrip_parse() {
 }
 
 #[test]
-fn repl_state_auto_approve_env_activates_auto_mode() {
-    // When ASTRA_CLI_AUTO_APPROVE=1, ReplState should start in Auto mode
+fn session_state_auto_approve_env_activates_auto_mode() {
+    // When ASTRA_CLI_AUTO_APPROVE=1, SessionState should start in Auto mode
     unsafe {
         std::env::set_var("ASTRA_CLI_AUTO_APPROVE", "1");
     }
-    let state = ReplState::default();
+    let state = SessionState::default();
     unsafe {
         std::env::remove_var("ASTRA_CLI_AUTO_APPROVE");
     }
@@ -1283,10 +1283,10 @@ fn format_project_instructions_wraps_in_tags() {
 
 #[test]
 fn build_effective_line_includes_project_instructions() {
-    let mut state = ReplState::default();
+    let mut state = SessionState::default();
     state.project_instructions = Some("Always use Rust.".to_string());
     let result =
-        repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+        chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
     assert!(
         result.contains("<project_instructions>"),
         "should wrap in tags"
@@ -1300,9 +1300,9 @@ fn build_effective_line_includes_project_instructions() {
 
 #[test]
 fn build_effective_line_no_instructions_when_none() {
-    let state = ReplState::default();
+    let state = SessionState::default();
     let result =
-        repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+        chat_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
     assert!(
         !result.contains("<project_instructions>"),
         "should not inject when None"

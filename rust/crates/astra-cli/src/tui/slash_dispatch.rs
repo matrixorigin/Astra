@@ -6,9 +6,9 @@
 //! fall back to `with_restored()` which temporarily exits the TUI.
 
 use crate::command_registry;
-use crate::repl_state::ReplState;
-use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
+use crate::session_state::SessionState;
 use crate::tui::bottom_pane::BottomPane;
+use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
 use crate::tui::history_cell::system::SystemCell;
 use crate::tui::terminal::TerminalGuard;
 
@@ -22,7 +22,7 @@ pub(crate) enum SlashResult {
 pub(crate) struct DispatchContext<'a> {
     pub api: &'a astra_thin_client::ThinClient,
     pub profile: Option<&'a str>,
-    pub state: &'a mut ReplState,
+    pub state: &'a mut SessionState,
     pub guard: &'a mut TerminalGuard,
     pub bottom_pane: &'a mut BottomPane,
     pub chat_widget: &'a mut crate::tui::chat_widget::ChatWidget,
@@ -339,7 +339,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 })
                 .collect();
 
-            // Build the Session / Budget summary from ReplState.
+            // Build the Session / Budget summary from SessionState.
             // All fields are cheap reads — no I/O, no extra locks.
             snap.session = Some(SessionSummary {
                 session_id: ctx.state.session_id.clone().unwrap_or_default(),
@@ -481,7 +481,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         // ── Worktrees (TUI-native) ──────────────────────────────────
         "/worktrees" => {
             use crate::tui::bottom_pane::worktrees_view::WorktreesView;
-            use crate::tui::worktrees::{parse, WorktreeList};
+            use crate::tui::worktrees::{WorktreeList, parse};
 
             // `git worktree list --porcelain` on a blocking thread.
             let porcelain = tokio::task::spawn_blocking(|| {
@@ -818,7 +818,7 @@ pub(crate) fn looks_like_session_id(s: &str) -> bool {
 /// Handle a ViewCompleted result from a BottomPaneView.
 pub(crate) fn handle_view_result(
     name: &str,
-    state: &mut ReplState,
+    state: &mut SessionState,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
 ) {
@@ -950,7 +950,7 @@ pub(crate) fn handle_view_result(
     chat_widget.commit_system(SystemCell::response(format!("Set model to {name}")));
 }
 
-fn show_stats_view(sub: &str, state: &ReplState, bottom_pane: &mut BottomPane) {
+fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane) {
     use crate::tui::bottom_pane::info_view::InfoView;
     use astra_services::{session_analytics, session_journal};
 
@@ -1285,7 +1285,7 @@ pub(crate) const MODEL_THINKING_SENTINEL: &str = "__model_thinking__\n";
 /// outer loop then checks the model's `thinking_capability` and
 /// either commits or pushes a thinking-mode picker.
 async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
-    let token = crate::repl_runtime::current_access_token(ctx.profile);
+    let token = crate::session_runtime::current_access_token(ctx.profile);
     match crate::slash_router::fetch_model_list(ctx.api, token.as_deref()).await {
         Ok(models) => {
             // Strip any `-thinking:*` suffix from the cached model
@@ -2189,7 +2189,7 @@ mod context_history_tests {
 mod view_result_tests {
     use super::handle_view_result;
     use crate::permission_manager::PermissionMode;
-    use crate::repl_state::ReplState;
+    use crate::session_state::SessionState;
     use crate::tui::bottom_pane::BottomPane;
     use crate::tui::chat_widget::ChatWidget;
     use crate::tui::history_cell::system::SystemCell;
@@ -2204,7 +2204,7 @@ mod view_result_tests {
 
     #[test]
     fn session_picker_result_is_reserved_for_outer_resume_pipeline() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
@@ -2222,7 +2222,7 @@ mod view_result_tests {
 
     #[test]
     fn permission_selection_updates_state_and_commits_feedback() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
@@ -2237,7 +2237,7 @@ mod view_result_tests {
 
     #[test]
     fn slash_command_selection_returns_command_to_composer() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
@@ -2252,7 +2252,7 @@ mod view_result_tests {
 
     #[test]
     fn model_selection_updates_footer_and_commits_feedback() {
-        let mut state = ReplState::default();
+        let mut state = SessionState::default();
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 

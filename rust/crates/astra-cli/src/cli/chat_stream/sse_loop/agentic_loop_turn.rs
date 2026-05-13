@@ -16,13 +16,10 @@ use astra_runtime::{
     pipeline::step_recorder::StepRecorder,
     prompts,
     tool_registry::{self, ToolRegistry},
-    tool_selector::{self, ToolSelector},
     turn::agentic_loop_host::{TurnInteractionMode, TurnInteractionPolicy},
     turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools,
     turn::agentic_turn_telemetry::{
-        accumulate_selector_token_usage, capture_first_selection_report_if_empty,
-        record_first_latency_ms_since, record_first_selector_confidence,
-        record_first_selector_latency_and_strategy,
+        capture_first_selection_report_if_empty, record_first_latency_ms_since,
     },
     turn::boost_domain_hints::{domain_hints_debug_strings, domain_hints_from_boost_terms},
     turn::chat_turn_api_error::{
@@ -38,7 +35,6 @@ use astra_runtime::{
         ChatTurnBasePayloadInput, chat_turn_base_payload, merge_active_skills_into_edge_profile,
         set_payload_tool_results_if_non_empty,
     },
-    turn::chat_turn_selection_context::build_agentic_tool_selection_context,
     turn::chat_turn_step_plan::record_agentic_step_plan_after_payload_prep,
     turn::prepare_turn_explain_text::explain_stderr_payload_line_pair,
     turn::tool_schema_prune::pin_invoked_tool_schemas,
@@ -232,11 +228,6 @@ fn retained_turn_role_priority(role: &str) -> u8 {
 /// First-turn / cross-turn counters updated while building the payload.
 pub(crate) struct PrepareTurnTelemetry<'a> {
     pub first_memoria_ms: &'a mut Option<u64>,
-    pub first_selector_ms: &'a mut Option<u64>,
-    pub first_selector_strategy: &'a mut Option<String>,
-    pub first_selector_confidence: &'a mut Option<f64>,
-    pub selector_tokens_in: &'a mut u64,
-    pub selector_tokens_out: &'a mut u64,
     pub first_selection_report: &'a mut Option<tool_registry::SelectionReport>,
     pub first_budget_pressure: &'a mut f64,
     pub first_context_assembly_ms: &'a mut Option<u64>,
@@ -257,7 +248,7 @@ struct PrepareChatTurnRequest<'a> {
     history: &'a [(String, String)],
     recent_tools: &'a [String],
     executor: Arc<ToolExecutor>,
-    selector: &'a dyn tool_selector::ToolSelector,
+
     registry: &'a tool_registry::ToolRegistry,
     tool_results: &'a [Value],
     all_schemas: &'a [Value],
@@ -360,9 +351,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     // Route skill listing through edge_profile → bridge volatile lane, so
     // it lands in RuntimeVolatile (post-cache-marker) rather than becoming a
     // leading role:system message that breaks the prefix cache on
-    // prefix-only providers (DeepSeek, GLM, Qwen). The skill selector
-    // re-ranks each turn, so the content changes — it must not live in the
-    // system prefix or it invalidates the cache every turn.
+    // prefix-only providers (DeepSeek, GLM, Qwen).
     if let Some(prefix) = ctx.ephemeral_prefix {
         if let Some(content) = prefix.get("content").and_then(serde_json::Value::as_str)
             && !content.is_empty()
@@ -399,7 +388,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Recalling memory…");
 
     let budget_pressure = {
-        let schema_tokens = ctx.selector.registry().total_pinned_token_cost();
+        let schema_tokens = ctx.registry.total_pinned_token_cost();
         budget_pressure_for_chat_turn(ctx.messages, ctx.model, schema_tokens as usize)
     };
 
@@ -470,12 +459,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     let memory_domain_hints = domain_hints_from_boost_terms(&boost_terms);
     merge_deprioritized_tools_into_restricted(ctx.turn_guard, ctx.restricted_tools);
-    let restricted_vec: Vec<String> = ctx.restricted_tools.iter().cloned().collect();
-    // Per-tool selector bias derived from recent outcome memory. Bounded ±0.10
-    // in the scoring pipeline so it nudges ties without overriding strong text
-    // signals (hard exclusions remain in `restricted_vec`). 3600s window keeps
-    // bias responsive within a session but lets stale evidence age out.
-    let outcome_bias = ctx.turn_guard.health.outcome_bias_by_tool(3600);
+    let _restricted_vec: Vec<String> = ctx.restricted_tools.iter().cloned().collect();
+    // Per-tool outcome bias derived from recent memory. Bounded by the scoring
+    // pipeline so it nudges ties without overriding strong text signals (hard
+    // exclusions remain in `restricted_vec`). 3600s window keeps bias
+    // responsive within a session but lets stale evidence age out.
+    let _outcome_bias = ctx.turn_guard.health.outcome_bias_by_tool(3600);
 
     ctx.step_recorder.record_perceive(
         semantic_query_str,
@@ -497,122 +486,33 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         _selection_tokens_in,
         _selection_tokens_out,
         selection_latency_ms,
-    ) = if ctx.tool_results.is_empty() {
+    ) = {
         let sel_start = Instant::now();
-        touch_prep_ui_phase(&ctx.prep_ui_phase, "Scanning context…");
-        let sel_ctx = build_agentic_tool_selection_context(
-            semantic_query_str,
-            ctx.history.len(),
-            ctx.recent_tools,
-            ctx.registry,
-            boost_terms.clone(),
-            budget_pressure,
-            memory_domain_hints.clone(),
-            restricted_vec.clone(),
-            ctx.file_context.to_vec(),
-            outcome_bias.clone(),
-            false,
-            ctx.tool_budget_override,
-            ctx.previous_confidence_fallback.clone(),
-        );
-        touch_prep_ui_phase(&ctx.prep_ui_phase, "Thinking…");
-        let sel_result = ctx.selector.select(&sel_ctx).await;
-        let sel_latency_ms = sel_start.elapsed().as_millis() as u64;
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Loading schemas…");
-        record_first_selector_latency_and_strategy(
-            ctx.telem.first_selector_ms,
-            ctx.telem.first_selector_strategy,
-            sel_start,
-            sel_result.strategy,
-            sel_result.confidence,
+        let budget = ctx
+            .tool_budget_override
+            .unwrap_or(ctx.registry.default_budget());
+        let (mut schemas, mut report) = ctx.registry.select_with_report_ctx(
+            semantic_query_str,
+            ctx.history.len() as u32,
+            budget,
+            ctx.recent_tools,
         );
-        record_first_selector_confidence(
-            ctx.telem.first_selector_confidence,
-            sel_result.confidence,
-        );
-        accumulate_selector_token_usage(
-            ctx.telem.selector_tokens_in,
-            ctx.telem.selector_tokens_out,
-            sel_result.selector_tokens_in,
-            sel_result.selector_tokens_out,
-        );
-
-        let conf = sel_result.confidence;
-        // Phase-8: honour `runtime.tool_surface.pinned_tools` from the user's
-        // TOML so `tools[]` reflects their config rather than baked defaults.
-        let surface_cfg = astra_config::runtime_config::RuntimeConfig::cached()
-            .tool_surface
-            .clone();
-        let (schemas, report) = tool_selector::resolve_schemas_with_surface(
-            ctx.registry,
-            &sel_result.tool_names,
-            budget_pressure,
-            &surface_cfg,
-        );
+        if !ctx.tool_results.is_empty() {
+            pin_invoked_tool_schemas(&mut schemas, &mut report, ctx.tool_results, ctx.all_schemas);
+        }
+        let sel_latency_ms = sel_start.elapsed().as_millis() as u64;
         (
             schemas,
             report,
-            conf,
-            sel_result.strategy.to_string(),
-            sel_result.selector_tokens_in,
-            sel_result.selector_tokens_out,
-            sel_latency_ms,
-        )
-    } else {
-        touch_prep_ui_phase(&ctx.prep_ui_phase, "Continuing…");
-        let sel_ctx = build_agentic_tool_selection_context(
-            semantic_query_str,
-            ctx.history.len(),
-            ctx.recent_tools,
-            ctx.registry,
-            boost_terms,
-            budget_pressure,
-            memory_domain_hints,
-            restricted_vec,
-            ctx.file_context.to_vec(),
-            outcome_bias,
-            true,
-            ctx.tool_budget_override,
-            ctx.previous_confidence_fallback.clone(),
-        );
-        touch_prep_ui_phase(&ctx.prep_ui_phase, "Thinking…");
-        let sel_start = Instant::now();
-        let sel_result = ctx.selector.select(&sel_ctx).await;
-        let sel_latency_ms = sel_start.elapsed().as_millis() as u64;
-        touch_prep_ui_phase(&ctx.prep_ui_phase, "Loading schemas…");
-        accumulate_selector_token_usage(
-            ctx.telem.selector_tokens_in,
-            ctx.telem.selector_tokens_out,
-            sel_result.selector_tokens_in,
-            sel_result.selector_tokens_out,
-        );
-        let conf = sel_result.confidence;
-        let surface_cfg = astra_config::runtime_config::RuntimeConfig::cached()
-            .tool_surface
-            .clone();
-        let (mut selected, mut report) = tool_selector::resolve_schemas_with_surface(
-            ctx.registry,
-            &sel_result.tool_names,
-            budget_pressure,
-            &surface_cfg,
-        );
-        pin_invoked_tool_schemas(
-            &mut selected,
-            &mut report,
-            ctx.tool_results,
-            ctx.all_schemas,
-        );
-        (
-            selected,
-            report,
-            conf,
-            sel_result.strategy.to_string(),
-            sel_result.selector_tokens_in,
-            sel_result.selector_tokens_out,
+            0.0_f64,
+            "registry".to_string(),
+            0u64,
+            0u64,
             sel_latency_ms,
         )
     };
-    log_chat_turn_timing_phase(timing, "tool_selector_resolve_schemas", &mut mark);
+    log_chat_turn_timing_phase(timing, "registry_select_schemas", &mut mark);
 
     // Force-inject any skill allowed_tools that the selector missed.
     let mut turn_schemas = turn_schemas;
@@ -976,7 +876,6 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub recent_tools: &'a [String],
     pub project_root: &'a Path,
     pub executor: Arc<ToolExecutor>,
-    pub selector: &'a dyn ToolSelector,
     pub registry: &'a ToolRegistry,
     pub messages: &'a [Value],
     /// Ephemeral system message prepended to messages for this turn only
@@ -1129,7 +1028,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         recent_tools,
         project_root,
         executor,
-        selector,
         registry,
         messages,
         ephemeral_prefix,
@@ -1191,7 +1089,6 @@ pub(crate) async fn fetch_chat_turn_sse(
             history,
             recent_tools,
             executor: Arc::clone(&executor),
-            selector,
             registry,
             tool_results,
             all_schemas,

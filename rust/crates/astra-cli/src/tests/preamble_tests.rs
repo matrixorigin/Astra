@@ -139,65 +139,26 @@ fn assistant_tc_msg_omits_reasoning_content_when_empty() {
     );
 }
 
-#[test]
-fn truncate_skill_desc_for_completion_empty() {
-    assert_eq!(truncate_skill_desc_for_completion(""), "");
-}
-
-#[test]
-fn truncate_skill_desc_for_completion_short_unchanged() {
-    let s = "Short skill blurb";
-    assert_eq!(truncate_skill_desc_for_completion(s), s);
-}
-
-#[test]
-fn truncate_skill_desc_for_completion_exact_limit_no_ellipsis() {
-    let s: String = (0..39).map(|_| 'a').collect();
-    assert_eq!(truncate_skill_desc_for_completion(&s), s);
-}
-
-#[test]
-fn truncate_skill_desc_for_completion_ascii_long_gets_ellipsis() {
-    let s: String = (0..45).map(|_| 'b').collect();
-    let out = truncate_skill_desc_for_completion(&s);
-    assert!(out.ends_with('…'), "out={out:?}");
-    assert_eq!(out.chars().count(), 40);
-    let head: String = s.chars().take(39).collect();
-    assert!(out.starts_with(&head));
-}
-
-/// Regression: byte index 39 was inside U+2014 EM DASH (3 bytes) — must not slice by bytes.
-#[test]
-fn truncate_skill_desc_for_completion_em_dash_no_panic() {
-    let s = "Review and manage persistent memories — promote, clean up, and organize knowledge across sessions";
-    let expect: String = s.chars().take(39).collect();
-    let out = truncate_skill_desc_for_completion(s);
-    assert_eq!(out, format!("{expect}…"));
-}
-
-#[test]
-fn truncate_skill_desc_for_completion_cjk_no_panic() {
-    let s = "数据".repeat(30);
-    let out = truncate_skill_desc_for_completion(&s);
-    assert!(out.ends_with('…'));
-    assert_eq!(out.chars().count(), 40);
-}
+// `truncate_skill_desc_for_completion` lived inside the deleted
+// `dynamic_completions` module (rustyline-only completion shortening
+// for the line-mode REPL). The TUI uses its own slash-menu rendering
+// and does not need the helper.
 
 #[test]
 fn resolve_unique_prefix_command() {
-    let resolved = resolve_slash_command("/mo").expect("/mo should resolve to /model");
+    let resolved = command_registry::resolve_command("/mo").expect("/mo should resolve to /model");
     assert_eq!(resolved, "/model");
 }
 
 #[test]
 fn resolve_review_command() {
-    let resolved = resolve_slash_command("/review").expect("/review should resolve");
+    let resolved = command_registry::resolve_command("/review").expect("/review should resolve");
     assert_eq!(resolved, "/review");
 }
 
 #[test]
 fn resolve_journal_target_session_uses_active_session_without_argument() {
-    let state = ReplState {
+    let state = SessionState {
         session_id: Some("sess-123".to_string()),
         ..Default::default()
     };
@@ -211,25 +172,22 @@ fn resolve_journal_target_session_uses_active_session_without_argument() {
 async fn slash_explain_toggles_state() {
     let api =
         astra_thin_client::ThinClient::new("http://127.0.0.1:8000", None).expect("test API URL");
-    let mut state = ReplState::default();
-    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
-        edge_tools::all_tool_schemas(),
-    ));
+    let mut state = SessionState::default();
     assert_eq!(state.explain, ExplainMode::Off);
 
-    let should_exit = handle_slash_command("/explain", &api, None, &mut state, None, &selector)
+    let should_exit = handle_slash_command("/explain", &api, None, &mut state, None)
         .await
         .expect("slash command should succeed");
     assert!(!should_exit);
     assert_eq!(state.explain, ExplainMode::On);
 
-    let should_exit = handle_slash_command("/explain", &api, None, &mut state, None, &selector)
+    let should_exit = handle_slash_command("/explain", &api, None, &mut state, None)
         .await
         .expect("slash command should succeed");
     assert!(!should_exit);
     assert_eq!(state.explain, ExplainMode::Verbose);
 
-    let should_exit = handle_slash_command("/explain", &api, None, &mut state, None, &selector)
+    let should_exit = handle_slash_command("/explain", &api, None, &mut state, None)
         .await
         .expect("slash command should succeed");
     assert!(!should_exit);
@@ -257,7 +215,7 @@ fn quiet_dispatch_captures_text_without_output() {
 async fn initialize_multi_agent_runtime_wires_spawner_and_engine() {
     let api =
         astra_thin_client::ThinClient::new("http://127.0.0.1:8000", None).expect("test API URL");
-    let mut state = ReplState::default();
+    let mut state = SessionState::default();
 
     initialize_multi_agent_runtime(&mut state, &api, "fake-token".to_string()).await;
 
@@ -305,13 +263,13 @@ fn compacted_history_skips_empty_user_messages() {
 #[test]
 fn compact_assistant_message_optional_session_memory_anchor() {
     let with_anchor =
-        repl_turn::compact_assistant_message(3, "Summary body", Some("- [fact] one\n- [fact] two"));
+        chat_turn::compact_assistant_message(3, "Summary body", Some("- [fact] one\n- [fact] two"));
     assert!(with_anchor.contains("[Session memory anchor]"));
     assert!(with_anchor.contains("[fact] one"));
     assert!(with_anchor.contains("[Prior context — 3 turns compacted]"));
     assert!(with_anchor.contains("Summary body"));
 
-    let no_anchor = repl_turn::compact_assistant_message(2, "Only summary", None);
+    let no_anchor = chat_turn::compact_assistant_message(2, "Only summary", None);
     assert!(!no_anchor.contains("[Session memory anchor]"));
     assert!(no_anchor.contains("[Prior context — 2 turns compacted]"));
     assert!(no_anchor.contains("Only summary"));

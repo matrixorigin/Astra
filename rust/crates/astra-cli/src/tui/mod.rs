@@ -47,8 +47,12 @@ mod view_stack;
 mod worktrees;
 mod wrapping;
 
+// Crate-level `theme::icon_*` helpers, exposed under a non-shadowing alias
+// because this module already declares an inner `mod theme` (UI palette).
+use crate::theme as cli_theme;
 use app_event::TuiAppEvent;
 use bottom_pane::{BottomPane, BottomPaneAction};
+use crossterm::style::Stylize;
 use history_cell::HistoryCell;
 
 use ratatui::widgets::Clear;
@@ -94,7 +98,7 @@ pub(crate) enum ActiveView {
 ///    caller can draw a bordered frame.
 /// 2. No active cell but the status indicator has content →
 ///    `Status` line (spinner + short label, no frame).
-/// 3. Neither → `Empty`. Idle REPL shows nothing above the
+/// 3. Neither → `Empty`. Idle TUI shows nothing above the
 ///    composer.
 fn active_viewport(
     chat_widget: &chat_widget::ChatWidget,
@@ -264,7 +268,7 @@ pub(crate) fn can_run_tui() -> bool {
         && std::env::var("TERM").map_or(true, |t| t != "dumb")
 }
 
-pub(crate) async fn run_tui_repl(
+pub(crate) async fn run_tui(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     initial_model: Option<&str>,
@@ -272,8 +276,8 @@ pub(crate) async fn run_tui_repl(
     no_instructions: bool,
     max_budget: f64,
 ) -> Result<(), String> {
-    use crate::repl_runtime::{build_repl_editor, initialize_repl_state};
-    use crate::repl_startup::complete_repl_startup;
+    use crate::session_runtime::initialize_session_state;
+    use crate::session_startup::complete_session_startup;
     use crate::startup_trace::StartupTracer;
 
     // ── Ensure terminal is in sane state before startup output ────────
@@ -290,16 +294,14 @@ pub(crate) async fn run_tui_repl(
 
     // ── Business initialization BEFORE entering TUI ─────────────────────
     let mut tracer = StartupTracer::new();
-    crate::repl_runtime::try_silent_auth(api, profile).await;
+    crate::session_runtime::try_silent_auth(api, profile).await;
     tracer.phase("auth");
-    let (_editor, _hist_path) = build_repl_editor()?;
-    tracer.phase("editor");
-    let mut state = initialize_repl_state(profile, initial_model);
+    let mut state = initialize_session_state(profile, initial_model);
     if max_budget > 0.0 {
         state.max_budget_limit = max_budget;
     }
     tracer.phase("state_init");
-    let startup = complete_repl_startup(
+    let startup = complete_session_startup(
         &mut state,
         &mut tracer,
         api,
@@ -396,6 +398,15 @@ pub(crate) async fn run_tui_repl(
 
     frame_requester.schedule_frame();
 
+    // Track why we left the TUI loop so finalization knows whether to
+    // print the resume hint and whether to clear `last_session_id`.
+    // Defaults to `Eof` (the BottomPane Quit path: Ctrl-D / ESC at idle
+    // composer). Every other break path reassigns this before breaking.
+    use crate::session_cleanup::SessionExit;
+    let mut exit_reason = SessionExit::Eof;
+
+    let mut shutdown_signal_rx = startup.shutdown_signal_rx.clone();
+
     let result: Result<(), String> = 'main: loop {
         let tick = tokio::time::sleep(Duration::from_millis(50));
         tokio::pin!(tick);
@@ -409,6 +420,21 @@ pub(crate) async fn run_tui_repl(
         }
 
         tokio::select! {
+            // Graceful shutdown on SIGTERM/SIGHUP. The watch sender is
+            // installed by `complete_session_startup`; before any signal
+            // arrives the channel value is `None` and `changed()`
+            // suspends until a real value lands.
+            Ok(()) = shutdown_signal_rx.changed() => {
+                if let Some(signal) = *shutdown_signal_rx.borrow() {
+                    eprintln!(
+                        "\n  {} Received {}. Shutting down gracefully...",
+                        cli_theme::icon_warn(),
+                        signal.label().bold()
+                    );
+                    exit_reason = SessionExit::Shutdown(signal);
+                    break 'main Ok(());
+                }
+            }
             Some(ev) = event_stream.next() => {
                 match ev {
                     TuiEvent::Key(key) => {
@@ -501,18 +527,24 @@ pub(crate) async fn run_tui_repl(
                                     let result = slash_dispatch::dispatch(&text, &mut dctx).await;
                                     match result {
                                         slash_dispatch::SlashResult::Handled => {}
-                                        slash_dispatch::SlashResult::Exit => { break 'main Ok(()); }
+                                        slash_dispatch::SlashResult::Exit => {
+                                            exit_reason = SessionExit::Command;
+                                            break 'main Ok(());
+                                        }
                                         slash_dispatch::SlashResult::Fallback => {
                                             let slash_text = text.clone();
                                             let slash_result = guard.with_restored(|| async {
-                                                let token = crate::repl_runtime::current_access_token(profile);
+                                                let token = crate::session_runtime::current_access_token(profile);
                                                 crate::slash_router::handle_slash_command(
                                                     &slash_text, api, profile, &mut state,
-                                                    token.as_deref(), &*startup.selector,
+                                                    token.as_deref(),
                                                 ).await
                                             }).await;
                                             match slash_result {
-                                                Ok(Ok(true)) => { break 'main Ok(()); }
+                                                Ok(Ok(true)) => {
+                                                    exit_reason = SessionExit::Command;
+                                                    break 'main Ok(());
+                                                }
                                                 Ok(Ok(false)) => {}
                                                 Ok(Err(e)) => {
                                                     chat_widget.commit_system(history_cell::system::SystemCell::error(e));
@@ -557,10 +589,10 @@ pub(crate) async fn run_tui_repl(
                                     state.tui_stream_event_tx = Some(turn_tx);
 
                                     let turn_result = {
-                                        let ctx = crate::repl_turn::ReplTurnContext { api, profile, selector: &*startup.selector };
-                                        let token = crate::repl_runtime::current_access_token(profile);
+                                        let ctx = crate::chat_turn::TurnContext { api, profile };
+                                        let token = crate::session_runtime::current_access_token(profile);
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
-                                        let fut = crate::repl_turn::handle_chat_input_with_ui(text, token.as_deref(), &mut state, ctx, &mut tui_ui);
+                                        let fut = crate::chat_turn::handle_chat_input_with_ui(text, token.as_deref(), &mut state, ctx, &mut tui_ui);
                                         tokio::pin!(fut);
 
                                         let r: Result<(), String> = loop {
@@ -807,6 +839,23 @@ pub(crate) async fn run_tui_repl(
 
                                     // Auto-send first queued message (will be picked up next iteration)
                                     inject_submit = bottom_pane.take_next_queued();
+
+                                    // `--max-budget`: post-turn cap. Once the
+                                    // cumulative cost crosses the limit, exit
+                                    // with the resume hint so the user can pick
+                                    // the session back up explicitly.
+                                    if state.max_budget_limit > 0.0
+                                        && state.total_session_cost >= state.max_budget_limit
+                                    {
+                                        eprintln!(
+                                            "\n  {} Session budget reached: {} / {} limit. Exiting.",
+                                            cli_theme::icon_warn(),
+                                            crate::slash_stats::format_cost(state.total_session_cost).bold(),
+                                            crate::slash_stats::format_cost(state.max_budget_limit),
+                                        );
+                                        exit_reason = SessionExit::BudgetLimit;
+                                        break 'main Ok(());
+                                    }
                                 }
                             }
                             BottomPaneAction::ViewCompleted { result, reopen } => {
@@ -878,7 +927,7 @@ pub(crate) async fn run_tui_repl(
                                                 // If the save produced a new version id,
                                                 // emit a ConfigChange journal event
                                                 // recording the transition and update
-                                                // ReplState so subsequent HeavyCheckpoints
+                                                // SessionState so subsequent HeavyCheckpoints
                                                 // carry the new pointer.
                                                 if let Some(save) = outcome.save.as_ref() {
                                                     let prev = state.config_version_id.clone();
@@ -948,7 +997,7 @@ pub(crate) async fn run_tui_repl(
                                         name.strip_prefix(slash_dispatch::MODEL_PICK_SENTINEL)
                                     {
                                         let base_model = base_model.to_string();
-                                        let token = crate::repl_runtime::current_access_token(profile);
+                                        let token = crate::session_runtime::current_access_token(profile);
                                         let raw = crate::slash_router::fetch_model_list_raw(
                                             api,
                                             token.as_deref(),
@@ -1028,7 +1077,7 @@ pub(crate) async fn run_tui_repl(
                                         let base_model =
                                             parts.next().unwrap_or("").to_string();
                                         let label = parts.next().unwrap_or("").to_string();
-                                        let token = crate::repl_runtime::current_access_token(profile);
+                                        let token = crate::session_runtime::current_access_token(profile);
                                         let raw = crate::slash_router::fetch_model_list_raw(
                                             api,
                                             token.as_deref(),
@@ -1102,20 +1151,17 @@ pub(crate) async fn run_tui_repl(
                                         continue;
                                     }
 
-                                    // `/session fork` picker → hand off to
-                                    // the line-mode `/session fork <parent>`
-                                    // pipeline. Calling `fork_local_session`
-                                    // inline here used to leave ReplState in
-                                    // a half-done state (session_id /
-                                    // journal / CSL all still pointed at the
-                                    // parent); the fallback path is the same
-                                    // code the line-mode handler runs
-                                    // through, so it does the full restore.
+                                    // `/session fork` picker → hand off to the
+                                    // `/session fork <parent>` slash router so
+                                    // SessionState (session_id / journal / CSL)
+                                    // gets fully rebound; calling
+                                    // `fork_local_session` inline here would
+                                    // leave it half-rebound to the parent.
                                     if let Some(parent_sid) = name.strip_prefix(slash_dispatch::FORK_PICK_SENTINEL) {
                                         let slash_text = format!("/session fork {parent_sid}");
                                         let slash_result = guard
                                             .with_restored(|| async {
-                                                let tok = crate::repl_runtime::current_access_token(
+                                                let tok = crate::session_runtime::current_access_token(
                                                     profile,
                                                 );
                                                 crate::slash_router::handle_slash_command(
@@ -1124,13 +1170,13 @@ pub(crate) async fn run_tui_repl(
                                                     profile,
                                                     &mut state,
                                                     tok.as_deref(),
-                                                    &*startup.selector,
                                                 )
                                                 .await
                                             })
                                             .await;
                                         match slash_result {
                                             Ok(Ok(true)) => {
+                                                exit_reason = SessionExit::Command;
                                                 break 'main Ok(());
                                             }
                                             Ok(Ok(false)) => {}
@@ -1185,14 +1231,17 @@ pub(crate) async fn run_tui_repl(
                                         let pre_sid = state.session_id.clone();
                                         let slash_text = format!("/resume {name}");
                                         let slash_result = guard.with_restored(|| async {
-                                            let token = crate::repl_runtime::current_access_token(profile);
+                                            let token = crate::session_runtime::current_access_token(profile);
                                             crate::slash_router::handle_slash_command(
                                                 &slash_text, api, profile, &mut state,
-                                                token.as_deref(), &*startup.selector,
+                                                token.as_deref(),
                                             ).await
                                         }).await;
                                         match slash_result {
-                                            Ok(Ok(true)) => { break 'main Ok(()); }
+                                            Ok(Ok(true)) => {
+                                                exit_reason = SessionExit::Command;
+                                                break 'main Ok(());
+                                            }
                                             Ok(Ok(false)) => {}
                                             Ok(Err(e)) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::error(e));
@@ -1247,7 +1296,24 @@ pub(crate) async fn run_tui_repl(
                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                                 }
                             }
-                            BottomPaneAction::Interrupt | BottomPaneAction::Quit => { break 'main Ok(()); }
+                            BottomPaneAction::Interrupt => {
+                                // Ctrl-C at idle (no active turn, no pending
+                                // approvals). Treat as "cancel" rather than
+                                // EOF: print the resume hint, leave
+                                // `last_session_id` so the next `astra` run
+                                // reattaches.
+                                exit_reason = SessionExit::Interrupt;
+                                break 'main Ok(());
+                            }
+                            BottomPaneAction::Quit => {
+                                // Ctrl-D / ESC at idle composer. True EOF:
+                                // `exit_reason` already defaults to `Eof`, so
+                                // `last_session_id` is cleared and the next
+                                // `astra` launch starts fresh. The resume hint
+                                // still prints (the session is recoverable
+                                // explicitly via `/resume <id>`).
+                                break 'main Ok(());
+                            }
                             BottomPaneAction::Consumed => {}
                             BottomPaneAction::Escalate(_) => {}
                             BottomPaneAction::ApprovalResolved { .. } => {
@@ -1316,6 +1382,20 @@ pub(crate) async fn run_tui_repl(
         }
     };
     drop(guard);
+
+    // Force the error variant if the loop bailed: error paths must not
+    // print the resume hint (session is in an unclean state) and must
+    // not clear `last_session_id` (so the next `astra` reattaches and
+    // the user can investigate).
+    if result.is_err() {
+        exit_reason = SessionExit::Error;
+    }
+
+    // Run the full session-end pipeline: write session_end to journal,
+    // drain ingestion, trigger Memoria governance/consolidation, extract
+    // L3 lessons, end observability, clear panic guard.
+    crate::session_cleanup::finalize_session_exit(&mut state, profile, exit_reason).await;
+
     result
 }
 

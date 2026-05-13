@@ -673,17 +673,6 @@ pub struct JournalEvent {
     /// Context assembly time in milliseconds (prompt building).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_ms: Option<u64>,
-    /// Tool selection strategy used (e.g. "tfidf", "llm", "tfidf_fast").
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selector_strategy: Option<String>,
-    /// Tool selection time in milliseconds (subset of context_ms).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selector_ms: Option<u64>,
-    /// LLM tokens consumed by tool selector (0 = TF-IDF only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selector_tokens_in: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selector_tokens_out: Option<u64>,
     /// Cache read tokens (prompt cache hits).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_tokens: Option<u64>,
@@ -709,9 +698,6 @@ pub struct JournalEvent {
     /// Stores the serialized ContextAssemblyTrace from runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_assembly_trace: Option<serde_json::Value>,
-    /// Selector confidence from the first tool-selection pass (0.0–1.0).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selector_confidence: Option<f64>,
     /// Routing domain hint label for this REPL turn (e.g. `github`); omitted when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_domain_hint: Option<String>,
@@ -2094,10 +2080,6 @@ impl JournalEvent {
             plan_subtask_id: None,
             ttft_ms: None,
             context_ms: None,
-            selector_strategy: None,
-            selector_ms: None,
-            selector_tokens_in: None,
-            selector_tokens_out: None,
             cache_read_tokens: None,
             cache_creation_tokens: None,
             memoria_ms: None,
@@ -2106,7 +2088,6 @@ impl JournalEvent {
             edge_policy: None,
             selection_trace: None,
             context_assembly_trace: None,
-            selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
             round: None,
@@ -2625,35 +2606,12 @@ impl JournalEvent {
         self
     }
 
-    /// Set tool selection time.
-    pub fn with_selector_time(mut self, selector_ms: Option<u64>) -> Self {
-        self.selector_ms = selector_ms;
-        self
-    }
-
-    /// Set tool selector LLM token usage.
-    pub fn with_selector_tokens(mut self, tokens_in: u64, tokens_out: u64) -> Self {
-        if tokens_in > 0 || tokens_out > 0 {
-            self.selector_tokens_in = Some(tokens_in);
-            self.selector_tokens_out = Some(tokens_out);
-        }
-        self
-    }
-
-    /// Set tool selection strategy.
-    pub fn with_selector_strategy(mut self, strategy: Option<String>) -> Self {
-        self.selector_strategy = strategy;
-        self
-    }
-
-    /// Learning / routing telemetry for this REPL turn (journal + analytics).
-    pub fn with_selector_learning_telemetry(
+    /// Routing telemetry for this REPL turn (journal + analytics).
+    pub fn with_routing_telemetry(
         mut self,
-        selector_confidence: Option<f64>,
         routing_domain_hint: Option<String>,
         entity_learn_skipped_no_domain: bool,
     ) -> Self {
-        self.selector_confidence = selector_confidence;
         self.routing_domain_hint = routing_domain_hint;
         self.entity_learn_skipped_no_domain = entity_learn_skipped_no_domain;
         self
@@ -3352,7 +3310,7 @@ impl JournalEvent {
         evt
     }
 
-    /// Record a selector confidence diagnosis (emitted only for actionable tiers).
+    /// Record a confidence diagnosis (emitted only for actionable tiers).
     pub fn confidence_diagnosis_recorded(
         session_id: Option<&str>,
         turn: u32,
@@ -3361,8 +3319,8 @@ impl JournalEvent {
     ) -> Self {
         let mut evt = Self::base(JournalEventType::ConfidenceDiagnosisRecorded, session_id);
         evt.turn = Some(turn);
-        evt.selector_confidence = Some(confidence);
         evt.metadata = Some(serde_json::json!({
+            "confidence": confidence,
             "confidence_diagnosis": diagnosis_json,
         }));
         evt

@@ -339,7 +339,7 @@ pub enum ExtractionOutcome {
         usage: CacheUsage,
     },
     SkippedMainWrote,
-    SkippedNoSelector,
+    SkippedNoModel,
     SkippedDisabled,
     /// A prior turn's extraction is still in flight. The current turn's
     /// extraction was NOT run. `prior_turn` identifies what is blocking us
@@ -357,7 +357,7 @@ impl ExtractionOutcome {
             Self::Started => "started",
             Self::Extracted { .. } => "extracted",
             Self::SkippedMainWrote => "skipped_main_wrote",
-            Self::SkippedNoSelector => "skipped_no_selector",
+            Self::SkippedNoModel => "skipped_no_model",
             Self::SkippedDisabled => "skipped_disabled",
             Self::SkippedBusy { .. } => "skipped_busy",
             Self::Error(_) => "error",
@@ -368,7 +368,7 @@ impl ExtractionOutcome {
 /// Input context for a single extraction attempt.
 pub struct ExtractionContext<'a> {
     pub turn: u32,
-    pub selector_params: Option<&'a LlmConnParams>,
+    pub memory_model_params: Option<&'a LlmConnParams>,
     pub user_message: &'a str,
     pub assistant_response: &'a str,
     /// Tool *names* the main model invoked this turn (names only; no args).
@@ -454,9 +454,9 @@ impl MemoryExtractor {
             self.last_processed_turn = ctx.turn;
             return ExtractionOutcome::SkippedMainWrote;
         }
-        let Some(params) = ctx.selector_params.cloned() else {
+        let Some(params) = ctx.memory_model_params.cloned() else {
             self.last_processed_turn = ctx.turn;
-            return ExtractionOutcome::SkippedNoSelector;
+            return ExtractionOutcome::SkippedNoModel;
         };
 
         self.last_processed_turn = ctx.turn;
@@ -863,7 +863,7 @@ async fn run_extraction(
 
 /// Build a JournalEvent capturing the given extraction outcome, including
 /// structured metadata specific to the outcome variant (e.g. `prior_turn`
-/// for `SkippedBusy`). Centralizing this keeps repl_turn/session_cleanup
+/// for `SkippedBusy`). Centralizing this keeps chat_turn/session_cleanup
 /// from dropping fields during manual construction.
 pub fn journal_event_for_outcome(
     session_id: Option<&str>,
@@ -1076,7 +1076,7 @@ mod tests {
     ) -> ExtractionContext<'a> {
         ExtractionContext {
             turn,
-            selector_params: params,
+            memory_model_params: params,
             user_message: "msg",
             assistant_response: "resp",
             tools_used: tools,
@@ -1097,7 +1097,7 @@ mod tests {
     ) -> ExtractionContext<'a> {
         ExtractionContext {
             turn,
-            selector_params: params,
+            memory_model_params: params,
             user_message: "msg",
             assistant_response: "resp",
             tools_used: tools,
@@ -1248,10 +1248,10 @@ mod tests {
     }
 
     #[test]
-    fn extractor_skips_when_no_selector() {
+    fn extractor_skips_when_no_model() {
         let mut ext = MemoryExtractor::new();
         let outcome = ext.maybe_extract(ctx(1, None, &[]));
-        assert_eq!(outcome.tag(), "skipped_no_selector");
+        assert_eq!(outcome.tag(), "skipped_no_model");
     }
 
     // ── P1-2: CacheUsage parsing & metrics ────────────────────────────────
@@ -1453,7 +1453,7 @@ mod tests {
     // ── review-critical #2: prior_turn must land in the journal event ─────
     //
     // P0-3's commit message claimed prior_turn was "plumbed into journal
-    // for ops correlation" — but the repl_turn path only used
+    // for ops correlation" — but the chat_turn path only used
     // JournalEvent::memory_extraction, dropping the field. Ops saw
     // `tag="skipped_busy"` with no way to know WHICH turn was blocking.
 
@@ -1516,7 +1516,7 @@ mod tests {
         // should not have a stray prior_turn field in metadata.
         for outcome in [
             ExtractionOutcome::SkippedMainWrote,
-            ExtractionOutcome::SkippedNoSelector,
+            ExtractionOutcome::SkippedNoModel,
             ExtractionOutcome::SkippedDisabled,
             ExtractionOutcome::Error("x".into()),
         ] {
@@ -1584,10 +1584,7 @@ mod tests {
             ExtractionOutcome::SkippedMainWrote.tag(),
             "skipped_main_wrote"
         );
-        assert_eq!(
-            ExtractionOutcome::SkippedNoSelector.tag(),
-            "skipped_no_selector"
-        );
+        assert_eq!(ExtractionOutcome::SkippedNoModel.tag(), "skipped_no_model");
         assert_eq!(ExtractionOutcome::SkippedDisabled.tag(), "skipped_disabled");
         assert_eq!(ExtractionOutcome::Error("x".into()).tag(), "error");
     }
@@ -1752,7 +1749,7 @@ mod tests {
         let mut ext = MemoryExtractor::new();
         let outcome = ext.maybe_extract(ExtractionContext {
             turn: 1,
-            selector_params: Some(&params),
+            memory_model_params: Some(&params),
             user_message: "hello",
             assistant_response: "world",
             tools_used: &[],
@@ -1788,7 +1785,7 @@ mod tests {
         let mut ext = MemoryExtractor::new();
         let _ = ext.maybe_extract(ExtractionContext {
             turn: 1,
-            selector_params: Some(&params),
+            memory_model_params: Some(&params),
             user_message: "I prefer Rust",
             assistant_response: "Noted",
             tools_used: &[],
@@ -1826,7 +1823,7 @@ mod tests {
         let mut ext = MemoryExtractor::new();
         let _ = ext.maybe_extract(ExtractionContext {
             turn: 1,
-            selector_params: Some(&params),
+            memory_model_params: Some(&params),
             user_message: "I prefer Rust",
             assistant_response: "Noted",
             tools_used: &[],
@@ -1861,7 +1858,7 @@ mod tests {
         let mut ext = MemoryExtractor::new();
         let _ = ext.maybe_extract(ExtractionContext {
             turn: 1,
-            selector_params: Some(&params),
+            memory_model_params: Some(&params),
             user_message: "keep it concise",
             assistant_response: "ok",
             tools_used: &[],
@@ -2049,7 +2046,7 @@ mod tests {
         let mut ext = MemoryExtractor::new();
         let outcome = ext.maybe_extract(ExtractionContext {
             turn: 1,
-            selector_params: Some(&params),
+            memory_model_params: Some(&params),
             user_message: "set dark mode",
             assistant_response: "done",
             tools_used: &[],
@@ -2095,7 +2092,7 @@ mod tests {
         let mut ext = MemoryExtractor::new();
         let _ = ext.maybe_extract(ExtractionContext {
             turn: 1,
-            selector_params: Some(&params),
+            memory_model_params: Some(&params),
             user_message: "be verbose",
             assistant_response: "ok",
             tools_used: &[],
@@ -2203,7 +2200,7 @@ mod tests {
         let mut ext = MemoryExtractor::new();
         let _ = ext.maybe_extract(ExtractionContext {
             turn: 1,
-            selector_params: Some(&params),
+            memory_model_params: Some(&params),
             user_message: "test",
             assistant_response: "ok",
             tools_used: &[],
@@ -2333,7 +2330,7 @@ mod tests {
         let mut ext = MemoryExtractor::new();
         let _ = ext.maybe_extract(ExtractionContext {
             turn: 1,
-            selector_params: Some(&params),
+            memory_model_params: Some(&params),
             user_message: "be concise",
             assistant_response: "ok",
             tools_used: &[],
@@ -2371,7 +2368,7 @@ mod tests {
         let mut ext = MemoryExtractor::new();
         let _ = ext.maybe_extract(ExtractionContext {
             turn: 1,
-            selector_params: Some(&params),
+            memory_model_params: Some(&params),
             user_message: "test",
             assistant_response: "ok",
             tools_used: &[],
@@ -2413,7 +2410,7 @@ mod tests {
         let mut ext = MemoryExtractor::new();
         let _ = ext.maybe_extract(ExtractionContext {
             turn: 1,
-            selector_params: Some(&params),
+            memory_model_params: Some(&params),
             user_message: "deadline is friday",
             assistant_response: "noted",
             tools_used: &[],

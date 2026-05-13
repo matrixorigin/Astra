@@ -134,4 +134,4 @@ astra-admin feedback export [--agent-id <agent_id>] [--format jsonl]
 - CLIs share credential storage: `~/.astra/credentials.json` (tests may set `ASTRA_CREDENTIALS_DIR`)
 - `--profile` lets you isolate credentials by environment/user
 - API errors are returned with HTTP status and compact response body for easier debugging
-- Interactive mode starts an in-terminal command loop (`help`/`exit` supported)
+- Interactive mode launches the TUI (requires a TTY; use `astra chat -m` or `--print` for non-interactive invocations)

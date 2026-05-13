@@ -58,7 +58,6 @@ use astra_services::{DatabaseEvaluationService, DatabaseEventService};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::tool_registry::SelectionReport;
 use astra_pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
@@ -68,6 +67,7 @@ use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::headless_types::HeadlessStderrStyle;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+use astra_turn_core::tool_registry_report::SelectionReport;
 use astra_turn_core::turn_guard::TurnGuard;
 use tokio_util::sync::CancellationToken;
 
@@ -366,7 +366,7 @@ pub struct TelemetryState {
     pub first_ttft_ms: Option<u64>,
     /// All tool names used across all turns.
     pub all_tools_used: HashSet<String>,
-    /// Selection report from the first turn's skill selector.
+    /// Selection report from the first turn's tool surface assembly.
     pub first_selection_report: Option<SelectionReport>,
     /// Budget pressure value from the first turn.
     pub first_budget_pressure: f64,
@@ -374,21 +374,10 @@ pub struct TelemetryState {
     pub first_context_assembly_ms: Option<u64>,
     /// Memoria retrieval duration from the first turn (ms).
     pub first_memoria_ms: Option<u64>,
-    /// Selector duration from the first turn (ms).
-    pub first_selector_ms: Option<u64>,
-    /// Selector strategy from the first turn.
-    pub first_selector_strategy: Option<String>,
-    /// Selector confidence from the first turn.
-    pub first_selector_confidence: Option<f64>,
-    /// Cumulative selector input tokens.
-    pub selector_tokens_in: u64,
-    /// Cumulative selector output tokens.
-    pub selector_tokens_out: u64,
     /// All skill names selected across all turns.
     pub all_selected_skills: Vec<String>,
-    /// Initial visible skill shortlist for the current outer turn.
-    pub initial_skill_selector_shortlist:
-        Option<astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace>,
+    /// Marker that the full skill listing was initialized for the current outer turn.
+    pub initial_skill_selector_shortlist: Option<()>,
     /// Optional observability session for context tracing, drift detection, and auto-tuning.
     /// When set, hooks are called at turn start/end, tool selection, etc.
     pub observability_session: Option<

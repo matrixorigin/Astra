@@ -305,18 +305,10 @@ fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
         ]));
     }
     if let Some(ctx) = t.context_ms {
-        let mut detail_parts: Vec<String> = Vec::new();
-        if let Some(sel) = t.selector_ms {
-            let strat = t.selector_strategy.as_deref().unwrap_or("?");
-            detail_parts.push(format!("selector: {sel}ms [{strat}]"));
-        }
-        if let Some(m) = t.memoria_ms {
-            detail_parts.push(format!("memoria: {m}ms"));
-        }
-        let detail = if detail_parts.is_empty() {
-            String::new()
+        let detail = if let Some(m) = t.memoria_ms {
+            format!(" (memoria: {m}ms)")
         } else {
-            format!(" ({})", detail_parts.join(", "))
+            String::new()
         };
         lines.push(Line::from(vec![
             Span::styled("  Context  ", label),
@@ -338,13 +330,9 @@ fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
         ]));
     }
     if let (Some(tin), Some(tout)) = (t.tokens_in, t.tokens_out) {
-        let sel_note = match (t.selector_tokens_in, t.selector_tokens_out) {
-            (Some(si), Some(so)) if si > 0 || so > 0 => format!(" (+sel: {si}→{so})"),
-            _ => String::new(),
-        };
         lines.push(Line::from(vec![
             Span::styled("  Tokens   ", label),
-            Span::styled(format!("{tin} in / {tout} out{sel_note}"), dim),
+            Span::styled(format!("{tin} in / {tout} out"), dim),
         ]));
     }
     if let Some(ref model) = t.model {
@@ -583,8 +571,6 @@ mod tests {
             cumulative_tokens_out: 0,
             ttft_ms: None,
             context_ms: None,
-            selector_ms: None,
-            selector_strategy: None,
             memoria_ms: None,
             llm_rounds: None,
             selected_skills: None,
@@ -593,8 +579,6 @@ mod tests {
             tool_calls: Vec::new(),
             user_input: None,
             assistant_output: None,
-            selector_tokens_in: None,
-            selector_tokens_out: None,
         }
     }
 

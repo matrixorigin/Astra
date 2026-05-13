@@ -78,7 +78,7 @@ pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str =
     "\n<!-- astra:system-prompt:dynamic-boundary -->\n";
 
 /// Escape XML metacharacters for embedding inside **element text
-/// content** of `<deferred_tools>` / `<available_skills>` blocks.
+/// content** of `<available_skills>` blocks.
 ///
 /// # Scope — element text only
 ///
@@ -118,36 +118,12 @@ fn xml_escape_text(s: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-/// Render the `<deferred_tools>` section of the system prompt.
-///
-/// The deferred block tells the LLM which tools exist outside the pinned
-/// `tools[]` array — without paying their full schema cost every turn.
-/// The model activates one by calling `tool_search(query="select:NAME")`
-/// which returns the schema as a tool_result.
-///
-/// Returns `None` when the surface has no deferred entries (no point
-/// emitting an empty block). The returned section carries
-/// [`CacheScope::Session`] so it joins the cached session prefix.
-///
-/// The rendered format mirrors the shape used by `<available_skills>`:
-///
-/// ```text
-/// <deferred_tools>
-///   <tool>
-///     <name>mcp__weather</name>
-///     <description>Get weather for a city</description>
-///   </tool>
-///   ...
-/// </deferred_tools>
-/// ```
-///
-/// Followed by a single nudge line so weak models know how to pull a
-/// schema in when they need one.
 /// Render the `<available_skills>` section of the system prompt.
 ///
-/// Mirrors [`build_deferred_tools_section`] for skills: name + description
-/// per entry, wrapped in `<available_skills>…</available_skills>`, plus a
-/// short nudge so the model calls the `skill` tool instead of guessing.
+/// Selector-based deferred surfacing was removed, so the section contains the
+/// full skill catalog: name + description per entry, wrapped in
+/// `<available_skills>…</available_skills>`, plus a short nudge so the model
+/// calls the `skill` tool instead of guessing.
 ///
 /// Returns `None` when there are no skills (don't emit a ghost block).
 /// The section is [`CacheScope::Session`] so the listing joins the cached
@@ -161,6 +137,7 @@ pub fn build_skill_listing_section(
     if skills.is_empty() {
         return None;
     }
+    crate::turn::skill_tool::warn_if_full_skill_catalog_surface_is_large(skills.len());
 
     // Sort for cache stability — provider iteration order is not a contract.
     let mut sorted: Vec<&astra_skills::traits::SkillToolInfo> = skills.iter().collect();
@@ -186,33 +163,7 @@ pub fn build_skill_listing_section(
     Some(PromptSection::stable(body, CacheScope::Session))
 }
 
-pub fn build_deferred_tools_section(
-    surface: &crate::tool_registry::surface::ToolSurface,
-) -> Option<PromptSection> {
-    let entries = surface.deferred();
-    if entries.is_empty() {
-        return None;
-    }
-
-    let mut body = String::with_capacity(entries.len() * 80 + 256);
-    body.push_str("<deferred_tools>\n");
-    for entry in entries {
-        body.push_str("  <tool>\n    <name>");
-        body.push_str(&xml_escape_text(&entry.name));
-        body.push_str("</name>\n    <description>");
-        body.push_str(&xml_escape_text(&entry.short_desc));
-        body.push_str("</description>\n  </tool>\n");
-    }
-    body.push_str("</deferred_tools>\n\n");
-    body.push_str(
-        "If a tool in `<deferred_tools>` fits your next step, call \
-         `tool_search(query=\"select:NAME\")` first — the tool_result will contain the \
-         full schema so you can invoke it on the next turn. Never guess at a tool that is \
-         not in `tools[]` without doing this.",
-    );
-
-    Some(PromptSection::stable(body, CacheScope::Session))
-}
+// build_deferred_tools_section removed (selector deleted; no deferred tool surface).
 
 /// Builder that enforces the **static-before-dynamic** invariant at the API
 /// level, so callers cannot silently push a volatile section into the cached
@@ -825,9 +776,9 @@ pub fn build_system_prompt_sections_with_style(
         ),
     ];
 
-    // ── Tool-dependent sections (CacheScope::None — change when tool selector
-    //    picks different tools per turn, so they MUST go after the cache marker
-    //    to keep the Global prefix stable) ──
+    // ── Tool-dependent sections (CacheScope::None — derived from the active
+    //    tool list/selection-confidence values, so they MUST go after the
+    //    cache marker to keep the Global prefix stable) ──
     sections.push(PromptSection::dynamic(
         self_model_section(tool_names),
         PromptTokenBucket::BasePersona,
@@ -3045,6 +2996,29 @@ mod tests {
         assert!(!signals.round_budget_warning);
         // Single-tool last round → no positive parallel_feedback either.
         assert!(!signals.parallel_feedback);
+    }
+
+    #[test]
+    fn skill_listing_section_is_session_scoped_without_deferred_tools() {
+        let skills = vec![
+            astra_skills::traits::SkillToolInfo {
+                name: "review".into(),
+                description: "Review code changes".into(),
+                ..Default::default()
+            },
+            astra_skills::traits::SkillToolInfo {
+                name: "debug".into(),
+                description: "Debug failures".into(),
+                ..Default::default()
+            },
+        ];
+
+        let section = build_skill_listing_section(&skills).expect("non-empty skill catalog");
+
+        assert_eq!(section.scope, CacheScope::Session);
+        assert!(section.text.contains("<available_skills>"));
+        assert!(!section.text.contains("<deferred_tools>"));
+        assert!(section.text.contains("call the `skill` tool"));
     }
 
     // ── SystemPromptBuilder invariants ─────────────────────────────────

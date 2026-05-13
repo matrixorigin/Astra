@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use crate::chat_stream::edge_executor_instance_id;
-use crate::repl_runtime::{attempt_token_refresh, current_access_token};
+use crate::session_runtime::{attempt_token_refresh, current_access_token};
 use astra_thin_client::{
     EdgeHeartbeatRequest, EdgeRegisterRequest, ThinClient, ThinClientError,
     edge_register_with_capabilities,

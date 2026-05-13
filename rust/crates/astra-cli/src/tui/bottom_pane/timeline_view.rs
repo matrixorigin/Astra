@@ -126,8 +126,6 @@ mod tests {
                 cumulative_tokens_out: 0,
                 ttft_ms: None,
                 context_ms: None,
-                selector_ms: None,
-                selector_strategy: None,
                 memoria_ms: None,
                 llm_rounds: None,
                 selected_skills: None,
@@ -136,8 +134,6 @@ mod tests {
                 tool_calls: Vec::new(),
                 user_input: None,
                 assistant_output: None,
-                selector_tokens_in: None,
-                selector_tokens_out: None,
             },
             TimelineTurn {
                 turn: 2,
@@ -154,8 +150,6 @@ mod tests {
                 cumulative_tokens_out: 0,
                 ttft_ms: None,
                 context_ms: None,
-                selector_ms: None,
-                selector_strategy: None,
                 memoria_ms: None,
                 llm_rounds: None,
                 selected_skills: None,
@@ -164,8 +158,6 @@ mod tests {
                 tool_calls: Vec::new(),
                 user_input: None,
                 assistant_output: None,
-                selector_tokens_in: None,
-                selector_tokens_out: None,
             },
         ]);
         TimelineView::new(Timeline::new(src, "sess_test"))

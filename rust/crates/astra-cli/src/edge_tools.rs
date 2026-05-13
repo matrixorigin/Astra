@@ -465,7 +465,7 @@ pub struct ToolExecutor {
     pub mcp_manager:
         Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
     /// File edit journal — records before-state of every file write for undo.
-    /// Wrapped in Arc so the REPL session can share the journal across turns.
+    /// Wrapped in Arc so the chat session can share the journal across turns.
     pub file_journal:
         std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>>,
     /// MatrixOne snapshot journal — records captured pre-state snapshots so the
@@ -546,7 +546,7 @@ pub struct ToolExecutor {
     default_executor: astra_tools::executor::DefaultToolExecutor,
     /// Plugin-registered tool schemas (e.g. MCP servers). Joined with the
     /// static catalog when `tool_search(select:X)` runs, so deferred
-    /// activation can reach plugin tools. Populated by the REPL after
+    /// activation can reach plugin tools. Populated by the TUI after
     /// `PluginRegistry::register` loads the user's skill manifests.
     plugin_schemas: std::sync::RwLock<Vec<Value>>,
 }
@@ -643,7 +643,7 @@ impl ToolExecutor {
     }
 
     /// Install plugin-registered schemas so `tool_search(select:NAME)`
-    /// can resolve MCP / skill-backed tools. Called once at REPL start
+    /// can resolve MCP / skill-backed tools. Called once at TUI start
     /// after `PluginRegistry::register` loads manifests.
     ///
     /// Poison handling: recovers via `into_inner()` so a prior panic
@@ -2753,7 +2753,7 @@ mod tests {
     #[tokio::test]
     async fn tool_search_select_finds_plugin_schema_once_installed() {
         // MCP / skill-backed plugins are installed via `set_plugin_schemas`
-        // at REPL startup. After install, `tool_search(select:mcp__X)`
+        // at TUI startup. After install, `tool_search(select:mcp__X)`
         // must resolve — that's the whole deferred activation contract
         // for plugin tools.
         let executor = test_executor();
@@ -3020,7 +3020,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = CheckpointRootGuard::set(tmp.path());
 
-        // Simulate ReplState: a shared in-memory journal with no persistence.
+        // Simulate SessionState: a shared in-memory journal with no persistence.
         let shared: std::sync::Arc<
             std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>,
         > = std::sync::Arc::new(std::sync::Mutex::new(

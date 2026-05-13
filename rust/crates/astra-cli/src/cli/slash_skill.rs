@@ -8,7 +8,7 @@ fn default_skill_category(category: Option<&str>) -> String {
         .to_string()
 }
 
-// ── Catalog surfacing (SkillSearchSettings → agent context; was /skill-search) ──
+// ── Legacy catalog surfacing (SkillSearchSettings → agent context; was /skill-search) ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SkillSurfacingCmd {
@@ -21,7 +21,7 @@ enum SkillSurfacingCmd {
 
 fn format_skill_surfacing_line(settings: &astra_core::SkillSearchSettings) -> String {
     format!(
-        "dynamic={}, min_catalog_size={}, surface_cap={}",
+        "dynamic={}, min_catalog_size={}, surface_cap={} (legacy; runtime surfaces the full catalog)",
         settings.dynamic_surface, settings.min_catalog_size, settings.surface_cap
     )
 }
@@ -70,7 +70,7 @@ fn parse_skill_surfacing(arg: &str) -> Result<SkillSurfacingCmd, String> {
     }
 }
 
-fn apply_skill_surfacing(state: &mut ReplState, command: SkillSurfacingCmd) -> (String, bool) {
+fn apply_skill_surfacing(state: &mut SessionState, command: SkillSurfacingCmd) -> (String, bool) {
     match command {
         SkillSurfacingCmd::Show => (
             format!(
@@ -125,7 +125,7 @@ fn apply_skill_surfacing(state: &mut ReplState, command: SkillSurfacingCmd) -> (
 pub(super) async fn handle_skill_command(
     arg: &str,
     api: &astra_thin_client::ThinClient,
-    state: &mut ReplState,
+    state: &mut SessionState,
     _profile: Option<&str>,
     token: Option<&str>,
 ) -> Result<(), String> {
@@ -201,7 +201,7 @@ pub(super) async fn handle_skill_command(
             eprintln!(
                 "    {}  {}",
                 "/skill surfacing …".magenta(),
-                "Agent catalog: dynamic/min/cap (discover_skills path)".dim()
+                "Legacy dynamic/min/cap settings (ignored by runtime)".dim()
             );
             eprintln!(
                 "    {}  {}",
@@ -1773,7 +1773,10 @@ fn skill_relevance_score(m: &astra_skills::SkillManifest, query: &str) -> u32 {
 // ═══════════════════════════════════════════════ Skill Auto-Generation ════
 
 /// Analyze the current session and generate a SKILL.md from observed patterns.
-async fn create_skill_from_session(arg: &str, state: &mut super::ReplState) -> Result<(), String> {
+async fn create_skill_from_session(
+    arg: &str,
+    state: &mut super::SessionState,
+) -> Result<(), String> {
     use astra_services::session_journal;
     use std::collections::HashMap;
 
@@ -2173,8 +2176,8 @@ mod tests {
     }
 
     #[test]
-    fn apply_skill_surfacing_mutates_repl_state() {
-        let mut state = ReplState::default();
+    fn apply_skill_surfacing_mutates_session_state() {
+        let mut state = SessionState::default();
 
         let (_, changed) = apply_skill_surfacing(&mut state, SkillSurfacingCmd::SetDynamic(false));
         assert!(changed);
@@ -2676,7 +2679,7 @@ mod tests {
             let prev_dir = std::env::current_dir().unwrap();
             std::env::set_current_dir(tmp.path()).unwrap();
 
-            // uninstall_skill_from_marketplace needs ReplState; test the core logic directly
+            // uninstall_skill_from_marketplace needs SessionState; test the core logic directly
             let target = std::env::current_dir()
                 .unwrap()
                 .join(".astra/skills/removable-skill");
@@ -2905,7 +2908,7 @@ async fn install_skill_from_marketplace(
     name: &str,
     api: &astra_thin_client::ThinClient,
     token: Option<&str>,
-    state: &mut ReplState,
+    state: &mut SessionState,
 ) {
     if name.is_empty() {
         eprintln!("{}", "  Usage: /skill install <name>[@version]".yellow());
@@ -2941,7 +2944,7 @@ fn install_skill_recursive<'a>(
     constraint: &'a astra_skills::version::VersionConstraint,
     api: &'a astra_thin_client::ThinClient,
     tok: &'a str,
-    state: &'a mut ReplState,
+    state: &'a mut SessionState,
     installed: &'a mut Vec<String>,
     depth: u32,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
@@ -3081,7 +3084,7 @@ async fn install_single_skill(
     version: Option<&str>,
     api: &astra_thin_client::ThinClient,
     tok: &str,
-    _state: &mut ReplState,
+    _state: &mut SessionState,
 ) -> bool {
     let bundle_path = format!("/skills/{}/bundle", skill_name);
     let query_pairs: Vec<(&str, String)> = if let Some(v) = version {
@@ -3226,7 +3229,7 @@ async fn publish_skill_to_marketplace(
     name: &str,
     api: &astra_thin_client::ThinClient,
     token: Option<&str>,
-    state: &ReplState,
+    state: &SessionState,
 ) {
     if name.is_empty() {
         eprintln!("{}", "  Usage: /skill publish <name>".yellow());
@@ -3373,7 +3376,7 @@ async fn publish_skill_to_marketplace(
 }
 
 /// Remove a locally installed skill.
-async fn uninstall_local_skill(name: &str, state: &mut ReplState) {
+async fn uninstall_local_skill(name: &str, state: &mut SessionState) {
     if name.is_empty() {
         eprintln!("{}", "  Usage: /skill uninstall <name>".yellow());
         eprintln!("{}", "  Removes a locally installed skill.".dim());
@@ -3520,7 +3523,7 @@ fn pack_skill_bundle(name: &str) {
 }
 
 /// Unpack a `.astra-skill` bundle to local skills directory.
-async fn unpack_skill_bundle(path_str: &str, state: &mut ReplState) {
+async fn unpack_skill_bundle(path_str: &str, state: &mut SessionState) {
     if path_str.is_empty() {
         eprintln!("{}", "  Usage: /skill unpack <file.astra-skill>".yellow());
         eprintln!("{}", "  Extracts a skill bundle to .astra/skills/.".dim());
@@ -3778,7 +3781,7 @@ async fn upgrade_skill(
     arg: &str,
     api: &astra_thin_client::ThinClient,
     token: Option<&str>,
-    state: &mut ReplState,
+    state: &mut SessionState,
 ) {
     let tok = token.unwrap_or("");
 
@@ -3877,7 +3880,11 @@ async fn upgrade_skill(
 }
 
 /// Upgrade all installed marketplace skills.
-async fn upgrade_all_skills(api: &astra_thin_client::ThinClient, tok: &str, state: &mut ReplState) {
+async fn upgrade_all_skills(
+    api: &astra_thin_client::ThinClient,
+    tok: &str,
+    state: &mut SessionState,
+) {
     eprintln!(
         "\n  {}",
         "Checking all installed skills for updates…".bold()
@@ -3985,7 +3992,7 @@ async fn rollback_skill(
     name: &str,
     api: &astra_thin_client::ThinClient,
     token: Option<&str>,
-    state: &mut ReplState,
+    state: &mut SessionState,
 ) {
     if name.is_empty() {
         eprintln!("{}", "  Usage: /skill rollback <name>".yellow());

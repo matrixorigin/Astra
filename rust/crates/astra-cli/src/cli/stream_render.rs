@@ -550,10 +550,10 @@ impl<'a> CliSseStreamHost<'a> {
         if !self.render_policy.is_silent() {
             eprintln!("{}", "  Token expired, attempting refresh…".yellow());
         }
-        if !super::repl_runtime::attempt_token_refresh(self.api, Some(profile)).await {
+        if !super::session_runtime::attempt_token_refresh(self.api, Some(profile)).await {
             return false;
         }
-        let Some(new_token) = super::repl_runtime::current_access_token(Some(profile)) else {
+        let Some(new_token) = super::session_runtime::current_access_token(Some(profile)) else {
             return false;
         };
         self.token = new_token;

@@ -218,7 +218,7 @@ fn build_hook_db_persist_from_payload(
             serde_json::Value::Object(action_profile)
         })
         .collect::<Vec<_>>();
-    let turn_number = valid_turn_number(hook_payload.get("turn_count"));
+    let _turn_number = valid_turn_number(hook_payload.get("turn_count"));
     let decision_audit = Some(TurnDecisionAuditRecord {
         decision_id: Uuid::now_v7().to_string(),
         session_id: session_id.clone(),
@@ -287,23 +287,6 @@ fn build_hook_db_persist_from_payload(
                 execution_time_ms: None,
             })
     };
-    let derived_shortlist = hook_payload
-        .get("skill_selector_shortlist")
-        .and_then(parse_skill_selector_shortlist_trace_value);
-    let skill_selector_metric = hook_payload
-        .get("skill_selector_metric")
-        .and_then(parse_turn_skill_selector_metric_record)
-        .or_else(|| {
-            turn_number.and_then(|turn_number| {
-                crate::turn::skill_tool::build_turn_skill_selector_metric_record(
-                    &session_id,
-                    &user_id,
-                    turn_number,
-                    derived_shortlist.as_ref(),
-                    &selected_skills,
-                )
-            })
-        });
     let implicit_feedback = if !run_implicit_feedback {
         first_user_content(&messages).and_then(|user_content| {
             let signal =
@@ -335,7 +318,6 @@ fn build_hook_db_persist_from_payload(
         TurnHookDbPersistPlan {
             decision_audit,
             skill_selection,
-            skill_selector_metric,
             implicit_feedback,
             reflection_mark: None,
             reflection_lesson: None,
@@ -516,18 +498,6 @@ fn truncate_text(text: &str, limit: usize) -> String {
     } else {
         text.to_string()
     }
-}
-
-fn parse_turn_skill_selector_metric_record(
-    value: &serde_json::Value,
-) -> Option<TurnSkillSelectorMetricRecord> {
-    serde_json::from_value(value.clone()).ok()
-}
-
-fn parse_skill_selector_shortlist_trace_value(
-    value: &serde_json::Value,
-) -> Option<astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace> {
-    serde_json::from_value(value.clone()).ok()
 }
 
 fn first_user_content(messages: &[serde_json::Value]) -> Option<&str> {
@@ -1041,86 +1011,6 @@ mod inprocess_hook_contract_tests {
         assert_eq!(selection.skill_name, "deploy-beta");
         assert_eq!(selection.selected_skills, vec!["deploy-beta"]);
         assert_eq!(selection.selection_method, "llm_skill_choice");
-
-        let metric = plan
-            .skill_selector_metric
-            .as_ref()
-            .expect("skill selector metric missing");
-        assert_eq!(metric.event_id, "metric-1");
-        assert_eq!(metric.turn_number, 5);
-        assert_eq!(metric.best_chosen_rank, Some(2));
-        assert_eq!(metric.selector_tier.as_deref(), Some("embedding"));
-    }
-
-    #[tokio::test]
-    async fn hook_derives_skill_selector_metric_from_structured_shortlist() {
-        let hook_writer = RecordingHookDbWriter::default();
-        run_bridge_hook_side_effects(
-            Some(build_hook_payload_with_derived_skill_metric()),
-            Arc::new(hook_writer.clone()),
-            Arc::new(RecordingReflectionStateStore::default()),
-            Arc::new(RecordingReflectionLessonWriter::default()),
-            Arc::new(RecordingObserverWorker::default()),
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let plans = hook_writer.plans.lock().await;
-        let metric = plans[0]
-            .skill_selector_metric
-            .as_ref()
-            .expect("derived metric missing");
-        assert_eq!(metric.turn_number, 6);
-        assert_eq!(metric.visible_skill_count, 2);
-        assert_eq!(metric.best_chosen_rank, Some(2));
-    }
-
-    #[tokio::test]
-    async fn hook_does_not_derive_skill_selector_metric_without_turn_count() {
-        let mut payload = build_hook_payload_with_derived_skill_metric();
-        payload
-            .as_object_mut()
-            .expect("payload object")
-            .remove("turn_count");
-        let hook_writer = RecordingHookDbWriter::default();
-
-        run_bridge_hook_side_effects(
-            Some(payload),
-            Arc::new(hook_writer.clone()),
-            Arc::new(RecordingReflectionStateStore::default()),
-            Arc::new(RecordingReflectionLessonWriter::default()),
-            Arc::new(RecordingObserverWorker::default()),
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let plans = hook_writer.plans.lock().await;
-        assert_eq!(plans.len(), 1);
-        assert!(plans[0].skill_selector_metric.is_none());
-    }
-
-    #[tokio::test]
-    async fn hook_does_not_derive_skill_selector_metric_with_invalid_turn_count() {
-        let mut payload = build_hook_payload_with_derived_skill_metric();
-        payload
-            .as_object_mut()
-            .expect("payload object")
-            .insert("turn_count".to_string(), json!(-1));
-        let hook_writer = RecordingHookDbWriter::default();
-
-        run_bridge_hook_side_effects(
-            Some(payload),
-            Arc::new(hook_writer.clone()),
-            Arc::new(RecordingReflectionStateStore::default()),
-            Arc::new(RecordingReflectionLessonWriter::default()),
-            Arc::new(RecordingObserverWorker::default()),
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let plans = hook_writer.plans.lock().await;
-        assert_eq!(plans.len(), 1);
-        assert!(plans[0].skill_selector_metric.is_none());
     }
 
     #[test]

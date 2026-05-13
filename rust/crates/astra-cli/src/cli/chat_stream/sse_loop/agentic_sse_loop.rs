@@ -116,11 +116,6 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) last_heavy_checkpoint: Option<StepCheckpoint>,
     pub(crate) ttft_ms: Option<u64>,
     pub(crate) context_ms: Option<u64>,
-    pub(crate) selector_strategy: Option<String>,
-    pub(crate) selector_ms: Option<u64>,
-    pub(crate) selector_confidence: Option<f64>,
-    pub(crate) selector_tokens_in: u64,
-    pub(crate) selector_tokens_out: u64,
     pub(crate) memoria_ms: Option<u64>,
     pub(crate) routing_domain_hint: Option<String>,
     pub(crate) entity_learn_skipped_no_domain: bool,
@@ -182,11 +177,6 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         last_heavy_checkpoint,
         ttft_ms,
         context_ms,
-        selector_strategy,
-        selector_ms,
-        selector_confidence,
-        selector_tokens_in,
-        selector_tokens_out,
         memoria_ms,
         routing_domain_hint,
         entity_learn_skipped_no_domain,
@@ -249,11 +239,6 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         last_heavy_checkpoint,
         ttft_ms,
         context_ms,
-        selector_strategy,
-        selector_ms,
-        selector_confidence,
-        selector_tokens_in,
-        selector_tokens_out,
         memoria_ms,
         routing_domain_hint,
         entity_learn_skipped_no_domain,
@@ -303,11 +288,6 @@ mod tests {
             last_heavy_checkpoint: None,
             ttft_ms: Some(42),
             context_ms: Some(100),
-            selector_strategy: Some("tfidf".into()),
-            selector_ms: Some(5),
-            selector_confidence: Some(0.75),
-            selector_tokens_in: 200,
-            selector_tokens_out: 50,
             memoria_ms: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
@@ -343,7 +323,6 @@ mod tests {
         assert_eq!(result.tool_calls_count, 3);
         assert_eq!(result.ttft_ms, Some(42));
         assert_eq!(result.context_ms, Some(100));
-        assert_eq!(result.selector_strategy.as_deref(), Some("tfidf"));
     }
 
     fn tool_record(name: &str, ok: bool, result_preview: Option<&str>) -> ToolCallRecord {

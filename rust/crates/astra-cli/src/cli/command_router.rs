@@ -1,7 +1,7 @@
 use super::*;
+use crate::chat_turn::is_auth_error;
 use crate::cli_utils::{fetch_session_trace_state, update_session_trace_state};
 use crate::permission_manager::PermissionMode;
-use crate::repl_turn::is_auth_error;
 use astra_thin_client::paths;
 use clap::CommandFactory;
 use crossterm::style::Stylize;
@@ -333,12 +333,12 @@ fn render_bug_args(args: &BugArgs) -> String {
     }
 }
 
-fn maybe_load_project_instructions(state: &mut ReplState) {
+fn maybe_load_project_instructions(state: &mut SessionState) {
     state.project_instructions = discover_project_instructions();
 }
 
 fn maybe_wire_delegation_engine(
-    state: &mut ReplState,
+    state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
     token: &str,
 ) {
@@ -374,7 +374,7 @@ async fn execute_repl_bridge_command(
 ) -> Result<ExitCode, String> {
     try_silent_auth(api, profile).await;
 
-    let mut state = initialize_repl_state(profile, global_model);
+    let mut state = initialize_session_state(profile, global_model);
     if let Ok(sid) = std::env::var("ASTRA_CLI_SESSION_ID") {
         state.session_id = Some(sid);
     }
@@ -383,7 +383,7 @@ async fn execute_repl_bridge_command(
     }
     maybe_load_project_instructions(&mut state);
 
-    let (_selector, pipeline_modules) = create_tool_selector(api, profile);
+    let pipeline_modules = create_pipeline_modules(api, profile);
     state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
@@ -427,7 +427,7 @@ async fn execute_repl_bridge_command(
     Ok(ExitCode::Success)
 }
 
-fn handle_permission_command(arg: &str, state: &mut ReplState) {
+fn handle_permission_command(arg: &str, state: &mut SessionState) {
     use permission_manager::PermissionMode;
 
     match arg {
@@ -489,10 +489,9 @@ pub(super) async fn execute_cli_command(
     api: &astra_thin_client::ThinClient,
     no_instructions: bool,
     max_budget: f64,
-    use_tui: bool,
 ) -> Result<ExitCode, String> {
     match command {
-        // No subcommand → interactive REPL (Codex-style default)
+        // No subcommand → interactive TUI (Codex-style default)
         None | Some(Command::Interactive) => {
             run_interactive_chat(
                 api,
@@ -501,7 +500,6 @@ pub(super) async fn execute_cli_command(
                 None,
                 no_instructions,
                 max_budget,
-                use_tui,
             )
             .await?;
             Ok(ExitCode::Success)
@@ -533,7 +531,7 @@ pub(super) async fn execute_cli_command(
             let mut continuation_messages = session_id
                 .as_deref()
                 .and_then(load_session_messages_for_continuation);
-            let selector = create_tool_selector(api, profile.as_deref());
+            let _pipeline = create_pipeline_modules(api, profile.as_deref());
             let mut pm = PermissionManager::with_project(
                 auto_approve,
                 &std::env::current_dir().unwrap_or_default(),
@@ -550,7 +548,6 @@ pub(super) async fn execute_cli_command(
                 render_md: terminal::size().is_ok(),
                 verbose_mode: true,
                 render_policy: crate::stream_render::RenderPolicy::Stream,
-                selector: &*selector.0,
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 skill_search: &skill_search,
                 // Non-Chat (Message-style) path — legacy single-shot
@@ -590,9 +587,9 @@ pub(super) async fn execute_cli_command(
                     .map_err(|f| f.error)?
                 }
                 Err(e) if is_auth_error(&e.error) => {
-                    if repl_runtime::attempt_token_refresh(api, profile.as_deref()).await {
+                    if session_runtime::attempt_token_refresh(api, profile.as_deref()).await {
                         if let Some(new_token) =
-                            repl_runtime::current_access_token(profile.as_deref())
+                            session_runtime::current_access_token(profile.as_deref())
                         {
                             eprintln!("  {} Token refreshed, retrying…", crate::theme::icon_ok());
                             stream_chat_sse(ChatTurnParams::basic_cli(
@@ -968,7 +965,7 @@ pub(super) async fn execute_cli_command(
                 }
                 m
             } else {
-                // No message → start REPL with optional pre-set session/model
+                // No message → start interactive TUI with optional pre-set session/model
                 let model = args.model.as_deref().or(global_model.as_deref());
                 run_interactive_chat(
                     api,
@@ -977,7 +974,6 @@ pub(super) async fn execute_cli_command(
                     None,
                     no_instructions,
                     max_budget,
-                    use_tui,
                 )
                 .await?;
                 return Ok(ExitCode::Success);
@@ -993,7 +989,7 @@ pub(super) async fn execute_cli_command(
                 .as_deref()
                 .and_then(load_session_messages_for_continuation);
             let is_tty = terminal::size().is_ok();
-            let selector = create_tool_selector(api, profile.as_deref());
+            let _pipeline = create_pipeline_modules(api, profile.as_deref());
             let mut pm = {
                 let project_root = std::env::current_dir().unwrap_or_default();
                 if let Some(ref mode_str) = args.permission_mode {
@@ -1078,7 +1074,6 @@ pub(super) async fn execute_cli_command(
                 render_md,
                 verbose_mode: !quiet,
                 render_policy,
-                selector: &*selector.0,
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 skill_search: &skill_search,
                 agent_spawner: Some(one_shot_spawner),
@@ -1155,10 +1150,6 @@ pub(super) async fn execute_cli_command(
                 if let Some(obj) = json_output.as_object_mut() {
                     obj.insert("ttft_ms".to_string(), serde_json::json!(sr.ttft_ms));
                     obj.insert("context_ms".to_string(), serde_json::json!(sr.context_ms));
-                    obj.insert(
-                        "selector_strategy".to_string(),
-                        serde_json::json!(sr.selector_strategy),
-                    );
                     obj.insert(
                         "background_agent_results".to_string(),
                         serde_json::json!(
@@ -1816,7 +1807,7 @@ pub(super) async fn run_print_mode(
     let mut continuation_messages = session_id
         .as_deref()
         .and_then(load_session_messages_for_continuation);
-    let selector = create_tool_selector(api, profile);
+    let _pipeline = create_pipeline_modules(api, profile);
     // Issue #326 P0 / R1 Major 2: print mode (headless `astra -p`) is
     // non-interactive — there is no TUI to ask for approvals. We force
     // `auto_approve = true` (= PermissionMode::Auto) here. The
@@ -1853,7 +1844,6 @@ pub(super) async fn run_print_mode(
         render_md: false,
         verbose_mode: false,
         render_policy: crate::stream_render::RenderPolicy::Silent,
-        selector: &*selector.0,
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
         skill_search: &skill_search,
         agent_spawner: None,
@@ -3272,12 +3262,7 @@ mod exit_code_tests {
             last_heavy_checkpoint: None,
             ttft_ms: None,
             context_ms: None,
-            selector_strategy: None,
-            selector_ms: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
             memoria_ms: None,
-            selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
@@ -3560,12 +3545,7 @@ mod final_json_output_tests {
             last_heavy_checkpoint: None,
             ttft_ms: None,
             context_ms: None,
-            selector_strategy: None,
-            selector_ms: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
             memoria_ms: None,
-            selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,

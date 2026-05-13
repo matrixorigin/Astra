@@ -1276,8 +1276,8 @@ impl ServerToolExecutor {
             }
             // ── Tool search (first-class activation primitive) ─────────
             //
-            // Lets the LLM look up schemas for deferred tools listed in
-            // `<deferred_tools>` via `tool_search(query="select:NAME")`.
+            // Lets the LLM look up schemas by name via
+            // `tool_search(query="select:NAME")`.
             // Schema pool = static server allowlist + plugin schemas
             // installed via `set_plugin_schemas`. Without the union,
             // MCP/skill-backed tools would never resolve.

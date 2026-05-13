@@ -53,24 +53,25 @@ fn find_model_list_entry<'a>(
         .find(|m| model_list_entry_name(m).is_some_and(|n| n.eq_ignore_ascii_case(name)))
 }
 
-/// Returns `true` when the REPL should exit.
-pub(super) async fn handle_slash_command(
+/// Slash-command fallback path used by the TUI for state-bearing
+/// commands (`/clear`, `/undo`, `/redo`, `/compact`, `/explain`,
+/// `/verbose`, `/reflect`, `/model`, etc.) that are dispatched from
+/// `tui::slash_dispatch::SlashResult::Fallback`. Returns `Ok(true)`
+/// when the caller should exit.
+pub(crate) async fn handle_slash_command(
     line: &str,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    state: &mut ReplState,
+    state: &mut SessionState,
     token: Option<&str>,
-    selector: &dyn tool_selector::ToolSelector,
 ) -> Result<bool, String> {
-    clear_slash_overlay();
-
     let mut parts = line.splitn(2, ' ');
     let raw_cmd = parts.next().unwrap_or("");
     let arg = parts.next().unwrap_or("").trim();
-    let cmd = match resolve_slash_command(raw_cmd) {
+    let cmd = match command_registry::resolve_command(raw_cmd) {
         Ok(command) => command,
         Err(candidates) if candidates.is_empty() => {
-            let suggestions = suggest_commands(raw_cmd, 3);
+            let suggestions = command_registry::suggest_commands(raw_cmd, 3);
             if suggestions.is_empty() {
                 eprintln!(
                     "{}",
@@ -96,10 +97,6 @@ pub(super) async fn handle_slash_command(
         }
     };
 
-    if cmd == "/" && arg.is_empty() && is_slash_picker_active() {
-        return Ok(false);
-    }
-
     if let Err(err) = command_usage::record_command_use(cmd) {
         eprintln!(
             "{}",
@@ -108,14 +105,8 @@ pub(super) async fn handle_slash_command(
     }
 
     match cmd {
-        "/" | "/?" | "/commands" | "/help" => {
-            if arg.trim() == "keys" {
-                print_keyboard_shortcuts()
-            } else {
-                print_slash_commands(Some(arg))
-            }
-        }
-
+        // `/help`, `/`, `/?`, `/commands` are handled by `tui::slash_dispatch`;
+        // they should not fall through to this path.
         "/model" if arg.is_empty() => {
             let Some(tok) = token else {
                 eprintln!("{}", "  Not logged in. Use /login.".yellow());
@@ -312,7 +303,7 @@ pub(super) async fn handle_slash_command(
 
         "/config" => slash_config::handle_config_command(arg),
 
-        "/checkpoint" => match create_manual_repl_checkpoint(state, arg) {
+        "/checkpoint" => match create_manual_checkpoint(state, arg) {
             Ok(summary) => {
                 eprintln!("  {} {}", theme::icon_ok(), summary.headline().green());
                 eprintln!(
@@ -517,7 +508,6 @@ pub(super) async fn handle_slash_command(
                     api,
                     profile,
                     token,
-                    selector,
                 },
                 state,
             )
@@ -596,7 +586,7 @@ pub(super) async fn handle_slash_command(
         }
 
         _ => {
-            let suggestions = suggest_commands(cmd, 3);
+            let suggestions = command_registry::suggest_commands(cmd, 3);
             if suggestions.is_empty() {
                 eprintln!(
                     "{}",

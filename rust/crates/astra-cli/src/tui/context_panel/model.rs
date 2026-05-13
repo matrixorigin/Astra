@@ -18,7 +18,7 @@ use astra_turn_core::context_assembly_trace::{
     ContextAssemblyTrace, DecisionExplanation, DecisionType, MemoryInjection, MemoryRejection,
     MemorySelection, RejectionReason, SkillInjection, ToolSelected,
 };
-use astra_turn_core::skill_selector_metrics::SkillSelectorShortlistEntry;
+
 use ratatui::style::Color;
 
 /// The full breakdown the panel renders.  Aggregates the top-level
@@ -149,7 +149,7 @@ pub(crate) enum SignalKind {
 }
 
 /// Session + budget summary built from [`ContextSnapshot::session`]
-/// (which in turn wraps `ReplState` fields).  Rendered as a
+/// (which in turn wraps `SessionState` fields).  Rendered as a
 /// dedicated section so users can see cost, token totals, and
 /// sticky state that drives follow-up turns.
 #[derive(Debug, Clone, PartialEq)]
@@ -452,7 +452,7 @@ pub(crate) struct ContextSnapshot<'a> {
     /// section (e.g. `~/.astra/rules/…`).
     pub user_rules_path: Option<String>,
     /// Session + budget state the trace doesn't carry. Populated
-    /// by the `/context` dispatch from `ReplState`.
+    /// by the `/context` dispatch from `SessionState`.
     pub session: Option<SessionSummary>,
     /// User-activated system skills (from `/skill` or auto-detect).
     /// These feed the prompt via `edge_profile.active_skills` but
@@ -601,24 +601,6 @@ impl ContextBreakdown {
             })
             .collect();
         skills.sort_by_key(|s| std::cmp::Reverse(s.tokens));
-        if skills.is_empty()
-            && let Some(shortlist) = trace.skill_selector.as_ref()
-        {
-            skills = shortlist
-                .skills
-                .iter()
-                .map(|e: &SkillSelectorShortlistEntry| SkillItem {
-                    name: e.skill_name.clone(),
-                    tokens: 0,
-                    description: if e.description.is_empty() {
-                        None
-                    } else {
-                        Some(e.description.clone())
-                    },
-                    source: Some(e.source.clone()),
-                })
-                .collect();
-        }
         // Last-resort fallback: the trace is silent but the CLI
         // state knows which system skills are currently loaded
         // via `/skill` (or auto-detect).  Surface them so users
