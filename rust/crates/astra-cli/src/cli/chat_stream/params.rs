@@ -91,6 +91,12 @@ pub enum StreamEvent {
 pub type StreamEventTx = mpsc::UnboundedSender<StreamEvent>;
 
 /// User's response to an approval prompt.
+///
+/// Issue #326 P0 / R2 Minor 4: `AutoRunSession` was removed because
+/// its semantics ("flip the whole session into Auto mode") clashed
+/// with P3's per-fingerprint `AllowScope::RestOfSession`. Global mode
+/// changes now go through the status line / `/mode auto` slash
+/// command; this enum stays focused on per-call decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalResponse {
     /// Allow this one invocation.
@@ -99,18 +105,13 @@ pub enum ApprovalResponse {
     Deny,
     /// Always allow this tool pattern (persistent rule).
     AlwaysAllow,
-    /// Switch to auto-run mode for the rest of the session.
-    AutoRunSession,
     /// Skip this tool (deny without recording).
     Skip,
 }
 
 impl ApprovalResponse {
     pub fn is_approved(self) -> bool {
-        matches!(
-            self,
-            Self::AllowOnce | Self::AlwaysAllow | Self::AutoRunSession
-        )
+        matches!(self, Self::AllowOnce | Self::AlwaysAllow)
     }
 }
 

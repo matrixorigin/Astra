@@ -1976,10 +1976,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     );
                                 pm.add_allow_rule(&rule);
                             }
-                            ApprovalResponse::AutoRunSession => {
-                                pm.record_approval(&t, Some(args), true);
-                                pm.set_mode(crate::permission_manager::PermissionMode::Auto);
-                            }
                             ApprovalResponse::Skip | ApprovalResponse::Deny => {}
                         }
                     }
@@ -2191,11 +2187,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         // requests under the same directory
                                         // (from any tool) skip the prompt.
                                         pm.trust_sandbox_root_from_reason(sandbox_msg);
-                                    }
-                                    if response == ApprovalResponse::AutoRunSession {
-                                        pm.set_mode(
-                                            crate::permission_manager::PermissionMode::Auto,
-                                        );
                                     }
                                     if response.is_approved() {
                                         pm.record_approval(&sandbox_tool_key, Some(args), true);

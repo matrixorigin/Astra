@@ -501,9 +501,14 @@ async fn run_chat_repl(
                         let autorun = trimmed == "!" || trimmed == "all" || trimmed == "yolo";
                         let denied = trimmed == "n" || trimmed == "no";
                         if approved || autorun || denied {
-                            let response = if autorun {
-                                chat_stream::ApprovalResponse::AutoRunSession
-                            } else if denied {
+                            // Issue #326 P0 / R2 Minor 4: AutoRunSession
+                            // variant is gone. "!"/"all"/"yolo" now
+                            // means: approve this one call AND flip
+                            // global mode to Auto for the rest of the
+                            // session — two separate effects, applied
+                            // here explicitly instead of bundled into
+                            // an ApprovalResponse variant.
+                            let response = if denied {
                                 chat_stream::ApprovalResponse::Deny
                             } else {
                                 chat_stream::ApprovalResponse::AllowOnce
