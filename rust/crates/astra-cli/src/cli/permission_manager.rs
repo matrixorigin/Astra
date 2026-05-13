@@ -149,49 +149,24 @@ fn content_aware_fingerprint(
     }
 }
 
-/// Permission mode controls how tool approval decisions are handled.
-///
-/// Issue #326 P0 / R1 Minor 5: `BypassSafety` is the domain-type
-/// name for what the UI displays as "YOLO".
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum PermissionMode {
-    /// Auto-approve all tools (except bypass-immune safety checks).
-    Auto,
-    /// Prompt the user for write/execute tools (default interactive mode).
-    Prompt,
-    /// Deny all write/execute tools without prompting (CI/headless mode).
-    Deny,
-    /// YOLO — skip every approval prompt. Bypass-immune hard-deny
-    /// rules still fire (catastrophic-command circuit breaker,
-    /// sensitive-path protections, git destructive guard).
-    BypassSafety,
-}
+// ─── Permission types: re-exports from astra-turn-core ──────────────
+//
+// Issue #326 P1 / R1 §1 / R2 Major 4: previously this file defined
+// its own `PermissionMode`, `PermissionRule`, and `PermissionDecision`
+// alongside the ones in `astra-turn-core::permission_types`. Three
+// independent type names with overlapping semantics caused a string-
+// roundtrip wart at every crate boundary (`with_inherited` matched
+// the cli enum, then converted to turn-core, then back).
+//
+// We now use turn-core's types directly via type aliases; the rule
+// parser and matcher are identical (compared field-by-field) so this
+// is a pure rename + import change. The CLI keeps its own
+// `PermissionDecision` (renamed to `GateOutcome` in P1) because its
+// shape (Allow / Deny / NeedApproval) is genuinely different from
+// turn-core's `PermissionDecision` (Approve / Deny / Escalate).
+pub(super) use astra_turn_core::permission_types::PermissionMode;
+pub(super) use astra_turn_core::permission_types::PermissionRule;
 
-impl std::str::FromStr for PermissionMode {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "prompt" => Ok(Self::Prompt),
-            "deny" => Ok(Self::Deny),
-            "bypass-safety" | "bypass_safety" | "yolo" => Ok(Self::BypassSafety),
-            _ => Err(format!(
-                "invalid permission mode '{s}': expected auto, prompt, deny, or bypass-safety (alias: yolo)"
-            )),
-        }
-    }
-}
-
-impl std::fmt::Display for PermissionMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Auto => write!(f, "auto"),
-            Self::Prompt => write!(f, "prompt"),
-            Self::Deny => write!(f, "deny"),
-            Self::BypassSafety => write!(f, "bypass-safety"),
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SideEffect {
@@ -205,70 +180,6 @@ enum ExecuteDecision {
     AllowSilent,
     Ask,
     Deny,
-}
-
-/// A permission rule loaded from settings or added at runtime.
-/// Format: `ToolName` or `ToolName(pattern:*)` for prefix matching.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct PermissionRule {
-    pub tool: String,
-    pub pattern: Option<String>,
-}
-
-impl PermissionRule {
-    fn parse(rule_str: &str) -> Self {
-        // Parse "Bash(git commit:*)" → tool="bash", pattern=Some("git commit")
-        // Parse "Edit" → tool="edit", pattern=None
-        if let Some(paren_start) = rule_str.find('(')
-            && let Some(paren_end) = rule_str.rfind(')')
-        {
-            let tool = rule_str[..paren_start].to_lowercase();
-            let inner = &rule_str[paren_start + 1..paren_end];
-            let pattern = inner.trim_end_matches(":*").trim_end_matches('*');
-            return Self {
-                tool,
-                pattern: Some(pattern.to_string()),
-            };
-        }
-        Self {
-            tool: rule_str.to_lowercase(),
-            pattern: None,
-        }
-    }
-
-    fn matches(&self, tool_name: &str, command: Option<&str>) -> bool {
-        if self.tool != tool_name.to_lowercase() {
-            return false;
-        }
-        match (&self.pattern, command) {
-            (None, _) => true, // Bare tool name matches all
-            (Some(prefix), Some(cmd)) => {
-                let lower_cmd = cmd.to_lowercase();
-                let lower_prefix = prefix.to_lowercase();
-                // Prefix match with word boundary: "git commit" matches
-                // "git commit -m 'foo'" but not "git commitizen".
-                if !lower_cmd.starts_with(&lower_prefix) {
-                    return false;
-                }
-                // After the prefix, the next char must be whitespace, end of string,
-                // or a separator — prevents "git commit" matching "git commitizen".
-                let rest = &lower_cmd[lower_prefix.len()..];
-                rest.is_empty()
-                    || rest.starts_with(char::is_whitespace)
-                    || rest.starts_with(&['-', '=', ';', '|', '&', '>', '<'][..])
-            }
-            (Some(_), None) => false, // Pattern rule but no command to match
-        }
-    }
-}
-
-impl std::fmt::Display for PermissionRule {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.pattern {
-            Some(pat) => write!(f, "{}({}:*)", self.tool, pat),
-            None => write!(f, "{}", self.tool),
-        }
-    }
 }
 
 /// Persistent permission settings, loaded from and saved to disk.
@@ -2227,9 +2138,21 @@ impl PermissionManager {
     }
 }
 
-/// Result of a non-blocking permission check.
+/// Outcome of a non-blocking permission gate evaluation.
+///
+/// Issue #326 P1 / R1 §1: this used to be called `PermissionDecision`,
+/// which collided with `astra_turn_core::permission_types::PermissionDecision`
+/// (a different shape: Approve / Deny / Escalate). The CLI gate
+/// produces a different envelope (Allow / Deny / NeedApproval) — the
+/// turn-core type is for callbacks inside the runtime, this one is
+/// what the gate hands back to the stream host. We rename to
+/// `GateOutcome` so the two never get confused at a use site.
+///
+/// The legacy alias `PermissionDecision` is kept for one PR cycle
+/// to avoid churning every call site; new code should use
+/// `GateOutcome`.
 #[derive(Debug)]
-pub(super) enum PermissionDecision {
+pub(super) enum GateOutcome {
     Allow,
     Deny(String),
     /// Tool requires interactive approval — route through async channel.
@@ -2240,6 +2163,11 @@ pub(super) enum PermissionDecision {
         reason: String,
     },
 }
+
+/// Backwards-compatible alias for the previous name. Exists only so
+/// the existing call sites in `stream_render.rs` etc. keep compiling
+/// during the P1 type-merge transition. Will be removed in P2.
+pub(super) type PermissionDecision = GateOutcome;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ApprovalPromptKind {
