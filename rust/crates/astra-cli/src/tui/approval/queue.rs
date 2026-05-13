@@ -65,6 +65,19 @@ pub(crate) struct PendingApproval {
     /// is not eligible for Always (e.g. compound shell command,
     /// MCP unknown capability).
     pub will_save_preview: Option<String>,
+    /// Issue #326 P3 / P5f / R2 Major 3: host-computed digest of
+    /// the file the tool will mutate, snapshotted at the moment
+    /// the approval enters the queue. The executor compares this
+    /// against a fresh digest right before running the tool; a
+    /// mismatch surfaces a stale-approval reject and a re-prompt
+    /// with the new diff. `None` for non-file tools or for
+    /// brand-new writes (where the file doesn't exist yet).
+    ///
+    /// Crucially: this is set by the host, NOT by the LLM. R2
+    /// Major 3 explicitly forbids trusting an `expected_base_sha`
+    /// arg from the model.
+    pub base_digest:
+        Option<astra_turn_core::approval_base_digest::BaseDigest>,
 }
 
 /// Metadata attached to a [`PendingApproval`] beyond the basic
@@ -78,6 +91,10 @@ pub(crate) struct ApprovalMetadata {
     pub host: Option<String>,
     pub risk_tags: Vec<astra_turn_core::permission_engine::RiskTag>,
     pub will_save_preview: Option<String>,
+    /// Host-computed snapshot of the file the tool will mutate;
+    /// see [`PendingApproval::base_digest`].
+    pub base_digest:
+        Option<astra_turn_core::approval_base_digest::BaseDigest>,
 }
 
 impl ApprovalMetadata {
@@ -117,6 +134,19 @@ impl ApprovalMetadata {
         self.mcp_capability = Some(meta);
         self
     }
+
+    /// Issue #326 P3 / P5f: snapshot the file's current digest at
+    /// approval enqueue time. The executor uses this to detect
+    /// stale approvals (file modified between approval and
+    /// execution) and re-prompt with the new diff.
+    #[must_use]
+    pub fn with_base_digest(
+        mut self,
+        digest: astra_turn_core::approval_base_digest::BaseDigest,
+    ) -> Self {
+        self.base_digest = Some(digest);
+        self
+    }
 }
 
 impl std::fmt::Debug for PendingApproval {
@@ -132,6 +162,7 @@ impl std::fmt::Debug for PendingApproval {
             .field("host", &self.host)
             .field("risk_tag_count", &self.risk_tags.len())
             .field("will_save_preview", &self.will_save_preview)
+            .field("base_digest", &self.base_digest.as_ref().map(|d| d.short_display()))
             .field(
                 "mcp_capability_known",
                 &self.mcp_capability.as_ref().map(|m| m.is_known()),
@@ -258,6 +289,7 @@ impl ApprovalQueue {
             host: metadata.host,
             risk_tags: metadata.risk_tags,
             will_save_preview: metadata.will_save_preview,
+            base_digest: metadata.base_digest,
         });
         // Promote pre-existing entries too — they now share the queue
         // and should expose the batch buttons on their next focus.
@@ -398,6 +430,23 @@ impl ApprovalQueue {
     pub fn focused_view(&self) -> Option<ApprovalView> {
         self.entries.get(self.focus).map(ApprovalView::from)
     }
+
+    /// Issue #326 P5f: stale-revalidate the focused entry's
+    /// approval against the file's current bytes.
+    ///
+    /// Returns `None` when the entry doesn't carry a base_digest
+    /// (e.g. non-file tools, brand-new writes). Otherwise reads
+    /// the file at `path` and returns the [`StaleCheck`] outcome.
+    pub fn focused_stale_check(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<std::io::Result<astra_turn_core::approval_base_digest::StaleCheck>> {
+        let entry = self.entries.get(self.focus)?;
+        Some(astra_turn_core::approval_base_digest::stale_check(
+            path,
+            entry.base_digest.clone(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -493,5 +542,93 @@ mod tests {
         let view = q.focused_view().unwrap();
         assert_eq!(view.risk_tag_labels, vec!["BashExecute"]);
         assert_eq!(view.will_save_preview.as_deref(), Some("Bash(npm test:*)"));
+    }
+
+    // ── Issue #326 P3 / P5f / R2 Major 3: base digest ──
+
+    #[test]
+    fn focused_stale_check_handles_request_without_digest() {
+        // For non-file tools (no base_digest set), focused_stale_check
+        // still returns Some(...) — the underlying stale_check
+        // helper interprets None previous as "file should be
+        // brand-new". This is the right behaviour because edit-vs-
+        // not-edit decisions live higher up; the queue accessor
+        // just runs the comparison.
+        let mut q = ApprovalQueue::new();
+        let (tx, _rx) = oneshot::channel();
+        q.push("write_file".into(), "h".into(), None, "r".into(), tx);
+        let path = std::env::temp_dir().join("definitely-does-not-exist-326-test");
+        let _ = std::fs::remove_file(&path); // best-effort
+        let result = q.focused_stale_check(&path).unwrap().unwrap();
+        // No previous, no current → StillAbsent (Fresh).
+        assert!(result.is_fresh());
+    }
+
+    #[test]
+    fn focused_stale_check_returns_none_when_queue_empty() {
+        // Returns None only when the focus index has no entry —
+        // the empty-queue case.
+        let q = ApprovalQueue::new();
+        let path = std::env::temp_dir();
+        assert!(q.focused_stale_check(&path).is_none());
+    }
+
+    #[test]
+    fn focused_stale_check_detects_modified_file() {
+        // Take a digest, modify the file, ensure stale_check
+        // surfaces the change. Locks the contract that approvals
+        // bound to a digest can see "the file is no longer the
+        // file you approved".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, b"baseline").unwrap();
+        let digest =
+            astra_turn_core::approval_base_digest::compute_file_digest(&path)
+                .unwrap()
+                .unwrap();
+
+        let mut q = ApprovalQueue::new();
+        let (tx, _rx) = oneshot::channel();
+        q.push_with_metadata(
+            "write_file".into(),
+            "h".into(),
+            None,
+            "r".into(),
+            tx,
+            ApprovalMetadata::default().with_base_digest(digest),
+        );
+
+        // Mutate the file behind the queue's back.
+        std::fs::write(&path, b"changed").unwrap();
+        let result = q.focused_stale_check(&path).unwrap().unwrap();
+        match result {
+            astra_turn_core::approval_base_digest::StaleCheck::Stale { .. } => {}
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn focused_stale_check_fresh_when_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, b"baseline").unwrap();
+        let digest =
+            astra_turn_core::approval_base_digest::compute_file_digest(&path)
+                .unwrap()
+                .unwrap();
+
+        let mut q = ApprovalQueue::new();
+        let (tx, _rx) = oneshot::channel();
+        q.push_with_metadata(
+            "write_file".into(),
+            "h".into(),
+            None,
+            "r".into(),
+            tx,
+            ApprovalMetadata::default().with_base_digest(digest),
+        );
+
+        let result = q.focused_stale_check(&path).unwrap().unwrap();
+        assert!(result.is_fresh());
     }
 }
