@@ -831,7 +831,16 @@ impl ToolHealthTracker {
                 });
             }
         }
-        entries.sort_by_key(|e| std::cmp::Reverse(e.at_epoch));
+        // Sort newest-first; break at_epoch ties on signature_hint so output
+        // is deterministic across HashMap iteration orders. Without the tie
+        // break, two failures sharing the same second-resolution timestamp
+        // would arrive in non-deterministic order, and `truncate(limit)` could
+        // silently drop different entries run-to-run.
+        entries.sort_by(|a, b| {
+            b.at_epoch
+                .cmp(&a.at_epoch)
+                .then_with(|| a.signature_hint.cmp(&b.signature_hint))
+        });
         entries.truncate(limit);
         entries
     }

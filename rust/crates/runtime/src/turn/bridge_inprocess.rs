@@ -1858,8 +1858,17 @@ impl InProcessChatTurnBridge {
             llm_messages.extend(merged_messages);
 
             // Apply context release: stub tool results the agent marked as
-            // no longer needed so they don't consume tokens.
-            apply_session_context_release(&session_id, &mut llm_messages);
+            // no longer needed so they don't consume tokens. Idempotent: runs
+            // every turn, so emit the per-turn stub count for observability.
+            let released_count = apply_session_context_release(&session_id, &mut llm_messages);
+            if released_count > 0 {
+                tracing::debug!(
+                    target: "astra::runtime::context_release",
+                    session_id = %session_id,
+                    stubbed = released_count,
+                    "context_release applied"
+                );
+            }
 
             // Strip old reasoning_content from history messages to reduce token
             // usage. Keeps the field (as empty string) for thinking-model API

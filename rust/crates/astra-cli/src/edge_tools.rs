@@ -1423,14 +1423,18 @@ impl ToolExecutor {
             Some(s) if !s.trim().is_empty() => s,
             _ => return "Error: no active session.".to_string(),
         };
-        // Accept single ID or array of IDs
-        let ids: Vec<String> = if let Some(arr) = args.get("tool_call_id").and_then(Value::as_array)
-        {
+        // Accept single ID or array of IDs. `tool_call_ids` (plural) is
+        // accepted as an alias so a typo in the agent prompt doesn't silently
+        // fall through to the missing-parameter error.
+        let raw = args
+            .get("tool_call_id")
+            .or_else(|| args.get("tool_call_ids"));
+        let ids: Vec<String> = if let Some(arr) = raw.and_then(Value::as_array) {
             arr.iter()
                 .filter_map(Value::as_str)
                 .map(String::from)
                 .collect()
-        } else if let Some(id) = args.get("tool_call_id").and_then(Value::as_str) {
+        } else if let Some(id) = raw.and_then(Value::as_str) {
             vec![id.to_string()]
         } else {
             return "Error: missing required parameter `tool_call_id` (string or array)."
