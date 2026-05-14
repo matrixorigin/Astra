@@ -18,6 +18,7 @@
 //! See repository `README.md` for `RUST_LOG` / `ASTRA_LOG_FORMAT`.
 
 use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "astra")]
@@ -470,10 +471,16 @@ pub(crate) enum TaskSubcommand {
     Done(TaskQueryArgs),
     /// Show task status and details
     Status(TaskQueryArgs),
-    /// Run a background task with the agent
-    Run(TaskTextArgs),
+    /// Run a headless task with the agent
+    Run(TaskRunArgs),
+    /// Queue a MatrixOne-backed cloud task without executing it locally (cloud-agent ops)
+    #[command(hide = true)]
+    Queue(TaskQueueArgs),
+    /// Claim and execute queued MatrixOne-backed cloud tasks (cloud-agent ops)
+    #[command(hide = true)]
+    Worker(TaskWorkerArgs),
     /// Show the result of a task run
-    Result(TaskQueryArgs),
+    Result(TaskResultArgs),
 }
 
 #[derive(Args, Debug)]
@@ -484,6 +491,62 @@ pub(crate) struct TaskTextArgs {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct TaskRunArgs {
+    /// Output task result and metadata as JSON
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+    /// Suppress progress output; only print the final answer
+    #[arg(long, default_value_t = false)]
+    pub quiet: bool,
+    /// Emit structured JSONL lifecycle/stream events to stderr
+    #[arg(long = "stream-events", hide = true, default_value_t = false)]
+    pub stream_events: bool,
+    /// Task prompt
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+    pub text: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct TaskQueueArgs {
+    /// Output queued task metadata as JSON
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+    /// Task prompt to queue
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+    pub text: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct TaskWorkerArgs {
+    /// Edge agent identifier used for task leases
+    #[arg(long)]
+    pub agent_id: Option<String>,
+    /// Claim and execute at most one task, then exit
+    #[arg(long, default_value_t = false)]
+    pub once: bool,
+    /// Keep polling for work until interrupted
+    #[arg(long = "loop", default_value_t = false)]
+    pub loop_mode: bool,
+    /// Seconds to wait between polls when --loop is set
+    #[arg(long, default_value_t = 5)]
+    pub poll_seconds: u64,
+    /// Lease TTL in seconds
+    #[arg(long, default_value_t = 900)]
+    pub ttl_seconds: i64,
+    /// Output lifecycle metadata as JSON
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+    /// Suppress task output while the worker runs
+    #[arg(long, default_value_t = false)]
+    pub quiet: bool,
+    /// Emit structured JSONL lifecycle/stream events to stderr while
+    /// executing the claimed task. Useful for a supervising process
+    /// (e.g. cloud agent) to tail worker progress.
+    #[arg(long = "stream-events", hide = true, default_value_t = false)]
+    pub stream_events: bool,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct TaskQueryArgs {
     /// Task id or title query
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
@@ -491,12 +554,19 @@ pub(crate) struct TaskQueryArgs {
 }
 
 #[derive(Args, Debug)]
-#[command(after_help = "Examples:\n  \
-        astra memory list\n  \
-        astra memory list --type profile\n  \
-        astra memory search 用户偏好\n  \
-        astra memory show <memory_id>\n  \
-        astra memory forget <memory_id>")]
+pub(crate) struct TaskResultArgs {
+    /// Output result as JSON
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+    /// Task id or title query
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+    pub query: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+#[command(
+    after_help = "Examples:\n  astra memory list\n  astra memory list --type profile\n  astra memory search 用户偏好\n  astra memory show <memory_id>\n  astra memory forget <memory_id>"
+)]
 pub(crate) struct MemoryArgs {
     #[command(subcommand)]
     pub command: Option<MemorySubcommand>,
@@ -609,7 +679,7 @@ pub(crate) struct GrepPatternArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra permissions status\n  astra permissions auto\n  astra permissions prompt\n  astra permissions rules"
+    after_help = "Examples:\n  astra permissions status\n  astra permissions auto\n  astra permissions prompt\n  astra permissions rules\n  astra permissions trust\n  astra permissions trace"
 )]
 pub(crate) struct PermissionsArgs {
     #[command(subcommand)]
@@ -630,6 +700,19 @@ pub(crate) enum PermissionsSubcommand {
     All,
     /// Show permission rules summary
     Rules,
+    /// Trust this workspace's project permission allow rules
+    Trust,
+    /// Mark this workspace untrusted and ignore project allow rules
+    Untrust,
+    /// Show recent permission audit events
+    Trace(PermissionsTraceArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct PermissionsTraceArgs {
+    /// Write redacted JSONL audit events to this file
+    #[arg(long = "export", value_name = "PATH")]
+    pub export: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

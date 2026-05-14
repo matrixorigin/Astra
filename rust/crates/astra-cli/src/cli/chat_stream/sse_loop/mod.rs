@@ -146,6 +146,7 @@ pub(crate) async fn stream_chat_sse(
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
     let root_agent_id = p.root_agent_id.unwrap_or("main");
+    p.perm_manager.clear_turn_overrides();
 
     // UX bridge: subscribe to the session-memory broker for this turn
     // and forward qualifying events to the CLI stream as `StatusLine`
@@ -237,6 +238,11 @@ pub(crate) async fn stream_chat_sse(
         } else {
             ex
         };
+        let ex = if let Some(ref cmds) = p.bg_task_commands {
+            ex.with_bg_task_commands(cmds.clone())
+        } else {
+            ex
+        };
         // Set turn index so journal entries are tagged for undo
         ex.journal_turn_index
             .store(p.turn_index, std::sync::atomic::Ordering::Release);
@@ -263,6 +269,7 @@ pub(crate) async fn stream_chat_sse(
                 spawner: spawner.clone(),
                 inherited_permissions: p.perm_manager.inherited_permissions_for_child(false),
                 active_skills: Vec::new(), // root agent — no inherited skills
+                live_event_sink: p.agent_live_event_sink.clone(),
             };
             ex.with_spawn_context(spawn_ctx)
         } else {
@@ -345,7 +352,7 @@ pub(crate) async fn stream_chat_sse(
     // Install MCP schemas on the edge executor so `tool_search(select:NAME)`
     // can resolve plugin tool schemas by name.
     executor.set_plugin_schemas(mcp_plugin_schemas);
-    let mut registry = ToolRegistry::new(all_schemas.clone());
+    let mut registry = ToolRegistry::new_runtime_surface(all_schemas.clone());
     // G3: when a DynamicAgentSpawner is wired, force-pin spawn_agent's
     // schema so the tfidf selector always surfaces it. Without this,
     // spawn_agent sits in all_schemas but TOOL_CATALOG has no entry
@@ -587,6 +594,8 @@ pub(crate) async fn stream_chat_sse(
         volatile_pending: Vec::new(),
         recent_rounds: Vec::new(),
         tool_results: Vec::new(),
+        session_memory_state: Default::default(),
+        session_memory_llm_params: None,
         current_session_id,
         current_run_id: Some(parent_turn_run_id.clone()),
         context_manifest_pool: None,

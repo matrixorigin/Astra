@@ -1,5 +1,11 @@
 use super::*;
 
+use crate::workspace_trust::{
+    TrustState, WorkspaceTrustEvaluation, WorkspaceTrustLedger, evaluate_workspace_trust,
+    project_permissions_hash,
+};
+#[cfg(test)]
+use crate::workspace_trust::{WorkspaceTrustReason, evaluate_workspace_trust_from_path};
 use astra_runtime::tool_sandbox::{
     CommandRisk, GitSafetyViolation, analyze_command_risks, is_dangerous_file_path,
     validate_git_command,
@@ -10,8 +16,13 @@ use astra_turn_core::cloud_approval_policy::{
     CloudGatedToolKind, bash_command_approval_reason, cloud_gated_tool_kind,
     cloud_gated_tool_kind_with_args,
 };
+use astra_turn_core::permission_engine::{
+    DecisionEnvelope, DecisionSource, HardDecision, allow_rule_preview,
+    allow_rule_preview_for_match_target,
+};
+use astra_turn_core::permission_match_target::{AllowMatchTarget, fingerprint_for_match_target};
 use astra_turn_core::tool_argument_hints::{
-    command_hint_from_args, path_hint_from_args, permission_prompt_primary_detail,
+    command_hint_from_args, path_hint_from_args, permission_prompt_display_label,
 };
 
 /// Classify a permission-denial reason and emit a short, actionable
@@ -149,40 +160,124 @@ fn content_aware_fingerprint(
     }
 }
 
-/// Permission mode controls how tool approval decisions are handled.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum PermissionMode {
-    /// Auto-approve all tools (except bypass-immune safety checks).
-    Auto,
-    /// Prompt the user for write/execute tools (default interactive mode).
-    Prompt,
-    /// Deny all write/execute tools without prompting (CI/headless mode).
-    Deny,
-}
+/// Candidate fingerprint for looking up a specific request in the override set.
+///
+/// Stored path rules may be exact, literal-prefix, directory-pattern, or bare
+/// tool rules. The lookup side must keep the raw path so exact rules for deep
+/// paths still match; broader stored patterns continue to subsume it.
+fn approval_lookup_fingerprint(
+    name: &str,
+    args: &serde_json::Value,
+) -> astra_turn_core::approval_fingerprint::ApprovalFingerprint {
+    use astra_turn_core::approval_fingerprint::ApprovalFingerprint;
 
-impl std::str::FromStr for PermissionMode {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "prompt" => Ok(Self::Prompt),
-            "deny" => Ok(Self::Deny),
-            _ => Err(format!(
-                "invalid permission mode '{s}': expected auto, prompt, or deny"
-            )),
+    match cloud_gated_tool_kind_with_args(name, Some(args)) {
+        Some(CloudGatedToolKind::Execute) => {
+            if let Some(cmd) = command_hint_from_args(args) {
+                let lower = cmd.to_ascii_lowercase();
+                let is_ro = is_read_only_allowlisted(&lower);
+                ApprovalFingerprint::shell(name, cmd, is_ro)
+            } else {
+                ApprovalFingerprint::bare(name)
+            }
         }
+        Some(CloudGatedToolKind::Write) => {
+            if let Some(path) = path_hint_from_args(args) {
+                ApprovalFingerprint::file_op_exact(name, Some(&path))
+            } else {
+                ApprovalFingerprint::bare(name)
+            }
+        }
+        None => ApprovalFingerprint::bare(name),
     }
 }
 
-impl std::fmt::Display for PermissionMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Auto => write!(f, "auto"),
-            Self::Prompt => write!(f, "prompt"),
-            Self::Deny => write!(f, "deny"),
+fn cloud_detail_lookup_fingerprint(
+    tool: &str,
+    detail: Option<&str>,
+) -> astra_turn_core::approval_fingerprint::ApprovalFingerprint {
+    use astra_turn_core::approval_fingerprint::ApprovalFingerprint;
+
+    match (cloud_gated_tool_kind(tool), detail) {
+        (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
+            ApprovalFingerprint::shell(tool, cmd, false)
         }
+        (Some(CloudGatedToolKind::Write), Some(path)) => {
+            ApprovalFingerprint::file_op_exact(tool, Some(path))
+        }
+        _ => ApprovalFingerprint::bare(tool),
     }
 }
+
+fn cloud_detail_is_sensitive(tool: &str, detail: Option<&str>) -> bool {
+    match (cloud_gated_tool_kind(tool), detail) {
+        (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
+            sensitive_path_match(&serde_json::json!({ "command": cmd })).is_some()
+        }
+        (Some(CloudGatedToolKind::Write), Some(path)) => {
+            sensitive_path_match(&serde_json::json!({ "path": path })).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn stored_override_allows_sensitive_path(
+    stored: &astra_turn_core::approval_fingerprint::ApprovalFingerprint,
+) -> bool {
+    if let Some(command) = stored
+        .command_exact
+        .as_deref()
+        .or(stored.command_prefix.as_deref())
+    {
+        return sensitive_path_match(&serde_json::json!({ "command": command })).is_some();
+    }
+
+    let Some(path) = stored.path_pattern.as_deref() else {
+        return false;
+    };
+
+    if stored.path_match == astra_turn_core::approval_fingerprint::PathMatchKind::Exact {
+        return true;
+    }
+
+    sensitive_path_match(&serde_json::json!({ "path": path })).is_some()
+}
+
+fn sensitive_path_match(args: &serde_json::Value) -> Option<String> {
+    if let Some(path) = path_hint_from_args(args)
+        && !path.is_empty()
+        && (is_dangerous_file_path(&path)
+            || astra_turn_core::permission_redact::matches_sensitive_path(&path))
+    {
+        return Some(path);
+    }
+    if let Some(cmd) = command_hint_from_args(args)
+        && !cmd.is_empty()
+        && (is_dangerous_file_path(cmd)
+            || astra_turn_core::permission_redact::matches_sensitive_path(cmd))
+    {
+        return Some(cmd.to_string());
+    }
+    None
+}
+
+// ─── Permission types: re-exports from astra-turn-core ──────────────
+//
+// Issue #326 P1 / R1 §1 / R2 Major 4: previously this file defined
+// its own `PermissionMode`, `PermissionRule`, and `PermissionDecision`
+// alongside the ones in `astra-turn-core::permission_types`. Three
+// independent type names with overlapping semantics caused a string-
+// roundtrip wart at every crate boundary (`with_inherited` matched
+// the cli enum, then converted to turn-core, then back).
+//
+// We now use turn-core's types directly via type aliases; the rule
+// parser and matcher are identical (compared field-by-field) so this
+// is a pure rename + import change. The CLI keeps its own
+// `PermissionDecision` (renamed to `GateOutcome` in P1) because its
+// shape (Allow / Deny / NeedApproval) is genuinely different from
+// turn-core's `PermissionDecision` (Approve / Deny / Escalate).
+pub(super) use astra_turn_core::permission_types::PermissionMode;
+pub(super) use astra_turn_core::permission_types::PermissionRule;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SideEffect {
@@ -198,70 +293,6 @@ enum ExecuteDecision {
     Deny,
 }
 
-/// A permission rule loaded from settings or added at runtime.
-/// Format: `ToolName` or `ToolName(pattern:*)` for prefix matching.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct PermissionRule {
-    pub tool: String,
-    pub pattern: Option<String>,
-}
-
-impl PermissionRule {
-    fn parse(rule_str: &str) -> Self {
-        // Parse "Bash(git commit:*)" → tool="bash", pattern=Some("git commit")
-        // Parse "Edit" → tool="edit", pattern=None
-        if let Some(paren_start) = rule_str.find('(')
-            && let Some(paren_end) = rule_str.rfind(')')
-        {
-            let tool = rule_str[..paren_start].to_lowercase();
-            let inner = &rule_str[paren_start + 1..paren_end];
-            let pattern = inner.trim_end_matches(":*").trim_end_matches('*');
-            return Self {
-                tool,
-                pattern: Some(pattern.to_string()),
-            };
-        }
-        Self {
-            tool: rule_str.to_lowercase(),
-            pattern: None,
-        }
-    }
-
-    fn matches(&self, tool_name: &str, command: Option<&str>) -> bool {
-        if self.tool != tool_name.to_lowercase() {
-            return false;
-        }
-        match (&self.pattern, command) {
-            (None, _) => true, // Bare tool name matches all
-            (Some(prefix), Some(cmd)) => {
-                let lower_cmd = cmd.to_lowercase();
-                let lower_prefix = prefix.to_lowercase();
-                // Prefix match with word boundary: "git commit" matches
-                // "git commit -m 'foo'" but not "git commitizen".
-                if !lower_cmd.starts_with(&lower_prefix) {
-                    return false;
-                }
-                // After the prefix, the next char must be whitespace, end of string,
-                // or a separator — prevents "git commit" matching "git commitizen".
-                let rest = &lower_cmd[lower_prefix.len()..];
-                rest.is_empty()
-                    || rest.starts_with(char::is_whitespace)
-                    || rest.starts_with(&['-', '=', ';', '|', '&', '>', '<'][..])
-            }
-            (Some(_), None) => false, // Pattern rule but no command to match
-        }
-    }
-}
-
-impl std::fmt::Display for PermissionRule {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.pattern {
-            Some(pat) => write!(f, "{}({}:*)", self.tool, pat),
-            None => write!(f, "{}", self.tool),
-        }
-    }
-}
-
 /// Persistent permission settings, loaded from and saved to disk.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(super) struct PermissionSettings {
@@ -275,55 +306,541 @@ pub(super) struct PermissionSettings {
     /// unless the user sets this to `true` at project or user scope.
     #[serde(default)]
     pub allow_sensitive_path_writes: bool,
+    /// Issue #326 P1.5b / R2 Major 2: grammar version. Files
+    /// without this field (every file written by astra prior to
+    /// this PR) are treated as v1 and parsed leniently. New
+    /// saves stamp `grammar_version = 2` so future readers know
+    /// the file is in the structured-key form
+    /// (`Bash(argv_prefix="…")`). The grammar-v2 parser is
+    /// backward-compatible: v1 strings still parse correctly.
+    #[serde(default)]
+    pub grammar_version: u32,
+}
+
+/// Outcome of loading a `permissions.json` file.
+///
+/// Carries `settings` (always non-None — a `LoadError` falls back to
+/// `Self::default()`) plus an optional `error` describing what went
+/// wrong so the TUI can show a banner instead of silently dropping a
+/// corrupt file.
+#[derive(Debug)]
+pub struct PermissionSettingsLoadOutcome {
+    pub settings: PermissionSettings,
+    pub error: Option<PermissionSettingsLoadError>,
+}
+
+/// Reasons a `permissions.json` failed to load.
+///
+/// Issue #326 P0: `PermissionSettings::load` used to call
+/// `unwrap_or_default()` on parse errors, silently dropping any rules
+/// in a corrupt file. That meant `deny` rules got lost without warning
+/// and team-shared rule files couldn't be diagnosed. This enum exposes
+/// the failure mode so the TUI can surface it (banner / fallback to
+/// session-only) and headless mode can exit non-zero.
+#[derive(Debug)]
+pub enum PermissionSettingsLoadError {
+    /// File exists but JSON parsing failed. `path` is the file we
+    /// tried to read; `message` is the parser error (line/column when
+    /// `serde_json` provides it).
+    Corrupt { path: PathBuf, message: String },
+    /// File exists but couldn't be read (permission denied, I/O
+    /// error). Stat-level errors (file simply not present) are *not*
+    /// reported here — those are normal first-run conditions.
+    Io { path: PathBuf, source: io::Error },
+    /// File parsed as JSON but contains a malformed v2 rule string.
+    InvalidRule {
+        path: PathBuf,
+        rule: String,
+        message: String,
+    },
+}
+
+impl std::fmt::Display for PermissionSettingsLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Corrupt { path, message } => {
+                write!(f, "{} is not valid JSON: {}", path.display(), message)
+            }
+            Self::Io { path, source } => {
+                write!(f, "failed to read {}: {}", path.display(), source)
+            }
+            Self::InvalidRule {
+                path,
+                rule,
+                message,
+            } => write!(
+                f,
+                "{} contains invalid permission rule {:?}: {}",
+                path.display(),
+                rule,
+                message
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PermissionSettingsLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Errors that can occur during [`PermissionSettings::modify`].
+///
+/// `Load` wraps a parse-time failure surfaced by [`PermissionSettingsLoadError`]
+/// — the lock-and-load step refuses to overwrite a corrupt file
+/// because doing so would silently drop existing rules. `Io` wraps
+/// any I/O failure with a hint about which stage tripped (lockfile
+/// open, flock, save, etc.). `User` is the closure's own error.
+#[derive(Debug)]
+pub enum ModifyError<E> {
+    Load(PermissionSettingsLoadError),
+    Io {
+        stage: &'static str,
+        source: io::Error,
+    },
+    User(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for ModifyError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Load(e) => write!(f, "load failed: {e}"),
+            Self::Io { stage, source } => write!(f, "{stage} failed: {source}"),
+            Self::User(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl<E: std::fmt::Display + std::fmt::Debug> std::error::Error for ModifyError<E> {}
+
+/// How aggressively a permission settings file should be applied.
+///
+/// Issue #326 P5b / R1 Critical 3 / R2 Major 7: not every entry
+/// point should treat project-level rules the same way. A user's
+/// own TUI session in a trusted workspace can apply both `allow`
+/// and `deny` rules; a sub-run spawned from headless mode in an
+/// unfamiliar workspace must apply `deny` rules (so a malicious
+/// project file can't escalate the child agent) but ignore
+/// `allow` rules (so it can't grant the child capabilities the
+/// parent never asked about).
+///
+/// All entry points pass one of these variants when constructing
+/// a [`PermissionManager`]; corrupt files surface as
+/// [`PermissionSettingsLoadError`] regardless, but how the
+/// effective rule set is shaped after parse depends on the policy.
+#[derive(Clone, Debug)]
+pub enum PermissionLoadPolicy {
+    /// Trusted interactive: load both allow and deny rules from
+    /// the project file. Used by `astra` / `astra --tui` when the
+    /// workspace is in the trust ledger (P5b).
+    InteractiveTrusted,
+    /// Untrusted interactive: parse the project file (so corrupt
+    /// JSON still surfaces) but apply ONLY deny rules.
+    /// `allow_sensitive_path_writes` and similar opt-in flags are
+    /// also ignored. The user can promote to trusted later via
+    /// the TUI's "Trust this workspace" prompt.
+    InteractiveUntrusted,
+    /// Headless / sub-run: never apply project allow rules, even
+    /// in trusted workspaces. Headless callers (`astra exec`,
+    /// `astra -p`, plan-executor, skill-subrun, delegate-subrun)
+    /// can't show a trust prompt and shouldn't silently inherit
+    /// project allowlists. Deny rules still apply so a project
+    /// can still TIGHTEN restrictions for sub-runs, just not
+    /// loosen them.
+    HeadlessSafe,
+    /// Test / debug entry point: full apply, no trust check.
+    TrustAll,
+}
+
+impl PermissionLoadPolicy {
+    /// Whether project-level `allow_*` rules and the
+    /// `allow_sensitive_path_writes` flag should be honoured.
+    #[must_use]
+    pub fn applies_project_allow(&self) -> bool {
+        matches!(self, Self::InteractiveTrusted | Self::TrustAll)
+    }
+
+    /// Whether project-level `deny_*` rules should be honoured.
+    /// All variants except a hypothetical "completely untrusted"
+    /// answer yes — denying is always safe.
+    #[must_use]
+    pub fn applies_project_deny(&self) -> bool {
+        true
+    }
+}
+
+/// Filter a parsed [`PermissionSettings`] through a load policy.
+///
+/// Returns the effective settings the manager should keep
+/// in-memory. Allow rules are stripped for non-trusted policies;
+/// deny rules and other safety opt-ins are preserved (deny is
+/// always safe to apply).
+#[must_use]
+pub fn apply_load_policy(
+    raw: PermissionSettings,
+    policy: &PermissionLoadPolicy,
+) -> PermissionSettings {
+    let mut effective = raw;
+    if !policy.applies_project_allow() {
+        effective.allow.clear();
+        effective.allow_sensitive_path_writes = false;
+    }
+    // Deny rules always survive.
+    effective
+}
+
+fn load_policy_for_workspace_trust(trust: &WorkspaceTrustEvaluation) -> PermissionLoadPolicy {
+    if trust.applies_project_allow() {
+        PermissionLoadPolicy::InteractiveTrusted
+    } else {
+        PermissionLoadPolicy::InteractiveUntrusted
+    }
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 impl PermissionSettings {
     /// Load from the project-level settings file (`.kiro/permissions.json`).
+    ///
+    /// Backwards-compatible facade: returns the parsed settings, falling
+    /// back to `default()` on any error and emitting a `tracing::warn`.
+    /// New callers that need to surface errors to the user should use
+    /// [`Self::try_load`].
     pub fn load(project_root: &Path) -> Self {
+        let outcome = Self::try_load(project_root);
+        if let Some(err) = &outcome.error {
+            tracing::warn!("permission_manager: {} (falling back to defaults)", err);
+        }
+        outcome.settings
+    }
+
+    /// Load from the project-level settings file, returning both the
+    /// settings (always defaulted on error so the agent stays usable)
+    /// and a structured error for the UI to surface.
+    pub fn try_load(project_root: &Path) -> PermissionSettingsLoadOutcome {
         let path = project_root.join(".kiro").join("permissions.json");
-        match fs::read_to_string(&path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => Self::default(),
+        Self::try_load_inner(&path)
+    }
+
+    fn try_load_inner(path: &Path) -> PermissionSettingsLoadOutcome {
+        match fs::read_to_string(path) {
+            Ok(content) => match serde_json::from_str::<Self>(&content) {
+                Ok(settings) => {
+                    if let Err(err) = settings.validate_rules(path) {
+                        return PermissionSettingsLoadOutcome {
+                            settings: Self::default(),
+                            error: Some(err),
+                        };
+                    }
+                    PermissionSettingsLoadOutcome {
+                        settings,
+                        error: None,
+                    }
+                }
+                Err(e) => PermissionSettingsLoadOutcome {
+                    settings: Self::default(),
+                    error: Some(PermissionSettingsLoadError::Corrupt {
+                        path: path.to_path_buf(),
+                        message: e.to_string(),
+                    }),
+                },
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => PermissionSettingsLoadOutcome {
+                settings: Self::default(),
+                error: None,
+            },
+            Err(e) => PermissionSettingsLoadOutcome {
+                settings: Self::default(),
+                error: Some(PermissionSettingsLoadError::Io {
+                    path: path.to_path_buf(),
+                    source: e,
+                }),
+            },
         }
     }
 
     /// Load from the user-level settings file (`~/.astra/permissions.json`).
+    ///
+    /// Same backwards-compatible facade as [`Self::load`].
     pub fn load_user() -> Self {
+        let outcome = Self::try_load_user();
+        if let Some(err) = &outcome.error {
+            tracing::warn!("permission_manager: {} (falling back to defaults)", err);
+        }
+        outcome.settings
+    }
+
+    /// Like [`Self::load_user`] but returns the structured error.
+    pub fn try_load_user() -> PermissionSettingsLoadOutcome {
         let Some(home) = dirs::home_dir() else {
-            return Self::default();
+            return PermissionSettingsLoadOutcome {
+                settings: Self::default(),
+                error: None,
+            };
         };
         let path = home.join(".astra").join("permissions.json");
-        match fs::read_to_string(&path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => Self::default(),
+        Self::try_load_inner(&path)
+    }
+
+    fn validate_rules(&self, path: &Path) -> Result<(), PermissionSettingsLoadError> {
+        for rule in self.allow.iter().chain(self.deny.iter()) {
+            if let Err(err) = astra_turn_core::permission_rule_grammar::parse_rule_v2(rule) {
+                return Err(PermissionSettingsLoadError::InvalidRule {
+                    path: path.to_path_buf(),
+                    rule: rule.clone(),
+                    message: err.to_string(),
+                });
+            }
         }
+        Ok(())
+    }
+
+    /// Save to a concrete settings file.
+    ///
+    /// Atomic: writes to a temp file, fsyncs, renames into place, then
+    /// fsyncs the parent directory. This guarantees that an interrupted
+    /// save (SIGINT, crash, OS shutdown) never leaves a partially-written
+    /// `permissions.json` on disk.
+    fn save_to_file(&self, dir: &Path, path: &Path, backup_path: &Path) -> io::Result<()> {
+        fs::create_dir_all(dir)?;
+
+        // Issue #326 P1.5b: every save stamps the current
+        // grammar version so the next load knows the file is
+        // structured. We clone-and-stamp so `save` stays
+        // `&self`-compatible with the existing call sites.
+        let mut to_serialize = self.clone();
+        to_serialize.grammar_version = astra_turn_core::permission_rule_grammar::GRAMMAR_VERSION;
+
+        // If this is the first time we're stamping a v2 over a
+        // pre-existing v1 file, write a `.v1.bak.json` sibling
+        // so the user can roll back manually. We skip the
+        // backup if the file doesn't exist yet (brand-new
+        // session / first save) or if it's already at the
+        // current version.
+        if path.exists() && self.grammar_version == 0 && !backup_path.exists() {
+            if let Ok(existing) = fs::read(path) {
+                let _ = fs::write(backup_path, existing);
+            }
+        }
+
+        let json = serde_json::to_string_pretty(&to_serialize)?;
+
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        std::io::Write::write_all(&mut tmp, json.as_bytes())?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(path).map_err(|e| e.error)?;
+
+        if let Ok(dir_handle) = fs::File::open(dir) {
+            let _ = dir_handle.sync_all();
+        }
+        Ok(())
     }
 
     /// Save to the project-level settings file.
+    ///
+    /// Issue #326 P5d: also takes a process-wide exclusive `flock`
+    /// on `.kiro/permissions.lock` for the duration of the
+    /// load-merge-save sequence in [`Self::modify`]. Direct callers
+    /// of `save` (i.e. the existing `add_allow_rule` path) get the
+    /// atomic-rename guarantee but skip the lock; they're racy
+    /// against another astra process writing the same file. Use
+    /// `modify` (preferred) when correctness across concurrent
+    /// processes matters.
     pub fn save(&self, project_root: &Path) -> io::Result<()> {
         let dir = project_root.join(".kiro");
-        fs::create_dir_all(&dir)?;
         let path = dir.join("permissions.json");
-        let json = serde_json::to_string_pretty(self)?;
-        fs::write(path, json)
+        let backup_path = dir.join("permissions.v1.bak.json");
+        self.save_to_file(&dir, &path, &backup_path)
+    }
+
+    fn user_settings_dir(home: &Path) -> PathBuf {
+        home.join(".astra")
+    }
+
+    fn user_settings_path(home: &Path) -> PathBuf {
+        Self::user_settings_dir(home).join("permissions.json")
+    }
+
+    fn user_home() -> io::Result<PathBuf> {
+        dirs::home_dir().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "home directory not found for ~/.astra/permissions.json",
+            )
+        })
+    }
+
+    fn save_user_in_home(&self, home: &Path) -> io::Result<()> {
+        let dir = Self::user_settings_dir(home);
+        let path = Self::user_settings_path(home);
+        let backup_path = dir.join("permissions.v1.bak.json");
+        self.save_to_file(&dir, &path, &backup_path)
+    }
+
+    /// Load → mutate → save with a process-wide exclusive lock.
+    ///
+    /// Issue #326 P5d / R2 Major 1: the previous `add_allow_rule`
+    /// flow (load once at construction → mutate in-memory → save)
+    /// loses concurrent updates: if process A and process B both
+    /// have astra running, both fetch the same baseline, both add
+    /// a rule, and the second save overwrites the first.
+    ///
+    /// `modify` closes that gap by:
+    ///
+    /// 1. Acquiring an exclusive flock on `.kiro/permissions.lock`
+    ///    (blocks until any other process releases).
+    /// 2. Re-reading the JSON file from disk so the closure sees
+    ///    the freshest baseline.
+    /// 3. Calling the user's mutation closure.
+    /// 4. Atomically renaming a fsync'd temp file into place.
+    /// 5. Releasing the flock.
+    ///
+    /// Errors at any stage abort the change. The closure can fail
+    /// fast by returning `Err` and no file is rewritten.
+    fn modify_file<F, E>(
+        dir: &Path,
+        path: &Path,
+        lock_path: &Path,
+        create_stage: &'static str,
+        mutate: F,
+        save: impl FnOnce(&Self) -> io::Result<()>,
+    ) -> Result<Self, ModifyError<E>>
+    where
+        F: FnOnce(&mut Self) -> Result<(), E>,
+    {
+        use fs2::FileExt;
+
+        fs::create_dir_all(dir).map_err(|e| ModifyError::Io {
+            stage: create_stage,
+            source: e,
+        })?;
+
+        // Acquire the per-file lock. We use a sibling .lock file
+        // rather than locking permissions.json itself so the lock
+        // survives the rename-replace step.
+        let lock_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(|e| ModifyError::Io {
+                stage: "open lockfile",
+                source: e,
+            })?;
+        lock_file.lock_exclusive().map_err(|e| ModifyError::Io {
+            stage: "acquire flock",
+            source: e,
+        })?;
+
+        // Re-read the file under the lock to pick up any concurrent
+        // writes from sibling processes.
+        let outcome = Self::try_load_inner(path);
+        if let Some(err) = outcome.error {
+            // Don't silently overwrite a corrupt file — bail loudly.
+            // The caller decides whether to surface this to the
+            // user as a banner / exit-1.
+            let _ = fs2::FileExt::unlock(&lock_file);
+            return Err(ModifyError::Load(err));
+        }
+        let mut settings = outcome.settings;
+
+        if let Err(user_err) = mutate(&mut settings) {
+            let _ = fs2::FileExt::unlock(&lock_file);
+            return Err(ModifyError::User(user_err));
+        }
+
+        if let Err(e) = save(&settings) {
+            let _ = fs2::FileExt::unlock(&lock_file);
+            return Err(ModifyError::Io {
+                stage: "save",
+                source: e,
+            });
+        }
+
+        let _ = fs2::FileExt::unlock(&lock_file);
+        Ok(settings)
+    }
+
+    pub fn modify<F, E>(project_root: &Path, mutate: F) -> Result<Self, ModifyError<E>>
+    where
+        F: FnOnce(&mut Self) -> Result<(), E>,
+    {
+        let dir = project_root.join(".kiro");
+        let path = dir.join("permissions.json");
+        let lock_path = dir.join("permissions.lock");
+        Self::modify_file(
+            &dir,
+            &path,
+            &lock_path,
+            "create .kiro/",
+            mutate,
+            |settings| settings.save(project_root),
+        )
+    }
+
+    pub fn modify_user<F, E>(mutate: F) -> Result<Self, ModifyError<E>>
+    where
+        F: FnOnce(&mut Self) -> Result<(), E>,
+    {
+        let home = Self::user_home().map_err(|e| ModifyError::Io {
+            stage: "resolve home directory",
+            source: e,
+        })?;
+        Self::modify_user_in_home(&home, mutate)
+    }
+
+    fn modify_user_in_home<F, E>(home: &Path, mutate: F) -> Result<Self, ModifyError<E>>
+    where
+        F: FnOnce(&mut Self) -> Result<(), E>,
+    {
+        let dir = Self::user_settings_dir(home);
+        let path = Self::user_settings_path(home);
+        let lock_path = dir.join("permissions.lock");
+        Self::modify_file(
+            &dir,
+            &path,
+            &lock_path,
+            "create ~/.astra/",
+            mutate,
+            |settings| settings.save_user_in_home(home),
+        )
     }
     #[allow(dead_code)] // Used in tests and by with_project
     fn parsed_allow_rules(&self) -> Vec<PermissionRule> {
         self.allow
             .iter()
-            .map(|s| PermissionRule::parse(s))
+            .map(|s| parse_rule_with_grammar_v2(s))
             .collect()
     }
 
     #[allow(dead_code)] // Used in tests and by with_project
     fn parsed_deny_rules(&self) -> Vec<PermissionRule> {
-        self.deny.iter().map(|s| PermissionRule::parse(s)).collect()
+        self.deny
+            .iter()
+            .map(|s| parse_rule_with_grammar_v2(s))
+            .collect()
     }
+}
+
+/// Issue #326 P1.5b: parse legacy and grammar-v2 rule strings into
+/// the shared turn-core enforcement type. Load-time validation has
+/// already made v2 parse failures loud; this helper keeps existing
+/// v1 strings backward-compatible.
+fn parse_rule_with_grammar_v2(s: &str) -> PermissionRule {
+    PermissionRule::parse(s)
 }
 
 pub(super) struct PermissionManager {
     mode: PermissionMode,
     session_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides,
+    turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides,
     denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker,
     /// Persistent rules loaded from project settings file.
     settings: PermissionSettings,
@@ -347,6 +864,24 @@ pub(super) struct PermissionManager {
     /// later requests under the same subtree (regardless of which tool)
     /// are auto-allowed without re-prompting.
     trusted_sandbox_roots: Vec<PathBuf>,
+    /// Last error from persisting an allow rule to disk (project or
+    /// user settings). Surfaced via [`last_save_error`] so the TUI can
+    /// show a "Failed to save rule" toast and fall back to session-only
+    /// behaviour. `None` after a successful save.
+    last_save_error: Option<String>,
+    /// Errors encountered when loading project / user `permissions.json`
+    /// at construction time. Surfaced via [`load_errors`] so the TUI
+    /// can show a one-shot banner ("permissions.json corrupt at line N
+    /// — falling back to session-only rules") and headless mode can
+    /// exit 1. Empty when both files loaded cleanly or were absent.
+    load_errors: Vec<PermissionSettingsLoadError>,
+    /// Policy used when shaping project-level permission settings.
+    load_policy: PermissionLoadPolicy,
+    /// Effective workspace trust decision when this manager was
+    /// constructed through the trust-aware interactive path.
+    workspace_trust: Option<WorkspaceTrustEvaluation>,
+    /// Active session id for durable permission audit events.
+    active_session_id: Option<String>,
 }
 
 impl PermissionManager {
@@ -411,6 +946,13 @@ impl PermissionManager {
         self.mode
     }
 
+    /// Whether project-level allow rules are active for this manager.
+    /// TUI approval cards use the inverse to disable Project scope
+    /// when workspace trust has not been granted or has gone stale.
+    pub(super) fn project_allow_rules_active(&self) -> bool {
+        self.load_policy.applies_project_allow()
+    }
+
     /// Snapshot of cumulative denial pressure for the SelfModel surface.
     /// Returns `(total_denials, max_total)` from the session-scoped
     /// [`DenialTracker`]. Surfaced to the agent via `SelfModel` so it can
@@ -447,6 +989,68 @@ impl PermissionManager {
         self.mode = mode;
     }
 
+    pub(super) fn set_active_session_id(&mut self, session_id: &str) {
+        self.active_session_id = Some(session_id.to_string());
+    }
+
+    fn active_session_id(&self) -> Option<&str> {
+        self.active_session_id.as_deref()
+    }
+
+    /// Start a new LLM turn: per-turn approvals from the previous
+    /// SSE stream must not leak into the next user message.
+    pub(super) fn clear_turn_overrides(&mut self) {
+        self.turn_overrides =
+            astra_turn_core::approval_fingerprint::FingerprintedOverrides::default();
+    }
+
+    fn check_overrides(
+        &self,
+        fp: &astra_turn_core::approval_fingerprint::ApprovalFingerprint,
+    ) -> Option<bool> {
+        self.turn_overrides
+            .check(fp)
+            .or_else(|| self.session_overrides.check(fp))
+    }
+
+    fn matching_override(
+        &self,
+        fp: &astra_turn_core::approval_fingerprint::ApprovalFingerprint,
+    ) -> Option<(
+        &astra_turn_core::approval_fingerprint::ApprovalFingerprint,
+        bool,
+    )> {
+        self.turn_overrides
+            .matching_rule(fp)
+            .or_else(|| self.session_overrides.matching_rule(fp))
+            .map(|(stored, allowed)| (stored, *allowed))
+    }
+
+    fn check_overrides_for_request(
+        &self,
+        fp: &astra_turn_core::approval_fingerprint::ApprovalFingerprint,
+        sensitive_path: bool,
+    ) -> Option<bool> {
+        let (stored, allowed) = self.matching_override(fp)?;
+        if !sensitive_path || !allowed || stored_override_allows_sensitive_path(stored) {
+            Some(allowed)
+        } else {
+            None
+        }
+    }
+
+    fn combined_overrides_for_evaluation(
+        &self,
+    ) -> astra_turn_core::approval_fingerprint::FingerprintedOverrides {
+        let mut combined = self.turn_overrides.clone();
+        for (fp, allowed) in self.session_overrides.iter() {
+            if combined.check(fp).is_none() {
+                combined.insert(fp.clone(), *allowed);
+            }
+        }
+        combined
+    }
+
     /// Create without loading project settings. Used in tests and internal auto-approved operations.
     #[cfg(test)]
     pub(super) fn new(auto_approve: bool) -> Self {
@@ -459,6 +1063,8 @@ impl PermissionManager {
             mode,
             session_overrides:
                 astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
+            turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
+            ),
             denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker::default(),
             recent_rejections: std::collections::VecDeque::new(),
             trusted_sandbox_roots: Vec::new(),
@@ -470,6 +1076,11 @@ impl PermissionManager {
             cached_user_allow: Vec::new(),
             cached_user_deny: Vec::new(),
             inherited: None,
+            last_save_error: None,
+            load_errors: Vec::new(),
+            load_policy: PermissionLoadPolicy::TrustAll,
+            workspace_trust: None,
+            active_session_id: None,
         }
     }
 
@@ -486,16 +1097,105 @@ impl PermissionManager {
 
     /// Create with explicit permission mode and project directory.
     pub(super) fn with_project_mode(mode: PermissionMode, project_root: &Path) -> Self {
-        let settings = PermissionSettings::load(project_root);
+        // Default to InteractiveTrusted for backwards compat. New
+        // code paths should prefer `with_load_policy` so the trust
+        // posture is explicit at the call site.
+        Self::with_load_policy(
+            mode,
+            project_root,
+            &PermissionLoadPolicy::InteractiveTrusted,
+        )
+    }
+
+    /// Create with workspace-trust evaluation. Unknown, untrusted, corrupt,
+    /// or changed workspaces apply project deny rules only.
+    pub(super) fn with_workspace_trust(auto_approve: bool, project_root: &Path) -> Self {
+        let mode = if auto_approve {
+            PermissionMode::Auto
+        } else {
+            PermissionMode::Prompt
+        };
+        Self::with_workspace_trust_mode(mode, project_root)
+    }
+
+    /// Create with explicit mode and workspace-trust evaluation.
+    pub(super) fn with_workspace_trust_mode(mode: PermissionMode, project_root: &Path) -> Self {
+        let trust = evaluate_workspace_trust(project_root);
+        Self::with_workspace_trust_evaluation(mode, project_root, trust)
+    }
+
+    #[cfg(test)]
+    fn with_workspace_trust_mode_from_ledger_path(
+        mode: PermissionMode,
+        project_root: &Path,
+        ledger_path: PathBuf,
+    ) -> Self {
+        let trust = evaluate_workspace_trust_from_path(project_root, ledger_path);
+        Self::with_workspace_trust_evaluation(mode, project_root, trust)
+    }
+
+    fn with_workspace_trust_evaluation(
+        mode: PermissionMode,
+        project_root: &Path,
+        trust: WorkspaceTrustEvaluation,
+    ) -> Self {
+        if !trust.applies_project_allow() {
+            tracing::warn!(
+                "permission_manager: {} for {}; applying project deny rules only",
+                trust.reason.display(),
+                project_root.display()
+            );
+        }
+        let policy = load_policy_for_workspace_trust(&trust);
+        Self::with_load_policy_and_trust(mode, project_root, policy, Some(trust))
+    }
+
+    /// Issue #326 P5b / R1 Critical 3 / R2 Major 7: construct a
+    /// permission manager with an explicit load policy.
+    ///
+    /// All entry points that have a meaningful trust signal (TUI
+    /// trust ledger, headless mode, sub-run) should use this and
+    /// pass the matching [`PermissionLoadPolicy`]. The policy
+    /// shapes which parts of the on-disk file end up in the
+    /// effective rule set.
+    pub(super) fn with_load_policy(
+        mode: PermissionMode,
+        project_root: &Path,
+        policy: &PermissionLoadPolicy,
+    ) -> Self {
+        Self::with_load_policy_and_trust(mode, project_root, policy.clone(), None)
+    }
+
+    fn with_load_policy_and_trust(
+        mode: PermissionMode,
+        project_root: &Path,
+        policy: PermissionLoadPolicy,
+        workspace_trust: Option<WorkspaceTrustEvaluation>,
+    ) -> Self {
+        let project_outcome = PermissionSettings::try_load(project_root);
+        let user_outcome = PermissionSettings::try_load_user();
+        let mut load_errors = Vec::new();
+        if let Some(err) = project_outcome.error {
+            load_errors.push(err);
+        }
+        if let Some(err) = user_outcome.error {
+            load_errors.push(err);
+        }
+        // Apply the trust-aware filter to the project file. User-level
+        // rules come from the user's own home dir and are always
+        // honoured (they don't carry workspace-trust risk).
+        let settings = apply_load_policy(project_outcome.settings, &policy);
         let cached_allow = settings.parsed_allow_rules();
         let cached_deny = settings.parsed_deny_rules();
-        let user_settings = PermissionSettings::load_user();
+        let user_settings = user_outcome.settings;
         let cached_user_allow = user_settings.parsed_allow_rules();
         let cached_user_deny = user_settings.parsed_deny_rules();
         Self {
             mode,
             session_overrides:
                 astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
+            turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
+            ),
             denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker::default(),
             recent_rejections: std::collections::VecDeque::new(),
             trusted_sandbox_roots: Vec::new(),
@@ -507,6 +1207,11 @@ impl PermissionManager {
             cached_user_allow,
             cached_user_deny,
             inherited: None,
+            last_save_error: None,
+            load_errors,
+            load_policy: policy,
+            workspace_trust,
+            active_session_id: None,
         }
     }
 
@@ -514,6 +1219,14 @@ impl PermissionManager {
     ///
     /// The child agent inherits the parent's permission mode and rules,
     /// but can still load project-level settings for additional rules.
+    ///
+    /// Issue #326 P0 / R1 Major 10 / task #17: if the parent envelope
+    /// carries a `fingerprinted_overrides` JSON blob, we deserialize
+    /// it back into the child's `session_overrides` so the child
+    /// honours per-fingerprint decisions (`Bash(cargo test:*) → Allow`)
+    /// instead of relying on the legacy `tool_name → bool` collapse.
+    /// A deserialization failure logs a warning and leaves overrides
+    /// empty rather than silently downgrading to a wider rule.
     pub(super) fn with_inherited(
         project_root: &Path,
         inherited: astra_runtime::orchestration::InheritedPermissions,
@@ -524,16 +1237,52 @@ impl PermissionManager {
             astra_runtime::orchestration::PermissionMode::Prompt => PermissionMode::Prompt,
             astra_runtime::orchestration::PermissionMode::Deny => PermissionMode::Deny,
         };
-        let settings = PermissionSettings::load(project_root);
+        let project_outcome = PermissionSettings::try_load(project_root);
+        let user_outcome = PermissionSettings::try_load_user();
+        let mut load_errors = Vec::new();
+        if let Some(err) = project_outcome.error {
+            load_errors.push(err);
+        }
+        if let Some(err) = user_outcome.error {
+            load_errors.push(err);
+        }
+        // Child/background managers cannot prompt for workspace trust.
+        // They still apply project deny rules, while allow rules arrive
+        // through the parent's inherited envelope when the parent was
+        // allowed to honour them.
+        let load_policy = PermissionLoadPolicy::HeadlessSafe;
+        let settings = apply_load_policy(project_outcome.settings, &load_policy);
         let cached_allow = settings.parsed_allow_rules();
         let cached_deny = settings.parsed_deny_rules();
-        let user_settings = PermissionSettings::load_user();
+        let user_settings = user_outcome.settings;
         let cached_user_allow = user_settings.parsed_allow_rules();
         let cached_user_deny = user_settings.parsed_deny_rules();
+
+        // Decode the parent's fingerprinted overrides if any. Failures
+        // are loud (tracing::warn) — we never silently fall back to a
+        // wider tool-level rule.
+        let session_overrides = match inherited.fingerprinted_overrides.as_ref() {
+            Some(value) => match serde_json::from_value::<
+                astra_turn_core::approval_fingerprint::FingerprintedOverrides,
+            >(value.clone())
+            {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    tracing::warn!(
+                        "permission_manager: child failed to decode fingerprinted_overrides from parent: {err}; \
+                         child will run with no session overrides (still has parent allow/deny rules)"
+                    );
+                    astra_turn_core::approval_fingerprint::FingerprintedOverrides::default()
+                }
+            },
+            None => astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
+        };
+
         Self {
             mode,
-            session_overrides:
-                astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
+            session_overrides,
+            turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
+            ),
             denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker::default(),
             recent_rejections: std::collections::VecDeque::new(),
             trusted_sandbox_roots: Vec::new(),
@@ -545,6 +1294,11 @@ impl PermissionManager {
             cached_user_allow,
             cached_user_deny,
             inherited: Some(inherited),
+            last_save_error: None,
+            load_errors,
+            load_policy,
+            workspace_trust: None,
+            active_session_id: None,
         }
     }
 
@@ -557,10 +1311,34 @@ impl PermissionManager {
         }
     }
 
+    fn is_inherited_allowed_with_context(
+        &self,
+        tool_name: &str,
+        ctx: &astra_turn_core::permission_types::RuleMatchContext,
+    ) -> bool {
+        if let Some(ref inherited) = self.inherited {
+            inherited.is_allowed_with_context(tool_name, ctx)
+        } else {
+            false
+        }
+    }
+
     /// Check if a tool is denied by inherited permissions.
     fn is_inherited_denied(&self, tool_name: &str, command: Option<&str>) -> bool {
         if let Some(ref inherited) = self.inherited {
             inherited.is_denied(tool_name, command)
+        } else {
+            false
+        }
+    }
+
+    fn is_inherited_denied_with_context(
+        &self,
+        tool_name: &str,
+        ctx: &astra_turn_core::permission_types::RuleMatchContext,
+    ) -> bool {
+        if let Some(ref inherited) = self.inherited {
+            inherited.is_denied_with_context(tool_name, ctx)
         } else {
             false
         }
@@ -581,6 +1359,22 @@ impl PermissionManager {
     }
 
     /// Export the current effective permission envelope for a spawned child agent.
+    ///
+    /// Issue #326 P0 / R1 Major 10 / task #17: previously this method
+    /// called `session_overrides.to_legacy_overrides()`, which collapses
+    /// every fingerprinted decision into a `tool_name → bool` map. So
+    /// a parent who pressed "Always" on `Bash(cargo test:*)` would
+    /// hand the child a `Bash → Allow` envelope, and the child could
+    /// then run `Bash(rm -rf …)` without ever asking. That is exactly
+    /// the bypass review-r1 calls out.
+    ///
+    /// We now hand the child the raw `FingerprintedOverrides` (encoded
+    /// as JSON because runtime types can't depend on
+    /// `approval_fingerprint`). The child is expected to consult those
+    /// fingerprints first; only if no fingerprint matches does it fall
+    /// through to the legacy `allow_rules` / `deny_rules`. The
+    /// `to_legacy_overrides()` helper still exists for telemetry /
+    /// display but is **no longer wired into enforcement**.
     pub(super) fn inherited_permissions_for_child(
         &self,
         is_background: bool,
@@ -613,14 +1407,24 @@ impl PermissionManager {
         for rule in self.cached_user_deny.iter().chain(self.cached_deny.iter()) {
             inherited.add_deny(RuntimePermissionRule::parse(&rule.to_string()));
         }
-        for (tool, allowed) in &self.session_overrides.to_legacy_overrides() {
-            let runtime_rule = RuntimePermissionRule::parse(tool);
-            if *allowed {
-                inherited.deny_rules.retain(|rule| rule != &runtime_rule);
-                inherited.add_allow(runtime_rule);
-            } else {
-                inherited.allow_rules.retain(|rule| rule != &runtime_rule);
-                inherited.add_deny(runtime_rule);
+
+        // Pass fingerprinted overrides as the **authoritative** source
+        // of session-level decisions. We serialize the
+        // FingerprintedOverrides to JSON so the runtime type stays
+        // dependency-free; the child decodes it back. If serialization
+        // fails (it shouldn't — these are simple owned strings/enums),
+        // we deliberately do NOT fall back to to_legacy_overrides:
+        // a downgrade-on-error would re-introduce the bypass we're
+        // fixing here.
+        match serde_json::to_value(&self.session_overrides) {
+            Ok(value) if !value.is_null() => {
+                inherited.fingerprinted_overrides = Some(value);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    "permission_manager: failed to serialize session_overrides for child agent: {err} — child will see only persistent allow/deny rules"
+                );
             }
         }
 
@@ -628,31 +1432,38 @@ impl PermissionManager {
     }
 
     /// Resolve §5.5 `approval_required` for cloud-orchestrated tools (posts to `/approval/respond`).
+    ///
+    /// `detail` is the RAW command/path — used by the banner's
+    /// `bash_command_approval_reason` classifier and by the
+    /// fingerprint/denial-tracker path. MUST stay raw; prepending
+    /// formatting here would silently bypass deny-rule matching.
+    ///
+    /// `display_label` is the rich preview ("$ ls -la", "Writing: foo")
+    /// used for the user-visible detail line. Falls back to `detail`
+    /// when `None`, matching the pre-split behaviour so existing
+    /// cloud consumers don't have to upgrade in lockstep.
+    #[cfg(test)]
     pub(super) fn resolve_cloud_approval(
         &mut self,
         tool: &str,
         detail: Option<&str>,
+        display_label: Option<&str>,
         approval_kind: ApprovalKind,
         quiet: bool,
     ) -> astra_thin_client::ApprovalDecision {
         use astra_thin_client::ApprovalDecision;
-        if quiet {
-            return if self.mode == PermissionMode::Auto {
-                ApprovalDecision::Allow
-            } else {
-                ApprovalDecision::Deny
-            };
+        if let Some(decision) =
+            self.preflight_cloud_approval_decision(tool, detail, approval_kind, quiet)
+        {
+            return decision;
         }
+        // Display preference: rich label if provided, else raw detail.
+        let display = display_label.or(detail);
         let explicit = Self::cloud_approval_is_explicit(approval_kind);
         if explicit {
-            match self.mode {
-                PermissionMode::Deny => return ApprovalDecision::Deny,
-                PermissionMode::Auto => return ApprovalDecision::Allow,
-                PermissionMode::Prompt => {}
-            }
             eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
-            if let Some(detail) = detail.filter(|s| !s.is_empty()) {
-                eprintln!("{}", Self::format_prompt_detail(detail).dim());
+            if let Some(shown) = display.filter(|s| !s.is_empty()) {
+                eprintln!("{}", Self::format_prompt_detail(shown).dim());
             }
             return match Self::prompt_approval(ApprovalPromptKind::ConfirmOnce) {
                 'y' => ApprovalDecision::Allow,
@@ -671,40 +1482,10 @@ impl PermissionManager {
                 _ => ApprovalDecision::Deny,
             };
         }
-        match self.mode {
-            PermissionMode::Auto => return ApprovalDecision::Allow,
-            PermissionMode::Deny => return ApprovalDecision::Deny,
-            PermissionMode::Prompt => {}
-        }
-        let synthetic_args = detail.map(|d| serde_json::json!({"command": d}));
-        let kind = cloud_gated_tool_kind_with_args(tool, synthetic_args.as_ref());
-        let fp = match (kind, detail) {
-            (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
-                astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(tool, cmd, false)
-            }
-            (Some(CloudGatedToolKind::Write), d) => {
-                astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
-            }
-            _ => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool),
-        };
-        if let Some(allowed) = self.session_overrides.check(&fp) {
-            return if allowed {
-                ApprovalDecision::Allow
-            } else {
-                ApprovalDecision::Deny
-            };
-        }
-        match self.denial_tracker.should_prompt(&fp) {
-            astra_turn_core::approval_fingerprint::DenialAction::SkipTool => {
-                return ApprovalDecision::Deny;
-            }
-            astra_turn_core::approval_fingerprint::DenialAction::FallbackToUser => {}
-            astra_turn_core::approval_fingerprint::DenialAction::Continue => {}
-        }
 
         eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
-        if let Some(detail) = detail.filter(|s| !s.is_empty()) {
-            eprintln!("{}", Self::format_prompt_detail(detail).dim());
+        if let Some(shown) = display.filter(|s| !s.is_empty()) {
+            eprintln!("{}", Self::format_prompt_detail(shown).dim());
         }
         self.apply_cloud_approval_choice(
             tool,
@@ -717,10 +1498,14 @@ impl PermissionManager {
     /// prompt on a blocking thread via `spawn_blocking`, preventing the
     /// `inquire::Select` TUI from blocking the tokio worker and conflicting
     /// with concurrent terminal output (spinners, SSE rendering).
+    ///
+    /// See [`resolve_cloud_approval`] for the raw-vs-display split contract.
+    #[cfg(test)]
     pub(super) async fn resolve_cloud_approval_async(
         &mut self,
         tool: &str,
         detail: Option<&str>,
+        display_label: Option<&str>,
         approval_kind: ApprovalKind,
         quiet: bool,
     ) -> astra_thin_client::ApprovalDecision {
@@ -730,11 +1515,12 @@ impl PermissionManager {
         {
             return decision;
         }
+        let display = display_label.or(detail);
         let explicit = Self::cloud_approval_is_explicit(approval_kind);
         if explicit {
             eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
-            if let Some(detail) = detail.filter(|s| !s.is_empty()) {
-                eprintln!("{}", Self::format_prompt_detail(detail).dim());
+            if let Some(shown) = display.filter(|s| !s.is_empty()) {
+                eprintln!("{}", Self::format_prompt_detail(shown).dim());
             }
             let ch = tokio::task::spawn_blocking(|| {
                 Self::prompt_approval(ApprovalPromptKind::ConfirmOnce)
@@ -759,8 +1545,8 @@ impl PermissionManager {
             };
         }
         eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
-        if let Some(detail) = detail.filter(|s| !s.is_empty()) {
-            eprintln!("{}", Self::format_prompt_detail(detail).dim());
+        if let Some(shown) = display.filter(|s| !s.is_empty()) {
+            eprintln!("{}", Self::format_prompt_detail(shown).dim());
         }
         let ch = tokio::task::spawn_blocking(|| {
             Self::prompt_approval(ApprovalPromptKind::CloudStandard)
@@ -770,9 +1556,10 @@ impl PermissionManager {
         self.apply_cloud_approval_choice(tool, detail, ch)
     }
 
+    #[cfg(test)]
     pub(super) async fn resolve_cloud_approval_batch_async(
         &mut self,
-        requests: &[(&str, Option<&str>, ApprovalKind)],
+        requests: &[(&str, Option<&str>, Option<&str>, ApprovalKind)],
         quiet: bool,
     ) -> Vec<astra_thin_client::ApprovalDecision> {
         use astra_thin_client::ApprovalDecision;
@@ -781,23 +1568,38 @@ impl PermissionManager {
             return Vec::new();
         }
         if requests.len() == 1 {
-            let (tool, detail, approval_kind) = requests[0];
+            let (tool, detail, display_label, approval_kind) = requests[0];
             return vec![
-                self.resolve_cloud_approval_async(tool, detail, approval_kind, quiet)
-                    .await,
+                self.resolve_cloud_approval_async(
+                    tool,
+                    detail,
+                    display_label,
+                    approval_kind,
+                    quiet,
+                )
+                .await,
             ];
         }
 
         let mut decisions: Vec<Option<ApprovalDecision>> = vec![None; requests.len()];
-        let mut unresolved: Vec<(usize, &str, Option<&str>, ApprovalKind)> = Vec::new();
+        type UnresolvedItem<'a> = (
+            usize,
+            &'a str,
+            Option<&'a str>,
+            Option<&'a str>,
+            ApprovalKind,
+        );
+        let mut unresolved: Vec<UnresolvedItem<'_>> = Vec::new();
 
-        for (idx, (tool, detail, approval_kind)) in requests.iter().copied().enumerate() {
+        for (idx, (tool, detail, display_label, approval_kind)) in
+            requests.iter().copied().enumerate()
+        {
             if let Some(decision) =
                 self.preflight_cloud_approval_decision(tool, detail, approval_kind, quiet)
             {
                 decisions[idx] = Some(decision);
             } else {
-                unresolved.push((idx, tool, detail, approval_kind));
+                unresolved.push((idx, tool, detail, display_label, approval_kind));
             }
         }
 
@@ -810,7 +1612,7 @@ impl PermissionManager {
 
         let all_explicit = unresolved
             .iter()
-            .all(|(_, _, _, approval_kind)| Self::cloud_approval_is_explicit(*approval_kind));
+            .all(|(_, _, _, _, approval_kind)| Self::cloud_approval_is_explicit(*approval_kind));
         let prompt_kind = if all_explicit {
             ApprovalPromptKind::ConfirmOnce
         } else {
@@ -825,13 +1627,15 @@ impl PermissionManager {
             )
             .yellow()
         );
-        for (_, tool, detail, _) in &unresolved {
+        for (_, tool, detail, display_label, _) in &unresolved {
+            // Show the rich label if provided, else fall back to the
+            // raw detail so older callers keep working.
+            let shown = display_label.or(*detail);
             eprintln!(
                 "  {} {}",
                 "•".dim(),
-                match detail.filter(|detail| !detail.is_empty()) {
-                    Some(detail) =>
-                        format!("{tool} — {}", Self::format_prompt_detail(detail).trim()),
+                match shown.filter(|s| !s.is_empty()) {
+                    Some(s) => format!("{tool} — {}", Self::format_prompt_detail(s).trim()),
                     None => (*tool).to_string(),
                 }
                 .dim()
@@ -848,7 +1652,7 @@ impl PermissionManager {
                 "  {}",
                 "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore.".yellow()
             );
-            for (idx, _, _, _) in unresolved {
+            for (idx, _, _, _, _) in unresolved {
                 decisions[idx] = Some(ApprovalDecision::Allow);
             }
         } else if all_explicit {
@@ -857,11 +1661,11 @@ impl PermissionManager {
             } else {
                 ApprovalDecision::Deny
             };
-            for (idx, _, _, _) in unresolved {
+            for (idx, _, _, _, _) in unresolved {
                 decisions[idx] = Some(decision.clone());
             }
         } else {
-            for (idx, tool, detail, _) in unresolved {
+            for (idx, tool, detail, _, _) in unresolved {
                 decisions[idx] = Some(self.apply_cloud_approval_choice(tool, detail, ch));
             }
         }
@@ -872,7 +1676,7 @@ impl PermissionManager {
             .collect()
     }
 
-    fn preflight_cloud_approval_decision(
+    pub(super) fn preflight_cloud_approval_decision(
         &mut self,
         tool: &str,
         detail: Option<&str>,
@@ -889,24 +1693,12 @@ impl PermissionManager {
         // re-prompted, which is the user-reported "Always doesn't
         // stick for bash" bug.
         //
-        // Use `cloud_gated_tool_kind(tool)` (not the args-aware
-        // variant) here so the lookup fingerprint matches what
-        // `apply_cloud_approval_choice` stores. The args-aware
-        // classifier returns `None` for read-only bash commands like
-        // `git status`, which would drop the fingerprint to `bare` —
-        // that doesn't match the `shell`-keyed override the store
-        // path wrote, and the user gets re-prompted. Keeping both
-        // sides on the tool-name-only classifier keeps them in sync.
-        let kind = cloud_gated_tool_kind(tool);
-        let fp = match (kind, detail) {
-            (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
-                astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(tool, cmd, false)
-            }
-            (Some(CloudGatedToolKind::Write), d) => {
-                astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
-            }
-            _ => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool),
-        };
+        // The lookup fingerprint uses the tool-name-only classifier for
+        // cloud details so read-only bash commands do not collapse to `bare`.
+        // For path-shaped tools it preserves the raw path; exact, prefix,
+        // pattern, and bare stored overrides can all match that candidate.
+        let fp = cloud_detail_lookup_fingerprint(tool, detail);
+        let sensitive_path = cloud_detail_is_sensitive(tool, detail);
 
         // Session override check — applies to every kind. A matched
         // `Always` means the user has already made an informed
@@ -914,12 +1706,29 @@ impl PermissionManager {
         // re-ask regardless of `approval_kind` or `quiet`. This also
         // means silent sub-runs can honour `Always` instead of
         // auto-denying.
-        if let Some(allowed) = self.session_overrides.check(&fp) {
+        if let Some(allowed) = self.check_overrides_for_request(&fp, sensitive_path) {
             return Some(if allowed {
                 ApprovalDecision::Allow
             } else {
                 ApprovalDecision::Deny
             });
+        }
+
+        if sensitive_path {
+            if self.mode == PermissionMode::Deny {
+                return Some(ApprovalDecision::Deny);
+            }
+            if self.mode == PermissionMode::Auto
+                && (self.settings.allow_sensitive_path_writes
+                    || self.user_settings.allow_sensitive_path_writes)
+            {
+                return Some(ApprovalDecision::Allow);
+            }
+            return if quiet {
+                Some(ApprovalDecision::Deny)
+            } else {
+                None
+            };
         }
 
         if quiet {
@@ -974,30 +1783,65 @@ impl PermissionManager {
 
     /// Check persistent deny rules (inherited + project + user, bypass-immune).
     fn check_deny_rules(&self, name: &str, args: &serde_json::Value) -> bool {
-        let cmd = command_hint_from_args(args);
+        let ctx = astra_turn_core::permission_types::RuleMatchContext::from_tool_args(name, args);
         // Check inherited deny rules first (from parent agent)
-        if self.is_inherited_denied(name, cmd) {
+        if self.is_inherited_denied_with_context(name, &ctx) {
             return true;
         }
-        self.cached_deny.iter().any(|rule| rule.matches(name, cmd))
+        self.cached_deny
+            .iter()
+            .any(|rule| rule.matches_with_context(name, &ctx))
             || self
                 .cached_user_deny
                 .iter()
-                .any(|rule| rule.matches(name, cmd))
+                .any(|rule| rule.matches_with_context(name, &ctx))
     }
 
     /// Check persistent allow rules: inherited first, then project-level, then user-level.
     fn check_allow_rules(&self, name: &str, args: &serde_json::Value) -> bool {
-        let cmd = command_hint_from_args(args);
+        let ctx = astra_turn_core::permission_types::RuleMatchContext::from_tool_args(name, args);
         // Check inherited allow rules first (from parent agent)
-        if self.is_inherited_allowed(name, cmd) {
+        if self.is_inherited_allowed_with_context(name, &ctx) {
             return true;
         }
-        self.cached_allow.iter().any(|rule| rule.matches(name, cmd))
+        self.cached_allow
+            .iter()
+            .any(|rule| rule.matches_with_context(name, &ctx))
             || self
                 .cached_user_allow
                 .iter()
-                .any(|rule| rule.matches(name, cmd))
+                .any(|rule| rule.matches_with_context(name, &ctx))
+    }
+
+    fn evaluation_context(&self) -> astra_turn_core::permission_types::PermissionSyncContext {
+        let mut inherited = self
+            .inherited
+            .clone()
+            .unwrap_or_else(|| astra_runtime::orchestration::InheritedPermissions::new(self.mode));
+        inherited.mode = self.mode;
+
+        for rule in self
+            .cached_allow
+            .iter()
+            .chain(self.cached_user_allow.iter())
+        {
+            inherited.add_allow(rule.clone());
+        }
+        for rule in self.cached_deny.iter().chain(self.cached_user_deny.iter()) {
+            inherited.add_deny(rule.clone());
+        }
+        inherited.fingerprinted_overrides = self.combined_overrides_for_evaluation().to_json();
+
+        astra_turn_core::permission_types::PermissionSyncContext::new(inherited)
+    }
+
+    fn evaluate_permission_envelope(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> DecisionEnvelope {
+        let ctx = self.evaluation_context();
+        astra_turn_core::permission_engine::evaluate_permission(name, args, &ctx)
     }
 
     /// Check if a file path targets a dangerous location.
@@ -1136,7 +1980,10 @@ impl PermissionManager {
             SideEffect::Write => "✎",
             SideEffect::Read => "◉",
         };
-        let brief = permission_prompt_primary_detail(name, args).unwrap_or_else(|| "…".into());
+        // Display label uses the shared rich preview so the approval
+        // dialog matches scrollback. (Rule-matching hint is a separate
+        // function — see `permission_prompt_primary_detail`.)
+        let brief = permission_prompt_display_label(name, args);
         let header = format!("{icon} {name}");
         let mut detail_lines = vec![Self::format_prompt_detail(&brief)];
         if let Some(explicit) = explicit_approval_reason(name, args) {
@@ -1146,6 +1993,20 @@ impl PermissionManager {
             detail_lines.push(Self::format_prompt_detail(&compensation));
         }
         let detail = Some(detail_lines.join("\n"));
+
+        // Issue #326 P3 / scenario #8: redact secret-looking
+        // content from the detail block before it lands in the
+        // approval card. The redactor is a no-op for benign
+        // detail; for sensitive-path tools (e.g. write_file
+        // .env) it collapses the body to "<N bytes redacted>"
+        // plus the gitignore reminder. We pass the path arg
+        // when present so the full-body collapse applies; for
+        // path-less detail the line-level redactor still runs.
+        let detail = detail.map(|d| {
+            let path = args.get("path").and_then(|v| v.as_str());
+            astra_turn_core::permission_redact::redact_for_approval_display(&d, path).display
+        });
+
         (header, detail)
     }
 
@@ -1157,92 +2018,37 @@ impl PermissionManager {
         }
     }
 
-    pub(crate) fn prompt_approval(kind: ApprovalPromptKind) -> char {
-        use std::io::IsTerminal;
-
-        // Build options based on prompt kind
-        let options: Vec<(&str, char)> = match kind {
-            ApprovalPromptKind::LocalStandard => vec![
-                ("✓  Yes (once)", 'y'),
-                ("✕  No", 'n'),
-                ("◉  Always allow this tool", 'a'),
-                ("▶  Auto-run session", '!'),
-                ("⏭  Skip tool", 's'),
-            ],
-            ApprovalPromptKind::CloudStandard => vec![
-                ("✓  Yes (once)", 'y'),
-                ("✕  No", 'n'),
-                ("◉  Allow tool (session)", 'a'),
-                ("▶  Auto-run session", '!'),
-                ("⏭  Skip tool", 's'),
-            ],
-            ApprovalPromptKind::ConfirmOnce => vec![
-                ("✓  Confirm", 'y'),
-                ("▶  Auto-run session", '!'),
-                ("✕  Cancel", 'n'),
-            ],
-        };
-
-        // Use inquire Select if terminal, fallback to single-char input
-        if std::io::stdin().is_terminal() {
-            let labels: Vec<String> = options.iter().map(|(s, _)| s.to_string()).collect();
-            match inquire::Select::new("", labels)
-                .with_render_config(Self::approval_select_theme())
-                .without_help_message()
-                .prompt()
-            {
-                Ok(choice) => {
-                    // Find the char for the selected option
-                    options
-                        .iter()
-                        .find(|(label, _)| choice == *label)
-                        .map(|(_, c)| *c)
-                        .unwrap_or('n')
-                }
-                Err(_) => 'n', // Esc or interrupt
-            }
-        } else {
-            // Non-terminal fallback: single character input
-            let hint = options
-                .iter()
-                .map(|(label, c)| {
-                    format!(
-                        "[{}] {}",
-                        c,
-                        label.trim_start_matches(|x: char| !x.is_alphabetic())
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" · ");
-            eprint!("  {} {hint} → ", "▸".magenta());
-            let _ = io::stderr().flush();
-
-            let mut response = String::new();
-            let _ = io::stdin().read_line(&mut response);
-            let ch = response.trim().to_lowercase().chars().next().unwrap_or('n');
-            if response.trim() == "!" { '!' } else { ch }
-        }
-    }
-
-    fn approval_select_theme() -> inquire::ui::RenderConfig<'static> {
-        use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet};
-        let magenta = Color::Rgb {
-            r: 200,
-            g: 80,
-            b: 200,
-        };
-        let mut rc = RenderConfig::default_colored();
-        rc.prompt_prefix = inquire::ui::Styled::new("▸").with_fg(magenta);
-        rc.highlighted_option_prefix = inquire::ui::Styled::new("▸").with_fg(magenta);
-        rc.selected_option = Some(
-            StyleSheet::new()
-                .with_fg(magenta)
-                .with_attr(Attributes::BOLD),
+    /// Issue #326 P0 (tui-only) / #331: legacy stdin-/inquire-based
+    /// approval prompt.
+    ///
+    /// Before #331 deleted the line-mode REPL, this function was the
+    /// fallback when a tool needed approval but no approval-channel
+    /// (TUI bottom_pane queue) was attached. With the REPL gone, the
+    /// only interactive surface is the TUI, which always installs an
+    /// approval channel. Callers that still reach this function are
+    /// in non-interactive contexts (sub-runs, scripted CI) where
+    /// reading stdin would either hang or accept stray input from a
+    /// pipe — neither is what the user wants.
+    ///
+    /// Behaviour: return `'n'` (deny). The caller's downstream
+    /// `apply_cloud_approval_choice` translates this to
+    /// `ApprovalDecision::Deny`. Callers that genuinely needed an
+    /// interactive prompt should switch to `ApprovalRequestTx` /
+    /// `ApprovalSink` (the contract described in plan v3 §P2).
+    ///
+    /// We deliberately keep the function shape — `kind` and the
+    /// `char` return type — so the surrounding cloud-approval logic
+    /// (which still encodes 'y'/'n'/'a'/'!'/'s' choices) compiles
+    /// without churn. A follow-up PR can collapse this into
+    /// `ApprovalSink` proper.
+    #[cfg(test)]
+    pub(crate) fn prompt_approval(_kind: ApprovalPromptKind) -> char {
+        astra_core::agent_warn!(
+            "permission",
+            "prompt_approval invoked in non-TUI context: returning Deny. \
+             This path is dead code post-#331; callers should switch to ApprovalSink."
         );
-        rc.answer = StyleSheet::new()
-            .with_fg(magenta)
-            .with_attr(Attributes::BOLD);
-        rc
+        'n'
     }
 
     pub(super) fn apply_cloud_approval_choice(
@@ -1295,13 +2101,28 @@ impl PermissionManager {
                 };
                 self.session_overrides.insert(fp, true);
                 let rule = Self::make_allow_rule(tool, &rule_args);
-                self.add_allow_rule(&rule);
-                let scope = if self.project_root.is_some() {
-                    "project"
+                if sensitive_path_match(&rule_args).is_some() {
+                    eprintln!("{}", format!("  ✓ {rule}: allowed for this session").dim());
                 } else {
-                    "session"
-                };
-                eprintln!("{}", format!("  ✓ {rule}: always allowed ({scope})").dim());
+                    self.add_allow_rule(&rule);
+                    let persist_error = self.take_last_save_error();
+                    let scope = if self.project_root.is_some() {
+                        "project"
+                    } else {
+                        "session"
+                    };
+                    if let Some(err) = persist_error {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "  ⚠ {rule}: allowed for this session; failed to save {scope} rule: {err}"
+                            )
+                            .yellow()
+                        );
+                    } else {
+                        eprintln!("{}", format!("  ✓ {rule}: always allowed ({scope})").dim());
+                    }
+                }
                 ApprovalDecision::AllowSession
             }
             '!' => {
@@ -1337,37 +2158,372 @@ impl PermissionManager {
         }
     }
 
-    /// Add a persistent allow rule and save to disk.
-    pub(super) fn add_allow_rule(&mut self, rule: &str) {
-        if !self.settings.allow.contains(&rule.to_string()) {
-            self.settings.allow.push(rule.to_string());
-            self.cached_allow = self.settings.parsed_allow_rules();
-            if let Some(ref root) = self.project_root {
-                let _ = self.settings.save(root);
+    fn replace_project_settings(&mut self, settings: PermissionSettings) {
+        self.settings = settings;
+        self.cached_allow = self.settings.parsed_allow_rules();
+        self.cached_deny = self.settings.parsed_deny_rules();
+    }
+
+    fn replace_user_settings(&mut self, settings: PermissionSettings) {
+        self.user_settings = settings;
+        self.cached_user_allow = self.user_settings.parsed_allow_rules();
+        self.cached_user_deny = self.user_settings.parsed_deny_rules();
+    }
+
+    fn remember_allow_rule_in_memory(
+        &mut self,
+        target: astra_turn_core::permission_audit::PersistTarget,
+        rule_text: &str,
+    ) {
+        match target {
+            astra_turn_core::permission_audit::PersistTarget::Project => {
+                if !self.settings.allow.iter().any(|rule| rule == rule_text) {
+                    self.settings.allow.push(rule_text.to_string());
+                    self.cached_allow = self.settings.parsed_allow_rules();
+                }
+            }
+            astra_turn_core::permission_audit::PersistTarget::User => {
+                if !self
+                    .user_settings
+                    .allow
+                    .iter()
+                    .any(|rule| rule == rule_text)
+                {
+                    self.user_settings.allow.push(rule_text.to_string());
+                    self.cached_user_allow = self.user_settings.parsed_allow_rules();
+                }
             }
         }
     }
 
-    /// Build a pattern-specific allow rule from a tool name and its arguments.
-    /// For execute tools (bash/shell), extracts the first command word to produce
-    /// `Bash(cargo:*)` instead of bare `bash` (which would match everything).
-    /// For write tools, returns the bare tool name (already scoped by nature).
-    pub(super) fn make_allow_rule(name: &str, args: &serde_json::Value) -> String {
-        if let Some(cmd) = command_hint_from_args(args) {
-            let first_word = cmd.split_whitespace().next().unwrap_or("");
-            if !first_word.is_empty() {
-                // Capitalize tool name for readability: bash → Bash
-                let cap = {
-                    let mut c = name.chars();
-                    match c.next() {
-                        None => name.to_string(),
-                        Some(f) => f.to_uppercase().to_string() + c.as_str(),
-                    }
-                };
-                return format!("{cap}({first_word}:*)");
+    fn record_rule_persisted(
+        &self,
+        timestamp_ms: u64,
+        correlation_id: String,
+        target: astra_turn_core::permission_audit::PersistTarget,
+        rule_text: String,
+        saved: bool,
+        failure_reason: Option<String>,
+    ) {
+        astra_turn_core::permission_audit::record_persisted_for_session(
+            self.active_session_id(),
+            astra_turn_core::permission_audit::RulePersistedEvent {
+                timestamp_ms,
+                correlation_id,
+                target,
+                rule_text,
+                saved,
+                failure_reason,
+            },
+        );
+    }
+
+    fn reload_project_settings_with_policy(
+        &mut self,
+        policy: PermissionLoadPolicy,
+        workspace_trust: Option<WorkspaceTrustEvaluation>,
+    ) {
+        let Some(root) = self.project_root.clone() else {
+            self.load_policy = policy;
+            self.workspace_trust = workspace_trust;
+            return;
+        };
+
+        let outcome = PermissionSettings::try_load(&root);
+        if let Some(err) = outcome.error {
+            tracing::warn!("permission_manager: {} after workspace trust change", err);
+            self.load_errors.push(err);
+        }
+        let settings = apply_load_policy(outcome.settings, &policy);
+        self.replace_project_settings(settings);
+        self.load_policy = policy;
+        self.workspace_trust = workspace_trust;
+    }
+
+    fn set_workspace_trust_state(
+        &mut self,
+        state: TrustState,
+        rules_hash: Option<String>,
+    ) -> Result<WorkspaceTrustEvaluation, String> {
+        let Some(root) = self.project_root.clone() else {
+            return Err("no project root is associated with this permission manager".to_string());
+        };
+
+        let (mut ledger, load_error) = WorkspaceTrustLedger::load();
+        if let Some(err) = load_error {
+            return Err(err.to_string());
+        }
+        ledger.set(&root, state, rules_hash, Some(now_rfc3339()));
+        ledger.save().map_err(|e| e.to_string())?;
+        Ok(evaluate_workspace_trust(&root))
+    }
+
+    /// Persist trust for the current workspace and reload project
+    /// settings so project allow rules become active immediately.
+    pub(super) fn trust_workspace(&mut self) -> Result<String, String> {
+        let Some(root) = self.project_root.clone() else {
+            return Err("no project root is associated with this permission manager".to_string());
+        };
+        let rules_hash = project_permissions_hash(&root).map_err(|e| e.to_string())?;
+        let trust = self.set_workspace_trust_state(TrustState::Trusted, rules_hash)?;
+        if !trust.applies_project_allow() {
+            return Err(format!(
+                "workspace trust was saved but did not validate: {}",
+                trust.reason.display()
+            ));
+        }
+        self.reload_project_settings_with_policy(
+            PermissionLoadPolicy::InteractiveTrusted,
+            Some(trust),
+        );
+        Ok(format!("Workspace trusted: {}", root.display()))
+    }
+
+    /// Persist an explicit untrusted decision and reload project
+    /// settings so project allow rules are removed from the active set.
+    pub(super) fn untrust_workspace(&mut self) -> Result<String, String> {
+        let Some(root) = self.project_root.clone() else {
+            return Err("no project root is associated with this permission manager".to_string());
+        };
+        let trust = self.set_workspace_trust_state(TrustState::Untrusted, None)?;
+        self.reload_project_settings_with_policy(
+            PermissionLoadPolicy::InteractiveUntrusted,
+            Some(trust),
+        );
+        Ok(format!("Workspace marked untrusted: {}", root.display()))
+    }
+
+    fn refresh_workspace_trust_hash_after_project_save(&mut self) {
+        let Some(root) = self.project_root.clone() else {
+            return;
+        };
+        if !self
+            .workspace_trust
+            .as_ref()
+            .is_some_and(WorkspaceTrustEvaluation::applies_project_allow)
+        {
+            return;
+        }
+        let rules_hash = match project_permissions_hash(&root) {
+            Ok(hash) => hash,
+            Err(err) => {
+                tracing::warn!(
+                    "permission_manager: allow rule saved, but failed to hash updated project permissions for workspace trust: {err}"
+                );
+                return;
+            }
+        };
+        match self.set_workspace_trust_state(TrustState::Trusted, rules_hash) {
+            Ok(trust) => {
+                self.workspace_trust = Some(trust);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "permission_manager: allow rule saved, but failed to refresh workspace trust ledger: {err}"
+                );
             }
         }
-        name.to_string()
+    }
+
+    /// Add a persistent allow rule and save to disk.
+    ///
+    /// Save errors are surfaced via `last_save_error()` and a `tracing::warn`
+    /// rather than silently swallowed. On failure the rule is still applied
+    /// to the current in-memory session so the user's explicit approval
+    /// takes effect immediately; callers must inspect `last_save_error()`
+    /// and notify the user that persistence failed.
+    pub(super) fn add_allow_rule(&mut self, rule: &str) {
+        use astra_turn_core::permission_audit::PersistTarget;
+
+        let rule_text = rule.to_string();
+        if self.settings.allow.contains(&rule_text) {
+            return;
+        }
+
+        let Some(root) = self.project_root.clone() else {
+            self.settings.allow.push(rule_text);
+            self.cached_allow = self.settings.parsed_allow_rules();
+            return;
+        };
+
+        let target_path = root.join(".kiro/permissions.json");
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let correlation_id = format!("rule-{}-{}", timestamp_ms, rule);
+        let save_result = PermissionSettings::modify(&root, |settings| -> Result<(), String> {
+            if !settings.allow.contains(&rule_text) {
+                settings.allow.push(rule_text.clone());
+            }
+            Ok(())
+        });
+
+        match save_result {
+            Err(e) => {
+                tracing::warn!(
+                    "permission_manager: failed to persist allow rule '{}' to {}: {}",
+                    rule,
+                    target_path.display(),
+                    e
+                );
+                self.last_save_error = Some(e.to_string());
+                self.remember_allow_rule_in_memory(PersistTarget::Project, &rule_text);
+                // Issue #326 P6 / R2 Major 4: emit
+                // RulePersistedEvent on failure so audit /
+                // `/permissions trace` can show the attempt + the
+                // error reason.
+                self.record_rule_persisted(
+                    timestamp_ms,
+                    correlation_id,
+                    PersistTarget::Project,
+                    rule_text,
+                    false,
+                    Some(e.to_string()),
+                );
+            }
+            Ok(settings) => {
+                self.replace_project_settings(settings);
+                self.refresh_workspace_trust_hash_after_project_save();
+                self.last_save_error = None;
+                self.record_rule_persisted(
+                    timestamp_ms,
+                    correlation_id,
+                    PersistTarget::Project,
+                    rule_text,
+                    true,
+                    None,
+                );
+            }
+        }
+    }
+
+    /// Add a user-level persistent allow rule and save to
+    /// `~/.astra/permissions.json` using the same lock/reload/merge/save
+    /// path as project rules.
+    pub(super) fn add_user_allow_rule(&mut self, rule: &str) {
+        self.add_user_allow_rule_with_home(rule, None);
+    }
+
+    fn add_user_allow_rule_with_home(&mut self, rule: &str, home: Option<&Path>) {
+        use astra_turn_core::permission_audit::PersistTarget;
+
+        let rule_text = rule.to_string();
+        if self.user_settings.allow.contains(&rule_text) {
+            return;
+        }
+
+        let target_path = home
+            .map(PermissionSettings::user_settings_path)
+            .or_else(|| dirs::home_dir().map(|home| PermissionSettings::user_settings_path(&home)))
+            .unwrap_or_else(|| PathBuf::from("~/.astra/permissions.json"));
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let correlation_id = format!("rule-{}-{}", timestamp_ms, rule);
+        let save_result = match home {
+            Some(home) => {
+                PermissionSettings::modify_user_in_home(home, |settings| -> Result<(), String> {
+                    if !settings.allow.contains(&rule_text) {
+                        settings.allow.push(rule_text.clone());
+                    }
+                    Ok(())
+                })
+            }
+            None => PermissionSettings::modify_user(|settings| -> Result<(), String> {
+                if !settings.allow.contains(&rule_text) {
+                    settings.allow.push(rule_text.clone());
+                }
+                Ok(())
+            }),
+        };
+
+        match save_result {
+            Err(e) => {
+                tracing::warn!(
+                    "permission_manager: failed to persist user allow rule '{}' to {}: {}",
+                    rule,
+                    target_path.display(),
+                    e
+                );
+                self.last_save_error = Some(e.to_string());
+                self.remember_allow_rule_in_memory(PersistTarget::User, &rule_text);
+                self.record_rule_persisted(
+                    timestamp_ms,
+                    correlation_id,
+                    PersistTarget::User,
+                    rule_text,
+                    false,
+                    Some(e.to_string()),
+                );
+            }
+            Ok(settings) => {
+                self.replace_user_settings(settings);
+                self.last_save_error = None;
+                self.record_rule_persisted(
+                    timestamp_ms,
+                    correlation_id,
+                    PersistTarget::User,
+                    rule_text,
+                    true,
+                    None,
+                );
+            }
+        }
+    }
+
+    /// Returns the last persistence error, if any. UI layers consult
+    /// this after invoking `add_allow_rule` / similar mutations to
+    /// decide whether to display a `Failed to save rule` toast.
+    pub fn last_save_error(&self) -> Option<&str> {
+        self.last_save_error.as_deref()
+    }
+
+    /// Clear the last persistence error (e.g. after the user has been
+    /// notified, so the next save attempt starts with a clean slate).
+    pub fn clear_last_save_error(&mut self) {
+        self.last_save_error = None;
+    }
+
+    /// Take the last persistence error so a caller can emit a one-shot
+    /// warning without repeating it on later successful operations.
+    pub fn take_last_save_error(&mut self) -> Option<String> {
+        self.last_save_error.take()
+    }
+
+    /// Errors encountered while loading `permissions.json` at construction.
+    ///
+    /// Returns an empty slice when both files loaded cleanly or were
+    /// absent. The TUI consumes this once on startup to render a banner
+    /// and then calls [`clear_load_errors`] so the warning isn't shown
+    /// repeatedly. Headless mode reads this and `exit(1)` if non-empty
+    /// so corrupt rule files don't silently fall back to "no rules".
+    pub fn load_errors(&self) -> &[PermissionSettingsLoadError] {
+        &self.load_errors
+    }
+
+    /// Drop the load-error list (called by the UI after surfacing).
+    pub fn clear_load_errors(&mut self) {
+        self.load_errors.clear();
+    }
+
+    /// Build the persistent allow rule for a tool invocation.
+    ///
+    /// This intentionally delegates to the turn-core preview builder so TUI
+    /// will-save copy and Project/User persistence use one rule shape. That
+    /// keeps the selected scope from changing the matched object: Turn,
+    /// Session, Project, and User all start from the same tool-call facts.
+    pub(super) fn make_allow_rule(name: &str, args: &serde_json::Value) -> String {
+        allow_rule_preview(name, args)
+    }
+
+    pub(super) fn make_allow_rule_with_match_target(
+        name: &str,
+        args: &serde_json::Value,
+        target: &AllowMatchTarget,
+    ) -> String {
+        allow_rule_preview_for_match_target(name, args, target)
     }
 
     /// Synchronous permission check — blocks on terminal prompt if needed.
@@ -1408,7 +2564,7 @@ impl PermissionManager {
                     }
                     if let Some(allowed) = self
                         .session_overrides
-                        .check(&content_aware_fingerprint(name, args))
+                        .check(&approval_lookup_fingerprint(name, args))
                     {
                         return allowed;
                     }
@@ -1476,7 +2632,7 @@ impl PermissionManager {
         // explicit-approval and mode gating so a prior approval isn't re-prompted).
         if let Some(allowed) = self
             .session_overrides
-            .check(&content_aware_fingerprint(name, args))
+            .check(&approval_lookup_fingerprint(name, args))
         {
             return allowed;
         }
@@ -1589,8 +2745,6 @@ impl PermissionManager {
         name: &str,
         args: &serde_json::Value,
     ) -> PermissionDecision {
-        /// Strip the trailing "Ask the user for permission..." instruction
-        /// from sandbox-denied tool output before handing it to the UI.
         fn trim_sandbox_reason_for_ui(raw: &str) -> String {
             const INSTRUCTION: &str =
                 "Ask the user for permission before accessing files outside the project.";
@@ -1601,237 +2755,98 @@ impl PermissionManager {
                 .to_string()
                 + "."
         }
-        // Sandbox expansion requests always require explicit user approval,
-        // regardless of permission mode (except Auto which trusts everything).
-        if let Some(inner_tool) = name.strip_prefix("sandbox_expand:") {
-            let reason = args
-                .get("reason")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("Access to path outside project boundary");
 
-            // Trusted-root check: `Always` on a previous sandbox prompt
-            // adds the target path to a session-scoped trust list. Any
-            // later request whose target sits under that subtree is
-            // auto-allowed — regardless of which tool (read_file,
-            // glob, bash …) is doing the access.
-            if let Some(target) = parse_sandbox_target_path(reason)
-                && self.path_under_trusted_root(&target)
-            {
-                return PermissionDecision::Allow;
-            }
+        let envelope = self.evaluate_permission_envelope(name, args);
+        astra_turn_core::permission_audit::record_evaluated_envelope_for_session(
+            self.active_session_id(),
+            name,
+            args,
+            &envelope,
+            "cli",
+            None,
+        );
 
-            // Check session overrides first
-            if let Some(allowed) = self
-                .session_overrides
-                .check(&content_aware_fingerprint(name, args))
-            {
+        if matches!(envelope.source, DecisionSource::SandboxExpansion)
+            && matches!(envelope.decision, HardDecision::NeedExternal { .. })
+        {
+            if let Some(allowed) = self.check_overrides(&approval_lookup_fingerprint(name, args)) {
                 return if allowed {
                     PermissionDecision::Allow
                 } else {
                     PermissionDecision::Deny("Sandbox expansion denied for session".into())
                 };
             }
-            return match self.mode {
-                PermissionMode::Auto => PermissionDecision::Allow,
-                PermissionMode::Deny => {
-                    PermissionDecision::Deny("Sandbox expansion denied (deny mode)".into())
-                }
-                PermissionMode::Prompt => PermissionDecision::NeedApproval {
-                    tool: name.to_string(),
-                    header: format!("{inner_tool} wants to read outside the project"),
-                    // `reason` carries the authoritative message from the
-                    // underlying fs/shell tool (with path + project root);
-                    // leave `detail` empty so it isn't repeated verbatim
-                    // right below the header. Strip the trailing
-                    // "Ask the user for permission..." instruction — it's
-                    // meant for the model, not the human.
-                    detail: None,
-                    reason: trim_sandbox_reason_for_ui(reason),
-                },
-            };
+            let reason = args
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Access to path outside project boundary");
+            if let Some(target) = parse_sandbox_target_path(reason)
+                && self.path_under_trusted_root(&target)
+            {
+                return PermissionDecision::Allow;
+            }
+            if self.check_allow_rules(name, args) {
+                return PermissionDecision::Allow;
+            }
         }
 
-        // Step 1: Deny rules (bypass-immune).
-        if self.check_deny_rules(name, args) {
-            return PermissionDecision::Deny("Denied by rule".into());
-        }
-
-        // Step 2: Read-only tools always allowed (before overrides, same as check()).
-        let side_effect = Self::classify_with_args(name, args);
-
-        // Step 3: Git safety checks.
-        // Hard violations (injection, config manipulation) are bypass-immune.
-        // Soft violations (cd+git compound, commit --amend) respect auto mode
-        // and session overrides so users aren't repeatedly prompted.
-        if side_effect == SideEffect::Execute {
-            let git_violations = Self::check_git_safety(args);
-            if !git_violations.is_empty() {
-                use astra_runtime::tool_sandbox::is_soft_violation;
-
-                let has_hard = git_violations.iter().any(|v| !is_soft_violation(v));
-                let all_soft = !has_hard;
-
-                if self.mode == PermissionMode::Deny {
-                    return PermissionDecision::Deny("Git safety violation (deny mode)".into());
-                }
-
-                // Soft-only violations: respect auto mode and session overrides.
-                if all_soft {
-                    if self.mode == PermissionMode::Auto {
-                        return PermissionDecision::Allow;
-                    }
-                    if let Some(allowed) = self
-                        .session_overrides
-                        .check(&content_aware_fingerprint(name, args))
-                    {
-                        return if allowed {
-                            PermissionDecision::Allow
-                        } else {
-                            PermissionDecision::Deny("Skipped for session".into())
-                        };
-                    }
-                }
-
-                let reasons: Vec<String> = git_violations.iter().map(|v| format!("{v}")).collect();
-                let (header, detail) = Self::format_tool_display(name, args);
-                return PermissionDecision::NeedApproval {
-                    tool: name.to_string(),
-                    header,
-                    detail,
-                    reason: format!("Git safety: {}", reasons.join(", ")),
+        if matches!(envelope.source, DecisionSource::SensitivePath { .. })
+            && matches!(envelope.decision, HardDecision::NeedExternal { .. })
+        {
+            if let Some(allowed) =
+                self.check_overrides_for_request(&approval_lookup_fingerprint(name, args), true)
+            {
+                return if allowed {
+                    PermissionDecision::Allow
+                } else {
+                    PermissionDecision::Deny("Sensitive path denied for session".into())
                 };
             }
+            if self.mode == PermissionMode::Auto
+                && (self.settings.allow_sensitive_path_writes
+                    || self.user_settings.allow_sensitive_path_writes)
+            {
+                astra_core::agent_warn!(
+                    "permission",
+                    "Auto mode allowed write to sensitive path (opt-in): tool={name}"
+                );
+                return PermissionDecision::Allow;
+            }
         }
 
-        // Step 5: Dangerous file path — respects Auto mode only when the user
-        // has explicitly opted in via `allow_sensitive_path_writes` (hard
-        // boundary: default strict even in Auto, so "模型绝不能越过" holds
-        // unless the operator has flipped the opt-in).
-        if let Some(warning) = Self::check_dangerous_path(name, args) {
-            match self.mode {
-                PermissionMode::Auto => {
-                    let opted_in = self.settings.allow_sensitive_path_writes
-                        || self.user_settings.allow_sensitive_path_writes;
-                    if opted_in {
-                        astra_core::agent_warn!(
-                            "permission",
-                            "Auto mode allowed write to sensitive path (opt-in): tool={name} warning={warning}"
-                        );
-                        return PermissionDecision::Allow;
+        match envelope.decision {
+            HardDecision::Allow => PermissionDecision::Allow,
+            HardDecision::Deny { reason } => PermissionDecision::Deny(reason),
+            HardDecision::NeedExternal { prompt } => {
+                if matches!(envelope.source, DecisionSource::Mode { .. }) {
+                    let fp = content_aware_fingerprint(name, args);
+                    match self.denial_tracker.should_prompt(&fp) {
+                        astra_turn_core::approval_fingerprint::DenialAction::SkipTool => {
+                            return PermissionDecision::Deny(format!(
+                                "{name}: auto-denied (repeated denials)"
+                            ));
+                        }
+                        astra_turn_core::approval_fingerprint::DenialAction::FallbackToUser => {}
+                        astra_turn_core::approval_fingerprint::DenialAction::Continue => {}
                     }
-                    let (header, detail) = Self::format_tool_display(name, args);
-                    return PermissionDecision::NeedApproval {
-                        tool: name.to_string(),
-                        header,
-                        detail,
-                        reason: format!(
-                            "{warning} (Auto mode is strict for sensitive paths; set allow_sensitive_path_writes=true in .kiro/permissions.json to opt in)"
-                        ),
+                }
+
+                let (header, detail, reason) =
+                    if matches!(envelope.source, DecisionSource::SandboxExpansion) {
+                        (
+                            prompt.header,
+                            prompt.detail,
+                            trim_sandbox_reason_for_ui(&prompt.reason),
+                        )
+                    } else {
+                        let (header, detail) = Self::format_tool_display(name, args);
+                        (header, detail, prompt.reason)
                     };
-                }
-                PermissionMode::Deny => {
-                    return PermissionDecision::Deny("Sensitive path (deny mode)".into());
-                }
-                PermissionMode::Prompt => {
-                    if let Some(allowed) = self
-                        .session_overrides
-                        .check(&content_aware_fingerprint(name, args))
-                    {
-                        return if allowed {
-                            PermissionDecision::Allow
-                        } else {
-                            PermissionDecision::Deny("Skipped for session".into())
-                        };
-                    }
-                    let (header, detail) = Self::format_tool_display(name, args);
-                    return PermissionDecision::NeedApproval {
-                        tool: name.to_string(),
-                        header,
-                        detail,
-                        reason: warning.to_string(),
-                    };
-                }
-            }
-        }
-
-        // Step 4: Execute decision.
-        if side_effect == SideEffect::Execute {
-            match Self::execute_decision(name, args) {
-                ExecuteDecision::AllowSilent => return PermissionDecision::Allow,
-                ExecuteDecision::Deny => {
-                    return PermissionDecision::Deny("Dangerous command".into());
-                }
-                ExecuteDecision::Ask => {}
-            }
-        } else if Self::is_dangerous(name, args) {
-            return PermissionDecision::Deny("Dangerous pattern".into());
-        }
-
-        if side_effect == SideEffect::Read && explicit_approval_reason(name, args).is_none() {
-            return PermissionDecision::Allow;
-        }
-
-        // Step 5: Session overrides (AFTER bypass-immune safety checks, BEFORE
-        // explicit-approval and mode gating so a prior approval isn't re-prompted).
-        if let Some(allowed) = self
-            .session_overrides
-            .check(&content_aware_fingerprint(name, args))
-        {
-            return if allowed {
-                PermissionDecision::Allow
-            } else {
-                PermissionDecision::Deny("Skipped for session".into())
-            };
-        }
-
-        if let Some(reason) = explicit_approval_reason(name, args) {
-            match self.mode {
-                PermissionMode::Deny => {
-                    return PermissionDecision::Deny(
-                        "Explicit approval required (deny mode)".into(),
-                    );
-                }
-                PermissionMode::Auto => return PermissionDecision::Allow,
-                PermissionMode::Prompt => {}
-            }
-            let (header, detail) = Self::format_tool_display(name, args);
-            return PermissionDecision::NeedApproval {
-                tool: name.to_string(),
-                header,
-                detail,
-                reason,
-            };
-        }
-
-        // Step 6: Persistent allow rules.
-        if self.check_allow_rules(name, args) {
-            return PermissionDecision::Allow;
-        }
-
-        // Step 7: Permission mode.
-        match self.mode {
-            PermissionMode::Auto => PermissionDecision::Allow,
-            PermissionMode::Deny => PermissionDecision::Deny("Denied by mode".into()),
-            PermissionMode::Prompt => {
-                // Check denial limits before prompting.
-                let fp = content_aware_fingerprint(name, args);
-                match self.denial_tracker.should_prompt(&fp) {
-                    astra_turn_core::approval_fingerprint::DenialAction::SkipTool => {
-                        return PermissionDecision::Deny(format!(
-                            "{name}: auto-denied (repeated denials)"
-                        ));
-                    }
-                    astra_turn_core::approval_fingerprint::DenialAction::FallbackToUser => {
-                        // Still show the prompt but add escalation context
-                    }
-                    astra_turn_core::approval_fingerprint::DenialAction::Continue => {}
-                }
-                let (header, detail) = Self::format_tool_display(name, args);
                 PermissionDecision::NeedApproval {
-                    tool: name.to_string(),
+                    tool: prompt.tool,
                     header,
                     detail,
-                    reason: "Write/execute tool requires approval".to_string(),
+                    reason,
                 }
             }
         }
@@ -1852,6 +2867,54 @@ impl PermissionManager {
         if !allowed {
             self.denial_tracker.record(&fp, false);
             self.record_rejection(name, "session override: deny");
+        }
+    }
+
+    pub(super) fn record_approval_with_match_target(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        target: &AllowMatchTarget,
+        allowed: bool,
+    ) {
+        let fp = fingerprint_for_match_target(name, args, target);
+        self.session_overrides.insert(fp.clone(), allowed);
+        if !allowed {
+            self.denial_tracker.record(&fp, false);
+            self.record_rejection(name, "session override: deny");
+        }
+    }
+
+    /// Record an approval that is valid only for the current LLM turn.
+    pub(super) fn record_turn_approval(
+        &mut self,
+        name: &str,
+        args: Option<&serde_json::Value>,
+        allowed: bool,
+    ) {
+        let fp = match args {
+            Some(a) => content_aware_fingerprint(name, a),
+            None => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(name),
+        };
+        self.turn_overrides.insert(fp.clone(), allowed);
+        if !allowed {
+            self.denial_tracker.record(&fp, false);
+            self.record_rejection(name, "turn override: deny");
+        }
+    }
+
+    pub(super) fn record_turn_approval_with_match_target(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        target: &AllowMatchTarget,
+        allowed: bool,
+    ) {
+        let fp = fingerprint_for_match_target(name, args, target);
+        self.turn_overrides.insert(fp.clone(), allowed);
+        if !allowed {
+            self.denial_tracker.record(&fp, false);
+            self.record_rejection(name, "turn override: deny");
         }
     }
 
@@ -1900,6 +2963,11 @@ impl PermissionManager {
         use std::fmt::Write;
         let mut out = String::new();
         let _ = writeln!(out, "  Mode: {}", self.mode);
+        if let Some(trust) = &self.workspace_trust {
+            let _ = writeln!(out, "  {}", trust.summary_line());
+        } else if self.project_root.is_some() {
+            let _ = writeln!(out, "  Project load policy: {:?}", self.load_policy);
+        }
         if !self.cached_allow.is_empty() {
             let _ = writeln!(out, "  Allow rules ({}):", self.cached_allow.len());
             for rule in &self.cached_allow {
@@ -1950,9 +3018,21 @@ impl PermissionManager {
     }
 }
 
-/// Result of a non-blocking permission check.
+/// Outcome of a non-blocking permission gate evaluation.
+///
+/// Issue #326 P1 / R1 §1: this used to be called `PermissionDecision`,
+/// which collided with `astra_turn_core::permission_types::PermissionDecision`
+/// (a different shape: Approve / Deny / Escalate). The CLI gate
+/// produces a different envelope (Allow / Deny / NeedApproval) — the
+/// turn-core type is for callbacks inside the runtime, this one is
+/// what the gate hands back to the stream host. We rename to
+/// `GateOutcome` so the two never get confused at a use site.
+///
+/// The legacy alias `PermissionDecision` is kept for one PR cycle
+/// to avoid churning every call site; new code should use
+/// `GateOutcome`.
 #[derive(Debug)]
-pub(super) enum PermissionDecision {
+pub(super) enum GateOutcome {
     Allow,
     Deny(String),
     /// Tool requires interactive approval — route through async channel.
@@ -1964,6 +3044,12 @@ pub(super) enum PermissionDecision {
     },
 }
 
+/// Backwards-compatible alias for the previous name. Exists only so
+/// the existing call sites in `stream_render.rs` etc. keep compiling
+/// during the P1 type-merge transition. Will be removed in P2.
+pub(super) type PermissionDecision = GateOutcome;
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ApprovalPromptKind {
     LocalStandard,
@@ -2144,7 +3230,13 @@ mod tests {
     fn resolve_cloud_approval_quiet_denies_without_auto() {
         let mut pm = PermissionManager::new(false);
         assert!(matches!(
-            pm.resolve_cloud_approval("write_file", Some("x.rs"), ApprovalKind::Standard, true),
+            pm.resolve_cloud_approval(
+                "write_file",
+                Some("x.rs"),
+                None,
+                ApprovalKind::Standard,
+                true
+            ),
             astra_thin_client::ApprovalDecision::Deny
         ));
     }
@@ -2153,9 +3245,81 @@ mod tests {
     fn resolve_cloud_approval_quiet_allows_when_auto() {
         let mut pm = PermissionManager::new(true);
         assert!(matches!(
-            pm.resolve_cloud_approval("write_file", Some("x.rs"), ApprovalKind::Standard, true),
+            pm.resolve_cloud_approval(
+                "write_file",
+                Some("x.rs"),
+                None,
+                ApprovalKind::Standard,
+                true
+            ),
             astra_thin_client::ApprovalDecision::Allow
         ));
+    }
+
+    #[test]
+    fn turn_override_allows_only_until_next_turn() {
+        let mut pm = PermissionManager::new(false);
+        let args = serde_json::json!({"command": "cargo test"});
+
+        assert!(matches!(
+            pm.check_nonblocking("bash", &args),
+            PermissionDecision::NeedApproval { .. }
+        ));
+
+        pm.record_turn_approval("bash", Some(&args), true);
+        assert!(matches!(
+            pm.check_nonblocking("bash", &args),
+            PermissionDecision::Allow
+        ));
+        assert!(pm.export_session_overrides().is_none());
+
+        pm.clear_turn_overrides();
+        assert!(matches!(
+            pm.check_nonblocking("bash", &args),
+            PermissionDecision::NeedApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn check_nonblocking_persists_permission_audit_to_active_session() {
+        let journal_dir = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
+        let session_id = format!("perm-manager-audit-{}", uuid::Uuid::new_v4());
+        let project_dir = tempfile::tempdir().unwrap();
+        let mut pm =
+            PermissionManager::with_project_mode(PermissionMode::Prompt, project_dir.path());
+        pm.set_active_session_id(&session_id);
+        let args = serde_json::json!({"path": "x.md", "content": "# x"});
+
+        assert!(matches!(
+            pm.check_nonblocking("write_file", &args),
+            PermissionDecision::NeedApproval { .. }
+        ));
+
+        let events = astra_services::session_journal::read_journal(&session_id).unwrap();
+        let permission_event = events
+            .iter()
+            .find(|event| {
+                event.event_type
+                    == astra_services::session_journal::JournalEventType::PermissionAudit
+            })
+            .expect("permission audit event");
+        let metadata = permission_event.metadata.as_ref().expect("metadata");
+        assert_eq!(
+            metadata.get("kind").and_then(serde_json::Value::as_str),
+            Some("evaluated")
+        );
+        assert_eq!(
+            metadata.get("decision").and_then(serde_json::Value::as_str),
+            Some("need_external")
+        );
+        assert_eq!(
+            metadata
+                .get("request_key")
+                .and_then(|value| value.get("tool"))
+                .and_then(serde_json::Value::as_str),
+            Some("write_file")
+        );
     }
 
     #[test]
@@ -2533,6 +3697,57 @@ mod tests {
     }
 
     #[test]
+    fn allow_rules_enforce_v2_op_and_path_context() {
+        let mut pm = PermissionManager::new(false);
+        pm.settings
+            .allow
+            .push(r#"write_file(path_glob="src/**/*.rs", op="write")"#.to_string());
+        pm.cached_allow = pm.settings.parsed_allow_rules();
+
+        assert!(pm.check_allow_rules(
+            "write_file",
+            &serde_json::json!({"path": "src/main.rs", "content": "fn main() {}"})
+        ));
+        assert!(!pm.check_allow_rules("read_file", &serde_json::json!({"path": "src/main.rs"})));
+    }
+
+    #[test]
+    fn allow_rules_enforce_v2_network_domain_context() {
+        let mut pm = PermissionManager::new(false);
+        pm.settings
+            .allow
+            .push(r#"Network(tool="web_fetch", domain="github.com")"#.to_string());
+        pm.cached_allow = pm.settings.parsed_allow_rules();
+
+        assert!(pm.check_allow_rules(
+            "web_fetch",
+            &serde_json::json!({"url": "https://api.github.com/repos"})
+        ));
+        assert!(!pm.check_allow_rules(
+            "web_fetch",
+            &serde_json::json!({"url": "https://example.com/repos"})
+        ));
+    }
+
+    #[test]
+    fn allow_rules_enforce_v2_mcp_capability_context() {
+        let mut pm = PermissionManager::new(false);
+        pm.settings.allow.push(
+            r#"MCP(tool="mcp_jira_create_issue", capability="destructive=false")"#.to_string(),
+        );
+        pm.cached_allow = pm.settings.parsed_allow_rules();
+
+        assert!(pm.check_allow_rules(
+            "mcp_jira_create_issue",
+            &serde_json::json!({"capability": "destructive=false"})
+        ));
+        assert!(!pm.check_allow_rules(
+            "mcp_jira_create_issue",
+            &serde_json::json!({"capability": "destructive=true"})
+        ));
+    }
+
+    #[test]
     fn settings_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let mut settings = PermissionSettings::default();
@@ -2543,6 +3758,377 @@ mod tests {
         let loaded = PermissionSettings::load(dir.path());
         assert_eq!(loaded.allow, vec!["Bash(git:*)"]);
         assert_eq!(loaded.deny, vec!["Bash(rm -rf:*)"]);
+    }
+
+    // ── Issue #326 P0: corrupt permissions.json must surface ────────────────
+
+    #[test]
+    fn try_load_returns_corrupt_for_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        let path = kiro.join("permissions.json");
+        std::fs::write(&path, "{ this is not json").unwrap();
+
+        let outcome = PermissionSettings::try_load(dir.path());
+        assert!(matches!(
+            outcome.error,
+            Some(PermissionSettingsLoadError::Corrupt { .. })
+        ));
+        // Settings still default-out so the agent stays usable.
+        assert!(outcome.settings.allow.is_empty());
+        assert!(outcome.settings.deny.is_empty());
+    }
+
+    #[test]
+    fn try_load_returns_none_for_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = PermissionSettings::try_load(dir.path());
+        assert!(outcome.error.is_none());
+    }
+
+    #[test]
+    fn try_load_returns_invalid_rule_for_unknown_v2_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(
+            kiro.join("permissions.json"),
+            r#"{"allow":["Bash(cwd_roott=\"packages/web\")"]}"#,
+        )
+        .unwrap();
+
+        let outcome = PermissionSettings::try_load(dir.path());
+        assert!(matches!(
+            outcome.error,
+            Some(PermissionSettingsLoadError::InvalidRule { .. })
+        ));
+        assert!(outcome.settings.allow.is_empty());
+    }
+
+    #[test]
+    fn permission_manager_with_corrupt_project_records_load_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(kiro.join("permissions.json"), "not valid json").unwrap();
+
+        let pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let errors = pm.load_errors();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, PermissionSettingsLoadError::Corrupt { .. })),
+            "load_errors should expose the corrupt-file failure: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_load_facade_still_returns_default_on_corrupt() {
+        // Backwards-compat: existing call sites that use `load()` get
+        // a defaulted settings struct (and a `tracing::warn` they may
+        // or may not be capturing). The new signal is on
+        // `PermissionManager::load_errors()`, not on `load()`.
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(kiro.join("permissions.json"), "garbage").unwrap();
+
+        let settings = PermissionSettings::load(dir.path());
+        assert!(settings.allow.is_empty());
+        assert!(settings.deny.is_empty());
+    }
+
+    // ── Issue #326 P5d: PermissionStore (modify with flock) ────────────
+
+    #[test]
+    fn modify_appends_rule_under_lock() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = PermissionSettings::modify(dir.path(), |s| -> Result<(), &'static str> {
+            s.allow.push("Bash(npm test:*)".to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(result.allow, vec!["Bash(npm test:*)"]);
+
+        // Re-load directly to confirm the change actually hit disk.
+        let reloaded = PermissionSettings::load(dir.path());
+        assert_eq!(reloaded.allow, vec!["Bash(npm test:*)"]);
+    }
+
+    #[test]
+    fn modify_picks_up_concurrent_writes() {
+        // Simulate "process A wrote a rule between our load and
+        // save"; modify must re-read the freshest baseline under
+        // the lock so we don't clobber A's rule.
+        let dir = tempfile::tempdir().unwrap();
+
+        // Process A: write a rule first.
+        let mut a = PermissionSettings::default();
+        a.allow.push("Bash(rule-a:*)".to_string());
+        a.save(dir.path()).unwrap();
+
+        // Process B: open a stale baseline by NOT calling load.
+        // Use modify to add a different rule — modify will re-load
+        // under the flock and see rule-a, then add rule-b on top.
+        let result = PermissionSettings::modify(dir.path(), |s| -> Result<(), &'static str> {
+            s.allow.push("Bash(rule-b:*)".to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            result.allow,
+            vec!["Bash(rule-a:*)", "Bash(rule-b:*)"],
+            "modify must merge with the on-disk baseline, not overwrite"
+        );
+    }
+
+    #[test]
+    fn modify_refuses_to_overwrite_corrupt_file() {
+        // If the file on disk is corrupt we MUST NOT silently
+        // overwrite it — that would lose any rules the user is
+        // trying to fix by hand. modify surfaces the error so the
+        // caller (TUI banner / headless exit-1) can deal with it.
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(kiro.join("permissions.json"), "{ not json").unwrap();
+
+        let err = PermissionSettings::modify(dir.path(), |_s| -> Result<(), &'static str> {
+            panic!("closure must not run when load fails")
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                ModifyError::Load(PermissionSettingsLoadError::Corrupt { .. })
+            ),
+            "expected Load(Corrupt), got {err:?}"
+        );
+
+        // The corrupt file is still on disk — modify did NOT
+        // replace it with default contents.
+        let raw = std::fs::read_to_string(kiro.join("permissions.json")).unwrap();
+        assert_eq!(raw, "{ not json");
+    }
+
+    #[test]
+    fn modify_propagates_user_error_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-write a baseline so we can detect any unexpected change.
+        let mut baseline = PermissionSettings::default();
+        baseline.allow.push("Bash(baseline:*)".to_string());
+        baseline.save(dir.path()).unwrap();
+
+        let err = PermissionSettings::modify(dir.path(), |s| -> Result<(), &'static str> {
+            s.allow.push("Bash(would-be:*)".to_string());
+            Err("user changed their mind")
+        })
+        .unwrap_err();
+        assert!(matches!(err, ModifyError::User("user changed their mind")));
+
+        // File on disk is unchanged.
+        let reloaded = PermissionSettings::load(dir.path());
+        assert_eq!(reloaded.allow, vec!["Bash(baseline:*)"]);
+    }
+
+    // ── Issue #326 P5b: PermissionLoadPolicy ──────────────────────────
+
+    #[test]
+    fn load_policy_headless_safe_drops_project_allow_keeps_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(
+            kiro.join("permissions.json"),
+            r#"{
+                "allow": ["Bash(curl:*)"],
+                "deny": ["Bash(rm -rf:*)"]
+            }"#,
+        )
+        .unwrap();
+
+        let pm = PermissionManager::with_load_policy(
+            PermissionMode::Auto,
+            dir.path(),
+            &PermissionLoadPolicy::HeadlessSafe,
+        );
+        // Project allow rules dropped — sub-run can't be granted
+        // capabilities the parent never asked about.
+        assert!(
+            pm.settings.allow.is_empty(),
+            "HeadlessSafe must drop project allow"
+        );
+        // Project deny rules preserved — a project can still tighten
+        // sub-run restrictions.
+        assert_eq!(pm.settings.deny, vec!["Bash(rm -rf:*)"]);
+    }
+
+    #[test]
+    fn load_policy_interactive_untrusted_drops_allow_keeps_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(
+            kiro.join("permissions.json"),
+            r#"{
+                "allow": ["Bash(rm:*)"],
+                "deny": ["Edit(/etc/**)"],
+                "allow_sensitive_path_writes": true
+            }"#,
+        )
+        .unwrap();
+
+        let pm = PermissionManager::with_load_policy(
+            PermissionMode::Prompt,
+            dir.path(),
+            &PermissionLoadPolicy::InteractiveUntrusted,
+        );
+        assert!(pm.settings.allow.is_empty());
+        assert_eq!(pm.settings.deny, vec!["Edit(/etc/**)"]);
+        assert!(
+            !pm.settings.allow_sensitive_path_writes,
+            "untrusted must zero allow_sensitive_path_writes"
+        );
+    }
+
+    #[test]
+    fn load_policy_interactive_trusted_loads_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(
+            kiro.join("permissions.json"),
+            r#"{
+                "allow": ["Bash(npm test:*)"],
+                "deny": ["Bash(rm -rf:*)"],
+                "allow_sensitive_path_writes": true
+            }"#,
+        )
+        .unwrap();
+
+        let pm = PermissionManager::with_load_policy(
+            PermissionMode::Prompt,
+            dir.path(),
+            &PermissionLoadPolicy::InteractiveTrusted,
+        );
+        assert_eq!(pm.settings.allow, vec!["Bash(npm test:*)"]);
+        assert_eq!(pm.settings.deny, vec!["Bash(rm -rf:*)"]);
+        assert!(pm.settings.allow_sensitive_path_writes);
+    }
+
+    #[test]
+    fn load_policy_corrupt_file_still_surfaces_through_headless_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(kiro.join("permissions.json"), "{ bad").unwrap();
+
+        let pm = PermissionManager::with_load_policy(
+            PermissionMode::Auto,
+            dir.path(),
+            &PermissionLoadPolicy::HeadlessSafe,
+        );
+        assert!(
+            !pm.load_errors().is_empty(),
+            "corrupt project file must surface even under HeadlessSafe"
+        );
+    }
+
+    #[test]
+    fn workspace_trust_unknown_drops_allow_keeps_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(
+            kiro.join("permissions.json"),
+            r#"{
+                "allow": ["Bash(npm test:*)"],
+                "deny": ["Bash(rm:*)"]
+            }"#,
+        )
+        .unwrap();
+        let ledger_path = dir.path().join("trusted_workspaces.json");
+
+        let pm = PermissionManager::with_workspace_trust_mode_from_ledger_path(
+            PermissionMode::Prompt,
+            dir.path(),
+            ledger_path,
+        );
+
+        assert!(pm.settings.allow.is_empty());
+        assert_eq!(pm.settings.deny, vec!["Bash(rm:*)"]);
+        assert!(matches!(
+            pm.workspace_trust.as_ref().map(|t| &t.reason),
+            Some(WorkspaceTrustReason::UnknownWorkspace)
+        ));
+    }
+
+    #[test]
+    fn workspace_trust_matching_hash_loads_project_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(
+            kiro.join("permissions.json"),
+            r#"{"allow":["Bash(npm test:*)"],"deny":["Bash(rm:*)"]}"#,
+        )
+        .unwrap();
+        let ledger_path = dir.path().join("trusted_workspaces.json");
+        let mut ledger = WorkspaceTrustLedger::empty_at(ledger_path.clone());
+        ledger.set(
+            dir.path(),
+            TrustState::Trusted,
+            project_permissions_hash(dir.path()).unwrap(),
+            Some("2026-05-13T11:25:00Z".into()),
+        );
+        ledger.save().unwrap();
+
+        let pm = PermissionManager::with_workspace_trust_mode_from_ledger_path(
+            PermissionMode::Prompt,
+            dir.path(),
+            ledger_path,
+        );
+
+        assert_eq!(pm.settings.allow, vec!["Bash(npm test:*)"]);
+        assert_eq!(pm.settings.deny, vec!["Bash(rm:*)"]);
+    }
+
+    #[test]
+    fn workspace_trust_hash_mismatch_drops_project_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        let permissions_path = kiro.join("permissions.json");
+        std::fs::write(&permissions_path, r#"{"allow":["Bash(ls:*)"]}"#).unwrap();
+        let trusted_hash = project_permissions_hash(dir.path()).unwrap();
+
+        let ledger_path = dir.path().join("trusted_workspaces.json");
+        let mut ledger = WorkspaceTrustLedger::empty_at(ledger_path.clone());
+        ledger.set(
+            dir.path(),
+            TrustState::Trusted,
+            trusted_hash,
+            Some("2026-05-13T11:25:00Z".into()),
+        );
+        ledger.save().unwrap();
+
+        std::fs::write(&permissions_path, r#"{"allow":["Bash(cargo test:*)"]}"#).unwrap();
+        let pm = PermissionManager::with_workspace_trust_mode_from_ledger_path(
+            PermissionMode::Prompt,
+            dir.path(),
+            ledger_path,
+        );
+
+        assert!(pm.settings.allow.is_empty());
+        assert!(matches!(
+            pm.workspace_trust.as_ref().map(|t| &t.reason),
+            Some(WorkspaceTrustReason::RulesHashChanged)
+        ));
     }
 
     // ── Dangerous file paths ──────────────────────────────────────────────────
@@ -2641,7 +4227,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let decision =
-            pm.resolve_cloud_approval("bash", Some("/tmp"), ApprovalKind::Standard, false);
+            pm.resolve_cloud_approval("bash", Some("/tmp"), None, ApprovalKind::Standard, false);
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
 
@@ -2650,7 +4236,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let decision =
-            pm.resolve_cloud_approval("bash", Some("/tmp"), ApprovalKind::Standard, false);
+            pm.resolve_cloud_approval("bash", Some("/tmp"), None, ApprovalKind::Standard, false);
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
 
@@ -2659,7 +4245,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let decision =
-            pm.resolve_cloud_approval("bash", Some("/tmp"), ApprovalKind::Explicit, true);
+            pm.resolve_cloud_approval("bash", Some("/tmp"), None, ApprovalKind::Explicit, true);
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
 
@@ -2669,8 +4255,13 @@ mod tests {
     fn auto_mode_cloud_explicit_interactive_auto_allows() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
-        let decision =
-            pm.resolve_cloud_approval("write_file", Some("new.rs"), ApprovalKind::Explicit, false);
+        let decision = pm.resolve_cloud_approval(
+            "write_file",
+            Some("new.rs"),
+            None,
+            ApprovalKind::Explicit,
+            false,
+        );
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
 
@@ -2678,8 +4269,13 @@ mod tests {
     fn deny_mode_cloud_explicit_interactive_denies() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
-        let decision =
-            pm.resolve_cloud_approval("write_file", Some("new.rs"), ApprovalKind::Explicit, false);
+        let decision = pm.resolve_cloud_approval(
+            "write_file",
+            Some("new.rs"),
+            None,
+            ApprovalKind::Explicit,
+            false,
+        );
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
 
@@ -2690,6 +4286,7 @@ mod tests {
         let decision = pm.resolve_cloud_approval(
             "bash",
             Some("Explicit approval required: action scope is unbounded."),
+            None,
             ApprovalKind::Standard,
             true,
         );
@@ -2966,6 +4563,36 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_expand_respects_deny_rule_in_auto_mode() {
+        // Issue #326 P2 / R1 Major 3: previously the `sandbox_expand:*`
+        // short-circuit ran BEFORE deny rules, so Auto mode would
+        // grant sandbox expansion even for a path the user had
+        // explicitly denied. Now Step 1 (DenyRules) runs first.
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+
+        // User pinned a deny rule on `sandbox_expand` — represents
+        // "I never want this tool to widen the sandbox".
+        pm.settings
+            .deny
+            .push("sandbox_expand:read_file".to_string());
+        pm.cached_deny = pm.settings.parsed_deny_rules();
+
+        let args = serde_json::json!({"reason": "/tmp/foo"});
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+
+        match decision {
+            PermissionDecision::Deny(reason) => {
+                assert!(
+                    reason.contains("rule") || reason.contains("Denied"),
+                    "expected deny-by-rule message, got: {reason}"
+                );
+            }
+            other => panic!("deny rule must beat sandbox_expand even in Auto mode; got {other:?}"),
+        }
+    }
+
+    #[test]
     fn sandbox_expand_always_remembered_across_different_paths() {
         // Regression: pressing "Always" on one sandbox-escape prompt
         // should silence prompts for later requests to the same tool
@@ -3130,8 +4757,9 @@ mod tests {
     #[test]
     fn session_override_cannot_bypass_dangerous_path() {
         // Hard boundary: Auto mode is strict on sensitive paths by default,
-        // even with a session override — operator must flip the explicit
-        // `allow_sensitive_path_writes` opt-in to proceed unattended.
+        // even with a broad tool-level session override. The operator must
+        // flip the explicit `allow_sensitive_path_writes` opt-in to proceed
+        // unattended without a content-specific approval.
         let mut pm = PermissionManager::new(true);
         pm.session_overrides.insert(bare_fp("write_file"), true);
         let args = serde_json::json!({"path": ".git/config", "content": "bad"});
@@ -3147,6 +4775,53 @@ mod tests {
         assert!(
             matches!(decision2, PermissionDecision::Allow),
             "opt-in should unlock Auto mode sensitive writes: got {decision2:?}"
+        );
+    }
+
+    #[test]
+    fn exact_session_override_allows_previously_approved_sensitive_path() {
+        let mut pm = PermissionManager::new(true);
+        let args = serde_json::json!({"path": ".git/config", "content": "ok"});
+        pm.record_approval_with_match_target("write_file", &args, &AllowMatchTarget::Exact, true);
+
+        let decision = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "content-specific sensitive path approval should be honored: got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn directory_override_cannot_bypass_sensitive_sibling_path() {
+        let mut pm = PermissionManager::new(true);
+        let safe = serde_json::json!({"path": "src/deep/main.rs", "content": "ok"});
+        let sensitive = serde_json::json!({"path": "src/deep/.env", "content": "SECRET=x"});
+
+        pm.record_approval("write_file", Some(&safe), true);
+
+        let decision = pm.check_nonblocking("write_file", &sensitive);
+        assert!(
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "non-sensitive directory approval must not unlock sensitive sibling: got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn sensitive_prefix_override_can_allow_matching_sensitive_path() {
+        let mut pm = PermissionManager::new(true);
+        let args = serde_json::json!({"path": ".git/config", "content": "ok"});
+        pm.record_approval_with_match_target(
+            "write_file",
+            &args,
+            &AllowMatchTarget::Prefix(".git/".to_string()),
+            true,
+        );
+
+        let later = serde_json::json!({"path": ".git/hooks/pre-commit", "content": "hook"});
+        let decision = pm.check_nonblocking("write_file", &later);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "sensitive prefix approval should cover matching sensitive path: got {decision:?}"
         );
     }
 
@@ -3190,17 +4865,140 @@ mod tests {
     // ── Security: make_allow_rule generates pattern-specific rules ───────────
 
     #[test]
-    fn make_allow_rule_bash_generates_pattern() {
+    fn make_allow_rule_bash_keeps_subcommand() {
+        // Issue #326 P1.5 / R1 Major 5: previously this saved
+        // `Bash(cargo:*)`, which would silently allow `cargo
+        // uninstall --no-confirm`. We now keep the subcommand.
         let args = serde_json::json!({"command": "cargo test --release"});
         let rule = PermissionManager::make_allow_rule("bash", &args);
-        assert_eq!(rule, "Bash(cargo:*)");
+        assert_eq!(rule, r#"Bash(argv_prefix="cargo test", op="execute")"#);
     }
 
     #[test]
-    fn make_allow_rule_no_command_falls_back() {
+    fn make_allow_rule_npm_does_not_overpermissive_to_npm_deploy() {
+        // Scenario #26: a user pressing Always on `npm test` MUST
+        // NOT silently authorize `npm run deploy`.
+        let test_args = serde_json::json!({"command": "npm test"});
+        let test_rule_str = PermissionManager::make_allow_rule("bash", &test_args);
+        assert_eq!(
+            test_rule_str,
+            r#"Bash(argv_prefix="npm test", op="execute")"#
+        );
+
+        let test_rule = PermissionRule::parse(&test_rule_str);
+        // npm test (and variants with flags) → still allowed
+        assert!(test_rule.matches_with_context(
+            "bash",
+            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                "bash",
+                &serde_json::json!({"command": "npm test"})
+            )
+        ));
+        assert!(test_rule.matches_with_context(
+            "bash",
+            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                "bash",
+                &serde_json::json!({"command": "npm test --verbose"})
+            )
+        ));
+        assert!(test_rule.matches_with_context(
+            "bash",
+            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                "bash",
+                &serde_json::json!({"command": "npm test -- --grep auth"})
+            )
+        ));
+
+        // npm run deploy → MUST NOT be allowed
+        assert!(
+            !test_rule.matches_with_context(
+                "bash",
+                &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                    "bash",
+                    &serde_json::json!({"command": "npm run deploy"})
+                )
+            ),
+            "npm test Allow must not match `npm run deploy`"
+        );
+        assert!(
+            !test_rule.matches_with_context(
+                "bash",
+                &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                    "bash",
+                    &serde_json::json!({"command": "npm run deploy:prod"})
+                )
+            ),
+            "npm test Allow must not match `npm run deploy:prod`"
+        );
+    }
+
+    #[test]
+    fn make_allow_rule_git_keeps_subcommand_so_push_does_not_share_commit_rule() {
+        // Pressing Always on `git commit -m 'fix'` should not
+        // authorize `git push --force`.
+        let commit_args = serde_json::json!({"command": "git commit -m 'fix'"});
+        let commit_rule_str = PermissionManager::make_allow_rule("bash", &commit_args);
+        assert_eq!(
+            commit_rule_str,
+            r#"Bash(argv_prefix="git commit", op="execute")"#
+        );
+
+        let commit_rule = PermissionRule::parse(&commit_rule_str);
+        assert!(commit_rule.matches_with_context(
+            "bash",
+            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                "bash",
+                &serde_json::json!({"command": "git commit -m 'fix'"})
+            )
+        ));
+        assert!(
+            !commit_rule.matches_with_context(
+                "bash",
+                &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                    "bash",
+                    &serde_json::json!({"command": "git push --force origin main"})
+                )
+            ),
+            "git commit Allow must not authorize git push --force"
+        );
+    }
+
+    #[test]
+    fn make_allow_rule_file_write_uses_path_rule() {
         let args = serde_json::json!({"path": "/tmp/foo"});
         let rule = PermissionManager::make_allow_rule("write_file", &args);
-        assert_eq!(rule, "write_file");
+        assert_eq!(rule, r#"write_file(path_glob="/tmp/foo", op="write")"#);
+
+        let parsed = PermissionRule::parse(&rule);
+        assert!(parsed.matches_with_context(
+            "write_file",
+            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                "write_file",
+                &args
+            )
+        ));
+        assert!(!parsed.matches_with_context(
+            "write_file",
+            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                "write_file",
+                &serde_json::json!({"path": "/tmp/foo-other"})
+            )
+        ));
+    }
+
+    #[test]
+    fn persisted_write_file_rule_does_not_widen_beyond_fingerprint() {
+        let mut pm = PermissionManager::new(false);
+        let approved_args = serde_json::json!({"path": "zzzz3.md", "content": "# zzzz3"});
+        let rule = PermissionManager::make_allow_rule("write_file", &approved_args);
+        pm.settings.allow.push(rule);
+        pm.cached_allow = pm.settings.parsed_allow_rules();
+
+        assert!(pm.check_allow_rules("write_file", &approved_args));
+        assert!(!pm.check_allow_rules(
+            "write_file",
+            &serde_json::json!({"path": "zzzz4.md", "content": "# zzzz4"})
+        ));
     }
 
     #[test]
@@ -3208,6 +5006,32 @@ mod tests {
         let args = serde_json::json!({"command": ""});
         let rule = PermissionManager::make_allow_rule("bash", &args);
         assert_eq!(rule, "bash");
+    }
+
+    #[test]
+    fn make_allow_rule_stops_at_pipe_or_redirect() {
+        // Compound commands: don't bake the pipe target into the rule.
+        let args = serde_json::json!({"command": "cargo test | tee log.txt"});
+        let rule = PermissionManager::make_allow_rule("bash", &args);
+        assert_eq!(rule, r#"Bash(argv_prefix="cargo test", op="execute")"#);
+
+        let args = serde_json::json!({"command": "ls -la > /tmp/out"});
+        let rule = PermissionManager::make_allow_rule("bash", &args);
+        assert_eq!(rule, r#"Bash(argv_prefix="ls", op="execute")"#);
+
+        let args = serde_json::json!({"command": "true && rm -rf"});
+        let rule = PermissionManager::make_allow_rule("bash", &args);
+        assert_eq!(rule, r#"Bash(argv_prefix="true", op="execute")"#);
+    }
+
+    #[test]
+    fn make_allow_rule_caps_at_three_tokens() {
+        // For deeply-nested subcommands, three tokens is enough to
+        // distinguish `npm run deploy:prod` from `npm run test:unit`.
+        let args = serde_json::json!({"command": "kubectl apply -f deployment.yaml"});
+        let rule = PermissionManager::make_allow_rule("bash", &args);
+        // -f stops the prefix, so we get `kubectl apply`.
+        assert_eq!(rule, r#"Bash(argv_prefix="kubectl apply", op="execute")"#);
     }
 
     // ── Security: word-boundary matching prevents false positives ────────────
@@ -3301,6 +5125,7 @@ mod tests {
             allow: vec!["Bash(cargo:*)".to_string()],
             deny: vec!["Bash(rm:*)".to_string()],
             allow_sensitive_path_writes: false,
+            grammar_version: 0,
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         fs::write(&path, json).unwrap();
@@ -3309,6 +5134,76 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded.allow, vec!["Bash(cargo:*)"]);
         assert_eq!(loaded.deny, vec!["Bash(rm:*)"]);
+    }
+
+    #[test]
+    fn modify_user_in_home_merges_and_saves_user_permissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let dir = home.join(".astra");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("permissions.json"),
+            serde_json::json!({
+                "allow": ["Bash(cargo test:*)"],
+                "deny": ["Bash(rm:*)"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let updated =
+            PermissionSettings::modify_user_in_home(home, |settings| -> Result<(), String> {
+                settings.allow.push("Bash(npm test:*)".to_string());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            updated.allow,
+            vec!["Bash(cargo test:*)", "Bash(npm test:*)"]
+        );
+        let reloaded = PermissionSettings::try_load_inner(&dir.join("permissions.json"));
+        assert!(reloaded.error.is_none());
+        assert_eq!(reloaded.settings.allow, updated.allow);
+        assert_eq!(reloaded.settings.deny, vec!["Bash(rm:*)"]);
+        assert_eq!(
+            reloaded.settings.grammar_version,
+            astra_turn_core::permission_rule_grammar::GRAMMAR_VERSION
+        );
+    }
+
+    #[test]
+    fn add_user_allow_rule_persists_and_updates_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let mut pm = PermissionManager::new(false);
+
+        pm.add_user_allow_rule_with_home("Bash(npm test:*)", Some(home));
+
+        assert!(pm.last_save_error().is_none());
+        let args = serde_json::json!({"command": "npm test -- --grep auth"});
+        assert!(pm.check_allow_rules("bash", &args));
+        let reloaded =
+            PermissionSettings::try_load_inner(&home.join(".astra").join("permissions.json"));
+        assert!(reloaded.error.is_none());
+        assert_eq!(reloaded.settings.allow, vec!["Bash(npm test:*)"]);
+    }
+
+    #[test]
+    fn sandbox_expand_user_rule_allows_prompt_mode_expansion() {
+        let mut pm = PermissionManager::new(false);
+        pm.user_settings
+            .allow
+            .push("sandbox_expand:bash".to_string());
+        pm.cached_user_allow = pm.user_settings.parsed_allow_rules();
+        let args = serde_json::json!({
+            "reason": "Path '/tmp/outside' is outside the project directory '/tmp/project'."
+        });
+
+        let decision = pm.check_nonblocking("sandbox_expand:bash", &args);
+
+        assert!(matches!(decision, PermissionDecision::Allow));
     }
 
     #[test]
@@ -3402,9 +5297,12 @@ mod tests {
 
     #[test]
     fn inherited_permissions_for_child_includes_session_overrides() {
-        use astra_runtime::orchestration::{
-            PermissionMode as RuntimeMode, PermissionRule as RuntimeRule,
-        };
+        // Issue #326 P0 / R1 Major 10 / task #17:
+        // session_overrides now flow through `fingerprinted_overrides`
+        // (a serde_json::Value carrying the full FingerprintedOverrides),
+        // NOT through allow_rules / deny_rules. The latter would lose
+        // command-prefix granularity.
+        use astra_runtime::orchestration::PermissionMode as RuntimeMode;
 
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
@@ -3415,8 +5313,91 @@ mod tests {
 
         assert_eq!(inherited.mode, RuntimeMode::Prompt);
         assert!(inherited.is_background);
-        assert!(inherited.allow_rules.contains(&RuntimeRule::parse("bash")));
-        assert!(inherited.deny_rules.contains(&RuntimeRule::parse("edit")));
+        // The fingerprinted overrides survived the trip across the
+        // runtime boundary as a JSON blob.
+        assert!(
+            inherited.fingerprinted_overrides.is_some(),
+            "fingerprinted_overrides must be populated; got {:?}",
+            inherited.fingerprinted_overrides
+        );
+    }
+
+    #[test]
+    fn child_inherits_fingerprinted_session_overrides_not_collapsed_to_tool_level() {
+        // Contract test for issue #326 P0 / R1 Major 10 / task #17:
+        // parent allowed `Bash(cargo test:*)` via session override.
+        // The child must NOT see this as `Bash(*) → Allow` (which would
+        // let it run `Bash(rm -rf …)`); it must reconstruct the same
+        // command-prefix-level fingerprint and only allow `cargo test`.
+        use astra_runtime::orchestration::PermissionMode as RuntimeMode;
+        use astra_turn_core::approval_fingerprint::{
+            ApprovalFingerprint, PathMatchKind, SideEffectClass,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        // Parent presses Always on `Bash(cargo test:*)` → session override.
+        let cargo_test_fp = ApprovalFingerprint {
+            tool_name: "bash".to_string(),
+            command_exact: None,
+            command_prefix: Some("cargo test".to_string()),
+            path_pattern: None,
+            path_match: PathMatchKind::Pattern,
+            side_effect: SideEffectClass::Execute,
+        };
+        parent.session_overrides.insert(cargo_test_fp.clone(), true);
+
+        // Hand off to child.
+        let envelope = parent.inherited_permissions_for_child(true);
+        assert_eq!(envelope.mode, RuntimeMode::Prompt);
+
+        let child_dir = tempfile::tempdir().unwrap();
+        let child = PermissionManager::with_inherited(child_dir.path(), envelope);
+
+        // The child's session_overrides must contain the same fingerprint.
+        // Verify by re-running the override lookup: `cargo test` should
+        // be allowed; `rm -rf /tmp` must NOT match the override (the
+        // override is command-prefix-level; rm doesn't share that prefix).
+        let cargo_test_match = child.session_overrides.check(&cargo_test_fp);
+        assert_eq!(
+            cargo_test_match,
+            Some(true),
+            "child must inherit the cargo-test fingerprint Allow decision"
+        );
+
+        let rm_fp = ApprovalFingerprint {
+            tool_name: "bash".to_string(),
+            command_exact: None,
+            command_prefix: Some("rm -rf".to_string()),
+            path_pattern: None,
+            path_match: PathMatchKind::Pattern,
+            side_effect: SideEffectClass::Execute,
+        };
+        let rm_match = child.session_overrides.check(&rm_fp);
+        assert!(
+            rm_match.is_none() || rm_match == Some(false),
+            "child must NOT see the cargo-test override generalize to rm; got {rm_match:?}"
+        );
+    }
+
+    #[test]
+    fn child_with_corrupt_fingerprinted_payload_falls_back_quietly() {
+        // If the JSON blob fails to decode (shouldn't happen in
+        // practice, but the contract is "warn loudly, never silently
+        // downgrade to a wider rule"), the child gets an empty
+        // session_overrides and otherwise-default behaviour. Crucially
+        // the parent's allow_rules / deny_rules are still honoured.
+        use astra_runtime::orchestration::{InheritedPermissions, PermissionMode as RuntimeMode};
+
+        let mut envelope = InheritedPermissions::new(RuntimeMode::Prompt);
+        envelope.fingerprinted_overrides =
+            Some(serde_json::json!({"this is": "not the right shape"}));
+
+        let dir = tempfile::tempdir().unwrap();
+        let child = PermissionManager::with_inherited(dir.path(), envelope);
+
+        assert!(child.session_overrides.is_empty());
     }
 
     #[test]
@@ -3457,7 +5438,13 @@ mod tests {
     async fn cloud_approval_async_quiet_denies_without_auto() {
         let mut pm = PermissionManager::new(false);
         let decision = pm
-            .resolve_cloud_approval_async("write_file", Some("x.rs"), ApprovalKind::Standard, true)
+            .resolve_cloud_approval_async(
+                "write_file",
+                Some("x.rs"),
+                None,
+                ApprovalKind::Standard,
+                true,
+            )
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
@@ -3466,7 +5453,13 @@ mod tests {
     async fn cloud_approval_async_quiet_allows_when_auto() {
         let mut pm = PermissionManager::new(true);
         let decision = pm
-            .resolve_cloud_approval_async("write_file", Some("x.rs"), ApprovalKind::Standard, true)
+            .resolve_cloud_approval_async(
+                "write_file",
+                Some("x.rs"),
+                None,
+                ApprovalKind::Standard,
+                true,
+            )
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
@@ -3476,7 +5469,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let decision = pm
-            .resolve_cloud_approval_async("bash", Some("/tmp"), ApprovalKind::Standard, false)
+            .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
@@ -3486,7 +5479,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let decision = pm
-            .resolve_cloud_approval_async("bash", Some("/tmp"), ApprovalKind::Standard, false)
+            .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
@@ -3500,6 +5493,7 @@ mod tests {
             .resolve_cloud_approval_async(
                 "write_file",
                 Some("new.rs"),
+                None,
                 ApprovalKind::Explicit,
                 false,
             )
@@ -3516,6 +5510,7 @@ mod tests {
             .resolve_cloud_approval_async(
                 "write_file",
                 Some("new.rs"),
+                None,
                 ApprovalKind::Explicit,
                 false,
             )
@@ -3529,7 +5524,7 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.session_overrides.insert(bare_fp("bash"), true);
         let decision = pm
-            .resolve_cloud_approval_async("bash", Some("/tmp"), ApprovalKind::Standard, false)
+            .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
@@ -3540,7 +5535,7 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.session_overrides.insert(bare_fp("bash"), false);
         let decision = pm
-            .resolve_cloud_approval_async("bash", Some("/tmp"), ApprovalKind::Standard, false)
+            .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
@@ -3613,6 +5608,7 @@ mod tests {
             .resolve_cloud_approval_async(
                 "write_file",
                 Some("src/main.rs"),
+                None,
                 ApprovalKind::Standard,
                 false,
             )
@@ -3699,9 +5695,9 @@ mod tests {
                 pm_async.session_overrides.insert(bare_fp(tool), v);
             }
             let sync_result =
-                pm_sync.resolve_cloud_approval(tool, Some("detail"), approval_kind, quiet);
+                pm_sync.resolve_cloud_approval(tool, Some("detail"), None, approval_kind, quiet);
             let async_result = pm_async
-                .resolve_cloud_approval_async(tool, Some("detail"), approval_kind, quiet)
+                .resolve_cloud_approval_async(tool, Some("detail"), None, approval_kind, quiet)
                 .await;
             assert_eq!(
                 sync_result, async_result,
@@ -3799,6 +5795,28 @@ mod tests {
     }
 
     #[test]
+    fn exact_path_match_target_allows_only_same_deep_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let args = serde_json::json!({"path": "src/deep/main.rs", "content": "a"});
+        let sibling = serde_json::json!({"path": "src/deep/other.rs", "content": "b"});
+
+        pm.record_approval_with_match_target("write_file", &args, &AllowMatchTarget::Exact, true);
+
+        let decision = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "exact path approval should match the same deep path: got {decision:?}"
+        );
+
+        let sibling_decision = pm.check_nonblocking("write_file", &sibling);
+        assert!(
+            matches!(sibling_decision, PermissionDecision::NeedApproval { .. }),
+            "exact path approval must not match a sibling path: got {sibling_decision:?}"
+        );
+    }
+
+    #[test]
     fn record_approval_without_args_falls_back_to_bare() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
@@ -3819,8 +5837,13 @@ mod tests {
     #[test]
     fn explicit_cloud_approval_auto_mode_allows() {
         let mut pm = PermissionManager::new(true);
-        let decision =
-            pm.resolve_cloud_approval("bash", Some("echo hello"), ApprovalKind::Explicit, false);
+        let decision = pm.resolve_cloud_approval(
+            "bash",
+            Some("echo hello"),
+            None,
+            ApprovalKind::Explicit,
+            false,
+        );
         assert!(
             matches!(decision, astra_thin_client::ApprovalDecision::Allow),
             "explicit approval should be allowed in Auto mode"
@@ -3831,8 +5854,13 @@ mod tests {
     fn explicit_cloud_approval_deny_mode_denies() {
         let mut pm = PermissionManager::new(false);
         pm.set_mode(PermissionMode::Deny);
-        let decision =
-            pm.resolve_cloud_approval("bash", Some("echo hello"), ApprovalKind::Explicit, false);
+        let decision = pm.resolve_cloud_approval(
+            "bash",
+            Some("echo hello"),
+            None,
+            ApprovalKind::Explicit,
+            false,
+        );
         assert!(
             matches!(decision, astra_thin_client::ApprovalDecision::Deny),
             "explicit approval should be denied in Deny mode"
@@ -3842,8 +5870,13 @@ mod tests {
     #[test]
     fn explicit_cloud_approval_quiet_auto_allows() {
         let mut pm = PermissionManager::new(true);
-        let decision =
-            pm.resolve_cloud_approval("bash", Some("echo hello"), ApprovalKind::Explicit, true);
+        let decision = pm.resolve_cloud_approval(
+            "bash",
+            Some("echo hello"),
+            None,
+            ApprovalKind::Explicit,
+            true,
+        );
         assert!(
             matches!(decision, astra_thin_client::ApprovalDecision::Allow),
             "quiet + Auto should allow explicit"
@@ -3853,8 +5886,13 @@ mod tests {
     #[test]
     fn explicit_cloud_approval_quiet_prompt_denies() {
         let mut pm = PermissionManager::new(false);
-        let decision =
-            pm.resolve_cloud_approval("bash", Some("echo hello"), ApprovalKind::Explicit, true);
+        let decision = pm.resolve_cloud_approval(
+            "bash",
+            Some("echo hello"),
+            None,
+            ApprovalKind::Explicit,
+            true,
+        );
         assert!(
             matches!(decision, astra_thin_client::ApprovalDecision::Deny),
             "quiet + Prompt should deny explicit"
@@ -3948,6 +5986,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cloud_preflight_strict_on_sensitive_path_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+
+        let interactive = pm.preflight_cloud_approval_decision(
+            "write_file",
+            Some(".ssh/id_rsa"),
+            ApprovalKind::Standard,
+            false,
+        );
+        assert!(
+            interactive.is_none(),
+            "interactive Auto mode should prompt for sensitive cloud writes: got {interactive:?}"
+        );
+
+        let quiet = pm.preflight_cloud_approval_decision(
+            "write_file",
+            Some(".ssh/id_rsa"),
+            ApprovalKind::Standard,
+            true,
+        );
+        assert_eq!(
+            quiet,
+            Some(astra_thin_client::ApprovalDecision::Deny),
+            "quiet Auto mode cannot prompt, so sensitive cloud writes must deny"
+        );
+
+        pm.settings.allow_sensitive_path_writes = true;
+        let opted_in = pm.preflight_cloud_approval_decision(
+            "write_file",
+            Some(".ssh/id_rsa"),
+            ApprovalKind::Standard,
+            true,
+        );
+        assert_eq!(
+            opted_in,
+            Some(astra_thin_client::ApprovalDecision::Allow),
+            "sensitive cloud writes should allow only after explicit opt-in"
+        );
+    }
+
+    #[test]
+    fn cloud_preflight_bare_override_does_not_allow_sensitive_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        pm.session_overrides.insert(bare_fp("write_file"), true);
+
+        let decision = pm.preflight_cloud_approval_decision(
+            "write_file",
+            Some(".git/config"),
+            ApprovalKind::Standard,
+            false,
+        );
+        assert!(
+            decision.is_none(),
+            "broad cloud override must not bypass sensitive path prompt: got {decision:?}"
+        );
+
+        let quiet = pm.preflight_cloud_approval_decision(
+            "write_file",
+            Some(".git/config"),
+            ApprovalKind::Standard,
+            true,
+        );
+        assert_eq!(
+            quiet,
+            Some(astra_thin_client::ApprovalDecision::Deny),
+            "quiet cloud sensitive path with only broad override must deny"
+        );
+    }
+
     // ── check_nonblocking after set_mode(Auto) ───────────────────────────────
 
     #[test]
@@ -3988,6 +6098,7 @@ mod tests {
         let cloud_decision = pm.resolve_cloud_approval(
             "str_replace",
             Some("src/foo.rs"),
+            None,
             ApprovalKind::Standard,
             false,
         );
@@ -4086,6 +6197,34 @@ mod tests {
         assert_eq!(
             first, second,
             "add_allow_rule must dedup: {first:?} vs {second:?}",
+        );
+    }
+
+    #[test]
+    fn phase_h_add_allow_rule_merges_with_disk_baseline_under_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        // Simulate another astra process writing a rule after this
+        // manager was constructed. add_allow_rule must use
+        // PermissionSettings::modify so it reads that fresh baseline
+        // instead of saving its stale in-memory settings over it.
+        let mut external = PermissionSettings::default();
+        external.allow.push("Bash(rule-a:*)".to_string());
+        external.save(dir.path()).unwrap();
+
+        pm.add_allow_rule("Bash(rule-b:*)");
+
+        let reloaded = PermissionSettings::load(dir.path());
+        assert_eq!(
+            reloaded.allow,
+            vec!["Bash(rule-a:*)", "Bash(rule-b:*)"],
+            "add_allow_rule must preserve concurrent disk additions"
+        );
+        assert_eq!(
+            pm.settings.allow,
+            vec!["Bash(rule-a:*)", "Bash(rule-b:*)"],
+            "manager cache should refresh to the lock-merged settings"
         );
     }
 
@@ -4400,8 +6539,9 @@ mod tests {
             settings_path.display()
         );
         let on_disk = std::fs::read_to_string(&settings_path).unwrap();
+        let saved: PermissionSettings = serde_json::from_str(&on_disk).unwrap();
         assert!(
-            on_disk.contains(&new_rule),
+            saved.allow.contains(&new_rule),
             "saved rule must appear in {}: got {on_disk}",
             settings_path.display()
         );
@@ -4470,6 +6610,7 @@ mod tests {
             .resolve_cloud_approval_async(
                 "bash",
                 Some("cargo test --lib"),
+                None,
                 ApprovalKind::Explicit,
                 // quiet=true is the TUI Silent policy; the point is
                 // that session_overrides wins even in Silent mode

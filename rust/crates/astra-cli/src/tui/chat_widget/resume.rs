@@ -149,8 +149,8 @@ mod tests {
             let sid = "sess_live_resume_e2e";
             let mut live = ChatWidget::new(sid);
 
-            live.handle_event(super::super::AppEvent::UserSubmit(
-                "inspect cache stats".into(),
+            live.handle_event(super::super::AppEvent::User(
+                super::super::UserEvent::Submit("inspect cache stats".into()),
             ));
             for ev in [
                 TuiAppEvent::ThinkingChunk("checking prior context".into()),
@@ -158,6 +158,8 @@ mod tests {
                 TuiAppEvent::ToolStarted {
                     name: "bash".into(),
                     description: "echo cache".into(),
+                    tool_use_id: "tu_test".into(),
+                    parent_tool_use_id: None,
                 },
                 TuiAppEvent::ToolCompleted {
                     name: "bash".into(),
@@ -166,6 +168,8 @@ mod tests {
                     duration_ms: 12,
                     output_summary: Some("cache ok".into()),
                     output: None,
+                    tool_use_id: "tu_test".into(),
+                    parent_tool_use_id: None,
                 },
                 TuiAppEvent::Token("Cache stats survived.".into()),
                 TuiAppEvent::TurnComplete,

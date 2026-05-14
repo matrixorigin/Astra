@@ -10,7 +10,7 @@
 payment / inventory / settlement / notification 等 12 个 crate，约 8 万行代
 码，含 1200 个集成测试）。团队上周决定从 actix-web 1.x 迁移到 axum 0.8，
 原因是 actix 的 extractor 生态滞后、tower 中间件生态无法复用。用户选
-astra web agent 做驾驶员式协作（不是 YOLO，每次写磁盘都要 diff 审）。
+astra web agent 做驾驶员式协作（不自动无审改仓库，每次写磁盘都要 diff 审）。
 
 **业务背景**：迁移不是"改 import"级别，而是牵动整个请求生命周期——
 actix 的 `Handler<T, R>`、`FromRequest`、`App::wrap` 与 axum 的

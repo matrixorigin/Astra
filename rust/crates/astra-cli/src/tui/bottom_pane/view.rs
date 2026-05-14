@@ -44,6 +44,29 @@ pub(crate) trait BottomPaneView: Send {
 
     fn pre_draw_tick(&mut self, _now: std::time::Instant) {}
 
+    fn refresh_task_cell(
+        &mut self,
+        _id: &str,
+        _cell: &crate::tui::history_cell::task::TaskCell,
+    ) -> bool {
+        false
+    }
+
+    fn live_task_id(&self) -> Option<&str> {
+        None
+    }
+
+    fn refresh_agent_rows(
+        &mut self,
+        _rows: Vec<crate::tui::bottom_pane::in_flight_agents_view::AgentRow>,
+    ) -> bool {
+        false
+    }
+
+    fn accepts_agent_rows(&self) -> bool {
+        false
+    }
+
     /// Short key-binding hint rendered as a 1-row footer at the bottom
     /// of the view. Return `None` to suppress (no hint bar reserved).
     ///

@@ -488,16 +488,8 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
     ToolMeta {
         name: "agent",
-        description: "Multi-agent operations: delegate (spawn sub-agent), run_chain (execute tool chain). For complex tasks requiring sub-agents.",
-        triggers: &[
-            "delegate",
-            "agent",
-            "spawn",
-            "chain",
-            "orchestrate",
-            "委派",
-            "代理",
-        ],
+        description: "Multi-agent operations: spawn (create sub-agent), get_result (collect background result), run_chain (execute tool chain). For complex tasks requiring sub-agents. Fan out N agents in parallel by emitting N spawn calls in one assistant message with run_in_background:true.",
+        triggers: &["agent", "spawn", "chain", "orchestrate", "代理"],
         pinned: true,
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,

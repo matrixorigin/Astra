@@ -462,6 +462,10 @@ pub(crate) struct ContextSnapshot<'a> {
     /// what skills are loaded.  Read-only display — no prompt
     /// cache impact.
     pub active_skills: Vec<ActiveSkill>,
+    /// Skill names actually chosen in the last completed turn.
+    /// Used as a more accurate fallback than `active_skills` when
+    /// the trace omitted per-skill injection details.
+    pub selected_skills: Vec<String>,
     /// Every turn in this session that fired compaction.  Sourced
     /// from `ObservabilitySession.compressed_turns` — the current
     /// trace only knows about the LAST turn's compaction events,
@@ -601,6 +605,21 @@ impl ContextBreakdown {
             })
             .collect();
         skills.sort_by_key(|s| std::cmp::Reverse(s.tokens));
+        // Fallback #2: last completed turn recorded which skills were
+        // actually chosen, even if per-skill prompt injection details
+        // were omitted from the trace.
+        if skills.is_empty() && !snap.selected_skills.is_empty() {
+            skills = snap
+                .selected_skills
+                .iter()
+                .map(|name| SkillItem {
+                    name: name.clone(),
+                    tokens: 0,
+                    description: None,
+                    source: Some("selected".to_string()),
+                })
+                .collect();
+        }
         // Last-resort fallback: the trace is silent but the CLI
         // state knows which system skills are currently loaded
         // via `/skill` (or auto-detect).  Surface them so users

@@ -150,7 +150,7 @@ pub(crate) struct SessionState {
     /// Matrix pool + journal ingestion + sync orchestrator (None if MatrixOne unavailable).
     pub matrix_runtime: Option<std::sync::Arc<astra_runtime::MatrixCloudRuntime>>,
     /// Local task service for /task commands.
-    pub task_service: Option<std::sync::Arc<astra_services::LocalTaskService>>,
+    pub task_service: Option<std::sync::Arc<dyn astra_services::TaskService>>,
     /// Cross-session tool health data for error budget persistence.
     pub tool_health_entries: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     /// Last successfully synced tool health snapshot, used to compute deltas.
@@ -362,12 +362,27 @@ pub(crate) struct SessionState {
     pub tui_render_policy: Option<crate::stream_render::RenderPolicy>,
     /// When set, `run_chat_turn` injects this channel into ChatTurnParams.
     pub tui_stream_event_tx: Option<crate::chat_stream::StreamEventTx>,
+    /// Live child-agent event lane; does not gate parent TurnComplete.
+    pub tui_agent_live_event_sink:
+        Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
     /// External cancellation token for TUI Ctrl+C interrupt.
     /// When set, `run_chat_turn` monitors this alongside its own ctrl_c handler.
     pub tui_cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
     /// When set, tool approval requests are sent through this channel
     /// instead of using interactive inquire prompts.
     pub tui_approval_request_tx: Option<crate::chat_stream::ApprovalRequestTx>,
+
+    /// Notifications from background tasks (completed/failed/stalled)
+    /// queued for injection into the model's next turn context.
+    pub pending_bg_notifications: Vec<String>,
+    /// Turns since the model last used any task tool action.
+    /// Reset to 0 whenever a task tool call is observed.
+    pub turns_since_task_use: u32,
+    /// Turns since the last task reminder was injected.
+    pub turns_since_task_reminder: u32,
+    /// Shared command queue for background task operations.
+    /// The tool executor pushes spawn/kill/output commands; the TUI drains them.
+    pub bg_task_commands: std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
 
     // ── Harness (observation + verification layer) ──
     #[cfg(feature = "harness")]
@@ -407,7 +422,7 @@ impl Default for SessionState {
             session_state_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::edge_tools::SessionStateRollbackJournal::default(),
             )),
-            task_manager: std::sync::Arc::new(crate::edge_tools::TaskManager::new()),
+            task_manager: std::sync::Arc::new(crate::edge_tools::TaskManager::in_memory()),
             continuation_anchor: None,
             diagnostics_context: None,
             queued_message: None,
@@ -438,7 +453,7 @@ impl Default for SessionState {
             journal: None,
             recent_tools: Vec::new(),
             recent_memory_actions: Vec::new(),
-            perm_manager: PermissionManager::with_project(
+            perm_manager: PermissionManager::with_workspace_trust(
                 std::env::var("ASTRA_CLI_AUTO_APPROVE")
                     .map(|v| v == "1")
                     .unwrap_or(false),
@@ -532,8 +547,13 @@ impl Default for SessionState {
             csl_manager: None,
             tui_render_policy: None,
             tui_stream_event_tx: None,
+            tui_agent_live_event_sink: None,
             tui_cancel_token: None,
             tui_approval_request_tx: None,
+            pending_bg_notifications: Vec::new(),
+            turns_since_task_use: 0,
+            turns_since_task_reminder: 0,
+            bg_task_commands: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(feature = "harness")]
             harness_sink: astra_harness::InMemorySnapshotSink::arc(),
             #[cfg(feature = "harness")]
@@ -545,6 +565,23 @@ impl Default for SessionState {
 }
 
 impl SessionState {
+    /// Set the current session id and keep the Tier 1 task manager in sync
+    /// (so `session_todos` reads/writes hit the correct session). Prefer
+    /// this over `self.session_id = Some(...)` at any path that rebinds
+    /// the session.
+    pub fn set_session_id(&mut self, session_id: impl Into<String>) {
+        let sid: String = session_id.into();
+        self.task_manager.rebind(&sid);
+        self.session_id = Some(sid);
+    }
+
+    /// Clear the current session id. Task manager falls back to an empty
+    /// session binding; the next `set_session_id` rebinds.
+    pub fn clear_session_id(&mut self) {
+        self.task_manager.rebind("");
+        self.session_id = None;
+    }
+
     /// Unregister and drop the root mailbox so a subsequent turn can
     /// re-register without agent_id collision.
     pub async fn unregister_root_mailbox(&mut self) {

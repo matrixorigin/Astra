@@ -882,6 +882,50 @@ mod tests {
     }
 
     #[test]
+    fn bridge_pipeline_outcome_keeps_deferred_tools_block_in_session_prefix() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        remove_test_env("ASTRA_OUTPUT_STYLE");
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+
+        let outcome = assemble_bridge_pipeline_outcome(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            &[],
+            0.8,
+            None,
+            &cache_cfg,
+            "sid-deferred-tools",
+            "gpt-4o",
+            "openai",
+            None,
+            None,
+            None,
+            "<deferred_tools><tool><name>github</name></tool></deferred_tools>",
+            "",
+        );
+
+        let primary_text = outcome
+            .primary_system
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let dynamic_text = outcome
+            .dynamic_system
+            .as_ref()
+            .and_then(|msg| msg.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        assert!(primary_text.contains("<deferred_tools>"));
+        assert!(!dynamic_text.contains("<deferred_tools>"));
+    }
+
+    #[test]
     fn bridge_pipeline_routes_low_confidence_warning_to_dynamic_message() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         remove_test_env("ASTRA_OUTPUT_STYLE");

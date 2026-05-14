@@ -170,6 +170,7 @@ dependencies = [
  "derive_more 1.0.0",
  "dirs 6.0.0",
  "dotenvy",
+ "fs2",
  "futures-util",
  "gix",
  "http",
@@ -425,6 +426,7 @@ dependencies = [
  "dotenvy",
  "fastrand",
  "flate2",
+ "fs2",
  "futures-util",
  "http-body-util",
  "notify",
@@ -448,6 +450,7 @@ dependencies = [
  "tower 0.5.3",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -561,6 +564,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "serial_test",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -6885,6 +6889,7 @@ checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

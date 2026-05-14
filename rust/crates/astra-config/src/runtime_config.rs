@@ -1040,6 +1040,14 @@ pub struct TelemetryConfig {
     #[serde(default = "default_true")]
     pub capture_context_traces: bool,
 
+    /// Whether to capture full LLM request/response payloads by default.
+    ///
+    /// Session metadata `full_llm_capture` still wins when it is explicitly
+    /// present, so `/session trace on|off` can override this global default for
+    /// one session.
+    #[serde(default)]
+    pub capture_full_llm_exchanges: bool,
+
     /// Whether to capture tool execution traces.
     #[serde(default = "default_true")]
     pub capture_tool_traces: bool,
@@ -1068,6 +1076,7 @@ impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
             capture_context_traces: true,
+            capture_full_llm_exchanges: false,
             capture_tool_traces: true,
             capture_explanations: false,
             max_traces_in_memory: default_max_traces_in_memory(),
@@ -1745,6 +1754,7 @@ impl RuntimeConfig {
 
         let TelemetryConfig {
             capture_context_traces,
+            capture_full_llm_exchanges,
             capture_tool_traces,
             capture_explanations,
             max_traces_in_memory,
@@ -1754,6 +1764,11 @@ impl RuntimeConfig {
             &mut self.telemetry.capture_context_traces,
             capture_context_traces,
             default_true(),
+        );
+        merge_if_non_default(
+            &mut self.telemetry.capture_full_llm_exchanges,
+            capture_full_llm_exchanges,
+            false,
         );
         merge_if_non_default(
             &mut self.telemetry.capture_tool_traces,
@@ -1990,6 +2005,9 @@ impl RuntimeConfig {
         if let Ok(val) = std::env::var("ASTRA_CAPTURE_TRACES") {
             self.telemetry.capture_context_traces = val == "1" || val.to_lowercase() == "true";
         }
+        if let Ok(val) = std::env::var("ASTRA_CAPTURE_FULL_LLM") {
+            self.telemetry.capture_full_llm_exchanges = val == "1" || val.to_lowercase() == "true";
+        }
         // ASTRA_FORK_INHERIT_PREFIX env var is ignored — fork capture
         // is now always-on. The `enabled` field is a deprecated no-op.
     }
@@ -2010,6 +2028,7 @@ mod tests {
         assert_eq!(config.compression.max_history_tokens, 40000);
         assert!((config.compression.compression_threshold - 0.8).abs() < 0.001);
         assert_eq!(config.memory.retrieval_top_k, 5);
+        assert!(!config.telemetry.capture_full_llm_exchanges);
     }
 
     #[test]
@@ -2204,6 +2223,7 @@ mod tests {
             },
             telemetry: TelemetryConfig {
                 capture_context_traces: false,
+                capture_full_llm_exchanges: true,
                 capture_tool_traces: false,
                 capture_explanations: true,
                 max_traces_in_memory: 42,
@@ -2273,6 +2293,7 @@ mod tests {
         assert_eq!(merged.tool_selection.max_tool_schema_tokens, 22000);
 
         assert!(!merged.telemetry.capture_context_traces);
+        assert!(merged.telemetry.capture_full_llm_exchanges);
         assert!(!merged.telemetry.capture_tool_traces);
         assert!(merged.telemetry.capture_explanations);
         assert_eq!(merged.telemetry.max_traces_in_memory, 42);
@@ -2771,7 +2792,7 @@ mod tests {
         let toml = r#"
             version = "1.0"
             [safety]
-            trust_mode = "yolo"
+            trust_mode = "unsafe"
         "#;
         let result: Result<RuntimeConfig, _> = toml::from_str(toml);
         assert!(result.is_err(), "unknown trust_mode should fail to parse");

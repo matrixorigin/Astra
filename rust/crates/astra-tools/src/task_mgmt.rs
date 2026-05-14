@@ -1,15 +1,29 @@
-//! Explicit scratchpad task management for the CLI.
+//! Session scratchpad task management.
 //!
 //! Runtime-owned continuity state is the authoritative source for agent progress.
 //! These tools are only an explicit user/model scratchpad and must not be relied
 //! on for multi-turn continuity or resume.
+//!
+//! ## Storage model
+//!
+//! [`TaskManager`] is a per-session **ergonomic wrapper**; [`TaskStore`] is the
+//! process-wide storage backend. All business logic (cycle detection, metadata
+//! merge, auto-complete, status validation) lives in `TaskManager`. The store
+//! only needs primitive read-all / write-all / next-id semantics — the
+//! per-session vec is small (dozens of rows) so full replacement per mutation
+//! is simpler and fast enough.
+//!
+//! Two implementations today:
+//!
+//! * [`InMemoryTaskStore`] — tests and offline-CLI mode.
+//! * `astra_services::session_task_store::MatrixOneTaskStore` — production;
+//!   same `session_id` visible from edge and cloud.
 
-#![allow(dead_code)]
+// #![allow(dead_code)] -- removed; narrow with per-item attrs if needed
+use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::sync::{
-    Mutex,
-    atomic::{AtomicU32, Ordering},
-};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// A scratchpad task tracked within the current CLI session.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -48,52 +62,433 @@ pub struct SessionSubtask {
     pub depends_on: Vec<String>,
 }
 
-/// In-memory scratchpad store for the current session.
-pub struct TaskManager {
-    tasks: Mutex<Vec<SessionTask>>,
-    id_counter: AtomicU32,
-}
-
+/// Point-in-time snapshot of a single session's task list plus its id counter.
+/// Used by the session-state rollback journal to undo a turn's task mutations.
 #[derive(Debug, Clone)]
 pub struct TaskManagerSnapshot {
     pub tasks: Vec<SessionTask>,
     pub next_task_id: u32,
 }
 
-impl Default for TaskManager {
+pub struct TaskMutationResult {
+    pub tasks: Vec<SessionTask>,
+    pub next_task_id: Option<u32>,
+    pub response: String,
+}
+
+pub type TaskMutation =
+    Box<dyn FnOnce(Vec<SessionTask>, u32) -> Result<TaskMutationResult, String> + Send>;
+
+/// Process-wide storage backend for session task lists.
+///
+/// Conceptually every session_id addresses an independent vec; the store
+/// hands out the vec plus an id counter on read, and persists a new vec on
+/// write. Business logic (cycle detection, auto-complete, metadata merge)
+/// lives in [`TaskManager`] so it is shared by all backends.
+#[async_trait]
+pub trait TaskStore: Send + Sync {
+    /// Load every task for this session in stable order.
+    async fn load(&self, session_id: &str) -> Result<Vec<SessionTask>, String>;
+    /// Replace the session's entire task list. The store must treat this as
+    /// atomic from the caller's perspective.
+    async fn save(&self, session_id: &str, tasks: Vec<SessionTask>) -> Result<(), String>;
+    /// Atomically load, mutate, and persist a session's task state.
+    ///
+    /// Implementations that can be shared across processes must serialize this
+    /// method per `session_id` so concurrent create/update/stop calls cannot
+    /// overwrite each other with stale full-list saves.
+    async fn mutate(&self, session_id: &str, mutation: TaskMutation) -> Result<String, String> {
+        let tasks = self.load(session_id).await?;
+        let next = self.peek_next_task_id(session_id).await?;
+        let result = mutation(tasks, next)?;
+        if let Some(next) = result.next_task_id {
+            self.set_next_task_id(session_id, next).await?;
+        }
+        self.save(session_id, result.tasks).await?;
+        Ok(result.response)
+    }
+    /// Return and consume the next integer to use when forming `task-<n>` ids.
+    /// Must be monotonic per session_id.
+    async fn next_task_id(&self, session_id: &str) -> Result<u32, String>;
+    /// Optional: set the id counter (used by `restore_snapshot` to rewind
+    /// numbering after a turn rollback). Default impl ignores the hint.
+    async fn set_next_task_id(&self, _session_id: &str, _next: u32) -> Result<(), String> {
+        Ok(())
+    }
+    /// Read the next id WITHOUT consuming or mutating the counter.
+    /// Used by `snapshot_state` to capture the counter for rollback
+    /// without leaving a hole in the id sequence.
+    ///
+    /// No default impl: the original alloc-then-rewind fallback was a
+    /// silent foot-gun — any new `TaskStore` impl that forgot to
+    /// override it would re-introduce the A1 race (concurrent
+    /// allocators would have their bump clobbered by the rewind).
+    /// Requiring an explicit impl makes correctness a compile-time
+    /// requirement.
+    async fn peek_next_task_id(&self, session_id: &str) -> Result<u32, String>;
+    /// Subscribe to "task list changed for <session_id>" events.
+    /// Default impl returns `None` (store does not support subscriptions,
+    /// and consumers fall back to polling — see `TaskBoardObserver`).
+    ///
+    /// Payload is the session_id that changed so a single subscriber can
+    /// multiplex observers across sessions cheaply.
+    fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        None
+    }
+
+    /// Load every session the store knows about, as
+    /// `(session_id, tasks)` pairs. Used by the multi-session
+    /// task board view. Order is implementation-defined —
+    /// callers sort on `updated_at` if they need a stable view.
+    ///
+    /// Default impl returns an empty vec so non-multi-session
+    /// stores never have to think about this method. Stores that
+    /// *can* enumerate sessions (in-memory, MatrixOne) override
+    /// with a real implementation.
+    async fn load_all_sessions(&self) -> Result<Vec<(String, Vec<SessionTask>)>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// In-memory store for tests and offline CLI mode. Holds a map
+/// `session_id -> (Vec<SessionTask>, next_id)` behind a single `Mutex`.
+/// Broadcasts `session_id` on every successful save so `TaskBoardObserver`
+/// can refresh immediately without waiting for a fallback poll.
+pub struct InMemoryTaskStore {
+    sessions: Mutex<HashMap<String, InMemorySession>>,
+    /// Broadcast sender for "session X changed" events. Capacity 16 is
+    /// generous for the expected subscriber count (one observer per REPL
+    /// + occasional test subscribers); slow consumers get dropped events
+    ///   (`RecvError::Lagged`) rather than blocking writers.
+    changed_tx: tokio::sync::broadcast::Sender<String>,
+}
+
+impl Default for InMemoryTaskStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl TaskManager {
+#[derive(Default, Clone)]
+struct InMemorySession {
+    tasks: Vec<SessionTask>,
+    next_id: u64,
+}
+
+impl InMemoryTaskStore {
     pub fn new() -> Self {
         Self {
-            tasks: Mutex::new(Vec::new()),
-            id_counter: AtomicU32::new(1),
+            sessions: Mutex::new(HashMap::new()),
+            changed_tx: tokio::sync::broadcast::channel(16).0,
         }
     }
+}
 
-    /// Get a snapshot of all tasks (for brief/diagnostics).
-    pub fn snapshot(&self) -> Vec<SessionTask> {
-        self.tasks.lock().map(|g| g.clone()).unwrap_or_default()
-    }
-
-    pub fn snapshot_state(&self) -> TaskManagerSnapshot {
-        TaskManagerSnapshot {
-            tasks: self.snapshot(),
-            next_task_id: self.id_counter.load(Ordering::SeqCst),
-        }
-    }
-
-    pub fn restore_snapshot(&self, snapshot: &TaskManagerSnapshot) -> Result<(), String> {
-        let mut tasks = self
-            .tasks
+#[async_trait]
+impl TaskStore for InMemoryTaskStore {
+    async fn load(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
+        let sessions = self
+            .sessions
             .lock()
-            .map_err(|_| "failed to access task list".to_string())?;
-        *tasks = snapshot.tasks.clone();
-        self.id_counter
-            .store(snapshot.next_task_id, Ordering::SeqCst);
+            .map_err(|_| "task store: session map poisoned".to_string())?;
+        Ok(sessions
+            .get(session_id)
+            .map(|s| s.tasks.clone())
+            .unwrap_or_default())
+    }
+
+    async fn save(&self, session_id: &str, tasks: Vec<SessionTask>) -> Result<(), String> {
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| "task store: session map poisoned".to_string())?;
+            let entry = sessions.entry(session_id.to_string()).or_default();
+            entry.tasks = tasks;
+        }
+        // Best-effort broadcast. `send` errors only when there are no
+        // receivers, which is the common "no observer attached" case in
+        // tests and headless CLI — not an error.
+        let _ = self.changed_tx.send(session_id.to_string());
+        Ok(())
+    }
+
+    async fn mutate(&self, session_id: &str, mutation: TaskMutation) -> Result<String, String> {
+        let response = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| "task store: session map poisoned".to_string())?;
+            let entry = sessions.entry(session_id.to_string()).or_default();
+            let next = if entry.next_id == 0 { 1 } else { entry.next_id };
+            let next = u32::try_from(next)
+                .map_err(|_| format!("task id counter exhausted for session {session_id}"))?;
+            let result = mutation(entry.tasks.clone(), next)?;
+            entry.tasks = result.tasks;
+            if let Some(next_task_id) = result.next_task_id {
+                entry.next_id = u64::from(next_task_id);
+            }
+            result.response
+        };
+        let _ = self.changed_tx.send(session_id.to_string());
+        Ok(response)
+    }
+
+    async fn next_task_id(&self, session_id: &str) -> Result<u32, String> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "task store: session map poisoned".to_string())?;
+        let entry = sessions.entry(session_id.to_string()).or_default();
+        if entry.next_id == 0 {
+            entry.next_id = 1;
+        }
+        // Read → reject > u32::MAX → bump via checked_add. Making the
+        // bound explicit: at `u32::MAX as u64 + 1` we've already
+        // allocated u32::MAX in a prior call, so the next caller hits
+        // the `try_from` guard and returns early before we touch the
+        // counter again. `checked_add` on u64 is overkill today but
+        // cheaper than a buried invariant — keeps the operation safe
+        // even if someone pokes the InMemorySession directly with a
+        // large seed.
+        let id = entry.next_id;
+        let task_id = u32::try_from(id)
+            .map_err(|_| format!("task id counter exhausted for session {session_id}"))?;
+        entry.next_id = id
+            .checked_add(1)
+            .ok_or_else(|| format!("task id counter overflow for session {session_id}"))?;
+        Ok(task_id)
+    }
+
+    async fn set_next_task_id(&self, session_id: &str, next: u32) -> Result<(), String> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "task store: session map poisoned".to_string())?;
+        let entry = sessions.entry(session_id.to_string()).or_default();
+        entry.next_id = u64::from(next);
+        Ok(())
+    }
+
+    async fn peek_next_task_id(&self, session_id: &str) -> Result<u32, String> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "task store: session map poisoned".to_string())?;
+        let next = sessions
+            .get(session_id)
+            .map(|s| if s.next_id == 0 { 1 } else { s.next_id })
+            .unwrap_or(1);
+        u32::try_from(next)
+            .map_err(|_| format!("task id counter exhausted for session {session_id}"))
+    }
+
+    fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        Some(self.changed_tx.subscribe())
+    }
+
+    async fn load_all_sessions(&self) -> Result<Vec<(String, Vec<SessionTask>)>, String> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "task store: session map poisoned".to_string())?;
+        let mut out: Vec<(String, Vec<SessionTask>)> = sessions
+            .iter()
+            .filter(|(_, s)| !s.tasks.is_empty())
+            .map(|(sid, s)| (sid.clone(), s.tasks.clone()))
+            .collect();
+        // Deterministic order: the HashMap's iteration is random,
+        // but callers want a stable view for snapshot diffs in the
+        // multi-session observer. Sort by session_id — the row-level
+        // sort on updated_at happens in `task_board_multi::flatten`.
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+}
+
+/// Per-session handle to the shared task store. Business logic lives here;
+/// storage is delegated to the `TaskStore` impl.
+///
+/// The session id can be rebound at runtime via [`TaskManager::rebind`] so
+/// that startup code paths (which construct the REPL state before login
+/// resolves the session) don't have to rebuild the whole manager graph
+/// once the real session id arrives.
+pub struct TaskManager {
+    session_id: Mutex<String>,
+    store: Arc<dyn TaskStore>,
+}
+
+/// Prepend a one-line human-readable summary to a JSON response body.
+/// The model sees the outcome at a glance without parsing the JSON;
+/// downstream code that still wants to parse the JSON can do so by
+/// splitting on the first `\n` and feeding the remainder to
+/// serde_json. Claudecode's task tools do this via
+/// `mapToolResultToToolResultBlockParam` returning a plain string;
+/// we keep the JSON for back-compat and prefix the summary.
+fn prefix_summary(summary: impl Into<String>, json_body: String) -> String {
+    format!("{}\n{}", summary.into(), json_body)
+}
+
+const VALID_UPDATE_STATUSES: &[&str] = &[
+    "pending",
+    "in_progress",
+    "completed",
+    "failed",
+    "cancelled",
+    "deleted",
+];
+
+fn normalize_update_status(args: &Value) -> Result<Option<String>, String> {
+    let canonical = args.get("new_status").and_then(Value::as_str);
+    let legacy = args.get("status").and_then(Value::as_str);
+    let Some(status) = canonical.or(legacy) else {
+        return Ok(None);
+    };
+    if let (Some(a), Some(b)) = (canonical, legacy)
+        && a != b
+    {
+        return Err(format!(
+            "conflicting status fields: new_status='{a}' but status='{b}'"
+        ));
+    }
+    if !VALID_UPDATE_STATUSES.contains(&status) {
+        return Err(format!(
+            "invalid new_status '{}' (valid: {})",
+            status,
+            VALID_UPDATE_STATUSES.join("|")
+        ));
+    }
+    Ok(Some(status.to_string()))
+}
+
+/// Highest numeric suffix on any `task-<n>` id in the list, or 0 when
+/// the list is empty or all ids are non-numeric. Used as a conservative
+/// fallback when peeking the counter fails — the restored counter is
+/// at least `max + 1`, which cannot collide with a surviving id.
+fn max_task_id(tasks: &[SessionTask]) -> u32 {
+    tasks
+        .iter()
+        .filter_map(|t| {
+            t.id.strip_prefix("task-")
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Bidirectional subtask ↔ parent status reconciliation. Called after
+/// any subtask mutation that might flip the all-completed state.
+///
+/// Forward arm (all subtasks completed → parent completed): only fires
+/// when the parent is in an *active* state (pending / in_progress).
+/// Terminal non-success states (failed / cancelled) stay as-is, since
+/// promoting them to completed would silently erase a failure signal.
+///
+/// Reverse arm (a subtask flipped back from completed → parent reopens):
+/// only fires when the parent is currently exactly "completed". If the
+/// parent is in any other status — including any future status not in
+/// today's vocabulary — we leave it alone. Reason: an operator who has
+/// explicitly moved the parent to e.g. "archived" probably doesn't want
+/// a subtask edit to resurrect it. The narrow `== "completed"` match
+/// keeps this function's scope tight and avoids future surprise.
+fn reconcile_subtask_completion(task: &mut SessionTask) {
+    if task.subtasks.is_empty() {
+        return;
+    }
+
+    let all_completed = task.subtasks.iter().all(|st| st.status == "completed");
+    if all_completed {
+        if matches!(task.status.as_str(), "pending" | "in_progress") {
+            task.status = "completed".to_string();
+        }
+    } else if task.status == "completed" {
+        task.status = "in_progress".to_string();
+    }
+}
+
+impl TaskManager {
+    /// Construct a manager bound to a specific session, backed by `store`.
+    pub fn new(session_id: impl Into<String>, store: Arc<dyn TaskStore>) -> Self {
+        Self {
+            session_id: Mutex::new(session_id.into()),
+            store,
+        }
+    }
+
+    /// Convenience for tests: a manager with session_id "default" over a
+    /// fresh in-memory store.
+    pub fn in_memory() -> Self {
+        Self::new("default", Arc::new(InMemoryTaskStore::new()))
+    }
+
+    /// Session id this manager currently points at.
+    pub fn session_id(&self) -> String {
+        self.session_id
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Handle to the underlying store. Exposed so callers outside
+    /// `astra-tools` can wire observers that subscribe to the same
+    /// change broadcast the manager writes through.
+    pub fn store(&self) -> Arc<dyn TaskStore> {
+        self.store.clone()
+    }
+
+    /// Rebind the session id. Also swaps the store if a new one is supplied
+    /// (for the offline → MO upgrade path).
+    pub fn rebind(&self, session_id: impl Into<String>) {
+        if let Ok(mut guard) = self.session_id.lock() {
+            *guard = session_id.into();
+        }
+    }
+
+    fn sid(&self) -> String {
+        self.session_id
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Get a snapshot of all tasks (for brief/diagnostics). This is async
+    /// because the store may be remote (MatrixOne).
+    pub async fn snapshot(&self) -> Vec<SessionTask> {
+        self.store.load(&self.sid()).await.unwrap_or_default()
+    }
+
+    /// Capture a full rollback snapshot (tasks + next id).
+    pub async fn snapshot_state(&self) -> TaskManagerSnapshot {
+        let tasks = self.snapshot().await;
+        // Read the counter without consuming or mutating it so concurrent
+        // allocators can't race us into duplicate ids (the old
+        // alloc-then-rewind dance clobbered concurrent increments). If
+        // the peek fails (MO pool hiccup, row lock, etc), fall back to
+        // `max(existing task id) + 1` rather than `1` — returning 1 on
+        // a peek error would make `restore_snapshot` rewind the counter
+        // and guarantee duplicate ids on the next allocation.
+        let peeked = match self.store.peek_next_task_id(&self.sid()).await {
+            Ok(v) => v,
+            Err(_) => max_task_id(&tasks).saturating_add(1).max(1),
+        };
+        TaskManagerSnapshot {
+            tasks,
+            next_task_id: peeked,
+        }
+    }
+
+    /// Restore a previously captured snapshot.
+    pub async fn restore_snapshot(&self, snapshot: &TaskManagerSnapshot) -> Result<(), String> {
+        // Restore the counter *before* the tasks. Otherwise a subscriber
+        // reacting to the save-broadcast can allocate a new id using
+        // the pre-rollback counter while already seeing post-rollback
+        // task rows, resulting in id collisions. The counter-write is
+        // side-effect-free to observers (no broadcast), so running it
+        // first is safe even if the save below fails.
+        self.store
+            .set_next_task_id(&self.sid(), snapshot.next_task_id)
+            .await?;
+        self.store.save(&self.sid(), snapshot.tasks.clone()).await?;
         Ok(())
     }
 
@@ -142,45 +537,62 @@ impl TaskManager {
             })
             .unwrap_or_default();
 
-        let task_id = format!("task-{}", self.id_counter.fetch_add(1, Ordering::SeqCst));
-
         let active_form = args
             .get("active_form")
             .and_then(Value::as_str)
             .map(String::from);
         let owner = args.get("owner").and_then(Value::as_str).map(String::from);
         let metadata = args.get("metadata").and_then(Value::as_object).cloned();
-
-        let task = SessionTask {
-            id: task_id.clone(),
-            title: title.clone(),
-            description,
-            status: "pending".to_string(),
-            subtasks,
-            created_at: now.clone(),
-            updated_at: now,
-            active_form,
-            owner,
-            metadata,
-            blocks: Vec::new(),
-            blocked_by: Vec::new(),
-        };
-
-        if let Ok(mut tasks) = self.tasks.lock() {
-            tasks.push(task);
+        let sid = self.sid();
+        let mutation_title = title.clone();
+        match self
+            .store
+            .mutate(
+                &sid,
+                Box::new(move |mut tasks, next| {
+                    let task_id = format!("task-{next}");
+                    let task = SessionTask {
+                        id: task_id.clone(),
+                        title: mutation_title.clone(),
+                        description,
+                        status: "pending".to_string(),
+                        subtasks,
+                        created_at: now.clone(),
+                        updated_at: now,
+                        active_form,
+                        owner,
+                        metadata,
+                        blocks: Vec::new(),
+                        blocked_by: Vec::new(),
+                    };
+                    tasks.push(task);
+                    let response = prefix_summary(
+                        format!("Task #{task_id} created: {mutation_title}"),
+                        json!({
+                            "success": true,
+                            "task_id": task_id,
+                            "message": format!("Task '{}' created successfully", mutation_title)
+                        })
+                        .to_string(),
+                    );
+                    let next_task_id = next.checked_add(1).ok_or_else(|| {
+                        "task id counter overflow for session during create".to_string()
+                    })?;
+                    Ok(TaskMutationResult {
+                        tasks,
+                        next_task_id: Some(next_task_id),
+                        response,
+                    })
+                }),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => format!("Error: {e}"),
         }
-
-        json!({
-            "success": true,
-            "task_id": task_id,
-            "message": format!("Task '{}' created successfully", title)
-        })
-        .to_string()
     }
 
     /// List tasks in the session, optionally filtered by status.
-    ///
-    /// Prefers `status_filter`; legacy `status` is no longer accepted on list.
     pub async fn list(&self, args: &Value) -> String {
         let status_filter = args
             .get("status")
@@ -188,9 +600,9 @@ impl TaskManager {
             .and_then(Value::as_str)
             .unwrap_or("all");
 
-        let tasks = match self.tasks.lock() {
-            Ok(guard) => guard.clone(),
-            Err(_) => return "Error: failed to access task list".to_string(),
+        let tasks = match self.store.load(&self.sid()).await {
+            Ok(t) => t,
+            Err(e) => return format!("Error: {e}"),
         };
 
         let filtered: Vec<_> = tasks
@@ -246,9 +658,9 @@ impl TaskManager {
             _ => return "Error: 'task_id' is required".to_string(),
         };
 
-        let tasks = match self.tasks.lock() {
-            Ok(guard) => guard.clone(),
-            Err(_) => return "Error: failed to access task list".to_string(),
+        let tasks = match self.store.load(&self.sid()).await {
+            Ok(t) => t,
+            Err(e) => return format!("Error: {e}"),
         };
 
         match tasks.iter().find(|t| t.id == task_id) {
@@ -258,335 +670,1060 @@ impl TaskManager {
         }
     }
 
-    /// Update a task's status or a specific subtask's status.
+    /// Update a task's status, metadata, or dependency edges.
     pub async fn update(&self, args: &Value) -> String {
         let task_id = match args.get("task_id").and_then(Value::as_str) {
-            Some(id) if !id.is_empty() => id,
+            Some(id) if !id.is_empty() => id.to_string(),
             _ => return "Error: 'task_id' is required".to_string(),
         };
 
-        // `status` field from the unified task tool schema.
-        // used to serve both list and update; schema is now split.
-        let new_status = args.get("status").and_then(Value::as_str);
-        // Reject terminal-only filters that used to share the enum.
-        if matches!(new_status, Some("all") | Some("active")) {
-            return format!(
-                "Error: invalid new_status '{}' (valid: pending|in_progress|completed|failed|deleted)",
-                new_status.unwrap()
-            );
-        }
-        let subtask_id = args.get("subtask_id").and_then(Value::as_str);
-        let error_message = args.get("error_message").and_then(Value::as_str);
+        let new_status = match normalize_update_status(args) {
+            Ok(status) => status,
+            Err(e) => return format!("Error: {e}"),
+        };
+        let subtask_id = args
+            .get("subtask_id")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let error_message = args
+            .get("error_message")
+            .and_then(Value::as_str)
+            .map(String::from);
         let now = chrono::Utc::now().to_rfc3339();
 
-        let mut tasks = match self.tasks.lock() {
-            Ok(guard) => guard,
-            Err(_) => return "Error: failed to access task list".to_string(),
-        };
+        let title_update = args.get("title").and_then(Value::as_str).map(String::from);
+        let desc_update = args
+            .get("description")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let active_form_update = args
+            .get("active_form")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let owner_update = args.get("owner").and_then(Value::as_str).map(String::from);
+        let metadata_update = args.get("metadata").and_then(Value::as_object).cloned();
+        let args_for_edges = args.clone();
+        let sid = self.sid();
 
-        let task = match tasks.iter_mut().find(|t| t.id == task_id) {
-            Some(t) => t,
-            None => return format!("Error: task '{}' not found", task_id),
-        };
-
-        if let Some(st_id) = subtask_id {
-            // Update subtask
-            match task.subtasks.iter_mut().find(|st| st.id == st_id) {
-                Some(subtask) => {
-                    let previous_status = subtask.status.clone();
-                    if let Some(status) = new_status {
-                        subtask.status = status.to_string();
+        match self
+            .store
+            .mutate(
+                &sid,
+                Box::new(move |mut tasks, _next| {
+                    // Subtask path short-circuits: all logic stays local to one SessionTask.
+                    if let Some(st_id) = subtask_id.as_deref() {
+                        let Some(task) = tasks.iter_mut().find(|t| t.id == task_id) else {
+                            return Err(format!("task '{}' not found", task_id));
+                        };
+                        let Some(subtask) = task.subtasks.iter_mut().find(|st| st.id == st_id) else {
+                            return Err(format!("subtask '{}' not found in task '{}'", st_id, task_id));
+                        };
+                        let previous_status = subtask.status.clone();
+                        if let Some(status) = new_status.as_deref() {
+                            subtask.status = status.to_string();
+                        }
+                        let final_subtask_status = subtask.status.clone();
+                        reconcile_subtask_completion(task);
+                        task.updated_at = now;
+                        let response = prefix_summary(
+                            format!(
+                                "Subtask {st_id} of #{task_id}: {previous_status} → {final_subtask_status}"
+                            ),
+                            json!({
+                                "success": true,
+                                "task_id": task_id,
+                                "subtask_id": st_id,
+                                "previous_status": previous_status,
+                                "status": final_subtask_status,
+                                "message": format!("Subtask '{}' updated to '{}'", st_id, final_subtask_status)
+                            })
+                            .to_string(),
+                        );
+                        return Ok(TaskMutationResult {
+                            tasks,
+                            next_task_id: None,
+                            response,
+                        });
                     }
+
+                    // "deleted" = soft-remove + clean symmetric edges.
+                    if new_status.as_deref() == Some("deleted") {
+                        let Some(previous_status) = tasks
+                            .iter()
+                            .find(|t| t.id == task_id)
+                            .map(|t| t.status.clone())
+                        else {
+                            return Err(format!("task '{}' not found", task_id));
+                        };
+                        tasks.retain(|t| t.id != task_id);
+                        for t in tasks.iter_mut() {
+                            t.blocks.retain(|id| id != &task_id);
+                            t.blocked_by.retain(|id| id != &task_id);
+                        }
+                        let response = prefix_summary(
+                            format!("Task #{task_id} deleted (was: {previous_status})"),
+                            json!({
+                                "success": true,
+                                "task_id": task_id,
+                                "previous_status": previous_status,
+                                "status": "deleted",
+                                "message": format!("Task '{}' deleted", task_id)
+                            })
+                            .to_string(),
+                        );
+                        return Ok(TaskMutationResult {
+                            tasks,
+                            next_task_id: None,
+                            response,
+                        });
+                    }
+
+                    let previous_status = match tasks.iter().find(|t| t.id == task_id) {
+                        Some(t) => t.status.clone(),
+                        None => return Err(format!("task '{}' not found", task_id)),
+                    };
+
+                    // Collect proposed edge changes before mutating so cycle detection
+                    // sees a consistent view.
+                    let proposed_blocks: Vec<String> = args_for_edges
+                        .get("add_blocks")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(String::from)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let proposed_blocked_by: Vec<String> = args_for_edges
+                        .get("add_blocked_by")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(String::from)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let remove_blocks: Vec<String> = args_for_edges
+                        .get("remove_blocks")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(String::from)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let remove_blocked_by: Vec<String> = args_for_edges
+                        .get("remove_blocked_by")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(String::from)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    for id in &proposed_blocks {
+                        if id == &task_id {
+                            return Err(format!("task '{}' cannot block itself", task_id));
+                        }
+                    }
+                    for id in &proposed_blocked_by {
+                        if id == &task_id {
+                            return Err(format!("task '{}' cannot be blocked by itself", task_id));
+                        }
+                    }
+
+                    // Cycle detection on the projected graph.
+                    if !proposed_blocks.is_empty() || !proposed_blocked_by.is_empty() {
+                        use std::collections::{HashSet, VecDeque};
+                        let mut blocked_by: HashMap<String, HashSet<String>> = HashMap::new();
+                        for t in tasks.iter() {
+                            blocked_by
+                                .entry(t.id.clone())
+                                .or_default()
+                                .extend(t.blocked_by.iter().cloned());
+                        }
+                        let entry = blocked_by.entry(task_id.clone()).or_default();
+                        for r in &remove_blocked_by {
+                            entry.remove(r);
+                        }
+                        for x in &proposed_blocks {
+                            blocked_by
+                                .entry(x.clone())
+                                .or_default()
+                                .insert(task_id.clone());
+                        }
+                        for y in &proposed_blocked_by {
+                            blocked_by
+                                .entry(task_id.clone())
+                                .or_default()
+                                .insert(y.clone());
+                        }
+                        let mut visited: HashSet<String> = HashSet::new();
+                        let mut queue: VecDeque<String> = VecDeque::new();
+                        if let Some(seeds) = blocked_by.get(&task_id) {
+                            for s in seeds {
+                                queue.push_back(s.clone());
+                            }
+                        }
+                        while let Some(node) = queue.pop_front() {
+                            if node == task_id {
+                                return Err(format!(
+                                    "adding these dependencies would create a cycle involving '{}'",
+                                    task_id
+                                ));
+                            }
+                            if !visited.insert(node.clone()) {
+                                continue;
+                            }
+                            if let Some(next) = blocked_by.get(&node) {
+                                for n in next {
+                                    queue.push_back(n.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    let Some(task) = tasks.iter_mut().find(|t| t.id == task_id) else {
+                        return Err(format!("task '{}' not found", task_id));
+                    };
+
+                    if let Some(status) = new_status.as_deref() {
+                        task.status = status.to_string();
+                        if status == "completed" {
+                            // Cascade parent→subtask completion, but preserve any
+                            // subtask already in a terminal non-success state.
+                            for subtask in &mut task.subtasks {
+                                if !matches!(
+                                    subtask.status.as_str(),
+                                    "failed" | "cancelled" | "completed"
+                                ) {
+                                    subtask.status = "completed".to_string();
+                                }
+                            }
+                        }
+                    }
+                    if let Some(err) = error_message.as_deref() {
+                        task.description = Some(format!(
+                            "{}\n\nError: {}",
+                            task.description.as_deref().unwrap_or(""),
+                            err
+                        ));
+                    }
+                    if let Some(title) = title_update.as_deref() {
+                        task.title = title.to_string();
+                    }
+                    if let Some(desc) = desc_update.as_deref() {
+                        task.description = Some(desc.to_string());
+                    }
+                    if let Some(af) = active_form_update.as_deref() {
+                        task.active_form = Some(af.to_string());
+                    }
+                    if let Some(owner) = owner_update.as_deref() {
+                        task.owner = Some(owner.to_string());
+                    }
+                    if let Some(meta_update) = metadata_update.as_ref() {
+                        let meta = task.metadata.get_or_insert_with(serde_json::Map::new);
+                        for (k, v) in meta_update {
+                            if v.is_null() {
+                                meta.remove(k);
+                            } else {
+                                meta.insert(k.clone(), v.clone());
+                            }
+                        }
+                        if meta.is_empty() {
+                            task.metadata = None;
+                        }
+                    }
+
+                    for id in proposed_blocks {
+                        if !task.blocks.contains(&id) {
+                            task.blocks.push(id);
+                        }
+                    }
+                    for id in proposed_blocked_by {
+                        if !task.blocked_by.contains(&id) {
+                            task.blocked_by.push(id);
+                        }
+                    }
+                    task.blocks.retain(|b| !remove_blocks.contains(b));
+                    task.blocked_by.retain(|b| !remove_blocked_by.contains(b));
                     task.updated_at = now;
-                    return json!({
-                        "success": true,
-                        "task_id": task_id,
-                        "subtask_id": st_id,
-                        "previous_status": previous_status,
-                        "status": subtask.status,
-                        "message": format!("Subtask '{}' updated to '{}'", st_id, subtask.status)
-                    })
-                    .to_string();
-                }
-                None => {
-                    return format!("Error: subtask '{}' not found in task '{}'", st_id, task_id);
-                }
-            }
-        }
 
-        // Handle "deleted" — soft-remove from list + clean symmetric edges
-        if new_status == Some("deleted") {
-            let previous_status = task.status.clone();
-            let task_id_owned = task_id.to_string();
-            tasks.retain(|t| t.id != task_id_owned);
-            // Clean dangling references from other tasks
-            for t in tasks.iter_mut() {
-                t.blocks.retain(|id| id != &task_id_owned);
-                t.blocked_by.retain(|id| id != &task_id_owned);
-            }
-            return json!({
-                "success": true,
-                "task_id": task_id_owned,
-                "previous_status": previous_status,
-                "status": "deleted",
-                "message": format!("Task '{}' deleted", task_id_owned)
-            })
-            .to_string();
-        }
+                    reconcile_subtask_completion(task);
 
-        // Update main task
-        let previous_status = task.status.clone();
-        if let Some(status) = new_status {
-            task.status = status.to_string();
-        }
-        if let Some(err) = error_message {
-            task.description = Some(format!(
-                "{}\n\nError: {}",
-                task.description.as_deref().unwrap_or(""),
-                err
-            ));
-        }
-
-        // Update title/description if provided
-        if let Some(title) = args.get("title").and_then(Value::as_str) {
-            task.title = title.to_string();
-        }
-        if let Some(desc) = args.get("description").and_then(Value::as_str) {
-            task.description = Some(desc.to_string());
-        }
-
-        // activeForm
-        if let Some(af) = args.get("active_form").and_then(Value::as_str) {
-            task.active_form = Some(af.to_string());
-        }
-
-        // Owner
-        if let Some(owner) = args.get("owner").and_then(Value::as_str) {
-            task.owner = Some(owner.to_string());
-        }
-
-        // Metadata (merge, not replace — set key to null to delete)
-        if let Some(meta_update) = args.get("metadata").and_then(Value::as_object) {
-            let meta = task.metadata.get_or_insert_with(serde_json::Map::new);
-            for (k, v) in meta_update {
-                if v.is_null() {
-                    meta.remove(k);
-                } else {
-                    meta.insert(k.clone(), v.clone());
-                }
-            }
-            if meta.is_empty() {
-                task.metadata = None;
-            }
-        }
-
-        // Blocking dependencies (additive, with cycle detection and
-        // symmetric removal support).
-        //
-        // Edges represent `A blocks B`  ⇔  `B blocked_by A`. We maintain both
-        // views in sync; cycles are rejected before mutation.
-        let self_id = task_id.to_string();
-
-        // Collect proposed new edges first so we can validate them against
-        // the current graph without partial mutation.
-        let mut proposed_blocks: Vec<String> = Vec::new();
-        let mut proposed_blocked_by: Vec<String> = Vec::new();
-        if let Some(add_blocks) = args.get("add_blocks").and_then(Value::as_array) {
-            for id in add_blocks.iter().filter_map(Value::as_str) {
-                let id = id.to_string();
-                if id == self_id {
-                    return format!("Error: task '{}' cannot block itself", self_id);
-                }
-                if !task.blocks.contains(&id) && !proposed_blocks.contains(&id) {
-                    proposed_blocks.push(id);
-                }
-            }
-        }
-        if let Some(add_blocked_by) = args.get("add_blocked_by").and_then(Value::as_array) {
-            for id in add_blocked_by.iter().filter_map(Value::as_str) {
-                let id = id.to_string();
-                if id == self_id {
-                    return format!("Error: task '{}' cannot be blocked by itself", self_id);
-                }
-                if !task.blocked_by.contains(&id) && !proposed_blocked_by.contains(&id) {
-                    proposed_blocked_by.push(id);
-                }
-            }
-        }
-
-        // Removals
-        let remove_blocks: Vec<String> = args
-            .get("remove_blocks")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let remove_blocked_by: Vec<String> = args
-            .get("remove_blocked_by")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Release the mutable borrow on `task` so we can re-scan the list
-        // for cycle detection. We'll re-acquire it below after validation.
-        let _ = task;
-
-        // Build an adjacency map for "blocked_by" edges (who must finish before
-        // the key). We overlay proposed additions and removals.
-        if !proposed_blocks.is_empty() || !proposed_blocked_by.is_empty() {
-            use std::collections::{HashMap, HashSet, VecDeque};
-            let mut blocked_by: HashMap<String, HashSet<String>> = HashMap::new();
-            for t in tasks.iter() {
-                blocked_by
-                    .entry(t.id.clone())
-                    .or_default()
-                    .extend(t.blocked_by.iter().cloned());
-            }
-            // Apply removals to the projection
-            let entry = blocked_by.entry(self_id.clone()).or_default();
-            for r in &remove_blocked_by {
-                entry.remove(r);
-            }
-            // `self blocks X` ⇒ `X blocked_by self`
-            for x in &proposed_blocks {
-                blocked_by
-                    .entry(x.clone())
-                    .or_default()
-                    .insert(self_id.clone());
-            }
-            // `self blocked_by Y` ⇒ add Y to self's set
-            for y in &proposed_blocked_by {
-                blocked_by
-                    .entry(self_id.clone())
-                    .or_default()
-                    .insert(y.clone());
-            }
-            // Cycle check: BFS from self over "blocked_by" — if we reach self,
-            // there's a cycle (self depends on something that depends on self).
-            let mut visited: HashSet<String> = HashSet::new();
-            let mut queue: VecDeque<String> = VecDeque::new();
-            if let Some(seeds) = blocked_by.get(&self_id) {
-                for s in seeds {
-                    queue.push_back(s.clone());
-                }
-            }
-            while let Some(node) = queue.pop_front() {
-                if node == self_id {
-                    return format!(
-                        "Error: adding these dependencies would create a cycle involving '{}'",
-                        self_id
+                    let final_status = task.status.clone();
+                    let response = prefix_summary(
+                        format!("Task #{task_id}: {previous_status} → {final_status}"),
+                        json!({
+                            "success": true,
+                            "task_id": task_id,
+                            "previous_status": previous_status,
+                            "status": final_status,
+                            "message": format!("Task '{}' updated to '{}'", task_id, final_status)
+                        })
+                        .to_string(),
                     );
-                }
-                if !visited.insert(node.clone()) {
-                    continue;
-                }
-                if let Some(next) = blocked_by.get(&node) {
-                    for n in next {
-                        queue.push_back(n.clone());
-                    }
-                }
-            }
+                    Ok(TaskMutationResult {
+                        tasks,
+                        next_task_id: None,
+                        response,
+                    })
+                }),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => format!("Error: {e}"),
         }
-
-        // All validations passed — apply mutations to self.
-        let task = match tasks.iter_mut().find(|t| t.id == self_id) {
-            Some(t) => t,
-            None => return format!("Error: task '{}' not found", self_id),
-        };
-        for id in proposed_blocks {
-            task.blocks.push(id);
-        }
-        for id in proposed_blocked_by {
-            task.blocked_by.push(id);
-        }
-        task.blocks.retain(|b| !remove_blocks.contains(b));
-        task.blocked_by.retain(|b| !remove_blocked_by.contains(b));
-
-        task.updated_at = now;
-
-        // Auto-complete task if all subtasks are completed
-        if !task.subtasks.is_empty() && task.subtasks.iter().all(|st| st.status == "completed") {
-            task.status = "completed".to_string();
-        }
-
-        json!({
-            "success": true,
-            "task_id": task_id,
-            "previous_status": previous_status,
-            "status": task.status,
-            "message": format!("Task '{}' updated to '{}'", task_id, task.status)
-        })
-        .to_string()
     }
 
     /// Stop/cancel a running task.
     pub async fn stop(&self, args: &Value) -> String {
         let task_id = match args.get("task_id").and_then(Value::as_str) {
-            Some(id) if !id.is_empty() => id,
+            Some(id) if !id.is_empty() => id.to_string(),
             _ => return "Error: 'task_id' is required".to_string(),
         };
 
         let reason = args
             .get("reason")
             .and_then(Value::as_str)
-            .unwrap_or("user requested");
+            .unwrap_or("user requested")
+            .to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
-        let mut tasks = match self.tasks.lock() {
-            Ok(guard) => guard,
-            Err(_) => return "Error: failed to access task list".to_string(),
-        };
+        let sid = self.sid();
+        match self
+            .store
+            .mutate(
+                &sid,
+                Box::new(move |mut tasks, _next| {
+                    let Some(task_idx) = tasks.iter().position(|t| t.id == task_id) else {
+                        return Err(format!("task '{}' not found", task_id));
+                    };
+                    let task_status = tasks[task_idx].status.clone();
 
-        let task = match tasks.iter_mut().find(|t| t.id == task_id) {
-            Some(t) => t,
-            None => return format!("Error: task '{}' not found", task_id),
-        };
+                    if task_status != "pending" && task_status != "in_progress" {
+                        return Ok(TaskMutationResult {
+                            tasks,
+                            next_task_id: None,
+                            response: json!({
+                                "success": false,
+                                "message": format!("Cannot stop task '{}': status is '{}' (only 'pending' or 'in_progress' can be stopped)", task_id, task_status)
+                            })
+                            .to_string(),
+                        });
+                    }
 
-        // Only allow stopping tasks that are running or pending
-        if task.status != "pending" && task.status != "in_progress" {
-            return json!({
-                "success": false,
-                "message": format!("Cannot stop task '{}': status is '{}' (only 'pending' or 'in_progress' can be stopped)", task_id, task.status)
-            })
-            .to_string();
+                    let task = &mut tasks[task_idx];
+                    let previous_status = task.status.clone();
+                    task.status = "cancelled".to_string();
+                    task.description = Some(format!(
+                        "{}\n\nCancelled: {} (was: {})",
+                        task.description.as_deref().unwrap_or(""),
+                        reason,
+                        previous_status
+                    ));
+                    task.updated_at = now;
+
+                    let mut cancelled_subtasks = 0;
+                    for subtask in &mut task.subtasks {
+                        if subtask.status == "pending" || subtask.status == "in_progress" {
+                            subtask.status = "cancelled".to_string();
+                            cancelled_subtasks += 1;
+                        }
+                    }
+
+                    let summary = if cancelled_subtasks > 0 {
+                        format!(
+                            "Task #{task_id} cancelled (was {previous_status}; {cancelled_subtasks} subtask(s) cancelled): {reason}"
+                        )
+                    } else {
+                        format!("Task #{task_id} cancelled (was {previous_status}): {reason}")
+                    };
+                    let response = prefix_summary(
+                        summary,
+                        json!({
+                            "success": true,
+                            "task_id": task_id,
+                            "previous_status": previous_status,
+                            "reason": reason,
+                            "cancelled_subtasks": cancelled_subtasks,
+                            "message": format!("Task '{}' cancelled (was: {})", task_id, previous_status)
+                        })
+                        .to_string(),
+                    );
+                    Ok(TaskMutationResult {
+                        tasks,
+                        next_task_id: None,
+                        response,
+                    })
+                }),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mgr() -> TaskManager {
+        TaskManager::in_memory()
+    }
+
+    #[tokio::test]
+    async fn create_and_list_roundtrips() {
+        let m = mgr();
+        let out = m
+            .create(&json!({"title": "a", "active_form": "doing a"}))
+            .await;
+        assert!(out.contains("\"success\":true"), "create: {out}");
+        let list = m.list(&json!({"status": "all"})).await;
+        assert!(list.contains("\"count\":1"), "list: {list}");
+    }
+
+    #[tokio::test]
+    async fn two_managers_same_session_share_store() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let a = TaskManager::new("sess-1", store.clone());
+        let b = TaskManager::new("sess-1", store.clone());
+        a.create(&json!({"title": "from-a"})).await;
+        let list = b.list(&json!({"status": "all"})).await;
+        assert!(list.contains("from-a"), "b should see a's task: {list}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_creates_keep_every_task_and_unique_ids() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let mut handles = Vec::new();
+        for i in 0..32 {
+            let mgr = TaskManager::new("sess-race", store.clone());
+            handles.push(tokio::spawn(async move {
+                mgr.create(&json!({"title": format!("task {i}")})).await
+            }));
+        }
+        for handle in handles {
+            let out = handle.await.expect("join concurrent create");
+            assert!(out.contains("\"success\":true"), "{out}");
         }
 
-        let previous_status = task.status.clone();
-        task.status = "cancelled".to_string();
-        task.description = Some(format!(
-            "{}\n\nCancelled: {} (was: {})",
-            task.description.as_deref().unwrap_or(""),
-            reason,
-            previous_status
-        ));
-        task.updated_at = now;
+        let mgr = TaskManager::new("sess-race", store);
+        let tasks = mgr.snapshot().await;
+        assert_eq!(tasks.len(), 32, "lost task(s): {tasks:?}");
+        let mut ids: Vec<_> = tasks.iter().map(|t| t.id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 32, "duplicate ids in {ids:?}");
+    }
 
-        // Also cancel any in-progress subtasks
-        let mut cancelled_subtasks = 0;
-        for subtask in &mut task.subtasks {
-            if subtask.status == "pending" || subtask.status == "in_progress" {
-                subtask.status = "cancelled".to_string();
-                cancelled_subtasks += 1;
+    #[tokio::test]
+    async fn update_accepts_schema_new_status_field() {
+        let m = mgr();
+        m.create(&json!({"title": "schema contract"})).await;
+        let out = m
+            .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        assert!(out.contains("\"success\":true"), "{out}");
+        assert!(out.contains("\"status\":\"in_progress\""), "{out}");
+        let task = m.get(&json!({"task_id": "task-1"})).await;
+        assert!(
+            task.contains("\"status\": \"in_progress\""),
+            "new_status must not be a no-op: {task}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_rejects_unknown_or_conflicting_status_fields() {
+        let m = mgr();
+        m.create(&json!({"title": "strict status"})).await;
+        let invalid = m
+            .update(&json!({"task_id": "task-1", "new_status": "active"}))
+            .await;
+        assert!(invalid.starts_with("Error:"), "{invalid}");
+        let task = m.get(&json!({"task_id": "task-1"})).await;
+        assert!(
+            task.contains("\"status\": \"pending\""),
+            "invalid status must not mutate task: {task}"
+        );
+
+        let conflict = m
+            .update(&json!({
+                "task_id": "task-1",
+                "new_status": "completed",
+                "status": "failed"
+            }))
+            .await;
+        assert!(conflict.starts_with("Error:"), "{conflict}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_restores_tasks_and_next_id() {
+        let m = mgr();
+        m.create(&json!({"title": "t1"})).await;
+        let snap = m.snapshot_state().await;
+        m.create(&json!({"title": "t2"})).await;
+        assert!(
+            m.list(&json!({"status": "all"}))
+                .await
+                .contains("\"count\":2")
+        );
+        m.restore_snapshot(&snap).await.unwrap();
+        let list = m.list(&json!({"status": "all"})).await;
+        assert!(list.contains("\"count\":1"), "after restore: {list}");
+        // Next create should get id reset.
+        let out = m.create(&json!({"title": "t2-again"})).await;
+        assert!(out.contains("task-2"), "id reset: {out}");
+    }
+
+    #[tokio::test]
+    async fn cycle_detection_rejects_self_dep() {
+        let m = mgr();
+        m.create(&json!({"title": "a"})).await;
+        let bad = m
+            .update(&json!({"task_id": "task-1", "add_blocks": ["task-1"]}))
+            .await;
+        assert!(bad.starts_with("Error:"), "{bad}");
+    }
+
+    #[tokio::test]
+    async fn delete_cleans_symmetric_edges() {
+        let m = mgr();
+        m.create(&json!({"title": "a"})).await;
+        m.create(&json!({"title": "b"})).await;
+        m.update(&json!({"task_id": "task-1", "add_blocks": ["task-2"]}))
+            .await;
+        let del = m
+            .update(&json!({"task_id": "task-1", "status": "deleted"}))
+            .await;
+        assert!(del.contains("\"status\":\"deleted\""), "{del}");
+        let get_b = m.get(&json!({"task_id": "task-2"})).await;
+        assert!(
+            !get_b.contains("\"blocked_by\":[\"task-1\"]"),
+            "b still references a: {get_b}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completing_last_subtask_auto_completes_parent() {
+        let m = mgr();
+        let create = m
+            .create(&json!({
+                "title": "parent",
+                "subtasks": [
+                    {"id": "s1", "title": "first"},
+                    {"id": "s2", "title": "second"}
+                ]
+            }))
+            .await;
+        assert!(create.contains("\"success\":true"), "{create}");
+
+        let first = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "s1",
+                "status": "completed"
+            }))
+            .await;
+        assert!(first.contains("\"success\":true"), "{first}");
+        let after_first = m.get(&json!({"task_id": "task-1"})).await;
+        let after_first: SessionTask =
+            serde_json::from_str(&after_first).expect("task json after first subtask");
+        assert!(
+            after_first.status == "pending",
+            "parent should stay pending until every subtask completes: {after_first:?}"
+        );
+
+        let second = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "s2",
+                "status": "completed"
+            }))
+            .await;
+        assert!(second.contains("\"success\":true"), "{second}");
+        let after_second = m.get(&json!({"task_id": "task-1"})).await;
+        let after_second: SessionTask =
+            serde_json::from_str(&after_second).expect("task json after second subtask");
+        assert!(
+            after_second.status == "completed",
+            "parent should auto-complete after the last subtask completes: {after_second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subtask_autocomplete_preserves_terminal_parent_status() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "parent",
+            "subtasks": [
+                {"id": "s1", "title": "first"},
+                {"id": "s2", "title": "second"}
+            ]
+        }))
+        .await;
+
+        let failed = m
+            .update(&json!({"task_id": "task-1", "status": "failed"}))
+            .await;
+        assert!(failed.contains("\"status\":\"failed\""), "{failed}");
+        m.update(&json!({"task_id": "task-1", "subtask_id": "s1", "status": "completed"}))
+            .await;
+        m.update(&json!({"task_id": "task-1", "subtask_id": "s2", "status": "completed"}))
+            .await;
+        let after_failed = m.get(&json!({"task_id": "task-1"})).await;
+        let after_failed: SessionTask =
+            serde_json::from_str(&after_failed).expect("task json after failed parent");
+        assert_eq!(
+            after_failed.status, "failed",
+            "subtask auto-complete must not overwrite explicit failed status"
+        );
+
+        m.create(&json!({
+            "title": "cancelled parent",
+            "subtasks": [
+                {"id": "s1", "title": "first"},
+                {"id": "s2", "title": "second"}
+            ]
+        }))
+        .await;
+        m.stop(&json!({"task_id": "task-2", "reason": "no longer needed"}))
+            .await;
+        m.update(&json!({"task_id": "task-2", "subtask_id": "s1", "status": "completed"}))
+            .await;
+        m.update(&json!({"task_id": "task-2", "subtask_id": "s2", "status": "completed"}))
+            .await;
+        let after_cancelled = m.get(&json!({"task_id": "task-2"})).await;
+        let after_cancelled: SessionTask =
+            serde_json::from_str(&after_cancelled).expect("task json after cancelled parent");
+        assert_eq!(
+            after_cancelled.status, "cancelled",
+            "subtask auto-complete must not overwrite explicit cancelled status"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncompleting_subtask_reopens_auto_completed_parent() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "parent",
+            "subtasks": [
+                {"id": "s1", "title": "first"},
+                {"id": "s2", "title": "second"}
+            ]
+        }))
+        .await;
+        m.update(&json!({"task_id": "task-1", "subtask_id": "s1", "status": "completed"}))
+            .await;
+        m.update(&json!({"task_id": "task-1", "subtask_id": "s2", "status": "completed"}))
+            .await;
+        let completed = m.get(&json!({"task_id": "task-1"})).await;
+        let completed: SessionTask =
+            serde_json::from_str(&completed).expect("task json after auto-complete");
+        assert_eq!(completed.status, "completed");
+
+        m.update(&json!({"task_id": "task-1", "subtask_id": "s1", "status": "pending"}))
+            .await;
+        let reopened = m.get(&json!({"task_id": "task-1"})).await;
+        let reopened: SessionTask =
+            serde_json::from_str(&reopened).expect("task json after reopening subtask");
+        assert_eq!(
+            reopened.status, "in_progress",
+            "reopening a subtask should stop showing the parent as completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn completing_parent_completes_incomplete_subtasks() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "parent",
+            "subtasks": [
+                {"id": "s1", "title": "first"},
+                {"id": "s2", "title": "second"}
+            ]
+        }))
+        .await;
+        let done = m
+            .update(&json!({"task_id": "task-1", "status": "completed"}))
+            .await;
+        assert!(done.contains("\"status\":\"completed\""), "{done}");
+
+        let task = m.get(&json!({"task_id": "task-1"})).await;
+        let task: SessionTask =
+            serde_json::from_str(&task).expect("task json after parent completion");
+        assert!(
+            task.subtasks.iter().all(|st| st.status == "completed"),
+            "explicit parent completion should not leave incomplete subtasks: {task:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completing_parent_preserves_terminal_subtask_failures() {
+        // Regression: the parent→subtask cascade used to blindly
+        // overwrite every subtask status with "completed", silently
+        // erasing `failed` / `cancelled` subtasks' failure history.
+        // Cascade must only reach pending / in_progress; terminal
+        // non-success states and already-completed stay as-is.
+        let m = mgr();
+        m.create(&json!({
+            "title": "parent",
+            "subtasks": [
+                {"id": "s1", "title": "pending-one"},
+                {"id": "s2", "title": "will-fail"},
+                {"id": "s3", "title": "will-cancel"},
+                {"id": "s4", "title": "already-done"}
+            ]
+        }))
+        .await;
+        // Mark s2 failed, s3 cancelled, s4 completed BEFORE completing parent.
+        for (sid, status) in [("s2", "failed"), ("s3", "cancelled"), ("s4", "completed")] {
+            m.update(&json!({
+                "task_id": "task-1",
+                "subtask_id": sid,
+                "status": status
+            }))
+            .await;
+        }
+        // Now cascade: parent → completed.
+        m.update(&json!({"task_id": "task-1", "status": "completed"}))
+            .await;
+
+        let task = m.get(&json!({"task_id": "task-1"})).await;
+        let task: SessionTask = serde_json::from_str(&task).expect("task json");
+        let by_id: std::collections::HashMap<_, _> = task
+            .subtasks
+            .iter()
+            .map(|s| (s.id.clone(), s.status.clone()))
+            .collect();
+        assert_eq!(
+            by_id["s1"], "completed",
+            "pending subtask should cascade to completed"
+        );
+        assert_eq!(
+            by_id["s2"], "failed",
+            "failed subtask must NOT be overwritten"
+        );
+        assert_eq!(
+            by_id["s3"], "cancelled",
+            "cancelled subtask must NOT be overwritten"
+        );
+        assert_eq!(
+            by_id["s4"], "completed",
+            "already-completed stays completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_counter_exhaustion_does_not_duplicate_last_id() {
+        let store = InMemoryTaskStore::new();
+        store
+            .set_next_task_id("sess-exhaust", u32::MAX)
+            .await
+            .unwrap();
+        assert_eq!(store.next_task_id("sess-exhaust").await.unwrap(), u32::MAX);
+        let err = store
+            .next_task_id("sess-exhaust")
+            .await
+            .expect_err("counter exhaustion must not return u32::MAX twice");
+        assert!(
+            err.contains("task id counter exhausted"),
+            "unexpected exhaustion error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_subscribe_fires_on_save() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let mut rx = store
+            .subscribe()
+            .expect("in-memory store supports subscribe");
+
+        // No signal yet.
+        assert!(rx.try_recv().is_err(), "no events before save");
+
+        store
+            .save(
+                "sess-signal-1",
+                vec![SessionTask {
+                    id: "task-1".into(),
+                    title: "probe".into(),
+                    description: None,
+                    status: "pending".into(),
+                    subtasks: vec![],
+                    created_at: "now".into(),
+                    updated_at: "now".into(),
+                    active_form: None,
+                    owner: None,
+                    metadata: None,
+                    blocks: vec![],
+                    blocked_by: vec![],
+                }],
+            )
+            .await
+            .unwrap();
+
+        let got = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("broadcast should deliver within 200ms")
+            .expect("sender still live");
+        assert_eq!(got, "sess-signal-1");
+    }
+
+    #[tokio::test]
+    async fn in_memory_subscribe_returns_none_on_save_with_no_subscribers() {
+        // No-subscriber save must not panic and must still complete.
+        let store = InMemoryTaskStore::new();
+        store
+            .save("sess-no-sub", vec![])
+            .await
+            .expect("save must succeed even without subscribers");
+    }
+
+    #[tokio::test]
+    async fn peek_does_not_consume_or_mutate() {
+        // Two consecutive peeks + a following next_task_id must all agree
+        // on the counter value — peek is pure read.
+        let store = InMemoryTaskStore::new();
+        let s = "sess-peek";
+        assert_eq!(store.peek_next_task_id(s).await.unwrap(), 1);
+        assert_eq!(store.peek_next_task_id(s).await.unwrap(), 1);
+        // Allocate; peek now reports the next unused value.
+        assert_eq!(store.next_task_id(s).await.unwrap(), 1);
+        assert_eq!(store.peek_next_task_id(s).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn snapshot_state_is_race_safe_against_concurrent_allocation() {
+        // Regression for A1: the old alloc/rewind dance in snapshot_state
+        // could clobber a concurrent next_task_id bump, handing the same
+        // id out twice. This test runs many snapshots interleaved with
+        // allocations and asserts every allocated id is unique.
+        use std::sync::Arc;
+        use tokio::task::JoinSet;
+
+        let manager = Arc::new(TaskManager::new(
+            "sess-race",
+            Arc::new(InMemoryTaskStore::new()),
+        ));
+        let store = manager.store();
+        let mut set: JoinSet<u32> = JoinSet::new();
+
+        // 200 concurrent next_task_id calls + 200 concurrent snapshots.
+        // If snapshot_state still rewinds the counter, at least one
+        // allocation will duplicate.
+        for _ in 0..200 {
+            let s = store.clone();
+            set.spawn(async move { s.next_task_id("sess-race").await.unwrap() });
+        }
+        for _ in 0..200 {
+            let m = manager.clone();
+            set.spawn(async move {
+                let _ = m.snapshot_state().await;
+                0 // snapshot branch returns sentinel; filtered out below
+            });
+        }
+
+        let mut ids: Vec<u32> = Vec::with_capacity(200);
+        while let Some(v) = set.join_next().await {
+            let id = v.unwrap();
+            if id != 0 {
+                ids.push(id);
+            }
+        }
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(
+            before,
+            ids.len(),
+            "duplicate ids handed out; snapshot_state raced the allocator"
+        );
+    }
+
+    #[test]
+    fn max_task_id_helper_handles_edges() {
+        assert_eq!(max_task_id(&[]), 0);
+        let t = SessionTask {
+            id: "task-7".into(),
+            title: "x".into(),
+            description: None,
+            status: "pending".into(),
+            subtasks: vec![],
+            created_at: "".into(),
+            updated_at: "".into(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: vec![],
+            blocked_by: vec![],
+        };
+        let nonnum = SessionTask {
+            id: "not-numeric".into(),
+            ..t.clone()
+        };
+        assert_eq!(max_task_id(std::slice::from_ref(&t)), 7);
+        assert_eq!(max_task_id(std::slice::from_ref(&nonnum)), 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_peek_failure_fallback_avoids_counter_rewind() {
+        // Regression for the A1-related concern: if peek_next_task_id
+        // fails, snapshot_state used to fall back to 1, which on
+        // restore would rewind the counter and collide with surviving
+        // task ids. Verify the fallback now derives from max(task id).
+        struct FlakyPeekStore {
+            inner: InMemoryTaskStore,
+        }
+
+        #[async_trait::async_trait]
+        impl TaskStore for FlakyPeekStore {
+            async fn load(&self, sid: &str) -> Result<Vec<SessionTask>, String> {
+                self.inner.load(sid).await
+            }
+            async fn save(&self, sid: &str, t: Vec<SessionTask>) -> Result<(), String> {
+                self.inner.save(sid, t).await
+            }
+            async fn next_task_id(&self, sid: &str) -> Result<u32, String> {
+                self.inner.next_task_id(sid).await
+            }
+            async fn set_next_task_id(&self, sid: &str, n: u32) -> Result<(), String> {
+                self.inner.set_next_task_id(sid, n).await
+            }
+            async fn peek_next_task_id(&self, _sid: &str) -> Result<u32, String> {
+                Err("simulated pool exhausted".into())
             }
         }
 
-        json!({
-            "success": true,
-            "task_id": task_id,
-            "previous_status": previous_status,
-            "reason": reason,
-            "cancelled_subtasks": cancelled_subtasks,
-            "message": format!("Task '{}' cancelled (was: {})", task_id, previous_status)
-        })
-        .to_string()
+        let inner = InMemoryTaskStore::new();
+        inner
+            .save(
+                "sess-fallback",
+                vec![SessionTask {
+                    id: "task-42".into(),
+                    title: "survivor".into(),
+                    description: None,
+                    status: "pending".into(),
+                    subtasks: vec![],
+                    created_at: "".into(),
+                    updated_at: "".into(),
+                    active_form: None,
+                    owner: None,
+                    metadata: None,
+                    blocks: vec![],
+                    blocked_by: vec![],
+                }],
+            )
+            .await
+            .unwrap();
+        let store: Arc<dyn TaskStore> = Arc::new(FlakyPeekStore { inner });
+        let mgr = TaskManager::new("sess-fallback", store);
+        let snap = mgr.snapshot_state().await;
+        assert_eq!(
+            snap.next_task_id, 43,
+            "peek failure must fall back to max(task id) + 1, not 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_sets_counter_before_broadcasting_save() {
+        // A subscriber waking on the save-broadcast and immediately
+        // calling peek_next_task_id MUST observe the restored counter,
+        // not the pre-restore value. This pins the ordering: set →
+        // save (broadcast). Without the fix, peek would return the
+        // old counter because set_next_task_id ran after save.
+        let store = Arc::new(InMemoryTaskStore::new());
+        let mgr = TaskManager::new("sess-order", store.clone() as Arc<dyn TaskStore>);
+        // Burn a few ids so the counter diverges from snapshot.
+        for _ in 0..5 {
+            let _ = store.next_task_id("sess-order").await.unwrap();
+        }
+        let snap = TaskManagerSnapshot {
+            tasks: vec![],
+            next_task_id: 1,
+        };
+        let mut rx = store.subscribe().expect("inmemory supports subscribe");
+        let store_probe = store.clone();
+        let probe = tokio::spawn(async move {
+            let _ = rx.recv().await.unwrap();
+            store_probe.peek_next_task_id("sess-order").await.unwrap()
+        });
+        mgr.restore_snapshot(&snap).await.unwrap();
+        let observed = tokio::time::timeout(std::time::Duration::from_millis(200), probe)
+            .await
+            .expect("probe should complete")
+            .expect("join");
+        assert_eq!(
+            observed, 1,
+            "subscriber woke on save-broadcast but saw pre-restore counter value"
+        );
+    }
+
+    // ── load_all_sessions (multi-session task board) ─────────────
+
+    #[tokio::test]
+    async fn load_all_sessions_empty_store_returns_empty() {
+        let store = InMemoryTaskStore::new();
+        let rows = store.load_all_sessions().await.expect("load_all");
+        assert!(rows.is_empty(), "empty store must yield empty rollup");
+    }
+
+    #[tokio::test]
+    async fn load_all_sessions_returns_every_bound_session() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        TaskManager::new("sess-a", store.clone())
+            .create(&json!({"title": "a1"}))
+            .await;
+        TaskManager::new("sess-b", store.clone())
+            .create(&json!({"title": "b1"}))
+            .await;
+        TaskManager::new("sess-b", store.clone())
+            .create(&json!({"title": "b2"}))
+            .await;
+
+        let rows = store.load_all_sessions().await.expect("load_all");
+        let mut sids: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
+        sids.sort();
+        assert_eq!(sids, vec!["sess-a", "sess-b"]);
+
+        let sess_b = rows.iter().find(|(s, _)| s == "sess-b").unwrap();
+        assert_eq!(sess_b.1.len(), 2, "sess-b must surface both of its tasks");
+    }
+
+    #[tokio::test]
+    async fn load_all_sessions_isolates_sessions_from_each_other() {
+        // Regression guard: if load_all_sessions accidentally
+        // concatenated every session's tasks, this would return
+        // 3 tasks under a single session. The method must preserve
+        // per-session grouping.
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        TaskManager::new("sess-1", store.clone())
+            .create(&json!({"title": "x"}))
+            .await;
+        TaskManager::new("sess-2", store.clone())
+            .create(&json!({"title": "y"}))
+            .await;
+        TaskManager::new("sess-2", store.clone())
+            .create(&json!({"title": "z"}))
+            .await;
+
+        let rows = store.load_all_sessions().await.expect("load_all");
+        for (sid, tasks) in &rows {
+            let titles: Vec<&str> = tasks.iter().map(|t| t.title.as_str()).collect();
+            if sid == "sess-1" {
+                assert_eq!(titles, vec!["x"]);
+            } else if sid == "sess-2" {
+                assert!(titles.contains(&"y") && titles.contains(&"z"));
+                assert!(!titles.contains(&"x"), "sess-2 must not leak sess-1 data");
+            }
+        }
     }
 }

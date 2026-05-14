@@ -1,5 +1,5 @@
 use super::*;
-use crate::{current_access_token, is_session_not_found_error};
+use crate::is_session_not_found_error;
 use astra_runtime::server::team_orchestrator::ExecutionPhase;
 #[allow(unused_imports)]
 use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode};
@@ -427,7 +427,9 @@ async fn ensure_team_run_session(
     profile: Option<&str>,
     state: &mut super::SessionState,
 ) -> Result<String, String> {
-    let token = current_access_token(profile).ok_or_else(|| "Not logged in".to_string())?;
+    let token = crate::session_runtime::fresh_access_token(api, profile)
+        .await
+        .ok_or_else(|| "Not logged in".to_string())?;
     if let Some(session_id) = state.session_id.clone() {
         match api.get_session_text(&token, &session_id).await {
             Ok(_) => return Ok(session_id),
@@ -437,7 +439,7 @@ async fn ensure_team_run_session(
                     return Ok(session_id);
                 }
                 let _ = crate::auth_flow::clear_profile_last_session(profile);
-                state.session_id = None;
+                state.clear_session_id();
                 state.unregister_root_mailbox().await;
                 state.run_id = None;
                 state.journal = None;
@@ -460,7 +462,7 @@ async fn ensure_team_run_session(
 
     crate::chat_turn::initialize_journal_pub(state, &session_id);
     crate::chat_turn::persist_last_session_id(profile, &session_id);
-    state.session_id = Some(session_id.clone());
+    state.set_session_id(session_id.clone());
     Ok(session_id)
 }
 
@@ -902,7 +904,7 @@ pub(super) async fn handle_team_command(
                     return;
                 }
             };
-            let token = match crate::current_access_token(profile) {
+            let token = match crate::session_runtime::fresh_access_token(api, profile).await {
                 Some(t) => t,
                 None => {
                     eprintln!("  {} Not logged in", theme::icon_err());

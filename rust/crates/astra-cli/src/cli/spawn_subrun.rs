@@ -22,13 +22,28 @@ use astra_runtime::{
     turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
 };
+use astra_turn_core::agent_live_event::SharedAgentLiveEventSink;
 use serde_json::{Value, json};
 
+use super::chat_stream::StreamEvent;
 use super::edge_tools;
 use super::permission_manager::PermissionMode;
 use super::skill_subrun::SubRunHost;
 
 // ─── CliSpawnAgentExecutor ──────────────────────────────────────────────────
+
+/// Read-the-current-token closure passed to [`CliSpawnAgentExecutor`].
+/// Implementations must be cheap (typically a credential-store lookup
+/// keyed by profile). Returns `None` when the user is logged out — the
+/// executor then falls back to the `token` field captured at construction
+/// time and lets the spawn fail with a clear "credentials" error.
+///
+/// Why this exists: sub-agent spawns failed with 401 in long-running
+/// interactive sessions because the executor froze the access token at
+/// startup time and never refreshed it. The parent turn flow retries on
+/// 401 after refreshing credentials; sub-agents must read the freshest
+/// token at the moment of spawn so they follow the same lifecycle.
+pub type TokenProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// CLI implementation of [`SpawnAgentExecutor`].
 ///
@@ -36,7 +51,17 @@ use super::skill_subrun::SubRunHost;
 /// but with agent-type-specific configuration (model, tools, prompts).
 pub struct CliSpawnAgentExecutor {
     api: astra_thin_client::ThinClient,
+    /// Token captured at construction. Used as the **fallback** when
+    /// `token_provider` is unset OR returns `None`. In production the
+    /// REPL installs a provider so sub-agent spawns always read the
+    /// freshest token; this field stays as a safety net for tests and
+    /// the one-shot `chat -m` path that doesn't have a profile to query.
     token: String,
+    /// Reads the current access token at spawn time. When set, takes
+    /// precedence over `self.token` so token refreshes done by the
+    /// parent turn flow propagate to children. When `None`, the executor
+    /// falls back to `self.token` for parity with the pre-fix behaviour.
+    token_provider: Option<TokenProvider>,
     project_root: PathBuf,
     permission_mode: PermissionMode,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
@@ -50,6 +75,10 @@ pub struct CliSpawnAgentExecutor {
     fork_cache_sink: Option<Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>>,
     /// Parent session journal writer for unified timeline.
     journal: Option<std::sync::Arc<astra_services::session_journal::JournalWriter>>,
+    /// Shared command queue for the parent's BackgroundTaskRegistry.
+    /// Threaded into the child's ToolExecutor so spawned sub-agents
+    /// can also use `task(action='background_shell')`.
+    bg_task_commands: Option<Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
 }
 
 /// Build the child agent's message array from system prompt, optional
@@ -108,6 +137,145 @@ pub(crate) fn build_child_messages(
     }
 }
 
+#[derive(Clone)]
+struct AgentLiveStreamEventSink {
+    agent_id: String,
+    sink: SharedAgentLiveEventSink,
+}
+
+impl std::fmt::Debug for AgentLiveStreamEventSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentLiveStreamEventSink")
+            .field("agent_id", &self.agent_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl super::chat_stream::StreamEventSink for AgentLiveStreamEventSink {
+    fn send(&self, event: StreamEvent) {
+        if let Some(kind) = stream_event_to_agent_live_kind(event)
+            && let Err(err) = self
+                .sink
+                .send(astra_turn_core::agent_live_event::AgentLiveEvent {
+                    agent_id: self.agent_id.clone(),
+                    kind,
+                })
+        {
+            astra_core::agent_warn!(
+                "spawn_subrun",
+                "dropping live event for {}: {err:?}",
+                self.agent_id
+            );
+        }
+    }
+}
+
+fn agent_live_stream_event_sink(
+    agent_id: String,
+    sink: Option<SharedAgentLiveEventSink>,
+) -> Option<super::chat_stream::SharedStreamEventSink> {
+    Some(Arc::new(AgentLiveStreamEventSink {
+        agent_id,
+        sink: sink?,
+    }))
+}
+
+fn emit_agent_terminated(
+    sink: Option<&SharedAgentLiveEventSink>,
+    agent_id: &str,
+    started_at: std::time::Instant,
+    termination: astra_turn_core::agent_live_event::AgentLiveTermination,
+    reason: Option<String>,
+) {
+    use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+    let Some(sink) = sink else {
+        return;
+    };
+    if let Err(err) = sink.send(AgentLiveEvent {
+        agent_id: agent_id.to_string(),
+        kind: AgentLiveEventKind::AgentTerminated {
+            termination,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+            reason,
+        },
+    }) {
+        astra_core::agent_warn!(
+            "spawn_subrun",
+            "failed to emit terminal live event for {agent_id}: {err:?}"
+        );
+    }
+}
+
+fn completion_status_from_finish_reason(finish_reason: Option<&str>) -> &'static str {
+    // `None` is only expected on the clean-completion path before any
+    // interruption record exists; cancelled/failed branches never call this
+    // helper.
+    match finish_reason {
+        None | Some("normal") => "completed",
+        Some(_) => "interrupted",
+    }
+}
+
+fn stream_event_to_agent_live_kind(
+    event: StreamEvent,
+) -> Option<astra_turn_core::agent_live_event::AgentLiveEventKind> {
+    use astra_turn_core::agent_live_event::AgentLiveEventKind;
+    match event {
+        StreamEvent::Token(text) => Some(AgentLiveEventKind::OutputDelta(text)),
+        StreamEvent::ThinkingChunk(text) => Some(AgentLiveEventKind::ThinkingDelta(text)),
+        StreamEvent::ToolStarted {
+            name,
+            description,
+            tool_use_id,
+            ..
+        } => Some(AgentLiveEventKind::ToolStarted {
+            name,
+            description,
+            tool_use_id,
+        }),
+        StreamEvent::ToolCompleted {
+            name,
+            description,
+            status,
+            duration_ms,
+            output_summary,
+            output,
+            tool_use_id,
+            ..
+        } => Some(AgentLiveEventKind::ToolCompleted {
+            name,
+            description,
+            status,
+            duration_ms,
+            output_summary,
+            output,
+            tool_use_id,
+        }),
+        StreamEvent::WaitingForModel => {
+            Some(AgentLiveEventKind::Status("waiting for model".to_string()))
+        }
+        StreamEvent::ModelResponding => {
+            Some(AgentLiveEventKind::Status("model responding".to_string()))
+        }
+        StreamEvent::StatusLine(text) => Some(AgentLiveEventKind::Status(text)),
+        StreamEvent::PermissionAutoApproved { tool, reason } => Some(AgentLiveEventKind::Status(
+            astra_turn_core::permission_notice::format_auto_approved_permission(&tool, &reason)
+                .trim()
+                .to_string(),
+        )),
+        StreamEvent::AgentControlStarted { label, .. } => Some(AgentLiveEventKind::Status(
+            format!("agent control started: {label}"),
+        )),
+        StreamEvent::AgentControlCompleted { label, status, .. } => Some(
+            AgentLiveEventKind::Status(format!("agent control {status}: {label}")),
+        ),
+        StreamEvent::ToolOutput { name, lines, bytes } => Some(AgentLiveEventKind::Status(
+            format!("{name} streaming: {lines} lines, {bytes} bytes"),
+        )),
+        StreamEvent::Thinking(_) | StreamEvent::AgentLive(_) => None,
+    }
+}
+
 impl CliSpawnAgentExecutor {
     pub fn new(
         api: astra_thin_client::ThinClient,
@@ -119,6 +287,7 @@ impl CliSpawnAgentExecutor {
         Self {
             api,
             token,
+            token_provider: None,
             project_root,
             permission_mode,
             cancel_token,
@@ -127,7 +296,51 @@ impl CliSpawnAgentExecutor {
             active_session_id: None,
             fork_cache_sink: None,
             journal: None,
+            bg_task_commands: None,
         }
+    }
+
+    /// Install a token provider so each spawn reads the freshest
+    /// access token at the moment of execution. The REPL wires this
+    /// to `current_access_token(profile)` so token refreshes done by
+    /// the parent agent's 401-retry path propagate to sub-agents.
+    /// Without this, long-running sessions hit "Could not validate
+    /// credentials" on every spawn after the first token rotation.
+    pub fn with_token_provider(mut self, provider: TokenProvider) -> Self {
+        self.token_provider = Some(provider);
+        self
+    }
+
+    /// Resolve the access token for the next spawn. Provider takes
+    /// precedence so refreshes propagate; falls back to the captured
+    /// `self.token` when the provider is absent or returns `None`.
+    fn resolve_token(&self) -> String {
+        if let Some(provider) = &self.token_provider {
+            if let Some(t) = provider() {
+                return t;
+            }
+        }
+        self.token.clone()
+    }
+
+    async fn resolve_token_async(&self) -> Result<String, String> {
+        let fallback = self.token.clone();
+        let Some(provider) = self.token_provider.clone() else {
+            return Ok(fallback);
+        };
+        tokio::task::spawn_blocking(move || provider().unwrap_or(fallback.clone()))
+            .await
+            .map_err(|err| format!("token provider task failed: {err}"))
+    }
+
+    /// Install the parent's bg task command queue so spawned children
+    /// can use `task(action='background_shell')`.
+    pub fn with_bg_task_commands(
+        mut self,
+        commands: Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
+    ) -> Self {
+        self.bg_task_commands = Some(commands);
+        self
     }
 
     /// Install the parent session's journal writer for unified timeline.
@@ -175,6 +388,15 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let all_schemas = edge_tools::all_tool_schemas();
         let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
 
+        // Hold a clone for emitting the terminal `AgentTerminated`
+        // event after the agentic loop returns. Without this, a
+        // crashed / timed-out / cancelled sub-agent would leave its
+        // multi_agent strip row stuck in the `live` state forever
+        // (reviewer L2-5 — UX C1 + Arch M1).
+        let live_event_sink_for_terminal = config.live_event_sink.clone();
+        let agent_id_for_terminal = config.agent_id.clone();
+        let started_at = std::time::Instant::now();
+
         // Create permission manager - use inherited permissions if available
         let perm_manager = if let Some(ref inherited) = config.inherited_permissions {
             super::permission_manager::PermissionManager::with_inherited(
@@ -182,9 +404,13 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 inherited.clone(),
             )
         } else {
-            super::permission_manager::PermissionManager::with_project_mode(
+            // Issue #326 P5b: spawned agent sub-run is headless
+            // when no inherited permissions are provided either.
+            // Either way, project allow rules don't apply.
+            super::permission_manager::PermissionManager::with_load_policy(
                 self.permission_mode,
                 &self.project_root,
+                &super::permission_manager::PermissionLoadPolicy::HeadlessSafe,
             )
         };
 
@@ -193,8 +419,27 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let compact_strategy =
             astra_turn_core::microcompact::CompactStrategy::from_provider_hint(&config.model);
 
-        let executor = edge_tools::ToolExecutor::new(&effective_root)
-            .with_cloud(self.api.api_origin(), &self.token);
+        // Resolve the freshest token at spawn time. Without this,
+        // sub-agents fail with 401 in long-running sessions after the
+        // parent's auth refresh rotates the token (session 82ff91e5).
+        let token = match self.resolve_token_async().await {
+            Ok(token) => token,
+            Err(err) => {
+                emit_agent_terminated(
+                    live_event_sink_for_terminal.as_ref(),
+                    &agent_id_for_terminal,
+                    started_at,
+                    astra_turn_core::agent_live_event::AgentLiveTermination::Failed,
+                    Some(err.clone()),
+                );
+                return Err(err);
+            }
+        };
+        let mut executor = edge_tools::ToolExecutor::new(&effective_root)
+            .with_cloud(self.api.api_origin(), &token);
+        if let Some(ref cmds) = self.bg_task_commands {
+            executor = executor.with_bg_task_commands(cmds.clone());
+        }
         if let Some(session_id) = self.active_session_id.as_deref() {
             executor.set_active_session_id(session_id.to_string());
         }
@@ -207,7 +452,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 
         let mut host = SubRunHost {
             api: self.api.clone(),
-            token: self.token.clone(),
+            token: token.clone(),
             model: Some(config.model.clone()),
             project_root: effective_root.clone(),
             executor: std::sync::Arc::new(executor),
@@ -221,6 +466,11 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             skill_resolver: self.skill_resolver.clone(),
             progress_tx: None,
             agent_id: config.agent_id.clone(),
+            stream_event_tx: None,
+            stream_event_sink: agent_live_stream_event_sink(
+                config.agent_id.clone(),
+                config.live_event_sink.clone(),
+            ),
             tool_cache: super::stream_render::EdgeToolCache::new(
                 resolved_tool_policy.max_identical_tool_calls,
             ),
@@ -321,6 +571,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             volatile_pending: Vec::new(),
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
+            session_memory_state: Default::default(),
+            session_memory_llm_params: None,
             current_session_id: server_session_id,
             current_run_id: Some(config.run_id.clone()),
             context_manifest_pool: None,
@@ -392,7 +644,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             last_turn_policy:
                 astra_runtime::turn::agentic_loop_host::TurnInteractionPolicy::default(),
             api: self.api.clone(),
-            api_token: self.token.clone(),
+            api_token: token.clone(),
             delegation_engine: None,
             delegations_this_turn: 0,
             project_context: None,
@@ -486,6 +738,21 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             .as_ref()
             .map(|i| i.kind.label().to_string());
 
+        // Helper: tell any live event sink that the sub-agent has
+        // reached a terminal state. The TUI's `agent_runs` registry
+        // is updated via this signal so the strip row flips from ◦
+        // (live) to ✓ / ✗ / ⊘ (terminal). Without this, a crashed or
+        // timed-out child leaves the row stuck in `live`.
+        let emit_terminated = |termination, reason: Option<String>| {
+            emit_agent_terminated(
+                live_event_sink_for_terminal.as_ref(),
+                &agent_id_for_terminal,
+                started_at,
+                termination,
+                reason,
+            );
+        };
+
         match loop_result {
             Ok(AgenticLoopOutcome::Completed) => {
                 // Emit completed event
@@ -505,10 +772,17 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                         duration_ms,
                     );
                 }
+                emit_terminated(
+                    astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
+                    finish_reason_from_state.clone(),
+                );
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,
-                    status: "completed".to_string(),
+                    status: completion_status_from_finish_reason(
+                        finish_reason_from_state.as_deref(),
+                    )
+                    .to_string(),
                     finish_reason: finish_reason_from_state.unwrap_or_else(|| "normal".to_string()),
                     output: Some(state.final_text),
                     error: None,
@@ -526,6 +800,14 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 if let Some(ref emitter) = progress_emitter {
                     emitter.cancelled("user cancellation");
                 }
+                emit_terminated(
+                    astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled,
+                    Some(
+                        finish_reason_from_state
+                            .clone()
+                            .unwrap_or_else(|| "user cancellation".to_string()),
+                    ),
+                );
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,
@@ -552,6 +834,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 if let Some(ref emitter) = progress_emitter {
                     emitter.failed(&error);
                 }
+                emit_terminated(
+                    astra_turn_core::agent_live_event::AgentLiveTermination::Failed,
+                    Some(error.clone()),
+                );
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,
@@ -599,6 +885,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 if let Some(ref emitter) = progress_emitter {
                     emitter.failed(&msg);
                 }
+                emit_terminated(
+                    astra_turn_core::agent_live_event::AgentLiveTermination::Failed,
+                    Some(msg.clone()),
+                );
                 Err(msg)
             }
         }
@@ -608,6 +898,19 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_turn_core::agent_live_event::{
+        AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveSendError,
+    };
+
+    #[derive(Debug, Default)]
+    struct RecordingLiveSink(std::sync::Mutex<Vec<AgentLiveEvent>>);
+
+    impl AgentLiveEventSink for RecordingLiveSink {
+        fn send(&self, event: AgentLiveEvent) -> Result<(), AgentLiveSendError> {
+            self.0.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_executor_creation() {
@@ -620,6 +923,202 @@ mod tests {
             None,
         );
         assert!(executor.skill_resolver.is_none());
+        assert!(
+            executor.token_provider.is_none(),
+            "fresh executor must have no provider — production wires \
+             one via with_token_provider"
+        );
+    }
+
+    #[test]
+    fn agent_live_stream_event_sink_translates_directly_without_stream_channel() {
+        let live_sink = Arc::new(RecordingLiveSink::default());
+        let stream_sink =
+            agent_live_stream_event_sink("reviewer@abc12345".into(), Some(live_sink.clone()))
+                .expect("sink");
+
+        stream_sink.send(StreamEvent::Token("hello".into()));
+        stream_sink.send(StreamEvent::ToolStarted {
+            name: "bash".into(),
+            description: "cargo test".into(),
+            tool_use_id: "tool-1".into(),
+            parent_tool_use_id: None,
+        });
+
+        let events = live_sink.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0].kind, AgentLiveEventKind::OutputDelta(_)));
+        assert!(matches!(
+            events[1].kind,
+            AgentLiveEventKind::ToolStarted { .. }
+        ));
+        assert_eq!(events[0].agent_id, "reviewer@abc12345");
+    }
+
+    /// REGRESSION (session 82ff91e5): sub-agent spawns failed with
+    /// "Could not validate credentials" because the executor froze
+    /// `token: String` at construction time and never refreshed it.
+    /// Long-running interactive sessions rotate the token via the
+    /// parent's 401-refresh-and-retry path; without a provider, the
+    /// stale token stays in the spawn executor and every spawn 401s.
+    ///
+    /// This test pins the fix: when a token provider is installed,
+    /// `resolve_token()` MUST return the provider's value, not the
+    /// frozen one. Mutating the provider's source between calls
+    /// proves freshness.
+    #[test]
+    fn token_provider_overrides_stale_captured_token() {
+        let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
+        let executor_no_provider = CliSpawnAgentExecutor::new(
+            api.clone(),
+            "stale-token".to_string(),
+            PathBuf::from("/tmp"),
+            PermissionMode::Prompt,
+            None,
+        );
+        assert_eq!(
+            executor_no_provider.resolve_token(),
+            "stale-token",
+            "without a provider, fall back to the captured token"
+        );
+
+        // Provider returns whatever the shared mutable cell currently holds.
+        let live_token = std::sync::Arc::new(std::sync::Mutex::new("v1".to_string()));
+        let live_token_for_closure = live_token.clone();
+        let provider: TokenProvider =
+            std::sync::Arc::new(move || Some(live_token_for_closure.lock().unwrap().clone()));
+        let executor = CliSpawnAgentExecutor::new(
+            api,
+            "stale-frozen-fallback".to_string(),
+            PathBuf::from("/tmp"),
+            PermissionMode::Prompt,
+            None,
+        )
+        .with_token_provider(provider);
+
+        assert_eq!(
+            executor.resolve_token(),
+            "v1",
+            "provider must take precedence over the captured fallback"
+        );
+        // Simulate a token refresh in the parent flow.
+        *live_token.lock().unwrap() = "v2-refreshed".to_string();
+        assert_eq!(
+            executor.resolve_token(),
+            "v2-refreshed",
+            "subsequent spawns must read the refreshed token, not a frozen copy"
+        );
+    }
+
+    /// Defensive: when the provider returns `None` (e.g. user logged
+    /// out mid-session), fall back to the captured token rather than
+    /// crashing or sending an empty string. The captured token will
+    /// itself fail with 401 — but at least with a recognisable error.
+    #[test]
+    fn token_provider_none_falls_back_to_captured() {
+        let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
+        let provider: TokenProvider = std::sync::Arc::new(|| None);
+        let executor = CliSpawnAgentExecutor::new(
+            api,
+            "fallback-token".to_string(),
+            PathBuf::from("/tmp"),
+            PermissionMode::Prompt,
+            None,
+        )
+        .with_token_provider(provider);
+
+        assert_eq!(
+            executor.resolve_token(),
+            "fallback-token",
+            "provider returning None must fall back to the captured token"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_token_provider_panic_surfaces_instead_of_using_stale_fallback() {
+        let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
+        let provider: TokenProvider = std::sync::Arc::new(|| panic!("token store poisoned"));
+        let executor = CliSpawnAgentExecutor::new(
+            api,
+            "stale-token".to_string(),
+            PathBuf::from("/tmp"),
+            PermissionMode::Prompt,
+            None,
+        )
+        .with_token_provider(provider);
+
+        let err = executor.resolve_token_async().await.unwrap_err();
+        assert!(
+            err.contains("token provider task failed"),
+            "join errors must be surfaced, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_resolution_failure_emits_terminal_live_event() {
+        let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
+        let provider: TokenProvider = std::sync::Arc::new(|| panic!("token store poisoned"));
+        let live_sink = Arc::new(RecordingLiveSink::default());
+        let executor = CliSpawnAgentExecutor::new(
+            api,
+            "stale-token".to_string(),
+            PathBuf::from("/tmp"),
+            PermissionMode::Prompt,
+            None,
+        )
+        .with_token_provider(provider);
+
+        let err = executor
+            .execute(SpawnRunConfig {
+                run_id: "run-1".into(),
+                agent_id: "reviewer@panic".into(),
+                recursion_depth: 1,
+                agent_type: "task".into(),
+                task: "review".into(),
+                system_prompt_addendum: String::new(),
+                model: "test-model".into(),
+                max_turns: 1,
+                allowed_tools: Vec::new(),
+                read_only: true,
+                working_dir: PathBuf::from("/tmp"),
+                mailbox: None,
+                progress_emitter: None,
+                context_cache: None,
+                inherited_permissions: None,
+                parent_address: None,
+                permission_context: None,
+                inherited_skills: Vec::new(),
+                live_event_sink: Some(live_sink.clone()),
+                inherited_prefix: None,
+                is_fork_child: false,
+            })
+            .await
+            .expect_err("token provider panic should fail execute");
+
+        assert!(err.contains("token provider task failed"), "{err}");
+        let events = live_sink.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].kind,
+            AgentLiveEventKind::AgentTerminated { .. }
+        ));
+    }
+
+    #[test]
+    fn completion_status_tracks_interrupted_finish_reasons() {
+        assert_eq!(completion_status_from_finish_reason(None), "completed");
+        assert_eq!(
+            completion_status_from_finish_reason(Some("normal")),
+            "completed"
+        );
+        assert_eq!(
+            completion_status_from_finish_reason(Some("budget_exhausted")),
+            "interrupted"
+        );
+        assert_eq!(
+            completion_status_from_finish_reason(Some("context_overflow")),
+            "interrupted"
+        );
     }
 
     /// Bug1 regression: when inherited prefix ends with a user or tool

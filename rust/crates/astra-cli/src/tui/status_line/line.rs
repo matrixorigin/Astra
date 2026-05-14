@@ -17,7 +17,6 @@ pub(crate) enum PermissionMode {
     Ask,
     Auto,
     Deny,
-    Bypass,
 }
 
 impl PermissionMode {
@@ -26,7 +25,6 @@ impl PermissionMode {
             Self::Ask => "",
             Self::Auto => "⚡auto",
             Self::Deny => "⚡deny",
-            Self::Bypass => "⚡bypass",
         }
     }
 }
@@ -46,6 +44,14 @@ pub(crate) struct StatusContext {
     pub git_branch: Option<String>,
     /// Number of approvals currently awaiting a user decision.
     pub pending_approvals: usize,
+    /// `(open, total)` task counts for the footer task-board chip.
+    /// `None` when the board has no tasks — chip hides rather than
+    /// wasting space with `0/0`.
+    pub task_counts: Option<(usize, usize)>,
+    /// Whether the user has Ctrl+T-expanded the task board. Controls
+    /// the chip glyph (`▼` expanded, `▶` collapsed) so the key's
+    /// target state is visible.
+    pub task_board_expanded: bool,
 }
 
 /// A styled text fragment that appears on either side of the line.
@@ -123,12 +129,6 @@ impl StatusLine {
                     Style::default().fg(Color::Red),
                 ));
             }
-            PermissionMode::Bypass => {
-                out.left.push(Segment::styled(
-                    PermissionMode::Bypass.chip_text(),
-                    Style::default().fg(Color::Red),
-                ));
-            }
         }
 
         if ctx.pending_approvals > 0 {
@@ -143,6 +143,28 @@ impl StatusLine {
                     .fg(Color::Yellow)
                     .add_modifier(ratatui::style::Modifier::BOLD),
             ));
+        }
+
+        // Task-board chip. `▶` = collapsed (Ctrl+T to expand),
+        // `▼` = expanded. Count is `open/total` for mixed boards and
+        // `total done` when nothing is open.
+        if let Some((open, total)) = ctx.task_counts {
+            if total > 0 {
+                let glyph = if ctx.task_board_expanded {
+                    "▼"
+                } else {
+                    "▶"
+                };
+                let (text, style) = if open == 0 {
+                    (
+                        format!("{glyph} {total} done"),
+                        Style::default().fg(Color::Green),
+                    )
+                } else {
+                    (format!("{glyph} {open}/{total}"), dim)
+                };
+                out.left.push(Segment::styled(text, style));
+            }
         }
 
         // ── Right: model · branch · cwd · tokens · cost ───────────

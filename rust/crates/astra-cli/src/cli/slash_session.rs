@@ -62,6 +62,54 @@ fn format_u64_grouped(n: u64) -> String {
     out.chars().rev().collect()
 }
 
+fn permission_audit_summary(metadata: Option<&serde_json::Value>) -> String {
+    let Some(meta) = metadata else {
+        return "unknown".to_string();
+    };
+    let kind = meta
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let tool = meta
+        .get("request_key")
+        .and_then(|value| value.get("tool"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    match kind {
+        "evaluated" => {
+            let decision = meta
+                .get("decision")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            format!("evaluated {tool} -> {decision}")
+        }
+        "resolved" => {
+            let response = meta
+                .get("response")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let mut summary = format!("resolved {tool} -> {response}");
+            if let Some(scope) = meta.get("scope").and_then(serde_json::Value::as_str) {
+                summary.push_str(&format!(" ({scope})"));
+            }
+            summary
+        }
+        "persisted" => {
+            let target = meta
+                .get("target")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let saved = meta
+                .get("saved")
+                .and_then(serde_json::Value::as_bool)
+                .map(|value| if value { "saved" } else { "failed" })
+                .unwrap_or("?");
+            format!("persisted {target} rule ({saved})")
+        }
+        other => other.to_string(),
+    }
+}
+
 /// One-line hint for session lists: cwd, git, turns (from `workspace.yaml` if present).
 fn workspace_summary_line(sid: &str) -> String {
     match session_workspace::read_workspace(sid) {
@@ -609,7 +657,7 @@ fn handle_session_switch(sub_arg: &str, state: &mut SessionState) {
 
     // Restore session state
     let st = crate::session_runtime::session_state_from_journal(&session_id);
-    state.session_id = Some(session_id.clone());
+    state.set_session_id(session_id.clone());
     state.journal = session_journal::JournalWriter::new(&session_id).ok();
     state.history = st.history;
     state.turn = st.turn;
@@ -874,7 +922,7 @@ pub(super) async fn handle_session_command(
                     // Fork CSL and restore child state.
                     // Journal provides turn/token counters (not in CSL).
                     let st = session_runtime::session_state_from_journal(&new_sid);
-                    state.session_id = Some(new_sid.clone());
+                    state.set_session_id(new_sid.clone());
                     state.journal = session_journal::JournalWriter::new(&new_sid).ok();
                     state.turn = st.turn;
                     state.total_prompt_tokens = st.total_prompt_tokens;
@@ -1384,6 +1432,14 @@ pub(super) async fn handle_session_command(
                                     ts_short.dim(),
                                     theme::icon_warn(),
                                     tool,
+                                );
+                            }
+                            session_journal::JournalEventType::PermissionAudit => {
+                                eprintln!(
+                                    "  {} {} permission audit: {}",
+                                    ts_short.dim(),
+                                    "🔐".cyan(),
+                                    permission_audit_summary(evt.metadata.as_ref()),
                                 );
                             }
                             session_journal::JournalEventType::ExecutionBoundaryOpened => {
@@ -4484,7 +4540,7 @@ fn resume_restore_service(state: &SessionState) -> HybridRestoreService {
 }
 
 fn reset_state_for_session_restore(state: &mut SessionState) {
-    state.session_id = None;
+    state.clear_session_id();
     state.pending_recovery = None;
     state.run_id = None;
     state.turn = 0;
@@ -4764,7 +4820,7 @@ async fn apply_restored_session(
 
     reset_state_for_session_restore(state);
 
-    state.session_id = Some(restored.session_id.clone());
+    state.set_session_id(restored.session_id.clone());
     state.turn = restored.turn_count;
     state.total_prompt_tokens = restored.total_tokens_in;
     state.total_completion_tokens = restored.total_tokens_out;
@@ -5908,7 +5964,7 @@ mod resume_tests {
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = SessionState::default();
-        state.session_id = Some(session_id.clone());
+        state.set_session_id(session_id.clone());
 
         handle_session_command("trace on", &api, None, &mut state, Some("test-token")).await;
     }

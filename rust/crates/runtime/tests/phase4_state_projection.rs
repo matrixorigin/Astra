@@ -135,7 +135,7 @@ async fn insert_todo(
     depth: i64,
 ) {
     sqlx::query(
-        "INSERT INTO session_todos
+        "INSERT INTO session_plan_todos
          (todo_id, user_id, session_id, parent_todo_id, backlog_pool_id, title, status,
           priority, depth, token_estimate, payload_json, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 30, '{}', NOW(6), NOW(6))",
@@ -839,13 +839,13 @@ async fn l2_43_backlog_pool_restores_todos_across_sessions() {
     let plan = explain_analyze_text(
         &pool,
         &format!(
-            "EXPLAIN ANALYZE SELECT todo_id FROM session_todos FORCE INDEX (idx_session_todos_pool) \
+            "EXPLAIN ANALYZE SELECT todo_id FROM session_plan_todos FORCE INDEX (idx_session_plan_todos_pool) \
              WHERE user_id = '{}' AND backlog_pool_id = '{}' AND status = 'backlog' ORDER BY updated_at DESC LIMIT 100",
             user_id, backlog_pool_id
         ),
     )
     .await;
-    assert_plan_uses(&plan, "idx_session_todos_pool");
+    assert_plan_uses(&plan, "idx_session_plan_todos_pool");
 }
 
 #[tokio::test]
@@ -899,8 +899,8 @@ async fn l3_11_s05_plan_thrashing_keeps_active_todos_bounded() {
     }
     let row = sqlx::query(
         "SELECT
-          (SELECT COUNT(*) FROM session_todos WHERE session_id = ? AND status = 'active') AS active_count,
-          (SELECT COUNT(*) FROM session_todos WHERE session_id = ? AND status IN ('cancelled', 'backlog')) AS inactive_count",
+          (SELECT COUNT(*) FROM session_plan_todos WHERE session_id = ? AND status = 'active') AS active_count,
+          (SELECT COUNT(*) FROM session_plan_todos WHERE session_id = ? AND status IN ('cancelled', 'backlog')) AS inactive_count",
     )
     .bind(&session_id)
     .bind(&session_id)
@@ -969,8 +969,8 @@ async fn l3_12_s06_compaction_preserves_sixty_todo_tree_skeleton() {
           (SELECT MAX(i.token_estimate)
            FROM context_manifest_items i JOIN context_manifests m ON m.manifest_id = i.manifest_id
            WHERE m.session_id = ? AND m.run_id = ? AND i.zone = 'plan_todo') AS plan_tokens,
-          (SELECT COUNT(*) FROM session_todos WHERE session_id = ? AND parent_todo_id IS NOT NULL) AS child_edges,
-          (SELECT COUNT(*) FROM session_todos WHERE session_id = ? AND status = 'active') AS active_todos",
+          (SELECT COUNT(*) FROM session_plan_todos WHERE session_id = ? AND parent_todo_id IS NOT NULL) AS child_edges,
+          (SELECT COUNT(*) FROM session_plan_todos WHERE session_id = ? AND status = 'active') AS active_todos",
     )
     .bind(&session_id)
     .bind(&run_id)

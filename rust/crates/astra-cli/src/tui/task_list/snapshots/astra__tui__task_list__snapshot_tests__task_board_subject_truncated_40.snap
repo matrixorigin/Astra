@@ -1,0 +1,7 @@
+---
+source: crates/astra-cli/src/tui/task_list/snapshot_tests.rs
+expression: "draw(&tasks, 40, 24, true)"
+---
+2 tasks (0 done, 1 in progress, 1 open)
+⠋ refactor the entire auth…
+◻ another very long task t…

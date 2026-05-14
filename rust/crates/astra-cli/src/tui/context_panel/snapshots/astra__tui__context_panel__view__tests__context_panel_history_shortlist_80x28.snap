@@ -16,7 +16,7 @@ expression: "render_panel(&b, 80, 28)"
 │    └ bash   189 tokens                                                       │
 │    └ read_file   152 tokens                                                  │
 │                                                                              │
-│   Skills · /skills (shortlist)                                               │
+│   Skills · /skills (no token breakdown)                                      │
 │    └ review_changes                                                          │
 │    └ verify_task                                                             │
 │                                                                              │

@@ -289,6 +289,7 @@ fn display_plan_updates_live(
                 state.current_plan_subtask_id = Some(subtask_id);
                 if let Some(sid) = session_id {
                     if state.session_id.is_none() {
+                        state.task_manager.rebind(&sid);
                         state.session_id = Some(sid);
                     }
                 }
@@ -543,13 +544,19 @@ fn display_plan_updates_live(
             PlanUpdate::StreamingEvent { event, .. } => {
                 use chat_stream::StreamEvent;
                 match event {
-                    StreamEvent::ToolStarted { name, description } => {
+                    StreamEvent::ToolStarted {
+                        name, description, ..
+                    } => {
                         let styled = stream_render::style_tool_description(&name, &description);
                         (
                             format!("  {} {} …", "⬢".magenta(), styled),
                             PostSpinner::Tool(description),
                         )
                     }
+                    StreamEvent::AgentControlStarted { label, .. } => (
+                        format!("  {} Agent {label} …", "⬢".magenta()),
+                        PostSpinner::Tool(label),
+                    ),
                     StreamEvent::ToolCompleted {
                         name,
                         description,
@@ -570,6 +577,23 @@ fn display_plan_updates_live(
                             .unwrap_or_default();
                         (
                             format!("  {icon} {styled}{}{summary}", dur.dim()),
+                            PostSpinner::None,
+                        )
+                    }
+                    StreamEvent::AgentControlCompleted {
+                        label,
+                        status,
+                        duration_ms,
+                        ..
+                    } => {
+                        let dur = cli_formatting::format_duration_suffix(duration_ms);
+                        let icon = if status == "error" {
+                            theme::icon_err()
+                        } else {
+                            theme::icon_ok()
+                        };
+                        (
+                            format!("  {icon} Agent {label}{}", dur.dim()),
                             PostSpinner::None,
                         )
                     }
@@ -677,9 +701,27 @@ fn display_plan_updates_live(
                         eprintln!("    {line}");
                         continue;
                     }
+                    StreamEvent::PermissionAutoApproved { tool, reason } => {
+                        finalize_plan_stream(
+                            &mut state.plan_in_token_stream,
+                            plan_spinner,
+                            &mut state.plan_md_renderer,
+                            &mut state.plan_thinking_pane,
+                        );
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        eprintln!(
+                            "    {}",
+                            astra_turn_core::permission_notice::format_auto_approved_permission(
+                                &tool, &reason
+                            )
+                        );
+                        continue;
+                    }
                     // Plan monitor runs headless (no TUI cells) — the
                     // progress ticks have no visual home here. Drop.
-                    StreamEvent::ToolOutput { .. } => continue,
+                    StreamEvent::ToolOutput { .. } | StreamEvent::AgentLive(_) => continue,
                 }
             }
             PlanUpdate::ApprovalNeeded {
@@ -757,7 +799,6 @@ pub(crate) async fn sync_plan_run_task_progress(state: &mut SessionState) {
     let Some(ref svc) = state.task_service else {
         return;
     };
-    use astra_services::TaskService;
     let _ = svc.update_progress(tid, pct, done, total).await;
 }
 
@@ -769,7 +810,7 @@ pub(crate) async fn finalize_plan_run_task_after_executor(state: &mut SessionSta
     let Some(ref svc) = state.task_service else {
         return;
     };
-    use astra_services::{TaskService, task_orchestrator::TaskOutcome};
+    use astra_services::task_orchestrator::TaskOutcome;
     if let Some(ref err) = state.plan_run_task_last_error {
         let err = err.clone();
         let _ = svc.fail_task(&tid, &err).await;
@@ -910,35 +951,22 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
         }
 
         if state.pending_approval.is_some() {
-            let approved = tokio::task::spawn_blocking(|| {
-                use std::io::IsTerminal;
-                if std::io::stdin().is_terminal() {
-                    let ch = crate::permission_manager::PermissionManager::prompt_approval(
-                        crate::permission_manager::ApprovalPromptKind::LocalStandard,
-                    );
-                    matches!(ch, 'y' | 'a' | '!')
-                } else {
-                    use std::io::Write;
-                    let _ = std::io::stderr().flush();
-                    eprint!("   Approve? [y/N]: ");
-                    let _ = std::io::stderr().flush();
-                    let mut line = String::new();
-                    if std::io::stdin().read_line(&mut line).is_err() {
-                        return false;
-                    }
-                    let t = line.trim().to_lowercase();
-                    t == "y" || t == "yes"
-                }
-            })
-            .await
-            .unwrap_or(false);
-            if let Some(tx) = state.pending_approval.take() {
-                let _ = tx.send(if approved {
-                    crate::chat_stream::ApprovalResponse::AllowOnce
-                } else {
-                    crate::chat_stream::ApprovalResponse::Deny
-                });
-            }
+            // Issue #326 P0 (tui-only) / #331: with the REPL gone,
+            // plan_monitor no longer prompts on stdin. The approval
+            // is owned by the TUI's bottom_pane queue (which receives
+            // it via the same response_tx channel pending_approval
+            // wraps). plan_monitor's only job here is to **not
+            // block** — drop through and let the next select branch
+            // tick the TUI / plan executor. If for some reason no
+            // TUI sink is attached (regression in caller wiring),
+            // the silent-deny in stream_render.rs:1985 still fires
+            // so we never hang waiting for a stdin readline.
+            //
+            // Keep the early-continue for back-pressure: tools that
+            // landed approvals during the previous loop iteration
+            // are settled via state.pending_approval = None on the
+            // TUI side, so the if-check above is the right gate.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             continue;
         }
 
@@ -1027,7 +1055,7 @@ fn apply_trailing_update(update: plan_executor::PlanUpdate, state: &mut SessionS
             state.current_plan_subtask_id = Some(subtask_id);
             if let Some(sid) = session_id {
                 if state.session_id.is_none() {
-                    state.session_id = Some(sid);
+                    state.set_session_id(sid);
                 }
             }
         }

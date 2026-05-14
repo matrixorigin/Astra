@@ -1000,7 +1000,7 @@ impl DatabaseStateProjectionStore {
         backlog_pool_id: &str,
     ) -> Result<Vec<String>, StateProjectionError> {
         let rows = sqlx::query(
-            "SELECT todo_id FROM session_todos FORCE INDEX (idx_session_todos_pool)
+            "SELECT todo_id FROM session_plan_todos FORCE INDEX (idx_session_plan_todos_pool)
              WHERE user_id = ? AND backlog_pool_id = ? AND status = 'backlog'
              ORDER BY updated_at DESC LIMIT 100",
         )

@@ -41,7 +41,7 @@ fn maybe_init_session_from_plan(state: &mut SessionState, outcome: &PlanLlmOutco
         // (generated at plan entry for journal) may differ from the server's.
         if state.session_id.as_deref() != Some(sid.as_str()) {
             super::chat_turn::initialize_journal_pub(state, sid);
-            state.session_id = Some(sid.clone());
+            state.set_session_id(sid.clone());
         }
     }
 }
@@ -1172,7 +1172,7 @@ pub async fn handle_plan_mode_input(
         // Apply session_id captured from the LLM response (plan_state borrow ends here).
         if let Some(sid) = new_session_id {
             super::chat_turn::initialize_journal_pub(state, &sid);
-            state.session_id = Some(sid);
+            state.set_session_id(sid);
         }
         return Ok(PlanInputResult::Handled);
     }
@@ -1269,7 +1269,6 @@ pub async fn handle_plan_mode_input(
                 );
 
                 if let Some(ref svc) = state.task_service {
-                    use astra_services::TaskService;
                     let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
                     let goal = &plan_state.goal;
                     if let Ok(tasks) = svc.list_tasks(user_id, None).await
@@ -1291,7 +1290,6 @@ pub async fn handle_plan_mode_input(
                 } else if plan_state.plan.progress_pct() == 100 {
                     eprintln!("  {} All tasks complete!", theme::icon_ok());
                     if let Some(ref svc) = state.task_service {
-                        use astra_services::TaskService;
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
                         let goal = &plan_state.goal;
                         if let Ok(tasks) = svc.list_tasks(user_id, None).await
@@ -1726,7 +1724,7 @@ async fn handle_plan_command(
             state.plan_run_task_last_progress = None;
             state.plan_run_task_last_error = None;
             if let Some(ref svc) = state.task_service {
-                use astra_services::{TaskCreateRequest, TaskService};
+                use astra_services::TaskCreateRequest;
                 let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
                 let session_id = state.session_id.as_deref().unwrap_or("no-session");
 
@@ -2182,7 +2180,7 @@ async fn handle_goal_submission(
     if state.session_id.is_none() {
         let new_sid = uuid::Uuid::new_v4().to_string();
         super::chat_turn::initialize_journal_pub(state, &new_sid);
-        state.session_id = Some(new_sid);
+        state.set_session_id(new_sid);
     } else if state.journal.is_none() {
         if let Some(sid) = state.session_id.clone() {
             super::chat_turn::initialize_journal_pub(state, &sid);
@@ -3330,7 +3328,7 @@ mod tests {
     fn maybe_init_session_from_plan_adopts_server_session_even_when_local_exists() {
         let mut state = SessionState::default();
         // Simulate local session_id generated at plan entry
-        state.session_id = Some("local-uuid-1234".to_string());
+        state.set_session_id("local-uuid-1234".to_string());
 
         let outcome = PlanLlmOutcome::Ok {
             text: "plan text".to_string(),
@@ -3348,7 +3346,7 @@ mod tests {
     #[test]
     fn maybe_init_session_from_plan_noop_when_already_matching() {
         let mut state = SessionState::default();
-        state.session_id = Some("same-id".to_string());
+        state.set_session_id("same-id".to_string());
 
         let outcome = PlanLlmOutcome::Ok {
             text: "text".to_string(),
@@ -3362,7 +3360,7 @@ mod tests {
     #[test]
     fn maybe_init_session_from_plan_noop_on_no_server_session() {
         let mut state = SessionState::default();
-        state.session_id = Some("local-id".to_string());
+        state.set_session_id("local-id".to_string());
 
         let outcome = PlanLlmOutcome::Ok {
             text: "text".to_string(),

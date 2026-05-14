@@ -10,7 +10,7 @@
 协作。今天要把生产集群的 k8s 部署脚本（helm chart + 4 套 overlay：
 dev/staging/canary/prod）从 helm 2 的 `requirements.yaml` 迁到 helm 3
 umbrella chart，并顺带把 hard-coded 的 image tag 抽成 argocd appset
-values。**不让 astra YOLO 改仓库**，每一步要 diff 审。
+values。**不让 astra 自动无审改仓库**，每一步要 diff 审。
 
 **业务背景**：当天要在 3 个物理设备之间切换：
 （1）09:00 公司 MacBook + 本地 repo（用 edge bridge）；
@@ -350,7 +350,7 @@ manifest JSON 全文（只读结构化 state）。
 
 | category | rows | 关键字段 |
 | --- | --- | --- |
-| anchor | 1 (1) | 迁移目标 + 不 YOLO 约束 |
+| anchor | 1 (1) | 迁移目标 + 不自动无审约束 |
 | workspace_state | 1 (1) | `authority=hybrid, primary=edge, edge_bridge_online=true` |
 | plan_state | 0 | — |
 | todo_state | 0 | — |

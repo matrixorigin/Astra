@@ -38,6 +38,7 @@ use crossterm::{
 };
 
 mod edge_tools;
+mod git_branch_cache;
 mod manifest_loader;
 mod mcp_client;
 mod skill_instructions;
@@ -193,6 +194,8 @@ mod stream_render;
 mod streaming_md;
 #[path = "cli/streaming_types.rs"]
 mod streaming_types;
+#[path = "cli/task_summary.rs"]
+mod task_summary;
 #[path = "cli/terminal_region.rs"]
 mod terminal_region;
 #[path = "cli/theme.rs"]
@@ -203,6 +206,8 @@ mod tool_safety_guard;
 mod tui;
 #[path = "cli/ui_adapter.rs"]
 mod ui_adapter;
+#[path = "cli/workspace_trust.rs"]
+mod workspace_trust;
 
 use agent_runtime::initialize_multi_agent_runtime;
 use astra_turn_core::chat_turn_heuristics::{

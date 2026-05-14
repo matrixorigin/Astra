@@ -63,15 +63,6 @@ fn snapshot_deny_mode() {
 }
 
 #[test]
-fn snapshot_bypass_mode() {
-    let ctx = StatusContext {
-        permission_mode: PermissionMode::Bypass,
-        ..base_ctx()
-    };
-    insta::assert_snapshot!("status_bypass_mode_80", render_ctx(&ctx, 80));
-}
-
-#[test]
 fn snapshot_high_token_usage_with_cost() {
     let ctx = StatusContext {
         token_budget: Some((92_000, 100_000)),
@@ -143,4 +134,44 @@ fn snapshot_very_long_cwd_truncates() {
         ..StatusContext::default()
     };
     insta::assert_snapshot!("status_long_cwd_80", render_ctx(&ctx, 80));
+}
+
+#[test]
+fn snapshot_task_chip_collapsed_mixed() {
+    let ctx = StatusContext {
+        task_counts: Some((2, 5)),
+        task_board_expanded: false,
+        ..base_ctx()
+    };
+    insta::assert_snapshot!("status_task_chip_collapsed_80", render_ctx(&ctx, 80));
+}
+
+#[test]
+fn snapshot_task_chip_expanded_mixed() {
+    let ctx = StatusContext {
+        task_counts: Some((2, 5)),
+        task_board_expanded: true,
+        ..base_ctx()
+    };
+    insta::assert_snapshot!("status_task_chip_expanded_80", render_ctx(&ctx, 80));
+}
+
+#[test]
+fn snapshot_task_chip_all_done() {
+    let ctx = StatusContext {
+        task_counts: Some((0, 4)),
+        task_board_expanded: false,
+        ..base_ctx()
+    };
+    insta::assert_snapshot!("status_task_chip_all_done_80", render_ctx(&ctx, 80));
+}
+
+#[test]
+fn snapshot_task_chip_empty_board_hidden() {
+    // total == 0 → chip must not render.
+    let ctx = StatusContext {
+        task_counts: Some((0, 0)),
+        ..base_ctx()
+    };
+    insta::assert_snapshot!("status_task_chip_empty_80", render_ctx(&ctx, 80));
 }

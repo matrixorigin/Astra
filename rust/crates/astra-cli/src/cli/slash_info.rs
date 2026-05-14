@@ -1193,7 +1193,7 @@ pub(super) async fn handle_info_command(
             );
             let _pipeline_modules =
                 crate::session_runtime::create_pipeline_modules_quiet(api, None);
-            let mut pm = PermissionManager::with_project(false, &project_root);
+            let mut pm = PermissionManager::with_workspace_trust(false, &project_root);
             let turn_start = std::time::Instant::now();
             let sr = stream_chat_sse(ChatTurnParams {
                 api,
@@ -1221,6 +1221,7 @@ pub(super) async fn handle_info_command(
                 cancel_token: None,
                 plan_assemble_line_release: None,
                 stream_event_tx: None,
+                agent_live_event_sink: None,
                 approval_request_tx: None,
                 mcp_manager: Some(state.mcp_manager.clone()),
                 skill_search: &state.skill_search,
@@ -1240,6 +1241,7 @@ pub(super) async fn handle_info_command(
                 git_worktree_journal: None,
                 session_state_journal: None,
                 task_manager: None,
+                bg_task_commands: None,
                 turn_index: 0,
                 pipeline_state: None,
                 pre_loaded_messages: None,
@@ -1254,7 +1256,7 @@ pub(super) async fn handle_info_command(
             .map_err(|f| f.error)?;
             if let Some(session_id) = sr.session_id.as_deref() {
                 crate::chat_turn::initialize_journal_pub(state, session_id);
-                state.session_id = Some(session_id.to_string());
+                state.set_session_id(session_id.to_string());
             }
             state.last_response = Some(sr.full_text.clone());
             let review_input = format!("/review {arg}").trim().to_string();
@@ -2637,7 +2639,7 @@ mod tests {
     #[test]
     fn render_whoami_includes_identity_and_skills() {
         let mut state = SessionState::default();
-        state.session_id = Some("sess-abc".to_string());
+        state.set_session_id("sess-abc".to_string());
         state.model = Some("gpt-5".to_string());
         state.turn = 3;
         state.history.push(("hi".into(), "hello".into()));
@@ -2653,7 +2655,7 @@ mod tests {
     #[test]
     fn render_whoami_surfaces_pending_improvement_proposal() {
         let mut state = SessionState::default();
-        state.session_id = Some("s".into());
+        state.set_session_id("s");
         state
             .skill_improvement_tracker
             .propose(astra_skills::improvement::ImprovementProposal {

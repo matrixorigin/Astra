@@ -6,46 +6,13 @@ use super::{SlashItem, SlashMenu, is_open_for};
 
 fn items() -> Vec<SlashItem> {
     vec![
-        SlashItem {
-            name: "/help",
-            description: "show help",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/model",
-            description: "pick a model",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/history",
-            description: "browse history",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/agent-create",
-            description: "create a new agent",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/resume",
-            description: "resume a session",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/review",
-            description: "review changes",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/allow",
-            description: "allow tool",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/yolo",
-            description: "bypass prompts",
-            subcommands: &[],
-        },
+        SlashItem::simple("/help", "show help"),
+        SlashItem::simple("/model", "pick a model"),
+        SlashItem::simple("/history", "browse history"),
+        SlashItem::simple("/agent-create", "create a new agent"),
+        SlashItem::simple("/resume", "resume a session"),
+        SlashItem::simple("/review", "review changes"),
+        SlashItem::simple("/allow", "allow tool"),
     ]
 }
 
@@ -90,10 +57,9 @@ fn empty_filter_shows_all_items_in_registered_order() {
             "/resume",
             "/review",
             "/allow",
-            "/yolo",
         ]
     );
-    assert_eq!(menu.len(), 8);
+    assert_eq!(menu.len(), 7);
     assert!(!menu.is_empty());
 }
 
@@ -167,7 +133,7 @@ fn filter_accepts_empty_slash() {
     let mut menu = SlashMenu::new(items());
     menu.set_filter("/");
     // With only '/' typed, show everything.
-    assert_eq!(menu.len(), 8);
+    assert_eq!(menu.len(), 7);
     assert_eq!(menu.selected_item().map(|i| i.name), Some("/help"));
 }
 
@@ -243,6 +209,7 @@ fn items_with_subs() -> Vec<SlashItem> {
             name: "/context",
             description: "context panel",
             subcommands: &[("dump", "Write a JSON snapshot to disk")],
+            ..Default::default()
         },
         SlashItem {
             name: "/skill",
@@ -252,6 +219,7 @@ fn items_with_subs() -> Vec<SlashItem> {
                 ("install", "Install from marketplace"),
                 ("list", "List skills"),
             ],
+            ..Default::default()
         },
         SlashItem::simple("/help", "show help"),
     ]

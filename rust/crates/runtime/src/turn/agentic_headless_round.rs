@@ -307,22 +307,29 @@ pub(crate) fn partition_tool_batches(
     tool_calls: &[Value],
 ) -> Vec<ToolBatch> {
     use astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS;
+    use astra_turn_core::tool_policy::is_tool_concurrency_safe;
 
     let mut batches = Vec::new();
     let mut concurrent_buf: Vec<HeadlessRoundToolIdx> = Vec::new();
 
     for &idx in indices {
-        let tool_name = match &idx {
-            HeadlessRoundToolIdx::ServerToolCall(i) => tool_calls
-                .get(*i)
-                .and_then(|tc| tc.get("function"))
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or(""),
-            HeadlessRoundToolIdx::SyntheticEdge(_) => "synthetic_edge",
+        let (tool_name, tool_args) = match &idx {
+            HeadlessRoundToolIdx::ServerToolCall(i) => {
+                let call = tool_calls.get(*i);
+                (
+                    call.and_then(|tc| tc.get("function"))
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or(""),
+                    call.and_then(astra_turn_core::parallel_tool_exec::parse_tool_args),
+                )
+            }
+            HeadlessRoundToolIdx::SyntheticEdge(_) => ("synthetic_edge", None),
         };
 
-        let is_readonly = READ_ONLY_TOOLS.contains(&tool_name) || tool_name == "synthetic_edge";
+        let is_readonly = READ_ONLY_TOOLS.contains(&tool_name)
+            || tool_name == "synthetic_edge"
+            || is_tool_concurrency_safe(tool_name, tool_args.as_ref());
 
         if is_readonly {
             concurrent_buf.push(idx);
@@ -337,4 +344,57 @@ pub(crate) fn partition_tool_batches(
         batches.push(ToolBatch::Concurrent(concurrent_buf));
     }
     batches
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn server_idx(i: usize) -> HeadlessRoundToolIdx {
+        HeadlessRoundToolIdx::ServerToolCall(i)
+    }
+
+    #[test]
+    fn partition_batches_agent_spawn_calls_concurrently() {
+        let calls = vec![
+            json!({
+                "id": "a1",
+                "function": {
+                    "name": "agent",
+                    "arguments": "{\"action\":\"spawn\",\"description\":\"one\",\"prompt\":\"p1\",\"run_in_background\":true}"
+                }
+            }),
+            json!({
+                "id": "a2",
+                "function": {
+                    "name": "agent",
+                    "arguments": "{\"action\":\"spawn\",\"description\":\"two\",\"prompt\":\"p2\",\"run_in_background\":true}"
+                }
+            }),
+        ];
+
+        let batches = partition_tool_batches(&[server_idx(0), server_idx(1)], &calls);
+        match batches.as_slice() {
+            [ToolBatch::Concurrent(items)] => assert_eq!(items.len(), 2),
+            _ => panic!("agent.spawn fan-out should be one concurrent batch"),
+        }
+    }
+
+    #[test]
+    fn partition_batches_agent_send_message_serially() {
+        let calls = vec![json!({
+            "id": "m1",
+            "function": {
+                "name": "agent",
+                "arguments": "{\"action\":\"send_message\",\"to\":\"agent-1\",\"message\":{\"content\":\"hi\"}}"
+            }
+        })];
+
+        let batches = partition_tool_batches(&[server_idx(0)], &calls);
+        assert!(
+            matches!(batches.as_slice(), [ToolBatch::Serial(_)]),
+            "agent.send_message mutates mailbox ordering and must stay serial"
+        );
+    }
 }

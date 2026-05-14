@@ -75,6 +75,7 @@ fn take_plan_context(
         git_worktree_journal: state.git_worktree_journal.clone(),
         session_state_journal: state.session_state_journal.clone(),
         task_manager: state.task_manager.clone(),
+        bg_task_commands: Some(state.bg_task_commands.clone()),
         #[cfg(feature = "harness")]
         harness_sink: Some(state.harness_sink.clone()),
         #[cfg(feature = "harness")]
@@ -251,7 +252,7 @@ mod tests {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
         let mut state = SessionState::default();
         state.executing_plan = Some(TaskPlan::default());
-        state.session_id = Some("sess-plan".to_string());
+        state.set_session_id("sess-plan".to_string());
         state.turn = 7;
 
         let hub =

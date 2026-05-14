@@ -59,9 +59,30 @@ pub enum StreamEvent {
     Thinking(bool),
     /// Thinking/reasoning preview chunk.
     ThinkingChunk(String),
-    /// Tool execution started.
-    ToolStarted { name: String, description: String },
-    /// Tool execution completed.
+    /// Tool execution started. `tool_use_id` is a server-minted UUIDv7
+    /// correlation key that round-trips through the tool's matching
+    /// `ToolCompleted` and survives into SSE JSON. `parent_tool_use_id`
+    /// is `Some` only when a sub-agent or nested tool produced this
+    /// event — the TUI uses it to render child events inside the
+    /// parent Task cell instead of in top-level scrollback.
+    ToolStarted {
+        name: String,
+        description: String,
+        tool_use_id: String,
+        parent_tool_use_id: Option<String>,
+    },
+    /// Structured lifecycle for the `agent` control tool. This keeps
+    /// user-facing agent rows keyed by child agent identity instead of
+    /// parsing display labels such as "Spawn agent:".
+    AgentControlStarted {
+        action: String,
+        label: String,
+        tool_use_id: String,
+        agent_id: Option<String>,
+    },
+    /// Tool execution completed. `tool_use_id` MUST match the paired
+    /// `ToolStarted`. `parent_tool_use_id` is propagated for the same
+    /// nested-event routing reason.
     ToolCompleted {
         name: String,
         description: String,
@@ -69,6 +90,17 @@ pub enum StreamEvent {
         duration_ms: u64,
         output_summary: Option<String>,
         output: Option<String>,
+        tool_use_id: String,
+        parent_tool_use_id: Option<String>,
+    },
+    AgentControlCompleted {
+        action: String,
+        label: String,
+        status: String,
+        duration_ms: u64,
+        output: Option<String>,
+        tool_use_id: String,
+        agent_id: Option<String>,
     },
     /// Mid-flight progress signal for a running tool. Emitted at a
     /// coarse cadence (~200ms) while the tool produces output so the
@@ -86,12 +118,35 @@ pub enum StreamEvent {
     ModelResponding,
     /// Status line from headless tool execution (diff, diagnostic, etc.).
     StatusLine(String),
+    /// Live event from a spawned child agent. This travels on an
+    /// app-level live lane, not the parent turn-completion lane.
+    AgentLive(astra_turn_core::agent_live_event::AgentLiveEvent),
+    /// Local policy approved a tool without showing an interactive prompt.
+    PermissionAutoApproved { tool: String, reason: String },
 }
 
 pub type StreamEventTx = mpsc::UnboundedSender<StreamEvent>;
 
+pub trait StreamEventSink: Send + Sync + std::fmt::Debug {
+    fn send(&self, event: StreamEvent);
+}
+
+pub type SharedStreamEventSink = Arc<dyn StreamEventSink>;
+
+/// Mint a server-side `tool_use_id`. Prefix keeps it grep-distinguishable
+/// from session ids and approval request ids in logs/SSE payloads.
+pub fn new_tool_use_id() -> String {
+    format!("tu_{}", uuid::Uuid::now_v7().simple())
+}
+
 /// User's response to an approval prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Issue #326 P0 / R2 Minor 4: `AutoRunSession` was removed because
+/// its semantics ("flip the whole session into Auto mode") clashed
+/// with P3's per-fingerprint `AllowScope::RestOfSession`. Global mode
+/// changes now go through the status line / `/mode auto` slash
+/// command; this enum stays focused on per-call decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalResponse {
     /// Allow this one invocation.
     AllowOnce,
@@ -99,29 +154,89 @@ pub enum ApprovalResponse {
     Deny,
     /// Always allow this tool pattern (persistent rule).
     AlwaysAllow,
-    /// Switch to auto-run mode for the rest of the session.
-    AutoRunSession,
+    /// Always allow with an explicit user-selected scope from the
+    /// TUI scope picker.
+    AlwaysAllowScoped(astra_turn_core::permission_scope::AllowScope),
+    /// Always allow with both dimensions selected by the user:
+    /// lifetime/sink scope and match target.
+    AlwaysAllowScopedTarget {
+        scope: astra_turn_core::permission_scope::AllowScope,
+        match_target: astra_turn_core::permission_match_target::AllowMatchTarget,
+    },
     /// Skip this tool (deny without recording).
     Skip,
 }
 
 impl ApprovalResponse {
-    pub fn is_approved(self) -> bool {
+    pub fn is_approved(&self) -> bool {
         matches!(
             self,
-            Self::AllowOnce | Self::AlwaysAllow | Self::AutoRunSession
+            Self::AllowOnce
+                | Self::AlwaysAllow
+                | Self::AlwaysAllowScoped(_)
+                | Self::AlwaysAllowScopedTarget { .. }
         )
+    }
+
+    pub fn always_scope(
+        &self,
+        default_scope: astra_turn_core::permission_scope::AllowScope,
+    ) -> Option<astra_turn_core::permission_scope::AllowScope> {
+        match self {
+            Self::AlwaysAllow => Some(default_scope),
+            Self::AlwaysAllowScoped(scope) => Some(*scope),
+            Self::AlwaysAllowScopedTarget { scope, .. } => Some(*scope),
+            _ => None,
+        }
+    }
+
+    pub fn match_target(
+        &self,
+    ) -> Option<&astra_turn_core::permission_match_target::AllowMatchTarget> {
+        match self {
+            Self::AlwaysAllowScopedTarget { match_target, .. } => Some(match_target),
+            _ => None,
+        }
     }
 }
 
 /// Approval request sent from the SSE stream host to the plan executor / REPL
 /// when a tool requires interactive approval (bypass-immune check).
+///
+/// Issue #326 P3: optional `metadata` carries the source-agent /
+/// host / risk-tag / will-save-preview / base-digest fields the
+/// TUI uses to populate the approval card. Senders that compute
+/// these fields attach them; senders that don't leave the field
+/// `None` and the TUI falls back to the bare card.
 pub struct ApprovalRequest {
     pub tool: String,
     pub header: String,
     pub detail: Option<String>,
     pub reason: String,
     pub response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
+    /// Optional enriched metadata. Stored as `Option<Box<…>>` so
+    /// the empty case stays cheap on the message channel.
+    pub metadata: Option<Box<crate::tui::approval::queue::ApprovalMetadata>>,
+}
+
+impl ApprovalRequest {
+    /// Convenience for senders that don't carry metadata.
+    pub fn bare(
+        tool: String,
+        header: String,
+        detail: Option<String>,
+        reason: String,
+        response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
+    ) -> Self {
+        Self {
+            tool,
+            header,
+            detail,
+            reason,
+            response_tx,
+            metadata: None,
+        }
+    }
 }
 
 pub type ApprovalRequestTx = mpsc::UnboundedSender<ApprovalRequest>;
@@ -179,6 +294,11 @@ pub(crate) struct ChatTurnParams<'a> {
     /// When present, `CliSseStreamHost` forwards fine-grained events through this channel
     /// even when `quiet` / `suppress_intermediate_output` are true.
     pub(crate) stream_event_tx: Option<StreamEventTx>,
+    /// App-level live lane for spawned child agents. Unlike
+    /// `stream_event_tx`, senders cloned into background children do
+    /// not control the parent turn's `TurnComplete`.
+    pub(crate) agent_live_event_sink:
+        Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
     /// Optional channel for async tool approval during plan execution.
     /// When a bypass-immune permission check triggers, the approval request is sent
     /// through this channel instead of blocking on stdin.
@@ -237,6 +357,10 @@ pub(crate) struct ChatTurnParams<'a> {
         Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>>,
     /// Session-scoped task manager so task mutations survive across turns.
     pub(crate) task_manager: Option<std::sync::Arc<crate::edge_tools::TaskManager>>,
+    /// Shared command queue for the TUI's BackgroundTaskRegistry.
+    /// When present, tool executor pushes spawn/kill/output commands here.
+    pub(crate) bg_task_commands:
+        Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
     /// Current REPL turn number — used to tag journal entries for undo.
     pub(crate) turn_index: u32,
     /// Pre-loaded CSL messages (from CslManager.load() in chat_turn).
@@ -291,6 +415,12 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// Passed through to `sse_loop::mod` for `SpawnAgentContext`
     /// wiring. When `agent_spawner` is None this is ignored.
     pub root_agent_id: Option<&'a str>,
+    /// Session-scoped task manager used by one-shot/headless paths that still
+    /// need the model-visible task board.
+    pub task_manager: Option<std::sync::Arc<crate::edge_tools::TaskManager>>,
+    /// Shared command queue for the TUI's BackgroundTaskRegistry.
+    pub bg_task_commands:
+        Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
     /// Optional channel for forwarding stream events (used by --stream-events).
     pub stream_event_tx: Option<StreamEventTx>,
     /// Shared harness snapshot sink for /inspect command (non-REPL one-shot paths).
@@ -340,6 +470,7 @@ impl<'a> ChatTurnParams<'a> {
             cancel_token: None,
             plan_assemble_line_release: None,
             stream_event_tx: ctx.stream_event_tx.clone(),
+            agent_live_event_sink: None,
             approval_request_tx: None,
             mcp_manager: None,
             skill_search: ctx.skill_search,
@@ -358,7 +489,8 @@ impl<'a> ChatTurnParams<'a> {
             git_commit_journal: None,
             git_worktree_journal: None,
             session_state_journal: None,
-            task_manager: None,
+            task_manager: ctx.task_manager.clone(),
+            bg_task_commands: ctx.bg_task_commands.clone(),
             turn_index: 0,
             pipeline_state: None,
             pre_loaded_messages: None,

@@ -1,0 +1,14 @@
+---
+source: crates/astra-cli/src/tui/history_cell/approval.rs
+assertion_line: 890
+expression: "render_at(&cell, 80)"
+---
+╭─ ⏸ npm test --filter auth [agent: review-subagent] [ssh:bastion-prod]
+│ ⚑ BashExecute
+│ npm test --filter auth -- --verbose
+│ ⚠ execute (Prompt mode, no allow rule matches)
+│ Will save: Bash(npm test:*)
+│ Always: session-only (sub-agent)
+│
+│  Accept   Reject   Turn   Session   Project×   User×   Skip
+╰─ ↑↓←→ select · Enter confirm · Esc reject · Ctrl+Enter quick accept

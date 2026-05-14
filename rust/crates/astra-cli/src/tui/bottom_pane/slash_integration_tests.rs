@@ -28,41 +28,38 @@ fn special(code: KeyCode) -> KeyEvent {
 
 fn items() -> Vec<SlashItem> {
     vec![
+        SlashItem::simple("/help", "show help"),
+        SlashItem::simple("/history", "browse history"),
+        SlashItem::simple("/model", "pick a model"),
+        SlashItem::simple("/resume", "resume a session"),
+        SlashItem::simple("/review", "review changes"),
+        SlashItem::simple("/agent-create", "create a new agent"),
+        SlashItem::simple("/exit", "exit astra"),
+    ]
+}
+
+/// Items exercising aliases + usage_boost + subcommands.
+fn items_with_aliases() -> Vec<SlashItem> {
+    vec![
         SlashItem {
             name: "/help",
             description: "show help",
             subcommands: &[],
+            aliases: &["h", "?"],
+            usage_boost: 0,
         },
         SlashItem {
             name: "/history",
             description: "browse history",
             subcommands: &[],
+            aliases: &[],
+            usage_boost: 100, // boosted so it wins ties with /help
         },
-        SlashItem {
-            name: "/model",
-            description: "pick a model",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/resume",
-            description: "resume a session",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/review",
-            description: "review changes",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/agent-create",
-            description: "create a new agent",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/exit",
-            description: "exit astra",
-            subcommands: &[],
-        },
+        SlashItem::simple("/model", "pick a model"),
+        SlashItem::simple("/resume", "resume a session"),
+        SlashItem::simple("/review", "review changes"),
+        SlashItem::simple("/agent-create", "create a new agent"),
+        SlashItem::simple("/exit", "exit astra"),
     ]
 }
 
@@ -87,6 +84,21 @@ fn typing_slash_opens_menu() {
     assert!(
         bp.slash_menu_is_open(),
         "slash menu should be visible after '/'"
+    );
+}
+
+#[test]
+fn slash_menu_opens_after_due_paste_burst_flush() {
+    let mut bp = fresh();
+    let now = std::time::Instant::now();
+    bp.composer.force_pending_paste_burst_for_test("/", now);
+
+    bp.pre_draw_tick(now);
+
+    assert_eq!(bp.composer.text(), "/");
+    assert!(
+        bp.slash_menu_is_open(),
+        "slash menu should sync after delayed burst flush"
     );
 }
 
@@ -234,4 +246,130 @@ fn enter_on_empty_matches_does_not_submit_garbage() {
         }
         other => panic!("unexpected action {other:?}"),
     }
+}
+
+// ─── Task-6 end-to-end coverage ───────────────────────────────────
+//
+// These tests lock in Task-1 (alias matching + usage_boost ranking),
+// Task-2 (PageUp/PageDown / Home / End navigation), and confirm the
+// fuzzy/prefix ordering contract from Task-3 end-to-end.
+
+fn fresh_with_aliases() -> BottomPane {
+    let mut bp = BottomPane::new();
+    bp.set_slash_items(items_with_aliases());
+    bp
+}
+
+#[test]
+fn alias_query_surfaces_command() {
+    // `/h` with aliases=["h","?"] on /help should still surface /help
+    // via the alias path even though /history also starts with "h".
+    let mut bp = fresh_with_aliases();
+    type_string(&mut bp, "/h");
+    assert!(bp.slash_menu_is_open());
+    let names = bp.slash_menu_names();
+    assert!(
+        names.iter().any(|n| n == "/help"),
+        "/h should include /help (alias or prefix); got {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "/history"),
+        "/h should still match /history by prefix; got {names:?}"
+    );
+}
+
+#[test]
+fn question_mark_alias_resolves_to_help() {
+    // `?` is a pure alias — no command literally starts with '?'.
+    // This is the regression test for alias-only lookup.
+    let mut bp = fresh_with_aliases();
+    type_string(&mut bp, "/?");
+    assert!(bp.slash_menu_is_open());
+    let names = bp.slash_menu_names();
+    assert!(
+        names.iter().any(|n| n == "/help"),
+        "alias '?' must resolve to /help; got {names:?}"
+    );
+}
+
+// PageUp/PageDown/Home/End navigation routes through `BottomPane` to the
+// SlashMenu helpers (page_up / page_down / go_first / go_last) added in
+// Task-1. The tests below lock in the wiring added in Task-6.
+
+#[test]
+fn end_jumps_to_last_home_jumps_to_first() {
+    let mut bp = fresh();
+    type_string(&mut bp, "/");
+    let first = bp.slash_menu_selected_name().unwrap().to_string();
+    let names = bp.slash_menu_names();
+    let last_expected = names.last().cloned().expect("non-empty menu");
+
+    let _ = bp.handle_key(special(KeyCode::End));
+    assert_eq!(
+        bp.slash_menu_selected_name().unwrap(),
+        last_expected,
+        "End should jump to last item"
+    );
+
+    let _ = bp.handle_key(special(KeyCode::Home));
+    assert_eq!(
+        bp.slash_menu_selected_name().unwrap(),
+        first,
+        "Home should return to first item"
+    );
+}
+
+#[test]
+fn pagedown_then_pageup_round_trips() {
+    let mut bp = fresh();
+    type_string(&mut bp, "/");
+    let first = bp.slash_menu_selected_name().unwrap().to_string();
+
+    let _ = bp.handle_key(special(KeyCode::PageDown));
+    // PageDown must advance selection when list has > 1 item.
+    if bp.slash_menu_len() > 1 {
+        assert_ne!(
+            bp.slash_menu_selected_name().unwrap(),
+            first,
+            "PageDown should advance selection"
+        );
+    }
+
+    let _ = bp.handle_key(special(KeyCode::PageUp));
+    assert_eq!(
+        bp.slash_menu_selected_name().unwrap(),
+        first,
+        "PageUp should round-trip back to the first item"
+    );
+}
+
+#[test]
+fn prefix_beats_fuzzy_ranking() {
+    // Task-3 contract: prefix matches outrank mid-string/fuzzy matches.
+    // "/re" must put /resume or /review first, never /agent-create.
+    let mut bp = fresh();
+    type_string(&mut bp, "/re");
+    let top = bp.slash_menu_selected_name().expect("selection");
+    assert!(
+        top == "/resume" || top == "/review",
+        "prefix match should win; got {top}"
+    );
+}
+
+#[test]
+fn typing_then_backspace_restores_full_list() {
+    let mut bp = fresh();
+    type_string(&mut bp, "/");
+    let full = bp.slash_menu_len();
+    type_string(&mut bp, "help");
+    assert!(bp.slash_menu_len() < full, "filter narrows the list");
+
+    for _ in 0..4 {
+        let _ = bp.handle_key(special(KeyCode::Backspace));
+    }
+    assert_eq!(
+        bp.slash_menu_len(),
+        full,
+        "backspacing the filter restores full list"
+    );
 }

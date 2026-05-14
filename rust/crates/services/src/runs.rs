@@ -1222,18 +1222,32 @@ impl RunStateStore for DatabaseRunStateStore {
         waiting_for: Option<&str>,
         error_message: Option<&str>,
     ) -> Result<bool, String> {
-        let result = sqlx::query(
-            "UPDATE agent_runs
-             SET status = ?, waiting_for = ?, error_message = COALESCE(?, error_message), updated_at = NOW(6)
-             WHERE run_id = ?",
-        )
-        .bind(status)
-        .bind(waiting_for)
-        .bind(error_message)
-        .bind(run_id)
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| db_error("update_run_status", run_id, source).to_string())?;
+        let result = if let Some(error_message) = error_message {
+            sqlx::query(
+                "UPDATE agent_runs
+                 SET status = ?, waiting_for = ?, error_message = ?, updated_at = NOW(6)
+                 WHERE run_id = ?",
+            )
+            .bind(status)
+            .bind(waiting_for)
+            .bind(error_message)
+            .bind(run_id)
+            .execute(self.pool.get())
+            .await
+            .map_err(|source| db_error("update_run_status", run_id, source).to_string())?
+        } else {
+            sqlx::query(
+                "UPDATE agent_runs
+                 SET status = ?, waiting_for = ?, updated_at = NOW(6)
+                 WHERE run_id = ?",
+            )
+            .bind(status)
+            .bind(waiting_for)
+            .bind(run_id)
+            .execute(self.pool.get())
+            .await
+            .map_err(|source| db_error("update_run_status", run_id, source).to_string())?
+        };
         Ok(result.rows_affected() > 0)
     }
 

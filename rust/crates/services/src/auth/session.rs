@@ -601,6 +601,10 @@ async fn hard_delete_session_rows(
             "DELETE FROM session_todos WHERE session_id = ?",
         ),
         (
+            "session_plan_todos",
+            "DELETE FROM session_plan_todos WHERE session_id = ?",
+        ),
+        (
             "harness_snapshots",
             "DELETE FROM harness_snapshots WHERE session_id = ?",
         ),
@@ -616,10 +620,11 @@ async fn hard_delete_session_rows(
             "skill_selection_events",
             "DELETE FROM skill_selection_events WHERE session_id = ?",
         ),
-        (
-            "skill_selector_turn_metrics",
-            "DELETE FROM skill_selector_turn_metrics WHERE session_id = ?",
-        ),
+        // skill_selector_turn_metrics — table was removed in PR #337
+        // (tool selector subsystem deletion); the cleanup statement
+        // remained and started failing with "no such table" once a
+        // session deletion ran against a fresh schema. Drop the
+        // stale cleanup entry.
         (
             "session_sync_log",
             "DELETE FROM session_sync_log WHERE session_id = ?",

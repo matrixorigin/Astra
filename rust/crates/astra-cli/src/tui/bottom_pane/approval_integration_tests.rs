@@ -8,7 +8,10 @@ use tokio::sync::oneshot;
 
 use super::{ApprovalActivation, BottomPane, BottomPaneAction};
 use crate::chat_stream::ApprovalResponse;
+use crate::tui::approval::queue::ApprovalMetadata;
 use crate::tui::slash_menu::SlashItem;
+use astra_turn_core::permission_match_target::AllowMatchTarget;
+use astra_turn_core::permission_scope::AllowScope;
 
 fn key(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -32,18 +35,37 @@ fn enqueue(bp: &mut BottomPane, tool: &str) -> oneshot::Receiver<ApprovalRespons
     rx
 }
 
+fn batch_group(tool_family: &str) -> astra_turn_core::approval_batch_group::ApprovalBatchGroupKey {
+    astra_turn_core::approval_batch_group::ApprovalBatchGroupKey::new(
+        tool_family,
+        "ReadOnly",
+        ["BashExecute".to_string()],
+        uuid::Uuid::nil(),
+    )
+    .with_scope_root("/repo")
+}
+
+fn enqueue_grouped(
+    bp: &mut BottomPane,
+    tool: &str,
+    group: astra_turn_core::approval_batch_group::ApprovalBatchGroupKey,
+) -> oneshot::Receiver<ApprovalResponse> {
+    let (tx, rx) = oneshot::channel();
+    bp.enqueue_approval_with_metadata(
+        tool.to_string(),
+        format!("{tool} needs approval"),
+        None,
+        "unknown".into(),
+        tx,
+        ApprovalMetadata::default().with_batch_group_key(group),
+    );
+    rx
+}
+
 fn slash_items() -> Vec<SlashItem> {
     vec![
-        SlashItem {
-            name: "/help",
-            description: "show help",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/history",
-            description: "browse history",
-            subcommands: &[],
-        },
+        SlashItem::simple("/help", "show help"),
+        SlashItem::simple("/history", "browse history"),
     ]
 }
 
@@ -107,6 +129,58 @@ fn esc_rejects_focused_approval() {
     let action = bp.handle_key(special(KeyCode::Esc));
     assert!(matches!(action, BottomPaneAction::ApprovalResolved { .. }));
     assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
+}
+
+// ─── Issue #326 P3 / R2 Major 6: Ctrl+D rejects, bare 'd' does NOT ──
+
+#[test]
+fn ctrl_d_rejects_focused_approval_when_composer_empty() {
+    let mut bp = BottomPane::new();
+    let rx = enqueue(&mut bp, "bash");
+    let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+    let action = bp.handle_key(key);
+    assert!(
+        matches!(action, BottomPaneAction::ApprovalResolved { .. }),
+        "Ctrl+D on focused approval should resolve, got {action:?}"
+    );
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
+}
+
+#[test]
+fn bare_d_reaches_composer_does_not_reject() {
+    // The whole point of P3's "Reject must be explicit": users
+    // mid-typing "do this" must not have their approval
+    // silently rejected when they hit 'd'.
+    let mut bp = BottomPane::new();
+    let _rx = enqueue(&mut bp, "bash");
+    // Press bare 'd' (no modifier).
+    let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+    let action = bp.handle_key(key);
+    // 'd' is consumed by the composer (it ends up in the
+    // input buffer), NOT routed to approval rejection.
+    assert!(
+        !matches!(action, BottomPaneAction::ApprovalResolved { .. }),
+        "bare 'd' must NOT resolve the approval, got {action:?}"
+    );
+    // Approval is still pending.
+    assert_eq!(bp.pending_approval_count(), 1);
+}
+
+#[test]
+fn ctrl_d_with_text_in_composer_does_not_reject() {
+    // Belt-and-braces: even Ctrl+D should not silently kill
+    // the approval if the user is still composing a message
+    // (composer non-empty). They must clear the composer first
+    // or use the explicit Reject button.
+    let mut bp = BottomPane::new();
+    let _rx = enqueue(&mut bp, "bash");
+    type_string(&mut bp, "hello");
+    let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+    let action = bp.handle_key(key);
+    assert!(
+        !matches!(action, BottomPaneAction::ApprovalResolved { .. }),
+        "Ctrl+D with composer text should not reject, got {action:?}"
+    );
 }
 
 // ─── Ctrl+Enter quick accept ─────────────────────────────────────
@@ -229,23 +303,28 @@ fn tab_cycles_between_pendings_when_composer_empty() {
 }
 
 #[test]
-fn batch_button_resolves_all_pendings() {
+fn batch_button_resolves_focused_group_only() {
     let mut bp = BottomPane::new();
-    let rx_a = enqueue(&mut bp, "a");
-    let rx_b = enqueue(&mut bp, "b");
-    let rx_c = enqueue(&mut bp, "c");
+    let group_a = batch_group("Read(src)");
+    let group_b = batch_group("Read(tests)");
+    let rx_a = enqueue_grouped(&mut bp, "a", group_a.clone());
+    let mut rx_b = enqueue_grouped(&mut bp, "b", group_b);
+    let rx_c = enqueue_grouped(&mut bp, "c", group_a);
     assert_eq!(bp.footer.pending_approvals, 3);
 
-    // Navigate to Accept-all (index 4 in the 6-button row).
-    for _ in 0..4 {
+    // Navigate to Accept-all (index 7 in the scoped + batch row).
+    for _ in 0..7 {
         bp.handle_key(special(KeyCode::Right));
     }
     let action = bp.handle_key(special(KeyCode::Enter));
     assert!(matches!(action, BottomPaneAction::ApprovalResolved { .. }));
-    assert_eq!(bp.footer.pending_approvals, 0);
+    assert_eq!(bp.footer.pending_approvals, 1);
     assert_eq!(rx_a.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
-    assert_eq!(rx_b.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
     assert_eq!(rx_c.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
+    assert!(
+        rx_b.try_recv().is_err(),
+        "cross-group approval must remain pending"
+    );
 }
 
 // ─── Preview of focused approval is rendered inside BottomPane ────
@@ -284,8 +363,8 @@ fn activation_single_vs_batch_reports_correct_variant() {
     ));
     assert_eq!(bp.footer.pending_approvals, 1);
 
-    // Navigate to Accept-all (index 4).
-    for _ in 0..4 {
+    // Navigate to Accept-all (index 7 in the scoped + batch row).
+    for _ in 0..7 {
         bp.handle_key(special(KeyCode::Right));
     }
     let act = bp.activate_focused_approval_button();
@@ -328,15 +407,23 @@ fn up_moves_focus_like_left_wrapping_to_skip() {
 }
 
 #[test]
-fn up_down_reach_always_button() {
-    // End-to-end: the user wants to pick "Always" via Up/Down only.
-    // From Accept (index 0), Down twice lands on Always (index 2).
+fn up_down_reach_turn_scope_then_exact_match_button() {
+    // End-to-end: scope selection is step one; match target is step two.
+    // From Accept (index 0), Down twice lands on Turn (index 2), then
+    // Enter opens match targets where Exact is focused by default.
     let mut bp = BottomPane::new();
     let rx = enqueue(&mut bp, "bash");
     let _ = bp.handle_key(special(KeyCode::Down));
     let _ = bp.handle_key(special(KeyCode::Down));
     let _ = bp.handle_key(special(KeyCode::Enter));
-    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::AlwaysAllow);
+    let _ = bp.handle_key(special(KeyCode::Enter));
+    assert_eq!(
+        rx.blocking_recv().unwrap(),
+        ApprovalResponse::AlwaysAllowScopedTarget {
+            scope: AllowScope::RestOfTurn,
+            match_target: AllowMatchTarget::Exact,
+        }
+    );
 }
 
 #[test]

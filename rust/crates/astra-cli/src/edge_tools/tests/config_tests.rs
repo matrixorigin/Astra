@@ -80,10 +80,10 @@ fn config_output_limit() {
     assert!(value > 0);
 }
 
-#[test]
-fn brief_includes_session_state() {
+#[tokio::test]
+async fn brief_includes_session_state() {
     let exe = test_executor();
-    let result = exe.brief(&json!({}));
+    let result = exe.brief(&json!({})).await;
     let parsed: Value = serde_json::from_str(&result).unwrap();
 
     assert!(parsed.get("effective_project_root").is_some());
@@ -97,7 +97,7 @@ fn brief_includes_session_state() {
 async fn brief_reports_created_tasks() {
     let exe = test_executor();
     exe.task_create(&json!({"title": "Implement thing"})).await;
-    let result = exe.brief(&json!({"focus": "tasks"}));
+    let result = exe.brief(&json!({"focus": "tasks"})).await;
     let parsed: Value = serde_json::from_str(&result).unwrap();
 
     assert_eq!(parsed["tasks"]["count"], 1);

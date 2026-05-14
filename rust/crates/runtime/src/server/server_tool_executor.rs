@@ -28,6 +28,7 @@ use uuid::Uuid;
 use astra_core::SharedPool;
 use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore};
 use astra_tools::executor::DefaultToolExecutor;
+use astra_tools::task_mgmt::{InMemoryTaskStore, TaskManager, TaskManagerSnapshot, TaskStore};
 use astra_tools::{AskUserDecision, AskUserGate, ToolExecutor};
 use async_trait::async_trait;
 
@@ -287,345 +288,6 @@ impl DatabaseSnapshotRollbackJournal {
         } else {
             false
         }
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct SessionTask {
-    id: String,
-    title: String,
-    description: Option<String>,
-    status: String,
-    subtasks: Vec<SessionSubtask>,
-    created_at: String,
-    updated_at: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct SessionSubtask {
-    id: String,
-    title: String,
-    description: Option<String>,
-    status: String,
-    depends_on: Vec<String>,
-}
-
-#[derive(Debug)]
-struct ServerTaskManager {
-    tasks: Mutex<Vec<SessionTask>>,
-    id_counter: AtomicU32,
-}
-
-#[derive(Debug, Clone)]
-struct TaskManagerSnapshot {
-    tasks: Vec<SessionTask>,
-    next_task_id: u32,
-}
-
-impl ServerTaskManager {
-    fn new() -> Self {
-        Self {
-            tasks: Mutex::new(Vec::new()),
-            id_counter: AtomicU32::new(1),
-        }
-    }
-
-    fn snapshot(&self) -> Vec<SessionTask> {
-        self.tasks
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
-    }
-
-    fn snapshot_state(&self) -> TaskManagerSnapshot {
-        TaskManagerSnapshot {
-            tasks: self.snapshot(),
-            next_task_id: self.id_counter.load(Ordering::SeqCst),
-        }
-    }
-
-    fn restore_snapshot(&self, snapshot: &TaskManagerSnapshot) -> Result<(), String> {
-        let mut tasks = self
-            .tasks
-            .lock()
-            .map_err(|_| "failed to access task list".to_string())?;
-        *tasks = snapshot.tasks.clone();
-        self.id_counter
-            .store(snapshot.next_task_id, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn create(&self, args: &Value) -> String {
-        let title = match args.get("title").and_then(Value::as_str) {
-            Some(title) if !title.is_empty() => title.to_string(),
-            _ => return "Error: 'title' is required".to_string(),
-        };
-
-        let description = args
-            .get("description")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
-        let now = chrono::Utc::now().to_rfc3339();
-
-        let subtasks: Vec<SessionSubtask> = args
-            .get("subtasks")
-            .and_then(Value::as_array)
-            .map(|subtasks| {
-                subtasks
-                    .iter()
-                    .filter_map(|subtask| {
-                        let id = subtask.get("id").and_then(Value::as_str)?;
-                        let title = subtask.get("title").and_then(Value::as_str)?;
-                        Some(SessionSubtask {
-                            id: id.to_string(),
-                            title: title.to_string(),
-                            description: subtask
-                                .get("description")
-                                .and_then(Value::as_str)
-                                .map(ToString::to_string),
-                            status: "pending".to_string(),
-                            depends_on: subtask
-                                .get("depends_on")
-                                .and_then(Value::as_array)
-                                .map(|deps| {
-                                    deps.iter()
-                                        .filter_map(Value::as_str)
-                                        .map(ToString::to_string)
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let task_id = format!("task-{}", self.id_counter.fetch_add(1, Ordering::SeqCst));
-        let task = SessionTask {
-            id: task_id.clone(),
-            title: title.clone(),
-            description,
-            status: "pending".to_string(),
-            subtasks,
-            created_at: now.clone(),
-            updated_at: now,
-        };
-
-        if let Ok(mut tasks) = self.tasks.lock() {
-            tasks.push(task);
-        }
-
-        json!({
-            "success": true,
-            "task_id": task_id,
-            "message": format!("Task '{title}' created successfully"),
-        })
-        .to_string()
-    }
-
-    fn list(&self, args: &Value) -> String {
-        let status_filter = args.get("status").and_then(Value::as_str).unwrap_or("all");
-
-        let tasks = match self.tasks.lock() {
-            Ok(guard) => guard.clone(),
-            Err(_) => return "Error: failed to access task list".to_string(),
-        };
-
-        let filtered: Vec<_> = tasks
-            .iter()
-            .filter(|task| match status_filter {
-                "all" => true,
-                "active" => task.status == "pending" || task.status == "in_progress",
-                other => task.status == other,
-            })
-            .map(|task| {
-                let subtask_summary = if task.subtasks.is_empty() {
-                    String::new()
-                } else {
-                    let done = task
-                        .subtasks
-                        .iter()
-                        .filter(|subtask| subtask.status == "completed")
-                        .count();
-                    format!(" [{done}/{}]", task.subtasks.len())
-                };
-                json!({
-                    "id": task.id,
-                    "title": task.title,
-                    "status": task.status,
-                    "subtasks": subtask_summary,
-                    "updated_at": task.updated_at,
-                })
-            })
-            .collect();
-
-        if filtered.is_empty() {
-            return format!("No tasks found with status '{status_filter}'");
-        }
-
-        json!({
-            "count": filtered.len(),
-            "tasks": filtered,
-        })
-        .to_string()
-    }
-
-    fn get(&self, args: &Value) -> String {
-        let task_id = match args.get("task_id").and_then(Value::as_str) {
-            Some(task_id) if !task_id.is_empty() => task_id,
-            _ => return "Error: 'task_id' is required".to_string(),
-        };
-
-        let tasks = match self.tasks.lock() {
-            Ok(guard) => guard.clone(),
-            Err(_) => return "Error: failed to access task list".to_string(),
-        };
-
-        match tasks.iter().find(|task| task.id == task_id) {
-            Some(task) => serde_json::to_string_pretty(task)
-                .unwrap_or_else(|_| "Error: serialization failed".to_string()),
-            None => format!("Error: task '{task_id}' not found"),
-        }
-    }
-
-    fn update(&self, args: &Value) -> String {
-        let task_id = match args.get("task_id").and_then(Value::as_str) {
-            Some(task_id) if !task_id.is_empty() => task_id,
-            _ => return "Error: 'task_id' is required".to_string(),
-        };
-
-        let new_status = args.get("status").and_then(Value::as_str);
-        let subtask_id = args.get("subtask_id").and_then(Value::as_str);
-        let error_message = args.get("error_message").and_then(Value::as_str);
-        let now = chrono::Utc::now().to_rfc3339();
-
-        let mut tasks = match self.tasks.lock() {
-            Ok(guard) => guard,
-            Err(_) => return "Error: failed to access task list".to_string(),
-        };
-
-        let task = match tasks.iter_mut().find(|task| task.id == task_id) {
-            Some(task) => task,
-            None => return format!("Error: task '{task_id}' not found"),
-        };
-
-        if let Some(subtask_id) = subtask_id {
-            match task
-                .subtasks
-                .iter_mut()
-                .find(|subtask| subtask.id == subtask_id)
-            {
-                Some(subtask) => {
-                    let previous_status = subtask.status.clone();
-                    if let Some(status) = new_status {
-                        subtask.status = status.to_string();
-                    }
-                    task.updated_at = now;
-                    return json!({
-                        "success": true,
-                        "task_id": task_id,
-                        "subtask_id": subtask_id,
-                        "previous_status": previous_status,
-                        "status": subtask.status,
-                        "message": format!("Subtask '{subtask_id}' updated to '{}'", subtask.status),
-                    })
-                    .to_string();
-                }
-                None => {
-                    return format!("Error: subtask '{subtask_id}' not found in task '{task_id}'");
-                }
-            }
-        }
-
-        let previous_status = task.status.clone();
-        if let Some(status) = new_status {
-            task.status = status.to_string();
-        }
-        if let Some(error_message) = error_message {
-            task.description = Some(format!(
-                "{}\n\nError: {error_message}",
-                task.description.as_deref().unwrap_or(""),
-            ));
-        }
-        task.updated_at = now;
-
-        if !task.subtasks.is_empty()
-            && task
-                .subtasks
-                .iter()
-                .all(|subtask| subtask.status == "completed")
-        {
-            task.status = "completed".to_string();
-        }
-
-        json!({
-            "success": true,
-            "task_id": task_id,
-            "previous_status": previous_status,
-            "status": task.status,
-            "message": format!("Task '{task_id}' updated to '{}'", task.status),
-        })
-        .to_string()
-    }
-
-    fn stop(&self, args: &Value) -> String {
-        let task_id = match args.get("task_id").and_then(Value::as_str) {
-            Some(task_id) if !task_id.is_empty() => task_id,
-            _ => return "Error: 'task_id' is required".to_string(),
-        };
-
-        let reason = args
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("user requested");
-        let now = chrono::Utc::now().to_rfc3339();
-
-        let mut tasks = match self.tasks.lock() {
-            Ok(guard) => guard,
-            Err(_) => return "Error: failed to access task list".to_string(),
-        };
-
-        let task = match tasks.iter_mut().find(|task| task.id == task_id) {
-            Some(task) => task,
-            None => return format!("Error: task '{task_id}' not found"),
-        };
-
-        if task.status != "pending" && task.status != "in_progress" {
-            return json!({
-                "success": false,
-                "message": format!(
-                    "Cannot stop task '{task_id}': status is '{}' (only 'pending' or 'in_progress' can be stopped)",
-                    task.status
-                ),
-            })
-            .to_string();
-        }
-
-        let previous_status = task.status.clone();
-        task.status = "cancelled".to_string();
-        task.description = Some(format!(
-            "{}\n\nCancelled: {reason} (was: {previous_status})",
-            task.description.as_deref().unwrap_or(""),
-        ));
-        task.updated_at = now;
-
-        let mut cancelled_subtasks = 0;
-        for subtask in &mut task.subtasks {
-            if subtask.status == "pending" || subtask.status == "in_progress" {
-                subtask.status = "cancelled".to_string();
-                cancelled_subtasks += 1;
-            }
-        }
-
-        json!({
-            "success": true,
-            "task_id": task_id,
-            "previous_status": previous_status,
-            "reason": reason,
-            "cancelled_subtasks": cancelled_subtasks,
-            "message": format!("Task '{task_id}' cancelled (was: {previous_status})"),
-        })
-        .to_string()
     }
 }
 
@@ -1187,8 +849,11 @@ pub struct ServerToolExecutor {
     database_snapshot_journal: Arc<Mutex<DatabaseSnapshotRollbackJournal>>,
     /// Session-state rollback journal for bounded self-mod and task undo.
     session_state_journal: Arc<Mutex<SessionStateRollbackJournal>>,
-    /// In-memory task manager for session-local task tools.
-    task_manager: Arc<ServerTaskManager>,
+    /// Task manager for session-local task tools. Backed by whichever
+    /// [`TaskStore`] the host wired in (in-memory for tests and offline CLI,
+    /// MatrixOne for production so the same `session_id` is visible across
+    /// edge and cloud).
+    task_manager: Arc<TaskManager>,
     /// Current turn index for journal entries.
     journal_turn_index: AtomicU32,
     /// Aggregate output bytes this turn.
@@ -1293,6 +958,9 @@ impl ServerToolExecutor {
             Duration::from_secs(15),
         );
 
+        let task_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let task_manager = Arc::new(TaskManager::new(session_id.clone(), task_store));
+
         Self {
             workspace_root,
             user_id,
@@ -1304,7 +972,7 @@ impl ServerToolExecutor {
                 DatabaseSnapshotRollbackJournal::default(),
             )),
             session_state_journal: Arc::new(Mutex::new(SessionStateRollbackJournal::default())),
-            task_manager: Arc::new(ServerTaskManager::new()),
+            task_manager,
             journal_turn_index: AtomicU32::new(0),
             aggregate_output_bytes: AtomicUsize::new(0),
             memoria_client,
@@ -1891,6 +1559,49 @@ impl ServerToolExecutor {
         }
     }
 
+    /// Swap the in-memory task store for a shared one (MatrixOne in
+    /// production). Keeps the session_id binding consistent.
+    ///
+    /// **Builder-stage only.** Must be called before any task tool runs.
+    /// If `session_state_journal` already holds `TaskState` snapshots, those
+    /// snapshots were captured against the *previous* store and would be
+    /// restored into this new (different-backend) store on rollback — which
+    /// silently corrupts state. We drop them here with a warning rather
+    /// than silently keeping a broken undo chain.
+    ///
+    /// Fix for M-SRV-1: prior code swapped `task_manager` and left stale
+    /// snapshots dangling, so `rollback_session_state` could replay an
+    /// in-memory snapshot against a MatrixOne store.
+    pub fn with_task_store(mut self, store: Arc<dyn TaskStore>) -> Self {
+        // Drop any TaskState rollback entries that referenced the old store.
+        // Other action kinds (ToolPreferences, ConfigOverride, Compression)
+        // are store-independent and survive the swap.
+        let dropped = match self.session_state_journal.lock() {
+            Ok(mut j) => {
+                let before = j.entries.len();
+                j.entries
+                    .retain(|e| !matches!(e.action, SessionStateRollbackAction::TaskState { .. }));
+                before - j.entries.len()
+            }
+            Err(poisoned) => {
+                let mut j = poisoned.into_inner();
+                let before = j.entries.len();
+                j.entries
+                    .retain(|e| !matches!(e.action, SessionStateRollbackAction::TaskState { .. }));
+                before - j.entries.len()
+            }
+        };
+        if dropped > 0 {
+            tracing::warn!(
+                session_id = %self.session_id,
+                dropped_task_state_snapshots = dropped,
+                "with_task_store: discarded stale TaskState rollback entries from previous store"
+            );
+        }
+        self.task_manager = Arc::new(TaskManager::new(self.session_id.clone(), store));
+        self
+    }
+
     fn publish_current_workspace(&self, source: &str) -> Result<(), String> {
         let Some(store) = self.workspace_artifact_store.clone() else {
             return Ok(());
@@ -2115,20 +1826,22 @@ impl ServerToolExecutor {
             "deprioritize_tool" => tool_result_from_output(self.deprioritize_tool(args)),
             "introspect" => tool_result_from_output(self.handle_introspect(args)),
             "compress_context" => tool_result_from_output(self.compress_context(args)),
-            "rollback_session_state" => tool_result_from_output(self.rollback_session_state(args)),
-            "task_create" => tool_result_from_output(self.task_create(args)),
-            "task_list" => tool_result_from_output(self.task_list(args)),
-            "task_get" => tool_result_from_output(self.task_get(args)),
-            "task_update" => tool_result_from_output(self.task_update(args)),
-            "task_stop" => tool_result_from_output(self.task_stop(args)),
+            "rollback_session_state" => {
+                tool_result_from_output(self.rollback_session_state(args).await)
+            }
+            "task_create" => tool_result_from_output(self.task_create(args).await),
+            "task_list" => tool_result_from_output(self.task_list(args).await),
+            "task_get" => tool_result_from_output(self.task_get(args).await),
+            "task_update" => tool_result_from_output(self.task_update(args).await),
+            "task_stop" => tool_result_from_output(self.task_stop(args).await),
             "task" => {
                 let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
                 match action {
-                    "create" => tool_result_from_output(self.task_create(args)),
-                    "list" => tool_result_from_output(self.task_list(args)),
-                    "get" => tool_result_from_output(self.task_get(args)),
-                    "update" => tool_result_from_output(self.task_update(args)),
-                    "stop" => tool_result_from_output(self.task_stop(args)),
+                    "create" => tool_result_from_output(self.task_create(args).await),
+                    "list" => tool_result_from_output(self.task_list(args).await),
+                    "get" => tool_result_from_output(self.task_get(args).await),
+                    "update" => tool_result_from_output(self.task_update(args).await),
+                    "stop" => tool_result_from_output(self.task_stop(args).await),
                     other => tool_result_from_output(format!(
                         "Unknown task action: '{other}'. Use: create, list, get, update, stop"
                     )),
@@ -2224,19 +1937,27 @@ impl ServerToolExecutor {
             "get_agent_info" => tool_result_from_output(self.server_get_agent_info(args)),
             // ── Consolidated agent tool ────────────────────────────────
             "agent" => {
-                let action = args
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("delegate");
+                // Mirrors the CLI executor: `agent(action='delegate')` was
+                // never intercepted by `agentic_delegate_interception` (which
+                // matches on tool NAME == "delegate", not action="delegate").
+                // It silently returned a fake-success acknowledgement.
+                // Removed in favor of `agent.spawn`. The standalone `delegate`
+                // tool name (below) still works — it IS intercepted upstream
+                // and routed through the real DelegationEngine.
+                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
                 match action {
-                    "delegate" => astra_tools::ToolResult::text(
-                        "Delegation request acknowledged. The delegation engine will execute \
-                         this request and provide results in the next round."
-                            .to_string(),
+                    "delegate" => astra_tools::ToolResult::error(
+                        "Error: agent.delegate has been removed because action-shaped \
+                         delegation was not intercepted by the delegation engine. Use \
+                         agent(action='spawn', description='...', prompt='...', run_in_background: true) \
+                         instead, or call the standalone `delegate` tool directly to engage \
+                         the engine.".to_string(),
                     ),
                     "run_chain" => self.default_executor.execute("run_chain", args).await,
                     other => tool_result_from_output(format!(
-                        "Unknown agent action: '{other}'. Use: delegate, run_chain"
+                        "Unknown agent action: '{other}'. Use: spawn, get_result, run_chain. \
+                         (Server-side execution does not handle spawn/get_result here — \
+                         those route through the agent_spawning module on the CLI/edge side.)"
                     )),
                 }
             }
@@ -2897,10 +2618,15 @@ impl ServerToolExecutor {
         Value::Object(value)
     }
 
-    fn rollback_session_state_entry(
+    async fn rollback_session_state_entry(
         &self,
         entry: &SessionStateRollbackEntry,
     ) -> Result<(), String> {
+        // C-SRV-2: bound any async restore step so a wedged store can't
+        // hang rollback indefinitely or be silently cancelled by an
+        // outer dropping future.
+        const ROLLBACK_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
         match &entry.action {
             SessionStateRollbackAction::ToolPreferences {
                 previous_pinned_tools,
@@ -2952,15 +2678,61 @@ impl ServerToolExecutor {
                 self.restore_observability_snapshot(snapshot)
             }
             SessionStateRollbackAction::TaskState { snapshot } => {
-                self.task_manager.restore_snapshot(snapshot)
+                // Bound the async restore: a stuck store must surface as
+                // an error, not silently drop on cancellation.
+                match tokio::time::timeout(
+                    ROLLBACK_STEP_TIMEOUT,
+                    self.task_manager.restore_snapshot(snapshot),
+                )
+                .await
+                {
+                    Ok(res) => res,
+                    Err(_) => Err(format!(
+                        "task_manager.restore_snapshot timed out after {}s",
+                        ROLLBACK_STEP_TIMEOUT.as_secs()
+                    )),
+                }
             }
         }
     }
 
-    fn task_create(&self, args: &Value) -> String {
-        let snapshot = self.task_manager.snapshot_state();
-        let output = self.task_manager.create(args);
-        if !output.starts_with("Error:") {
+    /// Decide whether a `task_*` tool's output represents a successful
+    /// mutation worth snapshotting for rollback.
+    ///
+    /// Conservative policy (C-SRV-1 fix): the **default is "yes"**, with
+    /// only two explicit reject paths:
+    ///   1. The output starts with `Error:` (legacy error convention).
+    ///   2. The output contains a JSON body with `"success": false`.
+    ///
+    /// Pre-fix this returned `false` when the body had no `{`, which
+    /// silently dropped the rollback snapshot for every successful
+    /// task_create / task_update / task_stop whose response was a plain
+    /// human-readable summary (e.g. just `"Created task #5: foo"`).
+    /// That made `rollback_session_state` a no-op on the most common path.
+    fn task_output_success(output: &str) -> bool {
+        if output.starts_with("Error:") {
+            return false;
+        }
+        // task_mgmt prefixes successful responses with a one-line summary
+        // followed by a JSON body (see `prefix_summary` in task_mgmt.rs).
+        // If we *can* find a JSON body, honor its explicit `success: false`;
+        // otherwise treat as a success (conservative — better to snapshot
+        // a no-op than to lose a real snapshot).
+        if let Some(pos) = output.find('{') {
+            if let Ok(value) = serde_json::from_str::<Value>(&output[pos..]) {
+                if let Some(false) = value.get("success").and_then(Value::as_bool) {
+                    return false;
+                }
+            }
+            // Unparseable JSON body: don't punish the caller; treat as success.
+        }
+        true
+    }
+
+    async fn task_create(&self, args: &Value) -> String {
+        let snapshot = self.task_manager.snapshot_state().await;
+        let output = self.task_manager.create(args).await;
+        if Self::task_output_success(&output) {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
@@ -2972,23 +2744,18 @@ impl ServerToolExecutor {
         output
     }
 
-    fn task_list(&self, args: &Value) -> String {
-        self.task_manager.list(args)
+    async fn task_list(&self, args: &Value) -> String {
+        self.task_manager.list(args).await
     }
 
-    fn task_get(&self, args: &Value) -> String {
-        self.task_manager.get(args)
+    async fn task_get(&self, args: &Value) -> String {
+        self.task_manager.get(args).await
     }
 
-    fn task_update(&self, args: &Value) -> String {
-        let snapshot = self.task_manager.snapshot_state();
-        let output = self.task_manager.update(args);
-        if !output.starts_with("Error:")
-            && serde_json::from_str::<Value>(&output)
-                .ok()
-                .and_then(|value| value.get("success").and_then(Value::as_bool))
-                .unwrap_or(false)
-        {
+    async fn task_update(&self, args: &Value) -> String {
+        let snapshot = self.task_manager.snapshot_state().await;
+        let output = self.task_manager.update(args).await;
+        if Self::task_output_success(&output) {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
@@ -3002,15 +2769,10 @@ impl ServerToolExecutor {
         output
     }
 
-    fn task_stop(&self, args: &Value) -> String {
-        let snapshot = self.task_manager.snapshot_state();
-        let output = self.task_manager.stop(args);
-        if !output.starts_with("Error:")
-            && serde_json::from_str::<Value>(&output)
-                .ok()
-                .and_then(|value| value.get("success").and_then(Value::as_bool))
-                .unwrap_or(false)
-        {
+    async fn task_stop(&self, args: &Value) -> String {
+        let snapshot = self.task_manager.snapshot_state().await;
+        let output = self.task_manager.stop(args).await;
+        if Self::task_output_success(&output) {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
@@ -3587,7 +3349,7 @@ impl ServerToolExecutor {
         .to_string()
     }
 
-    pub(crate) fn rollback_session_state(&self, args: &Value) -> String {
+    pub(crate) async fn rollback_session_state(&self, args: &Value) -> String {
         let scope = args
             .get("scope")
             .and_then(Value::as_str)
@@ -3644,7 +3406,7 @@ impl ServerToolExecutor {
                 let mut restored = Vec::new();
                 let mut failed = Vec::new();
                 for entry in &plan {
-                    match self.rollback_session_state_entry(entry) {
+                    match self.rollback_session_state_entry(entry).await {
                         Ok(()) => {
                             self.remove_session_state_rollback(entry.sequence);
                             restored.push(Self::rollback_session_state_entry_json(entry));
@@ -5110,7 +4872,21 @@ esac
                 }),
             )
             .await;
-        assert!(result.contains("2 times"));
+        // Unified banner contract (PR #334): must show the sentinel
+        // banner AND a precise occurrence count. "2 times" alone would
+        // also match "22 times" — pair with banner to lock format.
+        assert!(
+            result.contains("STR_REPLACE FAILED") || result.contains("WHAT:"),
+            "must include unified banner sentinel: {result}"
+        );
+        // Use the literal expected count phrase, not a digit substring,
+        // so a regression to "found 22 times" doesn't sneak through.
+        assert!(
+            result.contains("found 2 times")
+                || result.contains("matched 2 times")
+                || result.contains("2 occurrences"),
+            "must mention exactly 2 occurrences with words: {result}"
+        );
     }
 
     #[tokio::test]
@@ -6205,5 +5981,125 @@ esac
             !result.contains("blocked while plan mode is active"),
             "bash must NOT be blocked after exit_plan_mode, got: {result}"
         );
+    }
+
+    // ── C-SRV-1 regression: task_output_success policy ────────────────
+    //
+    // Pre-fix returned `false` when the output had no `{`, silently
+    // dropping rollback snapshots for human-readable success summaries.
+    // The fix flips the default to `true`, only rejecting on `Error:`
+    // prefix or explicit `success: false` JSON.
+
+    #[test]
+    fn task_output_success_treats_plain_summary_as_success() {
+        // No JSON body at all — used to be rejected, now accepted.
+        assert!(ServerToolExecutor::task_output_success(
+            "Created task #5: build PR"
+        ));
+    }
+
+    #[test]
+    fn task_output_success_accepts_summary_plus_json_body() {
+        let out = "Created task #5\n{\"success\": true, \"id\": 5}";
+        assert!(ServerToolExecutor::task_output_success(out));
+    }
+
+    #[test]
+    fn task_output_success_rejects_error_prefix() {
+        assert!(!ServerToolExecutor::task_output_success(
+            "Error: title is required"
+        ));
+    }
+
+    #[test]
+    fn task_output_success_rejects_explicit_success_false() {
+        let out = "Failed to create\n{\"success\": false, \"reason\": \"dup\"}";
+        assert!(!ServerToolExecutor::task_output_success(out));
+    }
+
+    #[test]
+    fn task_output_success_accepts_unparseable_json_body() {
+        // Don't punish callers with malformed JSON — we'd rather snapshot
+        // a no-op than lose a real one (bias toward safety).
+        let out = "Created task #5\n{not actually json";
+        assert!(ServerToolExecutor::task_output_success(out));
+    }
+
+    // ── M-SRV-1 regression: with_task_store undo-stack hygiene ────────
+    //
+    // Pre-fix: with_task_store() swapped the TaskManager but left any
+    // pre-existing TaskState rollback entries pointing at the old store's
+    // snapshots. A subsequent rollback_session_state could then replay an
+    // in-memory snapshot against a MatrixOne store, silently corrupting
+    // task state. The fix drops TaskState entries on swap while preserving
+    // store-independent entries (config/prefs/compression).
+
+    #[test]
+    fn with_task_store_drops_stale_task_state_entries() {
+        let (exec, _dir) = test_executor();
+
+        // Seed a TaskState entry against the original (in-memory) store.
+        exec.record_task_state_rollback(
+            TaskManagerSnapshot {
+                tasks: vec![],
+                next_task_id: 1,
+            },
+            "seed",
+        );
+        assert_eq!(
+            exec.session_state_entries().len(),
+            1,
+            "precondition: one TaskState entry recorded"
+        );
+
+        // Swap to a fresh store — must drop the stale TaskState entry.
+        let new_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let exec = exec.with_task_store(new_store);
+
+        assert_eq!(
+            exec.session_state_entries().len(),
+            0,
+            "with_task_store must purge TaskState entries that referenced the prior store"
+        );
+    }
+
+    #[test]
+    fn with_task_store_preserves_tool_preferences_entries() {
+        // ToolPreferences is a store-independent action and must survive
+        // a task-store swap. (Compression / ConfigOverride carry an
+        // ObservabilitySession snapshot that's not trivially constructible
+        // in a unit test, so we exercise the retain predicate via the
+        // simpler ToolPreferences variant.)
+        let (exec, _dir) = test_executor();
+
+        exec.record_task_state_rollback(
+            TaskManagerSnapshot {
+                tasks: vec![],
+                next_task_id: 1,
+            },
+            "task-seed",
+        );
+        exec.record_session_state_rollback(
+            "prefs-seed".to_string(),
+            SessionStateRollbackAction::ToolPreferences {
+                previous_pinned_tools: vec!["bash".into()],
+                previous_deprioritized_tools: vec![],
+            },
+        );
+        assert_eq!(exec.session_state_entries().len(), 2);
+
+        let new_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let exec = exec.with_task_store(new_store);
+
+        let surviving = exec.session_state_entries();
+        assert_eq!(
+            surviving.len(),
+            1,
+            "exactly the ToolPreferences entry should survive"
+        );
+        assert!(matches!(
+            surviving[0].action,
+            SessionStateRollbackAction::ToolPreferences { .. }
+        ));
     }
 }

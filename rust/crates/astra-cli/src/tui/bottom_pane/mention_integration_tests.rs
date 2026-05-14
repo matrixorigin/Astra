@@ -164,11 +164,7 @@ fn slash_and_mention_are_mutually_exclusive() {
     let mut bp = fresh();
     // Register slash items so slash menu can open.
     use crate::tui::slash_menu::SlashItem;
-    bp.set_slash_items(vec![SlashItem {
-        name: "/help",
-        description: "show help",
-        subcommands: &[],
-    }]);
+    bp.set_slash_items(vec![SlashItem::simple("/help", "show help")]);
 
     let _ = bp.handle_key(key('/'));
     assert!(bp.slash_menu_is_open());

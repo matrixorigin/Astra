@@ -1,5 +1,17 @@
 use super::*;
 
+/// Parse a task-tool response into JSON, tolerating the human-readable
+/// summary line that `prefix_summary` prepends to success responses.
+/// Strips everything up to the first `{`.
+fn parse_task_json(response: &str) -> serde_json::Value {
+    let body = response
+        .find('{')
+        .map(|pos| &response[pos..])
+        .unwrap_or(response);
+    serde_json::from_str(body)
+        .unwrap_or_else(|e| panic!("task response not JSON: {e}; raw: {response}"))
+}
+
 // ── Task tool tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -16,7 +28,7 @@ async fn task_create_returns_task_id() {
     let dir = tempfile::tempdir().unwrap();
     let exe = ToolExecutor::new(dir.path());
     let result = exe.task_create(&json!({"title": "Test task"})).await;
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let parsed = parse_task_json(&result);
     assert_eq!(
         parsed["success"], true,
         "task_create must succeed — got: {result}"
@@ -81,7 +93,7 @@ async fn task_update_changes_status() {
             "status": "in_progress"
         }))
         .await;
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let parsed = parse_task_json(&result);
     assert!(parsed["success"].as_bool().unwrap());
     assert_eq!(parsed["previous_status"], "pending");
     assert_eq!(parsed["status"], "in_progress");
@@ -141,7 +153,7 @@ async fn task_update_reports_previous_subtask_status() {
             "status": "completed"
         }))
         .await;
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let parsed = parse_task_json(&result);
 
     assert!(parsed["success"].as_bool().unwrap());
     assert_eq!(parsed["previous_status"], "pending");
@@ -220,7 +232,7 @@ async fn task_stop_cancels_running_task() {
             "reason": "Taking too long"
         }))
         .await;
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let parsed = parse_task_json(&result);
 
     assert!(parsed["success"].as_bool().unwrap());
     assert_eq!(parsed["previous_status"], "in_progress");
@@ -245,7 +257,7 @@ async fn task_stop_cancels_pending_task() {
 
     // Stop it while pending
     let result = exe.task_stop(&json!({"task_id": "task-1"})).await;
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let parsed = parse_task_json(&result);
 
     assert!(parsed["success"].as_bool().unwrap());
     assert_eq!(parsed["previous_status"], "pending");
@@ -266,7 +278,7 @@ async fn task_stop_rejects_completed_task() {
 
     // Try to stop it
     let result = exe.task_stop(&json!({"task_id": "task-1"})).await;
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let parsed = parse_task_json(&result);
 
     assert!(!parsed["success"].as_bool().unwrap());
     assert!(parsed["message"].as_str().unwrap().contains("Cannot stop"));
@@ -296,7 +308,7 @@ async fn task_stop_cancels_subtasks() {
 
     // Stop it
     let result = exe.task_stop(&json!({"task_id": "task-1"})).await;
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let parsed = parse_task_json(&result);
 
     assert!(parsed["success"].as_bool().unwrap());
     assert_eq!(parsed["cancelled_subtasks"], 2);

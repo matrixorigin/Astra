@@ -180,3 +180,50 @@ fn skill_listing_contains_skill_invocation_nudge() {
         section.text
     );
 }
+
+/// REGRESSION (session 5e74f365): the listing nudge said
+/// "call the `skill` tool with that skill's name FIRST (before any
+/// other tool)". This was a hard imperative — it routed every request
+/// matching a skill (e.g. `review-changes` matching "review latest
+/// commit") through the skill, even when the user explicitly asked
+/// for parallel agents ("多agents review", "3 agents review"). The
+/// model never reached `agent.spawn`.
+///
+/// Fix: soften the nudge so explicit user intent for parallel
+/// fan-out wins over skill routing. The nudge now must mention BOTH
+/// the parallel-agent override AND name `agent.spawn` as the path
+/// (so the model has a concrete next step, not just "don't use the
+/// skill").
+#[test]
+fn skill_listing_nudge_carves_out_parallel_agent_intent() {
+    let section =
+        build_skill_listing_section(&[skill("review-changes", "Review code changes")]).unwrap();
+    let body = &section.text;
+
+    // The hard "FIRST (before any other tool)" imperative is gone.
+    // Tolerate any case-insensitive variant of "FIRST" only when it's
+    // qualified — assert the *unqualified* hard form is absent.
+    assert!(
+        !body.contains("FIRST (before any other tool)"),
+        "the unqualified 'FIRST (before any other tool)' rule must be \
+         removed — it overrode explicit user parallel-agent intent. \
+         Got:\n{body}"
+    );
+
+    // The nudge MUST tell the model that parallel-agent requests
+    // bypass skill routing and go to agent.spawn.
+    let lower = body.to_ascii_lowercase();
+    assert!(
+        lower.contains("parallel")
+            || lower.contains("multi-agent")
+            || lower.contains("multiple agents"),
+        "nudge must name the parallel-agent override (the very intent \
+         that was being silently routed through skills). Got:\n{body}"
+    );
+    assert!(
+        body.contains("agent.spawn") || body.contains("agent(action='spawn')"),
+        "nudge must point at `agent.spawn` so the model has a concrete \
+         alternative path when the user wants parallel fan-out. \
+         Got:\n{body}"
+    );
+}
