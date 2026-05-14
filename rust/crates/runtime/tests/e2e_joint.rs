@@ -1707,10 +1707,21 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
         expired >= 1,
         "S14 sweeper must expire at least device-2 lease, got {expired}"
     );
-    let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("S14 device lease SSE parity event must be published")
-        .expect("S14 device lease event receiver must be open");
+    let event = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = rx
+                .recv()
+                .await
+                .expect("S14 device lease event receiver must be open");
+            if event.get("session_id").and_then(Value::as_str) == Some(session_id.as_str())
+                && event.get("device_id").and_then(Value::as_str) == Some("device-2")
+            {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("S14 device lease SSE parity event must be published");
     assert!(
         event.get("type").and_then(Value::as_str) == Some("device_lease_expired")
             && event.get("device_id").and_then(Value::as_str) == Some("device-2"),

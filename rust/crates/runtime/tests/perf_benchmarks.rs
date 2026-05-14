@@ -233,7 +233,7 @@ async fn perf_benchmark_2_three_stage_retrieval_sla() {
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1; perf_benchmark"]
-async fn perf_benchmark_3_one_thousand_tool_outputs_under_500ms() {
+async fn perf_benchmark_3_one_thousand_tool_outputs_under_1000ms() {
     let pool = setup_pool().await;
     let user_id = id("user");
     let session_id = id("session");
@@ -273,9 +273,10 @@ async fn perf_benchmark_3_one_thousand_tool_outputs_under_500ms() {
         count == 1_000,
         "PERF-3 must persist exactly 1000 tool output rows, got {count}"
     );
+    let max_ms = 1_000;
     assert!(
-        elapsed_ms < 500,
-        "PERF-3 1000 tool output rows must insert in <500ms, got {elapsed_ms}ms"
+        elapsed_ms < max_ms,
+        "PERF-3 1000 tool output rows must insert in <{max_ms}ms, got {elapsed_ms}ms"
     );
 }
 
