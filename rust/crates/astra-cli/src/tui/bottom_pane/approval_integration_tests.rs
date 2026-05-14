@@ -10,6 +10,7 @@ use super::{ApprovalActivation, BottomPane, BottomPaneAction};
 use crate::chat_stream::ApprovalResponse;
 use crate::tui::approval::queue::ApprovalMetadata;
 use crate::tui::slash_menu::SlashItem;
+use astra_turn_core::permission_match_target::AllowMatchTarget;
 use astra_turn_core::permission_scope::AllowScope;
 
 fn key(c: char) -> KeyEvent {
@@ -414,17 +415,22 @@ fn up_moves_focus_like_left_wrapping_to_skip() {
 }
 
 #[test]
-fn up_down_reach_turn_scope_button() {
-    // End-to-end: the user wants a scoped Always decision via Up/Down only.
-    // From Accept (index 0), Down twice lands on Turn (index 2).
+fn up_down_reach_turn_scope_then_exact_match_button() {
+    // End-to-end: scope selection is step one; match target is step two.
+    // From Accept (index 0), Down twice lands on Turn (index 2), then
+    // Enter opens match targets where Exact is focused by default.
     let mut bp = BottomPane::new();
     let rx = enqueue(&mut bp, "bash");
     let _ = bp.handle_key(special(KeyCode::Down));
     let _ = bp.handle_key(special(KeyCode::Down));
     let _ = bp.handle_key(special(KeyCode::Enter));
+    let _ = bp.handle_key(special(KeyCode::Enter));
     assert_eq!(
         rx.blocking_recv().unwrap(),
-        ApprovalResponse::AlwaysAllowScoped(AllowScope::RestOfTurn)
+        ApprovalResponse::AlwaysAllowScopedTarget {
+            scope: AllowScope::RestOfTurn,
+            match_target: AllowMatchTarget::Exact,
+        }
     );
 }
 

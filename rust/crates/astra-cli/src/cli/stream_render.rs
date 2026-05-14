@@ -246,7 +246,7 @@ enum ApprovalMemoryAction {
 }
 
 fn approval_memory_action(
-    response: super::chat_stream::ApprovalResponse,
+    response: &super::chat_stream::ApprovalResponse,
     always_scope: astra_turn_core::permission_scope::AllowScope,
     stale_revalidation_passed: bool,
 ) -> ApprovalMemoryAction {
@@ -259,7 +259,9 @@ fn approval_memory_action(
 
     match response {
         ApprovalResponse::AllowOnce => ApprovalMemoryAction::None,
-        ApprovalResponse::AlwaysAllow | ApprovalResponse::AlwaysAllowScoped(_) => {
+        ApprovalResponse::AlwaysAllow
+        | ApprovalResponse::AlwaysAllowScoped(_)
+        | ApprovalResponse::AlwaysAllowScopedTarget { .. } => {
             let selected_scope = response.always_scope(always_scope).unwrap_or(always_scope);
             match selected_scope {
                 AllowScope::Project => ApprovalMemoryAction::PersistProjectRule,
@@ -278,10 +280,17 @@ fn persist_scoped_allow_rule(
     target: astra_turn_core::permission_audit::PersistTarget,
     tool: &str,
     args: &Value,
+    match_target: Option<&astra_turn_core::permission_match_target::AllowMatchTarget>,
     save_warning_tx: Option<&super::chat_stream::StreamEventTx>,
 ) {
-    pm.record_approval(tool, Some(args), true);
-    let rule = crate::permission_manager::PermissionManager::make_allow_rule(tool, args);
+    let default_target = astra_turn_core::permission_match_target::default_match_target(tool, args);
+    let match_target = match_target.unwrap_or(&default_target);
+    pm.record_approval_with_match_target(tool, args, match_target, true);
+    let rule = crate::permission_manager::PermissionManager::make_allow_rule_with_match_target(
+        tool,
+        args,
+        match_target,
+    );
     match target {
         astra_turn_core::permission_audit::PersistTarget::Project => pm.add_allow_rule(&rule),
         astra_turn_core::permission_audit::PersistTarget::User => pm.add_user_allow_rule(&rule),
@@ -308,15 +317,18 @@ fn apply_approval_memory_action(
     action: ApprovalMemoryAction,
     tool: &str,
     args: &Value,
+    match_target: Option<&astra_turn_core::permission_match_target::AllowMatchTarget>,
     save_warning_tx: Option<&super::chat_stream::StreamEventTx>,
 ) {
+    let default_target = astra_turn_core::permission_match_target::default_match_target(tool, args);
+    let match_target = match_target.unwrap_or(&default_target);
     match action {
         ApprovalMemoryAction::None => {}
         ApprovalMemoryAction::RecordAllowTurn => {
-            pm.record_turn_approval(tool, Some(args), true);
+            pm.record_turn_approval_with_match_target(tool, args, match_target, true);
         }
         ApprovalMemoryAction::RecordAllowSession => {
-            pm.record_approval(tool, Some(args), true);
+            pm.record_approval_with_match_target(tool, args, match_target, true);
         }
         ApprovalMemoryAction::RecordDenySession => {
             pm.record_approval(tool, Some(args), false);
@@ -327,6 +339,7 @@ fn apply_approval_memory_action(
                 astra_turn_core::permission_audit::PersistTarget::Project,
                 tool,
                 args,
+                Some(match_target),
                 save_warning_tx,
             );
         }
@@ -336,6 +349,7 @@ fn apply_approval_memory_action(
                 astra_turn_core::permission_audit::PersistTarget::User,
                 tool,
                 args,
+                Some(match_target),
                 save_warning_tx,
             );
         }
@@ -2047,11 +2061,17 @@ impl CliSseStreamHost<'_> {
             // Explicit cloud approvals are confirm-once by contract,
             // so treat Always as AllowOnce until the P3 scope picker
             // can disable persistent scopes for this prompt kind.
-            ApprovalResponse::AlwaysAllow | ApprovalResponse::AlwaysAllowScoped(_) if explicit => {
+            ApprovalResponse::AlwaysAllow
+            | ApprovalResponse::AlwaysAllowScoped(_)
+            | ApprovalResponse::AlwaysAllowScopedTarget { .. }
+                if explicit =>
+            {
                 ApprovalDecision::Allow
             }
-            ApprovalResponse::AlwaysAllow | ApprovalResponse::AlwaysAllowScoped(_) => {
-                let action = approval_memory_action(response, always_scope, true);
+            ApprovalResponse::AlwaysAllow
+            | ApprovalResponse::AlwaysAllowScoped(_)
+            | ApprovalResponse::AlwaysAllowScopedTarget { .. } => {
+                let action = approval_memory_action(&response, always_scope, true);
                 let save_warning_tx = self.stream_event_tx.clone();
                 if let Some(pm) = self.perm_manager.as_mut() {
                     apply_approval_memory_action(
@@ -2059,6 +2079,7 @@ impl CliSseStreamHost<'_> {
                         action,
                         tool,
                         &approval_args,
+                        response.match_target(),
                         save_warning_tx.as_ref(),
                     );
                 }
@@ -2418,6 +2439,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     metadata.is_compound_command = scope_ctx.is_compound_command;
                     metadata.has_dynamic_eval = scope_ctx.has_dynamic_eval;
                     let always_scope = approval_default_always_scope(&scope_ctx);
+                    metadata.custom_match_source =
+                        astra_turn_core::permission_match_target::custom_prefix_source(&t, args);
 
                     // Will-save: what would Always persist? We use
                     // the same make_allow_rule the post-resolve
@@ -2584,12 +2607,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         apply_approval_memory_action(
                             pm,
                             approval_memory_action(
-                                response,
+                                &response,
                                 always_scope,
                                 stale_revalidation_passed,
                             ),
                             &t,
                             args,
+                            response.match_target(),
                             save_warning_tx.as_ref(),
                         );
                     }
@@ -2625,6 +2649,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             ApprovalResponse::AlwaysAllowScoped(_) => {
                                 astra_turn_core::approval_sink::ApprovalResponse::AlwaysAllow
                             }
+                            ApprovalResponse::AlwaysAllowScopedTarget { .. } => {
+                                astra_turn_core::approval_sink::ApprovalResponse::AlwaysAllow
+                            }
                             ApprovalResponse::Deny => {
                                 astra_turn_core::approval_sink::ApprovalResponse::Deny
                             }
@@ -2635,6 +2662,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         let scope = response
                             .always_scope(always_scope)
                             .map(audit_scope_for_always);
+                        let match_target = response.match_target().cloned().or_else(|| {
+                            response.always_scope(always_scope).map(|_| {
+                                astra_turn_core::permission_match_target::default_match_target(
+                                    &t, args,
+                                )
+                            })
+                        });
                         astra_turn_core::permission_audit::record_resolved_for_session(
                             self.executor.active_session_id().as_deref(),
                             astra_turn_core::permission_audit::ApprovalResolvedEvent {
@@ -2643,6 +2677,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 request_key,
                                 response: core_response,
                                 scope,
+                                match_target,
                                 stale_revalidation_passed,
                             },
                         );
@@ -3574,9 +3609,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 let save_warning_tx = self.stream_event_tx.clone();
                                 apply_approval_memory_action(
                                     pm,
-                                    approval_memory_action(response, always_scope, true),
+                                    approval_memory_action(&response, always_scope, true),
                                     &approval_tool,
                                     &guard_args,
+                                    response.match_target(),
                                     save_warning_tx.as_ref(),
                                 );
                             } else {
@@ -7483,7 +7519,7 @@ mod tests {
         use astra_turn_core::permission_scope::AllowScope;
 
         assert_eq!(
-            approval_memory_action(ApprovalResponse::AllowOnce, AllowScope::Project, true),
+            approval_memory_action(&ApprovalResponse::AllowOnce, AllowScope::Project, true),
             ApprovalMemoryAction::None
         );
     }
@@ -7494,20 +7530,20 @@ mod tests {
         use astra_turn_core::permission_scope::AllowScope;
 
         assert_eq!(
-            approval_memory_action(ApprovalResponse::AlwaysAllow, AllowScope::Project, true),
+            approval_memory_action(&ApprovalResponse::AlwaysAllow, AllowScope::Project, true),
             ApprovalMemoryAction::PersistProjectRule
         );
         assert_eq!(
-            approval_memory_action(ApprovalResponse::AlwaysAllow, AllowScope::User, true),
+            approval_memory_action(&ApprovalResponse::AlwaysAllow, AllowScope::User, true),
             ApprovalMemoryAction::PersistUserRule
         );
         assert_eq!(
-            approval_memory_action(ApprovalResponse::AlwaysAllow, AllowScope::RestOfTurn, true),
+            approval_memory_action(&ApprovalResponse::AlwaysAllow, AllowScope::RestOfTurn, true),
             ApprovalMemoryAction::RecordAllowTurn
         );
         assert_eq!(
             approval_memory_action(
-                ApprovalResponse::AlwaysAllow,
+                &ApprovalResponse::AlwaysAllow,
                 AllowScope::RestOfSession,
                 true
             ),
@@ -7515,14 +7551,14 @@ mod tests {
         );
         assert_eq!(
             approval_memory_action(
-                ApprovalResponse::AlwaysAllow,
+                &ApprovalResponse::AlwaysAllow,
                 AllowScope::OnceThisCall,
                 true
             ),
             ApprovalMemoryAction::None
         );
         assert_eq!(
-            approval_memory_action(ApprovalResponse::AlwaysAllow, AllowScope::Project, false),
+            approval_memory_action(&ApprovalResponse::AlwaysAllow, AllowScope::Project, false),
             ApprovalMemoryAction::RecordDenySession
         );
     }

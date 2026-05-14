@@ -58,6 +58,7 @@ use crate::approval_sink::ApprovalResponse;
 use crate::permission_engine::{
     DecisionEnvelope, DecisionSource, HardDecision, RiskTag, RuleOrigin,
 };
+use crate::permission_match_target::AllowMatchTarget;
 
 /// Global ring-buffer cap per event kind.
 const RING_BUFFER_CAPACITY: usize = 1000;
@@ -213,6 +214,10 @@ pub struct ApprovalResolvedEvent {
     pub response: ApprovalResponse,
     /// `Some(_)` when the response was AlwaysAllow.
     pub scope: Option<AllowScope>,
+    /// `Some(_)` when the user selected what future request the
+    /// scoped approval should match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_target: Option<AllowMatchTarget>,
     /// True if the executor's pre-execute revalidation (P5f
     /// stale-check) confirmed the file/payload hadn't changed
     /// since approval. Always true for non-edit tools.
@@ -567,9 +572,19 @@ fn format_audit_event(event: &PermissionAuditEvent) -> String {
                 .scope
                 .map(|s| format!("{s:?}"))
                 .unwrap_or_else(|| "none".to_string());
+            let match_target = e
+                .match_target
+                .as_ref()
+                .map(|target| format!("{target:?}"))
+                .unwrap_or_else(|| "none".to_string());
             format!(
-                "{} resolved {} -> {:?} scope={} stale_ok={}",
-                e.timestamp_ms, e.request_key.tool, e.response, scope, e.stale_revalidation_passed
+                "{} resolved {} -> {:?} scope={} match_target={} stale_ok={}",
+                e.timestamp_ms,
+                e.request_key.tool,
+                e.response,
+                scope,
+                match_target,
+                e.stale_revalidation_passed
             )
         }
         PermissionAuditEvent::Persisted(e) => {
@@ -614,6 +629,7 @@ fn redact_event_for_export(event: PermissionAuditEvent) -> PermissionAuditEvent 
         }
         PermissionAuditEvent::Resolved(mut e) => {
             e.request_key = redact_request_key_for_export(e.request_key);
+            e.match_target = e.match_target.map(redact_match_target_for_export);
             PermissionAuditEvent::Resolved(e)
         }
         PermissionAuditEvent::Persisted(mut e) => {
@@ -621,6 +637,15 @@ fn redact_event_for_export(event: PermissionAuditEvent) -> PermissionAuditEvent 
             e.failure_reason = e.failure_reason.map(redact_text_for_export);
             PermissionAuditEvent::Persisted(e)
         }
+    }
+}
+
+fn redact_match_target_for_export(target: AllowMatchTarget) -> AllowMatchTarget {
+    match target {
+        AllowMatchTarget::Prefix(prefix) => {
+            AllowMatchTarget::Prefix(redact_text_for_export(prefix))
+        }
+        other => other,
     }
 }
 
@@ -687,6 +712,7 @@ mod tests {
             request_key: fixture_request(),
             response: ApprovalResponse::AllowOnce,
             scope: Some(AllowScope::OnceThisCall),
+            match_target: Some(AllowMatchTarget::Exact),
             stale_revalidation_passed: true,
         });
         r.push_persisted(RulePersistedEvent {
@@ -727,6 +753,25 @@ mod tests {
         // events without inspecting fields.
         assert!(line.contains("\"kind\":\"evaluated\""));
         assert!(line.contains("\"decision\":\"allow\""));
+    }
+
+    #[test]
+    fn resolved_event_serializes_scope_and_match_target() {
+        let event = PermissionAuditEvent::Resolved(ApprovalResolvedEvent {
+            timestamp_ms: 2,
+            correlation_id: "c-resolved".into(),
+            request_key: fixture_request(),
+            response: ApprovalResponse::AlwaysAllow,
+            scope: Some(AllowScope::RestOfSession),
+            match_target: Some(AllowMatchTarget::Tool),
+            stale_revalidation_passed: true,
+        });
+
+        let line = serde_json::to_string(&event).unwrap();
+        assert!(line.contains("\"kind\":\"resolved\""));
+        assert!(line.contains("\"scope\":\"rest_of_session\""));
+        assert!(line.contains("\"match_target\""));
+        assert!(line.contains("\"kind\":\"tool\""));
     }
 
     #[test]

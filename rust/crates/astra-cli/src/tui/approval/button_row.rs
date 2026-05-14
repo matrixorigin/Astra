@@ -1,8 +1,8 @@
 //! Pure logic for the Cursor-style button row on an approval cell.
 //!
-//! The cell renders a horizontal row of buttons (Accept / Reject / Always
-//! / Skip) with a focus index. Arrow keys shift focus; Enter activates
-//! the focused button to produce an `ApprovalResponse`.
+//! The cell renders a horizontal row of buttons with a focus index. Arrow
+//! keys shift focus; Enter either resolves the approval or advances from
+//! scope selection into match-target selection.
 //!
 //! When the pending queue contains more than one entry we prepend two
 //! **batch buttons** (Accept all / Reject all). Those are surfaced
@@ -12,19 +12,28 @@
 #![allow(dead_code)]
 
 use crate::chat_stream::ApprovalResponse;
+use astra_turn_core::permission_match_target::AllowMatchTarget;
 use astra_turn_core::permission_scope::AllowScope;
 
 /// What a single button does when Enter fires.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ButtonAction {
     /// Resolve the focused approval with this response.
     Respond(ApprovalResponse),
     /// Resolve the focused approval's batch group with this response.
     RespondAll(ApprovalResponse),
+    /// Move from scope selection into match-target selection.
+    SelectScope(AllowScope),
+    /// Resolve the selected scope with this match target.
+    SelectMatch(AllowMatchTarget),
+    /// Return from match-target selection to scope selection.
+    BackToScopes,
+    /// Enter custom-prefix input mode.
+    EditCustomPrefix,
 }
 
 /// Static metadata for a button.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Button {
     pub label: &'static str,
     pub action: ButtonAction,
@@ -53,21 +62,19 @@ pub(crate) const PRIMARY_BUTTONS: &[Button] = &[
     },
     Button {
         label: "Turn",
-        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(AllowScope::RestOfTurn)),
+        action: ButtonAction::SelectScope(AllowScope::RestOfTurn),
     },
     Button {
         label: "Session",
-        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(
-            AllowScope::RestOfSession,
-        )),
+        action: ButtonAction::SelectScope(AllowScope::RestOfSession),
     },
     Button {
         label: "Project",
-        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(AllowScope::Project)),
+        action: ButtonAction::SelectScope(AllowScope::Project),
     },
     Button {
         label: "User",
-        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(AllowScope::User)),
+        action: ButtonAction::SelectScope(AllowScope::User),
     },
     Button {
         label: "Skip",
@@ -101,21 +108,19 @@ pub(crate) const PRIMARY_WITH_BATCH: &[Button] = &[
     },
     Button {
         label: "Turn",
-        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(AllowScope::RestOfTurn)),
+        action: ButtonAction::SelectScope(AllowScope::RestOfTurn),
     },
     Button {
         label: "Session",
-        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(
-            AllowScope::RestOfSession,
-        )),
+        action: ButtonAction::SelectScope(AllowScope::RestOfSession),
     },
     Button {
         label: "Project",
-        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(AllowScope::Project)),
+        action: ButtonAction::SelectScope(AllowScope::Project),
     },
     Button {
         label: "User",
-        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(AllowScope::User)),
+        action: ButtonAction::SelectScope(AllowScope::User),
     },
     Button {
         label: "Skip",
@@ -128,6 +133,25 @@ pub(crate) const PRIMARY_WITH_BATCH: &[Button] = &[
     Button {
         label: "Reject all",
         action: ButtonAction::RespondAll(ApprovalResponse::Deny),
+    },
+];
+
+pub(crate) const MATCH_TARGET_BUTTONS: &[Button] = &[
+    Button {
+        label: "Exact",
+        action: ButtonAction::SelectMatch(AllowMatchTarget::Exact),
+    },
+    Button {
+        label: "This tool",
+        action: ButtonAction::SelectMatch(AllowMatchTarget::Tool),
+    },
+    Button {
+        label: "Custom prefix",
+        action: ButtonAction::EditCustomPrefix,
+    },
+    Button {
+        label: "Back",
+        action: ButtonAction::BackToScopes,
     },
 ];
 
@@ -160,6 +184,13 @@ impl ButtonRow {
     pub fn primary_with_batch() -> Self {
         Self {
             buttons: PRIMARY_WITH_BATCH,
+            focus: 0,
+        }
+    }
+
+    pub fn match_targets() -> Self {
+        Self {
+            buttons: MATCH_TARGET_BUTTONS,
             focus: 0,
         }
     }
@@ -200,7 +231,7 @@ impl ButtonRow {
         if let Some(pos) = self
             .buttons
             .iter()
-            .position(|b| matches!(b.action, ButtonAction::Respond(ApprovalResponse::Deny)))
+            .position(|b| matches!(&b.action, ButtonAction::Respond(ApprovalResponse::Deny)))
         {
             self.focus = pos;
         }
@@ -208,6 +239,6 @@ impl ButtonRow {
 
     /// What the currently focused button produces on activation.
     pub fn activate(&self) -> Option<ButtonAction> {
-        self.buttons.get(self.focus).map(|b| b.action)
+        self.buttons.get(self.focus).map(|b| b.action.clone())
     }
 }

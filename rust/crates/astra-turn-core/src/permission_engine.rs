@@ -52,17 +52,16 @@ use astra_sandbox::{is_dangerous_file_path, is_soft_violation, validate_git_comm
 use serde_json::Value;
 
 use crate::action_compensation::explicit_approval_reason;
-use crate::approval_fingerprint::{
-    ApprovalFingerprint, FingerprintedOverrides, normalize_path_pattern,
-};
+use crate::approval_fingerprint::{ApprovalFingerprint, FingerprintedOverrides};
 use crate::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind_with_args};
 use crate::parallel_tool_exec::is_read_only_tool_with_args;
-use crate::permission_rule_grammar::{PermissionRuleV2, serialize_rule_v2};
+use crate::permission_match_target::{
+    AllowMatchTarget, allow_rule_for_match_target, default_match_target,
+};
 use crate::permission_types::{PermissionMode, PermissionSyncContext};
 use crate::safety_middleware::{SafetyMiddlewareDecision, evaluate_tool_safety_request};
 use crate::tool_argument_hints::{
-    command_hint_from_args, normalized_argv_prefix, path_hint_from_args,
-    permission_prompt_primary_detail,
+    command_hint_from_args, path_hint_from_args, permission_prompt_primary_detail,
 };
 
 /// Final outcome of a permission evaluation.
@@ -819,48 +818,16 @@ pub fn evaluate_permission(
 /// Preview the rule that an "Always allow" action would persist for this call.
 #[must_use]
 pub fn allow_rule_preview(tool_name: &str, args: &Value) -> String {
-    match cloud_gated_tool_kind_with_args(tool_name, Some(args)) {
-        Some(CloudGatedToolKind::Execute) => {
-            if let Some(rule) = command_allow_rule_preview(tool_name, args) {
-                return rule;
-            }
-        }
-        Some(CloudGatedToolKind::Write) => {
-            if let Some(path) = path_hint_from_args(args) {
-                return serialize_rule_v2(&PermissionRuleV2 {
-                    tool: tool_name.to_string(),
-                    argv_prefix: None,
-                    path_glob: Some(normalize_path_pattern(&path)),
-                    op: Some("write".to_string()),
-                    cwd_root: None,
-                    git_branch: None,
-                    domain: None,
-                    capability: None,
-                    extra: Default::default(),
-                });
-            }
-        }
-        None => {
-            if let Some(rule) = command_allow_rule_preview(tool_name, args) {
-                return rule;
-            }
-        }
-    }
-    tool_name.to_string()
+    allow_rule_for_match_target(tool_name, args, &default_match_target(tool_name, args))
 }
 
-fn command_allow_rule_preview(tool_name: &str, args: &Value) -> Option<String> {
-    let cmd = command_hint_from_args(args)?;
-    let prefix = normalized_argv_prefix(cmd);
-    if prefix.is_empty() {
-        return None;
-    }
-    let mut chars = tool_name.chars();
-    let cap = match chars.next() {
-        None => tool_name.to_string(),
-        Some(first) => first.to_uppercase().to_string() + chars.as_str(),
-    };
-    Some(format!("{cap}({prefix}:*)"))
+#[must_use]
+pub fn allow_rule_preview_for_match_target(
+    tool_name: &str,
+    args: &Value,
+    target: &AllowMatchTarget,
+) -> String {
+    allow_rule_for_match_target(tool_name, args, target)
 }
 
 fn envelope(

@@ -400,16 +400,33 @@ impl BottomPane {
         let action = self.approval_queue.focused_button_action()?;
         match action {
             ButtonAction::Respond(resp) => {
-                let id = self.respond_focused_approval(resp)?;
+                let id = self.respond_focused_approval(resp.clone())?;
                 Some(ApprovalActivation::Single { id, response: resp })
             }
             ButtonAction::RespondAll(resp) => {
-                let n = self.approval_queue.respond_focused_group(resp);
+                let n = self.approval_queue.respond_focused_group(resp.clone());
                 self.footer.pending_approvals = self.approval_queue.len();
                 Some(ApprovalActivation::Batch {
                     count: n,
                     response: resp,
                 })
+            }
+            ButtonAction::SelectScope(scope) => {
+                self.approval_queue.select_scope_for_focused(scope);
+                None
+            }
+            ButtonAction::SelectMatch(target) => {
+                let response = self.approval_queue.response_for_match_target(target)?;
+                let id = self.respond_focused_approval(response.clone())?;
+                Some(ApprovalActivation::Single { id, response })
+            }
+            ButtonAction::EditCustomPrefix => {
+                self.approval_queue.enter_custom_prefix_for_focused();
+                None
+            }
+            ButtonAction::BackToScopes => {
+                self.approval_queue.back_to_scope_for_focused();
+                None
             }
         }
     }
@@ -484,6 +501,12 @@ impl BottomPane {
         }
         if let Some(preview) = view.will_save_preview {
             cell = cell.with_will_save_preview(preview);
+        }
+        if let Some(hint) = view.selection_hint {
+            cell = cell.with_selection_hint(hint);
+        }
+        if let Some(input) = view.custom_match_input {
+            cell = cell.with_custom_match_input(input);
         }
         cell = cell.with_scope_context(
             view.workspace_untrusted,
@@ -596,6 +619,34 @@ impl BottomPane {
         // any letter shortcut risks consuming text the user is still
         // typing.
         if self.has_pending_approvals() {
+            if self.approval_queue.focused_custom_prefix_active() {
+                match key.code {
+                    KeyCode::Enter => {
+                        if let Some(response) =
+                            self.approval_queue.submit_custom_prefix_for_focused()
+                        {
+                            if let Some(id) = self.respond_focused_approval(response) {
+                                return BottomPaneAction::ApprovalResolved { id };
+                            }
+                        }
+                        return BottomPaneAction::Consumed;
+                    }
+                    KeyCode::Esc => {
+                        self.approval_queue.cancel_custom_prefix_for_focused();
+                        return BottomPaneAction::Consumed;
+                    }
+                    KeyCode::Backspace => {
+                        self.approval_queue.pop_custom_prefix_char();
+                        return BottomPaneAction::Consumed;
+                    }
+                    KeyCode::Char(ch) if !ctrl => {
+                        self.approval_queue.push_custom_prefix_char(ch);
+                        return BottomPaneAction::Consumed;
+                    }
+                    _ => {}
+                }
+            }
+
             // Ctrl+Enter → quick accept regardless of button focus.
             if key.code == KeyCode::Enter && ctrl {
                 if let Some(id) = self.respond_focused_approval(ApprovalResponse::AllowOnce) {
@@ -993,7 +1044,7 @@ fn render_hint_bar(hint: &str, area: Rect, buf: &mut Buffer) {
 
 /// Summary of what happened when the user activates a button on the
 /// focused approval cell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ApprovalActivation {
     /// Resolved a single entry via its button.
     Single { id: u64, response: ApprovalResponse },

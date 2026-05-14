@@ -58,6 +58,21 @@ impl std::str::FromStr for PermissionMode {
 
 // ─── Permission Rules ───────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionPatternMatch {
+    #[default]
+    Prefix,
+    Exact,
+}
+
+impl PermissionPatternMatch {
+    #[must_use]
+    pub fn is_prefix(&self) -> bool {
+        *self == Self::Prefix
+    }
+}
+
 /// A permission rule that can be inherited or synchronized.
 ///
 /// Format: `tool_name` or `tool_name(pattern:*)` for prefix matching.
@@ -72,6 +87,10 @@ pub struct PermissionRule {
     /// Optional command prefix for execute tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
+    /// Whether `pattern` is a legacy prefix/glob match or an exact
+    /// command/path match.
+    #[serde(default, skip_serializing_if = "PermissionPatternMatch::is_prefix")]
+    pub pattern_match: PermissionPatternMatch,
     /// Optional operation kind constraint (`read`, `write`, `execute`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op: Option<String>,
@@ -95,6 +114,7 @@ impl PermissionRule {
         Self {
             tool: name.into().to_lowercase(),
             pattern: None,
+            pattern_match: PermissionPatternMatch::Prefix,
             op: None,
             cwd_root: None,
             git_branch: None,
@@ -108,6 +128,7 @@ impl PermissionRule {
         Self {
             tool: name.into().to_lowercase(),
             pattern: Some(pattern.into()),
+            pattern_match: PermissionPatternMatch::Prefix,
             op: None,
             cwd_root: None,
             git_branch: None,
@@ -129,19 +150,32 @@ impl PermissionRule {
         } else {
             lower_family.clone()
         };
-        let pattern = if lower_family == "bash" {
-            rule.argv_prefix.clone()
+        let (pattern, pattern_match) = if lower_family == "bash" {
+            if let Some(exact) = rule.argv_exact.clone() {
+                (Some(exact), PermissionPatternMatch::Exact)
+            } else {
+                (rule.argv_prefix.clone(), PermissionPatternMatch::Prefix)
+            }
         } else if matches!(lower_family.as_str(), "edit" | "read" | "view") {
-            rule.path_glob.clone()
+            (rule.path_glob.clone(), PermissionPatternMatch::Prefix)
         } else {
-            rule.argv_prefix
-                .clone()
-                .or_else(|| rule.path_glob.clone())
-                .or_else(|| rule.extra.get("pattern").cloned())
+            (
+                rule.argv_exact
+                    .clone()
+                    .or_else(|| rule.argv_prefix.clone())
+                    .or_else(|| rule.path_glob.clone())
+                    .or_else(|| rule.extra.get("pattern").cloned()),
+                if rule.argv_exact.is_some() {
+                    PermissionPatternMatch::Exact
+                } else {
+                    PermissionPatternMatch::Prefix
+                },
+            )
         };
         Self {
             tool,
             pattern,
+            pattern_match,
             op: rule.op,
             cwd_root: rule.cwd_root,
             git_branch: rule.git_branch,
@@ -163,6 +197,7 @@ impl PermissionRule {
                 return Self {
                     tool,
                     pattern: Some(pattern.to_string()),
+                    pattern_match: PermissionPatternMatch::Prefix,
                     op: None,
                     cwd_root: None,
                     git_branch: None,
@@ -174,6 +209,7 @@ impl PermissionRule {
         Self {
             tool: rule_str.to_lowercase(),
             pattern: None,
+            pattern_match: PermissionPatternMatch::Prefix,
             op: None,
             cwd_root: None,
             git_branch: None,
@@ -248,6 +284,10 @@ impl PermissionRule {
         match (&self.pattern, target) {
             (None, _) => true, // Bare tool name matches all
             (Some(pattern), Some(cmd)) => {
+                if self.pattern_match == PermissionPatternMatch::Exact {
+                    return pattern == cmd;
+                }
+
                 if target_is_constrained_path {
                     if pattern_contains_glob_metachars(pattern) {
                         return crate::permission_path_glob::glob_match(pattern, cmd);
@@ -472,6 +512,7 @@ impl std::fmt::Display for PermissionRule {
         if has_v2_constraints {
             let mut rule = crate::permission_rule_grammar::PermissionRuleV2 {
                 tool: self.tool.clone(),
+                argv_exact: None,
                 argv_prefix: None,
                 path_glob: None,
                 op: self.op.clone(),
@@ -482,7 +523,11 @@ impl std::fmt::Display for PermissionRule {
                 extra: Default::default(),
             };
             if self.tool == "bash" {
-                rule.argv_prefix = self.pattern.clone();
+                if self.pattern_match == PermissionPatternMatch::Exact {
+                    rule.argv_exact = self.pattern.clone();
+                } else {
+                    rule.argv_prefix = self.pattern.clone();
+                }
             } else {
                 rule.path_glob = self.pattern.clone();
             }

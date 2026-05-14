@@ -97,7 +97,7 @@ pub type StreamEventTx = mpsc::UnboundedSender<StreamEvent>;
 /// with P3's per-fingerprint `AllowScope::RestOfSession`. Global mode
 /// changes now go through the status line / `/mode auto` slash
 /// command; this enum stays focused on per-call decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalResponse {
     /// Allow this one invocation.
     AllowOnce,
@@ -108,25 +108,44 @@ pub enum ApprovalResponse {
     /// Always allow with an explicit user-selected scope from the
     /// TUI scope picker.
     AlwaysAllowScoped(astra_turn_core::permission_scope::AllowScope),
+    /// Always allow with both dimensions selected by the user:
+    /// lifetime/sink scope and match target.
+    AlwaysAllowScopedTarget {
+        scope: astra_turn_core::permission_scope::AllowScope,
+        match_target: astra_turn_core::permission_match_target::AllowMatchTarget,
+    },
     /// Skip this tool (deny without recording).
     Skip,
 }
 
 impl ApprovalResponse {
-    pub fn is_approved(self) -> bool {
+    pub fn is_approved(&self) -> bool {
         matches!(
             self,
-            Self::AllowOnce | Self::AlwaysAllow | Self::AlwaysAllowScoped(_)
+            Self::AllowOnce
+                | Self::AlwaysAllow
+                | Self::AlwaysAllowScoped(_)
+                | Self::AlwaysAllowScopedTarget { .. }
         )
     }
 
     pub fn always_scope(
-        self,
+        &self,
         default_scope: astra_turn_core::permission_scope::AllowScope,
     ) -> Option<astra_turn_core::permission_scope::AllowScope> {
         match self {
             Self::AlwaysAllow => Some(default_scope),
-            Self::AlwaysAllowScoped(scope) => Some(scope),
+            Self::AlwaysAllowScoped(scope) => Some(*scope),
+            Self::AlwaysAllowScopedTarget { scope, .. } => Some(*scope),
+            _ => None,
+        }
+    }
+
+    pub fn match_target(
+        &self,
+    ) -> Option<&astra_turn_core::permission_match_target::AllowMatchTarget> {
+        match self {
+            Self::AlwaysAllowScopedTarget { match_target, .. } => Some(match_target),
             _ => None,
         }
     }

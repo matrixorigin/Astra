@@ -38,6 +38,7 @@
 //! ## Examples (v2)
 //!
 //! ```text
+//! Bash(argv_exact="npm test -- --watch")
 //! Bash(argv_prefix="npm test", cwd_root="packages/web")
 //! Bash(argv_prefix="cargo test")
 //! Edit(path_glob="src/**/*.rs", op="write")
@@ -71,6 +72,11 @@ pub struct PermissionRuleV2 {
     /// Required: tool family (`Bash`, `Edit`, `Read`, `Network`,
     /// `MCP`, etc.). Stored verbatim; matchers lowercase-compare.
     pub tool: String,
+
+    /// Bash class: exact command line. Unlike `argv_prefix`, this
+    /// does not allow extra args after the stored command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv_exact: Option<String>,
 
     /// Bash class: command-line argv prefix (`"npm test"`,
     /// `"cargo test"`).
@@ -122,6 +128,7 @@ impl PermissionRuleV2 {
     pub fn bash(argv_prefix: impl Into<String>) -> Self {
         Self {
             tool: "Bash".to_string(),
+            argv_exact: None,
             argv_prefix: Some(argv_prefix.into()),
             path_glob: None,
             op: None,
@@ -138,6 +145,7 @@ impl PermissionRuleV2 {
     pub fn edit(path_glob: impl Into<String>, op: impl Into<String>) -> Self {
         Self {
             tool: "Edit".to_string(),
+            argv_exact: None,
             argv_prefix: None,
             path_glob: Some(path_glob.into()),
             op: Some(op.into()),
@@ -154,6 +162,7 @@ impl PermissionRuleV2 {
     pub fn network(tool: impl Into<String>, domain: impl Into<String>) -> Self {
         Self {
             tool: "Network".to_string(),
+            argv_exact: None,
             argv_prefix: None,
             path_glob: None,
             op: None,
@@ -229,6 +238,7 @@ pub fn parse_rule_v2(s: &str) -> Result<PermissionRuleV2, RuleParseError> {
     let Some(paren_start) = s.find('(') else {
         return Ok(PermissionRuleV2 {
             tool: s.to_string(),
+            argv_exact: None,
             argv_prefix: None,
             path_glob: None,
             op: None,
@@ -259,6 +269,7 @@ pub fn parse_rule_v2(s: &str) -> Result<PermissionRuleV2, RuleParseError> {
         let pattern = body.trim_end_matches(":*").trim_end_matches('*').trim();
         let mut rule = PermissionRuleV2 {
             tool: tool.clone(),
+            argv_exact: None,
             argv_prefix: None,
             path_glob: None,
             op: None,
@@ -289,6 +300,7 @@ pub fn parse_rule_v2(s: &str) -> Result<PermissionRuleV2, RuleParseError> {
     // v2 path: parse comma-separated key="value" pairs.
     let mut rule = PermissionRuleV2 {
         tool: tool.clone(),
+        argv_exact: None,
         argv_prefix: None,
         path_glob: None,
         op: None,
@@ -318,6 +330,7 @@ pub fn parse_rule_v2(s: &str) -> Result<PermissionRuleV2, RuleParseError> {
 
         // Reject duplicate keys.
         let already_set = match key.as_str() {
+            "argv_exact" => rule.argv_exact.is_some(),
             "argv_prefix" => rule.argv_prefix.is_some(),
             "path_glob" => rule.path_glob.is_some(),
             "op" => rule.op.is_some(),
@@ -332,6 +345,7 @@ pub fn parse_rule_v2(s: &str) -> Result<PermissionRuleV2, RuleParseError> {
         }
 
         match key.as_str() {
+            "argv_exact" => rule.argv_exact = Some(value.to_string()),
             "argv_prefix" => rule.argv_prefix = Some(value.to_string()),
             "path_glob" => rule.path_glob = Some(value.to_string()),
             "op" => rule.op = Some(value.to_string()),
@@ -364,6 +378,9 @@ pub fn parse_rule_v2(s: &str) -> Result<PermissionRuleV2, RuleParseError> {
 #[must_use]
 pub fn serialize_rule_v2(rule: &PermissionRuleV2) -> String {
     let mut fields: Vec<(String, String)> = Vec::new();
+    if let Some(v) = &rule.argv_exact {
+        fields.push(("argv_exact".into(), v.clone()));
+    }
     if let Some(v) = &rule.argv_prefix {
         fields.push(("argv_prefix".into(), v.clone()));
     }
@@ -490,6 +507,7 @@ mod tests {
     fn v2_full_field_roundtrip() {
         let rule = PermissionRuleV2 {
             tool: "Bash".to_string(),
+            argv_exact: None,
             argv_prefix: Some("cargo test".to_string()),
             path_glob: None,
             op: None,

@@ -42,6 +42,11 @@ pub enum SideEffectClass {
 pub struct ApprovalFingerprint {
     /// Tool name (e.g., `"bash"`, `"write_file"`, `"mcp_github_create_issue"`).
     pub tool_name: String,
+    /// Full command line for exact command approvals and for checking
+    /// custom command prefixes. Older serialized fingerprints omit this;
+    /// prefix-only matching still works through `command_prefix`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_exact: Option<String>,
     /// Normalized command prefix for shell tools (e.g., `"git commit"`).
     /// `None` for non-shell tools.
     pub command_prefix: Option<String>,
@@ -58,7 +63,38 @@ impl ApprovalFingerprint {
         let prefix = extract_command_prefix(command);
         Self {
             tool_name: tool_name.to_lowercase(),
+            command_exact: Some(normalize_command(command)),
             command_prefix: Some(prefix),
+            path_pattern: None,
+            side_effect: if is_read_only {
+                SideEffectClass::ReadOnly
+            } else {
+                SideEffectClass::Execute
+            },
+        }
+    }
+
+    /// Create a shell fingerprint that matches exactly this command.
+    pub fn shell_exact(tool_name: &str, command: &str, is_read_only: bool) -> Self {
+        Self {
+            tool_name: tool_name.to_lowercase(),
+            command_exact: Some(normalize_command(command)),
+            command_prefix: None,
+            path_pattern: None,
+            side_effect: if is_read_only {
+                SideEffectClass::ReadOnly
+            } else {
+                SideEffectClass::Execute
+            },
+        }
+    }
+
+    /// Create a shell fingerprint for a user-selected command prefix.
+    pub fn shell_prefix(tool_name: &str, prefix: &str, is_read_only: bool) -> Self {
+        Self {
+            tool_name: tool_name.to_lowercase(),
+            command_exact: None,
+            command_prefix: Some(prefix.trim().to_string()),
             path_pattern: None,
             side_effect: if is_read_only {
                 SideEffectClass::ReadOnly
@@ -72,8 +108,31 @@ impl ApprovalFingerprint {
     pub fn file_op(tool_name: &str, path: Option<&str>) -> Self {
         Self {
             tool_name: tool_name.to_lowercase(),
+            command_exact: None,
             command_prefix: None,
             path_pattern: path.map(normalize_path_pattern),
+            side_effect: SideEffectClass::Write,
+        }
+    }
+
+    /// Create an exact file-operation fingerprint.
+    pub fn file_op_exact(tool_name: &str, path: Option<&str>) -> Self {
+        Self {
+            tool_name: tool_name.to_lowercase(),
+            command_exact: None,
+            command_prefix: None,
+            path_pattern: path.map(|p| p.trim().to_string()),
+            side_effect: SideEffectClass::Write,
+        }
+    }
+
+    /// Create a file-operation fingerprint from an explicit user pattern.
+    pub fn file_op_pattern(tool_name: &str, pattern: Option<&str>) -> Self {
+        Self {
+            tool_name: tool_name.to_lowercase(),
+            command_exact: None,
+            command_prefix: None,
+            path_pattern: pattern.map(|p| p.trim().to_string()),
             side_effect: SideEffectClass::Write,
         }
     }
@@ -82,6 +141,7 @@ impl ApprovalFingerprint {
     pub fn bare(tool_name: &str) -> Self {
         Self {
             tool_name: tool_name.to_lowercase(),
+            command_exact: None,
             command_prefix: None,
             path_pattern: None,
             side_effect: SideEffectClass::Unknown,
@@ -105,15 +165,25 @@ impl ApprovalFingerprint {
         if self.tool_name != other.tool_name {
             return false;
         }
+        if self.command_prefix.is_none()
+            && let Some(ref exact) = self.command_exact
+        {
+            match &other.command_exact {
+                Some(their_exact) if their_exact == exact => {}
+                _ => return false,
+            }
+        }
         // If self has no command prefix, it matches any command for this tool.
         if let Some(ref my_prefix) = self.command_prefix {
-            match &other.command_prefix {
-                Some(their_prefix) => {
-                    if !their_prefix.starts_with(my_prefix.as_str()) {
-                        return false;
-                    }
-                }
-                None => return false,
+            let Some(their_command) = other
+                .command_exact
+                .as_deref()
+                .or(other.command_prefix.as_deref())
+            else {
+                return false;
+            };
+            if !command_prefix_matches(my_prefix, their_command) {
+                return false;
             }
         }
         // If self has no path pattern, it matches any path for this tool.
@@ -136,6 +206,9 @@ impl ApprovalFingerprint {
         let mut parts = vec![self.tool_name.clone()];
         if let Some(ref prefix) = self.command_prefix {
             parts.push(format!("cmd:{prefix}"));
+        }
+        if let Some(ref command) = self.command_exact {
+            parts.push(format!("exact:{command}"));
         }
         if let Some(ref path) = self.path_pattern {
             parts.push(format!("path:{path}"));
@@ -180,6 +253,25 @@ fn extract_command_prefix(command: &str) -> String {
     // Take up to 2 tokens for the prefix.
     let tokens: Vec<&str> = cmd.split_whitespace().take(2).collect();
     tokens.join(" ")
+}
+
+fn normalize_command(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn command_prefix_matches(prefix: &str, command: &str) -> bool {
+    let prefix = normalize_command(prefix).to_lowercase();
+    if prefix.is_empty() {
+        return false;
+    }
+    let command = normalize_command(command).to_lowercase();
+    if !command.starts_with(&prefix) {
+        return false;
+    }
+    let rest = &command[prefix.len()..];
+    rest.is_empty()
+        || rest.starts_with(char::is_whitespace)
+        || rest.starts_with(&['-', '=', ';', '|', '&', '>', '<'][..])
 }
 
 /// Normalize a file path into a pattern suitable for approval matching.

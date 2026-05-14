@@ -2,8 +2,11 @@
 
 #![cfg(test)]
 
-use super::button_row::{BATCH_BUTTONS, ButtonAction, ButtonRow, PRIMARY_BUTTONS};
+use super::button_row::{
+    BATCH_BUTTONS, ButtonAction, ButtonRow, MATCH_TARGET_BUTTONS, PRIMARY_BUTTONS,
+};
 use crate::chat_stream::ApprovalResponse;
+use astra_turn_core::permission_match_target::AllowMatchTarget;
 use astra_turn_core::permission_scope::AllowScope;
 
 // ─── Primary row invariants ───────────────────────────────────────
@@ -82,15 +85,29 @@ fn activate_reject_returns_deny() {
 }
 
 #[test]
-fn activate_turn_returns_scoped_always_allow() {
+fn activate_turn_enters_match_target_selection() {
     let mut row = ButtonRow::primary();
     row.move_right();
     row.move_right();
     assert_eq!(
         row.activate(),
-        Some(ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(
-            AllowScope::RestOfTurn
-        )))
+        Some(ButtonAction::SelectScope(AllowScope::RestOfTurn))
+    );
+}
+
+#[test]
+fn match_target_row_has_expected_order_and_actions() {
+    let mut row = ButtonRow::match_targets();
+    let labels: Vec<&str> = row.buttons().iter().map(|b| b.label).collect();
+    assert_eq!(labels, vec!["Exact", "This tool", "Custom prefix", "Back"]);
+    assert_eq!(
+        row.activate(),
+        Some(ButtonAction::SelectMatch(AllowMatchTarget::Exact))
+    );
+    row.move_right();
+    assert_eq!(
+        row.activate(),
+        Some(ButtonAction::SelectMatch(AllowMatchTarget::Tool))
     );
 }
 
@@ -153,4 +170,5 @@ fn batch_activate_reject_all_returns_deny_all() {
 fn exported_constants_match_the_primary_and_batch_rows() {
     assert_eq!(PRIMARY_BUTTONS.len(), 7);
     assert_eq!(BATCH_BUTTONS.len(), 2);
+    assert_eq!(MATCH_TARGET_BUTTONS.len(), 4);
 }

@@ -96,6 +96,8 @@ pub(crate) struct ApprovalCell {
     ///                  "Saved to .kiro/permissions.json" or
     ///                  "Failed to save rule: <reason>"
     pub save_outcome: Option<String>,
+    pub selection_hint: Option<String>,
+    pub custom_match_input: Option<String>,
     pub workspace_untrusted: bool,
     pub is_compound_command: bool,
     pub has_dynamic_eval: bool,
@@ -123,6 +125,8 @@ impl ApprovalCell {
             source_agent: None,
             host: None,
             save_outcome: None,
+            selection_hint: None,
+            custom_match_input: None,
             workspace_untrusted: false,
             is_compound_command: false,
             has_dynamic_eval: false,
@@ -153,6 +157,8 @@ impl ApprovalCell {
             source_agent: None,
             host: None,
             save_outcome: None,
+            selection_hint: None,
+            custom_match_input: None,
             workspace_untrusted: false,
             is_compound_command: false,
             has_dynamic_eval: false,
@@ -193,6 +199,18 @@ impl ApprovalCell {
     #[must_use]
     pub fn with_save_outcome(mut self, outcome: impl Into<String>) -> Self {
         self.save_outcome = Some(outcome.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_selection_hint(mut self, hint: impl Into<String>) -> Self {
+        self.selection_hint = Some(hint.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_custom_match_input(mut self, input: impl Into<String>) -> Self {
+        self.custom_match_input = Some(input.into());
         self
     }
 
@@ -308,10 +326,8 @@ impl ApprovalCell {
     }
 
     fn button_disabled(&self, btn: &crate::tui::approval::Button) -> bool {
-        match btn.action {
-            crate::tui::approval::ButtonAction::Respond(
-                crate::chat_stream::ApprovalResponse::AlwaysAllowScoped(scope),
-            ) => !self.scope_available(scope),
+        match &btn.action {
+            crate::tui::approval::ButtonAction::SelectScope(scope) => !self.scope_available(*scope),
             _ => false,
         }
     }
@@ -486,6 +502,23 @@ impl HistoryCell for ApprovalCell {
             ]));
         }
 
+        if let Some(hint) = &self.selection_hint {
+            lines.push(Line::from(vec![
+                bar.clone(),
+                Span::styled("Match: ".to_string(), muted),
+                Span::styled(hint.clone(), body_style),
+            ]));
+        }
+
+        if let Some(input) = &self.custom_match_input {
+            lines.push(Line::from(vec![
+                bar.clone(),
+                Span::styled("Prefix: ".to_string(), muted),
+                Span::styled(input.clone(), body_style.add_modifier(Modifier::BOLD)),
+                Span::styled("▌".to_string(), accent_style.add_modifier(Modifier::BOLD)),
+            ]));
+        }
+
         // Issue #326 P3 / scenarios #6/#9/#15: when the request
         // carries destructive risk tags, advertise that the
         // Always button can't be used to persist a project /
@@ -524,13 +557,14 @@ impl HistoryCell for ApprovalCell {
         // style. Unfocused: plain border close — the user isn't
         // looking at this card for actions yet.
         let bottom = if self.focused {
+            let hint = if self.custom_match_input.is_some() {
+                "type prefix · Enter approve · Esc back"
+            } else {
+                "↑↓←→ select · Enter confirm · Esc reject · Ctrl+Enter quick accept"
+            };
             Line::from(vec![
                 Span::styled("╰─ ".to_string(), accent_style),
-                Span::styled(
-                    "↑↓←→ select · Enter confirm · Esc reject · Ctrl+Enter quick accept"
-                        .to_string(),
-                    muted,
-                ),
+                Span::styled(hint.to_string(), muted),
             ])
         } else {
             Line::from(vec![Span::styled("╰─".to_string(), accent_style)])

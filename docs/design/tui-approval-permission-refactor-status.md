@@ -55,12 +55,16 @@ Implemented and verified in code:
   safety.
 - P3 TUI scope picker is now explicit: approval cards expose Turn, Session,
   Project, and User scope buttons, with unavailable scopes disabled through the
-  shared `permitted_scopes` policy. Turn approvals use a per-turn override
-  cache that is cleared at the start of each SSE turn; User approvals persist to
+  shared `permitted_scopes` policy. Scope selection is only the first dimension:
+  the TUI then asks for the match target (`Exact`, `This tool`, or
+  `Custom prefix`) with an English explanation of the resulting approval.
+  Custom prefix input only accepts characters that keep the value a real prefix
+  of the current command/path. Turn approvals use a per-turn override cache
+  that is cleared at the start of each SSE turn; User approvals persist to
   `~/.astra/permissions.json` via the same lock/reload/merge/save path as
-  project rules. Project/User persistence uses the same content-aware tool-call
-  facts as Turn/Session matching; file writes persist path-scoped rules rather
-  than bare tool-wide rules.
+  project rules. Project/User persistence uses the same match-target builder as
+  Turn/Session matching, and session permission-audit events record both
+  dimensions (`scope` and `match_target`).
 - P4 approval queue batch safety: group resolution is exact; dangerous
   ungrouped "accept all" is disabled.
 - P5b workspace trust is enforced at production entry points. Interactive TUI

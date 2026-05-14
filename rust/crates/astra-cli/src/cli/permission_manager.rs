@@ -18,7 +18,9 @@ use astra_turn_core::cloud_approval_policy::{
 };
 use astra_turn_core::permission_engine::{
     DecisionEnvelope, DecisionSource, HardDecision, allow_rule_preview,
+    allow_rule_preview_for_match_target,
 };
+use astra_turn_core::permission_match_target::{AllowMatchTarget, fingerprint_for_match_target};
 use astra_turn_core::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_primary_detail,
 };
@@ -2380,6 +2382,14 @@ impl PermissionManager {
         allow_rule_preview(name, args)
     }
 
+    pub(super) fn make_allow_rule_with_match_target(
+        name: &str,
+        args: &serde_json::Value,
+        target: &AllowMatchTarget,
+    ) -> String {
+        allow_rule_preview_for_match_target(name, args, target)
+    }
+
     /// Synchronous permission check — blocks on terminal prompt if needed.
     /// Only used by tests; production code uses [`check_nonblocking()`].
     #[cfg(test)]
@@ -2713,6 +2723,21 @@ impl PermissionManager {
         }
     }
 
+    pub(super) fn record_approval_with_match_target(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        target: &AllowMatchTarget,
+        allowed: bool,
+    ) {
+        let fp = fingerprint_for_match_target(name, args, target);
+        self.session_overrides.insert(fp.clone(), allowed);
+        if !allowed {
+            self.denial_tracker.record(&fp, false);
+            self.record_rejection(name, "session override: deny");
+        }
+    }
+
     /// Record an approval that is valid only for the current LLM turn.
     pub(super) fn record_turn_approval(
         &mut self,
@@ -2724,6 +2749,21 @@ impl PermissionManager {
             Some(a) => content_aware_fingerprint(name, a),
             None => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(name),
         };
+        self.turn_overrides.insert(fp.clone(), allowed);
+        if !allowed {
+            self.denial_tracker.record(&fp, false);
+            self.record_rejection(name, "turn override: deny");
+        }
+    }
+
+    pub(super) fn record_turn_approval_with_match_target(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        target: &AllowMatchTarget,
+        allowed: bool,
+    ) {
+        let fp = fingerprint_for_match_target(name, args, target);
         self.turn_overrides.insert(fp.clone(), allowed);
         if !allowed {
             self.denial_tracker.record(&fp, false);
@@ -4613,7 +4653,7 @@ mod tests {
         // uninstall --no-confirm`. We now keep the subcommand.
         let args = serde_json::json!({"command": "cargo test --release"});
         let rule = PermissionManager::make_allow_rule("bash", &args);
-        assert_eq!(rule, "Bash(cargo test:*)");
+        assert_eq!(rule, r#"Bash(argv_prefix="cargo test", op="execute")"#);
     }
 
     #[test]
@@ -4622,22 +4662,55 @@ mod tests {
         // NOT silently authorize `npm run deploy`.
         let test_args = serde_json::json!({"command": "npm test"});
         let test_rule_str = PermissionManager::make_allow_rule("bash", &test_args);
-        assert_eq!(test_rule_str, "Bash(npm test:*)");
+        assert_eq!(
+            test_rule_str,
+            r#"Bash(argv_prefix="npm test", op="execute")"#
+        );
 
         let test_rule = PermissionRule::parse(&test_rule_str);
         // npm test (and variants with flags) → still allowed
-        assert!(test_rule.matches("bash", Some("npm test")));
-        assert!(test_rule.matches("bash", Some("npm test --verbose")));
-        assert!(test_rule.matches("bash", Some("npm test -- --grep auth")));
+        assert!(test_rule.matches_with_context(
+            "bash",
+            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                "bash",
+                &serde_json::json!({"command": "npm test"})
+            )
+        ));
+        assert!(test_rule.matches_with_context(
+            "bash",
+            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                "bash",
+                &serde_json::json!({"command": "npm test --verbose"})
+            )
+        ));
+        assert!(test_rule.matches_with_context(
+            "bash",
+            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                "bash",
+                &serde_json::json!({"command": "npm test -- --grep auth"})
+            )
+        ));
 
         // npm run deploy → MUST NOT be allowed
         assert!(
-            !test_rule.matches("bash", Some("npm run deploy")),
-            "Bash(npm test:*) must not match `npm run deploy`"
+            !test_rule.matches_with_context(
+                "bash",
+                &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                    "bash",
+                    &serde_json::json!({"command": "npm run deploy"})
+                )
+            ),
+            "npm test Allow must not match `npm run deploy`"
         );
         assert!(
-            !test_rule.matches("bash", Some("npm run deploy:prod")),
-            "Bash(npm test:*) must not match `npm run deploy:prod`"
+            !test_rule.matches_with_context(
+                "bash",
+                &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                    "bash",
+                    &serde_json::json!({"command": "npm run deploy:prod"})
+                )
+            ),
+            "npm test Allow must not match `npm run deploy:prod`"
         );
     }
 
@@ -4647,12 +4720,27 @@ mod tests {
         // authorize `git push --force`.
         let commit_args = serde_json::json!({"command": "git commit -m 'fix'"});
         let commit_rule_str = PermissionManager::make_allow_rule("bash", &commit_args);
-        assert_eq!(commit_rule_str, "Bash(git commit:*)");
+        assert_eq!(
+            commit_rule_str,
+            r#"Bash(argv_prefix="git commit", op="execute")"#
+        );
 
         let commit_rule = PermissionRule::parse(&commit_rule_str);
-        assert!(commit_rule.matches("bash", Some("git commit -m 'fix'")));
+        assert!(commit_rule.matches_with_context(
+            "bash",
+            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                "bash",
+                &serde_json::json!({"command": "git commit -m 'fix'"})
+            )
+        ));
         assert!(
-            !commit_rule.matches("bash", Some("git push --force origin main")),
+            !commit_rule.matches_with_context(
+                "bash",
+                &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                    "bash",
+                    &serde_json::json!({"command": "git push --force origin main"})
+                )
+            ),
             "git commit Allow must not authorize git push --force"
         );
     }
@@ -4707,15 +4795,15 @@ mod tests {
         // Compound commands: don't bake the pipe target into the rule.
         let args = serde_json::json!({"command": "cargo test | tee log.txt"});
         let rule = PermissionManager::make_allow_rule("bash", &args);
-        assert_eq!(rule, "Bash(cargo test:*)");
+        assert_eq!(rule, r#"Bash(argv_prefix="cargo test", op="execute")"#);
 
         let args = serde_json::json!({"command": "ls -la > /tmp/out"});
         let rule = PermissionManager::make_allow_rule("bash", &args);
-        assert_eq!(rule, "Bash(ls:*)");
+        assert_eq!(rule, r#"Bash(argv_prefix="ls", op="execute")"#);
 
         let args = serde_json::json!({"command": "true && rm -rf"});
         let rule = PermissionManager::make_allow_rule("bash", &args);
-        assert_eq!(rule, "Bash(true:*)");
+        assert_eq!(rule, r#"Bash(argv_prefix="true", op="execute")"#);
     }
 
     #[test]
@@ -4725,7 +4813,7 @@ mod tests {
         let args = serde_json::json!({"command": "kubectl apply -f deployment.yaml"});
         let rule = PermissionManager::make_allow_rule("bash", &args);
         // -f stops the prefix, so we get `kubectl apply`.
-        assert_eq!(rule, "Bash(kubectl apply:*)");
+        assert_eq!(rule, r#"Bash(argv_prefix="kubectl apply", op="execute")"#);
     }
 
     // ── Security: word-boundary matching prevents false positives ────────────
@@ -5032,6 +5120,7 @@ mod tests {
         // Parent presses Always on `Bash(cargo test:*)` → session override.
         let cargo_test_fp = ApprovalFingerprint {
             tool_name: "bash".to_string(),
+            command_exact: None,
             command_prefix: Some("cargo test".to_string()),
             path_pattern: None,
             side_effect: SideEffectClass::Execute,
@@ -5058,6 +5147,7 @@ mod tests {
 
         let rm_fp = ApprovalFingerprint {
             tool_name: "bash".to_string(),
+            command_exact: None,
             command_prefix: Some("rm -rf".to_string()),
             path_pattern: None,
             side_effect: SideEffectClass::Execute,

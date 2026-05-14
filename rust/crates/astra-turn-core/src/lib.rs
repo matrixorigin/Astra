@@ -132,6 +132,7 @@ pub mod permission_audit;
 pub mod permission_compound_command;
 pub mod permission_cwd_root;
 pub mod permission_engine;
+pub mod permission_match_target;
 pub mod permission_path_glob;
 pub mod permission_redact;
 pub mod permission_rule_grammar;
