@@ -1716,34 +1716,6 @@ pub(super) async fn handle_session_command(
                                     if passed { "passed" } else { "failed" },
                                 );
                             }
-                            session_journal::JournalEventType::CompositeSnapshot => {
-                                let snap_id = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("snapshot_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let components = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("components"))
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| {
-                                        a.iter()
-                                            .filter_map(|v| v.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    })
-                                    .unwrap_or_default();
-                                eprintln!(
-                                    "  {} {} T{} snapshot {} [{}]",
-                                    ts_short.dim(),
-                                    "📸".green(),
-                                    evt.turn.unwrap_or(0),
-                                    snap_id,
-                                    components,
-                                );
-                            }
                             session_journal::JournalEventType::ContextAssemblyRecorded => {
                                 // Context assembly trace (M1 telemetry) — detailed view via /session context
                                 let tokens = evt
@@ -1872,28 +1844,6 @@ pub(super) async fn handle_session_command(
                                     );
                                 }
                             }
-                            session_journal::JournalEventType::AdaptiveExperimentEnrolled => {
-                                let exp = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("experiment_name"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let variant = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("variant_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                eprintln!(
-                                    "  {} {} T{} experiment enrolled: {} → variant {}",
-                                    ts_short.dim(),
-                                    "🧪".magenta(),
-                                    evt.turn.unwrap_or(0),
-                                    exp,
-                                    variant,
-                                );
-                            }
                             session_journal::JournalEventType::AdaptiveTuningRuleTriggered => {
                                 let rule = evt
                                     .metadata
@@ -1988,29 +1938,6 @@ pub(super) async fn handle_session_command(
                                     evt.tool_calls_returned.unwrap_or(0),
                                 );
                             }
-                            session_journal::JournalEventType::ConfidenceDiagnosisRecorded => {
-                                let conf = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("confidence"))
-                                    .and_then(|v| v.as_f64())
-                                    .unwrap_or(0.0);
-                                let tier = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("confidence_diagnosis"))
-                                    .and_then(|v| v.get("tier"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown");
-                                eprintln!(
-                                    "  {} {} T{} confidence: {:.2} ({})",
-                                    ts_short.dim(),
-                                    "🔍".yellow(),
-                                    evt.turn.unwrap_or(0),
-                                    conf,
-                                    tier,
-                                );
-                            }
                             session_journal::JournalEventType::CompactionRetry => {
                                 let retry_count = evt
                                     .metadata
@@ -2048,31 +1975,6 @@ pub(super) async fn handle_session_command(
                                     evt.turn.unwrap_or(0),
                                 );
                             }
-                            session_journal::JournalEventType::MemoryExtraction => {
-                                let outcome = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("outcome"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let saved = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("memories_saved"))
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                eprintln!(
-                                    "  {} 🧠 T{} memory extraction: {} ({})",
-                                    ts_short.dim(),
-                                    evt.turn.unwrap_or(0),
-                                    outcome,
-                                    if saved > 0 {
-                                        format!("{saved} saved")
-                                    } else {
-                                        "none".to_string()
-                                    },
-                                );
-                            }
                             session_journal::JournalEventType::SessionMemoryExtraction => {
                                 let meta = evt.metadata.as_ref();
                                 let outcome = meta
@@ -2101,7 +2003,9 @@ pub(super) async fn handle_session_command(
                             }
                             session_journal::JournalEventType::PipelineFeedback
                             | session_journal::JournalEventType::PipelineAlert
-                            | session_journal::JournalEventType::PipelineCompactionAudit => {
+                            | session_journal::JournalEventType::PipelineCompactionAudit
+                            | session_journal::JournalEventType::MemorySuppressed
+                            | session_journal::JournalEventType::ContextReleased => {
                                 // Rendered by /inspect; suppress in timeline for now
                             }
                         }
@@ -3310,7 +3214,6 @@ fn handle_session_adaptive(_arg: &str, state: &SessionState) {
                         e.event_type,
                         session_journal::JournalEventType::AdaptiveScenarioApplied
                             | session_journal::JournalEventType::AdaptivePerTurnApplied
-                            | session_journal::JournalEventType::AdaptiveExperimentEnrolled
                             | session_journal::JournalEventType::AdaptiveTuningRuleTriggered
                             | session_journal::JournalEventType::AdaptiveBaselinePromoted
                     )
@@ -3393,28 +3296,6 @@ fn handle_session_adaptive(_arg: &str, state: &SessionState) {
                                 "↻".magenta(),
                                 n,
                                 triggers
-                            );
-                        }
-                        session_journal::JournalEventType::AdaptiveExperimentEnrolled => {
-                            let exp = evt
-                                .metadata
-                                .as_ref()
-                                .and_then(|m| m.get("experiment_name"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("?");
-                            let var = evt
-                                .metadata
-                                .as_ref()
-                                .and_then(|m| m.get("variant_id"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("?");
-                            eprintln!(
-                                "    {} T{:>2} {} enrolled: {} → {}",
-                                ts.dim(),
-                                turn,
-                                "🧪".magenta(),
-                                exp,
-                                var
                             );
                         }
                         session_journal::JournalEventType::AdaptiveTuningRuleTriggered => {

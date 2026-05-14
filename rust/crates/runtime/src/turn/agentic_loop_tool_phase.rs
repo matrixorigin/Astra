@@ -1587,6 +1587,29 @@ fn build_introspect_snapshot(
     // this snapshot (e.g., for server-side introspect API) leave it empty.
     let current_round = state.current_round_index;
 
+    let bias_map = state.turn_guard.health.outcome_bias_by_tool(3600);
+    let tool_health: Vec<astra_turn_core::introspect::ToolHealthEntry> = state
+        .turn_guard
+        .health
+        .all()
+        .iter()
+        .filter(|(_, h)| h.total_calls > 0)
+        .map(|(name, h)| {
+            let last_fail_cat = bias_map.get(name).and_then(|b| b.last_failure_tag.clone());
+            astra_turn_core::introspect::ToolHealthEntry {
+                name: name.clone(),
+                calls: h.total_calls as u32,
+                errors: h.total_failures as u32,
+                avg_ms: 0,
+                deprioritized: h.deprioritized,
+                consecutive_failures: h.consecutive_failures as u32,
+                last_failure_category: last_fail_cat,
+            }
+        })
+        .collect();
+
+    let tool_errors = state.turn_guard.health.recent_errors(10);
+
     astra_turn_core::introspect::IntrospectSnapshot {
         token_pressure: 0.0, // TODO: wire from pipeline_session.stats when available
         cache_hit_ratio: cache_ratio,
@@ -1594,7 +1617,7 @@ fn build_introspect_snapshot(
         turns_remaining: state.remaining_turns as u32,
         compaction_tier: format!("{:?}", state.compact_tier_applied),
         alerts: Vec::new(),
-        tool_health: Vec::new(), // TODO: wire from step_recorder.tool_timings
+        tool_health,
         working_memory_summary: working_mem,
         total_input_tokens: state.total_prompt + state.total_cache_read,
         total_output_tokens: state.total_completion,
@@ -1605,6 +1628,8 @@ fn build_introspect_snapshot(
         stall_state,
         injection_freshness: Vec::new(),
         current_round,
+        tool_errors,
+        circuit_breaker: None, // populated by bridge when available
     }
 }
 

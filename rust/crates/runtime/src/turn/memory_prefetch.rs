@@ -27,12 +27,15 @@ pub struct MemoryPrefetchResult {
 
 /// Prefetch memories relevant to the user message via hybrid retrieval.
 /// Sends two queries (full message + entity tokens), merges and deduplicates.
+/// When `session_id` is provided, memories suppressed via
+/// `MemoriaClient::suppress_memory` are filtered out before building entries.
 pub async fn prefetch_memories(
     mem_url: &str,
     mem_key: &str,
     user_msg: &str,
     user_id: &str,
     top_k: u32,
+    session_id: Option<&str>,
 ) -> MemoryPrefetchResult {
     if mem_key.is_empty() || user_msg.trim().is_empty() {
         return MemoryPrefetchResult::default();
@@ -64,6 +67,14 @@ pub async fn prefetch_memories(
     astra_turn_types::sort_by_retrieval_score(&mut merged_records);
     let ranked_cap = (top_k as usize).saturating_mul(2).max(top_k as usize);
     merged_records.truncate(ranked_cap);
+
+    // Filter out session-suppressed memories before building entries.
+    if let Some(sid) = session_id {
+        let suppressed = astra_tools::memoria::MemoriaClient::suppressed_snapshot(sid);
+        if !suppressed.is_empty() {
+            merged_records.retain(|m| !suppressed.contains(&m.memory_id));
+        }
+    }
 
     // Slice each record to its compact view (tag + abstract layer)
     // before handing it to the section builders. The volatile system-
@@ -826,6 +837,29 @@ fn parse_rankable(value: serde_json::Value) -> Option<RankableMemory> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn serve_memory_response(body: &'static str, requests: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..requests {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0_u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
 
     #[test]
     fn extract_entity_tokens_empty_string() {
@@ -1418,16 +1452,47 @@ mod tests {
 
     #[tokio::test]
     async fn prefetch_memories_empty_key_returns_default() {
-        let result = prefetch_memories("http://localhost", "", "query", "user1", 5).await;
+        let result = prefetch_memories("http://localhost", "", "query", "user1", 5, None).await;
         assert!(result.section.is_none());
         assert_eq!(result.items, 0);
     }
 
     #[tokio::test]
     async fn prefetch_memories_whitespace_message_returns_default() {
-        let result = prefetch_memories("http://localhost", "key", "   ", "user1", 5).await;
+        let result = prefetch_memories("http://localhost", "key", "   ", "user1", 5, None).await;
         assert!(result.section.is_none());
         assert_eq!(result.items, 0);
+    }
+
+    #[tokio::test]
+    async fn prefetch_memories_filters_session_suppressed_ids() {
+        let sid = "prefetch-suppression-test";
+        astra_tools::memoria::MemoriaClient::reset_suppressed(sid);
+        astra_tools::memoria::MemoriaClient::suppress_memory(sid, "mem-suppressed");
+        let body = r#"[
+            {
+                "memory_id": "mem-suppressed",
+                "content": "Real insight: suppressed memory should not be injected",
+                "memory_type": "semantic",
+                "retrieval_score": 0.99
+            },
+            {
+                "memory_id": "mem-visible",
+                "content": "Real insight: visible memory should be injected",
+                "memory_type": "semantic",
+                "retrieval_score": 0.5
+            }
+        ]"#;
+        let base_url = serve_memory_response(body, 1).await;
+
+        let result =
+            prefetch_memories(&base_url, "test-key", "memory topic", "user1", 5, Some(sid)).await;
+
+        astra_tools::memoria::MemoriaClient::reset_suppressed(sid);
+        let section = result.section.expect("visible memory should remain");
+        assert!(!section.contains("suppressed memory"));
+        assert!(section.contains("visible memory"));
+        assert_eq!(result.items, 1);
     }
 
     #[tokio::test]

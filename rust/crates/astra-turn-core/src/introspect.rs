@@ -54,6 +54,14 @@ pub struct IntrospectSnapshot {
     /// `rounds_alive` in the freshness report. 0 when unknown.
     #[serde(default)]
     pub current_round: u32,
+
+    /// Recent tool errors with previews — feeds `subtopic=errors`.
+    #[serde(default)]
+    pub tool_errors: Vec<ToolErrorEntry>,
+
+    /// Bridge circuit breaker state — surfaced in stall/full renders.
+    #[serde(default)]
+    pub circuit_breaker: Option<CircuitBreakerSnapshot>,
 }
 
 /// Per-round summary surfaced through `introspect(subtopic=recent)`.
@@ -110,6 +118,31 @@ pub struct ToolHealthEntry {
     pub calls: u32,
     pub errors: u32,
     pub avg_ms: u64,
+    #[serde(default)]
+    pub deprioritized: bool,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub last_failure_category: Option<String>,
+}
+
+/// Recent tool error entry for `subtopic=errors`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolErrorEntry {
+    pub tool: String,
+    pub signature_hint: String,
+    pub failure_category: Option<String>,
+    pub error_preview: Option<String>,
+    pub at_epoch: u64,
+}
+
+/// Bridge circuit breaker state snapshot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CircuitBreakerSnapshot {
+    pub state: String,
+    pub failure_count: u64,
+    pub success_count: u64,
+    pub consecutive_failures: u64,
 }
 
 /// Output detail level — chosen by budget or explicit arg.
@@ -207,12 +240,14 @@ fn render_full(s: &IntrospectSnapshot) -> String {
 
     if !s.tool_health.is_empty() {
         out.push_str("\n## Tool Health\n");
-        out.push_str("| Tool | Calls | Errors | Avg ms |\n");
-        out.push_str("|------|-------|--------|--------|\n");
+        out.push_str("| Tool | Calls | Errors | Avg ms | ConsecFail | Depri | LastFail |\n");
+        out.push_str("|------|-------|--------|--------|------------|-------|----------|\n");
         for t in &s.tool_health {
+            let depri = if t.deprioritized { "YES" } else { "-" };
+            let last_fail = t.last_failure_category.as_deref().unwrap_or("-");
             out.push_str(&format!(
-                "| {} | {} | {} | {} |\n",
-                t.name, t.calls, t.errors, t.avg_ms
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                t.name, t.calls, t.errors, t.avg_ms, t.consecutive_failures, depri, last_fail
             ));
         }
     }
@@ -361,6 +396,51 @@ pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
             out.push('\n');
         }
     }
+    if let Some(cb) = &s.circuit_breaker {
+        out.push_str(&format!(
+            "\n### Bridge Circuit Breaker\nstate={} failures={} successes={} consecutive_failures={}\n",
+            cb.state, cb.failure_count, cb.success_count, cb.consecutive_failures,
+        ));
+    }
+    out
+}
+
+/// Render `subtopic=errors` — recent tool failures with error previews.
+pub fn render_errors(s: &IntrospectSnapshot) -> String {
+    if s.tool_errors.is_empty() {
+        return "## Recent Tool Errors\n(No failures recorded this session.)".to_string();
+    }
+    let mut out = String::from(
+        "## Recent Tool Errors (newest first)\n\
+         | Tool | Category | Age(s) | Preview |\n\
+         |------|----------|--------|---------|\n",
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for e in &s.tool_errors {
+        let age = now.saturating_sub(e.at_epoch);
+        let cat = e.failure_category.as_deref().unwrap_or("-");
+        let preview = e
+            .error_preview
+            .as_deref()
+            .map(|p| p.replace('|', "\\|").replace('\n', " "))
+            .unwrap_or_else(|| "-".to_string());
+        let short: String = preview.chars().take(80).collect();
+        out.push_str(&format!(
+            "| {} | {} | {}s | {} |\n",
+            e.tool, cat, age, short,
+        ));
+    }
+    if !s.tool_errors.is_empty() {
+        out.push_str("\nSignature hints:\n");
+        for e in s.tool_errors.iter().take(5) {
+            if !e.signature_hint.is_empty() {
+                out.push_str(&format!("- {}: {}\n", e.tool, e.signature_hint));
+            }
+        }
+    }
     out
 }
 
@@ -448,7 +528,7 @@ fn channel_tag(ch: InjectionChannel) -> &'static str {
 
 /// Render `subtopic=all` — everything. Useful when debugging / when
 /// the agent isn't sure which lens to pick. Same content as
-/// `render_full` + the three Task #46 subtopics + injection freshness.
+/// `render_full` + the three Task #46 subtopics + injection freshness + errors.
 pub fn render_all(s: &IntrospectSnapshot) -> String {
     let mut out = render_full(s);
     out.push_str("\n\n");
@@ -459,6 +539,8 @@ pub fn render_all(s: &IntrospectSnapshot) -> String {
     out.push_str(&render_stall_state(s));
     out.push_str("\n\n");
     out.push_str(&render_injection_freshness(s));
+    out.push_str("\n\n");
+    out.push_str(&render_errors(s));
     out
 }
 
@@ -499,18 +581,27 @@ mod tests {
                     calls: 15,
                     errors: 5,
                     avg_ms: 2300,
+                    deprioritized: false,
+                    consecutive_failures: 0,
+                    last_failure_category: None,
                 },
                 ToolHealthEntry {
                     name: "read_file".into(),
                     calls: 22,
                     errors: 0,
                     avg_ms: 12,
+                    deprioritized: false,
+                    consecutive_failures: 0,
+                    last_failure_category: None,
                 },
                 ToolHealthEntry {
                     name: "grep".into(),
                     calls: 8,
                     errors: 1,
                     avg_ms: 45,
+                    deprioritized: true,
+                    consecutive_failures: 3,
+                    last_failure_category: Some("Timeout".into()),
                 },
             ],
             working_memory_summary: "Goal: implement streaming resume".into(),
@@ -523,6 +614,8 @@ mod tests {
             stall_state: StallSnapshotSummary::default(),
             injection_freshness: Vec::new(),
             current_round: 0,
+            tool_errors: Vec::new(),
+            circuit_breaker: None,
         }
     }
 
@@ -862,5 +955,103 @@ mod tests {
             out.contains("runtime has not injected anything"),
             "no-injection summary missing: {out}"
         );
+    }
+
+    // ── Tests for render_errors ──────────────────────────────────────────
+
+    #[test]
+    fn render_errors_empty_reports_no_failures() {
+        let snap = IntrospectSnapshot::default();
+        let out = render_errors(&snap);
+        assert!(
+            out.contains("No failures recorded"),
+            "empty errors should report no failures: {out}"
+        );
+    }
+
+    #[test]
+    fn render_errors_shows_tool_and_category() {
+        let snap = IntrospectSnapshot {
+            tool_errors: vec![ToolErrorEntry {
+                tool: "bash".into(),
+                signature_hint: "bash:ls -la".into(),
+                failure_category: Some("Timeout".into()),
+                error_preview: Some("command timed out".into()),
+                at_epoch: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            }],
+            ..Default::default()
+        };
+        let out = render_errors(&snap);
+        assert!(out.contains("bash"), "tool name missing: {out}");
+        assert!(out.contains("Timeout"), "category missing: {out}");
+        assert!(out.contains("command timed out"), "preview missing: {out}");
+        assert!(
+            out.contains("Signature hints"),
+            "hints section missing: {out}"
+        );
+        assert!(out.contains("bash:ls -la"), "signature hint missing: {out}");
+    }
+
+    #[test]
+    fn render_errors_truncates_preview_to_80_chars() {
+        let long_preview = "x".repeat(200);
+        let snap = IntrospectSnapshot {
+            tool_errors: vec![ToolErrorEntry {
+                tool: "read_file".into(),
+                signature_hint: "read_file:/long/path".into(),
+                failure_category: None,
+                error_preview: Some(long_preview.clone()),
+                at_epoch: 1000,
+            }],
+            ..Default::default()
+        };
+        let out = render_errors(&snap);
+        // The rendered preview in the table should be at most 80 chars
+        assert!(
+            !out.contains(&long_preview),
+            "full 200-char preview should not appear in render"
+        );
+    }
+
+    // ── Tests for circuit breaker rendering ──────────────────────────────
+
+    #[test]
+    fn render_stall_with_circuit_breaker() {
+        let snap = IntrospectSnapshot {
+            stall_state: StallSnapshotSummary {
+                nudge_count: 1,
+                ..Default::default()
+            },
+            circuit_breaker: Some(CircuitBreakerSnapshot {
+                state: "half_open".into(),
+                failure_count: 5,
+                success_count: 20,
+                consecutive_failures: 3,
+            }),
+            ..Default::default()
+        };
+        let out = render_stall_state(&snap);
+        assert!(out.contains("half_open"), "CB state missing: {out}");
+        assert!(
+            out.contains("consecutive_failures=3"),
+            "CB consecutive missing: {out}"
+        );
+    }
+
+    // ── Tests for enhanced tool health rendering ─────────────────────────
+
+    #[test]
+    fn render_full_shows_deprioritized_tool() {
+        let snap = sample_snapshot();
+        let out = render_full(&snap);
+        assert!(out.contains("YES"), "deprioritized YES missing: {out}");
+        assert!(
+            out.contains("Timeout"),
+            "last failure category missing: {out}"
+        );
+        assert!(out.contains("ConsecFail"), "header missing: {out}");
     }
 }

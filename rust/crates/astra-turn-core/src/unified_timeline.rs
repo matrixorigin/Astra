@@ -59,6 +59,13 @@ pub enum TimelineEntryKind {
         kind: String,
         stall_signal: Option<String>,
     },
+    MemorySuppressed {
+        memory_id: String,
+        reason: Option<String>,
+    },
+    ContextReleased {
+        tool_call_ids: Vec<String>,
+    },
 }
 
 /// Assembled unified timeline (ordered by timestamp).
@@ -250,6 +257,38 @@ pub fn build_timeline(events: &[serde_json::Value]) -> UnifiedTimeline {
                     kind: TimelineEntryKind::Interruption { kind, stall_signal },
                 });
             }
+            "memory_suppressed" => {
+                let memory_id = metadata
+                    .and_then(|m| m.get("memory_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let reason = metadata
+                    .and_then(|m| m.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                entries.push(TimelineEntry {
+                    ts: ts.to_string(),
+                    agent_id: None,
+                    kind: TimelineEntryKind::MemorySuppressed { memory_id, reason },
+                });
+            }
+            "context_released" => {
+                let tool_call_ids = metadata
+                    .and_then(|m| m.get("tool_call_ids"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                entries.push(TimelineEntry {
+                    ts: ts.to_string(),
+                    agent_id: None,
+                    kind: TimelineEntryKind::ContextReleased { tool_call_ids },
+                });
+            }
             _ => {}
         }
     }
@@ -373,6 +412,17 @@ pub fn render_timeline(timeline: &UnifiedTimeline, limit: usize) -> String {
                     .map(|s| format!(" ({s})"))
                     .unwrap_or_default();
                 let _ = writeln!(out, "  ⛔ INTERRUPTED: {kind}{signal}");
+            }
+            TimelineEntryKind::MemorySuppressed { memory_id, reason } => {
+                let reason_s = reason
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default();
+                let _ = writeln!(out, "  🚫 memory suppressed: {memory_id}{reason_s}");
+            }
+            TimelineEntryKind::ContextReleased { tool_call_ids } => {
+                let ids = tool_call_ids.join(", ");
+                let _ = writeln!(out, "  ♻ context released: [{ids}]");
             }
         }
     }
@@ -545,5 +595,88 @@ mod tests {
             !rendered.contains("r0 "),
             "first round must be truncated: {rendered}"
         );
+    }
+
+    #[test]
+    fn build_timeline_parses_memory_suppressed() {
+        let events = vec![json!({
+            "type": "memory_suppressed",
+            "ts": "2026-05-14T12:00:00Z",
+            "turn": 5,
+            "metadata": {
+                "memory_id": "mem-abc123",
+                "reason": "stale"
+            }
+        })];
+        let tl = build_timeline(&events);
+        assert_eq!(tl.entries.len(), 1);
+        match &tl.entries[0].kind {
+            TimelineEntryKind::MemorySuppressed { memory_id, reason } => {
+                assert_eq!(memory_id, "mem-abc123");
+                assert_eq!(reason.as_deref(), Some("stale"));
+            }
+            other => panic!("expected MemorySuppressed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_timeline_parses_context_released() {
+        let events = vec![json!({
+            "type": "context_released",
+            "ts": "2026-05-14T12:01:00Z",
+            "turn": 7,
+            "metadata": {
+                "tool_call_ids": ["call_001", "call_002"]
+            }
+        })];
+        let tl = build_timeline(&events);
+        assert_eq!(tl.entries.len(), 1);
+        match &tl.entries[0].kind {
+            TimelineEntryKind::ContextReleased { tool_call_ids } => {
+                assert_eq!(tool_call_ids.len(), 2);
+                assert_eq!(tool_call_ids[0], "call_001");
+                assert_eq!(tool_call_ids[1], "call_002");
+            }
+            other => panic!("expected ContextReleased, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_timeline_shows_memory_suppressed() {
+        let events = vec![json!({
+            "type": "memory_suppressed",
+            "ts": "2026-05-14T12:00:00Z",
+            "turn": 3,
+            "metadata": {"memory_id": "m1", "reason": "irrelevant"}
+        })];
+        let tl = build_timeline(&events);
+        let rendered = render_timeline(&tl, 50);
+        assert!(
+            rendered.contains("memory suppressed"),
+            "missing marker: {rendered}"
+        );
+        assert!(rendered.contains("m1"), "missing memory_id: {rendered}");
+        assert!(
+            rendered.contains("irrelevant"),
+            "missing reason: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_timeline_shows_context_released() {
+        let events = vec![json!({
+            "type": "context_released",
+            "ts": "2026-05-14T12:00:00Z",
+            "turn": 4,
+            "metadata": {"tool_call_ids": ["c1", "c2"]}
+        })];
+        let tl = build_timeline(&events);
+        let rendered = render_timeline(&tl, 50);
+        assert!(
+            rendered.contains("context released"),
+            "missing marker: {rendered}"
+        );
+        assert!(rendered.contains("c1"), "missing id: {rendered}");
+        assert!(rendered.contains("c2"), "missing id: {rendered}");
     }
 }

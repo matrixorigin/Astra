@@ -1,10 +1,13 @@
 use std::cell::RefCell;
 use std::ops::Range;
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+use super::paste_burst::{BurstDecision, PasteBurstDetector};
 
 const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
 
@@ -18,6 +21,7 @@ pub(crate) struct TextArea {
     wrap_cache: RefCell<Option<WrapCache>>,
     kill_buffer: String,
     scroll: u16,
+    paste_burst: PasteBurstDetector,
 }
 
 #[derive(Debug)]
@@ -35,6 +39,7 @@ impl TextArea {
             wrap_cache: RefCell::new(None),
             kill_buffer: String::new(),
             scroll: 0,
+            paste_burst: PasteBurstDetector::new(),
         }
     }
 
@@ -75,6 +80,24 @@ impl TextArea {
 
     // ─── Input handling ─────────────────────────────────────────────────
 
+    pub fn flush_paste_burst(&mut self) -> bool {
+        let now = Instant::now();
+        if let Some(text) = self.paste_burst.flush_if_due(now) {
+            self.insert_str(&text);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn paste_burst_active(&self) -> bool {
+        self.paste_burst.is_active()
+    }
+
+    pub fn paste_burst_tick_ms() -> u64 {
+        PasteBurstDetector::recommended_tick_ms()
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> TextAreaAction {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -85,7 +108,15 @@ impl TextArea {
                 self.insert_char('\n');
                 TextAreaAction::Changed
             }
-            KeyCode::Enter => TextAreaAction::Submit,
+            KeyCode::Enter => {
+                let now = Instant::now();
+                if self.paste_burst.enter_should_insert_newline(now) {
+                    self.insert_char('\n');
+                    TextAreaAction::Changed
+                } else {
+                    TextAreaAction::Submit
+                }
+            }
 
             // Emacs keybindings
             KeyCode::Char('c') if ctrl => TextAreaAction::Cancel,
@@ -143,7 +174,17 @@ impl TextArea {
                 TextAreaAction::Changed
             }
 
-            // Basic editing
+            // Basic editing — route through paste burst detector
+            KeyCode::Char(c) if !ctrl && !alt => {
+                let now = Instant::now();
+                match self.paste_burst.on_char(c, now) {
+                    BurstDecision::Normal => {
+                        self.insert_char(c);
+                        TextAreaAction::Changed
+                    }
+                    BurstDecision::Buffered => TextAreaAction::Changed,
+                }
+            }
             KeyCode::Char(c) => {
                 self.insert_char(c);
                 TextAreaAction::Changed

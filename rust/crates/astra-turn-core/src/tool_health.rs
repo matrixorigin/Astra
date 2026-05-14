@@ -231,6 +231,24 @@ pub struct ToolHealthTracker {
     /// so cross-session persistence and cloud sync can preserve recent identical-call
     /// evidence.
     outcome_cache: HashMap<String, VecDeque<ToolOutcome>>,
+    /// Parallel ring of error previews keyed by the same signature as
+    /// `outcome_cache`. Each entry corresponds 1:1 with its `ToolOutcome`
+    /// partner. `None` for successes; `Some(first_200_chars)` for failures.
+    /// Kept separate so `ToolOutcome` stays `Copy`.
+    error_preview_cache: HashMap<String, VecDeque<Option<String>>>,
+    /// Parallel ring of monotonic insertion sequence numbers, 1:1 with
+    /// `outcome_cache` entries. Used as a final tie-breaker in
+    /// `recent_errors` so two failures sharing the same `at_epoch` *and*
+    /// `signature_hint` still order deterministically (newest insertion
+    /// first). Not persisted — purely session-local.
+    outcome_seq_cache: HashMap<String, VecDeque<u64>>,
+    /// Monotonic counter feeding `outcome_seq_cache`. Increments on every
+    /// `record_outcome_with_preview` call.
+    outcome_seq_counter: u64,
+    /// Cached tool name extracted from `sig_key` at insert time. Avoids
+    /// re-parsing the signature in `recent_errors()` and is robust against
+    /// future tool names that themselves contain ':'.
+    signature_to_tool: HashMap<String, String>,
     /// Session-local cache-hit counts keyed by canonical tool signature.
     /// Used to detect wasteful repeated cache hits without overblocking
     /// unrelated calls to the same tool.
@@ -648,9 +666,34 @@ impl ToolHealthTracker {
                     })
                     .collect();
                 if !ring.is_empty() {
+                    let preview_ring: VecDeque<Option<String>> =
+                        std::iter::repeat_with(|| None).take(ring.len()).collect();
+                    // Allocate a contiguous block of seq numbers for this
+                    // signature so persisted entries keep a deterministic
+                    // tie-break order matching their original insertion order.
+                    let len = ring.len() as u64;
+                    let base = tracker.outcome_seq_counter.wrapping_add(1);
+                    let seq_ring: VecDeque<u64> = (0..len).map(|i| base.wrapping_add(i)).collect();
+                    tracker.outcome_seq_counter = tracker.outcome_seq_counter.wrapping_add(len);
+                    // Pre-extract tool name (first ':' split) so recent_errors
+                    // doesn't have to re-parse on every call.
+                    let tool = outcome_entry
+                        .signature
+                        .split_once(':')
+                        .map(|(t, _)| t.to_string())
+                        .unwrap_or_else(|| outcome_entry.signature.clone());
                     tracker
                         .outcome_cache
                         .insert(outcome_entry.signature.clone(), ring);
+                    tracker
+                        .error_preview_cache
+                        .insert(outcome_entry.signature.clone(), preview_ring);
+                    tracker
+                        .outcome_seq_cache
+                        .insert(outcome_entry.signature.clone(), seq_ring);
+                    tracker
+                        .signature_to_tool
+                        .insert(outcome_entry.signature.clone(), tool);
                 }
             }
         }
@@ -759,6 +802,23 @@ impl ToolHealthTracker {
     /// calls land in the same ring. The ring is bounded by
     /// [`OUTCOME_RING_CAPACITY`]; oldest entries are evicted first.
     pub fn record_outcome(&mut self, sig_key: &str, outcome: ToolOutcome) {
+        self.record_outcome_with_preview(sig_key, outcome, None);
+    }
+
+    /// Record a `ToolOutcome` with an optional error preview string.
+    /// The preview is stored in a parallel ring so `ToolOutcome` stays `Copy`.
+    pub fn record_outcome_with_preview(
+        &mut self,
+        sig_key: &str,
+        outcome: ToolOutcome,
+        error_preview: Option<&str>,
+    ) {
+        // Bump the monotonic counter once per call so the seq ring stays in
+        // lockstep with the outcome ring even on collisions (same epoch +
+        // signature_hint). Used as a final tie-breaker in recent_errors().
+        self.outcome_seq_counter = self.outcome_seq_counter.wrapping_add(1);
+        let seq = self.outcome_seq_counter;
+
         let ring = self
             .outcome_cache
             .entry(sig_key.to_string())
@@ -767,6 +827,115 @@ impl ToolHealthTracker {
             ring.pop_front();
         }
         ring.push_back(outcome);
+
+        let preview_ring = self
+            .error_preview_cache
+            .entry(sig_key.to_string())
+            .or_insert_with(|| VecDeque::with_capacity(OUTCOME_RING_CAPACITY));
+        if preview_ring.len() == OUTCOME_RING_CAPACITY {
+            preview_ring.pop_front();
+        }
+        let capped = error_preview.map(|p| {
+            let s: String = p.chars().take(200).collect();
+            s
+        });
+        preview_ring.push_back(capped);
+
+        let seq_ring = self
+            .outcome_seq_cache
+            .entry(sig_key.to_string())
+            .or_insert_with(|| VecDeque::with_capacity(OUTCOME_RING_CAPACITY));
+        if seq_ring.len() == OUTCOME_RING_CAPACITY {
+            seq_ring.pop_front();
+        }
+        seq_ring.push_back(seq);
+
+        // Remember the tool name extracted at insert time so recent_errors()
+        // doesn't have to re-parse `sig_key` (which is fragile if the tool
+        // name itself contains ':' — e.g. a future namespaced tool).
+        if !self.signature_to_tool.contains_key(sig_key) {
+            // sig_key format: `<tool>:<canonical_args>`. Anchor on the FIRST
+            // ':' only — args may contain colons, tool names do not.
+            let tool = sig_key
+                .split_once(':')
+                .map(|(t, _)| t.to_string())
+                .unwrap_or_else(|| sig_key.to_string());
+            self.signature_to_tool.insert(sig_key.to_string(), tool);
+        }
+    }
+
+    /// Return recent tool failures with error previews, newest first.
+    pub fn recent_errors(&self, limit: usize) -> Vec<crate::introspect::ToolErrorEntry> {
+        // Local triple to carry the sort key (seq) without leaking it through
+        // the public `ToolErrorEntry` shape.
+        struct Pending {
+            entry: crate::introspect::ToolErrorEntry,
+            seq: u64,
+        }
+        let mut entries: Vec<Pending> = Vec::new();
+        for (sig_key, ring) in &self.outcome_cache {
+            let preview_ring = self.error_preview_cache.get(sig_key);
+            let seq_ring = self.outcome_seq_cache.get(sig_key);
+            debug_assert_eq!(
+                preview_ring.map(VecDeque::len).unwrap_or(0),
+                ring.len(),
+                "tool health outcome and error-preview rings diverged for {sig_key}"
+            );
+            debug_assert_eq!(
+                seq_ring.map(VecDeque::len).unwrap_or(0),
+                ring.len(),
+                "tool health outcome and seq rings diverged for {sig_key}"
+            );
+            for (idx, outcome) in ring.iter().enumerate().rev() {
+                if outcome.success {
+                    continue;
+                }
+                // Prefer the cached tool name (recorded at insert time);
+                // fall back to splitting on the FIRST ':' for entries that
+                // were rebuilt from persisted state without a cached name.
+                let tool = self
+                    .signature_to_tool
+                    .get(sig_key)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        sig_key
+                            .split_once(':')
+                            .map(|(t, _)| t.to_string())
+                            .unwrap_or_else(|| sig_key.to_string())
+                    });
+                let sig_hint: String = sig_key.chars().take(60).collect();
+                let preview = preview_ring
+                    .and_then(|pr| pr.get(idx))
+                    .and_then(|p| p.clone());
+                let seq = seq_ring.and_then(|sr| sr.get(idx).copied()).unwrap_or(0);
+                entries.push(Pending {
+                    entry: crate::introspect::ToolErrorEntry {
+                        tool,
+                        signature_hint: sig_hint,
+                        failure_category: outcome.failure_category.map(|c| format!("{c:?}")),
+                        error_preview: preview,
+                        at_epoch: outcome.at_epoch,
+                    },
+                    seq,
+                });
+            }
+        }
+        // Sort newest-first. Tie-break order:
+        //   1. at_epoch (second-resolution timestamp) — primary newness signal.
+        //   2. signature_hint — stable lexicographic ordering across
+        //      HashMap iteration orders so output is reproducible.
+        //   3. seq — monotonic insert order; the final tie-break that
+        //      survives even when two failures share at_epoch *and*
+        //      signature_hint (e.g. same call retried in the same second).
+        entries.sort_by(|a, b| {
+            b.entry
+                .at_epoch
+                .cmp(&a.entry.at_epoch)
+                .then_with(|| a.entry.signature_hint.cmp(&b.entry.signature_hint))
+                .then_with(|| b.seq.cmp(&a.seq))
+        });
+        entries.truncate(limit);
+        entries.into_iter().map(|p| p.entry).collect()
     }
 
     /// Most recent outcome for a `(tool_name, args)` signature, if any.
@@ -1868,5 +2037,229 @@ mod tests {
             msg.contains("str_replace"),
             "injection should mention str_replace, got: {msg}"
         );
+    }
+
+    // ── Tests for record_outcome_with_preview + recent_errors ─────────
+
+    #[test]
+    fn record_outcome_with_preview_stores_error_preview() {
+        let mut tracker = ToolHealthTracker::new();
+        let outcome = ToolOutcome {
+            success: false,
+            latency_ms: 100,
+            result_hash: 42,
+            at_epoch: 1000,
+            failure_category: Some(crate::action_compensation::FailureCategory::Timeout),
+        };
+        tracker.record_outcome_with_preview(
+            "bash:ls -la",
+            outcome,
+            Some("command timed out after 30s"),
+        );
+
+        let errors = tracker.recent_errors(10);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].tool, "bash");
+        assert_eq!(errors[0].signature_hint, "bash:ls -la");
+        assert_eq!(
+            errors[0].error_preview.as_deref(),
+            Some("command timed out after 30s")
+        );
+        assert!(errors[0].failure_category.is_some());
+        assert_eq!(errors[0].at_epoch, 1000);
+    }
+
+    #[test]
+    fn record_outcome_with_preview_none_for_success() {
+        let mut tracker = ToolHealthTracker::new();
+        let outcome = ToolOutcome {
+            success: true,
+            latency_ms: 50,
+            result_hash: 99,
+            at_epoch: 2000,
+            failure_category: None,
+        };
+        tracker.record_outcome_with_preview("read_file:src/main.rs", outcome, None);
+
+        let errors = tracker.recent_errors(10);
+        assert!(
+            errors.is_empty(),
+            "successes should not appear in recent_errors"
+        );
+    }
+
+    #[test]
+    fn recent_errors_sorted_newest_first() {
+        let mut tracker = ToolHealthTracker::new();
+        for epoch in [100, 300, 200] {
+            let outcome = ToolOutcome {
+                success: false,
+                latency_ms: 10,
+                result_hash: epoch,
+                at_epoch: epoch,
+                failure_category: None,
+            };
+            tracker.record_outcome_with_preview(
+                &format!("tool:{epoch}"),
+                outcome,
+                Some(&format!("error at {epoch}")),
+            );
+        }
+
+        let errors = tracker.recent_errors(10);
+        assert_eq!(errors.len(), 3);
+        assert_eq!(errors[0].at_epoch, 300);
+        assert_eq!(errors[1].at_epoch, 200);
+        assert_eq!(errors[2].at_epoch, 100);
+    }
+
+    #[test]
+    fn recent_errors_respects_limit() {
+        let mut tracker = ToolHealthTracker::new();
+        for i in 0..5 {
+            let outcome = ToolOutcome {
+                success: false,
+                latency_ms: 10,
+                result_hash: i,
+                at_epoch: i,
+                failure_category: None,
+            };
+            tracker.record_outcome_with_preview(&format!("tool:{i}"), outcome, Some("err"));
+        }
+
+        let errors = tracker.recent_errors(3);
+        assert_eq!(errors.len(), 3);
+    }
+
+    #[test]
+    fn error_preview_truncated_to_200_chars() {
+        let mut tracker = ToolHealthTracker::new();
+        let long_msg = "x".repeat(500);
+        let outcome = ToolOutcome {
+            success: false,
+            latency_ms: 10,
+            result_hash: 1,
+            at_epoch: 1,
+            failure_category: None,
+        };
+        tracker.record_outcome_with_preview("bash:fail", outcome, Some(&long_msg));
+
+        let errors = tracker.recent_errors(1);
+        assert_eq!(errors[0].error_preview.as_ref().unwrap().len(), 200);
+    }
+
+    #[test]
+    fn error_preview_cache_ring_bounded() {
+        let mut tracker = ToolHealthTracker::new();
+        for i in 0..(OUTCOME_RING_CAPACITY + 3) {
+            let outcome = ToolOutcome {
+                success: false,
+                latency_ms: 10,
+                result_hash: i as u64,
+                at_epoch: i as u64,
+                failure_category: None,
+            };
+            tracker.record_outcome_with_preview(
+                "bash:same-sig",
+                outcome,
+                Some(&format!("error #{i}")),
+            );
+        }
+
+        // Ring should be bounded to OUTCOME_RING_CAPACITY
+        let ring = tracker.outcome_history("bash:same-sig").unwrap();
+        assert_eq!(ring.len(), OUTCOME_RING_CAPACITY);
+    }
+
+    #[test]
+    fn record_outcome_without_preview_leaves_none() {
+        let mut tracker = ToolHealthTracker::new();
+        let outcome = ToolOutcome {
+            success: false,
+            latency_ms: 10,
+            result_hash: 1,
+            at_epoch: 500,
+            failure_category: None,
+        };
+        tracker.record_outcome("bash:old-api", outcome);
+
+        let errors = tracker.recent_errors(10);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].error_preview, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "tool health outcome and error-preview rings diverged")]
+    fn recent_errors_asserts_preview_ring_sync_in_debug() {
+        let mut tracker = ToolHealthTracker::new();
+        let outcome = ToolOutcome {
+            success: false,
+            latency_ms: 10,
+            result_hash: 1,
+            at_epoch: 500,
+            failure_category: None,
+        };
+        tracker.record_outcome_with_preview("bash:desync", outcome, Some("boom"));
+        tracker.error_preview_cache.remove("bash:desync");
+
+        let _ = tracker.recent_errors(10);
+    }
+
+    /// Two failures with identical `at_epoch` AND identical `signature_hint`
+    /// (after the 60-char cap) must still order by insertion sequence, so
+    /// `recent_errors(limit)` drops the same entries on every call.
+    #[test]
+    fn recent_errors_seq_breaks_full_tie() {
+        let mut tracker = ToolHealthTracker::new();
+        // Identical 60-char prefix to force signature_hint collision; only
+        // the suffix differs.
+        let prefix = "bash:".to_string() + &"x".repeat(60);
+        let sig_a = format!("{prefix}A");
+        let sig_b = format!("{prefix}B");
+        let mk = || ToolOutcome {
+            success: false,
+            latency_ms: 1,
+            result_hash: 0,
+            at_epoch: 777,
+            failure_category: None,
+        };
+        // Insert A first, then B. Both share at_epoch and signature_hint
+        // (since the hint truncates at 60 chars). Newest-first ordering
+        // must place B before A on every run.
+        tracker.record_outcome_with_preview(&sig_a, mk(), Some("a"));
+        tracker.record_outcome_with_preview(&sig_b, mk(), Some("b"));
+
+        let errors = tracker.recent_errors(10);
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].error_preview.as_deref(), Some("b"));
+        assert_eq!(errors[1].error_preview.as_deref(), Some("a"));
+
+        // truncate(1) must consistently keep B (the newer insertion).
+        let only = tracker.recent_errors(1);
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].error_preview.as_deref(), Some("b"));
+    }
+
+    /// Tool name extraction must anchor on the FIRST ':' so future tool
+    /// names containing ':' (or args containing ':') don't mis-parse.
+    #[test]
+    fn recent_errors_tool_name_anchors_on_first_colon() {
+        let mut tracker = ToolHealthTracker::new();
+        let outcome = ToolOutcome {
+            success: false,
+            latency_ms: 1,
+            result_hash: 0,
+            at_epoch: 1,
+            failure_category: None,
+        };
+        // sig_key with multiple ':' — args contain colons (e.g. URL-like).
+        tracker.record_outcome_with_preview(
+            "web_fetch:url=https://example.com:8080/path",
+            outcome,
+            Some("boom"),
+        );
+        let errors = tracker.recent_errors(10);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].tool, "web_fetch");
     }
 }
