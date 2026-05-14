@@ -653,9 +653,14 @@ impl ToolHealthTracker {
                     })
                     .collect();
                 if !ring.is_empty() {
+                    let preview_ring: VecDeque<Option<String>> =
+                        std::iter::repeat_with(|| None).take(ring.len()).collect();
                     tracker
                         .outcome_cache
                         .insert(outcome_entry.signature.clone(), ring);
+                    tracker
+                        .error_preview_cache
+                        .insert(outcome_entry.signature.clone(), preview_ring);
                 }
             }
         }
