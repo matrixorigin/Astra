@@ -1980,6 +1980,29 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         _ => astra_turn_core::permission_engine::RiskTag::BashExecute,
                     };
                     metadata.risk_tags = vec![risk_tag];
+                    // Issue #326 P5 / R2 Major 5: MCP tools without
+                    // a registered ToolCapabilityMetadata default to
+                    // MCPUnknownCapability — this is the contract
+                    // that disables persistent-scope buttons in the
+                    // P3 scope picker. The server-annotation lookup
+                    // (slash_mcp's ToolAnnotations → ApprovalMetadata)
+                    // would override this when present; the lookup
+                    // is staged for the slash_mcp follow-up.
+                    if t.starts_with("mcp_") {
+                        if !metadata
+                            .risk_tags
+                            .contains(&astra_turn_core::permission_engine::RiskTag::MCPUnknownCapability)
+                        {
+                            metadata.risk_tags.push(
+                                astra_turn_core::permission_engine::RiskTag::MCPUnknownCapability,
+                            );
+                        }
+                        // Default mcp_capability stays None until
+                        // slash_mcp wiring lands. is_known() = false,
+                        // which the scope picker uses to grey out
+                        // Project / User scopes per
+                        // permission_scope::permitted_scopes.
+                    }
                     // Issue #326 P5f / R2 Major 3: for file-mutating
                     // tools, snapshot the target file's SHA-256
                     // here (host-side, NOT from LLM args). The
