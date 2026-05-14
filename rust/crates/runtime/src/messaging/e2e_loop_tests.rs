@@ -1407,7 +1407,10 @@ mod tests {
         let tool_calls = vec![json!({
             "id": "call-bash-denied",
             "name": "bash",
-            "arguments": r#"{"command": "echo hi"}"#
+            // Keep this command non-read-only: Prompt mode now auto-approves
+            // read-only bash calls like `echo hi` locally, so they never reach
+            // the parent mailbox this test is exercising.
+            "arguments": r#"{"command": "touch astra-permission-denied-test"}"#
         })];
 
         let mut messages = Vec::new();

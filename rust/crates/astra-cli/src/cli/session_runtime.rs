@@ -139,8 +139,11 @@ fn create_pipeline_modules_inner(
     // (server HOME skills + database skills visible to this user). That keeps
     // CLI and Web aligned for shared server capabilities without pretending
     // that project-local CLI skills are available to Web sessions.
-    let remote_catalog = current_access_token(profile).map(|token| {
-        astra_runtime::capabilities::RemoteSkillCatalogProvider::new(api.clone(), token)
+    let remote_catalog = current_access_token(profile).map(|_| {
+        let profile_owned = profile.map(str::to_string);
+        let token_provider: astra_runtime::capabilities::TokenProvider =
+            std::sync::Arc::new(move || current_access_token(profile_owned.as_deref()));
+        astra_runtime::capabilities::RemoteSkillCatalogProvider::new(api.clone(), token_provider)
     });
     let unified_skill_registry =
         astra_runtime::capabilities::build_cli_local_skill_registry(remote_catalog);
@@ -1111,8 +1114,8 @@ mod tests {
     fn jwt_with_exp(exp: i64) -> String {
         use base64::Engine;
 
-        let header =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
         let payload =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
         format!("{header}.{payload}.sig")

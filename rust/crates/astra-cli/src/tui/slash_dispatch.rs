@@ -7,8 +7,8 @@
 
 use crate::command_registry;
 use crate::session_state::SessionState;
-use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
 use crate::tui::bottom_pane::BottomPane;
+use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
 use crate::tui::history_cell::system::SystemCell;
 use crate::tui::terminal::TerminalGuard;
 
@@ -579,7 +579,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         // ── Worktrees (TUI-native) ──────────────────────────────────
         "/worktrees" => {
             use crate::tui::bottom_pane::worktrees_view::WorktreesView;
-            use crate::tui::worktrees::{parse, WorktreeList};
+            use crate::tui::worktrees::{WorktreeList, parse};
 
             // `git worktree list --porcelain` on a blocking thread.
             let porcelain = tokio::task::spawn_blocking(|| {

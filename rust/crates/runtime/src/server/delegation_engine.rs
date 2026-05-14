@@ -18,15 +18,15 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::turn::agentic_loop_host::RequestConstraints;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use astra_services::coordination::{
-    aggregate_results, AgentProfile, AgentProfileRegistry, AgentResult, AggregationStrategy,
-    CoordinationPattern, DelegationRequest, DelegationResult,
+    AgentProfile, AgentProfileRegistry, AgentResult, AggregationStrategy, CoordinationPattern,
+    DelegationRequest, DelegationResult, aggregate_results,
 };
 use astra_services::{BubbleUpTarget, DatabaseStateProjectionStore, LlmTokenServiceConfig};
 
@@ -4914,11 +4914,13 @@ mod tests {
         // Fan-out with always-fail gate: result should be verification_failed
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "verification_failed");
-        assert!(result.agent_results[0]
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("quality too low"));
+        assert!(
+            result.agent_results[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("quality too low")
+        );
     }
 
     #[tokio::test]
@@ -5283,11 +5285,13 @@ mod tests {
     async fn gate_verdict_variants() {
         assert!(GateVerdict::Pass.is_pass());
         assert!(GateVerdict::Skip.is_pass());
-        assert!(!GateVerdict::Fail {
-            reason: "x".into(),
-            details: None
-        }
-        .is_pass());
+        assert!(
+            !GateVerdict::Fail {
+                reason: "x".into(),
+                details: None
+            }
+            .is_pass()
+        );
     }
 
     // ── Persistence tests ────────────────────────────────────────────────
@@ -5852,11 +5856,13 @@ mod tests {
         // Hard errors should be captured as failed agent results, not propagated
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "failed");
-        assert!(result.agent_results[0]
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("crashed"));
+        assert!(
+            result.agent_results[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("crashed")
+        );
     }
 
     // ── Sequential: output chaining across stages ───────────────────────────
@@ -6671,11 +6677,11 @@ mod tests {
     #[tokio::test]
     async fn resolve_inherited_prefix_resolves_captured_parent() {
         use astra_turn_core::fork_capture::{
-            capture_parent_prefix, CaptureRequest, ForkCaptureOutcome,
+            CaptureRequest, ForkCaptureOutcome, capture_parent_prefix,
         };
         use astra_turn_core::fork_prefix::{
-            hash_tool_schema, CacheMode, ProviderKind, SystemBlock, ThinkingConfigSlice,
-            ToolSchemaEntry,
+            CacheMode, ProviderKind, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry,
+            hash_tool_schema,
         };
         use astra_turn_core::fork_prefix_store::{InMemoryPrefixStore, PrefixCaptureSink};
 
