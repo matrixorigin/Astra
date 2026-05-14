@@ -16,10 +16,11 @@ use astra_turn_core::cloud_approval_policy::{
     CloudGatedToolKind, bash_command_approval_reason, cloud_gated_tool_kind,
     cloud_gated_tool_kind_with_args,
 };
-use astra_turn_core::permission_engine::{DecisionEnvelope, DecisionSource, HardDecision};
+use astra_turn_core::permission_engine::{
+    DecisionEnvelope, DecisionSource, HardDecision, allow_rule_preview,
+};
 use astra_turn_core::tool_argument_hints::{
-    command_hint_from_args, normalized_argv_prefix, path_hint_from_args,
-    permission_prompt_primary_detail,
+    command_hint_from_args, path_hint_from_args, permission_prompt_primary_detail,
 };
 
 /// Classify a permission-denial reason and emit a short, actionable
@@ -2369,42 +2370,14 @@ impl PermissionManager {
         self.load_errors.clear();
     }
 
-    /// Build a pattern-specific allow rule from a tool name and its arguments.
+    /// Build the persistent allow rule for a tool invocation.
     ///
-    /// Issue #326 P1.5 / R1 Major 5 / scenario #26: this used to take
-    /// only the first whitespace-separated word, so a user pressing
-    /// "Always" on `npm test` would persist `Bash(npm:*)` and silently
-    /// allow `npm run deploy:prod` thereafter. Same bug for `git
-    /// commit` getting saved as `Bash(git:*)` (allowing `git push
-    /// --force`).
-    ///
-    /// The fix is to save the **normalized argv prefix**: keep the
-    /// program plus the leading non-flag tokens (the subcommand
-    /// chain) up to the first flag (`-x`), the first redirect (`|`,
-    /// `>`, `;`, `&&`), or the first token whose role is "argument
-    /// data" rather than "subcommand". For `npm test --verbose` we
-    /// keep `npm test`; for `git push origin main --force` we keep
-    /// `git push`. The prefix is a sub-string of the original
-    /// command so it always parses cleanly.
-    ///
-    /// For non-bash tools (write_file etc.) we still return the bare
-    /// tool name; those are already scoped by nature.
+    /// This intentionally delegates to the turn-core preview builder so TUI
+    /// will-save copy and Project/User persistence use one rule shape. That
+    /// keeps the selected scope from changing the matched object: Turn,
+    /// Session, Project, and User all start from the same tool-call facts.
     pub(super) fn make_allow_rule(name: &str, args: &serde_json::Value) -> String {
-        if let Some(cmd) = command_hint_from_args(args) {
-            let prefix = normalized_argv_prefix(&cmd);
-            if !prefix.is_empty() {
-                // Capitalize tool name for readability: bash → Bash
-                let cap = {
-                    let mut c = name.chars();
-                    match c.next() {
-                        None => name.to_string(),
-                        Some(f) => f.to_uppercase().to_string() + c.as_str(),
-                    }
-                };
-                return format!("{cap}({prefix}:*)");
-            }
-        }
-        name.to_string()
+        allow_rule_preview(name, args)
     }
 
     /// Synchronous permission check — blocks on terminal prompt if needed.
@@ -4685,10 +4658,41 @@ mod tests {
     }
 
     #[test]
-    fn make_allow_rule_no_command_falls_back() {
+    fn make_allow_rule_file_write_uses_path_rule() {
         let args = serde_json::json!({"path": "/tmp/foo"});
         let rule = PermissionManager::make_allow_rule("write_file", &args);
-        assert_eq!(rule, "write_file");
+        assert_eq!(rule, r#"write_file(path_glob="/tmp/foo", op="write")"#);
+
+        let parsed = PermissionRule::parse(&rule);
+        assert!(parsed.matches_with_context(
+            "write_file",
+            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                "write_file",
+                &args
+            )
+        ));
+        assert!(!parsed.matches_with_context(
+            "write_file",
+            &astra_turn_core::permission_types::RuleMatchContext::from_tool_args(
+                "write_file",
+                &serde_json::json!({"path": "/tmp/foo-other"})
+            )
+        ));
+    }
+
+    #[test]
+    fn persisted_write_file_rule_does_not_widen_beyond_fingerprint() {
+        let mut pm = PermissionManager::new(false);
+        let approved_args = serde_json::json!({"path": "zzzz3.md", "content": "# zzzz3"});
+        let rule = PermissionManager::make_allow_rule("write_file", &approved_args);
+        pm.settings.allow.push(rule);
+        pm.cached_allow = pm.settings.parsed_allow_rules();
+
+        assert!(pm.check_allow_rules("write_file", &approved_args));
+        assert!(!pm.check_allow_rules(
+            "write_file",
+            &serde_json::json!({"path": "zzzz4.md", "content": "# zzzz4"})
+        ));
     }
 
     #[test]

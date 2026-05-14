@@ -185,7 +185,8 @@ fn extract_command_prefix(command: &str) -> String {
 /// Normalize a file path into a pattern suitable for approval matching.
 ///
 /// Strips trailing components beyond depth 2 to group by directory.
-fn normalize_path_pattern(path: &str) -> String {
+#[must_use]
+pub fn normalize_path_pattern(path: &str) -> String {
     let path = path.trim();
     // Keep the directory and immediate parent for grouping.
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();

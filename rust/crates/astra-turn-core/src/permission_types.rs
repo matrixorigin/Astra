@@ -243,9 +243,18 @@ impl PermissionRule {
         } else {
             ctx.path.as_deref().or(ctx.command.as_deref())
         };
+        let target_is_constrained_path =
+            self.tool != "bash" && ctx.path.is_some() && self.op.is_some();
         match (&self.pattern, target) {
             (None, _) => true, // Bare tool name matches all
             (Some(pattern), Some(cmd)) => {
+                if target_is_constrained_path {
+                    if pattern_contains_glob_metachars(pattern) {
+                        return crate::permission_path_glob::glob_match(pattern, cmd);
+                    }
+                    return pattern == cmd;
+                }
+
                 if pattern_contains_glob_metachars(pattern) {
                     // Glob path: match the WHOLE command (post-
                     // lower-casing) against the user's pattern.
@@ -1116,6 +1125,24 @@ mod tests {
 
         assert!(rule.matches_with_context("edit", &write_ctx));
         assert!(!rule.matches_with_context("edit", &read_ctx));
+    }
+
+    #[test]
+    fn v2_path_rule_without_glob_matches_exact_path() {
+        let rule = PermissionRule::parse(r#"write_file(path_glob="zzzz3.md", op="write")"#);
+        let approved = RuleMatchContext {
+            path: Some("zzzz3.md".into()),
+            op: Some("write".into()),
+            ..Default::default()
+        };
+        let sibling = RuleMatchContext {
+            path: Some("zzzz4.md".into()),
+            op: Some("write".into()),
+            ..Default::default()
+        };
+
+        assert!(rule.matches_with_context("write_file", &approved));
+        assert!(!rule.matches_with_context("write_file", &sibling));
     }
 
     #[test]

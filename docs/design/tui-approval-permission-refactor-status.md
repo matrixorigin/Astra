@@ -58,7 +58,9 @@ Implemented and verified in code:
   shared `permitted_scopes` policy. Turn approvals use a per-turn override
   cache that is cleared at the start of each SSE turn; User approvals persist to
   `~/.astra/permissions.json` via the same lock/reload/merge/save path as
-  project rules.
+  project rules. Project/User persistence uses the same content-aware tool-call
+  facts as Turn/Session matching; file writes persist path-scoped rules rather
+  than bare tool-wide rules.
 - P4 approval queue batch safety: group resolution is exact; dangerous
   ungrouped "accept all" is disabled.
 - P5b workspace trust is enforced at production entry points. Interactive TUI
