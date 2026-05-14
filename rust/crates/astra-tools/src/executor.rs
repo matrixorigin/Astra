@@ -15,7 +15,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::github::GitHubClient;
-use crate::task_mgmt::TaskManager;
+use crate::task_mgmt::{InMemoryTaskStore, TaskManager, TaskStore};
 use crate::{ToolApprovalGate, ToolContext, ToolExecutor, ToolProgressCallback, ToolResult};
 
 // ─── Helper ─────────────────────────────────────────────────────────────────
@@ -108,16 +108,26 @@ pub const DEFAULT_BASH_CACHE_TTL: std::time::Duration = std::time::Duration::fro
 
 impl DefaultToolExecutor {
     pub fn new(ctx: ToolContext) -> Self {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let task_manager = Arc::new(TaskManager::new(ctx.session_id.clone(), store));
         Self {
             ctx,
             approval_gate: None,
             progress_callback: None,
             github_client: None,
-            task_manager: Arc::new(TaskManager::new()),
+            task_manager,
             bash_cache: Arc::new(Mutex::new(HashMap::new())),
             workspace_generation: Arc::new(AtomicU64::new(0)),
             bash_cache_ttl: DEFAULT_BASH_CACHE_TTL,
         }
+    }
+
+    /// Reuse an externally supplied task store (required for MO-backed
+    /// cross-client task visibility; keeps `Self::new` ergonomic for tests
+    /// that just want a process-local store).
+    pub fn with_task_store(mut self, store: Arc<dyn TaskStore>) -> Self {
+        self.task_manager = Arc::new(TaskManager::new(self.ctx.session_id.clone(), store));
+        self
     }
 
     /// Override the bash cache TTL. Intended for tests; production

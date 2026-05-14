@@ -27,13 +27,14 @@ use astra_runtime::{
     },
     turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn,
     turn::chat_turn_edge_profile::{
-        detect_active_system_skills_in_message, read_git_branch_abbrev,
+        EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT, detect_active_system_skills_in_message,
+        read_git_branch_abbrev,
     },
     turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
     turn::chat_turn_heuristics::extract_repos_from_memory,
     turn::chat_turn_payload::{
         ChatTurnBasePayloadInput, chat_turn_base_payload, merge_active_skills_into_edge_profile,
-        set_payload_tool_results_if_non_empty,
+        merge_edge_profile_extensions, set_payload_tool_results_if_non_empty,
     },
     turn::chat_turn_step_plan::record_agentic_step_plan_after_payload_prep,
     turn::prepare_turn_explain_text::explain_stderr_payload_line_pair,
@@ -552,9 +553,18 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     );
     ctx.executor.set_budget_pressure(budget_pressure);
 
+    let tool_surface =
+        tool_registry::surface::ToolSurface::from_runtime_config(ctx.registry.all_tool_schemas());
+    if let Some(deferred_tools_text) = tool_surface.deferred_block_text() {
+        merge_edge_profile_extensions(
+            &mut payload,
+            &json!({ EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT: deferred_tools_text }),
+        );
+    }
+
     apply_selector_hints_then_attach_filtered_edge_tools(
         &mut payload,
-        turn_schemas,
+        tool_surface.pinned_schemas(),
         ctx.restricted_tools,
         ctx.telem.first_selection_report.as_ref(),
         selection_confidence,
@@ -1148,6 +1158,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         perm_manager: Some(perm_manager),
         cancel_token,
         stream_event_tx,
+        stream_event_sink: None,
         approval_request_tx,
         skill_resolver,
         skill_continuation,

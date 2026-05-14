@@ -1,20 +1,24 @@
 //! Pure-logic inline slash-command menu.
 //!
-//! Supports a two-level completion model:
-//!   1. `/` → filter top-level commands.
-//!   2. `/cmd <space>` → filter that command's subcommands (from
-//!      [`SlashItem::subcommands`]).
+//! Two-level completion:
+//!   1. `/` → filter top-level commands (fuzzy, multi-token).
+//!   2. `/cmd <space>` → filter that command's subcommands.
 //!
-//! The mode transition is driven entirely by the buffer text, so
-//! callers only need to feed the composer content back via
-//! [`SlashMenu::set_filter`].
+//! Scoring features:
+//! * Fuzzy scoring via `nucleo-matcher::Atom`.
+//! * Per-item `usage_boost` nudges frequently-used commands to the top.
+//! * Optional aliases: `/h` finds `/help` when `aliases=["h"]`.
+//! * Returns match positions for highlight rendering.
 
 #![allow(dead_code)]
 
-use nucleo_matcher::{Config, Matcher, Utf32Str, pattern::Atom};
+use nucleo_matcher::{
+    Config, Matcher, Utf32Str,
+    pattern::{Atom, AtomKind, CaseMatching, Normalization},
+};
 
 /// A single slash command exposed to the menu.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct SlashItem {
     /// Full command token including leading `/`, e.g. `/help`.
     pub name: &'static str,
@@ -24,24 +28,26 @@ pub(crate) struct SlashItem {
     /// space. Matches the `(token, description)` shape in the
     /// command registry so the two stay trivially in sync.
     pub subcommands: &'static [(&'static str, &'static str)],
+    /// Optional short aliases (without leading `/`), e.g. `["h"]` for `/help`.
+    pub aliases: &'static [&'static str],
+    /// Frequency hint — higher means "show sooner on ties".
+    pub usage_boost: u32,
 }
 
 impl SlashItem {
-    /// Tests and narrow callsites that don't need subcommands can
-    /// skip the field rather than threading an empty slice through
-    /// every construction site.
+    /// Minimal constructor for the common case.
     pub const fn simple(name: &'static str, description: &'static str) -> Self {
         Self {
             name,
             description,
             subcommands: &[],
+            aliases: &[],
+            usage_boost: 0,
         }
     }
 }
 
 /// Should the menu be open for the given composer buffer?
-///
-/// Rule: open iff the *first line* starts with `/` (no leading whitespace).
 pub(crate) fn is_open_for(buffer: &str) -> bool {
     buffer
         .lines()
@@ -53,20 +59,11 @@ pub(crate) fn is_open_for(buffer: &str) -> bool {
 /// Which completion axis the menu is filtering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Mode {
-    /// Filtering top-level commands.  The stored token is the
-    /// text after the leading `/`, without its trailing space (if
-    /// any).
     Command { token: String },
-    /// Filtering subcommands of a known parent command. `parent`
-    /// is the full `/cmd` string (with leading `/`); `token` is
-    /// the partial subcommand the user has typed so far.
     Subcommand { parent: String, token: String },
 }
 
-/// Parse a buffer into the current filter mode. The mode is
-/// determined by whether the first line contains whitespace after
-/// the command token AND that token resolves to a known command in
-/// `items` with a non-empty subcommand list.
+/// Parse a buffer into the current filter mode.
 fn derive_mode(buffer: &str, items: &[SlashItem]) -> Mode {
     let first = buffer.lines().next().unwrap_or("");
     let body = first.strip_prefix('/').unwrap_or("");
@@ -77,9 +74,6 @@ fn derive_mode(buffer: &str, items: &[SlashItem]) -> Mode {
         Some(sp) => {
             let cmd_tok = &body[..sp];
             let after = body[sp..].trim_start();
-            // Parent must exist AND carry subcommands. Otherwise
-            // fall back to command-mode filtering so users don't
-            // get an empty menu on something like `/unknown foo`.
             let parent = format!("/{cmd_tok}");
             let has_subs = items
                 .iter()
@@ -94,9 +88,6 @@ fn derive_mode(buffer: &str, items: &[SlashItem]) -> Mode {
                         .to_ascii_lowercase(),
                 }
             } else {
-                // No subcommands → menu collapses to "no matches"
-                // for the user's typed token; keep Command-mode
-                // so the UX is consistent with free-text args.
                 Mode::Command {
                     token: cmd_tok.to_ascii_lowercase(),
                 }
@@ -105,45 +96,194 @@ fn derive_mode(buffer: &str, items: &[SlashItem]) -> Mode {
     }
 }
 
+/// Result of scoring one candidate against the filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScoredItem {
+    item_idx: usize,
+    score: u32,
+    name_hit: bool,
+    indices: Vec<u32>,
+}
+
+/// Public fuzzy-score helper: rank a single `haystack` against a user
+/// `needle`. Returns `None` if there is no match, or a score where
+/// larger = better.
+pub fn score_token(needle: &str, haystack: &str) -> Option<u32> {
+    let n = needle.to_ascii_lowercase();
+    let h = haystack.to_ascii_lowercase();
+
+    if n.is_empty() {
+        return Some(0);
+    }
+
+    let short_bonus = 100u32.saturating_sub(h.len().min(100) as u32);
+
+    if h == n {
+        return Some(1200 + short_bonus);
+    }
+    if h.starts_with(&n) {
+        return Some(500 + short_bonus);
+    }
+    if h.contains(&n) {
+        return Some(250 + short_bonus);
+    }
+
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let atom = Atom::new(
+        &n,
+        CaseMatching::Ignore,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+        false,
+    );
+    let mut buf = Vec::new();
+    let hay = Utf32Str::new(&h, &mut buf);
+    atom.score(hay, &mut matcher)
+        .map(|s| s as u32 + short_bonus)
+}
+
+/// Score a single candidate against the token.
+fn score_one(
+    matcher: &mut Matcher,
+    token: &str,
+    item_idx: usize,
+    item: &SlashItem,
+) -> Option<ScoredItem> {
+    let atom = Atom::new(
+        token,
+        CaseMatching::Ignore,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+        false,
+    );
+
+    let name_lower = item.name.trim_start_matches('/').to_ascii_lowercase();
+
+    // Primary: command name (without '/').
+    let mut name_buf = Vec::new();
+    let name_haystack = Utf32Str::new(name_lower.as_str(), &mut name_buf);
+    let mut name_indices: Vec<u32> = Vec::new();
+    let name_score = atom.indices(name_haystack, matcher, &mut name_indices);
+
+    // Secondary: each alias.
+    let mut alias_score: Option<u16> = None;
+    for alias in item.aliases {
+        let alias_lower = alias.to_ascii_lowercase();
+        let mut ab = Vec::new();
+        let hay = Utf32Str::new(alias_lower.as_str(), &mut ab);
+        if let Some(s) = atom.score(hay, matcher) {
+            alias_score = Some(alias_score.map_or(s, |cur| cur.max(s)));
+        }
+    }
+
+    // Tertiary: description.
+    let desc_lower = item.description.to_ascii_lowercase();
+    let mut db = Vec::new();
+    let desc_haystack = Utf32Str::new(desc_lower.as_str(), &mut db);
+    let desc_score = atom.score(desc_haystack, matcher);
+
+    let name_hit = name_score.is_some() || alias_score.is_some();
+    let base = match (name_score, alias_score, desc_score) {
+        (Some(ns), Some(aliass), _) => ns.max(aliass) as u32,
+        (Some(ns), None, _) => ns as u32,
+        (None, Some(aliass), _) => aliass as u32,
+        (None, None, Some(ds)) => ds as u32 / 2,
+        (None, None, None) => return None,
+    };
+
+    let mut bonus = 0u32;
+    if name_lower.starts_with(token) {
+        bonus += 500;
+    }
+    if name_lower == token {
+        bonus += 200;
+    }
+    bonus += item.usage_boost.min(150);
+
+    let indices = if name_score.is_some() {
+        name_indices.iter().map(|i| i + 1).collect()
+    } else {
+        Vec::new()
+    };
+
+    Some(ScoredItem {
+        item_idx,
+        score: base + bonus,
+        name_hit,
+        indices,
+    })
+}
+
 /// Pure-logic slash command menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SlashMenu {
     items: Vec<SlashItem>,
-    /// Indices of `items` that currently match, ordered by match score
-    /// (best first). When the filter is empty this is `0..items.len()`.
-    /// Used only in [`Mode::Command`].
+    /// Pre-built synthetic `SlashItem`s for each parent's subcommands.
+    /// `prebuilt_subs[i]` corresponds to `items[i].subcommands`.
+    /// Built once at construction — avoids per-keystroke allocation.
+    prebuilt_subs: Vec<Vec<SlashItem>>,
     filtered: Vec<usize>,
-    /// In [`Mode::Subcommand`], the filtered subcommand list derived
-    /// from the parent item's `subcommands` slice.  Each entry holds
-    /// `(token, description, full_name)` — full_name is `"/cmd sub"`
-    /// so the popup renderer + accept-handler can use it uniformly.
-    sub_filtered: Vec<SlashItem>,
+    /// Indices into the prebuilt subcommand list for the active parent.
+    sub_filtered: Vec<usize>,
+    /// Index of the parent item whose subcommands are currently shown.
+    sub_parent_idx: Option<usize>,
+    highlights: Vec<Vec<u32>>,
     mode: Mode,
     selected: usize,
 }
 
 impl SlashMenu {
     pub fn new(items: Vec<SlashItem>) -> Self {
-        let filtered: Vec<usize> = (0..items.len()).collect();
-        Self {
+        let prebuilt_subs: Vec<Vec<SlashItem>> = items
+            .iter()
+            .map(|item| {
+                item.subcommands
+                    .iter()
+                    .map(|(sub_name, sub_desc)| {
+                        let full: &'static str =
+                            Box::leak(format!("{} {sub_name}", item.name).into_boxed_str());
+                        SlashItem {
+                            name: full,
+                            description: sub_desc,
+                            ..Default::default()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut s = Self {
             items,
-            filtered,
+            prebuilt_subs,
+            filtered: Vec::new(),
             sub_filtered: Vec::new(),
+            sub_parent_idx: None,
+            highlights: Vec::new(),
             mode: Mode::Command {
                 token: String::new(),
             },
             selected: 0,
-        }
+        };
+        s.reset_to_all();
+        s
     }
 
-    /// Update the filter from a composer buffer. Re-scores and re-orders
-    /// `filtered`. Clamps `selected` into bounds.  Also detects the
-    /// Command → Subcommand transition based on whitespace in the
-    /// buffer (see [`derive_mode`]).
+    fn reset_to_all(&mut self) {
+        let mut idx: Vec<usize> = (0..self.items.len()).collect();
+        idx.sort_by(|&a, &b| {
+            self.items[b]
+                .usage_boost
+                .cmp(&self.items[a].usage_boost)
+                .then(a.cmp(&b))
+        });
+        self.filtered = idx;
+        self.highlights = vec![Vec::new(); self.filtered.len()];
+        self.sub_filtered.clear();
+        self.clamp_selected();
+    }
+
+    /// Update the filter from a composer buffer.
     pub fn set_filter(&mut self, buffer: &str) {
         let new_mode = derive_mode(buffer, &self.items);
-        // Mode transition resets selection so the user doesn't land
-        // on a stale index from the other axis.
         if std::mem::discriminant(&new_mode) != std::mem::discriminant(&self.mode) {
             self.selected = 0;
         }
@@ -153,77 +293,85 @@ impl SlashMenu {
             Mode::Command { token } => {
                 self.sub_filtered.clear();
                 if token.is_empty() {
-                    self.filtered = (0..self.items.len()).collect();
-                    self.clamp_selected();
+                    self.reset_to_all();
                     return;
                 }
-                let scored = score_tokens(
-                    token,
-                    self.items.iter().map(|it| it.name.trim_start_matches('/')),
-                );
-                self.filtered = scored;
+
+                let mut matcher = Matcher::new(Config::DEFAULT);
+                let mut scored: Vec<ScoredItem> = self
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, item)| score_one(&mut matcher, token, i, item))
+                    .collect();
+
+                scored.sort_by(|a, b| {
+                    b.name_hit
+                        .cmp(&a.name_hit)
+                        .then(b.score.cmp(&a.score))
+                        .then(
+                            self.items[b.item_idx]
+                                .usage_boost
+                                .cmp(&self.items[a.item_idx].usage_boost),
+                        )
+                        .then(a.item_idx.cmp(&b.item_idx))
+                });
+
+                self.highlights = scored.iter().map(|s| s.indices.clone()).collect();
+                self.filtered = scored.into_iter().map(|s| s.item_idx).collect();
                 self.clamp_selected();
             }
             Mode::Subcommand { parent, token } => {
                 self.filtered.clear();
-                // Find parent and enumerate its subcommands.
-                let subs = self
-                    .items
-                    .iter()
-                    .find(|it| it.name == parent.as_str())
-                    .map(|it| it.subcommands)
+                let parent_idx = self.items.iter().position(|it| it.name == parent.as_str());
+                self.sub_parent_idx = parent_idx;
+
+                let prebuilt = parent_idx
+                    .map(|i| self.prebuilt_subs[i].as_slice())
                     .unwrap_or(&[]);
-                let filtered_sub_idxs: Vec<usize> = if token.is_empty() {
-                    (0..subs.len()).collect()
+
+                self.sub_filtered = if token.is_empty() {
+                    (0..prebuilt.len()).collect()
                 } else {
-                    score_tokens(token, subs.iter().map(|(name, _)| *name))
+                    let mut scored: Vec<(usize, u32)> = prebuilt
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, item)| {
+                            let sub_name = item.name.rsplit(' ').next().unwrap_or("");
+                            score_token(token, sub_name).map(|s| (i, s))
+                        })
+                        .collect();
+                    scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                    scored.into_iter().map(|(i, _)| i).collect()
                 };
-                // Build the synthetic SlashItems the popup renders.
-                // Use a leaked static description — the popup only
-                // reads `name` + `description` through &str borrows
-                // of `'static` elsewhere, but we need owned storage
-                // here. Workaround: keep SlashItem `'static`-ish by
-                // using Box::leak is overkill; instead we carry
-                // a parallel owned-string Vec and expose it via a
-                // separate accessor so the popup uses the same
-                // name/description columns.
-                self.sub_filtered = filtered_sub_idxs
-                    .into_iter()
-                    .map(|i| {
-                        let (name, desc) = subs[i];
-                        // Leak the composed full name once — a
-                        // subcommand list is tiny (≤ ~20 entries)
-                        // and leaking N strings per process is
-                        // negligible.  Gives us a `'static str`
-                        // name that matches SlashItem's field.
-                        let full: &'static str =
-                            Box::leak(format!("{parent} {name}").into_boxed_str());
-                        SlashItem {
-                            name: full,
-                            description: desc,
-                            subcommands: &[],
-                        }
-                    })
-                    .collect();
+                self.highlights = vec![Vec::new(); self.sub_filtered.len()];
                 self.clamp_selected();
             }
         }
     }
 
-    /// Ordered, filtered view into items. Empty when no matches.
-    /// In subcommand mode this returns the synthetic
-    /// `"/cmd sub"` items generated from the parent's subcommand
-    /// list so every caller treats them uniformly.
+    /// Ordered, filtered view into items.
     pub fn matches(&self) -> Vec<&SlashItem> {
         match &self.mode {
             Mode::Command { .. } => self.filtered.iter().map(|&i| &self.items[i]).collect(),
-            Mode::Subcommand { .. } => self.sub_filtered.iter().collect(),
+            Mode::Subcommand { .. } => {
+                let prebuilt = self
+                    .sub_parent_idx
+                    .map(|i| self.prebuilt_subs[i].as_slice())
+                    .unwrap_or(&[]);
+                self.sub_filtered.iter().map(|&i| &prebuilt[i]).collect()
+            }
         }
     }
 
     /// `true` when the menu is currently filtering subcommands.
     pub fn is_subcommand_mode(&self) -> bool {
         matches!(self.mode, Mode::Subcommand { .. })
+    }
+
+    /// Per-match highlight indices.
+    pub fn match_indices(&self) -> &[Vec<u32>] {
+        &self.highlights
     }
 
     pub fn move_up(&mut self) {
@@ -246,7 +394,33 @@ impl SlashMenu {
         self.selected = (self.selected + 1) % n;
     }
 
-    /// Index of current selection within `matches()`. `None` when empty.
+    pub fn page_down(&mut self, n: usize) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + n).min(self.match_count().saturating_sub(1));
+    }
+
+    pub fn page_up(&mut self, n: usize) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        self.selected = self.selected.saturating_sub(n);
+    }
+
+    pub fn go_first(&mut self) {
+        if self.match_count() > 0 {
+            self.selected = 0;
+        }
+    }
+
+    pub fn go_last(&mut self) {
+        let n = self.match_count();
+        if n > 0 {
+            self.selected = n - 1;
+        }
+    }
+
     pub fn selected(&self) -> Option<usize> {
         if self.match_count() == 0 {
             None
@@ -255,12 +429,16 @@ impl SlashMenu {
         }
     }
 
-    /// The currently selected item, if any. In subcommand mode this
-    /// returns the synthetic `"/cmd sub"` item.
     pub fn selected_item(&self) -> Option<&SlashItem> {
         match &self.mode {
             Mode::Command { .. } => self.filtered.get(self.selected).map(|&i| &self.items[i]),
-            Mode::Subcommand { .. } => self.sub_filtered.get(self.selected),
+            Mode::Subcommand { .. } => {
+                let prebuilt = self
+                    .sub_parent_idx
+                    .map(|i| self.prebuilt_subs[i].as_slice())
+                    .unwrap_or(&[]);
+                self.sub_filtered.get(self.selected).map(|&i| &prebuilt[i])
+            }
         }
     }
 
@@ -287,29 +465,4 @@ impl SlashMenu {
             self.selected = n - 1;
         }
     }
-}
-
-fn score_tokens<'a, I>(token: &str, haystacks: I) -> Vec<usize>
-where
-    I: IntoIterator<Item = &'a str>,
-{
-    let mut matcher = Matcher::new(Config::DEFAULT);
-    let atom = Atom::new(
-        token,
-        nucleo_matcher::pattern::CaseMatching::Ignore,
-        nucleo_matcher::pattern::Normalization::Smart,
-        nucleo_matcher::pattern::AtomKind::Fuzzy,
-        false,
-    );
-    let mut scored: Vec<(u16, usize)> = haystacks
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, hay)| {
-            let mut buf = Vec::new();
-            let hay_utf32 = Utf32Str::new(hay, &mut buf);
-            atom.score(hay_utf32, &mut matcher).map(|s| (s, i))
-        })
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, i)| i).collect()
 }

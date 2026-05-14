@@ -526,7 +526,18 @@ mod tests {
     // synthetic-outcome construction that was previously untested;
     // this test routes a shim `/bin/sh -c "sleep 10"` script through
     // the real executor path.
+    //
+    // `#[serial]`: this test is timing-sensitive. The 1-second case
+    // timeout races against `tokio::time::timeout` precision and
+    // process-spawn latency. Under heavy parallel test load
+    // (`cargo test --workspace` spawns 100+ test binaries) the
+    // child-process spawn was failing with EAGAIN/ENOMEM, producing
+    // exit_code=-1 instead of 124 and tripping the assertion. Running
+    // serial removes the contention on a path the test isn't actually
+    // exercising. (The other path-1/path-2 spawn-error handling stays
+    // covered by `external_executor_spawn_failure_returns_-1` etc.)
     #[tokio::test]
+    #[serial_test::serial]
     async fn timeout_kills_subprocess_and_returns_posix_124() {
         if !std::path::Path::new("/bin/sh").exists() {
             return;

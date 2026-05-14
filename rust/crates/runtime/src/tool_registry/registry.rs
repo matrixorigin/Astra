@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+use astra_config::ToolSurfaceConfig;
+
 use super::scoring::{
     DEFAULT_TOOL_BUDGET_TOKENS, pre_filter_dynamic, pre_filter_dynamic_with_memory,
     pre_filter_dynamic_with_outcome_bias, pre_filter_dynamic_with_quality,
@@ -35,9 +37,27 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new(all_schemas: Vec<Value>) -> Self {
+        Self::new_with_surface_config(all_schemas, None)
+    }
+
+    pub fn new_runtime_surface(all_schemas: Vec<Value>) -> Self {
+        let cfg = astra_config::runtime_config::RuntimeConfig::cached()
+            .tool_surface
+            .clone();
+        Self::new_with_surface_config(all_schemas, Some(&cfg))
+    }
+
+    pub fn new_with_tool_surface(all_schemas: Vec<Value>, surface_cfg: &ToolSurfaceConfig) -> Self {
+        Self::new_with_surface_config(all_schemas, Some(surface_cfg))
+    }
+
+    fn new_with_surface_config(
+        all_schemas: Vec<Value>,
+        surface_cfg: Option<&ToolSurfaceConfig>,
+    ) -> Self {
         let measured_costs = Self::measure_all_schemas(&all_schemas);
         let schema_index = Self::build_schema_index(&all_schemas);
-        let pinned_schemas = Self::resolve_pinned(&all_schemas, &schema_index);
+        let pinned_schemas = Self::resolve_pinned(&all_schemas, &schema_index, surface_cfg);
         Self {
             all_schemas,
             budget_tokens: DEFAULT_TOOL_BUDGET_TOKENS,
@@ -98,7 +118,22 @@ impl ToolRegistry {
     fn resolve_pinned(
         schemas: &[Value],
         index: &std::collections::HashMap<String, usize>,
+        surface_cfg: Option<&ToolSurfaceConfig>,
     ) -> Vec<(String, Value)> {
+        if let Some(cfg) = surface_cfg {
+            return super::surface::ToolSurface::build(schemas.to_vec(), cfg, &[])
+                .pinned_schemas()
+                .into_iter()
+                .filter_map(|schema| {
+                    let name = schema
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    name.map(|name| (name, schema))
+                })
+                .collect();
+        }
         TOOL_CATALOG
             .iter()
             .filter(|t| t.pinned)
@@ -752,6 +787,30 @@ mod tests {
             names.contains(&"skill"),
             "pinned_only should include injected pinned tools"
         );
+    }
+
+    #[test]
+    fn new_with_tool_surface_honors_runtime_pinned_overrides() {
+        let schemas = vec![
+            sample_schema("bash"),
+            sample_schema("grep"),
+            sample_schema("github"),
+            sample_schema("tool_search"),
+            sample_schema("skill"),
+        ];
+        let cfg = ToolSurfaceConfig {
+            pinned_tools: vec!["github".into(), "-grep".into()],
+        };
+
+        let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
+        let pinned_names: Vec<String> = reg
+            .pinned_schemas
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        assert!(pinned_names.iter().any(|name| name == "github"));
+        assert!(!pinned_names.iter().any(|name| name == "grep"));
     }
 
     // ── Selector observability integration (Pass B) ──

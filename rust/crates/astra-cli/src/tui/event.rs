@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crossterm::event::{Event, EventStream, KeyEvent};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::broadcast;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::BroadcastStream;
@@ -60,12 +60,48 @@ impl TuiEventStream {
 
 fn map_crossterm_event(event: Event) -> Option<TuiEvent> {
     match event {
-        Event::Key(key_event) => Some(TuiEvent::Key(key_event)),
+        // Only forward Press events. Some terminals (kitty keyboard protocol,
+        // Windows console, certain multiplexers) emit Repeat/Release for the
+        // same physical keypress, which would otherwise cause a single ↑ to
+        // trigger HistoryPrev multiple times.
+        Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
+            Some(TuiEvent::Key(normalize_key_event(key_event)))
+        }
+        Event::Key(_) => None,
         Event::Resize(_, _) => Some(TuiEvent::Resize),
         Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
         Event::FocusGained | Event::FocusLost => Some(TuiEvent::Draw),
         _ => None,
     }
+}
+
+fn normalize_key_event(mut key_event: KeyEvent) -> KeyEvent {
+    let KeyCode::Char(c) = key_event.code else {
+        return key_event;
+    };
+
+    match c {
+        '\u{1b}' => {
+            key_event.code = KeyCode::Esc;
+        }
+        '\u{7f}' | '\u{8}' => {
+            key_event.code = KeyCode::Backspace;
+        }
+        '\t' => {
+            key_event.code = KeyCode::Tab;
+        }
+        '\n' | '\r' => {
+            key_event.code = KeyCode::Enter;
+        }
+        '\u{1}'..='\u{1a}' => {
+            let offset = c as u8 - 1;
+            key_event.code = KeyCode::Char((b'a' + offset) as char);
+            key_event.modifiers.insert(KeyModifiers::CONTROL);
+        }
+        _ => {}
+    }
+
+    key_event
 }
 
 impl Stream for TuiEventStream {
@@ -92,5 +128,34 @@ impl Stream for TuiEventStream {
         }
 
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+
+    #[test]
+    fn raw_ctrl_c_char_is_normalized_to_ctrl_c_key() {
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::NONE));
+
+        let Some(TuiEvent::Key(mapped)) = map_crossterm_event(event) else {
+            panic!("expected mapped key event");
+        };
+
+        assert_eq!(mapped.code, KeyCode::Char('c'));
+        assert!(mapped.modifiers.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn raw_escape_char_is_normalized_to_escape_key() {
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('\u{1b}'), KeyModifiers::NONE));
+
+        let Some(TuiEvent::Key(mapped)) = map_crossterm_event(event) else {
+            panic!("expected mapped key event");
+        };
+
+        assert_eq!(mapped.code, KeyCode::Esc);
     }
 }

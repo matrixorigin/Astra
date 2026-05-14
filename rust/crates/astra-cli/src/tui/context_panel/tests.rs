@@ -469,6 +469,27 @@ fn decisions_populated_from_explanations() {
 // ─── ActiveSkill fallback + Compaction section ──────────────────
 
 #[test]
+fn skills_fall_back_to_last_turn_selected_skills_before_active_system_skills() {
+    use super::model::{ActiveSkill, ContextSnapshot};
+    let t = trace(100_000, 1_000, 0, 0, 0, 0);
+    let mut snap = ContextSnapshot::default();
+    snap.selected_skills = vec!["review_changes".into(), "verify_task".into()];
+    snap.active_skills = vec![ActiveSkill {
+        name: "loaded_only".into(),
+        description: "loaded".into(),
+    }];
+    let b = ContextBreakdown::from_trace_with(&t, &snap);
+    let names: Vec<&str> = b.skills.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["review_changes", "verify_task"]);
+    assert!(
+        b.skills
+            .iter()
+            .all(|s| s.source.as_deref() == Some("selected")),
+        "selected-skill fallback should outrank loaded-skill fallback"
+    );
+}
+
+#[test]
 fn skills_fall_back_to_active_system_skills_when_trace_silent() {
     use super::model::{ActiveSkill, ContextSnapshot};
     let t = trace(100_000, 1_000, 0, 0, 0, 0);

@@ -3,6 +3,16 @@
 use super::{SessionState, agent_loader, delegate_subrun, spawn_subrun};
 use std::path::PathBuf;
 
+fn attach_session_to_spawner(
+    spawner: astra_runtime::orchestration::DynamicAgentSpawner,
+    session_id: Option<&str>,
+) -> astra_runtime::orchestration::DynamicAgentSpawner {
+    match session_id {
+        Some(session_id) => spawner.with_session(session_id.to_string()),
+        None => spawner,
+    }
+}
+
 /// Build a fully-wired [`DynamicAgentSpawner`] without mutating a
 /// SessionState. Extracted from [`initialize_multi_agent_runtime`] so
 /// the one-shot `chat -m` code path can wire `spawn_agent` support
@@ -46,8 +56,11 @@ pub(crate) async fn build_one_shot_spawner(
         spawn_subrun::CliSpawnAgentExecutor::new(api.clone(), token, project_root, perm_mode, None)
             .with_skill_resolver(skill_resolver)
             .with_skill_search(skill_search);
-    if let Some(sid) = session_id {
-        spawn_executor = spawn_executor.with_active_session_id(sid);
+    // One-shot `chat -m` uses the captured token only — no profile to
+    // re-read from. The token-provider wiring lives on the REPL path
+    // (`initialize_multi_agent_runtime`) where token rotation is real.
+    if let Some(sid) = session_id.as_deref() {
+        spawn_executor = spawn_executor.with_active_session_id(sid.to_string());
     }
 
     let runtime_cfg = astra_config::runtime_config::RuntimeConfig::load();
@@ -68,14 +81,15 @@ pub(crate) async fn build_one_shot_spawner(
     let prefix_store: std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink> =
         std::sync::Arc::new(astra_turn_core::fork_prefix_store::InMemoryPrefixStore::new());
 
-    std::sync::Arc::new(
+    std::sync::Arc::new(attach_session_to_spawner(
         astra_runtime::orchestration::DynamicAgentSpawner::with_broadcaster(
             mailbox_router,
             progress_broadcaster,
         )
         .with_executor(std::sync::Arc::new(spawn_executor))
         .with_prefix_store(prefix_store),
-    )
+        session_id.as_deref(),
+    ))
 }
 
 async fn build_turn_skill_resolver(
@@ -100,6 +114,7 @@ pub(crate) async fn initialize_multi_agent_runtime(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
     token: String,
+    profile: Option<&str>,
 ) {
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let skill_resolver = build_turn_skill_resolver(state.unified_skill_registry.clone()).await;
@@ -184,7 +199,27 @@ pub(crate) async fn initialize_multi_agent_runtime(
         None,
     )
     .with_skill_resolver(skill_resolver)
-    .with_skill_search(state.skill_search.clone());
+    .with_skill_search(state.skill_search.clone())
+    .with_bg_task_commands(state.bg_task_commands.clone());
+    // Wire a token provider so each spawn reads the freshest access
+    // token at execution time. Without this, sub-agents fail with 401
+    // in long-running sessions after the parent's auth refresh
+    // rotates the token (session 82ff91e5 reproduced this — 4
+    // sub-agents all returned "Could not validate credentials"
+    // because the executor froze the token at startup).
+    //
+    // We can't borrow `state` into the closure (state lives on the
+    // REPL stack and gets mutated each turn), but `current_access_token`
+    // takes only `Option<&str>` for the profile and reads the
+    // credentials file fresh on each call. So we capture an owned
+    // profile string and the closure becomes Send + Sync + 'static.
+    {
+        let profile_owned = profile.map(str::to_string);
+        let provider: spawn_subrun::TokenProvider = std::sync::Arc::new(move || {
+            super::session_runtime::current_access_token(profile_owned.as_deref())
+        });
+        spawn_executor = spawn_executor.with_token_provider(provider);
+    }
     if let Some(session_id) = state.session_id.clone() {
         spawn_executor = spawn_executor.with_active_session_id(session_id);
     }
@@ -211,12 +246,13 @@ pub(crate) async fn initialize_multi_agent_runtime(
         spawn_executor = spawn_executor.with_fork_cache_sink(sink);
     }
 
-    state.agent_spawner = Some(std::sync::Arc::new(
+    state.agent_spawner = Some(std::sync::Arc::new(attach_session_to_spawner(
         astra_runtime::orchestration::DynamicAgentSpawner::with_broadcaster(
             mailbox_router,
             progress_broadcaster,
         )
         .with_executor(std::sync::Arc::new(spawn_executor))
         .with_prefix_store(prefix_store),
-    ));
+        state.session_id.as_deref(),
+    )));
 }

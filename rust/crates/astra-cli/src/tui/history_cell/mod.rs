@@ -29,6 +29,7 @@ pub(crate) mod approval;
 pub(crate) mod assistant;
 pub(crate) mod reasoning;
 pub(crate) mod system;
+pub(crate) mod task;
 pub(crate) mod tool;
 pub(crate) mod turn_summary;
 pub(crate) mod user;

@@ -214,7 +214,7 @@ impl ToolExecutor {
 
         // Task status
         if category == "all" || category == "tasks" {
-            let tasks = self.task_manager.snapshot();
+            let tasks = self.task_manager.snapshot().await;
 
             let mut tasks_info = serde_json::Map::new();
             tasks_info.insert("total".to_string(), json!(tasks.len()));

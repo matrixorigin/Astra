@@ -260,9 +260,13 @@ fn agent_spawn_schema_requires_description_and_prompt() {
 fn agent_other_actions_have_conditional_required() {
     let schemas = all_tool_schemas();
     let agent = tool_schema(&schemas, "agent");
+    // `delegate` removed — it had no execution backend in CLI mode and
+    // silently no-op'd. Schema enum + per-action required entries
+    // both gone. See `agent_action_delegate_is_rejected_with_redirect_to_spawn`.
     assert_eq!(
         conditional_required_for(agent, "delegate"),
-        vec!["task".to_string()]
+        Vec::<String>::new(),
+        "delegate must NOT have a per-action-required entry — the action was removed"
     );
     assert_eq!(
         conditional_required_for(agent, "run_chain"),

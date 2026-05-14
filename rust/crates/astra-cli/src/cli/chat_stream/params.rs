@@ -59,9 +59,30 @@ pub enum StreamEvent {
     Thinking(bool),
     /// Thinking/reasoning preview chunk.
     ThinkingChunk(String),
-    /// Tool execution started.
-    ToolStarted { name: String, description: String },
-    /// Tool execution completed.
+    /// Tool execution started. `tool_use_id` is a server-minted UUIDv7
+    /// correlation key that round-trips through the tool's matching
+    /// `ToolCompleted` and survives into SSE JSON. `parent_tool_use_id`
+    /// is `Some` only when a sub-agent or nested tool produced this
+    /// event — the TUI uses it to render child events inside the
+    /// parent Task cell instead of in top-level scrollback.
+    ToolStarted {
+        name: String,
+        description: String,
+        tool_use_id: String,
+        parent_tool_use_id: Option<String>,
+    },
+    /// Structured lifecycle for the `agent` control tool. This keeps
+    /// user-facing agent rows keyed by child agent identity instead of
+    /// parsing display labels such as "Spawn agent:".
+    AgentControlStarted {
+        action: String,
+        label: String,
+        tool_use_id: String,
+        agent_id: Option<String>,
+    },
+    /// Tool execution completed. `tool_use_id` MUST match the paired
+    /// `ToolStarted`. `parent_tool_use_id` is propagated for the same
+    /// nested-event routing reason.
     ToolCompleted {
         name: String,
         description: String,
@@ -69,6 +90,17 @@ pub enum StreamEvent {
         duration_ms: u64,
         output_summary: Option<String>,
         output: Option<String>,
+        tool_use_id: String,
+        parent_tool_use_id: Option<String>,
+    },
+    AgentControlCompleted {
+        action: String,
+        label: String,
+        status: String,
+        duration_ms: u64,
+        output: Option<String>,
+        tool_use_id: String,
+        agent_id: Option<String>,
     },
     /// Mid-flight progress signal for a running tool. Emitted at a
     /// coarse cadence (~200ms) while the tool produces output so the
@@ -86,9 +118,26 @@ pub enum StreamEvent {
     ModelResponding,
     /// Status line from headless tool execution (diff, diagnostic, etc.).
     StatusLine(String),
+    /// Live event from a spawned child agent. This travels on an
+    /// app-level live lane, not the parent turn-completion lane.
+    AgentLive(astra_turn_core::agent_live_event::AgentLiveEvent),
+    /// Local policy approved a tool without showing an interactive prompt.
+    PermissionAutoApproved { tool: String, reason: String },
 }
 
 pub type StreamEventTx = mpsc::UnboundedSender<StreamEvent>;
+
+pub trait StreamEventSink: Send + Sync + std::fmt::Debug {
+    fn send(&self, event: StreamEvent);
+}
+
+pub type SharedStreamEventSink = Arc<dyn StreamEventSink>;
+
+/// Mint a server-side `tool_use_id`. Prefix keeps it grep-distinguishable
+/// from session ids and approval request ids in logs/SSE payloads.
+pub fn new_tool_use_id() -> String {
+    format!("tu_{}", uuid::Uuid::now_v7().simple())
+}
 
 /// User's response to an approval prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +228,11 @@ pub(crate) struct ChatTurnParams<'a> {
     /// When present, `CliSseStreamHost` forwards fine-grained events through this channel
     /// even when `quiet` / `suppress_intermediate_output` are true.
     pub(crate) stream_event_tx: Option<StreamEventTx>,
+    /// App-level live lane for spawned child agents. Unlike
+    /// `stream_event_tx`, senders cloned into background children do
+    /// not control the parent turn's `TurnComplete`.
+    pub(crate) agent_live_event_sink:
+        Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
     /// Optional channel for async tool approval during plan execution.
     /// When a bypass-immune permission check triggers, the approval request is sent
     /// through this channel instead of blocking on stdin.
@@ -237,6 +291,10 @@ pub(crate) struct ChatTurnParams<'a> {
         Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>>,
     /// Session-scoped task manager so task mutations survive across turns.
     pub(crate) task_manager: Option<std::sync::Arc<crate::edge_tools::TaskManager>>,
+    /// Shared command queue for the TUI's BackgroundTaskRegistry.
+    /// When present, tool executor pushes spawn/kill/output commands here.
+    pub(crate) bg_task_commands:
+        Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
     /// Current REPL turn number — used to tag journal entries for undo.
     pub(crate) turn_index: u32,
     /// Pre-loaded CSL messages (from CslManager.load() in chat_turn).
@@ -291,6 +349,12 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// Passed through to `sse_loop::mod` for `SpawnAgentContext`
     /// wiring. When `agent_spawner` is None this is ignored.
     pub root_agent_id: Option<&'a str>,
+    /// Session-scoped task manager used by one-shot/headless paths that still
+    /// need the model-visible task board.
+    pub task_manager: Option<std::sync::Arc<crate::edge_tools::TaskManager>>,
+    /// Shared command queue for the TUI's BackgroundTaskRegistry.
+    pub bg_task_commands:
+        Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
     /// Optional channel for forwarding stream events (used by --stream-events).
     pub stream_event_tx: Option<StreamEventTx>,
     /// Shared harness snapshot sink for /inspect command (non-REPL one-shot paths).
@@ -340,6 +404,7 @@ impl<'a> ChatTurnParams<'a> {
             cancel_token: None,
             plan_assemble_line_release: None,
             stream_event_tx: ctx.stream_event_tx.clone(),
+            agent_live_event_sink: None,
             approval_request_tx: None,
             mcp_manager: None,
             skill_search: ctx.skill_search,
@@ -358,7 +423,8 @@ impl<'a> ChatTurnParams<'a> {
             git_commit_journal: None,
             git_worktree_journal: None,
             session_state_journal: None,
-            task_manager: None,
+            task_manager: ctx.task_manager.clone(),
+            bg_task_commands: ctx.bg_task_commands.clone(),
             turn_index: 0,
             pipeline_state: None,
             pre_loaded_messages: None,

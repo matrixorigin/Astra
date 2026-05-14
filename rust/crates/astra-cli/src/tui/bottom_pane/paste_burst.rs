@@ -105,6 +105,23 @@ impl PasteBurstDetector {
         self.active
     }
 
+    pub fn reset(&mut self) {
+        self.last_char_time = None;
+        self.consecutive_fast_chars = 0;
+        self.buffer.clear();
+        self.active = false;
+        self.last_flush_time = None;
+    }
+
+    #[cfg(test)]
+    pub fn force_due_buffer_for_test(&mut self, text: &str, now: Instant) {
+        self.last_char_time = Some(now - std::time::Duration::from_millis(FLUSH_IDLE_MS + 1));
+        self.consecutive_fast_chars = BURST_MIN_CHARS;
+        self.buffer = text.to_string();
+        self.active = true;
+        self.last_flush_time = None;
+    }
+
     pub fn recommended_tick_ms() -> u64 {
         FLUSH_IDLE_MS + 1
     }
@@ -185,5 +202,24 @@ mod tests {
         assert!(d.enter_should_insert_newline(t0 + Duration::from_millis(100)));
         // After 120ms
         assert!(!d.enter_should_insert_newline(t0 + Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn reset_drops_active_buffer_and_timing_state() {
+        let mut d = PasteBurstDetector::new();
+        let t0 = Instant::now();
+        d.on_char('a', t0);
+        d.on_char('b', t0 + Duration::from_millis(2));
+        d.on_char('c', t0 + Duration::from_millis(4));
+        assert!(d.is_active());
+
+        d.reset();
+
+        assert!(!d.is_active());
+        assert!(d.flush_if_due(t0 + Duration::from_millis(20)).is_none());
+        assert!(matches!(
+            d.on_char('/', t0 + Duration::from_millis(30)),
+            BurstDecision::Normal
+        ));
     }
 }

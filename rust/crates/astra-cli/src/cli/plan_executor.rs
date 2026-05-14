@@ -1138,6 +1138,11 @@ pub(super) struct BackgroundPlanContext {
     pub session_state_journal:
         Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>,
     pub task_manager: Arc<crate::edge_tools::TaskManager>,
+    /// Shared command queue for the TUI's BackgroundTaskRegistry.
+    /// Threaded from `SessionState.bg_task_commands` so plan subtasks
+    /// can also use `task(action='background_shell')`. `None` for
+    /// non-TUI plan executions (headless test paths).
+    pub bg_task_commands: Option<Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
 
     // ─── Harness (test observability) ────────────────────────────────────
     /// Shared harness snapshot sink for /inspect command.
@@ -1723,6 +1728,7 @@ async fn plan_executor_task(
                     cancel_token: Some(cancel_token),
                     plan_assemble_line_release: None,
                     stream_event_tx: Some(stream_tx),
+                    agent_live_event_sink: None,
                     approval_request_tx: Some(approval_tx),
                     mcp_manager: None,
                     skill_search: &ctx.skill_search,
@@ -1742,6 +1748,7 @@ async fn plan_executor_task(
                     git_worktree_journal: Some(ctx.git_worktree_journal.clone()),
                     session_state_journal: Some(ctx.session_state_journal.clone()),
                     task_manager: Some(ctx.task_manager.clone()),
+                    bg_task_commands: ctx.bg_task_commands.clone(),
                     turn_index: ctx.turn,
                     pipeline_state: None,
                     pre_loaded_messages: None,
@@ -2303,7 +2310,8 @@ mod tests {
             session_state_journal: Arc::new(std::sync::Mutex::new(
                 crate::edge_tools::SessionStateRollbackJournal::default(),
             )),
-            task_manager: Arc::new(crate::edge_tools::TaskManager::new()),
+            task_manager: Arc::new(crate::edge_tools::TaskManager::in_memory()),
+            bg_task_commands: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
             #[cfg(feature = "harness")]

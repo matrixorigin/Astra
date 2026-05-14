@@ -226,6 +226,8 @@ mod tests {
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: None,
+            session_memory_state: Default::default(),
+            session_memory_llm_params: None,
             compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),
@@ -688,9 +690,17 @@ mod tests {
 
         assert_eq!(tool_results.len(), 1);
         assert_eq!(tool_call_records.len(), 1);
+        // The agent_type's `allowed_tools` is now treated as the
+        // sub-agent's authorised surface — the parent's `agent.spawn`
+        // declared what tools the child gets, so the gate denies
+        // bash up-front with "not in allowlist" instead of trying to
+        // ask a parent that was never registered (the pre-fix path,
+        // which would deny with "no parent available"). Same outcome
+        // — denial — but the new message is actionable: the child
+        // agent's own allowlist is the rule.
         assert_eq!(
             tool_call_records[0].error.as_deref(),
-            Some("blocked_tool: Tool 'bash' requires permission but no parent available"),
+            Some("blocked_tool: Tool 'bash' not in allowed tools list"),
         );
     }
 
@@ -1350,13 +1360,18 @@ mod tests {
         )));
         let handler = PermissionRequestHandler::new(parent_ctx.clone());
 
-        // Child requires asking parent for all tools
+        // Child requires asking parent for all tools.
+        // `allowed_tools: None` is required to exercise the
+        // request-parent flow this test pins: when an explicit
+        // allowlist is set, the gate denies up-front for tools
+        // outside it (and approves up-front for tools inside it),
+        // never reaching the mailbox.
         let child_inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
             allow_rules: vec![],
             deny_rules: vec![],
             ask_rules: vec![],
-            allowed_tools: Some(HashSet::new()), // Empty = nothing allowed locally
+            allowed_tools: None,
             is_background: false,
         };
         let child_permission_ctx = Arc::new(tokio::sync::RwLock::new(PermissionSyncContext::new(

@@ -11,7 +11,7 @@ use astra_turn_core::cloud_approval_policy::{
     cloud_gated_tool_kind_with_args,
 };
 use astra_turn_core::tool_argument_hints::{
-    command_hint_from_args, path_hint_from_args, permission_prompt_primary_detail,
+    command_hint_from_args, path_hint_from_args, permission_prompt_display_label,
 };
 
 /// Classify a permission-denial reason and emit a short, actionable
@@ -628,10 +628,21 @@ impl PermissionManager {
     }
 
     /// Resolve §5.5 `approval_required` for cloud-orchestrated tools (posts to `/approval/respond`).
+    ///
+    /// `detail` is the RAW command/path — used by the banner's
+    /// `bash_command_approval_reason` classifier and by the
+    /// fingerprint/denial-tracker path. MUST stay raw; prepending
+    /// formatting here would silently bypass deny-rule matching.
+    ///
+    /// `display_label` is the rich preview ("$ ls -la", "Writing: foo")
+    /// used for the user-visible detail line. Falls back to `detail`
+    /// when `None`, matching the pre-split behaviour so existing
+    /// cloud consumers don't have to upgrade in lockstep.
     pub(super) fn resolve_cloud_approval(
         &mut self,
         tool: &str,
         detail: Option<&str>,
+        display_label: Option<&str>,
         approval_kind: ApprovalKind,
         quiet: bool,
     ) -> astra_thin_client::ApprovalDecision {
@@ -643,6 +654,8 @@ impl PermissionManager {
                 ApprovalDecision::Deny
             };
         }
+        // Display preference: rich label if provided, else raw detail.
+        let display = display_label.or(detail);
         let explicit = Self::cloud_approval_is_explicit(approval_kind);
         if explicit {
             match self.mode {
@@ -651,8 +664,8 @@ impl PermissionManager {
                 PermissionMode::Prompt => {}
             }
             eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
-            if let Some(detail) = detail.filter(|s| !s.is_empty()) {
-                eprintln!("{}", Self::format_prompt_detail(detail).dim());
+            if let Some(shown) = display.filter(|s| !s.is_empty()) {
+                eprintln!("{}", Self::format_prompt_detail(shown).dim());
             }
             return match Self::prompt_approval(ApprovalPromptKind::ConfirmOnce) {
                 'y' => ApprovalDecision::Allow,
@@ -703,8 +716,8 @@ impl PermissionManager {
         }
 
         eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
-        if let Some(detail) = detail.filter(|s| !s.is_empty()) {
-            eprintln!("{}", Self::format_prompt_detail(detail).dim());
+        if let Some(shown) = display.filter(|s| !s.is_empty()) {
+            eprintln!("{}", Self::format_prompt_detail(shown).dim());
         }
         self.apply_cloud_approval_choice(
             tool,
@@ -717,10 +730,13 @@ impl PermissionManager {
     /// prompt on a blocking thread via `spawn_blocking`, preventing the
     /// `inquire::Select` TUI from blocking the tokio worker and conflicting
     /// with concurrent terminal output (spinners, SSE rendering).
+    ///
+    /// See [`resolve_cloud_approval`] for the raw-vs-display split contract.
     pub(super) async fn resolve_cloud_approval_async(
         &mut self,
         tool: &str,
         detail: Option<&str>,
+        display_label: Option<&str>,
         approval_kind: ApprovalKind,
         quiet: bool,
     ) -> astra_thin_client::ApprovalDecision {
@@ -730,11 +746,12 @@ impl PermissionManager {
         {
             return decision;
         }
+        let display = display_label.or(detail);
         let explicit = Self::cloud_approval_is_explicit(approval_kind);
         if explicit {
             eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
-            if let Some(detail) = detail.filter(|s| !s.is_empty()) {
-                eprintln!("{}", Self::format_prompt_detail(detail).dim());
+            if let Some(shown) = display.filter(|s| !s.is_empty()) {
+                eprintln!("{}", Self::format_prompt_detail(shown).dim());
             }
             let ch = tokio::task::spawn_blocking(|| {
                 Self::prompt_approval(ApprovalPromptKind::ConfirmOnce)
@@ -759,8 +776,8 @@ impl PermissionManager {
             };
         }
         eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
-        if let Some(detail) = detail.filter(|s| !s.is_empty()) {
-            eprintln!("{}", Self::format_prompt_detail(detail).dim());
+        if let Some(shown) = display.filter(|s| !s.is_empty()) {
+            eprintln!("{}", Self::format_prompt_detail(shown).dim());
         }
         let ch = tokio::task::spawn_blocking(|| {
             Self::prompt_approval(ApprovalPromptKind::CloudStandard)
@@ -772,7 +789,7 @@ impl PermissionManager {
 
     pub(super) async fn resolve_cloud_approval_batch_async(
         &mut self,
-        requests: &[(&str, Option<&str>, ApprovalKind)],
+        requests: &[(&str, Option<&str>, Option<&str>, ApprovalKind)],
         quiet: bool,
     ) -> Vec<astra_thin_client::ApprovalDecision> {
         use astra_thin_client::ApprovalDecision;
@@ -781,23 +798,38 @@ impl PermissionManager {
             return Vec::new();
         }
         if requests.len() == 1 {
-            let (tool, detail, approval_kind) = requests[0];
+            let (tool, detail, display_label, approval_kind) = requests[0];
             return vec![
-                self.resolve_cloud_approval_async(tool, detail, approval_kind, quiet)
-                    .await,
+                self.resolve_cloud_approval_async(
+                    tool,
+                    detail,
+                    display_label,
+                    approval_kind,
+                    quiet,
+                )
+                .await,
             ];
         }
 
         let mut decisions: Vec<Option<ApprovalDecision>> = vec![None; requests.len()];
-        let mut unresolved: Vec<(usize, &str, Option<&str>, ApprovalKind)> = Vec::new();
+        type UnresolvedItem<'a> = (
+            usize,
+            &'a str,
+            Option<&'a str>,
+            Option<&'a str>,
+            ApprovalKind,
+        );
+        let mut unresolved: Vec<UnresolvedItem<'_>> = Vec::new();
 
-        for (idx, (tool, detail, approval_kind)) in requests.iter().copied().enumerate() {
+        for (idx, (tool, detail, display_label, approval_kind)) in
+            requests.iter().copied().enumerate()
+        {
             if let Some(decision) =
                 self.preflight_cloud_approval_decision(tool, detail, approval_kind, quiet)
             {
                 decisions[idx] = Some(decision);
             } else {
-                unresolved.push((idx, tool, detail, approval_kind));
+                unresolved.push((idx, tool, detail, display_label, approval_kind));
             }
         }
 
@@ -810,7 +842,7 @@ impl PermissionManager {
 
         let all_explicit = unresolved
             .iter()
-            .all(|(_, _, _, approval_kind)| Self::cloud_approval_is_explicit(*approval_kind));
+            .all(|(_, _, _, _, approval_kind)| Self::cloud_approval_is_explicit(*approval_kind));
         let prompt_kind = if all_explicit {
             ApprovalPromptKind::ConfirmOnce
         } else {
@@ -825,13 +857,15 @@ impl PermissionManager {
             )
             .yellow()
         );
-        for (_, tool, detail, _) in &unresolved {
+        for (_, tool, detail, display_label, _) in &unresolved {
+            // Show the rich label if provided, else fall back to the
+            // raw detail so older callers keep working.
+            let shown = display_label.or(*detail);
             eprintln!(
                 "  {} {}",
                 "•".dim(),
-                match detail.filter(|detail| !detail.is_empty()) {
-                    Some(detail) =>
-                        format!("{tool} — {}", Self::format_prompt_detail(detail).trim()),
+                match shown.filter(|s| !s.is_empty()) {
+                    Some(s) => format!("{tool} — {}", Self::format_prompt_detail(s).trim()),
                     None => (*tool).to_string(),
                 }
                 .dim()
@@ -848,7 +882,7 @@ impl PermissionManager {
                 "  {}",
                 "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore.".yellow()
             );
-            for (idx, _, _, _) in unresolved {
+            for (idx, _, _, _, _) in unresolved {
                 decisions[idx] = Some(ApprovalDecision::Allow);
             }
         } else if all_explicit {
@@ -857,11 +891,11 @@ impl PermissionManager {
             } else {
                 ApprovalDecision::Deny
             };
-            for (idx, _, _, _) in unresolved {
+            for (idx, _, _, _, _) in unresolved {
                 decisions[idx] = Some(decision.clone());
             }
         } else {
-            for (idx, tool, detail, _) in unresolved {
+            for (idx, tool, detail, _, _) in unresolved {
                 decisions[idx] = Some(self.apply_cloud_approval_choice(tool, detail, ch));
             }
         }
@@ -1136,7 +1170,10 @@ impl PermissionManager {
             SideEffect::Write => "✎",
             SideEffect::Read => "◉",
         };
-        let brief = permission_prompt_primary_detail(name, args).unwrap_or_else(|| "…".into());
+        // Display label uses the shared rich preview so the approval
+        // dialog matches scrollback. (Rule-matching hint is a separate
+        // function — see `permission_prompt_primary_detail`.)
+        let brief = permission_prompt_display_label(name, args);
         let header = format!("{icon} {name}");
         let mut detail_lines = vec![Self::format_prompt_detail(&brief)];
         if let Some(explicit) = explicit_approval_reason(name, args) {
@@ -2144,7 +2181,13 @@ mod tests {
     fn resolve_cloud_approval_quiet_denies_without_auto() {
         let mut pm = PermissionManager::new(false);
         assert!(matches!(
-            pm.resolve_cloud_approval("write_file", Some("x.rs"), ApprovalKind::Standard, true),
+            pm.resolve_cloud_approval(
+                "write_file",
+                Some("x.rs"),
+                None,
+                ApprovalKind::Standard,
+                true
+            ),
             astra_thin_client::ApprovalDecision::Deny
         ));
     }
@@ -2153,7 +2196,13 @@ mod tests {
     fn resolve_cloud_approval_quiet_allows_when_auto() {
         let mut pm = PermissionManager::new(true);
         assert!(matches!(
-            pm.resolve_cloud_approval("write_file", Some("x.rs"), ApprovalKind::Standard, true),
+            pm.resolve_cloud_approval(
+                "write_file",
+                Some("x.rs"),
+                None,
+                ApprovalKind::Standard,
+                true
+            ),
             astra_thin_client::ApprovalDecision::Allow
         ));
     }
@@ -2641,7 +2690,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let decision =
-            pm.resolve_cloud_approval("bash", Some("/tmp"), ApprovalKind::Standard, false);
+            pm.resolve_cloud_approval("bash", Some("/tmp"), None, ApprovalKind::Standard, false);
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
 
@@ -2650,7 +2699,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let decision =
-            pm.resolve_cloud_approval("bash", Some("/tmp"), ApprovalKind::Standard, false);
+            pm.resolve_cloud_approval("bash", Some("/tmp"), None, ApprovalKind::Standard, false);
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
 
@@ -2659,7 +2708,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let decision =
-            pm.resolve_cloud_approval("bash", Some("/tmp"), ApprovalKind::Explicit, true);
+            pm.resolve_cloud_approval("bash", Some("/tmp"), None, ApprovalKind::Explicit, true);
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
 
@@ -2669,8 +2718,13 @@ mod tests {
     fn auto_mode_cloud_explicit_interactive_auto_allows() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
-        let decision =
-            pm.resolve_cloud_approval("write_file", Some("new.rs"), ApprovalKind::Explicit, false);
+        let decision = pm.resolve_cloud_approval(
+            "write_file",
+            Some("new.rs"),
+            None,
+            ApprovalKind::Explicit,
+            false,
+        );
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
 
@@ -2678,8 +2732,13 @@ mod tests {
     fn deny_mode_cloud_explicit_interactive_denies() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
-        let decision =
-            pm.resolve_cloud_approval("write_file", Some("new.rs"), ApprovalKind::Explicit, false);
+        let decision = pm.resolve_cloud_approval(
+            "write_file",
+            Some("new.rs"),
+            None,
+            ApprovalKind::Explicit,
+            false,
+        );
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
 
@@ -2690,6 +2749,7 @@ mod tests {
         let decision = pm.resolve_cloud_approval(
             "bash",
             Some("Explicit approval required: action scope is unbounded."),
+            None,
             ApprovalKind::Standard,
             true,
         );
@@ -3457,7 +3517,13 @@ mod tests {
     async fn cloud_approval_async_quiet_denies_without_auto() {
         let mut pm = PermissionManager::new(false);
         let decision = pm
-            .resolve_cloud_approval_async("write_file", Some("x.rs"), ApprovalKind::Standard, true)
+            .resolve_cloud_approval_async(
+                "write_file",
+                Some("x.rs"),
+                None,
+                ApprovalKind::Standard,
+                true,
+            )
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
@@ -3466,7 +3532,13 @@ mod tests {
     async fn cloud_approval_async_quiet_allows_when_auto() {
         let mut pm = PermissionManager::new(true);
         let decision = pm
-            .resolve_cloud_approval_async("write_file", Some("x.rs"), ApprovalKind::Standard, true)
+            .resolve_cloud_approval_async(
+                "write_file",
+                Some("x.rs"),
+                None,
+                ApprovalKind::Standard,
+                true,
+            )
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
@@ -3476,7 +3548,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let decision = pm
-            .resolve_cloud_approval_async("bash", Some("/tmp"), ApprovalKind::Standard, false)
+            .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
@@ -3486,7 +3558,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let decision = pm
-            .resolve_cloud_approval_async("bash", Some("/tmp"), ApprovalKind::Standard, false)
+            .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
@@ -3500,6 +3572,7 @@ mod tests {
             .resolve_cloud_approval_async(
                 "write_file",
                 Some("new.rs"),
+                None,
                 ApprovalKind::Explicit,
                 false,
             )
@@ -3516,6 +3589,7 @@ mod tests {
             .resolve_cloud_approval_async(
                 "write_file",
                 Some("new.rs"),
+                None,
                 ApprovalKind::Explicit,
                 false,
             )
@@ -3529,7 +3603,7 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.session_overrides.insert(bare_fp("bash"), true);
         let decision = pm
-            .resolve_cloud_approval_async("bash", Some("/tmp"), ApprovalKind::Standard, false)
+            .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
@@ -3540,7 +3614,7 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.session_overrides.insert(bare_fp("bash"), false);
         let decision = pm
-            .resolve_cloud_approval_async("bash", Some("/tmp"), ApprovalKind::Standard, false)
+            .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
@@ -3613,6 +3687,7 @@ mod tests {
             .resolve_cloud_approval_async(
                 "write_file",
                 Some("src/main.rs"),
+                None,
                 ApprovalKind::Standard,
                 false,
             )
@@ -3699,9 +3774,9 @@ mod tests {
                 pm_async.session_overrides.insert(bare_fp(tool), v);
             }
             let sync_result =
-                pm_sync.resolve_cloud_approval(tool, Some("detail"), approval_kind, quiet);
+                pm_sync.resolve_cloud_approval(tool, Some("detail"), None, approval_kind, quiet);
             let async_result = pm_async
-                .resolve_cloud_approval_async(tool, Some("detail"), approval_kind, quiet)
+                .resolve_cloud_approval_async(tool, Some("detail"), None, approval_kind, quiet)
                 .await;
             assert_eq!(
                 sync_result, async_result,
@@ -3819,8 +3894,13 @@ mod tests {
     #[test]
     fn explicit_cloud_approval_auto_mode_allows() {
         let mut pm = PermissionManager::new(true);
-        let decision =
-            pm.resolve_cloud_approval("bash", Some("echo hello"), ApprovalKind::Explicit, false);
+        let decision = pm.resolve_cloud_approval(
+            "bash",
+            Some("echo hello"),
+            None,
+            ApprovalKind::Explicit,
+            false,
+        );
         assert!(
             matches!(decision, astra_thin_client::ApprovalDecision::Allow),
             "explicit approval should be allowed in Auto mode"
@@ -3831,8 +3911,13 @@ mod tests {
     fn explicit_cloud_approval_deny_mode_denies() {
         let mut pm = PermissionManager::new(false);
         pm.set_mode(PermissionMode::Deny);
-        let decision =
-            pm.resolve_cloud_approval("bash", Some("echo hello"), ApprovalKind::Explicit, false);
+        let decision = pm.resolve_cloud_approval(
+            "bash",
+            Some("echo hello"),
+            None,
+            ApprovalKind::Explicit,
+            false,
+        );
         assert!(
             matches!(decision, astra_thin_client::ApprovalDecision::Deny),
             "explicit approval should be denied in Deny mode"
@@ -3842,8 +3927,13 @@ mod tests {
     #[test]
     fn explicit_cloud_approval_quiet_auto_allows() {
         let mut pm = PermissionManager::new(true);
-        let decision =
-            pm.resolve_cloud_approval("bash", Some("echo hello"), ApprovalKind::Explicit, true);
+        let decision = pm.resolve_cloud_approval(
+            "bash",
+            Some("echo hello"),
+            None,
+            ApprovalKind::Explicit,
+            true,
+        );
         assert!(
             matches!(decision, astra_thin_client::ApprovalDecision::Allow),
             "quiet + Auto should allow explicit"
@@ -3853,8 +3943,13 @@ mod tests {
     #[test]
     fn explicit_cloud_approval_quiet_prompt_denies() {
         let mut pm = PermissionManager::new(false);
-        let decision =
-            pm.resolve_cloud_approval("bash", Some("echo hello"), ApprovalKind::Explicit, true);
+        let decision = pm.resolve_cloud_approval(
+            "bash",
+            Some("echo hello"),
+            None,
+            ApprovalKind::Explicit,
+            true,
+        );
         assert!(
             matches!(decision, astra_thin_client::ApprovalDecision::Deny),
             "quiet + Prompt should deny explicit"
@@ -3988,6 +4083,7 @@ mod tests {
         let cloud_decision = pm.resolve_cloud_approval(
             "str_replace",
             Some("src/foo.rs"),
+            None,
             ApprovalKind::Standard,
             false,
         );
@@ -4470,6 +4566,7 @@ mod tests {
             .resolve_cloud_approval_async(
                 "bash",
                 Some("cargo test --lib"),
+                None,
                 ApprovalKind::Explicit,
                 // quiet=true is the TUI Silent policy; the point is
                 // that session_overrides wins even in Silent mode

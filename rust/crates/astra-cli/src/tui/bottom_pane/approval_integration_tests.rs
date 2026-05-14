@@ -34,16 +34,8 @@ fn enqueue(bp: &mut BottomPane, tool: &str) -> oneshot::Receiver<ApprovalRespons
 
 fn slash_items() -> Vec<SlashItem> {
     vec![
-        SlashItem {
-            name: "/help",
-            description: "show help",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/history",
-            description: "browse history",
-            subcommands: &[],
-        },
+        SlashItem::simple("/help", "show help"),
+        SlashItem::simple("/history", "browse history"),
     ]
 }
 

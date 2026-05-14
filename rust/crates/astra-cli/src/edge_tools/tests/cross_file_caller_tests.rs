@@ -560,7 +560,9 @@ async fn rename_symbol_changes_can_be_rolled_back_by_turn() {
         result.contains("2 file"),
         "rename should touch both files: {result}"
     );
-    let rollback = executor.rollback_turn_actions(&json!({"scope": "current_turn"}));
+    let rollback = executor
+        .rollback_turn_actions(&json!({"scope": "current_turn"}))
+        .await;
     let rollback_json: serde_json::Value =
         serde_json::from_str(&rollback).expect("rollback_turn_actions json");
     assert_eq!(

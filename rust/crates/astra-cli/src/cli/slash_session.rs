@@ -609,7 +609,7 @@ fn handle_session_switch(sub_arg: &str, state: &mut SessionState) {
 
     // Restore session state
     let st = crate::session_runtime::session_state_from_journal(&session_id);
-    state.session_id = Some(session_id.clone());
+    state.set_session_id(session_id.clone());
     state.journal = session_journal::JournalWriter::new(&session_id).ok();
     state.history = st.history;
     state.turn = st.turn;
@@ -874,7 +874,7 @@ pub(super) async fn handle_session_command(
                     // Fork CSL and restore child state.
                     // Journal provides turn/token counters (not in CSL).
                     let st = session_runtime::session_state_from_journal(&new_sid);
-                    state.session_id = Some(new_sid.clone());
+                    state.set_session_id(new_sid.clone());
                     state.journal = session_journal::JournalWriter::new(&new_sid).ok();
                     state.turn = st.turn;
                     state.total_prompt_tokens = st.total_prompt_tokens;
@@ -4484,7 +4484,7 @@ fn resume_restore_service(state: &SessionState) -> HybridRestoreService {
 }
 
 fn reset_state_for_session_restore(state: &mut SessionState) {
-    state.session_id = None;
+    state.clear_session_id();
     state.pending_recovery = None;
     state.run_id = None;
     state.turn = 0;
@@ -4764,7 +4764,7 @@ async fn apply_restored_session(
 
     reset_state_for_session_restore(state);
 
-    state.session_id = Some(restored.session_id.clone());
+    state.set_session_id(restored.session_id.clone());
     state.turn = restored.turn_count;
     state.total_prompt_tokens = restored.total_tokens_in;
     state.total_completion_tokens = restored.total_tokens_out;
@@ -5908,7 +5908,7 @@ mod resume_tests {
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = SessionState::default();
-        state.session_id = Some(session_id.clone());
+        state.set_session_id(session_id.clone());
 
         handle_session_command("trace on", &api, None, &mut state, Some("test-token")).await;
     }

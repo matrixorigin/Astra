@@ -9,7 +9,7 @@ async fn refresh_auth_runtime(
 ) {
     if let Some(token) = current_access_token(profile) {
         clear_auth_runtime(state);
-        initialize_multi_agent_runtime(state, api, token).await;
+        initialize_multi_agent_runtime(state, api, token, profile).await;
     }
 }
 

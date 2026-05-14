@@ -10,8 +10,9 @@ use astra_turn_core::sse_edge_stderr_lines::{
 };
 use astra_turn_core::sse_stream_host::{
     EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, SseStreamHost, ToolBatchRequest,
-    consume_sse_stream_cancellable, is_tool_concurrency_safe, stream_idle_timeout,
+    consume_sse_stream_cancellable, stream_idle_timeout,
 };
+use astra_turn_core::tool_policy::is_tool_concurrency_safe;
 use astra_turn_core::tool_result_semantics::{
     cloud_tool_result_status_label, tool_dedup_signature, tool_error_triggers_rollback,
 };
@@ -27,6 +28,51 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+const AGENT_TOOL_OUTPUT_EVENT_LIMIT: usize = 50_000;
+const DEFAULT_TOOL_OUTPUT_EVENT_LIMIT: usize = 5_000;
+
+fn agent_control_action(args: &Value) -> Option<&str> {
+    args.get("action")
+        .and_then(Value::as_str)
+        .and_then(|action| matches!(action, "spawn" | "get_result").then_some(action))
+}
+
+fn agent_control_label(args: &Value, fallback: String) -> String {
+    args.get("name")
+        .and_then(Value::as_str)
+        .or_else(|| args.get("agent_id").and_then(Value::as_str))
+        .or_else(|| args.get("description").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(fallback)
+}
+
+fn agent_id_from_args(args: &Value) -> Option<String> {
+    args.get("agent_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn agent_id_from_output(output: &str) -> Option<String> {
+    serde_json::from_str::<Value>(output)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn tool_output_event_text(tool: &str, output: &str) -> String {
+    let limit = if tool == "agent" {
+        AGENT_TOOL_OUTPUT_EVENT_LIMIT
+    } else {
+        DEFAULT_TOOL_OUTPUT_EVENT_LIMIT
+    };
+    output.chars().take(limit).collect()
+}
 
 // CLI formatting utilities
 use super::cli_formatting::{
@@ -174,6 +220,9 @@ pub(super) struct EdgeSseContext<'a> {
     pub cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
     /// Optional channel for forwarding fine-grained stream events.
     pub stream_event_tx: Option<super::chat_stream::StreamEventTx>,
+    /// Optional direct stream sink. Used by spawned child agents to
+    /// avoid an unbounded intermediate channel in the live-output path.
+    pub stream_event_sink: Option<super::chat_stream::SharedStreamEventSink>,
     /// Optional channel for async tool approval requests during plan execution.
     pub approval_request_tx: Option<super::chat_stream::ApprovalRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls in the SSE stream.
@@ -229,6 +278,8 @@ struct CliSseStreamHost<'a> {
     cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
     /// Optional channel for forwarding fine-grained stream events.
     stream_event_tx: Option<super::chat_stream::StreamEventTx>,
+    /// Optional direct stream sink for bounded/live paths.
+    stream_event_sink: Option<super::chat_stream::SharedStreamEventSink>,
     /// Optional channel for async tool approval requests during plan execution.
     approval_request_tx: Option<super::chat_stream::ApprovalRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls.
@@ -481,6 +532,7 @@ impl<'a> CliSseStreamHost<'a> {
             xml_tag_buffer: String::new(),
             cancel_token: ctx.cancel_token,
             stream_event_tx: ctx.stream_event_tx,
+            stream_event_sink: ctx.stream_event_sink,
             approval_request_tx: ctx.approval_request_tx,
             skill_resolver: ctx.skill_resolver,
             skills_invoked: std::collections::HashSet::new(),
@@ -756,7 +808,7 @@ impl<'a> CliSseStreamHost<'a> {
 
 impl<'a> CliSseStreamHost<'a> {
     #[allow(clippy::too_many_arguments)]
-    fn rollback_from_checkpoints(
+    async fn rollback_from_checkpoints(
         &self,
         turn_index: u32,
         file_checkpoint: u64,
@@ -800,16 +852,19 @@ impl<'a> CliSseStreamHost<'a> {
             return None;
         }
 
-        let rollback_output = self.executor.rollback_turn_actions(&serde_json::json!({
-            "scope": "turn",
-            "turn_index": turn_index,
-            "file_after_sequence": file_checkpoint,
-            "database_after_sequence": database_checkpoint,
-            "stash_after_sequence": stash_checkpoint,
-            "commit_after_sequence": commit_checkpoint,
-            "worktree_after_sequence": worktree_checkpoint,
-            "session_state_after_sequence": session_state_checkpoint,
-        }));
+        let rollback_output = self
+            .executor
+            .rollback_turn_actions(&serde_json::json!({
+                "scope": "turn",
+                "turn_index": turn_index,
+                "file_after_sequence": file_checkpoint,
+                "database_after_sequence": database_checkpoint,
+                "stash_after_sequence": stash_checkpoint,
+                "commit_after_sequence": commit_checkpoint,
+                "worktree_after_sequence": worktree_checkpoint,
+                "session_state_after_sequence": session_state_checkpoint,
+            }))
+            .await;
         Some(
             serde_json::from_str(&rollback_output).unwrap_or_else(|error| {
                 serde_json::json!({
@@ -955,7 +1010,10 @@ impl<'a> CliSseStreamHost<'a> {
         rendered
     }
 
-    fn rollback_active_batch_transaction(&self, active: &ActiveBatchTransaction) -> Option<Value> {
+    async fn rollback_active_batch_transaction(
+        &self,
+        active: &ActiveBatchTransaction,
+    ) -> Option<Value> {
         self.rollback_from_checkpoints(
             active.turn_index,
             active.file_checkpoint,
@@ -965,9 +1023,10 @@ impl<'a> CliSseStreamHost<'a> {
             active.worktree_checkpoint,
             active.session_state_checkpoint,
         )
+        .await
     }
 
-    fn rollback_active_turn(&self, active: &ActiveTurnRollback) -> Option<Value> {
+    async fn rollback_active_turn(&self, active: &ActiveTurnRollback) -> Option<Value> {
         self.rollback_from_checkpoints(
             active.turn_index,
             active.file_checkpoint,
@@ -977,6 +1036,7 @@ impl<'a> CliSseStreamHost<'a> {
             active.worktree_checkpoint,
             active.session_state_checkpoint,
         )
+        .await
     }
 
     fn merge_turn_rollback_fields(
@@ -1236,14 +1296,28 @@ impl<'a> CliSseStreamHost<'a> {
     ) -> EdgeToolExecResult {
         let duration_ms = 0;
 
-        if let Some(tx) = &self.stream_event_tx {
+        if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
             let output_summary = self
                 .render
                 .format_output_summary(&req.tool, &output, status)
                 .map(|summary| summary.text)
                 .unwrap_or_default();
             let tool_description = self.render.format_tool_description(&req.tool, &req.args);
-            let _ = tx.send(super::chat_stream::StreamEvent::ToolCompleted {
+            if req.tool == "agent"
+                && let Some(action) = agent_control_action(&req.args)
+            {
+                self.emit_stream_event(super::chat_stream::StreamEvent::AgentControlCompleted {
+                    action: action.to_string(),
+                    label: agent_control_label(&req.args, tool_description.clone()),
+                    status: status.to_string(),
+                    duration_ms,
+                    output: Some(tool_output_event_text(&req.tool, &output)),
+                    tool_use_id: req.request_id.clone(),
+                    agent_id: agent_id_from_output(&output)
+                        .or_else(|| agent_id_from_args(&req.args)),
+                });
+            }
+            self.emit_stream_event(super::chat_stream::StreamEvent::ToolCompleted {
                 name: req.tool.clone(),
                 description: tool_description,
                 status: status.to_string(),
@@ -1253,7 +1327,9 @@ impl<'a> CliSseStreamHost<'a> {
                 } else {
                     Some(output_summary)
                 },
-                output: Some(output.chars().take(5000).collect()),
+                output: Some(tool_output_event_text(&req.tool, &output)),
+                tool_use_id: req.request_id.clone(),
+                parent_tool_use_id: None,
             });
         }
 
@@ -1294,9 +1370,10 @@ impl<'a> CliSseStreamHost<'a> {
             let metadata = match Self::parse_batch_transaction_metadata(&req.args) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    let rollback = active_tx
-                        .as_ref()
-                        .and_then(|active| self.rollback_active_batch_transaction(active));
+                    let rollback = match active_tx.as_ref() {
+                        Some(active) => self.rollback_active_batch_transaction(active).await,
+                        None => None,
+                    };
                     let result = self
                         .record_synthetic_batch_result(
                             req,
@@ -1408,9 +1485,10 @@ impl<'a> CliSseStreamHost<'a> {
                 if let Some(error) =
                     Self::batch_transaction_boundary_violation(&req.tool, &req.args)
                 {
-                    let rollback = active_tx
-                        .as_ref()
-                        .and_then(|active| self.rollback_active_batch_transaction(active));
+                    let rollback = match active_tx.as_ref() {
+                        Some(active) => self.rollback_active_batch_transaction(active).await,
+                        None => None,
+                    };
                     let result = self
                         .record_synthetic_batch_result(
                             req,
@@ -1456,9 +1534,10 @@ impl<'a> CliSseStreamHost<'a> {
                 }
 
                 if !Self::batch_transaction_boundary_supported(&req.tool, &req.args) {
-                    let rollback = active_tx
-                        .as_ref()
-                        .and_then(|active| self.rollback_active_batch_transaction(active));
+                    let rollback = match active_tx.as_ref() {
+                        Some(active) => self.rollback_active_batch_transaction(active).await,
+                        None => None,
+                    };
                     let result = self
                         .record_synthetic_batch_result(
                             req,
@@ -1518,7 +1597,7 @@ impl<'a> CliSseStreamHost<'a> {
                 if metadata.as_ref().is_some_and(|meta| meta.id == active.id)
                     && result.status == "error"
                 {
-                    let rollback = self.rollback_active_batch_transaction(active);
+                    let rollback = self.rollback_active_batch_transaction(active).await;
                     let failure_reason = result.output.clone();
                     result.output = Self::append_transaction_note(
                         &result.output,
@@ -1593,6 +1672,15 @@ pub(crate) fn reusable_speculative_output(r: Option<(String, bool)>) -> Option<S
 }
 
 impl CliSseStreamHost<'_> {
+    fn emit_stream_event(&self, event: super::chat_stream::StreamEvent) {
+        if let Some(tx) = &self.stream_event_tx {
+            let _ = tx.send(event.clone());
+        }
+        if let Some(sink) = &self.stream_event_sink {
+            sink.send(event);
+        }
+    }
+
     /// D-9: Harvest speculative results for the upcoming concurrent batch.
     ///
     /// `wait_all()` is used so in-flight speculations finish before the
@@ -1663,9 +1751,7 @@ impl CliSseStreamHost<'_> {
 #[async_trait::async_trait]
 impl SseStreamHost for CliSseStreamHost<'_> {
     fn on_before_sse_read_loop(&mut self) {
-        if let Some(tx) = &self.stream_event_tx {
-            let _ = tx.send(super::chat_stream::StreamEvent::WaitingForModel);
-        }
+        self.emit_stream_event(super::chat_stream::StreamEvent::WaitingForModel);
         if self.render_policy.is_silent() {
             return;
         }
@@ -1673,9 +1759,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     fn on_first_sse_frame(&mut self) {
-        if let Some(tx) = &self.stream_event_tx {
-            let _ = tx.send(super::chat_stream::StreamEvent::ModelResponding);
-        }
+        self.emit_stream_event(super::chat_stream::StreamEvent::ModelResponding);
         // Don't stop the TTFT spinner here — the first SSE frame is often
         // metadata (session_info, usage) not visible content.  Let the
         // spinner run until actual thinking/text arrives, which will
@@ -1697,7 +1781,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 
     fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
         // Forward to stream event channel (even when quiet/suppress are on)
-        if let Some(tx) = &self.stream_event_tx {
+        if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
             use super::chat_stream::StreamEvent;
             for effect in &effects {
                 let ev = match effect {
@@ -1712,7 +1796,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     _ => None,
                 };
                 if let Some(ev) = ev {
-                    let _ = tx.send(ev);
+                    self.emit_stream_event(ev);
                 }
             }
         }
@@ -1800,10 +1884,22 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     ) -> EdgeToolExecResult {
         // Forward tool-started event to observer channel
         let tool_description = self.render.format_tool_description(tool, args);
-        if let Some(tx) = &self.stream_event_tx {
-            let _ = tx.send(super::chat_stream::StreamEvent::ToolStarted {
+        if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+            if tool == "agent"
+                && let Some(action) = agent_control_action(args)
+            {
+                self.emit_stream_event(super::chat_stream::StreamEvent::AgentControlStarted {
+                    action: action.to_string(),
+                    label: agent_control_label(args, tool_description.clone()),
+                    tool_use_id: request_id.to_string(),
+                    agent_id: agent_id_from_args(args),
+                });
+            }
+            self.emit_stream_event(super::chat_stream::StreamEvent::ToolStarted {
                 name: tool.to_string(),
                 description: tool_description.clone(),
+                tool_use_id: request_id.to_string(),
+                parent_tool_use_id: None,
             });
         }
 
@@ -2307,7 +2403,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             && tool_error_triggers_rollback(tool, &output)
             && let Some(active) = self.active_turn_rollback.clone()
         {
-            let rollback = self.rollback_active_turn(&active);
+            let rollback = self.rollback_active_turn(&active).await;
             let failure_reason = output.clone();
             output = Self::append_turn_rollback_note(&output, "failed", rollback.as_ref());
             tool_result_fields = Self::merge_turn_rollback_fields(
@@ -2347,14 +2443,27 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
 
         // Forward tool-completed event to observer channel
-        if let Some(tx) = &self.stream_event_tx {
+        if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
             let output_summary = self
                 .render
                 .format_output_summary(tool, &output, &status)
                 .map(|summary| summary.text)
                 .unwrap_or_default();
             let tool_description = self.render.format_tool_description(tool, args);
-            let _ = tx.send(super::chat_stream::StreamEvent::ToolCompleted {
+            if tool == "agent"
+                && let Some(action) = agent_control_action(args)
+            {
+                self.emit_stream_event(super::chat_stream::StreamEvent::AgentControlCompleted {
+                    action: action.to_string(),
+                    label: agent_control_label(args, tool_description.clone()),
+                    status: status.clone(),
+                    duration_ms,
+                    output: Some(tool_output_event_text(tool, &output)),
+                    tool_use_id: request_id.to_string(),
+                    agent_id: agent_id_from_output(&output).or_else(|| agent_id_from_args(args)),
+                });
+            }
+            self.emit_stream_event(super::chat_stream::StreamEvent::ToolCompleted {
                 name: tool.to_string(),
                 description: tool_description,
                 status: status.clone(),
@@ -2364,7 +2473,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 } else {
                     Some(output_summary)
                 },
-                output: Some(output.chars().take(5000).collect()),
+                output: Some(tool_output_event_text(tool, &output)),
+                tool_use_id: request_id.to_string(),
+                parent_tool_use_id: None,
             });
         }
 
@@ -2410,6 +2521,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         approval_kind: astra_thin_client::ApprovalKind,
         session_id: Option<&str>,
         detail: Option<&str>,
+        display_label: Option<&str>,
     ) -> EdgeApprovalResult {
         // `resolve_cloud_approval` writes to stderr only. Never bump `lines_written` here:
         // that counter drives stdout `MoveUp` when clearing streamed text before the first
@@ -2425,6 +2537,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 pm.resolve_cloud_approval_async(
                     tool,
                     detail,
+                    display_label,
                     approval_kind,
                     self.render_policy.is_silent(),
                 )
@@ -2479,6 +2592,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         (
                             request.tool.as_str(),
                             request.detail.as_deref(),
+                            request.display_label.as_deref(),
                             request.approval_kind,
                         )
                     })
@@ -2690,10 +2804,22 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         for (i, (_, req)) in conc_reqs.iter().enumerate() {
             // Forward tool-started event.
             let desc = self.render.format_tool_description(&req.tool, &req.args);
-            if let Some(tx) = &self.stream_event_tx {
-                let _ = tx.send(super::chat_stream::StreamEvent::ToolStarted {
+            if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+                if req.tool == "agent"
+                    && let Some(action) = agent_control_action(&req.args)
+                {
+                    self.emit_stream_event(super::chat_stream::StreamEvent::AgentControlStarted {
+                        action: action.to_string(),
+                        label: agent_control_label(&req.args, desc.clone()),
+                        tool_use_id: req.request_id.clone(),
+                        agent_id: agent_id_from_args(&req.args),
+                    });
+                }
+                self.emit_stream_event(super::chat_stream::StreamEvent::ToolStarted {
                     name: req.tool.clone(),
                     description: desc,
+                    tool_use_id: req.request_id.clone(),
+                    parent_tool_use_id: None,
                 });
             }
             // First-tool clearing (once per turn).
@@ -2764,6 +2890,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     let request_id = req.request_id.clone();
                     let sem = sem.clone();
                     let speculative = speculative_by_id.get(&req.request_id).cloned();
+                    let cancel_token = self.cancel_token.cloned();
                     async move {
                         if let Some(output) = reusable_speculative_output(speculative) {
                             return (
@@ -2813,10 +2940,25 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         // (it lives only for this batch), so acquire() won't fail; the
                         // `ok()` fallback is defensive.
                         let _permit = sem.acquire_owned().await.ok();
-                        let (outcome, dur) = catch_tool_execution_panic(
+                        let exec = catch_tool_execution_panic(
                             executor.execute_with_metadata(&tool, &effective_args),
-                        )
-                        .await;
+                        );
+                        let (outcome, dur) = if let Some(token) = cancel_token {
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => (
+                                    crate::edge_tools::ToolExecutionOutcome {
+                                        output: "Cancelled by user".to_string(),
+                                        tool_result_fields: None,
+                                        is_error: true,
+                                    },
+                                    0u64,
+                                ),
+                                result = exec => result,
+                            }
+                        } else {
+                            exec.await
+                        };
                         // ── Post-tool hooks (rewrite output if any hook requests it) ──
                         if astra_turn_core::tool_hooks::global_has_hooks().await {
                             let post_ctx = astra_turn_core::tool_hooks::ToolHookContext::post(
@@ -2909,14 +3051,30 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             let status = cloud_tool_result_status_label(&output);
 
             // Forward tool-completed event.
-            if let Some(tx) = &self.stream_event_tx {
+            if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
                 let output_summary = self
                     .render
                     .format_output_summary(&req.tool, &output, status)
                     .map(|summary| summary.text)
                     .unwrap_or_default();
                 let desc = self.render.format_tool_description(&req.tool, &req.args);
-                let _ = tx.send(super::chat_stream::StreamEvent::ToolCompleted {
+                if req.tool == "agent"
+                    && let Some(action) = agent_control_action(&req.args)
+                {
+                    self.emit_stream_event(
+                        super::chat_stream::StreamEvent::AgentControlCompleted {
+                            action: action.to_string(),
+                            label: agent_control_label(&req.args, desc.clone()),
+                            status: status.to_string(),
+                            duration_ms,
+                            output: Some(tool_output_event_text(&req.tool, &output)),
+                            tool_use_id: req.request_id.clone(),
+                            agent_id: agent_id_from_output(&output)
+                                .or_else(|| agent_id_from_args(&req.args)),
+                        },
+                    );
+                }
+                self.emit_stream_event(super::chat_stream::StreamEvent::ToolCompleted {
                     name: req.tool.clone(),
                     description: desc,
                     status: status.to_string(),
@@ -2926,7 +3084,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     } else {
                         Some(output_summary)
                     },
-                    output: Some(output.chars().take(5000).collect()),
+                    output: Some(tool_output_event_text(&req.tool, &output)),
+                    tool_use_id: req.request_id.clone(),
+                    parent_tool_use_id: None,
                 });
             }
 
@@ -3500,6 +3660,15 @@ impl StreamRenderState {
 
     /// Format tool description, optionally adjusting based on output.
     /// For read_file, detects auto-expand and adjusts description accordingly.
+    ///
+    /// Canonical per-tool formatting lives in
+    /// [`astra_turn_core::tool_preview::render_preview`] — a shared
+    /// function used by both this scrollback renderer and the
+    /// permission approval prompt so the two views stay in lockstep.
+    /// This method only handles the adjustments that depend on
+    /// *runtime* state the pure previewer doesn't know about:
+    /// terminal width (for budget) and the tool's output buffer (for
+    /// `read_file` auto-expand detection).
     fn format_tool_description_with_output(
         &self,
         tool: &str,
@@ -3509,1092 +3678,32 @@ impl StreamRenderState {
         // Dynamic budget based on terminal width.
         // Layout: "  ✓ {description} {duration}" — prefix ~6 chars, duration ~6 chars.
         let term_w = self.term_width;
-        let desc_budget = term_w.saturating_sub(14); // room for prefix + duration
-        // Path budget: description budget minus the label prefix (e.g. "Reading: ")
-        let path_budget = |prefix_len: usize| desc_budget.saturating_sub(prefix_len).max(20);
+        let desc_budget = term_w.saturating_sub(14);
 
-        match tool {
-            "bash" | "shell_exec" => {
-                let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
-                format!("$ {}", truncate_line(cmd, path_budget(2)))
-            }
-            "powershell" => {
-                let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
-                format!("PS> {}", truncate_line(cmd, path_budget(4)))
-            }
-            "read_file" => {
+        // read_file auto-expand: when the model requested a ranged
+        // read but the tool returned the full file because it was
+        // within the auto-expand threshold, the description should
+        // read "(full)" instead of showing the requested range. This
+        // cross-cuts args + output so it lives here, not in the pure
+        // previewer.
+        if tool == "read_file" {
+            let auto_expanded = output
+                .map(|o| o.starts_with("[Auto-expanded to full file"))
+                .unwrap_or(false);
+            if auto_expanded {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                let start = args.get("start_line").and_then(Value::as_u64);
-                let end = args.get("end_line").and_then(Value::as_u64);
-                let short_path = shorten_path(path, path_budget(10)); // "Reading: "
-
-                // Check if auto-expanded (ranged request but full file returned)
-                let auto_expanded = output
-                    .map(|o| o.starts_with("[Auto-expanded to full file"))
-                    .unwrap_or(false);
-
-                if auto_expanded {
-                    format!("Reading: {short_path} (full)")
-                } else {
-                    match (start, end) {
-                        (Some(s), Some(e)) => format!("Reading: {short_path}:{s}-{e}"),
-                        (Some(s), None) => format!("Reading: {short_path}:{s}-"),
-                        _ => format!("Reading: {short_path}"),
-                    }
-                }
+                let path_budget = desc_budget.saturating_sub(10).max(20);
+                let short_path = astra_text_utils::str_preview::shorten_path(path, path_budget);
+                return format!("Reading: {short_path} (full)");
             }
-            "write_file" => {
-                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                if args.get("delete").and_then(Value::as_bool).unwrap_or(false) {
-                    format!("Deleting: {}", shorten_path(path, path_budget(10)))
-                } else {
-                    format!("Writing: {}", shorten_path(path, path_budget(9)))
-                }
-            }
-            "str_replace" | "multi_edit" => {
-                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                format!("Editing: {}", shorten_path(path, path_budget(9)))
-            }
-            "delete_file" => {
-                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                format!("Deleting: {}", shorten_path(path, path_budget(10)))
-            }
-            "list_dir" => {
-                let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-                format!("Listing: {}", shorten_path(path, path_budget(9)))
-            }
-            "grep" => {
-                let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-                let glob_filter = args.get("glob").and_then(Value::as_str);
-                let path = args.get("path").and_then(Value::as_str);
-                let pat_budget = desc_budget / 3;
-                let short_pattern = truncate_line(pattern, pat_budget);
-                match (glob_filter, path) {
-                    (Some(g), _) => format!("Grep: \"{short_pattern}\" in {g}"),
-                    (None, Some(p)) => {
-                        let p_budget = desc_budget.saturating_sub(10 + pat_budget);
-                        format!("Grep: \"{short_pattern}\" in {}", shorten_path(p, p_budget))
-                    }
-                    _ => format!("Grep: \"{short_pattern}\""),
-                }
-            }
-            "glob" => {
-                let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-                format!("Glob: {}", truncate_line(pattern, path_budget(6)))
-            }
-            "git" => {
-                let action = args
-                    .get("action")
-                    .and_then(Value::as_str)
-                    .unwrap_or("status");
-                match action {
-                    "status" => "Git status".to_string(),
-                    "log" => {
-                        let n = args.get("n").and_then(Value::as_u64);
-                        let branch = args.get("branch").and_then(Value::as_str);
-                        match (n, branch) {
-                            (Some(n), Some(b)) => format!("Git log -{n} {b}"),
-                            (Some(n), None) => format!("Git log -{n}"),
-                            (None, Some(b)) => format!("Git log {b}"),
-                            _ => "Git log".to_string(),
-                        }
-                    }
-                    "show" => {
-                        let commit = args
-                            .get("commit")
-                            .or_else(|| args.get("ref"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        format!("Git show {}", truncate_line(commit, path_budget(9)))
-                    }
-                    "diff" => {
-                        let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
-                        let path = args.get("path").and_then(Value::as_str);
-                        let stat_only = args
-                            .get("stat_only")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        let suffix = if stat_only { " --stat" } else { "" };
-                        match (staged, path) {
-                            (true, Some(p)) => format!(
-                                "Git diff --staged{suffix} {}",
-                                shorten_path(p, path_budget(18))
-                            ),
-                            (true, None) => format!("Git diff --staged{suffix}"),
-                            (false, Some(p)) => {
-                                format!("Git diff{suffix} {}", shorten_path(p, path_budget(10)))
-                            }
-                            _ => format!("Git diff{suffix}"),
-                        }
-                    }
-                    "blame" => {
-                        let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                        format!("Git blame {}", shorten_path(path, path_budget(10)))
-                    }
-                    "file_history" => {
-                        let file = args.get("file").and_then(Value::as_str).unwrap_or("");
-                        format!("Git history {}", shorten_path(file, path_budget(12)))
-                    }
-                    "log_search" => {
-                        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                        format!(
-                            "Git log search \"{}\"",
-                            truncate_line(query, path_budget(17))
-                        )
-                    }
-                    "contributors" => {
-                        let path = args.get("path").and_then(Value::as_str);
-                        match path {
-                            Some(p) => {
-                                format!("Git contributors {}", shorten_path(p, path_budget(17)))
-                            }
-                            None => "Git contributors".to_string(),
-                        }
-                    }
-                    "commit" => {
-                        let msg = args.get("message").and_then(Value::as_str).unwrap_or("");
-                        format!("Git commit \"{}\"", truncate_line(msg, path_budget(13)))
-                    }
-                    "stash" => {
-                        let sub = args
-                            .get("stash_action")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        format!("Git stash {sub}")
-                    }
-                    _ => format!("Git {action}"),
-                }
-            }
-            "github" => {
-                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-                let owner = args.get("owner").and_then(Value::as_str);
-                let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
-                match action {
-                    "list_prs" => format!("GitHub: list PRs {repo_display}"),
-                    "get_pr" => {
-                        let pr = args.get("pr_number").and_then(Value::as_u64);
-                        match pr {
-                            Some(n) => format!("GitHub: PR #{n} {repo_display}"),
-                            None => format!("GitHub: get PR {repo_display}"),
-                        }
-                    }
-                    "ci_status" => format!("GitHub: CI status {repo_display}"),
-                    "list_issues" => format!("GitHub: list issues {repo_display}"),
-                    "get_issue" => {
-                        let n = args.get("issue_number").and_then(Value::as_u64);
-                        match n {
-                            Some(n) => format!("GitHub: issue #{n} {repo_display}"),
-                            None => format!("GitHub: get issue {repo_display}"),
-                        }
-                    }
-                    "repo_stats" => format!("GitHub: stats {repo_display}"),
-                    "create_issue" => {
-                        let title = args.get("title").and_then(Value::as_str).unwrap_or("");
-                        format!(
-                            "GitHub: create issue \"{}\"",
-                            truncate_line(title, path_budget(22))
-                        )
-                    }
-                    _ => format!("GitHub: {action}"),
-                }
-            }
-            "memory" => {
-                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-                match action {
-                    "recall" => {
-                        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                        format!("Recalling: \"{}\"", truncate_line(query, path_budget(13)))
-                    }
-                    "remember" => {
-                        let content = args.get("content").and_then(Value::as_str).unwrap_or("");
-                        format!(
-                            "Remembering: \"{}\"",
-                            truncate_line(content, path_budget(13))
-                        )
-                    }
-                    "expand" => match args.get("memory_id").and_then(Value::as_str) {
-                        Some(mid) => {
-                            format!("Expanding memory: {}", truncate_line(mid, path_budget(18)))
-                        }
-                        None => "Expanding memory".to_string(),
-                    },
-                    "forget" => {
-                        match args
-                            .get("memory_id")
-                            .and_then(Value::as_str)
-                            .or_else(|| args.get("topic").and_then(Value::as_str))
-                        {
-                            Some(target) => format!(
-                                "Forgetting: \"{}\"",
-                                truncate_line(target, path_budget(18))
-                            ),
-                            None => "Forgetting".to_string(),
-                        }
-                    }
-                    "update" => match args.get("memory_id").and_then(Value::as_str) {
-                        Some(mid) => {
-                            format!("Updating memory: {}", truncate_line(mid, path_budget(18)))
-                        }
-                        None => "Updating memory".to_string(),
-                    },
-                    "focus" => {
-                        let value = args
-                            .get("focus_value")
-                            .or_else(|| args.get("value"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        format!("Focus on: \"{}\"", truncate_line(value, path_budget(16)))
-                    }
-                    "reflect" => "Reflecting on memories".to_string(),
-                    "profile" => "Checking profile".to_string(),
-                    "feedback" => {
-                        let signal = args.get("signal").and_then(Value::as_str).unwrap_or("");
-                        if signal.is_empty() {
-                            "Memory feedback".to_string()
-                        } else {
-                            format!("Memory feedback: {signal}")
-                        }
-                    }
-                    _ => format!("Memory: {action}"),
-                }
-            }
-            "session" => {
-                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-                match action {
-                    "config" => {
-                        let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                        format!("Adjust config: {}", truncate_line(path, path_budget(15)))
-                    }
-                    "prioritize" => {
-                        let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
-                        format!("Prioritize: {}", truncate_line(tool, path_budget(12)))
-                    }
-                    "deprioritize" => {
-                        let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
-                        format!("Deprioritize: {}", truncate_line(tool, path_budget(14)))
-                    }
-                    "set_goal" => {
-                        let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
-                        format!("Set goal: \"{}\"", truncate_line(goal, path_budget(12)))
-                    }
-                    "compact" => "Compress context".to_string(),
-                    "enter_plan" => {
-                        let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
-                        format!(
-                            "Enter plan mode: \"{}\"",
-                            truncate_line(goal, path_budget(18))
-                        )
-                    }
-                    "exit_plan" => "Exit plan mode".to_string(),
-                    "rollback_edits" => {
-                        let scope = args.get("scope").and_then(Value::as_str);
-                        match scope {
-                            Some(s) => {
-                                format!("Revert file edits: {}", truncate_line(s, path_budget(19)))
-                            }
-                            None => "Revert file edits".to_string(),
-                        }
-                    }
-                    "ask_user" => {
-                        let question = args.get("question").and_then(Value::as_str).unwrap_or("");
-                        format!(
-                            "Asking user: \"{}\"",
-                            truncate_line(question, path_budget(15))
-                        )
-                    }
-                    "sleep" => {
-                        let duration_ms =
-                            args.get("duration_ms").and_then(Value::as_u64).unwrap_or(0);
-                        format!("Sleeping: {duration_ms}ms")
-                    }
-                    "tool_search" => {
-                        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                        format!(
-                            "Searching tools: \"{}\"",
-                            truncate_line(query, path_budget(18))
-                        )
-                    }
-                    _ => format!("Session: {action}"),
-                }
-            }
-            "mo" => {
-                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-                match action {
-                    "query" => {
-                        let sql = args.get("sql").and_then(Value::as_str).unwrap_or("");
-                        format!("MO query: \"{}\"", truncate_line(sql, path_budget(11)))
-                    }
-                    "snapshot" => {
-                        let name = args.get("name").and_then(Value::as_str).unwrap_or("");
-                        format!("MO snapshot: {}", truncate_line(name, path_budget(13)))
-                    }
-                    "branch" => {
-                        let name = args.get("name").and_then(Value::as_str).unwrap_or("");
-                        format!("MO branch: {}", truncate_line(name, path_budget(11)))
-                    }
-                    _ => format!("MO: {action}"),
-                }
-            }
-            "agent" => {
-                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-                match action {
-                    "delegate" => {
-                        let task = args.get("task").and_then(Value::as_str).unwrap_or("");
-                        format!("Delegating: \"{}\"", truncate_line(task, path_budget(14)))
-                    }
-                    "run_chain" => {
-                        let chain = args.get("chain_name").and_then(Value::as_str).unwrap_or("");
-                        format!("Running chain: {}", truncate_line(chain, path_budget(15)))
-                    }
-                    "spawn" => {
-                        let description = args.get("description").and_then(Value::as_str);
-                        let agent_type = args.get("agent_type").and_then(Value::as_str);
-                        match (description, agent_type) {
-                            (Some(desc), Some(at)) => format!(
-                                "Spawn agent: {} ({})",
-                                truncate_line(desc, path_budget(13)),
-                                truncate_line(at, path_budget(8))
-                            ),
-                            (Some(desc), None) => {
-                                format!("Spawn agent: {}", truncate_line(desc, path_budget(13)))
-                            }
-                            (None, Some(at)) => {
-                                format!("Spawn agent: {}", truncate_line(at, path_budget(13)))
-                            }
-                            _ => "Spawn agent".to_string(),
-                        }
-                    }
-                    "get_result" => {
-                        let agent_id = args.get("agent_id").and_then(Value::as_str).unwrap_or("");
-                        format!(
-                            "Get agent result: {}",
-                            truncate_line(agent_id, path_budget(19))
-                        )
-                    }
-                    "send_message" => {
-                        let to = args.get("to").and_then(Value::as_str).unwrap_or("");
-                        let summary = args.get("summary").and_then(Value::as_str);
-                        let message = args.get("message").and_then(Value::as_str);
-                        match (summary, message) {
-                            (Some(s), _) => format!(
-                                "Send message: {}: {}",
-                                truncate_line(to, path_budget(12)),
-                                truncate_line(s, path_budget(16))
-                            ),
-                            (None, Some(m)) => format!(
-                                "Send message: {}: {}",
-                                truncate_line(to, path_budget(12)),
-                                truncate_line(m, path_budget(16))
-                            ),
-                            (None, None) => {
-                                format!("Send message: {}", truncate_line(to, path_budget(14)))
-                            }
-                        }
-                    }
-                    _ => format!("Agent: {action}"),
-                }
-            }
-            "introspect" => "Introspecting…".to_string(),
-            // Legacy individual tool names (kept for backward compat)
-            "git_status" => "Git status".to_string(),
-            "git_log" => {
-                let n = args.get("n").and_then(Value::as_u64);
-                let branch = args.get("branch").and_then(Value::as_str);
-                match (n, branch) {
-                    (Some(n), Some(b)) => format!("Git log -{n} {b}"),
-                    (Some(n), None) => format!("Git log -{n}"),
-                    (None, Some(b)) => format!("Git log {b}"),
-                    _ => "Git log".to_string(),
-                }
-            }
-            "git_show" => {
-                let commit = args
-                    .get("commit")
-                    .or_else(|| args.get("ref"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                format!("Git show {}", truncate_line(commit, path_budget(9)))
-            }
-            "git_diff" => {
-                let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
-                let path = args.get("path").and_then(Value::as_str);
-                let base_ref = args.get("base_ref").and_then(Value::as_str);
-                let git_ref = args.get("ref").and_then(Value::as_str);
-                if let Some(base) = base_ref {
-                    let tip = git_ref.unwrap_or("HEAD");
-                    let range = format!("{base}..{tip}");
-                    match path {
-                        Some(p) => {
-                            format!("Git diff {} -- {}", range, shorten_path(p, path_budget(20)))
-                        }
-                        None => format!("Git diff {range}"),
-                    }
-                } else {
-                    match (staged, path) {
-                        (true, Some(p)) => {
-                            format!("Git diff --staged {}", shorten_path(p, path_budget(18)))
-                        }
-                        (true, None) => "Git diff --staged".to_string(),
-                        (false, Some(p)) => {
-                            format!("Git diff {}", shorten_path(p, path_budget(10)))
-                        }
-                        _ => "Git diff".to_string(),
-                    }
-                }
-            }
-            "git_blame" => {
-                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                format!("Git blame {}", shorten_path(path, path_budget(10)))
-            }
-            "git_file_history" => {
-                let file = args.get("file").and_then(Value::as_str).unwrap_or("");
-                format!("Git history {}", shorten_path(file, path_budget(12)))
-            }
-            "git_log_search" => {
-                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                format!(
-                    "Git log search \"{}\"",
-                    truncate_line(query, path_budget(17))
-                )
-            }
-            "git_contributors" => {
-                let path = args.get("path").and_then(Value::as_str);
-                let since = args.get("since").and_then(Value::as_str);
-                match (path, since) {
-                    (Some(path), Some(since)) => format!(
-                        "Git contributors {} since {}",
-                        shorten_path(path, path_budget(23)),
-                        truncate_line(since, 18)
-                    ),
-                    (Some(path), None) => {
-                        format!("Git contributors {}", shorten_path(path, path_budget(17)))
-                    }
-                    (None, Some(since)) => {
-                        format!(
-                            "Git contributors since {}",
-                            truncate_line(since, path_budget(23))
-                        )
-                    }
-                    (None, None) => "Git contributors".to_string(),
-                }
-            }
-            "git_commit" => {
-                let msg = args.get("message").and_then(Value::as_str).unwrap_or("");
-                format!("Git commit \"{}\"", truncate_line(msg, path_budget(13)))
-            }
-            "git_revert_commit" => {
-                let sha = args.get("commit_sha").and_then(Value::as_str).unwrap_or("");
-                format!("Git revert {}", truncate_line(sha, path_budget(13)))
-            }
-            "git_stash" => {
-                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-                let stash_ref = args.get("stash_ref").and_then(Value::as_str);
-                let index = args.get("index").and_then(Value::as_i64);
-                match (action, stash_ref, index) {
-                    ("", _, _) => "Git stash".to_string(),
-                    (action, Some(stash_ref), _) => format!(
-                        "Git stash {action} {}",
-                        truncate_line(stash_ref, path_budget(19))
-                    ),
-                    (action, None, Some(index)) => format!("Git stash {action} stash@{{{index}}}"),
-                    (action, None, None) => format!("Git stash {action}"),
-                }
-            }
-            "git_checkout_file" => {
-                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                let git_ref = args.get("ref").and_then(Value::as_str);
-                match git_ref {
-                    Some(git_ref) => format!(
-                        "Git checkout {} -- {}",
-                        truncate_line(git_ref, 16),
-                        shorten_path(path, path_budget(20))
-                    ),
-                    None => format!("Git checkout {}", shorten_path(path, path_budget(13))),
-                }
-            }
-            "git_worktree" => {
-                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-                let branch = args.get("branch").and_then(Value::as_str);
-                let path = args.get("path").and_then(Value::as_str);
-                match (branch, path) {
-                    (Some(branch), _) => format!(
-                        "Git worktree {} {}",
-                        truncate_line(action, 16),
-                        truncate_line(branch, path_budget(19))
-                    ),
-                    (None, Some(path)) => format!(
-                        "Git worktree {} {}",
-                        truncate_line(action, 16),
-                        shorten_path(path, path_budget(19))
-                    ),
-                    (None, None) => {
-                        format!("Git worktree {}", truncate_line(action, path_budget(13)))
-                    }
-                }
-            }
-            "find_definition" => {
-                let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
-                format!(
-                    "Find definition of {}",
-                    truncate_line(symbol, path_budget(20))
-                )
-            }
-            "find_references" => {
-                let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
-                format!(
-                    "Find references to {}",
-                    truncate_line(symbol, path_budget(19))
-                )
-            }
-            "symbol_search" => {
-                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                format!("Search symbol {}", truncate_line(query, path_budget(15)))
-            }
-            "symbols" => {
-                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                format!("Get symbols in {}", shorten_path(path, path_budget(16)))
-            }
-            "call_graph" => {
-                let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
-                format!("Call graph for {}", truncate_line(symbol, path_budget(16)))
-            }
-            "hover_info" => {
-                let file = args.get("file").and_then(Value::as_str).unwrap_or("");
-                let line = args.get("line").and_then(Value::as_u64);
-                let column = args.get("column").and_then(Value::as_u64);
-                match (line, column) {
-                    (Some(line), Some(column)) => {
-                        let suffix_len = format!(":{line}:{column}").chars().count();
-                        let short_file = shorten_path(file, path_budget(14 + suffix_len));
-                        format!("Hover info at {short_file}:{line}:{column}")
-                    }
-                    (Some(line), None) => {
-                        let suffix_len = format!(":{line}").chars().count();
-                        let short_file = shorten_path(file, path_budget(14 + suffix_len));
-                        format!("Hover info at {short_file}:{line}")
-                    }
-                    (None, _) => format!("Hover info at {}", shorten_path(file, path_budget(14))),
-                }
-            }
-            "type_hierarchy" => {
-                let name = args.get("name").and_then(Value::as_str).unwrap_or("");
-                let direction = args.get("direction").and_then(Value::as_str);
-                match direction {
-                    Some(direction) => format!(
-                        "Type hierarchy for {} ({})",
-                        truncate_line(name, path_budget(23)),
-                        truncate_line(direction, 16)
-                    ),
-                    None => format!(
-                        "Type hierarchy for {}",
-                        truncate_line(name, path_budget(19))
-                    ),
-                }
-            }
-            "rename_symbol" => {
-                let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
-                let new_name = args.get("new_name").and_then(Value::as_str).unwrap_or("");
-                format!(
-                    "Rename symbol {} -> {}",
-                    truncate_line(symbol, path_budget(18)),
-                    truncate_line(new_name, 18)
-                )
-            }
-            "dead_code" => {
-                let path = args.get("path").and_then(Value::as_str);
-                let kind = args.get("kind").and_then(Value::as_str);
-                match (path, kind) {
-                    (Some(path), Some(kind)) => format!(
-                        "Find dead code: {} ({})",
-                        shorten_path(path, path_budget(22)),
-                        truncate_line(kind, 16)
-                    ),
-                    (Some(path), None) => {
-                        format!("Find dead code: {}", shorten_path(path, path_budget(16)))
-                    }
-                    (None, Some(kind)) => {
-                        format!("Find dead code: {}", truncate_line(kind, path_budget(16)))
-                    }
-                    (None, None) => "Find dead code".to_string(),
-                }
-            }
-            "extract_members" => {
-                let file = args.get("file").and_then(Value::as_str).unwrap_or("");
-                let line = args.get("line").and_then(Value::as_u64);
-                match line {
-                    Some(line) => {
-                        let suffix_len = format!(":{line}").chars().count();
-                        let short_file = shorten_path(file, path_budget(17 + suffix_len));
-                        format!("Extract members: {short_file}:{line}")
-                    }
-                    None => format!("Extract members: {}", shorten_path(file, path_budget(17))),
-                }
-            }
-            "lsp" => {
-                let operation = args.get("operation").and_then(Value::as_str);
-                let file = args.get("file").and_then(Value::as_str);
-                let line = args.get("line").and_then(Value::as_u64);
-                let column = args.get("column").and_then(Value::as_u64);
-                let symbol = args.get("symbol").and_then(Value::as_str);
-                let query = args.get("query").and_then(Value::as_str);
-                match (operation, file, line, column, symbol, query) {
-                    (Some(operation), Some(file), Some(line), Some(column), _, _) => {
-                        let suffix_len = format!(":{line}:{column}").chars().count();
-                        let prefix_len = 5 + operation.chars().count() + 1;
-                        let short_file = shorten_path(file, path_budget(prefix_len + suffix_len));
-                        format!("LSP: {operation} {short_file}:{line}:{column}")
-                    }
-                    (Some(operation), Some(file), _, _, _, _) => format!(
-                        "LSP: {} {}",
-                        truncate_line(operation, path_budget(5)),
-                        shorten_path(file, path_budget(18))
-                    ),
-                    (Some(operation), _, _, _, Some(symbol), _) => format!(
-                        "LSP: {} {}",
-                        truncate_line(operation, path_budget(5)),
-                        truncate_line(symbol, path_budget(18))
-                    ),
-                    (Some(operation), _, _, _, _, Some(query)) => format!(
-                        "LSP: {} {}",
-                        truncate_line(operation, path_budget(5)),
-                        truncate_line(query, path_budget(18))
-                    ),
-                    (Some(operation), _, _, _, _, _) => {
-                        format!("LSP: {}", truncate_line(operation, path_budget(13)))
-                    }
-                    _ => "LSP".to_string(),
-                }
-            }
-            "run_build_test" => {
-                let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
-                format!("$ {}", truncate_line(cmd, path_budget(2)))
-            }
-            "web_fetch" => {
-                let url = args.get("url").and_then(Value::as_str).unwrap_or("");
-                format!("Fetching: {}", truncate_line(url, path_budget(10)))
-            }
-            "web_search" => {
-                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                format!(
-                    "Searching web: \"{}\"",
-                    truncate_line(query, path_budget(17))
-                )
-            }
-            "github_get_pr" => {
-                let owner = args.get("owner").and_then(Value::as_str);
-                let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
-                let num = args.get("pr_number").and_then(Value::as_u64).unwrap_or(0);
-                format!("Getting PR: {repo_display}#{num}")
-            }
-            "github_list_prs" => {
-                let owner = args.get("owner").and_then(Value::as_str);
-                let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
-                format!("Listing PRs: {repo_display}")
-            }
-            "github_get_issue" => {
-                let owner = args.get("owner").and_then(Value::as_str);
-                let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
-                let num = args
-                    .get("issue_number")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                format!("Getting issue: {repo_display}#{num}")
-            }
-            "github_list_issues" => {
-                let owner = args.get("owner").and_then(Value::as_str);
-                let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
-                format!("Listing issues: {repo_display}")
-            }
-            "github_repo_stats" => {
-                let owner = args.get("owner").and_then(Value::as_str);
-                let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
-                format!("GitHub stats: {repo_display}")
-            }
-            "github_ci_status" => {
-                let owner = args.get("owner").and_then(Value::as_str);
-                let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
-                format!("GitHub CI: {repo_display}")
-            }
-            "get_agent_info" => {
-                let dimension = args.get("dimension").and_then(Value::as_str).unwrap_or("");
-                format!(
-                    "Getting agent info: {}",
-                    truncate_line(dimension, path_budget(18))
-                )
-            }
-            "reflect" => {
-                let question = args.get("question").and_then(Value::as_str);
-                let focus = args.get("focus").and_then(Value::as_str);
-                match (question, focus) {
-                    (Some(question), _) => format!(
-                        "Reflecting: \"{}\"",
-                        truncate_line(question, path_budget(13))
-                    ),
-                    (None, Some(focus)) => {
-                        format!("Reflecting: {}", truncate_line(focus, path_budget(13)))
-                    }
-                    (None, None) => "Reflecting".to_string(),
-                }
-            }
-            "context_analysis" => {
-                let mode = args.get("mode").and_then(Value::as_str);
-                let turn = args.get("turn").and_then(Value::as_i64);
-                let turn_a = args.get("turn_a").and_then(Value::as_i64);
-                let turn_b = args.get("turn_b").and_then(Value::as_i64);
-                match (mode, turn, turn_a, turn_b) {
-                    (Some("turn"), Some(turn), _, _) => format!("Context analysis: turn {turn}"),
-                    (Some("compare"), _, Some(turn_a), Some(turn_b)) => {
-                        format!("Context analysis: compare {turn_a} vs {turn_b}")
-                    }
-                    (Some(mode), _, _, _) => {
-                        format!("Context analysis: {}", truncate_line(mode, path_budget(18)))
-                    }
-                    _ => "Context analysis".to_string(),
-                }
-            }
-            "rollback_file_edits" => {
-                let scope = args.get("scope").and_then(Value::as_str);
-                let turn_index = args.get("turn_index").and_then(Value::as_i64);
-                let path = args.get("path").and_then(Value::as_str);
-                match (scope, turn_index, path) {
-                    (Some("turn"), Some(turn_index), _) => {
-                        format!("Revert file edits: turn {turn_index}")
-                    }
-                    (Some("file"), _, Some(path)) => format!(
-                        "Revert file edits: {}",
-                        truncate_line(path, path_budget(19))
-                    ),
-                    (Some(scope), _, _) => format!(
-                        "Revert file edits: {}",
-                        truncate_line(scope, path_budget(19))
-                    ),
-                    _ => "Revert file edits".to_string(),
-                }
-            }
-            "rollback_database_snapshots" => {
-                let scope = args.get("scope").and_then(Value::as_str);
-                let turn_index = args.get("turn_index").and_then(Value::as_i64);
-                let snapshot_id = args.get("snapshot_id").and_then(Value::as_str);
-                match (scope, turn_index, snapshot_id) {
-                    (Some("turn"), Some(turn_index), _) => {
-                        format!("Revert DB snapshots: turn {turn_index}")
-                    }
-                    (Some("snapshot"), _, Some(snapshot_id)) => format!(
-                        "Revert DB snapshots: {}",
-                        truncate_line(snapshot_id, path_budget(21))
-                    ),
-                    (Some(scope), _, _) => format!(
-                        "Revert DB snapshots: {}",
-                        truncate_line(scope, path_budget(21))
-                    ),
-                    _ => "Revert DB snapshots".to_string(),
-                }
-            }
-            "rollback_turn_actions" => {
-                let scope = args.get("scope").and_then(Value::as_str);
-                let turn_index = args.get("turn_index").and_then(Value::as_i64);
-                match (scope, turn_index) {
-                    (Some("turn"), Some(turn_index)) => {
-                        format!("Rollback turn actions: turn {turn_index}")
-                    }
-                    (Some(scope), _) => format!(
-                        "Rollback turn actions: {}",
-                        truncate_line(scope, path_budget(24))
-                    ),
-                    _ => "Rollback turn actions".to_string(),
-                }
-            }
-            "diagnose" => {
-                let category = args.get("category").and_then(Value::as_str);
-                let verbose = args.get("verbose").and_then(Value::as_bool);
-                match (category, verbose) {
-                    (Some(category), Some(true)) => format!(
-                        "Diagnose: {} verbose",
-                        truncate_line(category, path_budget(10))
-                    ),
-                    (Some(category), _) => {
-                        format!("Diagnose: {}", truncate_line(category, path_budget(10)))
-                    }
-                    (None, Some(true)) => "Diagnose: verbose".to_string(),
-                    _ => "Diagnose".to_string(),
-                }
-            }
-            "env" => {
-                let operation = args.get("operation").and_then(Value::as_str);
-                let name = args.get("name").and_then(Value::as_str);
-                let pattern = args.get("pattern").and_then(Value::as_str);
-                match (operation, name, pattern) {
-                    (Some(operation), Some(name), _) => format!(
-                        "Env: {} {}",
-                        truncate_line(operation, path_budget(5)),
-                        truncate_line(name, path_budget(14))
-                    ),
-                    (Some("search"), _, Some(pattern)) => {
-                        format!("Env: search {}", truncate_line(pattern, path_budget(12)))
-                    }
-                    (Some(operation), _, _) => {
-                        format!("Env: {}", truncate_line(operation, path_budget(12)))
-                    }
-                    _ => "Env".to_string(),
-                }
-            }
-            "notebook_edit" => {
-                let edit_mode = args.get("edit_mode").and_then(Value::as_str);
-                let notebook_path = args.get("notebook_path").and_then(Value::as_str);
-                match (edit_mode, notebook_path) {
-                    (Some(edit_mode), Some(notebook_path)) => format!(
-                        "Notebook edit: {} {}",
-                        truncate_line(edit_mode, path_budget(7)),
-                        truncate_line(notebook_path, path_budget(17))
-                    ),
-                    (_, Some(notebook_path)) => format!(
-                        "Notebook edit: {}",
-                        truncate_line(notebook_path, path_budget(19))
-                    ),
-                    _ => "Notebook edit".to_string(),
-                }
-            }
-            "config" => {
-                let setting = args.get("setting").and_then(Value::as_str).unwrap_or("");
-                let value = args.get("value").and_then(Value::as_str);
-                match value {
-                    Some(value) => format!(
-                        "Config: {}={}",
-                        truncate_line(setting, path_budget(8)),
-                        truncate_line(value, path_budget(10))
-                    ),
-                    None => format!("Config: {}", truncate_line(setting, path_budget(13))),
-                }
-            }
-            "brief" => {
-                let focus = args.get("focus").and_then(Value::as_str);
-                match focus {
-                    Some(focus) => format!("Brief: {}", truncate_line(focus, path_budget(14))),
-                    None => "Brief".to_string(),
-                }
-            }
-            "share_context" => {
-                let key = args.get("key").and_then(Value::as_str).unwrap_or("");
-                format!("Share context: {}", truncate_line(key, path_budget(16)))
-            }
-            "query_context" => {
-                let key = args.get("key").and_then(Value::as_str);
-                let prefix = args.get("prefix").and_then(Value::as_str);
-                let list_keys = args.get("list_keys").and_then(Value::as_bool);
-                match (key, prefix, list_keys) {
-                    (Some(key), _, _) => {
-                        format!("Query context: {}", truncate_line(key, path_budget(16)))
-                    }
-                    (None, Some(prefix), _) => {
-                        format!("Query context: {}", truncate_line(prefix, path_budget(16)))
-                    }
-                    (None, None, Some(true)) => "Query context: keys".to_string(),
-                    _ => "Query context".to_string(),
-                }
-            }
-            "adjust_config" => {
-                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                format!("Adjust config: {}", truncate_line(path, path_budget(15)))
-            }
-            "prioritize_tool" => {
-                let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
-                format!("Prioritize tool: {}", truncate_line(tool, path_budget(17)))
-            }
-            "deprioritize_tool" => {
-                let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
-                format!(
-                    "Deprioritize tool: {}",
-                    truncate_line(tool, path_budget(19))
-                )
-            }
-            "set_goal" => {
-                let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
-                format!("Set goal: \"{}\"", truncate_line(goal, path_budget(12)))
-            }
-            "compress_context" => {
-                let reason = args.get("reason").and_then(Value::as_str);
-                match reason {
-                    Some(reason) => format!(
-                        "Compress context: {}",
-                        truncate_line(reason, path_budget(18))
-                    ),
-                    None => "Compress context".to_string(),
-                }
-            }
-            "rollback_session_state" => {
-                let scope = args.get("scope").and_then(Value::as_str);
-                let turn_index = args.get("turn_index").and_then(Value::as_i64);
-                match (scope, turn_index) {
-                    (Some("turn"), Some(turn_index)) => {
-                        format!("Rollback session state: turn {turn_index}")
-                    }
-                    (Some(scope), _) => {
-                        format!(
-                            "Rollback session state: {}",
-                            truncate_line(scope, path_budget(24))
-                        )
-                    }
-                    _ => "Rollback session state".to_string(),
-                }
-            }
-            "github_create_issue" => {
-                let owner = args.get("owner").and_then(Value::as_str);
-                let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
-                let title = args.get("title").and_then(Value::as_str).unwrap_or("");
-                format!(
-                    "Creating issue: {} \"{}\"",
-                    repo_display,
-                    truncate_line(title, path_budget(19))
-                )
-            }
-            "ask_user" => {
-                let question = args.get("question").and_then(Value::as_str).unwrap_or("");
-                format!(
-                    "Asking user: \"{}\"",
-                    truncate_line(question, path_budget(15))
-                )
-            }
-            "sleep" => {
-                let duration_ms = args.get("duration_ms").and_then(Value::as_u64).unwrap_or(0);
-                let reason = args.get("reason").and_then(Value::as_str);
-                match reason {
-                    Some(reason) => format!(
-                        "Sleeping: {}ms ({})",
-                        duration_ms,
-                        truncate_line(reason, path_budget(18))
-                    ),
-                    None => format!("Sleeping: {duration_ms}ms"),
-                }
-            }
-            "tool_search" => {
-                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                format!(
-                    "Searching tools: \"{}\"",
-                    truncate_line(query, path_budget(18))
-                )
-            }
-            "task_create" => {
-                let title = args.get("title").and_then(Value::as_str).unwrap_or("");
-                format!(
-                    "Creating task: \"{}\"",
-                    truncate_line(title, path_budget(16))
-                )
-            }
-            "task_list" => {
-                let status = args.get("status").and_then(Value::as_str);
-                match status {
-                    Some(status) => {
-                        format!("Listing tasks: {}", truncate_line(status, path_budget(15)))
-                    }
-                    None => "Listing tasks".to_string(),
-                }
-            }
-            "task_get" => {
-                let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
-                format!("Getting task: {}", truncate_line(task_id, path_budget(14)))
-            }
-            "task_update" => {
-                let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
-                let status = args.get("status").and_then(Value::as_str);
-                match status {
-                    Some(status) => format!(
-                        "Updating task: {} -> {}",
-                        truncate_line(task_id, path_budget(21)),
-                        truncate_line(status, 16)
-                    ),
-                    None => format!("Updating task: {}", truncate_line(task_id, path_budget(15))),
-                }
-            }
-            "task_stop" => {
-                let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
-                format!("Stopping task: {}", truncate_line(task_id, path_budget(15)))
-            }
-            "mo_query" => {
-                let sql = args.get("sql").and_then(Value::as_str).unwrap_or("");
-                format!(
-                    "MatrixOne query: \"{}\"",
-                    truncate_line(sql, path_budget(18))
-                )
-            }
-            "mo_snapshot" => {
-                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-                let name = args.get("name").and_then(Value::as_str);
-                match name {
-                    Some(name) => format!(
-                        "MatrixOne snapshot: {} {}",
-                        truncate_line(action, 16),
-                        truncate_line(name, path_budget(30))
-                    ),
-                    None => format!(
-                        "MatrixOne snapshot: {}",
-                        truncate_line(action, path_budget(20))
-                    ),
-                }
-            }
-            "mo_branch" => {
-                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-                let name = args.get("name").and_then(Value::as_str);
-                match name {
-                    Some(name) => format!(
-                        "MatrixOne branch: {} {}",
-                        truncate_line(action, 16),
-                        truncate_line(name, path_budget(28))
-                    ),
-                    None => format!(
-                        "MatrixOne branch: {}",
-                        truncate_line(action, path_budget(18))
-                    ),
-                }
-            }
-            // Skill tool — show specific skill name or discover query
-            "skill" => {
-                let action = args.get("action").and_then(Value::as_str).unwrap_or("run");
-                match action {
-                    "discover" => {
-                        let query = args
-                            .get("query")
-                            .and_then(Value::as_str)
-                            .unwrap_or("skills");
-                        format!(
-                            "Discovering skills: \"{}\"",
-                            truncate_line(query, path_budget(22))
-                        )
-                    }
-                    _ => {
-                        let skill_name = args
-                            .get("skill_name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown");
-                        format!(
-                            "Running skill: {}",
-                            truncate_line(skill_name, path_budget(16))
-                        )
-                    }
-                }
-            }
-            other if other.starts_with("mcp_") => {
-                let rest = &other[4..];
-                if let Some(sep) = rest.find('_') {
-                    let server = &rest[..sep];
-                    let tool_name = &rest[sep + 1..];
-                    format!(
-                        "MCP {server} {}",
-                        truncate_line(tool_name, path_budget(5 + server.len()))
-                    )
-                } else {
-                    format!("MCP {rest}")
-                }
-            }
-            _ => tool.to_string(),
         }
+
+        astra_turn_core::tool_preview::render_preview(
+            tool,
+            args,
+            astra_turn_core::tool_preview::PreviewStyle::Concise,
+            desc_budget,
+        )
     }
 
     /// Shorten a path by keeping the last N chars with leading "..."
@@ -6710,6 +5819,7 @@ mod tests {
             perm_manager: None,
             cancel_token: None,
             stream_event_tx: None,
+            stream_event_sink: None,
             approval_request_tx: None,
             skill_resolver: None,
             skill_continuation: false,
@@ -6945,6 +6055,7 @@ mod tests {
                 tool,
                 approval_kind,
                 detail,
+                display_label: _,
             } => {
                 assert_eq!(request_id, "ap-1");
                 assert_eq!(tool, "write_file");
@@ -7165,16 +6276,6 @@ mod tests {
     }
 
     #[test]
-    fn format_shell_exec_same_as_bash() {
-        let r = StreamRenderState::new();
-        let args = serde_json::json!({"command": "echo hi"});
-        let bash = r.format_tool_description("bash", &args);
-        let shell_exec = r.format_tool_description("shell_exec", &args);
-        assert_eq!(bash, shell_exec);
-        assert!(bash.starts_with("$ "));
-    }
-
-    #[test]
     fn format_mcp_description_with_server_and_tool() {
         let r = StreamRenderState::new();
         let desc = r.format_tool_description("mcp_github_search_repos", &serde_json::json!({}));
@@ -7186,41 +6287,6 @@ mod tests {
         let r = StreamRenderState::new();
         let desc = r.format_tool_description("mcp_mytool", &serde_json::json!({}));
         assert_eq!(desc, "MCP mytool");
-    }
-
-    #[test]
-    fn format_git_revert_description() {
-        let r = StreamRenderState::new();
-        let args = serde_json::json!({"commit_sha": "abc123def456"});
-        let desc = r.format_tool_description("git_revert_commit", &args);
-        assert_eq!(desc, "Git revert abc123def456");
-    }
-
-    #[test]
-    fn format_git_stash_description() {
-        let r = StreamRenderState::new();
-        let args = serde_json::json!({"action": "apply", "stash_ref": "stash@{2}"});
-        let desc = r.format_tool_description("git_stash", &args);
-        assert_eq!(desc, "Git stash apply stash@{2}");
-    }
-
-    #[test]
-    fn format_git_helper_descriptions() {
-        let r = StreamRenderState::new();
-        let file_history = r.format_tool_description(
-            "git_file_history",
-            &serde_json::json!({"file": "src/main.rs"}),
-        );
-        let log_search =
-            r.format_tool_description("git_log_search", &serde_json::json!({"query": "auth"}));
-        let contributors = r.format_tool_description(
-            "git_contributors",
-            &serde_json::json!({"path": "src/", "since": "30 days ago"}),
-        );
-
-        assert_eq!(file_history, "Git history src/main.rs");
-        assert_eq!(log_search, "Git log search \"auth\"");
-        assert_eq!(contributors, "Git contributors src/ since 30 days ago");
     }
 
     #[test]
@@ -7248,22 +6314,6 @@ mod tests {
     }
 
     #[test]
-    fn format_additional_git_tool_descriptions() {
-        let r = StreamRenderState::new();
-        let checkout = r.format_tool_description(
-            "git_checkout_file",
-            &serde_json::json!({"path": "src/lib.rs", "ref": "HEAD~1"}),
-        );
-        let worktree = r.format_tool_description(
-            "git_worktree",
-            &serde_json::json!({"action": "add", "branch": "feature/ui"}),
-        );
-
-        assert_eq!(checkout, "Git checkout HEAD~1 -- src/lib.rs");
-        assert_eq!(worktree, "Git worktree add feature/ui");
-    }
-
-    #[test]
     fn format_additional_git_tool_preview_display_names() {
         assert_eq!(
             format_tool_display_from_preview("git_checkout_file", Some("HEAD~1 -- src/lib.rs")),
@@ -7273,48 +6323,6 @@ mod tests {
             format_tool_display_from_preview("git_worktree", Some("add feature/ui")),
             "Git worktree add feature/ui"
         );
-    }
-
-    #[test]
-    fn format_git_checkout_preview_shortens_long_path() {
-        let r = StreamRenderState::new();
-        let path = path_longer_than_any_sane_terminal_budget();
-        let desc = r.format_tool_description(
-            "git_checkout_file",
-            &serde_json::json!({
-                "path": path,
-                "ref": "HEAD~1"
-            }),
-        );
-        assert!(
-            desc.starts_with("Git checkout HEAD~1 -- .../"),
-            "expected ellipsis-prefixed path; got {desc:?}"
-        );
-        assert!(desc.ends_with("src/lib.rs"), "got {desc:?}");
-    }
-
-    #[test]
-    fn format_github_descriptions_use_repo_argument() {
-        let r = StreamRenderState::new();
-        let pr = r.format_tool_description(
-            "github_get_pr",
-            &serde_json::json!({"repo": "matrixorigin/astra", "pr_number": 159}),
-        );
-        let issue = r.format_tool_description(
-            "github_create_issue",
-            &serde_json::json!({"repo": "matrixorigin/astra", "title": "Fix renderer drift"}),
-        );
-        let ci = r.format_tool_description(
-            "github_ci_status",
-            &serde_json::json!({"repo": "matrixorigin/astra"}),
-        );
-
-        assert_eq!(pr, "Getting PR: matrixorigin/astra#159");
-        assert_eq!(
-            issue,
-            "Creating issue: matrixorigin/astra \"Fix renderer drift\""
-        );
-        assert_eq!(ci, "GitHub CI: matrixorigin/astra");
     }
 
     #[test]
@@ -7337,25 +6345,6 @@ mod tests {
     }
 
     #[test]
-    fn format_utility_tool_descriptions() {
-        let r = StreamRenderState::new();
-        let ask_user = r.format_tool_description(
-            "ask_user",
-            &serde_json::json!({"question": "Continue with the refactor?"}),
-        );
-        let sleep = r.format_tool_description(
-            "sleep",
-            &serde_json::json!({"duration_ms": 1500, "reason": "waiting for CI"}),
-        );
-        let tool_search =
-            r.format_tool_description("tool_search", &serde_json::json!({"query": "git"}));
-
-        assert_eq!(ask_user, "Asking user: \"Continue with the refactor?\"");
-        assert_eq!(sleep, "Sleeping: 1500ms (waiting for CI)");
-        assert_eq!(tool_search, "Searching tools: \"git\"");
-    }
-
-    #[test]
     fn format_utility_preview_display_names() {
         assert_eq!(
             format_tool_display_from_preview("ask_user", Some("Continue with the refactor?")),
@@ -7369,31 +6358,6 @@ mod tests {
             format_tool_display_from_preview("tool_search", Some("\"git\"")),
             "Searching tools: \"git\""
         );
-    }
-
-    #[test]
-    fn format_meta_tool_descriptions() {
-        let r = StreamRenderState::new();
-        // send_message is now an action within the `agent` consolidated tool
-        let send = r.format_tool_description(
-            "agent",
-            &serde_json::json!({"action": "send_message", "to": "agent-2", "summary": "Need review"}),
-        );
-        let env = r.format_tool_description(
-            "env",
-            &serde_json::json!({"operation": "get", "name": "PATH"}),
-        );
-        let notebook = r.format_tool_description(
-            "notebook_edit",
-            &serde_json::json!({"edit_mode": "replace", "notebook_path": "analysis.ipynb"}),
-        );
-        let query =
-            r.format_tool_description("query_context", &serde_json::json!({"prefix": "auth/"}));
-
-        assert_eq!(send, "Send message: agent-2: Need review");
-        assert_eq!(env, "Env: get PATH");
-        assert_eq!(notebook, "Notebook edit: replace analysis.ipynb");
-        assert_eq!(query, "Query context: auth/");
     }
 
     #[test]
@@ -7417,35 +6381,7 @@ mod tests {
     }
 
     #[test]
-    fn format_memory_maintenance_descriptions() {
-        let r = StreamRenderState::new();
-        let forget = r.format_tool_description(
-            "memory",
-            &serde_json::json!({"action": "forget", "topic": "renderer drift"}),
-        );
-        let update = r.format_tool_description(
-            "memory",
-            &serde_json::json!({"action": "update", "memory_id": "mem-123"}),
-        );
-        let profile =
-            r.format_tool_description("memory", &serde_json::json!({"action": "profile"}));
-        let focus = r.format_tool_description(
-            "memory",
-            &serde_json::json!({"action": "focus", "focus_value": "oauth"}),
-        );
-        let reflect =
-            r.format_tool_description("memory", &serde_json::json!({"action": "reflect"}));
-
-        assert_eq!(forget, "Forgetting: \"renderer drift\"");
-        assert_eq!(update, "Updating memory: mem-123");
-        assert_eq!(profile, "Checking profile");
-        assert_eq!(focus, "Focus on: \"oauth\"");
-        assert_eq!(reflect, "Reflecting on memories");
-    }
-
-    #[test]
-    fn format_memory_preview_display_names() {
-        // Preview-only path can't know the action; it surfaces the raw preview.
+    fn format_memory_maintenance_preview_display_names() {
         assert_eq!(
             format_tool_display_from_preview("memory", Some("action=purge topic=...")),
             "Memory: action=purge topic=..."
@@ -7469,33 +6405,6 @@ mod tests {
     }
 
     #[test]
-    fn format_analysis_tool_descriptions() {
-        let r = StreamRenderState::new();
-        let info = r.format_tool_description(
-            "get_agent_info",
-            &serde_json::json!({"dimension": "budget"}),
-        );
-        let reflect = r.format_tool_description(
-            "reflect",
-            &serde_json::json!({"question": "why did the tool fail?"}),
-        );
-        let context = r.format_tool_description(
-            "context_analysis",
-            &serde_json::json!({"mode": "compare", "turn_a": 3, "turn_b": 7}),
-        );
-        // run_chain is now an action within the `agent` consolidated tool
-        let chain = r.format_tool_description(
-            "agent",
-            &serde_json::json!({"action": "run_chain", "chain_name": "search-and-read"}),
-        );
-
-        assert_eq!(info, "Getting agent info: budget");
-        assert_eq!(reflect, "Reflecting: \"why did the tool fail?\"");
-        assert_eq!(context, "Context analysis: compare 3 vs 7");
-        assert_eq!(chain, "Running chain: search-and-read");
-    }
-
-    #[test]
     fn format_analysis_tool_preview_display_names() {
         assert_eq!(
             format_tool_display_from_preview("get_agent_info", Some("budget")),
@@ -7513,48 +6422,6 @@ mod tests {
             format_tool_display_from_preview("run_chain", Some("search-and-read")),
             "Running chain: search-and-read"
         );
-    }
-
-    #[test]
-    fn format_session_state_tool_descriptions() {
-        let r = StreamRenderState::new();
-        let powershell = r.format_tool_description(
-            "powershell",
-            &serde_json::json!({"command": "Get-ChildItem"}),
-        );
-        let adjust = r.format_tool_description(
-            "adjust_config",
-            &serde_json::json!({"path": "display.max_output_lines"}),
-        );
-        let rollback = r.format_tool_description(
-            "rollback_session_state",
-            &serde_json::json!({"scope": "turn", "turn_index": 5}),
-        );
-
-        assert_eq!(powershell, "PS> Get-ChildItem");
-        assert_eq!(adjust, "Adjust config: display.max_output_lines");
-        assert_eq!(rollback, "Rollback session state: turn 5");
-    }
-
-    #[test]
-    fn format_rollback_tool_descriptions() {
-        let r = StreamRenderState::new();
-        let file = r.format_tool_description(
-            "rollback_file_edits",
-            &serde_json::json!({"scope": "file", "path": "src/main.rs"}),
-        );
-        let snapshot = r.format_tool_description(
-            "rollback_database_snapshots",
-            &serde_json::json!({"scope": "snapshot", "snapshot_id": "snap_123"}),
-        );
-        let turn = r.format_tool_description(
-            "rollback_turn_actions",
-            &serde_json::json!({"scope": "turn", "turn_index": 7}),
-        );
-
-        assert_eq!(file, "Revert file edits: src/main.rs");
-        assert_eq!(snapshot, "Revert DB snapshots: snap_123");
-        assert_eq!(turn, "Rollback turn actions: turn 7");
     }
 
     #[test]
@@ -7590,24 +6457,6 @@ mod tests {
     }
 
     #[test]
-    fn format_task_tool_descriptions() {
-        let r = StreamRenderState::new();
-        let create = r.format_tool_description(
-            "task_create",
-            &serde_json::json!({"title": "Fix renderer drift"}),
-        );
-        let update = r.format_tool_description(
-            "task_update",
-            &serde_json::json!({"task_id": "render-pass", "status": "in_progress"}),
-        );
-        let list = r.format_tool_description("task_list", &serde_json::json!({"status": "active"}));
-
-        assert_eq!(create, "Creating task: \"Fix renderer drift\"");
-        assert_eq!(update, "Updating task: render-pass -> in_progress");
-        assert_eq!(list, "Listing tasks: active");
-    }
-
-    #[test]
     fn format_task_preview_display_names() {
         assert_eq!(
             format_tool_display_from_preview("task_create", Some("Fix renderer drift")),
@@ -7624,27 +6473,6 @@ mod tests {
     }
 
     #[test]
-    fn format_mo_tool_descriptions() {
-        let r = StreamRenderState::new();
-        let query = r.format_tool_description(
-            "mo_query",
-            &serde_json::json!({"sql": "select * from users"}),
-        );
-        let snapshot = r.format_tool_description(
-            "mo_snapshot",
-            &serde_json::json!({"action": "create", "name": "pre-migration"}),
-        );
-        let branch = r.format_tool_description(
-            "mo_branch",
-            &serde_json::json!({"action": "create", "name": "exp-a"}),
-        );
-
-        assert_eq!(query, "MatrixOne query: \"select * from users\"");
-        assert_eq!(snapshot, "MatrixOne snapshot: create pre-migration");
-        assert_eq!(branch, "MatrixOne branch: create exp-a");
-    }
-
-    #[test]
     fn format_mo_preview_display_names() {
         assert_eq!(
             format_tool_display_from_preview("mo_query", Some("select * from users")),
@@ -7658,35 +6486,6 @@ mod tests {
             format_tool_display_from_preview("mo_branch", Some("create exp-a")),
             "MatrixOne branch: create exp-a"
         );
-    }
-
-    #[test]
-    fn format_code_navigation_descriptions() {
-        let r = StreamRenderState::new();
-        let search = r.format_tool_description(
-            "symbol_search",
-            &serde_json::json!({"query": "SessionFacts"}),
-        );
-        let hover = r.format_tool_description(
-            "hover_info",
-            &serde_json::json!({"file": "src/lib.rs", "line": 42, "column": 3}),
-        );
-        let hierarchy = r.format_tool_description(
-            "type_hierarchy",
-            &serde_json::json!({"name": "SessionStore", "direction": "implementations"}),
-        );
-        let lsp = r.format_tool_description(
-            "lsp",
-            &serde_json::json!({"operation": "hover", "file": "src/lib.rs", "line": 42, "column": 3}),
-        );
-
-        assert_eq!(search, "Search symbol SessionFacts");
-        assert_eq!(hover, "Hover info at src/lib.rs:42:3");
-        assert_eq!(
-            hierarchy,
-            "Type hierarchy for SessionStore (implementations)"
-        );
-        assert_eq!(lsp, "LSP: hover src/lib.rs:42:3");
     }
 
     #[test]
@@ -7709,45 +6508,6 @@ mod tests {
         assert_eq!(
             format_tool_display_from_preview("lsp", Some("hover src/lib.rs:42:3")),
             "LSP: hover src/lib.rs:42:3"
-        );
-    }
-
-    #[test]
-    fn format_code_navigation_truncates_long_position_paths() {
-        let r = StreamRenderState::new();
-        let file = path_longer_than_any_sane_terminal_budget();
-        let hover = r.format_tool_description(
-            "hover_info",
-            &serde_json::json!({
-                "file": file,
-                "line": 42,
-                "column": 3
-            }),
-        );
-        assert!(
-            hover.starts_with("Hover info at .../"),
-            "expected ellipsis-prefixed path; got {hover:?}"
-        );
-        assert!(hover.ends_with(":42:3"), "got {hover:?}");
-    }
-
-    #[test]
-    fn format_code_navigation_keeps_medium_position_paths() {
-        let r = StreamRenderState::new();
-        // Path must fit within the 80-col budget:
-        // desc_budget = 80 - 14 = 66; "Hover info at " (14) + path + ":42:3" (5) ≤ 66
-        // => path ≤ 47 chars.  This path is 38 chars.
-        let hover = r.format_tool_description(
-            "hover_info",
-            &serde_json::json!({
-                "file": "/moderately/long/path/to/module/file.rs",
-                "line": 42,
-                "column": 3
-            }),
-        );
-        assert_eq!(
-            hover,
-            "Hover info at /moderately/long/path/to/module/file.rs:42:3"
         );
     }
 
@@ -7809,27 +6569,6 @@ mod tests {
         assert!(extract.chars().count() <= 40);
         assert!(lsp.ends_with(":42:3"));
         assert!(lsp.chars().count() <= 40);
-    }
-
-    #[test]
-    fn format_remaining_code_tool_descriptions() {
-        let r = StreamRenderState::new();
-        let rename = r.format_tool_description(
-            "rename_symbol",
-            &serde_json::json!({"symbol": "SessionStore", "new_name": "StoreSession"}),
-        );
-        let dead_code = r.format_tool_description(
-            "dead_code",
-            &serde_json::json!({"path": "src/", "kind": "function"}),
-        );
-        let extract_members = r.format_tool_description(
-            "extract_members",
-            &serde_json::json!({"file": "src/lib.rs", "line": 88}),
-        );
-
-        assert_eq!(rename, "Rename symbol SessionStore -> StoreSession");
-        assert_eq!(dead_code, "Find dead code: src/ (function)");
-        assert_eq!(extract_members, "Extract members: src/lib.rs:88");
     }
 
     #[test]
@@ -8333,6 +7072,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -8425,6 +7165,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -8515,6 +7256,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -8607,6 +7349,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -8692,6 +7435,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -8775,6 +7519,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -8869,6 +7614,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -8948,6 +7694,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -9046,6 +7793,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -9134,6 +7882,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -9230,6 +7979,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -9292,6 +8042,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -9350,6 +8101,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -9409,6 +8161,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -9499,6 +8252,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -9553,6 +8307,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -9610,6 +8365,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -9706,6 +8462,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -9782,6 +8539,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -9875,6 +8633,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
@@ -9962,6 +8721,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 perm_manager: None,
                 cancel_token: None,
                 stream_event_tx: None,
+                stream_event_sink: None,
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,

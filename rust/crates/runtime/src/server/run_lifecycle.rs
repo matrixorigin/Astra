@@ -2763,6 +2763,8 @@ impl AgenticRunLifecycleService {
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: self.memory_extraction_service.clone(),
+            session_memory_state: Default::default(),
+            session_memory_llm_params: None,
             compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
                 request.model.as_deref().unwrap_or(""),
             ),
@@ -3104,6 +3106,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // already-provisioned workspace for the ServerToolExecutor.
         if let Some(workspace) = server_workspace {
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
+            let task_store = astra_tools::task_mgmt_matrixone::select_task_store(
+                self.shared_pool.as_ref().map(|p| p.get().clone()),
+            );
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 user_id.clone(),
@@ -3111,7 +3116,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 memoria_base,
                 None,
             )
-            .with_cancel_token(loop_state.cancellation.token.clone());
+            .with_cancel_token(loop_state.cancellation.token.clone())
+            .with_task_store(task_store);
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
@@ -3540,6 +3546,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Wire ServerToolExecutor when no edge agent is connected (web-agent mode).
         if let Some(workspace) = server_workspace {
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
+            let task_store = astra_tools::task_mgmt_matrixone::select_task_store(
+                self.shared_pool.as_ref().map(|p| p.get().clone()),
+            );
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 user_id.clone(),
@@ -3547,7 +3556,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 memoria_base,
                 None,
             )
-            .with_cancel_token(state.cancellation.token.clone());
+            .with_cancel_token(state.cancellation.token.clone())
+            .with_task_store(task_store);
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
@@ -4546,6 +4556,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: self.memory_extraction_service.clone(),
+            session_memory_state: Default::default(),
+            session_memory_llm_params: None,
             compact_strategy,
             approval_overrides: None,
             confidence_trend: Default::default(),
@@ -4577,6 +4589,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
         {
             let workspace = self.provision_subrun_workspace(&config.session_id, &config.run_id);
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
+            let task_store = astra_tools::task_mgmt_matrixone::select_task_store(
+                self.shared_pool.as_ref().map(|p| p.get().clone()),
+            );
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 config.user_id.clone(),
@@ -4584,7 +4599,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 memoria_base,
                 None,
             )
-            .with_cancel_token(config.cancel_token.clone());
+            .with_cancel_token(config.cancel_token.clone())
+            .with_task_store(task_store);
             if let Some(pool) = self.shared_pool.as_ref() {
                 executor.set_context_manifest_pool(pool.clone());
                 executor = executor.with_workspace_artifact_store(

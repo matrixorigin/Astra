@@ -290,6 +290,12 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             value: Value::from(config.telemetry.capture_context_traces),
         },
         SettingItem {
+            id: "telemetry.capture_full_llm_exchanges".to_string(),
+            label: "Capture full LLM request/response payloads".to_string(),
+            kind: SettingKind::Bool,
+            value: Value::from(config.telemetry.capture_full_llm_exchanges),
+        },
+        SettingItem {
             id: "telemetry.persist_to_journal".to_string(),
             label: "Persist telemetry to journal".to_string(),
             kind: SettingKind::Bool,
@@ -455,10 +461,41 @@ pub fn apply_edit(
         "telemetry.capture_context_traces" => {
             config.telemetry.capture_context_traces = as_bool(&new_value, id)?;
         }
+        "telemetry.capture_full_llm_exchanges" => {
+            config.telemetry.capture_full_llm_exchanges = as_bool(&new_value, id)?;
+        }
         "telemetry.persist_to_journal" => {
             config.telemetry.persist_to_journal = as_bool(&new_value, id)?;
         }
         unknown => return Err(OverlayError::UnknownPath(unknown.to_string())),
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_includes_full_llm_capture_toggle() {
+        let config = RuntimeConfig::default();
+        let catalog = build_settings_catalog(&config);
+        let item = catalog
+            .iter()
+            .find(|item| item.id == "telemetry.capture_full_llm_exchanges")
+            .expect("catalog must expose the full LLM capture toggle");
+        assert_eq!(item.label, "Capture full LLM request/response payloads");
+        assert_eq!(item.value, Value::Bool(false));
+    }
+
+    #[test]
+    fn apply_edit_updates_full_llm_capture_toggle() {
+        let updated = apply_edit(
+            RuntimeConfig::default(),
+            "telemetry.capture_full_llm_exchanges",
+            Value::Bool(true),
+        )
+        .expect("toggle edit should succeed");
+        assert!(updated.telemetry.capture_full_llm_exchanges);
+    }
 }

@@ -4,7 +4,6 @@
 //! tool names, paths, and other constants are compiled-in rather than
 //! hardcoded strings that drift out of sync.
 
-mod batch;
 mod debug;
 mod reflect;
 mod remember;
@@ -15,9 +14,14 @@ mod verify;
 
 /// Returns all dynamic skill contents as `(frontmatter_yaml + body)` strings
 /// ready to be parsed by `parse_skill_md`.
+///
+/// `batch` was deleted: its instructions told the model to call the
+/// removed `delegate` action, and its triggers (`parallel`, `bulk`,
+/// `for each`) auto-fired on read-only review requests. With
+/// `agent.spawn` + `run_in_background: true` documented in the tool
+/// description, the model already knows how to fan out parallel work.
 pub fn all_dynamic_skills() -> Vec<String> {
     vec![
-        batch::skill_content(),
         debug::skill_content(),
         reflect::skill_content(),
         review::skill_content(),
@@ -33,8 +37,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn returns_eight_skills() {
-        assert_eq!(all_dynamic_skills().len(), 8);
+    fn returns_seven_skills() {
+        // Was 8 — `batch` removed (referenced removed `delegate` action,
+        // and its triggers auto-fired on read-only review requests).
+        assert_eq!(all_dynamic_skills().len(), 7);
+    }
+
+    /// Regression: the dynamic `batch` skill must NOT come back. It
+    /// referenced the removed `delegate` action and matched on overly
+    /// broad triggers like "parallel" / "bulk" / "for each", which
+    /// caused it to auto-fire on read-only multi-angle review requests
+    /// (session f3c4b457). Guarding against silent reintroduction.
+    #[test]
+    fn batch_dynamic_skill_is_not_reintroduced() {
+        let all = all_dynamic_skills().join("\n");
+        assert!(
+            !all.contains("name: batch\n"),
+            "the `batch` dynamic skill was deleted; do not reintroduce \
+             without first proving it doesn't auto-fire on read-only \
+             multi-angle review and that it does not reference removed \
+             tool actions"
+        );
     }
 
     #[test]
@@ -68,7 +91,7 @@ mod tests {
     fn individual_skill_names_present() {
         let all = all_dynamic_skills().join("\n");
         for name in [
-            "batch", "debug", "reflect", "review", "skillify", "stuck", "verify", "remember",
+            "debug", "reflect", "review", "skillify", "stuck", "verify", "remember",
         ] {
             assert!(
                 all.contains(&format!("name: {name}")),

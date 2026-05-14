@@ -17,6 +17,20 @@ pub fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
+/// Truncate a string to the first line and cap at `max_chars` display
+/// characters (adds `…` if truncated). The `…` is included in the
+/// char budget — `max_chars=5` on "hello world" returns "hell…".
+/// Multi-line input is reduced to the first line first.
+pub fn truncate_line(s: &str, max_chars: usize) -> String {
+    let line = s.lines().next().unwrap_or(s);
+    if line.chars().count() <= max_chars {
+        line.to_string()
+    } else {
+        let truncated: String = line.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{truncated}…")
+    }
+}
+
 fn truncate_to_width(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()

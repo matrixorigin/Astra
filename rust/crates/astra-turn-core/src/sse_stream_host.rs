@@ -19,6 +19,8 @@ use crate::chat_turn_sse_dispatch::{
     ChatTurnEdgePending, ChatTurnSseAccum, ChatTurnSseFramer, EdgeApprovalRequest, SseRenderEffect,
     dispatch_chat_turn_sse_event_block,
 };
+pub use crate::tool_policy::is_tool_concurrency_safe;
+use crate::tool_policy::tool_batch_coalesce_duration;
 use astra_thin_client::ApprovalKind;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -108,64 +110,14 @@ pub struct ToolBatchRequest {
     pub args: Value,
 }
 
-/// Returns `true` if the named tool is safe for concurrent execution.
-///
-/// Concurrent-safe tools are read-only operations without observable side effects,
-/// making them safe to execute in parallel via `futures::future::join_all`.
-/// This includes both sync tools (fast local I/O) and async tools (network I/O
-/// that benefits most from parallel execution).
-pub fn is_tool_concurrency_safe(tool: &str, args: Option<&serde_json::Value>) -> bool {
-    // `memory` is action-aware: `recall` / `expand` / `profile` are pure
-    // reads, safe to parallelize. All other actions (remember / forget /
-    // update / focus / reflect / feedback) must be serialized.
-    if tool == "memory" {
-        return matches!(
-            args.and_then(|a| a.get("action")).and_then(|v| v.as_str()),
-            Some("recall") | Some("expand") | Some("profile")
-        );
-    }
-    matches!(
-        tool,
-        // ── Local read-only (sync) ───────────────────────────────────
-        "read_file"
-            | "list_dir"
-            | "grep"
-            | "glob"
-            | "git_status"
-            | "git_diff"
-            | "git_log"
-            | "git_show"
-            | "git_blame"
-            | "git_file_history"
-            | "git_contributors"
-            | "git_log_search"
-            | "find_definition"
-            | "find_references"
-            | "call_graph"
-            | "extract_members"
-            | "type_hierarchy"
-            | "hover_info"
-            | "symbol_search"
-            | "dead_code"
-            | "symbols"
-            | "lsp"
-            | "env"
-            | "brief"
-            | "tool_search"
-            | "get_agent_info"
-            | "reflect"
-            | "web_fetch"
-            | "web_search"
-            | "share_context"
-            | "query_context"
-            // ── GitHub read-only (async — benefits from join_all) ─────
-            | "github_list_prs"
-            | "github_get_pr"
-            | "github_ci_status"
-            | "github_list_issues"
-            | "github_get_issue"
-            | "github_repo_stats"
-    )
+fn pending_is_coalescible_tool_batch(pending: &[ChatTurnEdgePending]) -> bool {
+    !pending.is_empty()
+        && pending.iter().all(|item| match item {
+            ChatTurnEdgePending::ToolRequest { tool, args, .. } => {
+                is_tool_concurrency_safe(tool, Some(args))
+            }
+            _ => false,
+        })
 }
 
 /// Aggregated result from consuming one SSE stream.
@@ -249,6 +201,11 @@ pub trait SseStreamHost: Send {
 
     /// Resolve an approval request that arrived via `approval_required` SSE event.
     /// CLI: interactive prompt. Headless: auto-deny or ledger-based.
+    ///
+    /// `detail` is the raw command/path (for classifier matching);
+    /// `display_label` is the rich preview string suitable for UI.
+    /// Implementations should prefer `display_label` for output and
+    /// fall back to `detail` when absent.
     async fn resolve_approval(
         &mut self,
         request_id: &str,
@@ -256,6 +213,7 @@ pub trait SseStreamHost: Send {
         approval_kind: ApprovalKind,
         session_id: Option<&str>,
         detail: Option<&str>,
+        display_label: Option<&str>,
     ) -> EdgeApprovalResult;
 
     /// Resolve a batch of approval requests in one interactive step when supported.
@@ -273,6 +231,7 @@ pub trait SseStreamHost: Send {
                     request.approval_kind,
                     session_id,
                     request.detail.as_deref(),
+                    request.display_label.as_deref(),
                 )
                 .await,
             );
@@ -409,50 +368,93 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             break;
         };
         for event_str in framer.push_lossy_bytes(&bytes) {
-            if !first_sse_frame_seen {
-                first_sse_frame_seen = true;
-                host.on_first_sse_frame();
-            }
-            let tc_len_before = accum.tool_calls.len();
-            let effects = dispatch_chat_turn_sse_event_block(&event_str, &mut accum, &mut pending);
-            if accum.session_id.as_deref() != reported_session_id.as_deref()
-                && let Some(session_id) = accum.session_id.as_deref()
-            {
-                host.on_session_id(session_id);
-                reported_session_id = Some(session_id.to_string());
-            }
-            host.on_render_effects(effects);
-            // Notify host of newly-complete tool_call entries (D-9 speculative
-            // streaming hook). Snapshot the values to avoid holding a borrow
-            // across the `await`.
-            if accum.tool_calls.len() > tc_len_before {
-                let new_calls: Vec<(usize, Value)> = accum.tool_calls[tc_len_before..]
-                    .iter()
-                    .enumerate()
-                    .map(|(off, v)| (tc_len_before + off, v.clone()))
-                    .collect();
-                for (idx, tc) in new_calls {
-                    host.on_tool_call_complete(idx, &tc).await;
-                }
-            }
-            // Skill-exclusivity: reorder so skill calls execute before
-            // non-skill calls within the same batch.
-            prioritize_skill_tools(&mut pending);
-            flush_pending_via_host(
-                &mut pending,
+            let _ = process_sse_event_block(
+                &event_str,
                 host,
-                accum.session_id.as_deref(),
-                &mut tool_results,
-                &mut approval_results,
+                &mut accum,
+                &mut pending,
+                &mut first_sse_frame_seen,
+                &mut reported_session_id,
             )
             .await;
         }
+
+        // Parallel tool calls often arrive as several adjacent SSE
+        // `tool_request` frames. If we flush immediately after the first
+        // frame, the first long-running `agent.spawn` blocks the socket reader
+        // and the later spawn frames cannot join the same batch. Coalesce only
+        // requests that are already classified as concurrency-safe, and only
+        // for a tiny window; side-effectful tools still execute inline to avoid
+        // the bridge/result deadlock guarded by `tool_request_executes_inline_not_deferred`.
+        while pending_is_coalescible_tool_batch(&pending) {
+            let next = if let Some(token) = cancel_token {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => {
+                        abort = Some(astra_core::ErrorKind::Cancelled);
+                        None
+                    }
+                    r = tokio::time::timeout(
+                        tool_batch_coalesce_duration(),
+                        chunks.next(),
+                    ) => r.ok().flatten(),
+                }
+            } else {
+                tokio::time::timeout(tool_batch_coalesce_duration(), chunks.next())
+                    .await
+                    .ok()
+                    .flatten()
+            };
+
+            let Some(next) = next else { break };
+            match next {
+                Ok(bytes) => {
+                    let mut saw_event = false;
+                    let mut all_events_extended_batch = true;
+                    for event_str in framer.push_lossy_bytes(&bytes) {
+                        saw_event = true;
+                        all_events_extended_batch &= process_sse_event_block(
+                            &event_str,
+                            host,
+                            &mut accum,
+                            &mut pending,
+                            &mut first_sse_frame_seen,
+                            &mut reported_session_id,
+                        )
+                        .await;
+                    }
+                    if saw_event && !all_events_extended_batch {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    abort = Some(astra_core::ErrorKind::StreamTransport);
+                    break;
+                }
+            }
+        }
+        if abort.is_some() {
+            break;
+        }
+        // Skill-exclusivity: reorder so skill calls execute before
+        // non-skill calls within the same batch.
+        prioritize_skill_tools(&mut pending);
+        flush_pending_via_host(
+            &mut pending,
+            host,
+            accum.session_id.as_deref(),
+            &mut tool_results,
+            &mut approval_results,
+        )
+        .await;
     }
 
     // Tombstone on abort (timeout or cancellation).
     if matches!(
         abort,
-        Some(astra_core::ErrorKind::StreamIdle) | Some(astra_core::ErrorKind::Cancelled)
+        Some(astra_core::ErrorKind::StreamIdle)
+            | Some(astra_core::ErrorKind::Cancelled)
+            | Some(astra_core::ErrorKind::StreamTransport)
     ) {
         accum.full_text.clear();
         accum.reasoning_content.clear();
@@ -471,6 +473,9 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 )
             }
             Some(astra_core::ErrorKind::Cancelled) => "Cancelled by user".to_string(),
+            Some(astra_core::ErrorKind::StreamTransport) => {
+                "Error: stream transport ended while reading model response".to_string()
+            }
             _ => "Unknown abort".to_string(),
         };
         accum.error_message = Some(msg);
@@ -479,28 +484,16 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
 
     let tail = framer.take_trailing_dispatch_blob();
     let ttft_ms = framer.ttft_ms;
-    if !tail.trim().is_empty() {
-        if !first_sse_frame_seen {
-            host.on_first_sse_frame();
-        }
-        let tc_len_before = accum.tool_calls.len();
-        let effects = dispatch_chat_turn_sse_event_block(&tail, &mut accum, &mut pending);
-        if accum.session_id.as_deref() != reported_session_id.as_deref()
-            && let Some(session_id) = accum.session_id.as_deref()
-        {
-            host.on_session_id(session_id);
-        }
-        host.on_render_effects(effects);
-        if accum.tool_calls.len() > tc_len_before {
-            let new_calls: Vec<(usize, Value)> = accum.tool_calls[tc_len_before..]
-                .iter()
-                .enumerate()
-                .map(|(off, v)| (tc_len_before + off, v.clone()))
-                .collect();
-            for (idx, tc) in new_calls {
-                host.on_tool_call_complete(idx, &tc).await;
-            }
-        }
+    if abort.is_none() && !tail.trim().is_empty() {
+        let _ = process_sse_event_block(
+            &tail,
+            host,
+            &mut accum,
+            &mut pending,
+            &mut first_sse_frame_seen,
+            &mut reported_session_id,
+        )
+        .await;
         prioritize_skill_tools(&mut pending);
         flush_pending_via_host(
             &mut pending,
@@ -543,6 +536,51 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         },
         abort,
     )
+}
+
+async fn process_sse_event_block<H: SseStreamHost>(
+    event_str: &str,
+    host: &mut H,
+    accum: &mut ChatTurnSseAccum,
+    pending: &mut Vec<ChatTurnEdgePending>,
+    first_sse_frame_seen: &mut bool,
+    reported_session_id: &mut Option<String>,
+) -> bool {
+    if !*first_sse_frame_seen {
+        *first_sse_frame_seen = true;
+        host.on_first_sse_frame();
+    }
+    let tc_len_before = accum.tool_calls.len();
+    let pending_len_before = pending.len();
+    let effects = dispatch_chat_turn_sse_event_block(event_str, accum, pending);
+    let extends_coalescible_batch = {
+        let appended = &pending[pending_len_before..];
+        !appended.is_empty()
+            && appended.iter().all(|item| match item {
+                ChatTurnEdgePending::ToolRequest { tool, args, .. } => {
+                    is_tool_concurrency_safe(tool, Some(args))
+                }
+                _ => false,
+            })
+    };
+    if accum.session_id.as_deref() != reported_session_id.as_deref()
+        && let Some(session_id) = accum.session_id.as_deref()
+    {
+        host.on_session_id(session_id);
+        *reported_session_id = Some(session_id.to_string());
+    }
+    host.on_render_effects(effects);
+    if accum.tool_calls.len() > tc_len_before {
+        let new_calls: Vec<(usize, Value)> = accum.tool_calls[tc_len_before..]
+            .iter()
+            .enumerate()
+            .map(|(off, v)| (tc_len_before + off, v.clone()))
+            .collect();
+        for (idx, tc) in new_calls {
+            host.on_tool_call_complete(idx, &tc).await;
+        }
+    }
+    extends_coalescible_batch
 }
 
 /// Reorder so that skill tool requests come before all non-skill requests.
@@ -598,11 +636,13 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 tool,
                 approval_kind,
                 detail,
+                display_label,
             } => approval_requests.push(EdgeApprovalRequest {
                 request_id,
                 tool,
                 approval_kind,
                 detail,
+                display_label,
             }),
             ChatTurnEdgePending::ApprovalBatchRequired { requests } => {
                 approval_requests.extend(requests);
@@ -610,12 +650,18 @@ async fn flush_pending_via_host<H: SseStreamHost>(
         }
     }
 
-    // Execute tools — the host decides whether to parallelize.
-    if !tool_batch.is_empty() {
-        let results = host.execute_tools_batch(tool_batch).await;
-        tool_results.extend(results);
-    }
-
+    // Approvals MUST resolve before tools execute. Pre-coalescing the
+    // event-at-a-time flush naturally enforced this (each
+    // approval_required event was processed and resolved before the
+    // next event arrived). Now that we coalesce concurrency-safe tool
+    // requests, both approvals and tools may sit in `pending`
+    // together — so we explicitly run approvals first to preserve
+    // the invariant pinned by
+    // `approval_then_tool_request_same_id_both_processed`.
+    //
+    // Practical impact: a `str_replace` whose `approval_required`
+    // event arrived just before its `tool_request` would otherwise
+    // execute the edit BEFORE the user / ledger granted permission.
     if approval_requests.len() > 1 {
         approval_results.extend(
             host.resolve_approvals_batch(&approval_requests, session_id)
@@ -629,9 +675,16 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 request.approval_kind,
                 session_id,
                 request.detail.as_deref(),
+                request.display_label.as_deref(),
             )
             .await,
         );
+    }
+
+    // Execute tools — the host decides whether to parallelize.
+    if !tool_batch.is_empty() {
+        let results = host.execute_tools_batch(tool_batch).await;
+        tool_results.extend(results);
     }
 }
 
@@ -674,6 +727,7 @@ impl SseStreamHost for NoopSseStreamHost {
         _approval_kind: ApprovalKind,
         _session_id: Option<&str>,
         _detail: Option<&str>,
+        _display_label: Option<&str>,
     ) -> EdgeApprovalResult {
         EdgeApprovalResult {
             request_id: request_id.to_string(),
@@ -752,6 +806,7 @@ impl SseStreamHost for RecordingSseStreamHost {
         approval_kind: ApprovalKind,
         _session_id: Option<&str>,
         _detail: Option<&str>,
+        _display_label: Option<&str>,
     ) -> EdgeApprovalResult {
         self.approval_kinds.push(approval_kind);
         EdgeApprovalResult {
@@ -1000,6 +1055,7 @@ mod tests {
                 _approval_kind: ApprovalKind,
                 _session_id: Option<&str>,
                 _detail: Option<&str>,
+                _display_label: Option<&str>,
             ) -> EdgeApprovalResult {
                 EdgeApprovalResult {
                     request_id: request_id.to_string(),
@@ -1205,7 +1261,7 @@ mod tests {
         ];
         let mut stream = stream::iter(chunks);
         let mut host = RecordingSseStreamHost::new();
-        let (_result, abort) = consume_sse_stream(
+        let (result, abort) = consume_sse_stream(
             &mut stream,
             &mut host,
             std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
@@ -1213,9 +1269,11 @@ mod tests {
         .await;
 
         assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
-        // Unlike idle timeout, transport error does NOT tombstone — partial
-        // state is preserved so the caller can decide what to do.
-        // (The consumer breaks out of the loop immediately.)
+        assert!(
+            result.accum.full_text.is_empty(),
+            "transport abort tombstones partial text so pending frames cannot be mistaken for a complete turn"
+        );
+        assert!(result.accum.error_message.is_some());
     }
 
     #[tokio::test]
@@ -1350,6 +1408,77 @@ mod tests {
         }
     }
 
+    /// REGRESSION (session 8ca96f0f): when the model emits N
+    /// `agent.spawn` calls in one round, all N must run in parallel.
+    /// Pre-fix the classifier omitted `agent`, so the dispatcher
+    /// took the sequential path and processed them one by one — the
+    /// strip showed "1 parallel agents" because only one ToolStarted
+    /// reached the chat_widget at a time.
+    ///
+    /// agent.spawn IS safe to parallelize: each spawn creates an
+    /// isolated sub-process with its own working dir / mailbox /
+    /// permission ctx. The only "side effect" is mailbox registration
+    /// keyed by unique run_id — no shared mutable state between
+    /// concurrent spawns.
+    ///
+    /// `agent.send_message` is the explicit exception: it mutates a
+    /// recipient mailbox; concurrent sends to the same target risk
+    /// reordering. Keep that one sequential.
+    #[test]
+    fn agent_spawn_is_concurrency_safe() {
+        use serde_json::json;
+        let args = json!({
+            "action": "spawn",
+            "agent_type": "code-review",
+            "name": "reviewer",
+            "description": "review",
+            "prompt": "x"
+        });
+        assert!(
+            super::is_tool_concurrency_safe("agent", Some(&args)),
+            "agent.spawn must be concurrency-safe so N parallel spawns \
+             actually run in parallel — pre-fix sequential dispatch \
+             was the smoking gun in session 8ca96f0f"
+        );
+    }
+
+    #[test]
+    fn agent_get_result_is_concurrency_safe() {
+        use serde_json::json;
+        let args = json!({"action": "get_result", "agent_id": "a@1"});
+        assert!(
+            super::is_tool_concurrency_safe("agent", Some(&args)),
+            "get_result is a pure read of the agent registry — safe \
+             to parallelize across N agent_ids"
+        );
+    }
+
+    #[test]
+    fn agent_send_message_stays_sequential() {
+        use serde_json::json;
+        let args = json!({
+            "action": "send_message",
+            "to": "agent-X",
+            "message": {"content": "hi"}
+        });
+        assert!(
+            !super::is_tool_concurrency_safe("agent", Some(&args)),
+            "send_message mutates the recipient mailbox — concurrent \
+             sends to the same target could reorder; keep sequential"
+        );
+    }
+
+    #[test]
+    fn agent_without_args_stays_sequential_defensively() {
+        // No args = unknown action; default to the safe-but-slow
+        // sequential path rather than parallelizing something that
+        // might mutate state.
+        assert!(
+            !super::is_tool_concurrency_safe("agent", None),
+            "missing args: default to sequential (defensive)"
+        );
+    }
+
     #[test]
     fn prioritize_puts_skill_before_others() {
         let mut items = vec![
@@ -1466,6 +1595,111 @@ mod tests {
         bridge.await.unwrap();
     }
 
+    /// Adjacent concurrency-safe tool requests may arrive as separate SSE
+    /// chunks. They must still execute as one batch; otherwise the first
+    /// long-running `agent.spawn` blocks the socket reader and the UI only
+    /// ever sees "1 parallel agent".
+    #[tokio::test]
+    async fn concurrent_agent_spawn_requests_coalesce_across_adjacent_chunks() {
+        let (tx, rx) = test_channel();
+        let mut stream = rx;
+
+        let batch_sizes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        struct BatchHost(std::sync::Arc<std::sync::Mutex<Vec<usize>>>);
+        #[async_trait]
+        impl SseStreamHost for BatchHost {
+            fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
+            fn on_stream_complete(&mut self) {}
+            async fn execute_tool(
+                &mut self,
+                rid: &str,
+                tool: &str,
+                args: &Value,
+            ) -> EdgeToolExecResult {
+                EdgeToolExecResult {
+                    request_id: rid.to_string(),
+                    tool: tool.to_string(),
+                    args: args.clone(),
+                    output: "ok".to_string(),
+                    tool_result_fields: None,
+                    status: "ok".to_string(),
+                    duration_ms: 1,
+                }
+            }
+            async fn execute_tools_batch(
+                &mut self,
+                requests: Vec<ToolBatchRequest>,
+            ) -> Vec<EdgeToolExecResult> {
+                self.0.lock().unwrap().push(requests.len());
+                requests
+                    .into_iter()
+                    .map(|req| EdgeToolExecResult {
+                        request_id: req.request_id,
+                        tool: req.tool,
+                        args: req.args,
+                        output: "ok".to_string(),
+                        tool_result_fields: None,
+                        status: "ok".to_string(),
+                        duration_ms: 1,
+                    })
+                    .collect()
+            }
+            async fn resolve_approval(
+                &mut self,
+                rid: &str,
+                _: &str,
+                _: ApprovalKind,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> EdgeApprovalResult {
+                EdgeApprovalResult {
+                    request_id: rid.to_string(),
+                    decision: "allow".to_string(),
+                    reason: None,
+                }
+            }
+        }
+
+        let bridge = tokio::spawn(async move {
+            let first = sse_event(
+                "tool_request",
+                ",\"request_id\":\"a1\",\"tool\":\"agent\",\"args\":{\"action\":\"spawn\",\"description\":\"review one\",\"prompt\":\"p1\",\"run_in_background\":true}",
+            );
+            let second = sse_event(
+                "tool_request",
+                ",\"request_id\":\"a2\",\"tool\":\"agent\",\"args\":{\"action\":\"spawn\",\"description\":\"review two\",\"prompt\":\"p2\",\"run_in_background\":true}",
+            );
+            let third = sse_event(
+                "tool_request",
+                ",\"request_id\":\"a3\",\"tool\":\"agent\",\"args\":{\"action\":\"spawn\",\"description\":\"review three\",\"prompt\":\"p3\",\"run_in_background\":true}",
+            );
+            tx.send(Ok(first.into_bytes())).await.unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            tx.send(Ok(second.into_bytes())).await.unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            tx.send(Ok(third.into_bytes())).await.unwrap();
+            drop(tx);
+        });
+
+        let mut host = BatchHost(batch_sizes.clone());
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+
+        assert!(abort.is_none(), "unexpected abort: {abort:?}");
+        assert_eq!(result.tool_results.len(), 3);
+        assert_eq!(
+            *batch_sizes.lock().unwrap(),
+            vec![3],
+            "agent.spawn requests should execute as one parallel batch"
+        );
+        bridge.await.unwrap();
+    }
+
     /// Skill and non-skill tool_request in the same SSE block during
     /// streaming: skill must execute first.
     #[tokio::test]
@@ -1508,6 +1742,7 @@ mod tests {
                 rid: &str,
                 _: &str,
                 _: ApprovalKind,
+                _: Option<&str>,
                 _: Option<&str>,
                 _: Option<&str>,
             ) -> EdgeApprovalResult {
@@ -1713,6 +1948,7 @@ mod tests {
                 _approval_kind: ApprovalKind,
                 _session_id: Option<&str>,
                 _detail: Option<&str>,
+                _display_label: Option<&str>,
             ) -> EdgeApprovalResult {
                 self.0
                     .lock()
@@ -1796,5 +2032,119 @@ mod tests {
             result.accum.full_text
         );
         assert!(result.accum.full_text.contains("create the file"));
+    }
+
+    /// REGRESSION (reviewer L2-4): approval-before-tool ordering MUST
+    /// hold across coalescing windows, not only within one. The
+    /// invariant: when a tool requires approval, the approval
+    /// request is resolved BEFORE the tool executes — even if the
+    /// approval_required event lands in window N and the
+    /// tool_request lands in window N+1 (e.g., adjacent SSE chunks
+    /// straddle the 25ms coalesce boundary).
+    ///
+    /// Mechanism check:
+    ///   - approval_required is NOT a `ChatTurnEdgePending::ToolRequest`,
+    ///     so `pending_is_coalescible_tool_batch` returns false the
+    ///     moment it lands.
+    ///   - That makes the inner `while pending_is_coalescible_tool_batch
+    ///     (&pending)` loop exit early.
+    ///   - `flush_pending_via_host` runs approvals first, then tools.
+    ///   - The next outer-loop iteration starts a fresh window for
+    ///     the tool.
+    ///
+    /// Test by injecting a delay between the approval chunk and the
+    /// tool chunk that EXCEEDS the coalescing window so they
+    /// definitely fall into separate windows.
+    #[tokio::test]
+    async fn approval_resolves_before_tool_even_across_coalesce_windows() {
+        let (tx, rx) = test_channel();
+        let mut stream = rx;
+
+        let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        struct OrderHost(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        #[async_trait]
+        impl SseStreamHost for OrderHost {
+            fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
+            fn on_stream_complete(&mut self) {}
+            async fn execute_tool(
+                &mut self,
+                rid: &str,
+                tool: &str,
+                args: &Value,
+            ) -> EdgeToolExecResult {
+                self.0.lock().unwrap().push(format!("exec:{rid}:{tool}"));
+                EdgeToolExecResult {
+                    request_id: rid.to_string(),
+                    tool: tool.to_string(),
+                    args: args.clone(),
+                    output: "ok".to_string(),
+                    tool_result_fields: None,
+                    status: "ok".to_string(),
+                    duration_ms: 0,
+                }
+            }
+            async fn resolve_approval(
+                &mut self,
+                rid: &str,
+                tool: &str,
+                _: ApprovalKind,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> EdgeApprovalResult {
+                self.0.lock().unwrap().push(format!("approve:{rid}:{tool}"));
+                EdgeApprovalResult {
+                    request_id: rid.to_string(),
+                    decision: "allow".to_string(),
+                    reason: None,
+                }
+            }
+        }
+
+        // Bridge: send approval, sleep WAY longer than the coalesce
+        // window (25ms default), then send tool_request. They land in
+        // different outer-loop iterations.
+        let bridge = tokio::spawn(async move {
+            let approval = sse_event(
+                "approval_required",
+                ",\"request_id\":\"shared-1\",\"tool\":\"str_replace\",\"approval_kind\":\"standard\",\"detail\":\"src/x.rs\"",
+            );
+            let tool_req = sse_event(
+                "tool_request",
+                ",\"request_id\":\"shared-1\",\"tool\":\"str_replace\",\"args\":{\"path\":\"src/x.rs\",\"old_str\":\"a\",\"new_str\":\"b\"}",
+            );
+            tx.send(Ok(approval.into_bytes())).await.unwrap();
+            // 100ms ≫ 25ms coalesce window — guarantees the approval
+            // chunk is fully processed and flushed before the tool
+            // chunk arrives, so the tool lands in window N+1.
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            tx.send(Ok(tool_req.into_bytes())).await.unwrap();
+            drop(tx);
+        });
+
+        let mut host = OrderHost(ops.clone());
+        let (_result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none(), "unexpected abort: {abort:?}");
+
+        let recorded = ops.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "expected approve + exec, got: {recorded:?}"
+        );
+        assert_eq!(
+            recorded[0], "approve:shared-1:str_replace",
+            "approval MUST resolve before the tool executes — even when \
+             the two events arrive in different coalescing windows. \
+             Got: {recorded:?}"
+        );
+        assert_eq!(recorded[1], "exec:shared-1:str_replace");
+
+        bridge.await.unwrap();
     }
 }

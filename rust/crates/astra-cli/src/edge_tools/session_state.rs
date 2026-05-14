@@ -255,7 +255,7 @@ impl ToolExecutor {
         Value::Object(value)
     }
 
-    fn rollback_session_state_entry(
+    async fn rollback_session_state_entry(
         &self,
         entry: &SessionStateRollbackEntry,
     ) -> Result<(), String> {
@@ -314,12 +314,12 @@ impl ToolExecutor {
                 self.restore_observability_snapshot(snapshot)
             }
             SessionStateRollbackAction::TaskState { snapshot } => {
-                self.task_manager.restore_snapshot(snapshot)
+                self.task_manager.restore_snapshot(snapshot).await
             }
         }
     }
 
-    pub(crate) fn rollback_session_state(&self, args: &Value) -> String {
+    pub(crate) async fn rollback_session_state(&self, args: &Value) -> String {
         let scope = args
             .get("scope")
             .and_then(Value::as_str)
@@ -376,7 +376,7 @@ impl ToolExecutor {
                 let mut restored = Vec::new();
                 let mut failed = Vec::new();
                 for entry in &plan {
-                    match self.rollback_session_state_entry(entry) {
+                    match self.rollback_session_state_entry(entry).await {
                         Ok(()) => {
                             self.remove_session_state_rollback(entry.sequence);
                             restored.push(Self::rollback_session_state_entry_json(entry));

@@ -80,6 +80,7 @@ astra-harness = { workspace = true, optional = true }
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 dashmap = "6.1.0"
 toml = { version = "1.1.2", features = ["preserve_order"] }
+fs2 = "0.4"
 
 [dev-dependencies]
 astra-core = { workspace = true, features = ["dev-defaults"] }
@@ -95,6 +96,7 @@ tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 tower.workspace = true
 proptest = "1"
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "hot_paths"

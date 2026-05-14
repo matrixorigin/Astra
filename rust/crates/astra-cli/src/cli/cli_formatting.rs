@@ -7,7 +7,7 @@ use crossterm::style::Stylize;
 use serde_json::Value;
 use std::borrow::Cow;
 
-pub use astra_text_utils::str_preview::{github_repo_display, shorten_path};
+pub use astra_text_utils::str_preview::{github_repo_display, shorten_path, truncate_line};
 
 /// Unified diff for CLI summaries: `str_replace` / `multi_edit` sentinels, or `write_file` JSON field.
 pub fn extract_cli_diff_block(output: &str) -> Option<Cow<'_, str>> {
@@ -124,17 +124,10 @@ pub fn format_duration_suffix(ms: u64) -> String {
     }
 }
 
-/// Truncate a string to max_chars, adding "…" if truncated.
-pub fn truncate_line(s: &str, max_chars: usize) -> String {
-    // Take first line only
-    let line = s.lines().next().unwrap_or(s);
-    if line.chars().count() <= max_chars {
-        line.to_string()
-    } else {
-        let truncated: String = line.chars().take(max_chars.saturating_sub(1)).collect();
-        format!("{truncated}…")
-    }
-}
+// `truncate_line` is re-exported from `astra_text_utils::str_preview`
+// at the top of this module (line 10). Keeping the definition here
+// would force two copies to stay in sync — a recipe for silent drift
+// between the scrollback preview and the approval-prompt preview.
 
 /// Simple syntax highlighting for code preview.
 /// Highlights: line numbers (dim), keywords (cyan), strings (green), comments (dim green).

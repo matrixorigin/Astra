@@ -6,46 +6,14 @@ use super::{SlashItem, SlashMenu, is_open_for};
 
 fn items() -> Vec<SlashItem> {
     vec![
-        SlashItem {
-            name: "/help",
-            description: "show help",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/model",
-            description: "pick a model",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/history",
-            description: "browse history",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/agent-create",
-            description: "create a new agent",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/resume",
-            description: "resume a session",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/review",
-            description: "review changes",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/allow",
-            description: "allow tool",
-            subcommands: &[],
-        },
-        SlashItem {
-            name: "/yolo",
-            description: "bypass prompts",
-            subcommands: &[],
-        },
+        SlashItem::simple("/help", "show help"),
+        SlashItem::simple("/model", "pick a model"),
+        SlashItem::simple("/history", "browse history"),
+        SlashItem::simple("/agent-create", "create a new agent"),
+        SlashItem::simple("/resume", "resume a session"),
+        SlashItem::simple("/review", "review changes"),
+        SlashItem::simple("/allow", "allow tool"),
+        SlashItem::simple("/yolo", "bypass prompts"),
     ]
 }
 
@@ -243,6 +211,7 @@ fn items_with_subs() -> Vec<SlashItem> {
             name: "/context",
             description: "context panel",
             subcommands: &[("dump", "Write a JSON snapshot to disk")],
+            ..Default::default()
         },
         SlashItem {
             name: "/skill",
@@ -252,6 +221,7 @@ fn items_with_subs() -> Vec<SlashItem> {
                 ("install", "Install from marketplace"),
                 ("list", "List skills"),
             ],
+            ..Default::default()
         },
         SlashItem::simple("/help", "show help"),
     ]

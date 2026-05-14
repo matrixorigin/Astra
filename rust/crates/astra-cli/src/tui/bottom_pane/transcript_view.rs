@@ -65,9 +65,16 @@ impl BottomPaneView for TranscriptView {
         let dim = Style::default().fg(Color::DarkGray);
         let bold = Style::default().add_modifier(Modifier::BOLD);
         let mut y = area.y;
+        let bottom = area.bottom();
+
+        // Helper: advance `y` by 1 with saturating add. Without this,
+        // a child Rect placed near `u16::MAX` (deeply nested overlay /
+        // tiled layout edge) would wrap to 0 and start drawing rows at
+        // the top of the buffer. Same fix as C-TUI-1 in task_detail_view.
+        let next_y = |y: u16| y.saturating_add(1).min(bottom);
 
         // Title
-        if y < area.bottom() {
+        if y < bottom {
             Widget::render(
                 Line::from(vec![
                     Span::styled("  Transcript", bold),
@@ -76,14 +83,14 @@ impl BottomPaneView for TranscriptView {
                 Rect::new(area.x, y, area.width, 1),
                 buf,
             );
-            y += 1;
+            y = next_y(y);
         }
 
         // Content
         let max_visible = self.max_visible as usize;
         let visible_end = (self.scroll + max_visible).min(self.lines.len());
         for i in self.scroll..visible_end {
-            if y >= area.bottom() {
+            if y >= bottom {
                 break;
             }
             Widget::render(
@@ -91,11 +98,11 @@ impl BottomPaneView for TranscriptView {
                 Rect::new(area.x, y, area.width, 1),
                 buf,
             );
-            y += 1;
+            y = next_y(y);
         }
 
         // Scroll indicator
-        if self.lines.len() > max_visible && y < area.bottom() {
+        if self.lines.len() > max_visible && y < bottom {
             Widget::render(
                 Line::from(Span::styled(
                     format!(
@@ -109,14 +116,14 @@ impl BottomPaneView for TranscriptView {
                 Rect::new(area.x, y, area.width, 1),
                 buf,
             );
-            y += 1;
+            y = next_y(y);
         }
 
         // Hint
-        if y < area.bottom() {
-            y += 1;
+        if y < bottom {
+            y = next_y(y);
         }
-        if y < area.bottom() {
+        if y < bottom {
             Widget::render(
                 Line::from(Span::styled(
                     "  ↑/↓ scroll  PgUp/PgDn page  Home/End  Esc close",

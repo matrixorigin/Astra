@@ -77,12 +77,19 @@ pub struct ChatTurnSseAccum {
 }
 
 /// Deferred edge work from `tool_request` / `approval_required` events.
+///
+/// `detail` carries the raw command/path for downstream rule matching
+/// (`bash_command_approval_reason`, `ApprovalFingerprint::shell`).
+/// `display_label` is the rich UI preview — when present, clients
+/// should show it to the user instead of the raw detail. Falls back
+/// to `detail` when the emitter didn't populate it (older servers).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeApprovalRequest {
     pub request_id: String,
     pub tool: String,
     pub approval_kind: ApprovalKind,
     pub detail: Option<String>,
+    pub display_label: Option<String>,
 }
 
 /// Deferred edge work from `tool_request` / approval SSE events.
@@ -98,6 +105,7 @@ pub enum ChatTurnEdgePending {
         tool: String,
         approval_kind: ApprovalKind,
         detail: Option<String>,
+        display_label: Option<String>,
     },
     ApprovalBatchRequired {
         requests: Vec<EdgeApprovalRequest>,
@@ -213,6 +221,10 @@ fn approval_request_from_event(event: &Value) -> Option<EdgeApprovalRequest> {
                 .and_then(|v| v.as_str())
                 .map(std::string::ToString::to_string)
         });
+    let display_label = event
+        .get("display_label")
+        .and_then(|v| v.as_str())
+        .map(std::string::ToString::to_string);
     if request_id.is_empty() || tool.is_empty() {
         return None;
     }
@@ -221,6 +233,7 @@ fn approval_request_from_event(event: &Value) -> Option<EdgeApprovalRequest> {
         tool,
         approval_kind,
         detail,
+        display_label,
     })
 }
 
@@ -330,6 +343,7 @@ fn apply_one_event(
                     tool: request.tool,
                     approval_kind: request.approval_kind,
                     detail: request.detail,
+                    display_label: request.display_label,
                 });
             }
         }
@@ -953,6 +967,7 @@ mod tests {
                 tool,
                 approval_kind,
                 detail,
+                display_label: _,
             } => {
                 assert_eq!(request_id, "ap-1");
                 assert_eq!(tool, "write_file");

@@ -437,7 +437,7 @@ async fn ensure_team_run_session(
                     return Ok(session_id);
                 }
                 let _ = crate::auth_flow::clear_profile_last_session(profile);
-                state.session_id = None;
+                state.clear_session_id();
                 state.unregister_root_mailbox().await;
                 state.run_id = None;
                 state.journal = None;
@@ -460,7 +460,7 @@ async fn ensure_team_run_session(
 
     crate::chat_turn::initialize_journal_pub(state, &session_id);
     crate::chat_turn::persist_last_session_id(profile, &session_id);
-    state.session_id = Some(session_id.clone());
+    state.set_session_id(session_id.clone());
     Ok(session_id)
 }
 

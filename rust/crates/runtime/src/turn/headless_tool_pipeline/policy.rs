@@ -560,6 +560,17 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         .await
         {
             PermissionCheckResult::Allowed => {}
+            PermissionCheckResult::AllowedImplicit { reason } => {
+                if !self.ctx.quiet {
+                    self.ctx.term.emit_line(
+                        HeadlessStderrStyle::Yellow,
+                        astra_turn_core::permission_notice::format_auto_approved_permission(
+                            &execution.name,
+                            &reason,
+                        ),
+                    );
+                }
+            }
             PermissionCheckResult::AllowedViaRequest { .. } => {
                 if !self.ctx.quiet {
                     self.ctx.term.emit_line(

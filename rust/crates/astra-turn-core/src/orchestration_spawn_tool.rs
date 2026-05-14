@@ -54,7 +54,14 @@ pub struct SpawnAgentInput {
     /// Run in background (async). Default false — synchronous mode
     /// ensures the parent receives the child's result in the tool-call
     /// response before its turn budget is consumed.
-    #[serde(default, deserialize_with = "deserialize_bool_lenient")]
+    ///
+    /// Accepts both `background` (legacy) and `run_in_background`
+    /// (claude-code-style) as wire keys.
+    #[serde(
+        default,
+        alias = "run_in_background",
+        deserialize_with = "deserialize_bool_lenient"
+    )]
     pub background: bool,
 
     /// Name for agent-to-agent messaging.
@@ -348,6 +355,16 @@ fn default_agent_type() -> String {
 }
 
 /// Output from spawn_agent tool.
+///
+/// Marked `#[must_use]`: every variant carries information the
+/// caller MUST act on. Forgetting `Launched` leaks a background
+/// agent (no one will ever call `get_result`); ignoring
+/// `Completed`/`Failed` discards the agent's actual output. The
+/// attribute makes the compiler nag if a spawn() return value is
+/// dropped without inspection.
+#[must_use = "spawning an agent without inspecting the result leaks the run \
+              (Launched: caller must follow up with get_result; \
+              Completed/Failed/Cancelled: caller must surface the agent's output)"]
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SpawnAgentOutput {
@@ -518,6 +535,32 @@ mod tests {
         assert!(
             input.background,
             "explicit background: true must be honored"
+        );
+    }
+
+    #[test]
+    fn run_in_background_alias_maps_to_background_field() {
+        // The tool schema advertises `run_in_background` (claude-code
+        // style). Some models primed on that name will emit that key
+        // instead of the legacy `background`. Both must route to the
+        // same boolean — otherwise the sync-default promise breaks
+        // silently for any caller that uses the schema-documented
+        // name.
+        let json = r#"{"description": "D", "prompt": "P", "run_in_background": true}"#;
+        let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
+        assert!(
+            input.background,
+            "run_in_background alias must populate the background field"
+        );
+    }
+
+    #[test]
+    fn run_in_background_false_matches_sync_default() {
+        let json = r#"{"description": "D", "prompt": "P", "run_in_background": false}"#;
+        let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
+        assert!(
+            !input.background,
+            "run_in_background: false must produce the sync-default spawn"
         );
     }
 

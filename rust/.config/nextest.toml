@@ -1,6 +1,23 @@
 [profile.default]
 fail-fast = false
 slow-timeout = { period = "15s", terminate-after = 1 }
+# `cargo nextest run --workspace` spawns ~100 test binaries each with
+# their own tokio runtime + thread pool. On a kernel where
+# `fs.inotify.max_user_instances` is small (default 128) or where
+# tmpfs is undersized for the concurrent test-temp-dir burst, the
+# default thread pool produces ENOSPC (errno 28) on tempfile creation
+# — flaky failures that pass when re-run alone.
+#
+# 2 was the empirically-stable cap on a 24-core / 30G RAM box with
+# default kernel limits. Increase if your kernel is tuned:
+#   sudo sysctl -w fs.inotify.max_user_instances=512
+#   sudo sysctl -w fs.aio-max-nr=1048576
+# then run with `cargo nextest run --test-threads N` to override.
+#
+# `make test-offline` / `make test-online` use the `strict` /
+# `strict-online` profiles which DO NOT cap threads — those targets
+# are intended for tuned CI hosts.
+test-threads = 2
 
 # All profiles share a uniform 15s per-test-case hard budget. TIMEOUT = FAIL;
 # no per-test/per-binary carve-outs. 15s is deliberately lax so flake from

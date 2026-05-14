@@ -8,7 +8,7 @@ pub(super) async fn handle_task_command(
     profile: Option<&str>,
     token: Option<&str>,
 ) {
-    use astra_services::{TaskCreateRequest, TaskService, TaskStatus};
+    use astra_services::{TaskCreateRequest, TaskStatus};
 
     let svc = match &state.task_service {
         Some(s) => s.clone(),
@@ -305,6 +305,7 @@ pub(super) async fn handle_task_command(
                     cancel_token: None,
                     plan_assemble_line_release: None,
                     stream_event_tx: None,
+                    agent_live_event_sink: None,
                     approval_request_tx: None,
                     mcp_manager: None,
                     skill_search: &bg_skill_search,
@@ -324,6 +325,7 @@ pub(super) async fn handle_task_command(
                     git_worktree_journal: None,
                     session_state_journal: None,
                     task_manager: None,
+                    bg_task_commands: None,
                     turn_index: 0,
                     pipeline_state: None,
                     pre_loaded_messages: None,

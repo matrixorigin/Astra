@@ -49,7 +49,7 @@ pub(crate) async fn complete_session_startup(
 
     // --session-id: override with explicit session UUID
     if let Ok(sid) = std::env::var("ASTRA_CLI_SESSION_ID") {
-        state.session_id = Some(sid.clone());
+        state.set_session_id(sid.clone());
         state.pending_recovery = None;
         eprintln!(
             "{}",
@@ -283,7 +283,7 @@ pub(crate) async fn complete_session_startup(
     tracer.phase("completions_deferred");
 
     if let Some(token) = current_access_token(profile) {
-        initialize_multi_agent_runtime(state, api, token).await;
+        initialize_multi_agent_runtime(state, api, token, profile).await;
     }
     tracer.phase("multi_agent_runtime");
 

@@ -1152,7 +1152,7 @@ impl ToolExecutor {
         }
     }
 
-    pub(crate) fn rollback_turn_actions(&self, args: &Value) -> String {
+    pub(crate) async fn rollback_turn_actions(&self, args: &Value) -> String {
         let scope = args
             .get("scope")
             .and_then(Value::as_str)
@@ -1196,7 +1196,7 @@ impl ToolExecutor {
                 );
                 let session_state_result = Self::parse_rollback_tool_output(
                     "rollback_session_state",
-                    self.rollback_session_state(args),
+                    self.rollback_session_state(args).await,
                 );
                 let file_entries = file_result
                     .get("entries")
@@ -1337,7 +1337,7 @@ impl ToolExecutor {
                 );
                 let session_state_result = Self::parse_rollback_tool_output(
                     "rollback_session_state",
-                    self.rollback_session_state(args),
+                    self.rollback_session_state(args).await,
                 );
                 let turn_index = database_result
                     .get("turn_index")
@@ -3180,11 +3180,16 @@ type Handler interface {
         let content = "fn hello() {}\n";
         let old_str = "completely_nonexistent_text";
         let msg = str_replace_not_found_hint(content, old_str);
-        assert!(msg.contains("FAILED"), "should be error: {msg}");
+        // The unified banner from PR #334 must include all four sentinel
+        // markers — emoji header + WHAT/WHY/NEXT structured lines. This
+        // test pins the contract so a regression unwinds visibly.
         assert!(
-            msg.contains("read_file") || msg.contains("Hint"),
-            "should give guidance: {msg}"
+            msg.contains("STR_REPLACE FAILED"),
+            "must include unified banner sentinel: {msg}"
         );
+        assert!(msg.contains("WHAT:"), "must include WHAT line: {msg}");
+        assert!(msg.contains("WHY:"), "must include WHY line: {msg}");
+        assert!(msg.contains("NEXT:"), "must include NEXT line: {msg}");
     }
 
     #[test]
@@ -3231,10 +3236,17 @@ type Handler interface {
             "new_str": "fn replaced() {}"
         }));
         assert!(
-            result2.contains("FAILED"),
-            "truly different should be error: {result2}"
+            result2.contains("STR_REPLACE FAILED"),
+            "must include unified banner sentinel: {result2}"
         );
-        assert!(result2.contains("Hint"), "should have hints: {result2}");
+        assert!(
+            result2.contains("WHAT:"),
+            "must include WHAT line: {result2}"
+        );
+        assert!(
+            result2.contains("NEXT:"),
+            "must include NEXT line: {result2}"
+        );
     }
 
     #[test]
@@ -3436,9 +3448,10 @@ type Handler interface {
             "replace_all": true
         }));
         assert!(
-            result.contains("FAILED"),
-            "should error on mixed curly-quote forms: {result}"
+            result.contains("STR_REPLACE FAILED"),
+            "must include unified banner sentinel: {result}"
         );
+        assert!(result.contains("WHAT:"), "must include WHAT line: {result}");
         assert!(
             result.contains("curly quote"),
             "error should mention curly quotes, got: {result}"

@@ -14,6 +14,103 @@ pub(crate) fn create_pipeline_modules_quiet(
     create_pipeline_modules_inner(api, profile, false)
 }
 
+pub(crate) fn local_task_service() -> std::sync::Arc<dyn astra_services::TaskService> {
+    let tasks_dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".astra")
+        .join("tasks");
+    std::sync::Arc::new(astra_services::LocalTaskService::new(tasks_dir))
+}
+
+pub(crate) async fn resolve_task_service() -> std::sync::Arc<dyn astra_services::TaskService> {
+    if std::env::var("MATRIXONE_HOST").is_ok() {
+        let settings = astra_core::MatrixOneSettings::from_env();
+        let catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        let _ = astra_services::storage::ensure_core_schema(&settings, &catalog).await;
+        if let Some(pool) = cloud_sync::try_connect_matrixone().await {
+            return std::sync::Arc::new(astra_services::MatrixOneTaskService::new(pool));
+        }
+    }
+    local_task_service()
+}
+
+/// Task store for the Tier 1 session scratchpad (`session_todos`). MO-backed
+/// when a pool is configured so edge/cloud see the same rows; in-memory
+/// fallback for offline CLI.
+pub(crate) async fn resolve_task_store() -> std::sync::Arc<dyn astra_tools::task_mgmt::TaskStore> {
+    if std::env::var("MATRIXONE_HOST").is_ok()
+        && let Some(pool) = cloud_sync::try_connect_matrixone().await
+    {
+        return std::sync::Arc::new(astra_tools::task_mgmt_matrixone::MatrixOneTaskStore::new(
+            pool,
+        ));
+    }
+    std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new())
+}
+
+pub(crate) fn install_task_service(
+    state: &mut SessionState,
+    task_service: std::sync::Arc<dyn astra_services::TaskService>,
+) {
+    state.task_service = Some(task_service);
+}
+
+/// Replace the task manager's store (used once at startup when we upgrade
+/// from the synchronous in-memory fallback to a MatrixOne-backed store).
+/// The new manager inherits the current session_id; later `rebind_task_session`
+/// calls keep it current.
+pub(crate) fn install_task_store(
+    state: &mut SessionState,
+    store: std::sync::Arc<dyn astra_tools::task_mgmt::TaskStore>,
+) {
+    let session_id = state
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "no-session".to_string());
+    state.task_manager =
+        std::sync::Arc::new(astra_tools::task_mgmt::TaskManager::new(session_id, store));
+}
+
+/// Notify the task manager that the session id changed. Cheap — just a
+/// mutex swap inside the manager — so every `state.session_id = ...`
+/// touch-point should call this to keep the session_todos view consistent.
+pub(crate) fn rebind_task_session(state: &SessionState, session_id: &str) {
+    state.task_manager.rebind(session_id);
+}
+
+pub(crate) async fn resolve_matrixone_task_runtime() -> Result<
+    (
+        std::sync::Arc<dyn astra_services::TaskService>,
+        std::sync::Arc<dyn astra_services::TaskLeaseService>,
+    ),
+    String,
+> {
+    if std::env::var("MATRIXONE_HOST").is_err() {
+        return Err(
+            "MatrixOne task runtime is not configured; set MATRIXONE_HOST and related MatrixOne env vars"
+                .to_string(),
+        );
+    }
+    let settings = astra_core::MatrixOneSettings::from_env();
+    let catalog =
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    astra_services::storage::ensure_core_schema(&settings, &catalog)
+        .await
+        .map_err(|e| format!("initialize MatrixOne task schema: {e}"))?;
+    let pool = cloud_sync::try_connect_matrixone()
+        .await
+        .ok_or_else(|| "connect MatrixOne task runtime".to_string())?;
+    let task_service: std::sync::Arc<dyn astra_services::TaskService> =
+        std::sync::Arc::new(astra_services::MatrixOneTaskService::new(pool.clone()));
+    let lease_service: std::sync::Arc<dyn astra_services::TaskLeaseService> =
+        std::sync::Arc::new(astra_services::DatabaseTaskLeaseService::new(
+            pool,
+            std::sync::Arc::new(astra_services::TaskLeaseHoldCache::default()),
+        ));
+    Ok((task_service, lease_service))
+}
+
 /// Shared runtime modules created during pipeline construction.
 ///
 /// Holds the unified skill registry, MCP client manager, and skill-watcher
@@ -389,14 +486,9 @@ pub(crate) fn initialize_session_state(
         state.model = Some(m.to_string());
     }
 
-    // Initialize local task service
-    let tasks_dir = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".astra")
-        .join("tasks");
-    state.task_service = Some(std::sync::Arc::new(astra_services::LocalTaskService::new(
-        tasks_dir,
-    )));
+    // Initialize a durable task service synchronously; startup paths that can
+    // await upgrade this to MatrixOne via `resolve_task_service`.
+    install_task_service(&mut state, local_task_service());
 
     // Initialize observability hub for M1-M6 integration
     // Use persistent storage under ~/.astra/observability for user profiles

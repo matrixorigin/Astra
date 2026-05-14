@@ -11,6 +11,7 @@
     clippy::unnecessary_map_or
 )]
 
+pub mod agent_live_event;
 pub mod agentic_recursion_guard;
 pub mod agentic_verdict_audit;
 pub mod alert_dispatcher;
@@ -66,6 +67,7 @@ pub mod microcompact;
 pub mod observer;
 pub mod optimize_limits;
 pub mod parallel_tool_exec;
+pub mod permission_notice;
 pub mod pipeline_config;
 pub mod pipeline_journal;
 pub mod pipeline_metrics;
@@ -97,6 +99,8 @@ pub mod tool_call_shape;
 pub mod tool_health;
 pub mod tool_health_persistence;
 pub mod tool_hooks;
+pub mod tool_policy;
+pub mod tool_preview;
 pub mod tool_result_compression;
 pub mod tool_result_dedup;
 pub mod tool_result_sanitize;

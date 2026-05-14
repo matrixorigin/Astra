@@ -1,0 +1,40 @@
+name: session_todos_create_and_list
+description: |
+  **What**: Drive a real LLM through the Tier 1 session task board so that
+  the unified `task` tool runs on a live `TaskManager` backed by
+  `MatrixOneTaskStore` (Plan §2.1). Complements the lower-level
+  `session_todos_cross_client_e2e.rs` direct-store asserts by proving the
+  whole path end-to-end: agent loop → tool dispatcher → `TaskManager` →
+  `MatrixOneTaskStore` → `session_todos` table.
+  **Tests**: real `task` tool-name dispatch, MO write-through on
+  `action=create`, MO read on subsequent `action=list`.
+  **Why**: Without this the HTTP layer is unverified in offline CI —
+  `test_llm_rounds` harness paths don't exercise server-side tool
+  execution, so we rely on a real LLM to make the decision to call tools.
+  **Pass means**: the model calls `task` (create) then `task` (list) and
+  the list response surfaces the title it just wrote.
+  **Fail means**: tool dispatch to `TaskManager` broken, `MatrixOneTaskStore`
+  save/load broken, or `session_todos` schema mismatch.
+prompt: |
+  You have a session task board tool named `task` with an `action` field.
+  Do exactly two things, in order, using that tool:
+  1. Call `task` with `{"action": "create", "title": "astra-session-todo-probe",
+     "description": "journey probe"}`.
+  2. Call `task` with `{"action": "list"}`.
+  Then print one short sentence that contains the exact token
+  `astra-session-todo-probe`.
+  Do not call any other tools. Do not use bash, read_file, or memory tools.
+timeout_seconds: 120
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: task
+  - type: text_contains
+    needle: astra-session-todo-probe
+  - type: turn_rounds_between
+    min: 1
+    max: 6
+  - type: tools_count_between
+    min: 2
+    max: 8

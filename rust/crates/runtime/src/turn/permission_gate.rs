@@ -22,6 +22,9 @@ use astra_turn_core::tool_argument_hints::{
 pub enum PermissionCheckResult {
     /// Permission granted — proceed with tool execution.
     Allowed,
+    /// Permission granted locally by policy; callers should surface this
+    /// because no interactive approval UI was shown.
+    AllowedImplicit { reason: String },
     /// Permission denied — return this error message instead of executing.
     Denied { reason: String },
     /// Permission granted after requesting from parent.
@@ -84,12 +87,39 @@ pub async fn check_tool_permission(
             return PermissionCheckResult::Allowed;
         }
 
-        // Auto mode: approve locally without mailbox round-trip.
-        // This avoids the 30s permission-request timeout that would otherwise
-        // block child agents whose parent happens to be mid-LLM-call.
-        // Still respects the allowed_tools allowlist — tools not on the list
-        // are denied even in Auto mode.
-        if ctx_guard.mode() == PermissionMode::Auto {
+        // Local-approve fast path. Two cases land here:
+        //
+        // 1. **Auto mode**: legacy "user opted into auto-approve". The
+        //    allowed_tools allowlist (when set) still gates the
+        //    surface — Auto doesn't mean unlimited.
+        //
+        // 2. **`allowed_tools` is set, regardless of mode**: the
+        //    parent's `agent.spawn` call already specified the
+        //    sub-agent's full tool surface (via `agent_type` ⇒ e.g.
+        //    `code-review` ⇒ {bash, grep, glob, view}). The user
+        //    authorized that surface when they ran the spawn — there
+        //    is no second consent step we could ask them about. Tools
+        //    OUTSIDE the allowlist still go through the normal
+        //    request-parent path below.
+        //
+        // Without this second case, sub-agents inheriting the REPL's
+        // default `Prompt` mode would try to `request_permission`
+        // from the orchestrator — which is never registered in the
+        // mailbox router (`initialize_multi_agent_runtime` builds the
+        // router but doesn't register a root mailbox). Result:
+        // `MailboxError::AgentNotFound("orchestrator@run-...")` →
+        // every bash/grep/etc call denied → the agent returns 0 tool
+        // calls and produces useless output. Reproduced in session
+        // 2a98814b: 4 code-review sub-agents all failed at first
+        // bash call.
+        //
+        // `explicit_approval`-required tools (e.g. `git_commit` with
+        // `-m`) still go through the request-parent flow because
+        // they're high-stakes mutations the agent_type allowlist
+        // alone shouldn't grant blanket consent for.
+        let in_auto_mode = ctx_guard.mode() == PermissionMode::Auto;
+        let allowlist_present = ctx_guard.inherited.allowed_tools.is_some();
+        if ctx_guard.mode() != PermissionMode::Deny && (in_auto_mode || allowlist_present) {
             if !ctx_guard.inherited.is_tool_allowed_by_allowlist(tool_name) {
                 drop(ctx_guard);
                 let reason = format!("Tool '{}' not in allowed tools list", tool_name);
@@ -99,7 +129,14 @@ pub async fn check_tool_permission(
                 return PermissionCheckResult::Denied { reason };
             }
             if explicit_approval.is_none() {
-                return PermissionCheckResult::Allowed;
+                let reason = if allowlist_present {
+                    "agent policy allowlist"
+                } else {
+                    "auto permission mode"
+                };
+                return PermissionCheckResult::AllowedImplicit {
+                    reason: reason.to_string(),
+                };
             }
         }
 
@@ -206,6 +243,13 @@ mod tests {
     };
     use std::collections::HashSet;
 
+    fn is_allowed(result: &PermissionCheckResult) -> bool {
+        matches!(
+            result,
+            PermissionCheckResult::Allowed | PermissionCheckResult::AllowedImplicit { .. }
+        )
+    }
+
     #[tokio::test]
     async fn no_context_always_allowed() {
         let result = check_tool_permission(
@@ -216,7 +260,7 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
-        assert!(matches!(result, PermissionCheckResult::Allowed));
+        assert!(is_allowed(&result));
     }
 
     #[tokio::test]
@@ -233,7 +277,7 @@ mod tests {
 
         let result =
             check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
-        assert!(matches!(result, PermissionCheckResult::Allowed));
+        assert!(is_allowed(&result));
     }
 
     #[tokio::test]
@@ -301,7 +345,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, PermissionCheckResult::Allowed),
+            is_allowed(&result),
             "Auto mode should approve tools locally"
         );
 
@@ -328,7 +372,7 @@ mod tests {
         // "view" is in the allowlist — should approve
         let result =
             check_tool_permission("view", None, Some(&ctx), None, Duration::from_secs(1)).await;
-        assert!(matches!(result, PermissionCheckResult::Allowed));
+        assert!(is_allowed(&result));
 
         // "bash" is NOT in the allowlist — should deny
         let result =
@@ -344,6 +388,170 @@ mod tests {
             "Auto mode should never send mailbox requests"
         );
         assert_eq!(telemetry.tools_blocked, 1);
+    }
+
+    /// REGRESSION: a sub-agent in `Prompt` mode whose tool IS in the
+    /// agent_type's `allowed_tools` allowlist must be auto-approved
+    /// without trying to ask the parent. The user already authorized
+    /// the agent.spawn that created this sub-agent, knowing its
+    /// agent_type's tool surface (e.g. `code-review` ⇒ bash, grep,
+    /// glob, view). Asking them again per-tool-call is friction
+    /// without consent value.
+    ///
+    /// The pre-fix bug (session 2a98814b): sub-agents inherited
+    /// Prompt mode, fell through to the "request parent" branch, but
+    /// the orchestrator mailbox was never registered in
+    /// `initialize_multi_agent_runtime` — so `request_permission`
+    /// returned `MailboxError::AgentNotFound("orchestrator@run-...")`
+    /// and the tool call was denied. 4 review agents spawned, all
+    /// returned 0 tool calls, useless output.
+    ///
+    /// Fix: extend the local-approve fast path so it also fires when
+    /// `allowed_tools.is_some()` AND the tool is in the list,
+    /// regardless of mode. The allowlist IS the consent.
+    #[tokio::test]
+    async fn allowlisted_tool_auto_approves_in_prompt_mode_without_mailbox() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            allow_rules: vec![],
+            deny_rules: vec![],
+            ask_rules: vec![],
+            // Mirror the current `code-review` agent type: bash, grep,
+            // glob, list_dir, read_file.
+            allowed_tools: Some(HashSet::from([
+                "bash".to_string(),
+                "grep".to_string(),
+                "glob".to_string(),
+                "list_dir".to_string(),
+                "read_file".to_string(),
+            ])),
+            is_background: false,
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        // No mailbox — orchestrator is not registered (the actual
+        // production state on a fresh REPL).
+        let result = check_tool_permission(
+            "bash",
+            Some(r#"{"command":"git show HEAD"}"#),
+            Some(&ctx),
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            is_allowed(&result),
+            "tool in agent_type allowlist must auto-approve in Prompt mode; \
+             got {result:?}. Pre-fix this would have hit the 'mailbox = None' \
+             branch and denied the call."
+        );
+
+        let telemetry = ctx.read().await.telemetry();
+        assert_eq!(
+            telemetry.permission_requests, 0,
+            "must NOT send a mailbox request — the allowlist is the consent"
+        );
+        assert_eq!(
+            telemetry.tools_blocked, 0,
+            "must NOT block the call — allowlisted tools bypass the prompt path"
+        );
+    }
+
+    /// Regression for session 2ee7f992: code-review children were
+    /// prompted to inspect `/tmp/astra_review_diff.txt`, chose
+    /// `read_file`, but the built-in allowlist still used the legacy
+    /// `view` tool name. That pushed `read_file` into the parent
+    /// permission-request path, which then failed with
+    /// `AgentNotFound(\"orchestrator@run-...\")` because the root
+    /// orchestrator mailbox is not registered.
+    #[tokio::test]
+    async fn code_review_allowlist_auto_approves_read_file_without_mailbox() {
+        let code_review = astra_turn_core::orchestration_builtin_agents::get_builtin_agent_types()
+            .into_iter()
+            .find(|def| def.agent_type == "code-review")
+            .expect("builtins must include code-review");
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            allow_rules: vec![],
+            deny_rules: vec![],
+            ask_rules: vec![],
+            allowed_tools: Some(code_review.allowed_tools),
+            is_background: false,
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        let result = check_tool_permission(
+            "read_file",
+            Some(r#"{"path":"/tmp/astra_review_diff.txt"}"#),
+            Some(&ctx),
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            is_allowed(&result),
+            "code-review allowlist must admit read_file locally; got {result:?}"
+        );
+
+        let telemetry = ctx.read().await.telemetry();
+        assert_eq!(telemetry.permission_requests, 0);
+        assert_eq!(telemetry.tools_blocked, 0);
+    }
+
+    /// Companion test: a tool OUTSIDE the allowlist still gets blocked
+    /// in Prompt mode without a mailbox. The fast-path doesn't widen
+    /// the agent's surface beyond what `agent_type` declared.
+    #[tokio::test]
+    async fn non_allowlisted_tool_still_denied_in_prompt_without_mailbox() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            allow_rules: vec![],
+            deny_rules: vec![],
+            ask_rules: vec![],
+            allowed_tools: Some(HashSet::from(["bash".to_string(), "grep".to_string()])),
+            is_background: false,
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        // `edit` is NOT in the code-review-style allowlist.
+        let result = check_tool_permission(
+            "edit",
+            Some(r#"{"path":"src/main.rs"}"#),
+            Some(&ctx),
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            matches!(result, PermissionCheckResult::Denied { .. }),
+            "tool outside the allowlist must still be denied; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_mode_overrides_agent_type_allowlist() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Deny,
+            allow_rules: vec![],
+            deny_rules: vec![],
+            ask_rules: vec![],
+            allowed_tools: Some(HashSet::from(["bash".to_string()])),
+            is_background: false,
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        let result = check_tool_permission(
+            "bash",
+            Some(r#"{"command":"git status"}"#),
+            Some(&ctx),
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            matches!(result, PermissionCheckResult::Denied { .. }),
+            "Deny mode must not be bypassed by an agent_type allowlist; got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -486,12 +694,16 @@ mod tests {
             })
             .await;
 
+        // No allowlist set — Prompt mode falls through to the
+        // request-parent flow that this test is exercising. (When an
+        // allowlist IS set, allowlisted tools auto-approve locally;
+        // see `allowlisted_tool_auto_approves_in_prompt_mode_without_mailbox`.)
         let inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
             allow_rules: vec![],
             deny_rules: vec![],
             ask_rules: vec![],
-            allowed_tools: Some(HashSet::from(["view".to_string()])),
+            allowed_tools: None,
             is_background: false,
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));

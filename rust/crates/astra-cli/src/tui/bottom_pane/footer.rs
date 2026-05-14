@@ -19,6 +19,8 @@ pub(crate) struct Footer {
     pub git_branch: Option<String>,
     pub token_budget: Option<(u64, u64)>,
     pub pending_approvals: usize,
+    pub task_counts: Option<(usize, usize)>,
+    pub task_board_expanded: bool,
 }
 
 impl Footer {
@@ -34,6 +36,8 @@ impl Footer {
             git_branch: detect_git_branch(),
             token_budget: None,
             pending_approvals: 0,
+            task_counts: None,
+            task_board_expanded: false,
         }
     }
 
@@ -65,6 +69,8 @@ impl Footer {
             cost_usd: self.cost_usd,
             git_branch: self.git_branch.clone(),
             pending_approvals: self.pending_approvals,
+            task_counts: self.task_counts,
+            task_board_expanded: self.task_board_expanded,
         }
     }
 
@@ -92,14 +98,10 @@ fn current_cwd_display() -> Option<String> {
 /// (covers `git bisect` / `git checkout <sha>`), and `None` for
 /// non-git cwds or I/O errors — the status line then shows just the
 /// cwd.
+///
+/// Delegates to the process-wide cached implementation so the footer
+/// (which redraws every frame) doesn't spawn a `gix::discover` per
+/// render. See `crate::git_branch_cache`.
 fn detect_git_branch() -> Option<String> {
-    let repo = gix::discover(std::env::current_dir().ok()?).ok()?;
-    let head = repo.head().ok()?;
-    if let Some(name) = head.referent_name() {
-        return Some(name.shorten().to_string());
-    }
-    // Detached HEAD: show abbreviated commit id.
-    let id = head.id()?;
-    let hex = id.to_hex_with_len(7).to_string();
-    Some(format!("({hex})"))
+    crate::git_branch_cache::detect_git_branch_cached()
 }

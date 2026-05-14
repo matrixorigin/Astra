@@ -166,6 +166,44 @@ impl TurnSource for StaticTurnSource {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::JournalTurnSource;
+    use super::TurnSource;
+    use astra_services::session_journal::{JournalDirGuard, JournalEvent, JournalWriter};
+    use tempfile::tempdir;
+
+    #[test]
+    fn journal_source_propagates_context_time() {
+        let dir = tempdir().expect("tempdir");
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let writer = JournalWriter::new("sess-timeline").expect("writer");
+
+        writer
+            .append(
+                &JournalEvent::turn(
+                    Some("sess-timeline"),
+                    1,
+                    Some("sonnet-4.6"),
+                    "inspect timeline",
+                    "done",
+                    0,
+                    120,
+                    40,
+                    500,
+                )
+                .with_context_time(Some(91)),
+            )
+            .expect("append turn");
+
+        let turns = JournalTurnSource::new().load("sess-timeline");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].context_ms, Some(91));
+    }
+}
+
 // ── Timeline engine — RED stubs ───────────────────────────────────
 
 pub(crate) struct Timeline {
