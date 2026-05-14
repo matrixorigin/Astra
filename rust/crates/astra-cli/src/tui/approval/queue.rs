@@ -13,15 +13,21 @@ use crate::chat_stream::ApprovalResponse;
 /// the non-Clone `oneshot::Sender`.
 pub(crate) type ApprovalId = u64;
 
-/// One pending approval. The `response_tx` is `Option` so `respond_*`
-/// can consume it exactly once without moving the whole struct.
+/// One pending approval. The `response_txs` vec lets dedup
+/// merge multiple in-flight requests with byte-identical
+/// `ApprovalRequestKey`s under one user-facing prompt — when
+/// the user resolves, all stored senders receive the same
+/// response (issue #326 P4 / R2 Critical 1).
 pub(crate) struct PendingApproval {
     pub id: ApprovalId,
     pub tool: String,
     pub header: String,
     pub detail: Option<String>,
     pub reason: String,
-    pub response_tx: Option<oneshot::Sender<ApprovalResponse>>,
+    /// All response channels waiting on this prompt. Empty
+    /// after the prompt resolves (each sender takes itself out
+    /// when broadcasting).
+    pub response_txs: Vec<oneshot::Sender<ApprovalResponse>>,
     /// Live button row owned per entry so arrow-key focus sticks
     /// through navigation even when focus cycles between entries.
     pub buttons: ButtonRow,
@@ -78,6 +84,18 @@ pub(crate) struct PendingApproval {
     /// arg from the model.
     pub base_digest:
         Option<astra_turn_core::approval_base_digest::BaseDigest>,
+    /// Issue #326 P4 / R2 Critical 1: the strict request
+    /// identity used for queue dedup. Two pending entries with
+    /// equal request_keys are merged into one prompt (their
+    /// senders unioned into `response_txs`); the user's choice
+    /// broadcasts to all waiting senders. None for legacy
+    /// callers that don't compute the key.
+    pub request_key: Option<astra_turn_core::approval_request_key::ApprovalRequestKey>,
+    /// Issue #326 P4 / R2 Major 1: the wide UI-grouping key.
+    /// Entries that share `batch_group_key` render as one
+    /// batch card with per-item rows. None means "render as a
+    /// solo card".
+    pub batch_group_key: Option<astra_turn_core::approval_batch_group::ApprovalBatchGroupKey>,
 }
 
 /// Metadata attached to a [`PendingApproval`] beyond the basic
@@ -95,6 +113,10 @@ pub(crate) struct ApprovalMetadata {
     /// see [`PendingApproval::base_digest`].
     pub base_digest:
         Option<astra_turn_core::approval_base_digest::BaseDigest>,
+    /// Issue #326 P4: strict request identity for queue dedup.
+    pub request_key: Option<astra_turn_core::approval_request_key::ApprovalRequestKey>,
+    /// Issue #326 P4: UI grouping key.
+    pub batch_group_key: Option<astra_turn_core::approval_batch_group::ApprovalBatchGroupKey>,
 }
 
 impl ApprovalMetadata {
@@ -147,6 +169,33 @@ impl ApprovalMetadata {
         self.base_digest = Some(digest);
         self
     }
+
+    /// Issue #326 P4 / R2 Critical 1: attach the strict
+    /// request-identity key. When the queue receives an
+    /// equal key it merges the new sender into the existing
+    /// entry's `response_txs` — no second prompt fires.
+    #[must_use]
+    pub fn with_request_key(
+        mut self,
+        key: astra_turn_core::approval_request_key::ApprovalRequestKey,
+    ) -> Self {
+        self.request_key = Some(key);
+        self
+    }
+
+    /// Issue #326 P4 / R2 Major 1: attach the wide UI
+    /// grouping key. Same-group entries can be batch-resolved
+    /// together; cross-group "Accept all" is rejected by
+    /// `ApprovalBatchGroupKey::allows_accept_all` for
+    /// destructive groups.
+    #[must_use]
+    pub fn with_batch_group_key(
+        mut self,
+        key: astra_turn_core::approval_batch_group::ApprovalBatchGroupKey,
+    ) -> Self {
+        self.batch_group_key = Some(key);
+        self
+    }
 }
 
 impl std::fmt::Debug for PendingApproval {
@@ -157,7 +206,7 @@ impl std::fmt::Debug for PendingApproval {
             .field("header", &self.header)
             .field("detail", &self.detail)
             .field("reason", &self.reason)
-            .field("has_response_tx", &self.response_tx.is_some())
+            .field("response_txs_len", &self.response_txs.len())
             .field("source_agent", &self.source_agent)
             .field("host", &self.host)
             .field("risk_tag_count", &self.risk_tags.len())
@@ -253,10 +302,13 @@ impl ApprovalQueue {
         )
     }
 
-    /// Issue #326 P3 / R1 Major 11: same as [`push`] but lets callers
-    /// attach extended metadata: source agent, MCP capability,
-    /// remote host, risk tags, and a "Will save" preview. See
-    /// [`ApprovalMetadata`] for the shape.
+    /// Issue #326 P3 / R1 Major 11 / P4 R2 Critical 1: same as
+    /// [`push`] but lets callers attach extended metadata. When
+    /// `metadata.request_key` is `Some` and equals the
+    /// request_key of an entry already in the queue, this entry
+    /// is **deduplicated**: the new sender is appended to the
+    /// existing entry's `response_txs` and no new prompt is
+    /// rendered. Returns the surviving entry's id.
     pub fn push_with_metadata(
         &mut self,
         tool: String,
@@ -266,6 +318,18 @@ impl ApprovalQueue {
         response_tx: oneshot::Sender<ApprovalResponse>,
         metadata: ApprovalMetadata,
     ) -> ApprovalId {
+        // Issue #326 P4 / R2 Critical 1: dedup on byte-equal
+        // ApprovalRequestKey. Senders waiting on the same
+        // request all get the same answer.
+        if let Some(ref rkey) = metadata.request_key {
+            for entry in self.entries.iter_mut() {
+                if entry.request_key.as_ref() == Some(rkey) {
+                    entry.response_txs.push(response_tx);
+                    return entry.id;
+                }
+            }
+        }
+
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
         // Promote to 6-button row when the queue already has entries:
@@ -282,7 +346,7 @@ impl ApprovalQueue {
             header,
             detail,
             reason,
-            response_tx: Some(response_tx),
+            response_txs: vec![response_tx],
             buttons,
             source_agent: metadata.source_agent,
             mcp_capability: metadata.mcp_capability,
@@ -290,6 +354,8 @@ impl ApprovalQueue {
             risk_tags: metadata.risk_tags,
             will_save_preview: metadata.will_save_preview,
             base_digest: metadata.base_digest,
+            request_key: metadata.request_key,
+            batch_group_key: metadata.batch_group_key,
         });
         // Promote pre-existing entries too — they now share the queue
         // and should expose the batch buttons on their next focus.
@@ -368,10 +434,18 @@ impl ApprovalQueue {
         let Some(entry) = self.entries.get_mut(idx) else {
             return false;
         };
-        match entry.response_tx.take() {
-            Some(tx) => tx.send(response).is_ok(),
-            None => false,
+        // Issue #326 P4 / R2 Critical 1: broadcast the
+        // response to every waiting sender. Drop dead
+        // senders silently — recv-side may have cancelled
+        // the future.
+        let txs = std::mem::take(&mut entry.response_txs);
+        let mut any_ok = false;
+        for tx in txs {
+            if tx.send(response).is_ok() {
+                any_ok = true;
+            }
         }
+        any_ok
     }
 
     fn clamp_focus(&mut self) {
@@ -630,5 +704,142 @@ mod tests {
 
         let result = q.focused_stale_check(&path).unwrap().unwrap();
         assert!(result.is_fresh());
+    }
+
+    // ── Issue #326 P4 / R2 Critical 1: dedup ─────────────────
+
+    fn fixed_request_key(args_seed: &str) -> astra_turn_core::approval_request_key::ApprovalRequestKey {
+        let args = serde_json::json!({"seed": args_seed});
+        astra_turn_core::approval_request_key::ApprovalRequestKey::new(
+            "bash",
+            std::env::temp_dir(),
+            &args,
+            None,
+            uuid::Uuid::nil(),
+        )
+    }
+
+    #[test]
+    fn dedup_merges_equal_request_keys_into_one_entry() {
+        let mut q = ApprovalQueue::new();
+        let key = fixed_request_key("npm-test");
+
+        let (tx_a, _rx_a) = oneshot::channel();
+        let id_a = q.push_with_metadata(
+            "bash".into(),
+            "npm test".into(),
+            None,
+            "execute".into(),
+            tx_a,
+            ApprovalMetadata::default().with_request_key(key.clone()),
+        );
+        assert_eq!(q.len(), 1);
+
+        // Second push with the SAME request_key must NOT
+        // create a new entry — the sender is appended to the
+        // existing one's response_txs.
+        let (tx_b, _rx_b) = oneshot::channel();
+        let id_b = q.push_with_metadata(
+            "bash".into(),
+            "npm test".into(),
+            None,
+            "execute".into(),
+            tx_b,
+            ApprovalMetadata::default().with_request_key(key.clone()),
+        );
+        assert_eq!(q.len(), 1, "dedup must keep queue length at 1");
+        assert_eq!(id_a, id_b, "dedup returns the existing entry's id");
+    }
+
+    #[test]
+    fn dedup_does_not_merge_different_request_keys() {
+        let mut q = ApprovalQueue::new();
+
+        let (tx_a, _rx_a) = oneshot::channel();
+        q.push_with_metadata(
+            "bash".into(),
+            "npm test".into(),
+            None,
+            "execute".into(),
+            tx_a,
+            ApprovalMetadata::default().with_request_key(fixed_request_key("a")),
+        );
+        let (tx_b, _rx_b) = oneshot::channel();
+        q.push_with_metadata(
+            "bash".into(),
+            "npm test".into(),
+            None,
+            "execute".into(),
+            tx_b,
+            ApprovalMetadata::default().with_request_key(fixed_request_key("b")),
+        );
+        assert_eq!(q.len(), 2, "different keys must NOT collapse");
+    }
+
+    #[test]
+    fn dedup_broadcasts_response_to_all_senders() {
+        // Critical contract: when the user resolves the merged
+        // entry, every dedup'd sender receives the same answer.
+        let mut q = ApprovalQueue::new();
+        let key = fixed_request_key("npm-test");
+
+        let (tx_a, mut rx_a) = oneshot::channel();
+        let (tx_b, mut rx_b) = oneshot::channel();
+        let (tx_c, mut rx_c) = oneshot::channel();
+        q.push_with_metadata(
+            "bash".into(),
+            "npm test".into(),
+            None,
+            "execute".into(),
+            tx_a,
+            ApprovalMetadata::default().with_request_key(key.clone()),
+        );
+        q.push_with_metadata(
+            "bash".into(),
+            "npm test".into(),
+            None,
+            "execute".into(),
+            tx_b,
+            ApprovalMetadata::default().with_request_key(key.clone()),
+        );
+        q.push_with_metadata(
+            "bash".into(),
+            "npm test".into(),
+            None,
+            "execute".into(),
+            tx_c,
+            ApprovalMetadata::default().with_request_key(key),
+        );
+        assert_eq!(q.len(), 1);
+
+        assert!(q.respond_focused(ApprovalResponse::AllowOnce));
+        assert_eq!(rx_a.try_recv().unwrap(), ApprovalResponse::AllowOnce);
+        assert_eq!(rx_b.try_recv().unwrap(), ApprovalResponse::AllowOnce);
+        assert_eq!(rx_c.try_recv().unwrap(), ApprovalResponse::AllowOnce);
+    }
+
+    #[test]
+    fn batch_group_key_is_carried_to_pending() {
+        use astra_turn_core::approval_batch_group::ApprovalBatchGroupKey;
+        let mut q = ApprovalQueue::new();
+        let group = ApprovalBatchGroupKey::new(
+            "Read",
+            "ReadOnly",
+            ["BashExecute".to_string()],
+            uuid::Uuid::nil(),
+        );
+
+        let (tx, _rx) = oneshot::channel();
+        q.push_with_metadata(
+            "read_file".into(),
+            "h".into(),
+            None,
+            "r".into(),
+            tx,
+            ApprovalMetadata::default().with_batch_group_key(group.clone()),
+        );
+
+        let entry = q.entries.front().unwrap();
+        assert_eq!(entry.batch_group_key.as_ref(), Some(&group));
     }
 }

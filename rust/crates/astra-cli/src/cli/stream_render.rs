@@ -1955,6 +1955,41 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     let mut metadata =
                         crate::tui::approval::queue::ApprovalMetadata::default();
 
+                    // Issue #326 P4 / R2 Critical 1: compute the
+                    // ApprovalRequestKey from the live request so
+                    // the queue can dedup any subsequent in-flight
+                    // request that resolves to byte-identical
+                    // (tool, cwd, args). The user only sees one
+                    // prompt; their answer broadcasts to all
+                    // waiting senders.
+                    let request_key =
+                        astra_turn_core::approval_request_key::ApprovalRequestKey::new(
+                            t.clone(),
+                            std::env::current_dir().unwrap_or_default(),
+                            args,
+                            None,
+                            uuid::Uuid::nil(),
+                        );
+                    metadata.request_key = Some(request_key);
+
+                    // Issue #326 P4 / R2 Major 1: also compute
+                    // the wider batch-group key. Same group →
+                    // future "Accept all" UI groups them under
+                    // one card. We default the side_effect to a
+                    // string projection of cloud_gated_tool_kind.
+                    let side_effect_label = match astra_turn_core::cloud_approval_policy::cloud_gated_tool_kind_with_args(&t, Some(args)) {
+                        Some(astra_turn_core::cloud_approval_policy::CloudGatedToolKind::Execute) => "Execute",
+                        Some(astra_turn_core::cloud_approval_policy::CloudGatedToolKind::Write) => "Write",
+                        _ => "Other",
+                    };
+                    let group_key = astra_turn_core::approval_batch_group::ApprovalBatchGroupKey::new(
+                        t.clone(),
+                        side_effect_label,
+                        Vec::<String>::new(), // risk tags filled below
+                        uuid::Uuid::nil(),
+                    );
+                    metadata.batch_group_key = Some(group_key);
+
                     // Issue #326 P3 / scenario #12: detect
                     // compound shell commands so the renderer
                     // can split them into per-step lines AND we
