@@ -508,6 +508,9 @@ impl BottomPane {
         if let Some(input) = view.custom_match_input {
             cell = cell.with_custom_match_input(input);
         }
+        if let Some(source) = view.custom_match_source {
+            cell = cell.with_custom_match_source(source);
+        }
         cell = cell.with_scope_context(
             view.workspace_untrusted,
             view.is_compound_command,

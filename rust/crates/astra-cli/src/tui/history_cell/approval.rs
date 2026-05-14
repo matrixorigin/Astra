@@ -98,6 +98,7 @@ pub(crate) struct ApprovalCell {
     pub save_outcome: Option<String>,
     pub selection_hint: Option<String>,
     pub custom_match_input: Option<String>,
+    pub custom_match_source: Option<String>,
     pub workspace_untrusted: bool,
     pub is_compound_command: bool,
     pub has_dynamic_eval: bool,
@@ -127,6 +128,7 @@ impl ApprovalCell {
             save_outcome: None,
             selection_hint: None,
             custom_match_input: None,
+            custom_match_source: None,
             workspace_untrusted: false,
             is_compound_command: false,
             has_dynamic_eval: false,
@@ -159,6 +161,7 @@ impl ApprovalCell {
             save_outcome: None,
             selection_hint: None,
             custom_match_input: None,
+            custom_match_source: None,
             workspace_untrusted: false,
             is_compound_command: false,
             has_dynamic_eval: false,
@@ -211,6 +214,12 @@ impl ApprovalCell {
     #[must_use]
     pub fn with_custom_match_input(mut self, input: impl Into<String>) -> Self {
         self.custom_match_input = Some(input.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_custom_match_source(mut self, source: impl Into<String>) -> Self {
+        self.custom_match_source = Some(source.into());
         self
     }
 
@@ -511,12 +520,24 @@ impl HistoryCell for ApprovalCell {
         }
 
         if let Some(input) = &self.custom_match_input {
-            lines.push(Line::from(vec![
+            let ghost_suffix = self
+                .custom_match_source
+                .as_deref()
+                .and_then(|source| source.strip_prefix(input.as_str()))
+                .filter(|suffix| !suffix.is_empty());
+            let mut spans = vec![
                 bar.clone(),
                 Span::styled("Prefix: ".to_string(), muted),
                 Span::styled(input.clone(), body_style.add_modifier(Modifier::BOLD)),
                 Span::styled("▌".to_string(), accent_style.add_modifier(Modifier::BOLD)),
-            ]));
+            ];
+            if let Some(suffix) = ghost_suffix {
+                spans.push(Span::styled(
+                    suffix.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
 
         // Issue #326 P3 / scenarios #6/#9/#15: when the request
@@ -658,6 +679,32 @@ mod tests {
             !rendered.contains("↑↓←→ select"),
             "unfocused cell should not advertise actions"
         );
+    }
+
+    #[test]
+    fn custom_prefix_input_renders_source_suffix_as_placeholder() {
+        let cell = ApprovalCell::new(
+            1,
+            "bash".into(),
+            "git status --short".into(),
+            None,
+            "execute".into(),
+            true,
+        )
+        .with_custom_match_input("git ")
+        .with_custom_match_source("git status --short");
+        let lines = cell.display_lines(80);
+        let prefix_line = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content == "Prefix: "))
+            .expect("prefix input line should render");
+        let rendered = prefix_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(rendered, "│ Prefix: git ▌status --short");
+        assert_eq!(prefix_line.spans[4].style.fg, Some(Color::DarkGray));
     }
 
     #[test]

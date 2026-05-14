@@ -276,6 +276,7 @@ pub(crate) struct ApprovalView {
     pub will_save_preview: Option<String>,
     pub selection_hint: Option<String>,
     pub custom_match_input: Option<String>,
+    pub custom_match_source: Option<String>,
     pub workspace_untrusted: bool,
     pub is_compound_command: bool,
     pub has_dynamic_eval: bool,
@@ -296,6 +297,12 @@ impl From<&PendingApproval> for ApprovalView {
             selection_hint: p.selection_hint(),
             custom_match_input: match &p.selection {
                 ApprovalSelection::CustomPrefix { input, .. } => Some(input.clone()),
+                _ => None,
+            },
+            custom_match_source: match &p.selection {
+                ApprovalSelection::CustomPrefix { .. } if !p.custom_match_source.is_empty() => {
+                    Some(p.custom_match_source.clone())
+                }
                 _ => None,
             },
             workspace_untrusted: p.workspace_untrusted,
@@ -335,6 +342,11 @@ impl PendingApproval {
                     ),
                 })
             }
+            ApprovalSelection::CustomPrefix { scope, input } if input.is_empty() => Some(format!(
+                "Type a prefix of `{}` {}.",
+                self.custom_match_source,
+                scope_duration(*scope)
+            )),
             ApprovalSelection::CustomPrefix { scope, input } => Some(format!(
                 "Approve requests matching `{}` {}. Only real prefixes are accepted.",
                 input,
@@ -1390,6 +1402,19 @@ mod tests {
             astra_turn_core::permission_scope::AllowScope::RestOfSession
         ));
         assert!(q.enter_custom_prefix_for_focused());
+        let empty_view = q.focused_view().unwrap();
+        assert_eq!(empty_view.custom_match_input.as_deref(), Some(""));
+        assert_eq!(
+            empty_view.custom_match_source.as_deref(),
+            Some("git status --short")
+        );
+        assert!(
+            empty_view
+                .selection_hint
+                .as_deref()
+                .unwrap()
+                .contains("Type a prefix of `git status --short`")
+        );
 
         for ch in "git st".chars() {
             assert!(q.push_custom_prefix_char(ch), "{ch:?} should extend prefix");
