@@ -263,6 +263,12 @@ fn render_permissions_args(args: &PermissionsArgs) -> String {
         Some(PermissionsSubcommand::Deny) => "deny".to_string(),
         Some(PermissionsSubcommand::All) => "all".to_string(),
         Some(PermissionsSubcommand::Rules) => "rules".to_string(),
+        Some(PermissionsSubcommand::Trust) => "trust".to_string(),
+        Some(PermissionsSubcommand::Untrust) => "untrust".to_string(),
+        Some(PermissionsSubcommand::Trace(cmd)) => match &cmd.export {
+            Some(path) => format!("trace --export {}", path.display()),
+            None => "trace".to_string(),
+        },
     }
 }
 
@@ -459,6 +465,45 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
             let summary = state.perm_manager.rules_summary();
             eprint!("{summary}");
         }
+        "trust" => match state.perm_manager.trust_workspace() {
+            Ok(message) => eprintln!("  {} {message}", theme::icon_info()),
+            Err(err) => eprintln!("  {} Failed to trust workspace: {err}", theme::icon_warn()),
+        },
+        "untrust" => match state.perm_manager.untrust_workspace() {
+            Ok(message) => eprintln!("  {} {message}", theme::icon_info()),
+            Err(err) => eprintln!(
+                "  {} Failed to mark workspace untrusted: {err}",
+                theme::icon_warn()
+            ),
+        },
+        "trace" => {
+            for line in astra_turn_core::permission_audit::format_snapshot_lines(50) {
+                eprintln!("{line}");
+            }
+        }
+        arg if arg.starts_with("trace --export ") => {
+            let path = arg.trim_start_matches("trace --export ").trim();
+            if path.is_empty() {
+                eprintln!("  {} Missing export path", theme::icon_warn());
+                return;
+            }
+            let lines = astra_turn_core::permission_audit::snapshot_redacted_jsonl_lines();
+            let body = if lines.is_empty() {
+                String::new()
+            } else {
+                format!("{}\n", lines.join("\n"))
+            };
+            match std::fs::write(path, body) {
+                Ok(()) => eprintln!(
+                    "  {} Permission trace exported to {path}",
+                    theme::icon_info()
+                ),
+                Err(err) => eprintln!(
+                    "  {} Failed to export permission trace to {path}: {err}",
+                    theme::icon_warn()
+                ),
+            }
+        }
         _ => match arg.parse::<PermissionMode>() {
             Ok(mode) => {
                 state.perm_manager.set_mode(mode);
@@ -470,7 +515,7 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
             }
             Err(_) => {
                 eprintln!(
-                    "  {} Unknown mode '{}'. Use: auto, prompt, deny, all, rules",
+                    "  {} Unknown mode '{}'. Use: auto, prompt, deny, all, rules, trust, untrust, trace",
                     theme::icon_warn(),
                     arg
                 );
@@ -532,9 +577,15 @@ pub(super) async fn execute_cli_command(
                 .as_deref()
                 .and_then(load_session_messages_for_continuation);
             let _pipeline = create_pipeline_modules(api, profile.as_deref());
-            let mut pm = PermissionManager::with_project(
-                auto_approve,
+            let mode = if auto_approve {
+                PermissionMode::Auto
+            } else {
+                PermissionMode::Prompt
+            };
+            let mut pm = PermissionManager::with_load_policy(
+                mode,
                 &std::env::current_dir().unwrap_or_default(),
+                &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
             );
             let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
             let skill_search = astra_core::SkillSearchSettings::default();
@@ -997,11 +1048,21 @@ pub(super) async fn execute_cli_command(
                         eprintln!("{}", format!("  ⚠  {e}, defaulting to prompt").yellow());
                         PermissionMode::Prompt
                     });
-                    PermissionManager::with_project_mode(mode, &project_root)
-                } else {
-                    PermissionManager::with_project(
-                        args.auto_approve || auto_approve,
+                    PermissionManager::with_load_policy(
+                        mode,
                         &project_root,
+                        &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+                    )
+                } else {
+                    let mode = if args.auto_approve || auto_approve {
+                        PermissionMode::Auto
+                    } else {
+                        PermissionMode::Prompt
+                    };
+                    PermissionManager::with_load_policy(
+                        mode,
+                        &project_root,
+                        &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
                     )
                 }
             };
@@ -3639,6 +3700,39 @@ mod arg_render_tests {
     fn bare_permissions_command_renders_empty_arg_for_mode_cycle() {
         let args = PermissionsArgs { command: None };
         assert_eq!(render_permissions_args(&args), "");
+    }
+
+    #[test]
+    fn permissions_trace_renders_trace_arg() {
+        let args = PermissionsArgs {
+            command: Some(PermissionsSubcommand::Trace(PermissionsTraceArgs {
+                export: None,
+            })),
+        };
+        assert_eq!(render_permissions_args(&args), "trace");
+    }
+
+    #[test]
+    fn permissions_trust_commands_render_args() {
+        let trust = PermissionsArgs {
+            command: Some(PermissionsSubcommand::Trust),
+        };
+        assert_eq!(render_permissions_args(&trust), "trust");
+
+        let untrust = PermissionsArgs {
+            command: Some(PermissionsSubcommand::Untrust),
+        };
+        assert_eq!(render_permissions_args(&untrust), "untrust");
+    }
+
+    #[test]
+    fn permissions_trace_export_renders_path_arg() {
+        let args = PermissionsArgs {
+            command: Some(PermissionsSubcommand::Trace(PermissionsTraceArgs {
+                export: Some(std::path::PathBuf::from("trace.jsonl")),
+            })),
+        };
+        assert_eq!(render_permissions_args(&args), "trace --export trace.jsonl");
     }
 }
 

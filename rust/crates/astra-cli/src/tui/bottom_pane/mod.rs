@@ -403,7 +403,7 @@ impl BottomPane {
                 Some(ApprovalActivation::Single { id, response: resp })
             }
             ButtonAction::RespondAll(resp) => {
-                let n = self.approval_queue.respond_all(resp);
+                let n = self.approval_queue.respond_focused_group(resp);
                 self.footer.pending_approvals = self.approval_queue.len();
                 Some(ApprovalActivation::Batch {
                     count: n,
@@ -484,6 +484,11 @@ impl BottomPane {
         if let Some(preview) = view.will_save_preview {
             cell = cell.with_will_save_preview(preview);
         }
+        cell = cell.with_scope_context(
+            view.workspace_untrusted,
+            view.is_compound_command,
+            view.has_dynamic_eval,
+        );
         Some(cell)
     }
 

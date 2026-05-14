@@ -672,7 +672,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── System ────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/allow",
-        "Permission mode: /allow [auto|prompt|deny|all|rules]",
+        "Permission mode: /allow [auto|prompt|deny|all|rules|trust|untrust|trace]",
         CommandGroup::System,
     )
     .with_subcommands(ALLOW_SUBCOMMANDS)

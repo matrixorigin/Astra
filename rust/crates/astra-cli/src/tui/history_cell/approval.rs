@@ -34,8 +34,18 @@ use crate::tui::turn_event::TurnEvent;
 /// from the risk tag list. Order is fixed (worst-first) so the
 /// badge is stable across renders.
 fn highest_risk_color(labels: &[String]) -> Color {
-    let critical = ["WritesSensitiveFile", "GitDestructive", "WritesOutsideWorkspace", "CredentialAccess"];
-    let high = ["NetworkExfiltration", "SqlDestructive", "MCPUnknownCapability", "WorkspaceUntrusted"];
+    let critical = [
+        "WritesSensitiveFile",
+        "GitDestructive",
+        "WritesOutsideWorkspace",
+        "CredentialAccess",
+    ];
+    let high = [
+        "NetworkExfiltration",
+        "SqlDestructive",
+        "MCPUnknownCapability",
+        "WorkspaceUntrusted",
+    ];
     let medium = ["WritesOutsidePackage", "SandboxExpansion"];
     if labels.iter().any(|l| critical.contains(&l.as_str())) {
         return Color::Red;
@@ -86,6 +96,9 @@ pub(crate) struct ApprovalCell {
     ///                  "Saved to .kiro/permissions.json" or
     ///                  "Failed to save rule: <reason>"
     pub save_outcome: Option<String>,
+    pub workspace_untrusted: bool,
+    pub is_compound_command: bool,
+    pub has_dynamic_eval: bool,
 }
 
 impl ApprovalCell {
@@ -110,6 +123,9 @@ impl ApprovalCell {
             source_agent: None,
             host: None,
             save_outcome: None,
+            workspace_untrusted: false,
+            is_compound_command: false,
+            has_dynamic_eval: false,
         }
     }
 
@@ -137,6 +153,9 @@ impl ApprovalCell {
             source_agent: None,
             host: None,
             save_outcome: None,
+            workspace_untrusted: false,
+            is_compound_command: false,
+            has_dynamic_eval: false,
         }
     }
 
@@ -174,6 +193,19 @@ impl ApprovalCell {
     #[must_use]
     pub fn with_save_outcome(mut self, outcome: impl Into<String>) -> Self {
         self.save_outcome = Some(outcome.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_scope_context(
+        mut self,
+        workspace_untrusted: bool,
+        is_compound_command: bool,
+        has_dynamic_eval: bool,
+    ) -> Self {
+        self.workspace_untrusted = workspace_untrusted;
+        self.is_compound_command = is_compound_command;
+        self.has_dynamic_eval = has_dynamic_eval;
         self
     }
 
@@ -218,6 +250,72 @@ impl ApprovalCell {
         None
     }
 
+    fn risk_tags_for_scope(&self) -> Vec<astra_turn_core::permission_engine::RiskTag> {
+        self.risk_tag_labels
+            .iter()
+            .filter_map(|label| match label.as_str() {
+                "BashExecute" => Some(astra_turn_core::permission_engine::RiskTag::BashExecute),
+                "WritesOutsidePackage" => {
+                    Some(astra_turn_core::permission_engine::RiskTag::WritesOutsidePackage)
+                }
+                "WritesOutsideWorkspace" => {
+                    Some(astra_turn_core::permission_engine::RiskTag::WritesOutsideWorkspace)
+                }
+                "WritesSensitiveFile" => {
+                    Some(astra_turn_core::permission_engine::RiskTag::WritesSensitiveFile)
+                }
+                "NetworkExfiltration" => {
+                    Some(astra_turn_core::permission_engine::RiskTag::NetworkExfiltration)
+                }
+                "CredentialAccess" => {
+                    Some(astra_turn_core::permission_engine::RiskTag::CredentialAccess)
+                }
+                "GitDestructive" => {
+                    Some(astra_turn_core::permission_engine::RiskTag::GitDestructive)
+                }
+                "SqlDestructive" => {
+                    Some(astra_turn_core::permission_engine::RiskTag::SqlDestructive)
+                }
+                "MCPUnknownCapability" => {
+                    Some(astra_turn_core::permission_engine::RiskTag::MCPUnknownCapability)
+                }
+                "WorkspaceUntrusted" => {
+                    Some(astra_turn_core::permission_engine::RiskTag::WorkspaceUntrusted)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn scope_context(&self) -> astra_turn_core::permission_scope::ScopeAvailabilityContext {
+        astra_turn_core::permission_scope::ScopeAvailabilityContext {
+            risk_tags: self.risk_tags_for_scope(),
+            source_agent_present: self.source_agent.is_some(),
+            mcp_unknown_capability: self
+                .risk_tag_labels
+                .iter()
+                .any(|label| label == "MCPUnknownCapability"),
+            workspace_untrusted: self.workspace_untrusted,
+            is_compound_command: self.is_compound_command,
+            has_dynamic_eval: self.has_dynamic_eval,
+        }
+    }
+
+    fn scope_available(&self, scope: astra_turn_core::permission_scope::AllowScope) -> bool {
+        astra_turn_core::permission_scope::permitted_scopes(&self.scope_context())
+            .into_iter()
+            .any(|entry| entry.scope == scope && entry.available)
+    }
+
+    fn button_disabled(&self, btn: &crate::tui::approval::Button) -> bool {
+        match btn.action {
+            crate::tui::approval::ButtonAction::Respond(
+                crate::chat_stream::ApprovalResponse::AlwaysAllowScoped(scope),
+            ) => !self.scope_available(scope),
+            _ => false,
+        }
+    }
+
     fn button_line(&self) -> Line<'static> {
         // Button row lives INSIDE the card, so the caller pads the
         // leading bar. We only emit spans for the buttons + their
@@ -236,7 +334,9 @@ impl ApprovalCell {
                 spans.push(Span::styled(" ".to_string(), dim));
             }
 
-            let is_focused = self.focused && i == self.buttons.focus();
+            let disabled = self.button_disabled(btn);
+            let is_focused = self.focused && i == self.buttons.focus() && !disabled;
+            let last = i + 1 == self.buttons.buttons().len();
             if is_focused {
                 // Cursor-style reversed pill with bracket markers so
                 // the focused button reads as a target even when the
@@ -246,11 +346,28 @@ impl ApprovalCell {
                     .bg(theme.accent)
                     .fg(theme.selected_fg)
                     .add_modifier(Modifier::BOLD);
-                spans.push(Span::styled(format!(" {} ", btn.label), sel_style));
+                let text = if last {
+                    format!(" {}", btn.label)
+                } else {
+                    format!(" {} ", btn.label)
+                };
+                spans.push(Span::styled(text, sel_style));
+            } else if disabled {
+                let text = if last {
+                    format!(" {}×", btn.label)
+                } else {
+                    format!(" {}× ", btn.label)
+                };
+                spans.push(Span::styled(text, Style::default().fg(Color::DarkGray)));
             } else {
                 // Subtle bracket outline so all buttons have the same
                 // shape as the focused one — just without the fill.
-                spans.push(Span::styled(format!(" {} ", btn.label), body));
+                let text = if last {
+                    format!(" {}", btn.label)
+                } else {
+                    format!(" {} ", btn.label)
+                };
+                spans.push(Span::styled(text, body));
             }
         }
         Line::from(spans)
@@ -283,17 +400,16 @@ impl HistoryCell for ApprovalCell {
                 self.header.clone(),
                 accent_style.add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" ".to_string(), accent_style),
         ];
         if let Some(agent) = &self.source_agent {
             top_spans.push(Span::styled(
-                format!("[agent: {agent}] "),
+                format!(" [agent: {agent}]"),
                 muted.add_modifier(Modifier::ITALIC),
             ));
         }
         if let Some(host) = &self.host {
             top_spans.push(Span::styled(
-                format!("[{host}] "),
+                format!(" [{host}]"),
                 muted.add_modifier(Modifier::ITALIC),
             ));
         }
@@ -303,13 +419,12 @@ impl HistoryCell for ApprovalCell {
         // card reads as one visual block, not a heap of bullet
         // points. Mirrors Cursor's inline tool cards.
         let bar = Span::styled("│ ".to_string(), accent_style);
+        let empty_bar = Span::styled("│".to_string(), accent_style);
 
         // Risk badge row (issue #326 P3 / R1 Major 7).
         if !self.risk_tag_labels.is_empty() {
             let risk_color = highest_risk_color(&self.risk_tag_labels);
-            let risk_style = Style::default()
-                .fg(risk_color)
-                .add_modifier(Modifier::BOLD);
+            let risk_style = Style::default().fg(risk_color).add_modifier(Modifier::BOLD);
             let badges = self
                 .risk_tag_labels
                 .iter()
@@ -350,10 +465,7 @@ impl HistoryCell for ApprovalCell {
             lines.push(Line::from(vec![
                 bar.clone(),
                 Span::styled("Will save: ".to_string(), muted),
-                Span::styled(
-                    preview.clone(),
-                    body_style.add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(preview.clone(), body_style.add_modifier(Modifier::BOLD)),
             ]));
         }
 
@@ -385,10 +497,7 @@ impl HistoryCell for ApprovalCell {
             let reason_text = self.always_disabled_reason().unwrap_or_default();
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::styled(
-                    "Always: ".to_string(),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled("Always: ".to_string(), Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "session-only ".to_string(),
                     Style::default()
@@ -403,7 +512,7 @@ impl HistoryCell for ApprovalCell {
         }
 
         // Breathing space inside the card.
-        lines.push(Line::from(bar.clone()));
+        lines.push(Line::from(empty_bar));
 
         // Button row (prefixed with bar so alignment is preserved).
         let mut button_row = vec![bar.clone()];
@@ -422,7 +531,6 @@ impl HistoryCell for ApprovalCell {
                         .to_string(),
                     muted,
                 ),
-                Span::styled(" ".to_string(), accent_style),
             ])
         } else {
             Line::from(vec![Span::styled("╰─".to_string(), accent_style)])
@@ -601,15 +709,8 @@ mod tests {
 
     #[test]
     fn renders_source_agent_chip_in_header() {
-        let cell = ApprovalCell::new(
-            1,
-            "bash".into(),
-            "npm test".into(),
-            None,
-            "".into(),
-            true,
-        )
-        .with_source_agent("review-subagent");
+        let cell = ApprovalCell::new(1, "bash".into(), "npm test".into(), None, "".into(), true)
+            .with_source_agent("review-subagent");
         let rendered = render(&cell);
         assert!(
             rendered.contains("[agent: review-subagent]"),
@@ -639,17 +740,13 @@ mod tests {
     fn omits_optional_lines_when_unset() {
         // Default cell has no risk tags / will-save / agent /
         // host, and should not render those lines.
-        let cell = ApprovalCell::new(
-            1,
-            "bash".into(),
-            "h".into(),
-            None,
-            "r".into(),
-            true,
-        );
+        let cell = ApprovalCell::new(1, "bash".into(), "h".into(), None, "r".into(), true);
         let rendered = render(&cell);
         assert!(!rendered.contains("⚑ "), "no risk badge expected");
-        assert!(!rendered.contains("Will save:"), "no will-save row expected");
+        assert!(
+            !rendered.contains("Will save:"),
+            "no will-save row expected"
+        );
         assert!(!rendered.contains("[agent:"), "no agent chip expected");
     }
 
@@ -659,16 +756,10 @@ mod tests {
         // refactor doesn't downgrade catastrophic tags into the
         // "vanilla" shade.
         assert_eq!(
-            highest_risk_color(&[
-                "BashExecute".into(),
-                "WritesSensitiveFile".into(),
-            ]),
+            highest_risk_color(&["BashExecute".into(), "WritesSensitiveFile".into(),]),
             Color::Red
         );
-        assert_eq!(
-            highest_risk_color(&["GitDestructive".into()]),
-            Color::Red
-        );
+        assert_eq!(highest_risk_color(&["GitDestructive".into()]), Color::Red);
         assert_eq!(
             highest_risk_color(&["NetworkExfiltration".into()]),
             Color::LightRed
@@ -808,10 +899,7 @@ mod tests {
         let cell = fixture_full()
             .with_source_agent("review-subagent")
             .with_host("ssh:bastion-prod");
-        insta::assert_snapshot!(
-            "approval_card_agent_and_host_80",
-            render_at(&cell, 80)
-        );
+        insta::assert_snapshot!("approval_card_agent_and_host_80", render_at(&cell, 80));
     }
 
     #[test]

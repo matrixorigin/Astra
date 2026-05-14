@@ -250,7 +250,10 @@ mod tests {
     fn brace_with_glob() {
         assert!(glob_match("src/{auth,admin}/*.rs", "src/auth/login.rs"));
         assert!(glob_match("src/{auth,admin}/*.rs", "src/admin/users.rs"));
-        assert!(!glob_match("src/{auth,admin}/*.rs", "src/billing/charge.rs"));
+        assert!(!glob_match(
+            "src/{auth,admin}/*.rs",
+            "src/billing/charge.rs"
+        ));
     }
 
     // ── Sensitive path patterns from scenario #8 ─────────────────

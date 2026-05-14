@@ -12,10 +12,8 @@ use crate::orchestration::permission_sync::{
     PermissionMode, PermissionRequest, PermissionResponse, PermissionSyncContext, PermissionUpdate,
 };
 use astra_messaging::router::AgentMailbox;
-use astra_turn_core::action_compensation::explicit_approval_reason;
-use astra_turn_core::tool_argument_hints::{
-    normalize_llm_function_arguments, permission_prompt_primary_detail,
-};
+use astra_turn_core::permission_engine::{HardDecision, evaluate_permission};
+use astra_turn_core::tool_argument_hints::normalize_llm_function_arguments;
 
 /// Result of a permission check.
 #[derive(Debug, Clone)]
@@ -64,68 +62,34 @@ pub async fn check_tool_permission(
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
         .map(|parsed| normalize_llm_function_arguments(&parsed))
         .unwrap_or_else(|| serde_json::json!({}));
-    let permission_hint = permission_prompt_primary_detail(tool_name, &normalized_args);
-    let rule_match_hint = permission_hint.as_deref();
-    let explicit_approval = explicit_approval_reason(tool_name, &normalized_args);
-
-    // Check local permission rules
-    {
+    let prompt = {
         let ctx_guard = ctx.read().await;
-        if ctx_guard.is_denied(tool_name, rule_match_hint) {
-            drop(ctx_guard);
-            let reason = format!("Tool '{}' denied by permission rules", tool_name);
-            ctx.write()
-                .await
-                .record_blocked_tool_with_reason(tool_name, Some(&reason));
-            return PermissionCheckResult::Denied { reason };
-        }
-
-        if explicit_approval.is_none() && ctx_guard.is_allowed(tool_name, rule_match_hint) {
-            return PermissionCheckResult::Allowed;
-        }
-
-        // Auto mode: approve locally without mailbox round-trip.
-        // This avoids the 30s permission-request timeout that would otherwise
-        // block child agents whose parent happens to be mid-LLM-call.
-        // Still respects the allowed_tools allowlist — tools not on the list
-        // are denied even in Auto mode.
-        if ctx_guard.mode() == PermissionMode::Auto {
-            if !ctx_guard.inherited.is_tool_allowed_by_allowlist(tool_name) {
+        let envelope = evaluate_permission(tool_name, &normalized_args, &ctx_guard);
+        astra_turn_core::permission_audit::record_evaluated_envelope(
+            tool_name,
+            &normalized_args,
+            &envelope,
+            "runtime",
+            None,
+        );
+        match envelope.decision {
+            HardDecision::Allow => return PermissionCheckResult::Allowed,
+            HardDecision::Deny { reason } => {
                 drop(ctx_guard);
-                let reason = format!("Tool '{}' not in allowed tools list", tool_name);
                 ctx.write()
                     .await
                     .record_blocked_tool_with_reason(tool_name, Some(&reason));
                 return PermissionCheckResult::Denied { reason };
             }
-            if explicit_approval.is_none() {
-                return PermissionCheckResult::Allowed;
-            }
+            HardDecision::NeedExternal { prompt } => prompt,
         }
-
-        // If mode is Deny, don't even try to request
-        if ctx_guard.mode() == PermissionMode::Deny {
-            drop(ctx_guard);
-            let reason = explicit_approval
-                .clone()
-                .unwrap_or_else(|| format!("Tool '{}' denied by permission mode", tool_name));
-            ctx.write()
-                .await
-                .record_blocked_tool_with_reason(tool_name, Some(&reason));
-            return PermissionCheckResult::Denied { reason };
-        }
-    }
+    };
 
     // Try to request permission from parent
     let Some(mailbox) = mailbox else {
-        let reason = explicit_approval.clone().map_or_else(
-            || {
-                format!(
-                    "Tool '{}' requires permission but no parent available",
-                    tool_name
-                )
-            },
-            |reason| format!("{reason} No parent is available to approve this tool call."),
+        let reason = format!(
+            "{} No parent is available to approve this tool call.",
+            prompt.reason
         );
         ctx.write()
             .await
@@ -134,12 +98,8 @@ pub async fn check_tool_permission(
     };
 
     // Build permission request
-    let mut request = PermissionRequest::new(tool_name, normalized_args).with_reason(
-        explicit_approval
-            .clone()
-            .unwrap_or_else(|| format!("Requesting permission to use tool: {tool_name}")),
-    );
-    if let Some(ref hint) = permission_hint {
+    let mut request = PermissionRequest::new(tool_name, normalized_args).with_reason(prompt.reason);
+    if let Some(ref hint) = prompt.detail {
         request = request.with_hint(hint.clone());
     }
 
@@ -228,6 +188,7 @@ mod tests {
             ask_rules: vec![],
             allowed_tools: None,
             is_background: false,
+            ..Default::default()
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
@@ -245,6 +206,7 @@ mod tests {
             ask_rules: vec![],
             allowed_tools: None,
             is_background: true,
+            ..Default::default()
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
@@ -262,6 +224,7 @@ mod tests {
             ask_rules: vec![],
             allowed_tools: Some(HashSet::from(["view".to_string()])), // edit not allowed
             is_background: false,
+            ..Default::default()
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
@@ -288,6 +251,7 @@ mod tests {
             ask_rules: vec![],
             allowed_tools: None, // no allowlist = all tools allowed
             is_background: false,
+            ..Default::default()
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
@@ -322,6 +286,7 @@ mod tests {
             ask_rules: vec![],
             allowed_tools: Some(HashSet::from(["view".to_string(), "grep".to_string()])),
             is_background: false,
+            ..Default::default()
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
@@ -347,7 +312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_actions_are_denied_without_parent_even_in_auto_mode() {
+    async fn explicit_actions_follow_auto_mode_without_parent() {
         let inherited = InheritedPermissions {
             mode: PermissionMode::Auto,
             allow_rules: vec![PermissionRule::parse("git_commit")],
@@ -355,6 +320,7 @@ mod tests {
             ask_rules: vec![],
             allowed_tools: None,
             is_background: false,
+            ..Default::default()
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
@@ -366,16 +332,11 @@ mod tests {
             Duration::from_secs(1),
         )
         .await;
-        match result {
-            PermissionCheckResult::Denied { reason } => {
-                assert!(reason.contains("Explicit approval required"));
-            }
-            other => panic!("expected denied explicit approval, got {other:?}"),
-        }
+        assert!(matches!(result, PermissionCheckResult::Allowed));
 
         let telemetry = ctx.read().await.telemetry();
         assert_eq!(telemetry.permission_requests, 0);
-        assert_eq!(telemetry.tools_blocked, 1);
+        assert_eq!(telemetry.tools_blocked, 0);
     }
 
     #[tokio::test]
@@ -407,12 +368,13 @@ mod tests {
             .await;
 
         let inherited = InheritedPermissions {
-            mode: PermissionMode::Auto,
+            mode: PermissionMode::Prompt,
             allow_rules: vec![PermissionRule::parse("git_commit")],
             deny_rules: vec![],
             ask_rules: vec![],
             allowed_tools: None,
             is_background: false,
+            ..Default::default()
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
@@ -493,6 +455,7 @@ mod tests {
             ask_rules: vec![],
             allowed_tools: Some(HashSet::from(["view".to_string()])),
             is_background: false,
+            ..Default::default()
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
@@ -522,7 +485,7 @@ mod tests {
 
         let result = check_tool_permission(
             "bash",
-            Some(r#"{"command":"echo hi"}"#),
+            Some(r#"{"command":"touch astra-permission-gate-test"}"#),
             Some(&ctx),
             Some(&mut child_mailbox),
             Duration::from_secs(1),
@@ -538,7 +501,10 @@ mod tests {
         }
 
         let ctx_guard = ctx.read().await;
-        assert!(ctx_guard.is_allowed("bash", Some(r#"{"command":"echo hi"}"#)));
+        assert!(ctx_guard.is_allowed(
+            "bash",
+            Some(r#"{"command":"touch astra-permission-gate-test"}"#)
+        ));
         let telemetry = ctx_guard.telemetry();
         assert_eq!(telemetry.permission_requests, 1);
         assert_eq!(telemetry.permission_requests_approved, 1);
@@ -580,6 +546,7 @@ mod tests {
             ask_rules: vec![],
             allowed_tools: None,
             is_background: false,
+            ..Default::default()
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 

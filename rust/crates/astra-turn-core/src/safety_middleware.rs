@@ -1960,9 +1960,8 @@ mod tests {
     fn sql_safety_blocks_destructive_after_upsert() {
         // …but a destructive verb after the upsert (separated
         // by `;` or buried in a CTE) must still be caught.
-        let result = check_sql_safety(
-            "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING; DROP TABLE secrets",
-        );
+        let result =
+            check_sql_safety("INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING; DROP TABLE secrets");
         assert_eq!(result, Some("DROP"));
     }
 
@@ -1971,9 +1970,8 @@ mod tests {
         // INSERT … SELECT … FROM (DELETE …) — the DELETE in the
         // sub-query must surface even though the outer statement
         // is "just" an INSERT.
-        let result = check_sql_safety(
-            "INSERT INTO log SELECT * FROM (DELETE FROM secrets RETURNING *) d",
-        );
+        let result =
+            check_sql_safety("INSERT INTO log SELECT * FROM (DELETE FROM secrets RETURNING *) d");
         assert_eq!(result, Some("DELETE"));
     }
 
@@ -1991,10 +1989,7 @@ mod tests {
     #[test]
     fn sql_safety_ignores_keyword_inside_quoted_identifier() {
         // Postgres-style "DELETE" used as a column name.
-        assert_eq!(
-            check_sql_safety(r#"SELECT "DELETE" FROM audit_log"#),
-            None
-        );
+        assert_eq!(check_sql_safety(r#"SELECT "DELETE" FROM audit_log"#), None);
     }
 
     #[test]

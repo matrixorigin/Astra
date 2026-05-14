@@ -309,8 +309,11 @@ pub(super) async fn handle_state_command(
             };
 
             eprintln!("  {}", "Summarizing…".dim());
-            let mut auto_pm =
-                PermissionManager::with_project(true, &std::env::current_dir().unwrap_or_default());
+            let mut auto_pm = PermissionManager::with_load_policy(
+                crate::permission_manager::PermissionMode::Auto,
+                &std::env::current_dir().unwrap_or_default(),
+                &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+            );
             let mut _cancel_token_guard: Option<
                 std::sync::Arc<tokio_util::sync::CancellationToken>,
             > = None;
@@ -431,9 +434,10 @@ pub(super) async fn handle_state_command(
                     // Extract structured facts from summary and store each individually
                     if saved_to_memoria && !compact_quick {
                         let extract_msg = format!("{}{summary}", prompts::MEMORY_EXTRACTOR_PROMPT);
-                        let mut auto_pm2 = PermissionManager::with_project(
-                            true,
+                        let mut auto_pm2 = PermissionManager::with_load_policy(
+                            crate::permission_manager::PermissionMode::Auto,
                             &std::env::current_dir().unwrap_or_default(),
+                            &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
                         );
                         let extract_result = stream_chat_sse(ChatTurnParams {
                             api,
@@ -529,9 +533,10 @@ pub(super) async fn handle_state_command(
                                  If no pattern exists, respond with exactly: NONE",
                                     fact_lines.join("\n")
                                 );
-                                let mut auto_pm3 = PermissionManager::with_project(
-                                    true,
+                                let mut auto_pm3 = PermissionManager::with_load_policy(
+                                    crate::permission_manager::PermissionMode::Auto,
                                     &std::env::current_dir().unwrap_or_default(),
+                                    &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
                                 );
                                 let synth_result = stream_chat_sse(ChatTurnParams {
                                     api,

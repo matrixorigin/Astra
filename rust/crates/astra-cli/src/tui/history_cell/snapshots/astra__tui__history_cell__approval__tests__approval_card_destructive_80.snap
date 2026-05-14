@@ -1,12 +1,13 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/approval.rs
+assertion_line: 909
 expression: "render_at(&cell, 80)"
 ---
-╭─ ⏸ edit /etc/hosts 
+╭─ ⏸ edit /etc/hosts
 │ ⚑ WritesOutsideWorkspace  ⚑ WritesSensitiveFile
 │ /etc/hosts
 │ ⚠ writes outside workspace
 │ Always: session-only (outside workspace)
-│ 
-│  Accept   Reject   Always   Skip 
+│
+│  Accept   Reject   Turn   Session   Project×   User×   Skip
 ╰─ ↑↓←→ select · Enter confirm · Esc reject · Ctrl+Enter quick accept

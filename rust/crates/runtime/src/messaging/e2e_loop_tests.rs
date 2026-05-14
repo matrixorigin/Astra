@@ -630,6 +630,7 @@ mod tests {
                 ask_rules: vec![],
                 allowed_tools: Some(HashSet::from(["view".to_string()])),
                 is_background: false,
+                ..Default::default()
             },
         )));
         let mut messages = Vec::new();
@@ -1223,6 +1224,7 @@ mod tests {
             ask_rules: vec![PermissionRule::parse("bash(*)")],
             allowed_tools: None,
             is_background: false,
+            ..Default::default()
         };
         let child_permission_ctx = Arc::new(tokio::sync::RwLock::new(PermissionSyncContext::new(
             child_inherited,
@@ -1355,6 +1357,7 @@ mod tests {
             ask_rules: vec![],
             allowed_tools: Some(HashSet::new()), // Empty = nothing allowed locally
             is_background: false,
+            ..Default::default()
         };
         let child_permission_ctx = Arc::new(tokio::sync::RwLock::new(PermissionSyncContext::new(
             child_inherited,

@@ -83,10 +83,7 @@ const SENSITIVE_PATH_PATTERNS: &[&str] = &[
 /// is the target path (when known) — used to detect
 /// sensitive-file paths for full-body redaction.
 #[must_use]
-pub fn redact_for_approval_display(
-    content: &str,
-    path: Option<&str>,
-) -> RedactedDetail {
+pub fn redact_for_approval_display(content: &str, path: Option<&str>) -> RedactedDetail {
     // Step 1: sensitive-path full-body collapse.
     if let Some(p) = path {
         if matches_sensitive_path(p) {

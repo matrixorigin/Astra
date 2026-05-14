@@ -105,13 +105,30 @@ pub enum ApprovalResponse {
     Deny,
     /// Always allow this tool pattern (persistent rule).
     AlwaysAllow,
+    /// Always allow with an explicit user-selected scope from the
+    /// TUI scope picker.
+    AlwaysAllowScoped(astra_turn_core::permission_scope::AllowScope),
     /// Skip this tool (deny without recording).
     Skip,
 }
 
 impl ApprovalResponse {
     pub fn is_approved(self) -> bool {
-        matches!(self, Self::AllowOnce | Self::AlwaysAllow)
+        matches!(
+            self,
+            Self::AllowOnce | Self::AlwaysAllow | Self::AlwaysAllowScoped(_)
+        )
+    }
+
+    pub fn always_scope(
+        self,
+        default_scope: astra_turn_core::permission_scope::AllowScope,
+    ) -> Option<astra_turn_core::permission_scope::AllowScope> {
+        match self {
+            Self::AlwaysAllow => Some(default_scope),
+            Self::AlwaysAllowScoped(scope) => Some(scope),
+            _ => None,
+        }
     }
 }
 

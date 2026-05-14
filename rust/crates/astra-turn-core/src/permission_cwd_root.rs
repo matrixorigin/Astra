@@ -107,9 +107,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("package.json"));
         assert_eq!(
-            nearest_package_root(dir.path(), Some(dir.path())).map(|p| {
-                std::fs::canonicalize(p).unwrap()
-            }),
+            nearest_package_root(dir.path(), Some(dir.path()))
+                .map(|p| { std::fs::canonicalize(p).unwrap() }),
             Some(std::fs::canonicalize(dir.path()).unwrap())
         );
     }

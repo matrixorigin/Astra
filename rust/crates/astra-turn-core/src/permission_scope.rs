@@ -199,7 +199,10 @@ mod tests {
     fn benign_request_allows_all_scopes() {
         let scopes = permitted_scopes(&ctx());
         for scope in scopes {
-            assert!(scope.available, "{scope:?} should be available for benign request");
+            assert!(
+                scope.available,
+                "{scope:?} should be available for benign request"
+            );
         }
     }
 

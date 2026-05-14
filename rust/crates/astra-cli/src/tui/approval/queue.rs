@@ -48,8 +48,7 @@ pub(crate) struct PendingApproval {
     /// openWorldHint). The TUI uses this to render a precise
     /// risk badge and to decide whether to disable persistent
     /// scopes for unknown-capability tools.
-    pub mcp_capability:
-        Option<astra_turn_core::permission_engine::ToolCapabilityMetadata>,
+    pub mcp_capability: Option<astra_turn_core::permission_engine::ToolCapabilityMetadata>,
     /// Issue #326 P3 / scenario #39: when the agent runs against a
     /// remote host (SSH session, dev container, sandbox VM), this
     /// records the host label so the UI can prefix paths with
@@ -71,6 +70,12 @@ pub(crate) struct PendingApproval {
     /// is not eligible for Always (e.g. compound shell command,
     /// MCP unknown capability).
     pub will_save_preview: Option<String>,
+    /// Workspace trust gate for Project scope. When true, Project
+    /// is rendered but cannot be activated; project allow rules are
+    /// not trusted for this session.
+    pub workspace_untrusted: bool,
+    pub is_compound_command: bool,
+    pub has_dynamic_eval: bool,
     /// Issue #326 P3 / P5f / R2 Major 3: host-computed digest of
     /// the file the tool will mutate, snapshotted at the moment
     /// the approval enters the queue. The executor compares this
@@ -82,8 +87,7 @@ pub(crate) struct PendingApproval {
     /// Crucially: this is set by the host, NOT by the LLM. R2
     /// Major 3 explicitly forbids trusting an `expected_base_sha`
     /// arg from the model.
-    pub base_digest:
-        Option<astra_turn_core::approval_base_digest::BaseDigest>,
+    pub base_digest: Option<astra_turn_core::approval_base_digest::BaseDigest>,
     /// Issue #326 P4 / R2 Critical 1: the strict request
     /// identity used for queue dedup. Two pending entries with
     /// equal request_keys are merged into one prompt (their
@@ -104,15 +108,16 @@ pub(crate) struct PendingApproval {
 #[derive(Default, Debug, Clone)]
 pub(crate) struct ApprovalMetadata {
     pub source_agent: Option<String>,
-    pub mcp_capability:
-        Option<astra_turn_core::permission_engine::ToolCapabilityMetadata>,
+    pub mcp_capability: Option<astra_turn_core::permission_engine::ToolCapabilityMetadata>,
     pub host: Option<String>,
     pub risk_tags: Vec<astra_turn_core::permission_engine::RiskTag>,
     pub will_save_preview: Option<String>,
+    pub workspace_untrusted: bool,
+    pub is_compound_command: bool,
+    pub has_dynamic_eval: bool,
     /// Host-computed snapshot of the file the tool will mutate;
     /// see [`PendingApproval::base_digest`].
-    pub base_digest:
-        Option<astra_turn_core::approval_base_digest::BaseDigest>,
+    pub base_digest: Option<astra_turn_core::approval_base_digest::BaseDigest>,
     /// Issue #326 P4: strict request identity for queue dedup.
     pub request_key: Option<astra_turn_core::approval_request_key::ApprovalRequestKey>,
     /// Issue #326 P4: UI grouping key.
@@ -145,6 +150,19 @@ impl ApprovalMetadata {
     #[must_use]
     pub fn with_will_save_preview(mut self, preview: impl Into<String>) -> Self {
         self.will_save_preview = Some(preview.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_workspace_untrusted(mut self, workspace_untrusted: bool) -> Self {
+        self.workspace_untrusted = workspace_untrusted;
+        self
+    }
+
+    #[must_use]
+    pub fn with_scope_shape(mut self, is_compound_command: bool, has_dynamic_eval: bool) -> Self {
+        self.is_compound_command = is_compound_command;
+        self.has_dynamic_eval = has_dynamic_eval;
         self
     }
 
@@ -211,7 +229,10 @@ impl std::fmt::Debug for PendingApproval {
             .field("host", &self.host)
             .field("risk_tag_count", &self.risk_tags.len())
             .field("will_save_preview", &self.will_save_preview)
-            .field("base_digest", &self.base_digest.as_ref().map(|d| d.short_display()))
+            .field(
+                "base_digest",
+                &self.base_digest.as_ref().map(|d| d.short_display()),
+            )
             .field(
                 "mcp_capability_known",
                 &self.mcp_capability.as_ref().map(|m| m.is_known()),
@@ -241,6 +262,9 @@ pub(crate) struct ApprovalView {
     /// "Will save: …" preview, mirrored from
     /// [`PendingApproval::will_save_preview`].
     pub will_save_preview: Option<String>,
+    pub workspace_untrusted: bool,
+    pub is_compound_command: bool,
+    pub has_dynamic_eval: bool,
 }
 
 impl From<&PendingApproval> for ApprovalView {
@@ -253,13 +277,38 @@ impl From<&PendingApproval> for ApprovalView {
             reason: p.reason.clone(),
             source_agent: p.source_agent.clone(),
             host: p.host.clone(),
-            risk_tag_labels: p
-                .risk_tags
-                .iter()
-                .map(|tag| format!("{tag:?}"))
-                .collect(),
+            risk_tag_labels: p.risk_tags.iter().map(|tag| format!("{tag:?}")).collect(),
             will_save_preview: p.will_save_preview.clone(),
+            workspace_untrusted: p.workspace_untrusted,
+            is_compound_command: p.is_compound_command,
+            has_dynamic_eval: p.has_dynamic_eval,
         }
+    }
+}
+
+impl PendingApproval {
+    fn scope_context(&self) -> astra_turn_core::permission_scope::ScopeAvailabilityContext {
+        astra_turn_core::permission_scope::ScopeAvailabilityContext {
+            risk_tags: self.risk_tags.clone(),
+            source_agent_present: self.source_agent.is_some(),
+            mcp_unknown_capability: self
+                .mcp_capability
+                .as_ref()
+                .is_some_and(|meta| !meta.is_known())
+                || self
+                    .risk_tags
+                    .contains(&astra_turn_core::permission_engine::RiskTag::MCPUnknownCapability),
+            workspace_untrusted: self.workspace_untrusted,
+            is_compound_command: self.is_compound_command,
+            has_dynamic_eval: self.has_dynamic_eval,
+            ..Default::default()
+        }
+    }
+
+    fn scope_available(&self, scope: astra_turn_core::permission_scope::AllowScope) -> bool {
+        astra_turn_core::permission_scope::permitted_scopes(&self.scope_context())
+            .into_iter()
+            .any(|entry| entry.scope == scope && entry.available)
     }
 }
 
@@ -332,7 +381,7 @@ impl ApprovalQueue {
 
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
-        // Promote to 6-button row when the queue already has entries:
+        // Promote to the batch-capable row when the queue already has entries:
         // the newcomer will coexist with others so batch actions are
         // useful. Otherwise the plain 4-button row suffices.
         let buttons = if self.entries.is_empty() {
@@ -353,6 +402,9 @@ impl ApprovalQueue {
             host: metadata.host,
             risk_tags: metadata.risk_tags,
             will_save_preview: metadata.will_save_preview,
+            workspace_untrusted: metadata.workspace_untrusted,
+            is_compound_command: metadata.is_compound_command,
+            has_dynamic_eval: metadata.has_dynamic_eval,
             base_digest: metadata.base_digest,
             request_key: metadata.request_key,
             batch_group_key: metadata.batch_group_key,
@@ -470,23 +522,75 @@ impl ApprovalQueue {
 
     /// Action of the currently focused button on the focused entry.
     pub fn focused_button_action(&self) -> Option<super::button_row::ButtonAction> {
-        self.entries
-            .get(self.focus)
-            .and_then(|e| e.buttons.activate())
+        let entry = self.entries.get(self.focus)?;
+        let action = entry.buttons.activate()?;
+        if let super::button_row::ButtonAction::Respond(response) = action
+            && let Some(scope) =
+                response.always_scope(astra_turn_core::permission_scope::AllowScope::OnceThisCall)
+            && !entry.scope_available(scope)
+        {
+            return None;
+        }
+        match action {
+            super::button_row::ButtonAction::RespondAll(response) if response.is_approved() => {
+                match entry.batch_group_key.as_ref() {
+                    Some(group) if group.allows_accept_all() => Some(action),
+                    Some(_) => None,
+                    // Legacy/ungrouped approvals are not batchable,
+                    // but the queue resolves only the focused entry
+                    // for safety. Keep the action available so the
+                    // row does not dead-end when older senders omit
+                    // metadata.
+                    None => Some(action),
+                }
+            }
+            _ => Some(action),
+        }
     }
 
-    /// Resolve every pending entry with the same response. Returns the
-    /// count actually resolved (senders may have been dropped).
-    pub fn respond_all(&mut self, response: ApprovalResponse) -> usize {
-        let mut n = 0usize;
-        while !self.entries.is_empty() {
-            // Always target index 0 so focus ordering doesn't matter.
-            if self.send_at(0, response) {
-                n += 1;
-            }
-            self.entries.pop_front();
+    /// Resolve every pending entry in the focused entry's batch group.
+    ///
+    /// `None` group keys are intentionally not batchable: pressing a
+    /// batch button on a legacy/ungrouped queue resolves only the
+    /// focused entry, never the whole queue. For grouped approvals,
+    /// `Accept all` is further gated by
+    /// [`ApprovalBatchGroupKey::allows_accept_all`]; destructive groups
+    /// must be approved item-by-item.
+    ///
+    /// Returns the count that received a response. Entries whose
+    /// receiver was already dropped are still removed from the queue.
+    pub fn respond_focused_group(&mut self, response: ApprovalResponse) -> usize {
+        if self.entries.is_empty() {
+            return 0;
         }
-        self.focus = 0;
+
+        let focused_group = self.entries[self.focus].batch_group_key.clone();
+        let Some(group) = focused_group else {
+            let focused = self.focus;
+            let sent = self.send_at(focused, response);
+            self.entries.remove(focused);
+            self.clamp_focus();
+            return usize::from(sent);
+        };
+
+        if response.is_approved() && !group.allows_accept_all() {
+            return 0;
+        }
+
+        let mut n = 0usize;
+        let mut idx = 0usize;
+        while idx < self.entries.len() {
+            let same_group = self.entries[idx].batch_group_key.as_ref() == Some(&group);
+            if same_group {
+                if self.send_at(idx, response) {
+                    n += 1;
+                }
+                self.entries.remove(idx);
+            } else {
+                idx += 1;
+            }
+        }
+        self.clamp_focus();
         n
     }
 
@@ -656,10 +760,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
         std::fs::write(&path, b"baseline").unwrap();
-        let digest =
-            astra_turn_core::approval_base_digest::compute_file_digest(&path)
-                .unwrap()
-                .unwrap();
+        let digest = astra_turn_core::approval_base_digest::compute_file_digest(&path)
+            .unwrap()
+            .unwrap();
 
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
@@ -686,10 +789,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
         std::fs::write(&path, b"baseline").unwrap();
-        let digest =
-            astra_turn_core::approval_base_digest::compute_file_digest(&path)
-                .unwrap()
-                .unwrap();
+        let digest = astra_turn_core::approval_base_digest::compute_file_digest(&path)
+            .unwrap()
+            .unwrap();
 
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
@@ -708,7 +810,9 @@ mod tests {
 
     // ── Issue #326 P4 / R2 Critical 1: dedup ─────────────────
 
-    fn fixed_request_key(args_seed: &str) -> astra_turn_core::approval_request_key::ApprovalRequestKey {
+    fn fixed_request_key(
+        args_seed: &str,
+    ) -> astra_turn_core::approval_request_key::ApprovalRequestKey {
         let args = serde_json::json!({"seed": args_seed});
         astra_turn_core::approval_request_key::ApprovalRequestKey::new(
             "bash",
@@ -717,6 +821,19 @@ mod tests {
             None,
             uuid::Uuid::nil(),
         )
+    }
+
+    fn fixed_batch_group(
+        tool_family: &str,
+        risk_tags: &[&str],
+    ) -> astra_turn_core::approval_batch_group::ApprovalBatchGroupKey {
+        astra_turn_core::approval_batch_group::ApprovalBatchGroupKey::new(
+            tool_family,
+            "ReadOnly",
+            risk_tags.iter().map(|tag| (*tag).to_string()),
+            uuid::Uuid::nil(),
+        )
+        .with_scope_root("/repo")
     }
 
     #[test]
@@ -841,5 +958,191 @@ mod tests {
 
         let entry = q.entries.front().unwrap();
         assert_eq!(entry.batch_group_key.as_ref(), Some(&group));
+    }
+
+    #[test]
+    fn respond_focused_group_resolves_only_matching_batch_group() {
+        let mut q = ApprovalQueue::new();
+        let group_a = fixed_batch_group("Read(src)", &["BashExecute"]);
+        let group_b = fixed_batch_group("Read(tests)", &["BashExecute"]);
+
+        let (tx_a, mut rx_a) = oneshot::channel();
+        q.push_with_metadata(
+            "read_file".into(),
+            "a".into(),
+            None,
+            "read".into(),
+            tx_a,
+            ApprovalMetadata::default().with_batch_group_key(group_a.clone()),
+        );
+        let (tx_b, mut rx_b) = oneshot::channel();
+        q.push_with_metadata(
+            "read_file".into(),
+            "b".into(),
+            None,
+            "read".into(),
+            tx_b,
+            ApprovalMetadata::default().with_batch_group_key(group_b),
+        );
+        let (tx_c, mut rx_c) = oneshot::channel();
+        q.push_with_metadata(
+            "read_file".into(),
+            "c".into(),
+            None,
+            "read".into(),
+            tx_c,
+            ApprovalMetadata::default().with_batch_group_key(group_a),
+        );
+
+        assert_eq!(q.respond_focused_group(ApprovalResponse::AllowOnce), 2);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.focused().unwrap().header, "b");
+        assert_eq!(rx_a.try_recv().unwrap(), ApprovalResponse::AllowOnce);
+        assert!(
+            rx_b.try_recv().is_err(),
+            "cross-group entry must stay pending"
+        );
+        assert_eq!(rx_c.try_recv().unwrap(), ApprovalResponse::AllowOnce);
+    }
+
+    #[test]
+    fn respond_focused_group_without_key_resolves_only_focused_entry() {
+        let mut q = ApprovalQueue::new();
+        let (tx_a, mut rx_a) = oneshot::channel();
+        q.push("bash".into(), "a".into(), None, "run".into(), tx_a);
+        let (tx_b, mut rx_b) = oneshot::channel();
+        q.push("bash".into(), "b".into(), None, "run".into(), tx_b);
+        let (tx_c, mut rx_c) = oneshot::channel();
+        q.push("bash".into(), "c".into(), None, "run".into(), tx_c);
+
+        assert_eq!(q.respond_focused_group(ApprovalResponse::AllowOnce), 1);
+        assert_eq!(q.len(), 2);
+        assert_eq!(rx_a.try_recv().unwrap(), ApprovalResponse::AllowOnce);
+        assert!(
+            rx_b.try_recv().is_err(),
+            "ungrouped entry must stay pending"
+        );
+        assert!(
+            rx_c.try_recv().is_err(),
+            "ungrouped entry must stay pending"
+        );
+    }
+
+    #[test]
+    fn respond_focused_group_rejects_accept_all_for_destructive_group() {
+        let mut q = ApprovalQueue::new();
+        let group = fixed_batch_group("Bash(rm)", &["GitDestructive"]);
+
+        let (tx_a, mut rx_a) = oneshot::channel();
+        q.push_with_metadata(
+            "bash".into(),
+            "rm a".into(),
+            None,
+            "execute".into(),
+            tx_a,
+            ApprovalMetadata::default().with_batch_group_key(group.clone()),
+        );
+        let (tx_b, mut rx_b) = oneshot::channel();
+        q.push_with_metadata(
+            "bash".into(),
+            "rm b".into(),
+            None,
+            "execute".into(),
+            tx_b,
+            ApprovalMetadata::default().with_batch_group_key(group),
+        );
+
+        assert_eq!(q.respond_focused_group(ApprovalResponse::AllowOnce), 0);
+        assert_eq!(q.len(), 2);
+        assert!(
+            rx_a.try_recv().is_err(),
+            "dangerous Accept all must not send"
+        );
+        assert!(
+            rx_b.try_recv().is_err(),
+            "dangerous Accept all must not send"
+        );
+
+        assert_eq!(q.respond_focused_group(ApprovalResponse::Deny), 2);
+        assert_eq!(q.len(), 0);
+        assert_eq!(rx_a.try_recv().unwrap(), ApprovalResponse::Deny);
+        assert_eq!(rx_b.try_recv().unwrap(), ApprovalResponse::Deny);
+    }
+
+    #[test]
+    fn dangerous_group_accept_all_button_has_no_action() {
+        let mut q = ApprovalQueue::new();
+        let group = fixed_batch_group("Bash(rm)", &["GitDestructive"]);
+
+        let (tx_a, _rx_a) = oneshot::channel();
+        q.push_with_metadata(
+            "bash".into(),
+            "rm a".into(),
+            None,
+            "execute".into(),
+            tx_a,
+            ApprovalMetadata::default().with_batch_group_key(group.clone()),
+        );
+        let (tx_b, _rx_b) = oneshot::channel();
+        q.push_with_metadata(
+            "bash".into(),
+            "rm b".into(),
+            None,
+            "execute".into(),
+            tx_b,
+            ApprovalMetadata::default().with_batch_group_key(group),
+        );
+
+        // Move from Accept to Accept all (index 7).
+        for _ in 0..7 {
+            q.focused_button_move_right();
+        }
+        assert!(
+            q.focused_button_action().is_none(),
+            "dangerous groups must not activate Accept all"
+        );
+
+        q.focused_button_move_right();
+        assert_eq!(
+            q.focused_button_action(),
+            Some(super::super::button_row::ButtonAction::RespondAll(
+                ApprovalResponse::Deny
+            )),
+            "Reject all remains available for dangerous groups"
+        );
+    }
+
+    #[test]
+    fn focused_button_action_blocks_unavailable_project_scope() {
+        let mut q = ApprovalQueue::new();
+        let (tx, _rx) = oneshot::channel();
+        q.push_with_metadata(
+            "bash".into(),
+            "npm test".into(),
+            None,
+            "execute".into(),
+            tx,
+            ApprovalMetadata::default().with_workspace_untrusted(true),
+        );
+
+        // Accept, Reject, Turn, Session, Project.
+        for _ in 0..4 {
+            q.focused_button_move_right();
+        }
+        assert!(
+            q.focused_button_action().is_none(),
+            "Project scope must be inactive when workspace trust is missing"
+        );
+
+        q.focused_button_move_left();
+        assert_eq!(
+            q.focused_button_action(),
+            Some(super::super::button_row::ButtonAction::Respond(
+                ApprovalResponse::AlwaysAllowScoped(
+                    astra_turn_core::permission_scope::AllowScope::RestOfSession
+                )
+            )),
+            "Session scope remains available for untrusted workspaces"
+        );
     }
 }

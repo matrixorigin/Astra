@@ -273,7 +273,11 @@ pub(super) async fn handle_task_command(
                     .await;
 
                 // Create fresh auto-approve permission manager for background
-                let mut perm_manager = PermissionManager::with_project(true, &workspace_root);
+                let mut perm_manager = PermissionManager::with_load_policy(
+                    crate::permission_manager::PermissionMode::Auto,
+                    &workspace_root,
+                    &crate::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+                );
                 let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
                 let _modules =

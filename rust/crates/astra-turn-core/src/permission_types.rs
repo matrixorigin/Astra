@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 // ─── Permission Mode ────────────────────────────────────────────────────────
 
@@ -82,6 +83,21 @@ pub struct PermissionRule {
     /// Optional command prefix for execute tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
+    /// Optional operation kind constraint (`read`, `write`, `execute`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    /// Optional cwd/package-root constraint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_root: Option<String>,
+    /// Optional current git branch constraint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    /// Optional domain constraint for URL/network-shaped tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Optional capability constraint for MCP/capability-shaped tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
 }
 
 impl PermissionRule {
@@ -90,6 +106,11 @@ impl PermissionRule {
         Self {
             tool: name.into().to_lowercase(),
             pattern: None,
+            op: None,
+            cwd_root: None,
+            git_branch: None,
+            domain: None,
+            capability: None,
         }
     }
 
@@ -98,11 +119,53 @@ impl PermissionRule {
         Self {
             tool: name.into().to_lowercase(),
             pattern: Some(pattern.into()),
+            op: None,
+            cwd_root: None,
+            git_branch: None,
+            domain: None,
+            capability: None,
+        }
+    }
+
+    /// Convert a parsed grammar-v2 rule into the enforcement shape.
+    #[must_use]
+    pub fn from_rule_v2(rule: crate::permission_rule_grammar::PermissionRuleV2) -> Self {
+        let lower_family = rule.tool.to_lowercase();
+        let tool = if matches!(lower_family.as_str(), "network" | "mcp") {
+            rule.extra
+                .get("tool")
+                .cloned()
+                .unwrap_or_else(|| lower_family.clone())
+                .to_lowercase()
+        } else {
+            lower_family.clone()
+        };
+        let pattern = if lower_family == "bash" {
+            rule.argv_prefix.clone()
+        } else if matches!(lower_family.as_str(), "edit" | "read" | "view") {
+            rule.path_glob.clone()
+        } else {
+            rule.argv_prefix
+                .clone()
+                .or_else(|| rule.path_glob.clone())
+                .or_else(|| rule.extra.get("pattern").cloned())
+        };
+        Self {
+            tool,
+            pattern,
+            op: rule.op,
+            cwd_root: rule.cwd_root,
+            git_branch: rule.git_branch,
+            domain: rule.domain,
+            capability: rule.capability,
         }
     }
 
     /// Parse a rule from string format: `Tool` or `Tool(pattern:*)`.
     pub fn parse(rule_str: &str) -> Self {
+        if let Ok(rule) = crate::permission_rule_grammar::parse_rule_v2(rule_str) {
+            return Self::from_rule_v2(rule);
+        }
         if let Some(paren_start) = rule_str.find('(') {
             if let Some(paren_end) = rule_str.rfind(')') {
                 let tool = rule_str[..paren_start].to_lowercase();
@@ -111,12 +174,22 @@ impl PermissionRule {
                 return Self {
                     tool,
                     pattern: Some(pattern.to_string()),
+                    op: None,
+                    cwd_root: None,
+                    git_branch: None,
+                    domain: None,
+                    capability: None,
                 };
             }
         }
         Self {
             tool: rule_str.to_lowercase(),
             pattern: None,
+            op: None,
+            cwd_root: None,
+            git_branch: None,
+            domain: None,
+            capability: None,
         }
     }
 
@@ -130,10 +203,58 @@ impl PermissionRule {
     /// behave the same way (`Bash(npm test:*)` still allows
     /// `npm test --verbose`).
     pub fn matches(&self, tool_name: &str, command: Option<&str>) -> bool {
+        self.matches_with_context(tool_name, &RuleMatchContext::legacy(command))
+    }
+
+    /// Check if this rule matches a fully-described tool call.
+    pub fn matches_with_context(&self, tool_name: &str, ctx: &RuleMatchContext) -> bool {
         if self.tool != tool_name.to_lowercase() {
             return false;
         }
-        match (&self.pattern, command) {
+        if let Some(expected) = &self.op
+            && !ctx
+                .op
+                .as_deref()
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+        {
+            return false;
+        }
+        if let Some(expected) = &self.cwd_root
+            && !ctx
+                .cwd
+                .as_deref()
+                .is_some_and(|cwd| cwd_matches_root(cwd, expected))
+        {
+            return false;
+        }
+        if let Some(expected) = &self.git_branch
+            && !ctx
+                .git_branch
+                .as_deref()
+                .is_some_and(|actual| actual == expected)
+        {
+            return false;
+        }
+        if let Some(expected) = &self.domain
+            && !ctx
+                .domain
+                .as_deref()
+                .is_some_and(|actual| domain_matches(expected, actual))
+        {
+            return false;
+        }
+        if let Some(expected) = &self.capability
+            && !capability_matches(expected, ctx)
+        {
+            return false;
+        }
+
+        let target = if self.tool == "bash" {
+            ctx.command.as_deref()
+        } else {
+            ctx.path.as_deref().or(ctx.command.as_deref())
+        };
+        match (&self.pattern, target) {
             (None, _) => true, // Bare tool name matches all
             (Some(pattern), Some(cmd)) => {
                 if pattern_contains_glob_metachars(pattern) {
@@ -162,6 +283,180 @@ impl PermissionRule {
     }
 }
 
+/// Context for v2 permission-rule matching.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuleMatchContext {
+    pub command: Option<String>,
+    pub path: Option<String>,
+    pub op: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub git_branch: Option<String>,
+    pub domain: Option<String>,
+    pub capability: Option<String>,
+}
+
+impl RuleMatchContext {
+    #[must_use]
+    pub fn legacy(command: Option<&str>) -> Self {
+        Self {
+            command: command.map(ToOwned::to_owned),
+            path: command.map(ToOwned::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[must_use]
+    pub fn from_tool_args(tool_name: &str, args: &serde_json::Value) -> Self {
+        let cwd = std::env::current_dir().ok();
+        let op = match crate::cloud_approval_policy::cloud_gated_tool_kind_with_args(
+            tool_name,
+            Some(args),
+        ) {
+            Some(crate::cloud_approval_policy::CloudGatedToolKind::Execute) => Some("execute"),
+            Some(crate::cloud_approval_policy::CloudGatedToolKind::Write) => Some("write"),
+            None => Some("read"),
+        }
+        .map(str::to_string);
+
+        let domain = string_arg(args, "domain")
+            .or_else(|| string_arg(args, "host"))
+            .or_else(|| string_arg(args, "url").and_then(|url| domain_from_urlish(&url)))
+            .or_else(|| string_arg(args, "uri").and_then(|url| domain_from_urlish(&url)));
+        let capability = string_arg(args, "capability").or_else(|| capability_from_args(args));
+        let git_branch = cwd.as_deref().and_then(current_git_branch);
+        Self {
+            command: crate::tool_argument_hints::command_hint_from_args(args).map(str::to_string),
+            path: crate::tool_argument_hints::path_hint_from_args(args),
+            op,
+            cwd,
+            git_branch,
+            domain,
+            capability,
+        }
+    }
+}
+
+fn string_arg(args: &serde_json::Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn capability_from_args(args: &serde_json::Value) -> Option<String> {
+    for key in ["destructive", "read_only", "open_world"] {
+        if let Some(value) = args.get(key) {
+            return match value {
+                serde_json::Value::Bool(b) => Some(format!("{key}={b}")),
+                serde_json::Value::String(s) => Some(format!("{key}={s}")),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+fn domain_from_urlish(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme)
+        .trim();
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let host = host
+        .strip_prefix('[')
+        .and_then(|s| s.split_once(']').map(|(host, _)| host))
+        .unwrap_or_else(|| host.split(':').next().unwrap_or(host))
+        .trim()
+        .trim_end_matches('.');
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_lowercase())
+    }
+}
+
+fn domain_matches(expected: &str, actual: &str) -> bool {
+    let expected = expected.trim().trim_end_matches('.').to_lowercase();
+    let actual = actual.trim().trim_end_matches('.').to_lowercase();
+    actual == expected || actual.ends_with(&format!(".{expected}"))
+}
+
+fn capability_matches(expected: &str, ctx: &RuleMatchContext) -> bool {
+    let Some(actual) = ctx.capability.as_deref() else {
+        return false;
+    };
+    if actual == expected {
+        return true;
+    }
+    if let Some((key, value)) = expected.split_once('=') {
+        return actual
+            .split_once('=')
+            .is_some_and(|(actual_key, actual_value)| {
+                actual_key == key && actual_value.eq_ignore_ascii_case(value)
+            });
+    }
+    false
+}
+
+fn cwd_matches_root(cwd: &Path, expected_root: &str) -> bool {
+    let expected_root = expected_root.trim();
+    if expected_root.is_empty() || expected_root == "." {
+        return true;
+    }
+    let expected = Path::new(expected_root);
+    if expected.is_absolute() {
+        let canonical_expected = expected
+            .canonicalize()
+            .unwrap_or_else(|_| expected.to_path_buf());
+        let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        return canonical_cwd.starts_with(canonical_expected);
+    }
+    cwd.ancestors()
+        .any(|ancestor| path_ends_with(ancestor, expected))
+}
+
+fn path_ends_with(path: &Path, suffix: &Path) -> bool {
+    let path_components: Vec<_> = path.components().collect();
+    let suffix_components: Vec<_> = suffix.components().collect();
+    path_components.len() >= suffix_components.len()
+        && path_components[path_components.len() - suffix_components.len()..] == suffix_components
+}
+
+fn current_git_branch(cwd: &Path) -> Option<String> {
+    let git_entry = cwd
+        .ancestors()
+        .map(|dir| dir.join(".git"))
+        .find(|path| path.exists())?;
+    let git_dir = if git_entry.is_dir() {
+        git_entry
+    } else {
+        let content = std::fs::read_to_string(&git_entry).ok()?;
+        let gitdir = content.strip_prefix("gitdir:")?.trim();
+        let path = Path::new(gitdir);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            git_entry.parent()?.join(path)
+        }
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    head.trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(ToOwned::to_owned)
+}
+
 /// Cheap predicate: does `pattern` contain any of the glob
 /// metacharacters [`crate::permission_path_glob`] recognizes?
 /// Used to decide between glob-match and legacy prefix-match.
@@ -171,9 +466,38 @@ fn pattern_contains_glob_metachars(pattern: &str) -> bool {
 
 impl std::fmt::Display for PermissionRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.pattern {
-            Some(pat) => write!(f, "{}({}:*)", self.tool, pat),
-            None => write!(f, "{}", self.tool),
+        let has_v2_constraints = self.op.is_some()
+            || self.cwd_root.is_some()
+            || self.git_branch.is_some()
+            || self.domain.is_some()
+            || self.capability.is_some();
+        if has_v2_constraints {
+            let mut rule = crate::permission_rule_grammar::PermissionRuleV2 {
+                tool: self.tool.clone(),
+                argv_prefix: None,
+                path_glob: None,
+                op: self.op.clone(),
+                cwd_root: self.cwd_root.clone(),
+                git_branch: self.git_branch.clone(),
+                domain: self.domain.clone(),
+                capability: self.capability.clone(),
+                extra: Default::default(),
+            };
+            if self.tool == "bash" {
+                rule.argv_prefix = self.pattern.clone();
+            } else {
+                rule.path_glob = self.pattern.clone();
+            }
+            write!(
+                f,
+                "{}",
+                crate::permission_rule_grammar::serialize_rule_v2(&rule)
+            )
+        } else {
+            match &self.pattern {
+                Some(pat) => write!(f, "{}({}:*)", self.tool, pat),
+                None => write!(f, "{}", self.tool),
+            }
         }
     }
 }
@@ -242,16 +566,26 @@ impl InheritedPermissions {
     }
     /// Check if a tool is explicitly allowed by inherited rules.
     pub fn is_allowed(&self, tool_name: &str, command: Option<&str>) -> bool {
+        self.is_allowed_with_context(tool_name, &RuleMatchContext::legacy(command))
+    }
+
+    /// Check if a tool is explicitly allowed by inherited rules.
+    pub fn is_allowed_with_context(&self, tool_name: &str, ctx: &RuleMatchContext) -> bool {
         self.allow_rules
             .iter()
-            .any(|r| r.matches(tool_name, command))
+            .any(|r| r.matches_with_context(tool_name, ctx))
     }
 
     /// Check if a tool is explicitly denied by inherited rules.
     pub fn is_denied(&self, tool_name: &str, command: Option<&str>) -> bool {
+        self.is_denied_with_context(tool_name, &RuleMatchContext::legacy(command))
+    }
+
+    /// Check if a tool is explicitly denied by inherited rules.
+    pub fn is_denied_with_context(&self, tool_name: &str, ctx: &RuleMatchContext) -> bool {
         self.deny_rules
             .iter()
-            .any(|r| r.matches(tool_name, command))
+            .any(|r| r.matches_with_context(tool_name, ctx))
     }
 
     /// Check if a tool is in the allowed_tools set (if set).
@@ -484,30 +818,40 @@ impl PermissionSyncContext {
 
     /// Check if a tool is allowed (by inherited or session rules).
     pub fn is_allowed(&self, tool_name: &str, command: Option<&str>) -> bool {
+        self.is_allowed_with_context(tool_name, &RuleMatchContext::legacy(command))
+    }
+
+    /// Check if a tool is allowed (by inherited or session rules).
+    pub fn is_allowed_with_context(&self, tool_name: &str, ctx: &RuleMatchContext) -> bool {
         // Check session overrides first
         if self
             .session_allow
             .iter()
-            .any(|r| r.matches(tool_name, command))
+            .any(|r| r.matches_with_context(tool_name, ctx))
         {
             return true;
         }
         // Check inherited rules
-        self.inherited.is_allowed(tool_name, command)
+        self.inherited.is_allowed_with_context(tool_name, ctx)
     }
 
     /// Check if a tool is denied (by inherited or session rules).
     pub fn is_denied(&self, tool_name: &str, command: Option<&str>) -> bool {
+        self.is_denied_with_context(tool_name, &RuleMatchContext::legacy(command))
+    }
+
+    /// Check if a tool is denied (by inherited or session rules).
+    pub fn is_denied_with_context(&self, tool_name: &str, ctx: &RuleMatchContext) -> bool {
         // Check session overrides first
         if self
             .session_deny
             .iter()
-            .any(|r| r.matches(tool_name, command))
+            .any(|r| r.matches_with_context(tool_name, ctx))
         {
             return true;
         }
         // Check inherited rules
-        self.inherited.is_denied(tool_name, command)
+        self.inherited.is_denied_with_context(tool_name, ctx)
     }
 
     /// Apply a permission update from parent.
@@ -670,10 +1014,7 @@ mod tests {
     fn rule_matches_with_glob_pattern() {
         // Issue #326 P5 / R2 Major 2: glob metacharacters in
         // the pattern switch from prefix-match to full glob.
-        let rule = PermissionRule {
-            tool: "edit".into(),
-            pattern: Some("src/**/*.rs".into()),
-        };
+        let rule = PermissionRule::with_pattern("edit", "src/**/*.rs");
         assert!(rule.matches("edit", Some("src/lib.rs")));
         assert!(rule.matches("edit", Some("src/auth/login.rs")));
         assert!(rule.matches("edit", Some("src/a/b/c/d.rs")));
@@ -682,10 +1023,7 @@ mod tests {
 
     #[test]
     fn rule_matches_with_brace_alternatives() {
-        let rule = PermissionRule {
-            tool: "edit".into(),
-            pattern: Some("**/*.{rs,ts,js}".into()),
-        };
+        let rule = PermissionRule::with_pattern("edit", "**/*.{rs,ts,js}");
         assert!(rule.matches("edit", Some("lib.rs")));
         assert!(rule.matches("edit", Some("ui/component.ts")));
         assert!(rule.matches("edit", Some("server.js")));
@@ -700,6 +1038,120 @@ mod tests {
         assert!(rule.matches("bash", Some("npm test")));
         assert!(rule.matches("bash", Some("npm test --watch")));
         assert!(!rule.matches("bash", Some("npm run deploy")));
+    }
+
+    #[test]
+    fn v2_rule_enforces_cwd_root_constraint() {
+        let rule =
+            PermissionRule::parse(r#"Bash(argv_prefix="npm test", cwd_root="packages/web")"#);
+        let matching = RuleMatchContext {
+            command: Some("npm test --watch".into()),
+            cwd: Some(PathBuf::from("/repo/packages/web/src")),
+            ..Default::default()
+        };
+        let other_package = RuleMatchContext {
+            command: Some("npm test --watch".into()),
+            cwd: Some(PathBuf::from("/repo/packages/api")),
+            ..Default::default()
+        };
+
+        assert!(rule.matches_with_context("bash", &matching));
+        assert!(!rule.matches_with_context("bash", &other_package));
+    }
+
+    #[test]
+    fn v2_rule_enforces_git_branch_constraint() {
+        let rule = PermissionRule::parse(r#"Bash(argv_prefix="git push", git_branch="main")"#);
+        let main_branch = RuleMatchContext {
+            command: Some("git push origin main".into()),
+            git_branch: Some("main".into()),
+            ..Default::default()
+        };
+        let feature_branch = RuleMatchContext {
+            command: Some("git push origin main".into()),
+            git_branch: Some("feature".into()),
+            ..Default::default()
+        };
+
+        assert!(rule.matches_with_context("bash", &main_branch));
+        assert!(!rule.matches_with_context("bash", &feature_branch));
+    }
+
+    #[test]
+    fn v2_rule_enforces_network_domain_constraint() {
+        let rule = PermissionRule::parse(r#"Network(tool="web_fetch", domain="github.com")"#);
+        let github = RuleMatchContext {
+            domain: Some("api.github.com".into()),
+            ..Default::default()
+        };
+        let other = RuleMatchContext {
+            domain: Some("example.com".into()),
+            ..Default::default()
+        };
+
+        assert!(rule.matches_with_context("web_fetch", &github));
+        assert!(!rule.matches_with_context("web_fetch", &other));
+    }
+
+    #[test]
+    fn v2_rule_enforces_mcp_capability_constraint() {
+        let rule = PermissionRule::parse(
+            r#"MCP(tool="mcp_jira_create_issue", capability="destructive=false")"#,
+        );
+        let safe_capability = RuleMatchContext {
+            capability: Some("destructive=false".into()),
+            ..Default::default()
+        };
+        let destructive_capability = RuleMatchContext {
+            capability: Some("destructive=true".into()),
+            ..Default::default()
+        };
+
+        assert!(rule.matches_with_context("mcp_jira_create_issue", &safe_capability));
+        assert!(!rule.matches_with_context("mcp_jira_create_issue", &destructive_capability));
+    }
+
+    #[test]
+    fn v2_rule_enforces_op_constraint() {
+        let rule = PermissionRule::parse(r#"Edit(path_glob="src/**/*.rs", op="write")"#);
+        let write_ctx = RuleMatchContext {
+            path: Some("src/main.rs".into()),
+            op: Some("write".into()),
+            ..Default::default()
+        };
+        let read_ctx = RuleMatchContext {
+            path: Some("src/main.rs".into()),
+            op: Some("read".into()),
+            ..Default::default()
+        };
+
+        assert!(rule.matches_with_context("edit", &write_ctx));
+        assert!(!rule.matches_with_context("edit", &read_ctx));
+    }
+
+    #[test]
+    fn sync_context_uses_v2_constraints_for_allow_rules() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            allow_rules: vec![PermissionRule::parse(
+                r#"Bash(argv_prefix="npm test", cwd_root="packages/web")"#,
+            )],
+            ..Default::default()
+        };
+        let sync = PermissionSyncContext::new(inherited);
+        let web_ctx = RuleMatchContext {
+            command: Some("npm test --watch".into()),
+            cwd: Some(PathBuf::from("/repo/packages/web")),
+            ..Default::default()
+        };
+        let api_ctx = RuleMatchContext {
+            command: Some("npm test --watch".into()),
+            cwd: Some(PathBuf::from("/repo/packages/api")),
+            ..Default::default()
+        };
+
+        assert!(sync.is_allowed_with_context("bash", &web_ctx));
+        assert!(!sync.is_allowed_with_context("bash", &api_ctx));
     }
 
     #[test]

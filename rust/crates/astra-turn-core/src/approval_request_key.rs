@@ -185,8 +185,7 @@ fn write_canonical(out: &mut String, value: &serde_json::Value) {
                 if i > 0 {
                     out.push(',');
                 }
-                let key_json =
-                    serde_json::to_string(*key).unwrap_or_else(|_| String::from("\"\""));
+                let key_json = serde_json::to_string(*key).unwrap_or_else(|_| String::from("\"\""));
                 out.push_str(&key_json);
                 out.push(':');
                 write_canonical(out, &map[*key]);

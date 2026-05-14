@@ -29,6 +29,33 @@ pub fn command_hint_from_args(args: &Value) -> Option<&str> {
     args.get("command").and_then(Value::as_str)
 }
 
+/// Extract the persistent allow-rule prefix from a shell command.
+///
+/// We stop at the first flag, the first shell metacharacter, or after at most
+/// three tokens. That keeps "Always allow" precise enough for subcommands
+/// without baking user data or flags into the rule.
+#[must_use]
+pub fn normalized_argv_prefix(cmd: &str) -> String {
+    const MAX_PREFIX_TOKENS: usize = 3;
+    const SHELL_METACHARS: &[&str] = &["|", ";", "&&", "||", ">", "<", ">>", "<<", "&"];
+
+    let mut tokens = Vec::new();
+    for raw in cmd.split_whitespace() {
+        if SHELL_METACHARS.iter().any(|m| *m == raw) {
+            break;
+        }
+        if raw.starts_with('-') {
+            break;
+        }
+        tokens.push(raw);
+        if tokens.len() >= MAX_PREFIX_TOKENS {
+            break;
+        }
+    }
+
+    tokens.join(" ")
+}
+
 /// One-line detail next to the CLI permission icon and cloud `approval_required` prompts.
 pub fn permission_prompt_primary_detail(tool_name: &str, args: &Value) -> Option<String> {
     // MCP tools: show a compact summary of arguments since they don't have
@@ -126,6 +153,18 @@ mod tests {
     fn command_hint_ignores_cmd_key() {
         let args = json!({"cmd": "whoami"});
         assert!(command_hint_from_args(&args).is_none());
+    }
+
+    #[test]
+    fn normalized_argv_prefix_stops_at_flags_and_shell_meta() {
+        assert_eq!(normalized_argv_prefix("cargo test --release"), "cargo test");
+        assert_eq!(
+            normalized_argv_prefix("npm run deploy:prod -- --foo"),
+            "npm run deploy:prod"
+        );
+        assert_eq!(normalized_argv_prefix("git commit -m 'fix'"), "git commit");
+        assert_eq!(normalized_argv_prefix("bash -c 'rm -rf tmp'"), "bash");
+        assert_eq!(normalized_argv_prefix("echo hi > out.txt"), "echo hi");
     }
 
     #[test]

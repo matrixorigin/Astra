@@ -279,7 +279,8 @@ pub fn parse_rule_v2(s: &str) -> Result<PermissionRuleV2, RuleParseError> {
             } else if lower_tool == "edit" || lower_tool == "read" || lower_tool == "view" {
                 rule.path_glob = Some(pattern.to_string());
             } else {
-                rule.extra.insert("pattern".to_string(), pattern.to_string());
+                rule.extra
+                    .insert("pattern".to_string(), pattern.to_string());
             }
         }
         return Ok(rule);
@@ -310,8 +311,8 @@ pub fn parse_rule_v2(s: &str) -> Result<PermissionRuleV2, RuleParseError> {
         };
         let key = raw_field[..eq].trim().to_string();
         let raw_value = raw_field[eq + 1..].trim();
-        let value = strip_optional_quotes(raw_value)
-            .ok_or_else(|| RuleParseError::MalformedField {
+        let value =
+            strip_optional_quotes(raw_value).ok_or_else(|| RuleParseError::MalformedField {
                 raw: raw_field.to_string(),
             })?;
 
@@ -338,9 +339,12 @@ pub fn parse_rule_v2(s: &str) -> Result<PermissionRuleV2, RuleParseError> {
             "git_branch" => rule.git_branch = Some(value.to_string()),
             "domain" => rule.domain = Some(value.to_string()),
             "capability" => rule.capability = Some(value.to_string()),
-            // For Network the legacy v1 parser stored a tool slot
-            // in extra; accept it gracefully on the v2 path too.
-            "tool" if rule.tool.eq_ignore_ascii_case("network") => {
+            // Network/MCP family rules may carry the concrete tool
+            // name in a structured `tool` slot.
+            "tool"
+                if rule.tool.eq_ignore_ascii_case("network")
+                    || rule.tool.eq_ignore_ascii_case("mcp") =>
+            {
                 rule.extra.insert(key, value.to_string());
             }
             _ => {
@@ -553,7 +557,29 @@ mod tests {
         // silently dropping.
         let rule = parse_rule_v2("CustomTool(some-pattern:*)").unwrap();
         assert_eq!(rule.tool, "CustomTool");
-        assert_eq!(rule.extra.get("pattern").map(String::as_str), Some("some-pattern"));
+        assert_eq!(
+            rule.extra.get("pattern").map(String::as_str),
+            Some("some-pattern")
+        );
+    }
+
+    #[test]
+    fn network_and_mcp_rules_accept_concrete_tool_key() {
+        let network = parse_rule_v2(r#"Network(tool="web_fetch", domain="github.com")"#).unwrap();
+        assert_eq!(
+            network.extra.get("tool").map(String::as_str),
+            Some("web_fetch")
+        );
+        assert_eq!(network.domain.as_deref(), Some("github.com"));
+
+        let mcp =
+            parse_rule_v2(r#"MCP(tool="mcp_jira_create_issue", capability="destructive=false")"#)
+                .unwrap();
+        assert_eq!(
+            mcp.extra.get("tool").map(String::as_str),
+            Some("mcp_jira_create_issue")
+        );
+        assert_eq!(mcp.capability.as_deref(), Some("destructive=false"));
     }
 
     // ── Loud failure modes ───────────────────────────────────────
@@ -597,7 +623,10 @@ mod tests {
     #[test]
     fn malformed_field_unterminated_quote_errors() {
         let err = parse_rule_v2(r#"Bash(argv_prefix="abc)"#).unwrap_err();
-        assert!(matches!(err, RuleParseError::MalformedField { .. } | RuleParseError::UnterminatedParen));
+        assert!(matches!(
+            err,
+            RuleParseError::MalformedField { .. } | RuleParseError::UnterminatedParen
+        ));
     }
 
     // ── Forward-compat ───────────────────────────────────────────

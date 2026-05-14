@@ -243,13 +243,19 @@ mod tests {
         let a = ApprovalBatchGroupKey::new(
             "Edit",
             "Write",
-            ["WritesOutsidePackage".to_string(), "BashExecute".to_string()],
+            [
+                "WritesOutsidePackage".to_string(),
+                "BashExecute".to_string(),
+            ],
             fixed_turn(),
         );
         let b = ApprovalBatchGroupKey::new(
             "Edit",
             "Write",
-            ["BashExecute".to_string(), "WritesOutsidePackage".to_string()],
+            [
+                "BashExecute".to_string(),
+                "WritesOutsidePackage".to_string(),
+            ],
             fixed_turn(),
         );
         assert_eq!(a, b, "BTreeSet should make tag order irrelevant");
@@ -277,12 +283,8 @@ mod tests {
             "CredentialAccess",
             "MCPUnknownCapability",
         ] {
-            let group = ApprovalBatchGroupKey::new(
-                "Bash(rm)",
-                "Execute",
-                [tag.to_string()],
-                fixed_turn(),
-            );
+            let group =
+                ApprovalBatchGroupKey::new("Bash(rm)", "Execute", [tag.to_string()], fixed_turn());
             assert!(
                 !group.allows_accept_all(),
                 "tag {tag} should disable Accept all"

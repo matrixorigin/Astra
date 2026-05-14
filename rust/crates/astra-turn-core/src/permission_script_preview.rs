@@ -59,15 +59,33 @@ pub struct ScriptPreview {
 /// word boundaries) so `dropbox-cli` doesn't trigger DROP and
 /// `cp /tmp/foo /tmp/bar` doesn't trigger "/" patterns.
 const DESTRUCTIVE_TOKENS: &[&str] = &[
-    "rm", "rmdir", "sudo", "doas", "su",
-    "shred", "wipe", "dd", "mkfs", "mkfs.ext4", "mkfs.xfs",
-    "fdisk", "parted", "lvremove", "vgremove", "wipefs",
-    "chmod", "chown",
+    "rm",
+    "rmdir",
+    "sudo",
+    "doas",
+    "su",
+    "shred",
+    "wipe",
+    "dd",
+    "mkfs",
+    "mkfs.ext4",
+    "mkfs.xfs",
+    "fdisk",
+    "parted",
+    "lvremove",
+    "vgremove",
+    "wipefs",
+    "chmod",
+    "chown",
     "rmrf", // rare alias
-    "kill", "killall", "pkill",
-    "iptables", "ufw",
+    "kill",
+    "killall",
+    "pkill",
+    "iptables",
+    "ufw",
     "format",
-    "userdel", "groupdel",
+    "userdel",
+    "groupdel",
 ];
 
 /// Two-token destructive sequences. Specifically needed for
@@ -131,10 +149,7 @@ fn has_script_extension(s: &str) -> bool {
 /// Read the script and build a preview. `script_path` is the
 /// path the script lives at; `cwd` is the project root used to
 /// resolve relative paths.
-pub fn build_script_preview(
-    script_path: &str,
-    cwd: &Path,
-) -> std::io::Result<ScriptPreview> {
+pub fn build_script_preview(script_path: &str, cwd: &Path) -> std::io::Result<ScriptPreview> {
     build_script_preview_with_limit(script_path, cwd, DEFAULT_PREVIEW_LINES)
 }
 
@@ -190,10 +205,9 @@ fn scan_destructive_keywords(line: &str) -> Vec<&'static str> {
     // Tokenize on whitespace for whole-word matches.
     let tokens: Vec<&str> = lower.split_whitespace().collect();
     for &kw in DESTRUCTIVE_TOKENS {
-        if tokens
-            .iter()
-            .any(|t| *t == kw || t.starts_with(&format!("{kw}-")) || t.starts_with(&format!("{kw}.")))
-        {
+        if tokens.iter().any(|t| {
+            *t == kw || t.starts_with(&format!("{kw}-")) || t.starts_with(&format!("{kw}."))
+        }) {
             hits.push(kw);
         }
     }
@@ -308,7 +322,10 @@ mod tests {
     #[test]
     fn ignores_keyword_inside_comment() {
         let hits = scan_destructive_keywords("echo hi # rm -rf /");
-        assert!(hits.is_empty(), "comment-only kw should not flag, got {hits:?}");
+        assert!(
+            hits.is_empty(),
+            "comment-only kw should not flag, got {hits:?}"
+        );
     }
 
     #[test]
@@ -337,8 +354,7 @@ mod tests {
             .join("\n");
         write_script(dir.path(), "long.sh", &body);
 
-        let p =
-            build_script_preview_with_limit("long.sh", dir.path(), 10).unwrap();
+        let p = build_script_preview_with_limit("long.sh", dir.path(), 10).unwrap();
         assert_eq!(p.lines.len(), 10);
         assert!(p.truncated);
         assert!(!p.has_destructive_hit);
@@ -356,7 +372,11 @@ mod tests {
         let bad_line = p.lines.iter().find(|l| l.text.contains("rm -rf")).unwrap();
         assert!(bad_line.destructive_hits.contains(&"rm"));
 
-        let safe_line = p.lines.iter().find(|l| l.text.contains("echo start")).unwrap();
+        let safe_line = p
+            .lines
+            .iter()
+            .find(|l| l.text.contains("echo start"))
+            .unwrap();
         assert!(safe_line.destructive_hits.is_empty());
     }
 

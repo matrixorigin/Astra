@@ -4,14 +4,20 @@
 
 use super::button_row::{BATCH_BUTTONS, ButtonAction, ButtonRow, PRIMARY_BUTTONS};
 use crate::chat_stream::ApprovalResponse;
+use astra_turn_core::permission_scope::AllowScope;
 
 // ─── Primary row invariants ───────────────────────────────────────
 
 #[test]
-fn primary_row_has_four_buttons_in_expected_order() {
+fn primary_row_has_scope_picker_buttons_in_expected_order() {
     let row = ButtonRow::primary();
     let labels: Vec<&str> = row.buttons().iter().map(|b| b.label).collect();
-    assert_eq!(labels, vec!["Accept", "Reject", "Always", "Skip"]);
+    assert_eq!(
+        labels,
+        vec![
+            "Accept", "Reject", "Turn", "Session", "Project", "User", "Skip"
+        ]
+    );
 }
 
 #[test]
@@ -76,22 +82,24 @@ fn activate_reject_returns_deny() {
 }
 
 #[test]
-fn activate_always_returns_always_allow() {
+fn activate_turn_returns_scoped_always_allow() {
     let mut row = ButtonRow::primary();
     row.move_right();
     row.move_right();
     assert_eq!(
         row.activate(),
-        Some(ButtonAction::Respond(ApprovalResponse::AlwaysAllow))
+        Some(ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(
+            AllowScope::RestOfTurn
+        )))
     );
 }
 
 #[test]
 fn activate_skip_returns_skip() {
     let mut row = ButtonRow::primary();
-    row.move_right();
-    row.move_right();
-    row.move_right();
+    for _ in 0..6 {
+        row.move_right();
+    }
     assert_eq!(
         row.activate(),
         Some(ButtonAction::Respond(ApprovalResponse::Skip))
@@ -106,7 +114,7 @@ fn focus_reject_jumps_to_reject_regardless_of_origin() {
     row.focus_reject();
     assert_eq!(row.focused().unwrap().label, "Reject");
 
-    row.move_right(); // now on Always
+    row.move_right(); // now on Turn
     row.focus_reject();
     assert_eq!(row.focused().unwrap().label, "Reject");
 }
@@ -143,6 +151,6 @@ fn batch_activate_reject_all_returns_deny_all() {
 
 #[test]
 fn exported_constants_match_the_primary_and_batch_rows() {
-    assert_eq!(PRIMARY_BUTTONS.len(), 4);
+    assert_eq!(PRIMARY_BUTTONS.len(), 7);
     assert_eq!(BATCH_BUTTONS.len(), 2);
 }

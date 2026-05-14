@@ -58,6 +58,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Current ledger schema version. Stamped into every saved file
 /// so future migrations have an anchor.
@@ -81,6 +82,65 @@ pub enum TrustState {
 impl Default for TrustState {
     fn default() -> Self {
         Self::Ask
+    }
+}
+
+/// Why a workspace is, or is not, allowed to apply project-level
+/// allow rules.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkspaceTrustReason {
+    Trusted,
+    UnknownWorkspace,
+    ExplicitlyUntrusted,
+    RulesHashChanged,
+    LedgerError(String),
+    RulesHashError(String),
+}
+
+impl WorkspaceTrustReason {
+    #[must_use]
+    pub fn display(&self) -> String {
+        match self {
+            Self::Trusted => "trusted workspace".to_string(),
+            Self::UnknownWorkspace => "workspace has not been trusted".to_string(),
+            Self::ExplicitlyUntrusted => "workspace is marked untrusted".to_string(),
+            Self::RulesHashChanged => {
+                "project permission rules changed since trust was granted".to_string()
+            }
+            Self::LedgerError(err) => {
+                format!("workspace trust ledger could not be loaded: {err}")
+            }
+            Self::RulesHashError(err) => {
+                format!("project permission rules could not be hashed: {err}")
+            }
+        }
+    }
+}
+
+/// Effective trust decision for a workspace at manager construction time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceTrustEvaluation {
+    pub state: TrustState,
+    pub recorded_rules_hash: Option<String>,
+    pub current_rules_hash: Option<String>,
+    pub reason: WorkspaceTrustReason,
+}
+
+impl WorkspaceTrustEvaluation {
+    #[must_use]
+    pub fn applies_project_allow(&self) -> bool {
+        matches!(self.reason, WorkspaceTrustReason::Trusted)
+    }
+
+    #[must_use]
+    pub fn summary_line(&self) -> String {
+        if self.applies_project_allow() {
+            return "Workspace trust: trusted; project allow rules are active".to_string();
+        }
+        format!(
+            "Workspace trust: {}; project allow rules are ignored",
+            self.reason.display()
+        )
     }
 }
 
@@ -148,10 +208,7 @@ pub enum WorkspaceTrustError {
         source: std::io::Error,
     },
     /// JSON parse error.
-    Corrupt {
-        path: PathBuf,
-        message: String,
-    },
+    Corrupt { path: PathBuf, message: String },
 }
 
 impl std::fmt::Display for WorkspaceTrustError {
@@ -196,8 +253,10 @@ impl WorkspaceTrustLedger {
     #[must_use]
     pub fn load() -> (Self, Option<WorkspaceTrustError>) {
         let Some(path) = Self::default_path() else {
-            return (Self::empty_at(PathBuf::from("trusted_workspaces.json")),
-                    Some(WorkspaceTrustError::NoHomeDir));
+            return (
+                Self::empty_at(PathBuf::from("trusted_workspaces.json")),
+                Some(WorkspaceTrustError::NoHomeDir),
+            );
         };
         Self::load_from(path)
     }
@@ -258,6 +317,13 @@ impl WorkspaceTrustLedger {
             .and_then(|e| e.rules_hash.as_deref())
     }
 
+    /// Full entry for a workspace, if present.
+    #[must_use]
+    pub fn entry_for(&self, workspace: &Path) -> Option<&WorkspaceTrustEntry> {
+        let key = canonicalize_key(workspace);
+        self.file.workspaces.get(&key)
+    }
+
     /// Set the trust state for a workspace.
     ///
     /// Marks the in-memory ledger dirty; call [`Self::save`] to
@@ -310,12 +376,11 @@ impl WorkspaceTrustLedger {
             })?;
         }
 
-        let json = serde_json::to_string_pretty(&self.file).map_err(|e| {
-            WorkspaceTrustError::Io {
+        let json =
+            serde_json::to_string_pretty(&self.file).map_err(|e| WorkspaceTrustError::Io {
                 stage: "serialize",
                 source: std::io::Error::other(e),
-            }
-        })?;
+            })?;
 
         let dir = self
             .path
@@ -323,22 +388,23 @@ impl WorkspaceTrustLedger {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
 
-        let mut tmp = tempfile::NamedTempFile::new_in(&dir).map_err(|e| {
-            WorkspaceTrustError::Io {
+        let mut tmp =
+            tempfile::NamedTempFile::new_in(&dir).map_err(|e| WorkspaceTrustError::Io {
                 stage: "create temp file",
                 source: e,
-            }
-        })?;
+            })?;
         std::io::Write::write_all(&mut tmp, json.as_bytes()).map_err(|e| {
             WorkspaceTrustError::Io {
                 stage: "write temp",
                 source: e,
             }
         })?;
-        tmp.as_file().sync_all().map_err(|e| WorkspaceTrustError::Io {
-            stage: "fsync temp",
-            source: e,
-        })?;
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| WorkspaceTrustError::Io {
+                stage: "fsync temp",
+                source: e,
+            })?;
         tmp.persist(&self.path)
             .map_err(|e| WorkspaceTrustError::Io {
                 stage: "rename",
@@ -353,6 +419,68 @@ impl WorkspaceTrustLedger {
     }
 }
 
+/// Evaluate workspace trust using the default per-user ledger.
+#[must_use]
+pub fn evaluate_workspace_trust(workspace: &Path) -> WorkspaceTrustEvaluation {
+    let (ledger, load_error) = WorkspaceTrustLedger::load();
+    evaluate_workspace_trust_with_ledger(workspace, &ledger, load_error)
+}
+
+/// Evaluate workspace trust from a specific ledger path. Tests use this
+/// to avoid touching the caller's real `~/.astra` state.
+#[must_use]
+pub fn evaluate_workspace_trust_from_path(
+    workspace: &Path,
+    ledger_path: PathBuf,
+) -> WorkspaceTrustEvaluation {
+    let (ledger, load_error) = WorkspaceTrustLedger::load_from(ledger_path);
+    evaluate_workspace_trust_with_ledger(workspace, &ledger, load_error)
+}
+
+fn evaluate_workspace_trust_with_ledger(
+    workspace: &Path,
+    ledger: &WorkspaceTrustLedger,
+    load_error: Option<WorkspaceTrustError>,
+) -> WorkspaceTrustEvaluation {
+    let current_hash = match project_permissions_hash(workspace) {
+        Ok(hash) => hash,
+        Err(err) => {
+            return WorkspaceTrustEvaluation {
+                state: TrustState::Ask,
+                recorded_rules_hash: None,
+                current_rules_hash: None,
+                reason: WorkspaceTrustReason::RulesHashError(err.to_string()),
+            };
+        }
+    };
+
+    if let Some(err) = load_error {
+        return WorkspaceTrustEvaluation {
+            state: TrustState::Ask,
+            recorded_rules_hash: None,
+            current_rules_hash: current_hash,
+            reason: WorkspaceTrustReason::LedgerError(err.to_string()),
+        };
+    }
+
+    let entry = ledger.entry_for(workspace);
+    let state = entry.map(|e| e.trust).unwrap_or(TrustState::Ask);
+    let recorded_hash = entry.and_then(|e| e.rules_hash.clone());
+    let reason = match state {
+        TrustState::Trusted if recorded_hash == current_hash => WorkspaceTrustReason::Trusted,
+        TrustState::Trusted => WorkspaceTrustReason::RulesHashChanged,
+        TrustState::Untrusted => WorkspaceTrustReason::ExplicitlyUntrusted,
+        TrustState::Ask => WorkspaceTrustReason::UnknownWorkspace,
+    };
+
+    WorkspaceTrustEvaluation {
+        state,
+        recorded_rules_hash: recorded_hash,
+        current_rules_hash: current_hash,
+        reason,
+    }
+}
+
 /// Use the canonicalized absolute path as the ledger key when
 /// possible; fall back to the lossy display string when
 /// canonicalization fails (the workspace may not exist yet).
@@ -360,6 +488,27 @@ fn canonicalize_key(workspace: &Path) -> String {
     std::fs::canonicalize(workspace)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| workspace.to_string_lossy().into_owned())
+}
+
+/// SHA-256 of `<workspace>/.kiro/permissions.json`, if it exists.
+pub fn project_permissions_hash(workspace: &Path) -> Result<Option<String>, WorkspaceTrustError> {
+    let path = workspace.join(".kiro").join("permissions.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(WorkspaceTrustError::Io {
+                stage: "read .kiro/permissions.json",
+                source: e,
+            });
+        }
+    };
+    let digest = Sha256::digest(&bytes);
+    let hex = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    Ok(Some(format!("sha256:{hex}")))
 }
 
 #[cfg(test)]
@@ -376,10 +525,7 @@ mod tests {
     #[test]
     fn unknown_workspace_defaults_to_ask() {
         let (_dir, ledger) = fresh_ledger();
-        assert_eq!(
-            ledger.state_for(Path::new("/some/path")),
-            TrustState::Ask
-        );
+        assert_eq!(ledger.state_for(Path::new("/some/path")), TrustState::Ask);
     }
 
     #[test]
@@ -464,5 +610,63 @@ mod tests {
 
         ledger.save().unwrap();
         assert!(!ledger.dirty());
+    }
+
+    #[test]
+    fn project_permissions_hash_returns_sha256_when_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(kiro.join("permissions.json"), b"{}").unwrap();
+        let hash = project_permissions_hash(dir.path()).unwrap().unwrap();
+        assert!(hash.starts_with("sha256:"));
+        assert_eq!(hash.len(), "sha256:".len() + 64);
+    }
+
+    #[test]
+    fn project_permissions_hash_returns_none_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(project_permissions_hash(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn project_permissions_hash_changes_when_rules_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        let path = kiro.join("permissions.json");
+        std::fs::write(&path, br#"{"allow":["Bash(ls:*)"]}"#).unwrap();
+        let first = project_permissions_hash(dir.path()).unwrap();
+        std::fs::write(&path, br#"{"allow":["Bash(cargo test:*)"]}"#).unwrap();
+        let second = project_permissions_hash(dir.path()).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn evaluate_workspace_trust_requires_matching_rules_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let kiro = dir.path().join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        let path = kiro.join("permissions.json");
+        std::fs::write(&path, br#"{"allow":["Bash(ls:*)"]}"#).unwrap();
+        let trusted_hash = project_permissions_hash(dir.path()).unwrap();
+
+        let ledger_path = dir.path().join("trusted_workspaces.json");
+        let mut ledger = WorkspaceTrustLedger::empty_at(ledger_path.clone());
+        ledger.set(
+            dir.path(),
+            TrustState::Trusted,
+            trusted_hash,
+            Some("2026-05-13T11:25:00Z".into()),
+        );
+        ledger.save().unwrap();
+
+        let trusted = evaluate_workspace_trust_from_path(dir.path(), ledger_path.clone());
+        assert!(trusted.applies_project_allow());
+
+        std::fs::write(&path, br#"{"allow":["Bash(cargo test:*)"]}"#).unwrap();
+        let changed = evaluate_workspace_trust_from_path(dir.path(), ledger_path);
+        assert!(!changed.applies_project_allow());
+        assert_eq!(changed.reason, WorkspaceTrustReason::RulesHashChanged);
     }
 }

@@ -8,7 +8,9 @@ use tokio::sync::oneshot;
 
 use super::{ApprovalActivation, BottomPane, BottomPaneAction};
 use crate::chat_stream::ApprovalResponse;
+use crate::tui::approval::queue::ApprovalMetadata;
 use crate::tui::slash_menu::SlashItem;
+use astra_turn_core::permission_scope::AllowScope;
 
 fn key(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -28,6 +30,33 @@ fn enqueue(bp: &mut BottomPane, tool: &str) -> oneshot::Receiver<ApprovalRespons
         None,
         "unknown".into(),
         tx,
+    );
+    rx
+}
+
+fn batch_group(tool_family: &str) -> astra_turn_core::approval_batch_group::ApprovalBatchGroupKey {
+    astra_turn_core::approval_batch_group::ApprovalBatchGroupKey::new(
+        tool_family,
+        "ReadOnly",
+        ["BashExecute".to_string()],
+        uuid::Uuid::nil(),
+    )
+    .with_scope_root("/repo")
+}
+
+fn enqueue_grouped(
+    bp: &mut BottomPane,
+    tool: &str,
+    group: astra_turn_core::approval_batch_group::ApprovalBatchGroupKey,
+) -> oneshot::Receiver<ApprovalResponse> {
+    let (tx, rx) = oneshot::channel();
+    bp.enqueue_approval_with_metadata(
+        tool.to_string(),
+        format!("{tool} needs approval"),
+        None,
+        "unknown".into(),
+        tx,
+        ApprovalMetadata::default().with_batch_group_key(group),
     );
     rx
 }
@@ -281,23 +310,28 @@ fn tab_cycles_between_pendings_when_composer_empty() {
 }
 
 #[test]
-fn batch_button_resolves_all_pendings() {
+fn batch_button_resolves_focused_group_only() {
     let mut bp = BottomPane::new();
-    let rx_a = enqueue(&mut bp, "a");
-    let rx_b = enqueue(&mut bp, "b");
-    let rx_c = enqueue(&mut bp, "c");
+    let group_a = batch_group("Read(src)");
+    let group_b = batch_group("Read(tests)");
+    let rx_a = enqueue_grouped(&mut bp, "a", group_a.clone());
+    let mut rx_b = enqueue_grouped(&mut bp, "b", group_b);
+    let rx_c = enqueue_grouped(&mut bp, "c", group_a);
     assert_eq!(bp.footer.pending_approvals, 3);
 
-    // Navigate to Accept-all (index 4 in the 6-button row).
-    for _ in 0..4 {
+    // Navigate to Accept-all (index 7 in the scoped + batch row).
+    for _ in 0..7 {
         bp.handle_key(special(KeyCode::Right));
     }
     let action = bp.handle_key(special(KeyCode::Enter));
     assert!(matches!(action, BottomPaneAction::ApprovalResolved { .. }));
-    assert_eq!(bp.footer.pending_approvals, 0);
+    assert_eq!(bp.footer.pending_approvals, 1);
     assert_eq!(rx_a.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
-    assert_eq!(rx_b.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
     assert_eq!(rx_c.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
+    assert!(
+        rx_b.try_recv().is_err(),
+        "cross-group approval must remain pending"
+    );
 }
 
 // ─── Preview of focused approval is rendered inside BottomPane ────
@@ -336,8 +370,8 @@ fn activation_single_vs_batch_reports_correct_variant() {
     ));
     assert_eq!(bp.footer.pending_approvals, 1);
 
-    // Navigate to Accept-all (index 4).
-    for _ in 0..4 {
+    // Navigate to Accept-all (index 7 in the scoped + batch row).
+    for _ in 0..7 {
         bp.handle_key(special(KeyCode::Right));
     }
     let act = bp.activate_focused_approval_button();
@@ -380,15 +414,18 @@ fn up_moves_focus_like_left_wrapping_to_skip() {
 }
 
 #[test]
-fn up_down_reach_always_button() {
-    // End-to-end: the user wants to pick "Always" via Up/Down only.
-    // From Accept (index 0), Down twice lands on Always (index 2).
+fn up_down_reach_turn_scope_button() {
+    // End-to-end: the user wants a scoped Always decision via Up/Down only.
+    // From Accept (index 0), Down twice lands on Turn (index 2).
     let mut bp = BottomPane::new();
     let rx = enqueue(&mut bp, "bash");
     let _ = bp.handle_key(special(KeyCode::Down));
     let _ = bp.handle_key(special(KeyCode::Down));
     let _ = bp.handle_key(special(KeyCode::Enter));
-    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::AlwaysAllow);
+    assert_eq!(
+        rx.blocking_recv().unwrap(),
+        ApprovalResponse::AlwaysAllowScoped(AllowScope::RestOfTurn)
+    );
 }
 
 #[test]

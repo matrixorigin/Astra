@@ -146,6 +146,7 @@ pub(crate) async fn stream_chat_sse(
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
     let root_agent_id = p.root_agent_id.unwrap_or("main");
+    p.perm_manager.clear_turn_overrides();
 
     // UX bridge: subscribe to the session-memory broker for this turn
     // and forward qualifying events to the CLI stream as `StatusLine`

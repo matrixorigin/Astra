@@ -217,6 +217,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 "" => {
                     let current = ctx.state.perm_manager.mode();
                     let rules_count = ctx.state.perm_manager.rules_summary().lines().count();
+                    let audit_count = astra_turn_core::permission_audit::counts();
+                    let audit_total = audit_count.0 + audit_count.1 + audit_count.2;
                     let items = vec![
                         SelectionItem {
                             name: "Auto".into(),
@@ -237,6 +239,27 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                             name: "Rules".into(),
                             description: Some(format!(
                                 "View permission rules ({rules_count} lines)"
+                            )),
+                            is_current: false,
+                        },
+                        SelectionItem {
+                            name: "Trust Workspace".into(),
+                            description: Some(
+                                "Apply project allow rules after hash validation".into(),
+                            ),
+                            is_current: false,
+                        },
+                        SelectionItem {
+                            name: "Untrust Workspace".into(),
+                            description: Some(
+                                "Ignore project allow rules for this workspace".into(),
+                            ),
+                            is_current: false,
+                        },
+                        SelectionItem {
+                            name: "Trace".into(),
+                            description: Some(format!(
+                                "View permission audit events ({audit_total})"
                             )),
                             is_current: false,
                         },
@@ -271,9 +294,54 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     )));
                     SlashResult::Handled
                 }
+                "trust" => {
+                    match ctx.state.perm_manager.trust_workspace() {
+                        Ok(message) => ctx.show_response(message),
+                        Err(err) => {
+                            ctx.show_error(format!("Failed to trust workspace: {err}"));
+                        }
+                    }
+                    SlashResult::Handled
+                }
+                "untrust" => {
+                    match ctx.state.perm_manager.untrust_workspace() {
+                        Ok(message) => ctx.show_response(message),
+                        Err(err) => {
+                            ctx.show_error(format!("Failed to mark workspace untrusted: {err}"));
+                        }
+                    }
+                    SlashResult::Handled
+                }
+                "trace" => {
+                    use crate::tui::bottom_pane::info_view::InfoView;
+                    let lines = astra_turn_core::permission_audit::format_snapshot_lines(50);
+                    ctx.bottom_pane
+                        .push_view(Box::new(InfoView::from_plain("Permission Trace", lines)));
+                    SlashResult::Handled
+                }
+                arg if arg.starts_with("trace --export ") => {
+                    let path = arg.trim_start_matches("trace --export ").trim();
+                    if path.is_empty() {
+                        ctx.show_error("Missing export path".to_string());
+                        return SlashResult::Handled;
+                    }
+                    let lines = astra_turn_core::permission_audit::snapshot_redacted_jsonl_lines();
+                    let body = if lines.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}\n", lines.join("\n"))
+                    };
+                    match std::fs::write(path, body) {
+                        Ok(()) => ctx.show_response(format!("Permission trace exported to {path}")),
+                        Err(err) => {
+                            ctx.show_error(format!("Failed to export permission trace: {err}"));
+                        }
+                    }
+                    SlashResult::Handled
+                }
                 _ => {
                     ctx.show_error(format!(
-                        "Unknown mode '{args}'. Use: auto, prompt, deny, all, rules"
+                        "Unknown mode '{args}'. Use: auto, prompt, deny, all, rules, trust, untrust, trace"
                     ));
                     SlashResult::Handled
                 }
@@ -931,6 +999,32 @@ pub(crate) fn handle_view_result(
                     summary.lines().map(|l| l.to_string()).collect(),
                 )
                 .with_reopen("/allow"),
+            ));
+            return;
+        }
+        "Trust Workspace" => {
+            match state.perm_manager.trust_workspace() {
+                Ok(message) => chat_widget.commit_system(SystemCell::response(message)),
+                Err(err) => chat_widget.commit_system(SystemCell::error(format!(
+                    "Failed to trust workspace: {err}"
+                ))),
+            }
+            return;
+        }
+        "Untrust Workspace" => {
+            match state.perm_manager.untrust_workspace() {
+                Ok(message) => chat_widget.commit_system(SystemCell::response(message)),
+                Err(err) => chat_widget.commit_system(SystemCell::error(format!(
+                    "Failed to mark workspace untrusted: {err}"
+                ))),
+            }
+            return;
+        }
+        "Trace" => {
+            use crate::tui::bottom_pane::info_view::InfoView;
+            let lines = astra_turn_core::permission_audit::format_snapshot_lines(50);
+            bottom_pane.push_view(Box::new(
+                InfoView::from_plain("Permission Trace", lines).with_reopen("/allow trace"),
             ));
             return;
         }

@@ -12,13 +12,14 @@
 #![allow(dead_code)]
 
 use crate::chat_stream::ApprovalResponse;
+use astra_turn_core::permission_scope::AllowScope;
 
 /// What a single button does when Enter fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ButtonAction {
     /// Resolve the focused approval with this response.
     Respond(ApprovalResponse),
-    /// Resolve every pending approval with this response.
+    /// Resolve the focused approval's batch group with this response.
     RespondAll(ApprovalResponse),
 }
 
@@ -51,8 +52,22 @@ pub(crate) const PRIMARY_BUTTONS: &[Button] = &[
         action: ButtonAction::Respond(ApprovalResponse::Deny),
     },
     Button {
-        label: "Always",
-        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllow),
+        label: "Turn",
+        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(AllowScope::RestOfTurn)),
+    },
+    Button {
+        label: "Session",
+        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(
+            AllowScope::RestOfSession,
+        )),
+    },
+    Button {
+        label: "Project",
+        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(AllowScope::Project)),
+    },
+    Button {
+        label: "User",
+        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(AllowScope::User)),
     },
     Button {
         label: "Skip",
@@ -85,8 +100,22 @@ pub(crate) const PRIMARY_WITH_BATCH: &[Button] = &[
         action: ButtonAction::Respond(ApprovalResponse::Deny),
     },
     Button {
-        label: "Always",
-        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllow),
+        label: "Turn",
+        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(AllowScope::RestOfTurn)),
+    },
+    Button {
+        label: "Session",
+        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(
+            AllowScope::RestOfSession,
+        )),
+    },
+    Button {
+        label: "Project",
+        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(AllowScope::Project)),
+    },
+    Button {
+        label: "User",
+        action: ButtonAction::Respond(ApprovalResponse::AlwaysAllowScoped(AllowScope::User)),
     },
     Button {
         label: "Skip",

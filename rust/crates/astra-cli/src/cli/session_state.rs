@@ -438,7 +438,7 @@ impl Default for SessionState {
             journal: None,
             recent_tools: Vec::new(),
             recent_memory_actions: Vec::new(),
-            perm_manager: PermissionManager::with_project(
+            perm_manager: PermissionManager::with_workspace_trust(
                 std::env::var("ASTRA_CLI_AUTO_APPROVE")
                     .map(|v| v == "1")
                     .unwrap_or(false),

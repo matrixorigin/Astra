@@ -430,6 +430,48 @@ pub(crate) async fn handle_slash_command(
                         let summary = state.perm_manager.rules_summary();
                         eprint!("{summary}");
                     }
+                    "trust" => match state.perm_manager.trust_workspace() {
+                        Ok(message) => eprintln!("  {} {message}", theme::icon_info()),
+                        Err(err) => {
+                            eprintln!("  {} Failed to trust workspace: {err}", theme::icon_warn())
+                        }
+                    },
+                    "untrust" => match state.perm_manager.untrust_workspace() {
+                        Ok(message) => eprintln!("  {} {message}", theme::icon_info()),
+                        Err(err) => eprintln!(
+                            "  {} Failed to mark workspace untrusted: {err}",
+                            theme::icon_warn()
+                        ),
+                    },
+                    "trace" => {
+                        for line in astra_turn_core::permission_audit::format_snapshot_lines(50) {
+                            eprintln!("{line}");
+                        }
+                    }
+                    arg if arg.starts_with("trace --export ") => {
+                        let path = arg.trim_start_matches("trace --export ").trim();
+                        if path.is_empty() {
+                            eprintln!("  {} Missing export path", theme::icon_warn());
+                        } else {
+                            let lines =
+                                astra_turn_core::permission_audit::snapshot_redacted_jsonl_lines();
+                            let body = if lines.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{}\n", lines.join("\n"))
+                            };
+                            match std::fs::write(path, body) {
+                                Ok(()) => eprintln!(
+                                    "  {} Permission trace exported to {path}",
+                                    theme::icon_info()
+                                ),
+                                Err(err) => eprintln!(
+                                    "  {} Failed to export permission trace to {path}: {err}",
+                                    theme::icon_warn()
+                                ),
+                            }
+                        }
+                    }
                     _ => match arg.parse::<PermissionMode>() {
                         Ok(mode) => {
                             state.perm_manager.set_mode(mode);
@@ -441,7 +483,7 @@ pub(crate) async fn handle_slash_command(
                         }
                         Err(_) => {
                             eprintln!(
-                                "  {} Unknown mode '{}'. Use: auto, prompt, deny, all, rules",
+                                "  {} Unknown mode '{}'. Use: auto, prompt, deny, all, rules, trust, untrust, trace",
                                 theme::icon_warn(),
                                 arg
                             );

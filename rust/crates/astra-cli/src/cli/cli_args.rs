@@ -18,6 +18,7 @@
 //! See repository `README.md` for `RUST_LOG` / `ASTRA_LOG_FORMAT`.
 
 use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "astra")]
@@ -609,7 +610,7 @@ pub(crate) struct GrepPatternArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra permissions status\n  astra permissions auto\n  astra permissions prompt\n  astra permissions rules"
+    after_help = "Examples:\n  astra permissions status\n  astra permissions auto\n  astra permissions prompt\n  astra permissions rules\n  astra permissions trust\n  astra permissions trace"
 )]
 pub(crate) struct PermissionsArgs {
     #[command(subcommand)]
@@ -630,6 +631,19 @@ pub(crate) enum PermissionsSubcommand {
     All,
     /// Show permission rules summary
     Rules,
+    /// Trust this workspace's project permission allow rules
+    Trust,
+    /// Mark this workspace untrusted and ignore project allow rules
+    Untrust,
+    /// Show recent permission audit events
+    Trace(PermissionsTraceArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct PermissionsTraceArgs {
+    /// Write redacted JSONL audit events to this file
+    #[arg(long = "export", value_name = "PATH")]
+    pub export: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

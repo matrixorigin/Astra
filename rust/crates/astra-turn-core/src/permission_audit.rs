@@ -50,11 +50,14 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use crate::approval_request_key::ApprovalRequestKey;
 use crate::approval_sink::ApprovalResponse;
-use crate::permission_engine::{DecisionSource, RiskTag, RuleOrigin};
+use crate::permission_engine::{
+    DecisionEnvelope, DecisionSource, HardDecision, RiskTag, RuleOrigin,
+};
 
 /// Global ring-buffer cap per event kind.
 const RING_BUFFER_CAPACITY: usize = 1000;
@@ -338,7 +341,11 @@ impl PermissionAuditRing {
     /// Per-kind counts for the status-line indicator.
     #[must_use]
     pub fn counts(&self) -> (usize, usize, usize) {
-        (self.evaluated.len(), self.resolved.len(), self.persisted.len())
+        (
+            self.evaluated.len(),
+            self.resolved.len(),
+            self.persisted.len(),
+        )
     }
 }
 
@@ -369,6 +376,44 @@ pub fn record_persisted(event: RulePersistedEvent) {
     }
 }
 
+/// Convenience wrapper for call sites that already have a
+/// [`DecisionEnvelope`]. Keeps CLI/runtime evaluated-event wiring consistent.
+pub fn record_evaluated_envelope(
+    tool_name: &str,
+    args: &serde_json::Value,
+    envelope: &DecisionEnvelope,
+    correlation_prefix: &str,
+    source_agent: Option<String>,
+) {
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let request_key = ApprovalRequestKey::new(
+        tool_name.to_string(),
+        cwd,
+        args,
+        source_agent,
+        uuid::Uuid::nil(),
+    );
+    let decision = match &envelope.decision {
+        HardDecision::Allow => "allow",
+        HardDecision::Deny { .. } => "deny",
+        HardDecision::NeedExternal { .. } => "need_external",
+    }
+    .to_string();
+    record_evaluated(PermissionEvaluatedEvent {
+        timestamp_ms,
+        correlation_id: format!("{correlation_prefix}-{timestamp_ms}-{tool_name}"),
+        request_key,
+        decision,
+        source: (&envelope.source).into(),
+        risk_tags: envelope.risk_tags.clone(),
+        need_external: matches!(&envelope.decision, HardDecision::NeedExternal { .. }),
+    });
+}
+
 /// Snapshot the global ring as time-sorted JSONL events.
 #[must_use]
 pub fn snapshot() -> Vec<PermissionAuditEvent> {
@@ -376,6 +421,126 @@ pub fn snapshot() -> Vec<PermissionAuditEvent> {
         .lock()
         .map(|r| r.snapshot_jsonl())
         .unwrap_or_default()
+}
+
+/// Snapshot as redacted JSONL lines suitable for writing to disk.
+/// Export redaction happens here, not at insert time: the in-memory
+/// ring keeps full fidelity for local diagnostics, while persisted
+/// exports remove cwd path prefixes and credential-looking text.
+#[must_use]
+pub fn snapshot_redacted_jsonl_lines() -> Vec<String> {
+    snapshot()
+        .into_iter()
+        .map(redact_event_for_export)
+        .filter_map(|event| serde_json::to_string(&event).ok())
+        .collect()
+}
+
+/// Current ring-buffer counts: `(evaluated, resolved, persisted)`.
+#[must_use]
+pub fn counts() -> (usize, usize, usize) {
+    ring().lock().map(|r| r.counts()).unwrap_or_default()
+}
+
+/// Human-readable trace lines for CLI/TUI surfaces.
+#[must_use]
+pub fn format_snapshot_lines(limit: usize) -> Vec<String> {
+    let events = snapshot();
+    if events.is_empty() {
+        return vec!["No permission audit events recorded yet.".to_string()];
+    }
+
+    let total = events.len();
+    let start = total.saturating_sub(limit.max(1));
+    let mut lines = Vec::with_capacity(total - start + 1);
+    lines.push(format!(
+        "Permission audit trace: showing {} of {} events",
+        total - start,
+        total
+    ));
+    for event in events.into_iter().skip(start) {
+        lines.push(format_audit_event(&event));
+    }
+    lines
+}
+
+fn format_audit_event(event: &PermissionAuditEvent) -> String {
+    match event {
+        PermissionAuditEvent::Evaluated(e) => {
+            let risks = if e.risk_tags.is_empty() {
+                "none".to_string()
+            } else {
+                e.risk_tags
+                    .iter()
+                    .map(|tag| format!("{tag:?}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            format!(
+                "{} evaluated {} -> {} via {} risks={}",
+                e.timestamp_ms, e.request_key.tool, e.decision, e.source.step, risks
+            )
+        }
+        PermissionAuditEvent::Resolved(e) => {
+            let scope = e
+                .scope
+                .map(|s| format!("{s:?}"))
+                .unwrap_or_else(|| "none".to_string());
+            format!(
+                "{} resolved {} -> {:?} scope={} stale_ok={}",
+                e.timestamp_ms, e.request_key.tool, e.response, scope, e.stale_revalidation_passed
+            )
+        }
+        PermissionAuditEvent::Persisted(e) => {
+            let status = if e.saved {
+                "saved".to_string()
+            } else {
+                format!(
+                    "failed:{}",
+                    e.failure_reason.as_deref().unwrap_or("unknown")
+                )
+            };
+            format!(
+                "{} persisted {:?} {} -> {}",
+                e.timestamp_ms, e.target, e.rule_text, status
+            )
+        }
+    }
+}
+
+fn redact_text_for_export(text: String) -> String {
+    crate::safety_middleware::redact_credentials_in_text(&text).0
+}
+
+fn redact_request_key_for_export(mut key: ApprovalRequestKey) -> ApprovalRequestKey {
+    key.canonical_cwd = PathBuf::from("<redacted-cwd>");
+    key.source_agent = key.source_agent.map(redact_text_for_export);
+    key
+}
+
+fn redact_source_label_for_export(mut source: SourceLabel) -> SourceLabel {
+    source.matched_rule = source.matched_rule.map(redact_text_for_export);
+    source.origin = source.origin.map(redact_text_for_export);
+    source
+}
+
+fn redact_event_for_export(event: PermissionAuditEvent) -> PermissionAuditEvent {
+    match event {
+        PermissionAuditEvent::Evaluated(mut e) => {
+            e.request_key = redact_request_key_for_export(e.request_key);
+            e.source = redact_source_label_for_export(e.source);
+            PermissionAuditEvent::Evaluated(e)
+        }
+        PermissionAuditEvent::Resolved(mut e) => {
+            e.request_key = redact_request_key_for_export(e.request_key);
+            PermissionAuditEvent::Resolved(e)
+        }
+        PermissionAuditEvent::Persisted(mut e) => {
+            e.rule_text = redact_text_for_export(e.rule_text);
+            e.failure_reason = e.failure_reason.map(redact_text_for_export);
+            PermissionAuditEvent::Persisted(e)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -453,7 +618,10 @@ mod tests {
         });
 
         let events = r.snapshot_jsonl();
-        let timestamps: Vec<u64> = events.iter().map(PermissionAuditEvent::timestamp_ms).collect();
+        let timestamps: Vec<u64> = events
+            .iter()
+            .map(PermissionAuditEvent::timestamp_ms)
+            .collect();
         assert_eq!(timestamps, vec![100, 200, 300]);
     }
 
@@ -473,12 +641,58 @@ mod tests {
             risk_tags: vec![RiskTag::BashExecute],
             need_external: false,
         });
-        let line =
-            serde_json::to_string(&r.snapshot_jsonl().pop().unwrap()).unwrap();
+        let line = serde_json::to_string(&r.snapshot_jsonl().pop().unwrap()).unwrap();
         // The kind tag must be present so the consumer can route
         // events without inspecting fields.
         assert!(line.contains("\"kind\":\"evaluated\""));
         assert!(line.contains("\"decision\":\"allow\""));
+    }
+
+    #[test]
+    fn redacted_export_removes_cwd_and_secret_text() {
+        let event = PermissionAuditEvent::Evaluated(PermissionEvaluatedEvent {
+            timestamp_ms: 1,
+            correlation_id: "c".into(),
+            request_key: ApprovalRequestKey {
+                tool: "bash".to_string(),
+                canonical_cwd: PathBuf::from("/Users/alice/private/project"),
+                args_hash: [0; 32],
+                payload_hash: None,
+                source_agent: Some("agent OPENAI_API_KEY=sk-1234567890abcdef".to_string()),
+                turn_id: Uuid::nil(),
+            },
+            decision: "deny".into(),
+            source: SourceLabel {
+                step: "deny_rule".into(),
+                matched_rule: Some("OPENAI_API_KEY=sk-1234567890abcdef".into()),
+                origin: Some("project".into()),
+            },
+            risk_tags: vec![RiskTag::CredentialAccess],
+            need_external: false,
+        });
+
+        let line = serde_json::to_string(&redact_event_for_export(event)).unwrap();
+        assert!(!line.contains("/Users/alice/private/project"));
+        assert!(!line.contains("sk-1234567890abcdef"));
+        assert!(line.contains("<redacted-cwd>"));
+    }
+
+    #[test]
+    fn audit_event_formatter_is_compact() {
+        let line = format_audit_event(&PermissionAuditEvent::Evaluated(PermissionEvaluatedEvent {
+            timestamp_ms: 1,
+            correlation_id: "c".into(),
+            request_key: fixture_request(),
+            decision: "allow".into(),
+            source: SourceLabel {
+                step: "mode".into(),
+                matched_rule: None,
+                origin: None,
+            },
+            risk_tags: vec![RiskTag::BashExecute],
+            need_external: false,
+        }));
+        assert_eq!(line, "1 evaluated bash -> allow via mode risks=BashExecute");
     }
 
     #[test]

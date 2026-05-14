@@ -1193,7 +1193,7 @@ pub(super) async fn handle_info_command(
             );
             let _pipeline_modules =
                 crate::session_runtime::create_pipeline_modules_quiet(api, None);
-            let mut pm = PermissionManager::with_project(false, &project_root);
+            let mut pm = PermissionManager::with_workspace_trust(false, &project_root);
             let turn_start = std::time::Instant::now();
             let sr = stream_chat_sse(ChatTurnParams {
                 api,
