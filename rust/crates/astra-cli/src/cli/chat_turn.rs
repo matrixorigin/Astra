@@ -176,7 +176,12 @@ pub(super) fn detect_correction_signal(message: &str) -> bool {
 
 enum TurnAttempt {
     Completed(Box<Result<StreamResult, crate::TurnFailure>>),
-    Interrupted,
+    /// User-cancelled (Ctrl+C / TUI cancel) but the stream was awaited to
+    /// completion so partial text + tool records reach the same persistence
+    /// paths that successful turns use. Carries the same payload as
+    /// `Completed`; the distinction is purely policy: skip auth/session
+    /// retries (the user said stop) and skip auto-invoke (latency).
+    Interrupted(Box<Result<StreamResult, crate::TurnFailure>>),
 }
 
 pub(super) async fn handle_chat_input(
@@ -288,20 +293,8 @@ pub(super) async fn handle_chat_input_with_ui(
 
     let session_id = state.session_id.clone();
     match run_chat_turn(state, &ctx, token, &effective_line, session_id.as_deref()).await {
-        TurnAttempt::Interrupted => {
-            state.last_turn_interrupted = true;
-            if let Some(journal) = state.journal.as_ref() {
-                let evt = session_journal::JournalEvent::turn_error(
-                    state.session_id.as_deref(),
-                    state.turn + 1,
-                    state.model.as_deref(),
-                    &line,
-                    "user_interrupted (Ctrl+C)",
-                    turn_start.elapsed().as_millis() as u64,
-                );
-                let _ = journal.append(&evt);
-                enqueue_ingestion(state, &evt);
-            }
+        TurnAttempt::Interrupted(result) => {
+            apply_user_cancelled_turn(state, ctx.profile, &line, *result, turn_start, ui).await;
             return Ok(());
         }
         TurnAttempt::Completed(result) => match *result {
@@ -326,20 +319,16 @@ pub(super) async fn handle_chat_input_with_ui(
                     ui.show_warning("  Session not found. Creating a new session…");
 
                     match run_chat_turn(state, &ctx, token, &effective_line, None).await {
-                        TurnAttempt::Interrupted => {
-                            state.last_turn_interrupted = true;
-                            if let Some(journal) = state.journal.as_ref() {
-                                let evt = session_journal::JournalEvent::turn_error(
-                                    state.session_id.as_deref(),
-                                    state.turn + 1,
-                                    state.model.as_deref(),
-                                    &line,
-                                    "user_interrupted (Ctrl+C)",
-                                    turn_start.elapsed().as_millis() as u64,
-                                );
-                                let _ = journal.append(&evt);
-                                enqueue_ingestion(state, &evt);
-                            }
+                        TurnAttempt::Interrupted(result) => {
+                            apply_user_cancelled_turn(
+                                state,
+                                ctx.profile,
+                                &line,
+                                *result,
+                                turn_start,
+                                ui,
+                            )
+                            .await;
                             return Ok(());
                         }
                         TurnAttempt::Completed(result) => match *result {
@@ -388,8 +377,16 @@ pub(super) async fn handle_chat_input_with_ui(
                             )
                             .await
                             {
-                                TurnAttempt::Interrupted => {
-                                    state.last_turn_interrupted = true;
+                                TurnAttempt::Interrupted(result) => {
+                                    apply_user_cancelled_turn(
+                                        state,
+                                        ctx.profile,
+                                        &line,
+                                        *result,
+                                        turn_start,
+                                        ui,
+                                    )
+                                    .await;
                                     return Ok(());
                                 }
                                 TurnAttempt::Completed(result) => match *result {
@@ -989,8 +986,12 @@ async fn run_chat_turn(
         crate::task_summary::format_summary(&tasks)
     };
 
-    let attempt = tokio::select! {
-        result = stream_chat_sse(ChatTurnParams {
+    // Snapshot tui_cancel_token before the stream future locks `state` so the
+    // cancel arms can observe it without re-borrowing.
+    let tui_cancel_token = state.tui_cancel_token.clone();
+
+    let (result, was_user_cancel) = {
+        let stream_fut = stream_chat_sse(ChatTurnParams {
             api: ctx.api,
             token,
             auth_profile: ctx.profile,
@@ -1046,23 +1047,61 @@ async fn run_chat_turn(
             harness_sink: Some(state.harness_sink.clone()),
             #[cfg(feature = "harness")]
             harness_trace: Some(state.harness_trace.clone()),
-        }) => TurnAttempt::Completed(Box::new(result)),
-        _ = tokio::signal::ctrl_c() => {
-            cancel_token_for_signal.cancel();
-            if state.tui_cancel_token.is_none() {
-                eprintln!("\n{}", "  Interrupted.".dim());
+        });
+        tokio::pin!(stream_fut);
+
+        // Phase 1: wait for either stream completion or user cancel.
+        // On cancel we flip the token and continue awaiting the same pinned
+        // future so partial text reaches the success/failure pipeline.
+        //
+        // Drain budget: 10s. Cancel handling at round boundaries is fast
+        // (25ms poll loop in agentic_loop_lifecycle.rs:434-462), but
+        // try_write_heavy_checkpoint serialises full state to disk —
+        // hundreds of KB on long sessions, several seeks under fsync
+        // pressure. 10s leaves headroom without freezing the REPL.
+        // The drain is also escapable via a second ^C (see Phase 2).
+        let drain_timeout = std::time::Duration::from_secs(10);
+        tokio::select! {
+            biased;
+            result = &mut stream_fut => (result, false),
+            _ = tokio::signal::ctrl_c() => {
+                cancel_token_for_signal.cancel();
+                if tui_cancel_token.is_none() {
+                    eprintln!("\n{}", "  Interrupted. (press Ctrl+C again to force-exit, or wait up to 10s for graceful drain)".dim());
+                }
+                // Phase 2: drain the runtime so partial text + tool records
+                // reach their persistence paths. Three concurrent escapes:
+                //  - stream completes naturally (best case, full data)
+                //  - timeout fires (wedged runtime, lose partial)
+                //  - second ^C (user impatient — also lose partial)
+                let drained = drain_after_cancel(
+                    &mut stream_fut,
+                    drain_timeout,
+                    "Ctrl+C",
+                ).await;
+                (drained, true)
             }
-            TurnAttempt::Interrupted
-        }
-        _ = async {
-            match &state.tui_cancel_token {
-                Some(token) => token.cancelled().await,
-                None => std::future::pending().await,
+            _ = async {
+                match tui_cancel_token.as_ref() {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                cancel_token_for_signal.cancel();
+                let drained = drain_after_cancel(
+                    &mut stream_fut,
+                    drain_timeout,
+                    "TUI cancel",
+                ).await;
+                (drained, true)
             }
-        } => {
-            cancel_token_for_signal.cancel();
-            TurnAttempt::Interrupted
         }
+    };
+
+    let attempt = if was_user_cancel {
+        TurnAttempt::Interrupted(Box::new(result))
+    } else {
+        TurnAttempt::Completed(Box::new(result))
     };
 
     // ─── P8: auto-invoke diagnostic skills at turn end ──────────────────────
@@ -1074,7 +1113,7 @@ async fn run_chat_turn(
     // Skip auto-invoke on Ctrl+C — the user expects immediate return,
     // and mutex acquisition + signal computation would add perceptible
     // latency to the interrupt response path.
-    if !matches!(attempt, TurnAttempt::Interrupted) {
+    if !matches!(attempt, TurnAttempt::Interrupted(_)) {
         maybe_run_auto_invoke(state).await;
     }
 
@@ -2755,6 +2794,144 @@ pub(super) fn is_auth_error(error: &str) -> bool {
 pub(super) fn is_llm_provider_auth_error(error: &str) -> bool {
     let lower = error.to_lowercase();
     lower.contains("llm provider authentication failed") || lower.contains("[auth] llm provider")
+}
+
+/// Build a `TurnFailure` placeholder when the agentic loop fails to drain
+/// within the post-cancel deadline. Centralised so clippy's
+/// `result_large_err` lint can be allowed once instead of at each call site.
+#[allow(clippy::result_large_err)]
+fn fabricate_user_cancel_failure(reason: &str) -> Result<StreamResult, crate::TurnFailure> {
+    Err(crate::TurnFailure {
+        error: reason.to_string(),
+        partial: crate::PartialTurnData::default(),
+    })
+}
+
+/// Drain the agentic-loop future after the cancel token has been flipped.
+/// Returns whichever of these wins first:
+///   - The future completing on its own (preferred — full partial data).
+///   - A second ^C from the user (force-exit — partial data lost).
+///   - The drain timeout (wedged runtime — partial data lost).
+///
+/// Without the second-^C arm, a runtime stuck inside an unresponsive tool
+/// (e.g. a Bash that ignores SIGTERM, an MCP call without cancel
+/// propagation) would freeze the REPL for the full timeout. The contract
+/// "Ctrl+C returns control to the user immediately" is preserved by giving
+/// them an explicit second-press escape.
+#[allow(clippy::result_large_err)]
+async fn drain_after_cancel<F>(
+    stream_fut: &mut std::pin::Pin<&mut F>,
+    timeout: std::time::Duration,
+    source: &'static str,
+) -> Result<StreamResult, crate::TurnFailure>
+where
+    F: std::future::Future<Output = Result<StreamResult, crate::TurnFailure>>,
+{
+    tokio::select! {
+        biased;
+        r = stream_fut => r,
+        _ = tokio::signal::ctrl_c() => {
+            // User pressed ^C twice — they want OUT now, even at the cost
+            // of partial-data loss. Suggest them, but don't wait further.
+            eprintln!("{}", "  Force-exiting (partial response lost).".dim());
+            fabricate_user_cancel_failure(&format!(
+                "user_interrupted ({source}, force-exit)"
+            ))
+        }
+        _ = tokio::time::sleep(timeout) => {
+            fabricate_user_cancel_failure(&format!(
+                "user_interrupted ({source}, drain timed out after {}s)",
+                timeout.as_secs()
+            ))
+        }
+    }
+}
+
+/// Apply a user-cancelled turn (Ctrl+C / TUI cancel) using the same
+/// persistence paths as a normal completion or failure, so the user's input
+/// line + any partial assistant text reach `state.history`, the journal,
+/// and (on success) `csl_manager.persist_turn`. Without this, the next turn
+/// would see no record of the cancelled exchange and the model's "previous
+/// turn" anchor would jump back two turns.
+///
+/// Branches:
+/// - `Ok(StreamResult)` — runtime drained gracefully (`AgenticLoopOutcome::
+///   Cancelled`, mapped to Ok by `stream_chat_sse`). The cancellation signal
+///   travels through `state.interruption = UserCancelled` (set by the
+///   runtime) → `result.interruption` → `merge_interruption_metadata`,
+///   surfacing as `metadata.interruption_kind="UserCancelled"` on the
+///   normal `JournalEventType::Turn` event. We deliberately reuse
+///   `apply_turn_success_async` so history + CSL stay coherent; the
+///   trade-off is that side-effects (token totals, followup suggestion
+///   inputs, memory extraction) run for a turn the user aborted. The
+///   followup-suggestion gate at `followup_suggestion.rs:19` checks
+///   `last_turn_interrupted`, which we set BEFORE the success path so any
+///   downstream reset of that flag inside `apply_turn_success_*` doesn't
+///   leak into the next turn.
+/// - `Err(TurnFailure)` — runtime returned an error after cancel (rare; only
+///   happens when the cancel races a real failure). We re-tag with the
+///   `[cancelled]` ErrorKind prefix so `ClassifiedError::from` recovers
+///   `ErrorKind::Cancelled`, then route through `report_turn_failure` —
+///   which already preserves partial text in history when present.
+///
+/// Always sets `last_turn_interrupted=true` so followup-suggestion is
+/// suppressed for the next turn.
+///
+/// CSL note: persisting a cancelled turn snapshot may capture a structurally
+/// incomplete `messages` array (e.g. an assistant message with `tool_use`
+/// blocks where the matching `tool_result` never arrived). The runtime
+/// `sanitize_empty_assistant_tool_calls_mut` pass handles the simplest case;
+/// more elaborate dangling-tool-use repair would belong in a runtime-side
+/// post-cancel cleanup, not here.
+async fn apply_user_cancelled_turn(
+    state: &mut SessionState,
+    profile: Option<&str>,
+    line: &str,
+    result: Result<StreamResult, crate::TurnFailure>,
+    turn_start: Instant,
+    // Threaded for symmetry with the non-cancel call sites; on the cancel
+    // path we deliberately route UI through `SilentUi` so the user does not
+    // see a duplicate red "⚠ user_interrupted" banner after the dim
+    // "Interrupted." print at the cancel arm.
+    _ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
+) {
+    // Set BEFORE delegating: `apply_turn_success_async` clears it via the
+    // outer `Completed::Ok` site — but that path is not on this code's
+    // call stack — and we want followup-suggestion to see `true` regardless.
+    state.last_turn_interrupted = true;
+    match result {
+        Ok(stream_result) => {
+            apply_turn_success_async(state, profile, line, stream_result, turn_start).await;
+            // Re-assert the flag in case anything downstream cleared it.
+            state.last_turn_interrupted = true;
+        }
+        Err(mut failure) => {
+            // `[cancelled]` prefix lets `ClassifiedError::from` recover
+            // `ErrorKind::Cancelled` (see `error_kind.rs:388-411`) so the
+            // journal records the canonical kind, retryable=false, with
+            // the user-cancel guidance string instead of "unknown".
+            failure.error = "[cancelled] user_interrupted (Ctrl+C)".to_string();
+            // Suppress the duplicate red "⚠ user_interrupted" banner in
+            // line-mode: the dim "Interrupted." print at the cancel arm
+            // already told the user. report_turn_failure still writes the
+            // journal + history.
+            report_turn_failure(state, profile, line, &failure, turn_start, &mut SilentUi);
+        }
+    }
+}
+
+/// Drop-target for `report_turn_failure`'s UI calls when we want the
+/// persistence side-effects (history push, journal write) without the
+/// red error banner. Used only on the user-cancel path, where the dim
+/// "Interrupted." line already informed the user.
+struct SilentUi;
+
+impl crate::ui_adapter::ReplUiAdapter for SilentUi {
+    fn show_error(&mut self, _msg: &str) {}
+    fn show_warning(&mut self, _msg: &str) {}
+    fn show_info(&mut self, _msg: &str) {}
+    fn show_status(&mut self, _msg: &str) {}
+    fn blank_line(&mut self) {}
 }
 
 fn report_turn_failure(
@@ -4515,6 +4692,195 @@ mod tests {
         assert_eq!(persisted.tool_count, Some(1));
         assert_eq!(persisted.tools_used, Some(vec!["read_file".into()]));
         assert_eq!(persisted.tool_calls.as_ref().map(Vec::len), Some(2));
+    }
+
+    /// Regression: pressing Ctrl+C while the model was streaming used to drop
+    /// the user's input + any partial assistant text on the floor. The next
+    /// turn's history would be anchored at *two turns ago*, breaking
+    /// follow-up references like "what I just asked".
+    ///
+    /// This test exercises the Err branch of `apply_user_cancelled_turn`,
+    /// asserting that the user line + partial response are pushed onto
+    /// `state.history`, and that the journal records `user_interrupted`
+    /// rather than the (often less useful) raw runtime error string.
+    #[tokio::test]
+    async fn user_cancelled_turn_with_partial_text_preserves_user_line_in_history() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-user-cancel-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState {
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            session_id: Some(sid.clone()),
+            model: Some("gpt-5".into()),
+            ..Default::default()
+        };
+
+        // Simulate the runtime returning Err(TurnFailure) carrying partial
+        // text — this is what stream_chat_sse produces after the cancel
+        // token short-circuits the loop and bubbles up through
+        // run_agentic_loop_with_host.
+        let failure = crate::TurnFailure {
+            error: "stream cancelled mid-flight".into(),
+            partial: crate::PartialTurnData {
+                partial_text: "The first half of the answer".into(),
+                ..Default::default()
+            },
+        };
+
+        apply_user_cancelled_turn(
+            &mut state,
+            None,
+            "explain LoopDispatcher",
+            Err(failure),
+            Instant::now(),
+            &mut crate::ui_adapter::LineUiAdapter,
+        )
+        .await;
+
+        // History must contain the user line + partial response so the
+        // *next* turn's prompt assembly anchors on this exchange.
+        assert_eq!(state.history.len(), 1, "user line must be in history");
+        assert_eq!(state.history[0].0, "explain LoopDispatcher");
+        assert!(
+            state.history[0].1.contains("user_interrupted"),
+            "history note should record the cancellation reason: {:?}",
+            state.history[0].1
+        );
+        assert!(
+            state.history[0].1.contains("The first half of the answer"),
+            "history must include the partial assistant text: {:?}",
+            state.history[0].1
+        );
+
+        // followup-suggestion gating relies on this flag.
+        assert!(state.last_turn_interrupted);
+
+        // Journal records the user-cancel reason, not the raw runtime error.
+        let event = state
+            .last_turn_event
+            .as_ref()
+            .expect("turn_error event written");
+        let error_text = event.error.as_deref().unwrap_or_default();
+        assert!(
+            error_text.contains("user_interrupted"),
+            "journal should record user_interrupted, got: {error_text:?}"
+        );
+        assert!(
+            !error_text.contains("stream cancelled mid-flight"),
+            "raw runtime error should not leak into journal: {error_text:?}"
+        );
+    }
+
+    /// Regression: the *Ok* branch of `apply_user_cancelled_turn` is the
+    /// production-common path. When the runtime emits
+    /// `AgenticLoopOutcome::Cancelled`, `stream_chat_sse` returns
+    /// `Ok(StreamResult { full_text: <partial>, interruption: Some(..), ... })`
+    /// — NOT Err. Without this routing the partial text + user line would
+    /// have been dropped on the floor.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn user_cancelled_turn_with_ok_outcome_persists_history_and_flags_interrupted() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-user-cancel-ok-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState {
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            session_id: Some(sid.clone()),
+            model: Some("gpt-5".into()),
+            ..Default::default()
+        };
+
+        // Mirror what stream_chat_sse produces when the runtime emits
+        // AgenticLoopOutcome::Cancelled: Ok with partial full_text and
+        // interruption metadata flagging UserCancelled.
+        let mut stream_result = stub_stream_result("The first half of the answer");
+        stream_result.interruption = Some(serde_json::json!({
+            "kind": "UserCancelled",
+            "reason": null
+        }));
+
+        let initial_turn = state.turn;
+
+        apply_user_cancelled_turn(
+            &mut state,
+            None,
+            "explain LoopDispatcher",
+            Ok(stream_result),
+            Instant::now(),
+            &mut crate::ui_adapter::LineUiAdapter,
+        )
+        .await;
+
+        // History contains the cancelled exchange so the next turn anchors
+        // on it instead of jumping back two turns (the regression).
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].0, "explain LoopDispatcher");
+        assert!(
+            state.history[0].1.contains("The first half of the answer"),
+            "history must include the partial assistant text: {:?}",
+            state.history[0].1
+        );
+
+        // Flag must remain set so the next turn's followup-suggestion gate
+        // suppresses recommendations.
+        assert!(
+            state.last_turn_interrupted,
+            "last_turn_interrupted must survive the apply_turn_success path",
+        );
+
+        // turn counter advances — cancelled turns do count, so /turn
+        // numbering and budget bookkeeping line up with what was journaled.
+        assert_eq!(state.turn, initial_turn + 1);
+    }
+
+    /// Regression: even when the cancelled turn produced no partial text
+    /// (user pressed ^C very early), the user's line must still be visible
+    /// in some persistent form. Today `report_turn_failure` only pushes
+    /// onto history when `partial_text` is non-empty, so the user line is
+    /// preserved through the journal, and `last_turn_interrupted` stays set.
+    #[tokio::test]
+    async fn user_cancelled_turn_without_partial_text_still_journals_and_flags() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-user-cancel-empty-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState {
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            session_id: Some(sid.clone()),
+            model: Some("gpt-5".into()),
+            ..Default::default()
+        };
+
+        let failure = crate::TurnFailure {
+            error: "stream cancelled before first token".into(),
+            partial: crate::PartialTurnData::default(),
+        };
+
+        apply_user_cancelled_turn(
+            &mut state,
+            None,
+            "what's in run_lifecycle.rs",
+            Err(failure),
+            Instant::now(),
+            &mut crate::ui_adapter::LineUiAdapter,
+        )
+        .await;
+
+        // No partial text → history stays empty (existing report_turn_failure
+        // semantics), but the user-line still reaches the journal so it's
+        // recoverable via /turn / /debug.
+        assert_eq!(state.history.len(), 0);
+        assert!(state.last_turn_interrupted);
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        let event = events
+            .iter()
+            .find(|e| {
+                e.event_type == session_journal::JournalEventType::TurnError
+                    && e.user_input.as_deref() == Some("what's in run_lifecycle.rs")
+            })
+            .expect("user-cancelled turn must reach journal");
+        let error_text = event.error.as_deref().unwrap_or_default();
+        assert!(
+            error_text.contains("user_interrupted"),
+            "journal should record user_interrupted, got: {error_text:?}"
+        );
     }
 
     #[test]
