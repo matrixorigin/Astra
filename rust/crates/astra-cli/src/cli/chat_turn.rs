@@ -1004,7 +1004,9 @@ async fn run_chat_turn(
             history: &state.history,
             perm_manager: &mut state.perm_manager,
             verbose_mode: state.verbose_mode,
-            render_policy: state.tui_render_policy.unwrap_or(crate::stream_render::RenderPolicy::Stream),
+            render_policy: state
+                .tui_render_policy
+                .unwrap_or(crate::stream_render::RenderPolicy::Stream),
             recent_tools: &state.recent_tools,
             tool_health_entries: &state.tool_health_entries,
             session_lessons: &state.session_lessons,
@@ -4906,10 +4908,16 @@ mod tests {
 
         // History must contain the user line (with a placeholder assistant
         // entry) so the next turn's prompt sees the cancelled exchange.
-        assert_eq!(state.history.len(), 1, "user line must be pushed to history");
+        assert_eq!(
+            state.history.len(),
+            1,
+            "user line must be pushed to history"
+        );
         assert_eq!(state.history[0].0, "what's in run_lifecycle.rs");
         assert!(
-            state.history[0].1.contains("Interrupted by user before any response"),
+            state.history[0]
+                .1
+                .contains("Interrupted by user before any response"),
             "history should carry an explicit no-response placeholder: {:?}",
             state.history[0].1
         );
