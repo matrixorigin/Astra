@@ -34,16 +34,22 @@ failure-output = "immediate"
 fail-fast = false
 failure-output = "immediate"
 slow-timeout = { period = "30s", terminate-after = 1 }
+# Use all available CPUs — this profile runs on tuned CI/dev hosts where
+# inotify limits are not the bottleneck. Heavy integration suites are still
+# serialised by their test-groups (integration_e2e / plan_executor_e2e).
+test-threads = "num-cpus"
 
 [profile.strict-online]
 fail-fast = false
 failure-output = "immediate"
 slow-timeout = { period = "30s", terminate-after = 1 }
+test-threads = "num-cpus"
 
 [profile.strict-online-ci]
 fail-fast = false
 failure-output = "immediate"
 slow-timeout = { period = "30s", terminate-after = 1 }
+test-threads = "num-cpus"
 
 # ── Parallelism caps for heavy integration suites ────────────────────────
 # Group membership is set via `[[profile.X.overrides]]` below. These test
@@ -74,6 +80,7 @@ test(/stress_multi_turn_state_continuity_50_turns/)
  or package(astra-runtime) and binary(phase_f_nested_cancel)
  or package(astra-runtime) and binary(web_agent_e2e)
  or package(astra-runtime) and binary(bridge_e2e_comprehensive)
+ or package(astra-runtime) and binary(edge_5_5_http_e2e)
 """
 test-group = "integration_e2e"
 
