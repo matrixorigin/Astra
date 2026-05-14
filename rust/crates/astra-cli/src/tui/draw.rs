@@ -112,12 +112,12 @@ pub(crate) fn active_viewport(
     // call. Co-exists with `active_cell` (assistant streaming WHILE
     // sub-agents run shows both).
     //
-    // Visibility rule (reviewer L3 — UX): show the strip whenever
-    // ANY agent is live or failed (the user wants to see in-flight
-    // and failure states), OR when all-success agents finished
-    // within the last `STRIP_LINGER` window so the user has a
-    // moment to glance at the final state before it dissolves.
-    // Beyond that they can still drill in via Ctrl+G.
+    // Visibility rule: show the strip while ANY agent is still live
+    // (running). Once all agents are terminal (completed OR failed),
+    // linger for `STRIP_LINGER` so the user can glance at the final
+    // state, then dismiss. Failed entries no longer pin the strip
+    // permanently — they participate in the same linger window.
+    // Beyond linger the user can still drill in via Ctrl+G.
     const STRIP_LINGER: std::time::Duration = std::time::Duration::from_secs(5);
     let _ = inner_w; // retained for future per-row layout decisions
     let agent_ids = chat_widget.agent_run_ids();
@@ -144,15 +144,15 @@ pub(crate) fn active_viewport(
             })
             .collect();
 
-        let any_live_or_failed = cells.iter().any(|entry| entry.live || entry.failed);
-        let any_recently_done = !any_live_or_failed
+        let any_live = cells.iter().any(|entry| entry.live);
+        let any_recently_terminal = !any_live
             && agent_ids.iter().any(|id| {
                 chat_widget.agent_run_cell(id).is_some_and(|tc| {
                     tc.completed_at
                         .is_some_and(|completed_at| completed_at.elapsed() < STRIP_LINGER)
                 })
             });
-        if any_live_or_failed || any_recently_done {
+        if any_live || any_recently_terminal {
             Some(cells)
         } else {
             None

@@ -2747,19 +2747,7 @@ pub(super) fn is_auth_error(error: &str) -> bool {
     if is_llm_provider_auth_error(error) {
         return false;
     }
-    let lower = error.to_lowercase();
-    // Keep this predicate tightly scoped to Astra session-auth failures.
-    // Generic `401 Unauthorized` / `HTTP 401` text can come from tools and
-    // upstream services (GitHub, MCP servers, provider bridges, etc.) and
-    // should not send the user to `/login`.
-    lower.contains("could not validate credentials")
-        || lower.contains("session expired")
-        || lower.contains("token expired")
-        || lower.contains("invalid token")
-        || lower.contains("invalid token type")
-        || lower.contains("authentication required — try /login")
-        || lower.contains("hint: session expired — try /login")
-        || lower.contains("hint: authentication required — try /login")
+    crate::cli_utils::is_astra_session_auth_error(error)
 }
 
 /// Detect LLM provider authentication failures — upstream Bedrock/Anthropic

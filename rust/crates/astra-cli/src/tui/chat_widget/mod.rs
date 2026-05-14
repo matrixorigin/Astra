@@ -227,6 +227,7 @@ impl AgentRunRegistry {
             cell.duration_ms = None;
             return;
         }
+
         self.order.push(id.clone());
         self.runs
             .insert(id.clone(), Box::new(TaskCell::new_running(id, label)));

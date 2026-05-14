@@ -86,6 +86,7 @@ pub(crate) struct BackgroundTaskHandle {
     pub stderr_path: PathBuf,
     last_output_size: u64,
     last_activity: Instant,
+    last_tail_probe_at: Option<Instant>,
 }
 
 impl BackgroundTaskHandle {
@@ -132,6 +133,7 @@ const MAX_OUTPUT_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
 #[cfg(test)]
 const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 const STALL_THRESHOLD: Duration = Duration::from_secs(45);
+const STALL_TAIL_RECHECK_COOLDOWN: Duration = Duration::from_secs(2);
 const PROMPT_PATTERNS: &[&str] = &[
     "(y/n)",
     "[Y/n]",
@@ -181,6 +183,7 @@ impl BackgroundTaskRegistry {
             stderr_path: stderr_path.clone(),
             last_output_size: 0,
             last_activity: Instant::now(),
+            last_tail_probe_at: None,
         };
         self.tasks.insert(id.clone(), handle);
 
@@ -361,7 +364,15 @@ impl BackgroundTaskRegistry {
             if current_size != handle.last_output_size {
                 handle.last_output_size = current_size;
                 handle.last_activity = Instant::now();
+                handle.last_tail_probe_at = None;
             } else if handle.last_activity.elapsed() > STALL_THRESHOLD {
+                if handle
+                    .last_tail_probe_at
+                    .is_some_and(|at| at.elapsed() < STALL_TAIL_RECHECK_COOLDOWN)
+                {
+                    continue;
+                }
+                handle.last_tail_probe_at = Some(Instant::now());
                 if let Ok(tail) =
                     read_combined_tail_str(&handle.stdout_path, &handle.stderr_path, 1024)
                 {
@@ -702,6 +713,7 @@ mod tests {
             stderr_path: dir.path().join("stderr.log"),
             last_output_size: 0,
             last_activity: Instant::now(),
+            last_tail_probe_at: None,
         };
         (handle, dir)
     }
@@ -934,6 +946,42 @@ mod tests {
             )),
             "expected output cap failure event, got {events:?}"
         );
+    }
+
+    #[test]
+    fn stall_check_throttles_same_size_tail_rechecks() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let (mut handle, _dir) = test_handle_with_status(BgTaskStatus::Running);
+        handle.id = "bg-throttle".into();
+        handle.stdout_path = tmp.path().join("stdout.log");
+        handle.stderr_path = tmp.path().join("stderr.log");
+        std::fs::write(&handle.stdout_path, "still working..\n").unwrap();
+        handle.last_output_size = 16;
+        handle.last_activity = Instant::now() - STALL_THRESHOLD - Duration::from_secs(1);
+        reg.tasks.insert(handle.id.clone(), handle);
+
+        reg.stall_check();
+        assert!(
+            reg.poll_completions().is_empty(),
+            "first non-prompt tail probe should not emit a stall event"
+        );
+
+        std::fs::write(tmp.path().join("stdout.log"), "Continue? [y/N]\n").unwrap();
+        reg.stall_check();
+        assert!(
+            reg.poll_completions().is_empty(),
+            "immediate same-size reread must be throttled to avoid repeated tail I/O"
+        );
+
+        let handle = reg.tasks.get_mut("bg-throttle").unwrap();
+        handle.last_tail_probe_at = Some(Instant::now() - STALL_TAIL_RECHECK_COOLDOWN);
+        reg.stall_check();
+        assert!(reg.poll_completions().iter().any(|event| matches!(
+            event,
+            BgTaskEvent::Stalled { id, last_output_tail }
+                if id == "bg-throttle" && last_output_tail.contains("Continue? [y/N]")
+        )));
     }
 
     #[cfg(unix)]

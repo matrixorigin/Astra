@@ -348,6 +348,22 @@ pub(super) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
     }
 }
 
+/// Session-auth shaped errors that should trigger Astra credential recovery.
+///
+/// Intentionally excludes generic upstream `401 Unauthorized` text: external
+/// services and tools can emit that even when the Astra session is healthy.
+pub(crate) fn is_astra_session_auth_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("could not validate credentials")
+        || lower.contains("session expired")
+        || lower.contains("token expired")
+        || lower.contains("invalid token")
+        || lower.contains("authentication failed")
+        || lower.contains("authentication required — try /login")
+        || lower.contains("hint: session expired — try /login")
+        || lower.contains("hint: authentication required — try /login")
+}
+
 /// Print an LLM/API call failure message with optional hint
 pub(super) fn eprint_api_error(status: u16, context: &str) {
     use crossterm::style::Stylize;
@@ -890,6 +906,20 @@ mod tests {
         let out = super::format_error_with_context(418, "I'm a teapot");
         assert!(out.contains("418"));
         assert!(!out.contains("Hint:"));
+    }
+
+    #[test]
+    fn astra_session_auth_error_matches_session_specific_failures() {
+        let msg =
+            "request failed (401): invalid token\n  Hint: Authentication required — try /login";
+        assert!(super::is_astra_session_auth_error(msg));
+    }
+
+    #[test]
+    fn astra_session_auth_error_ignores_generic_upstream_401s() {
+        assert!(!super::is_astra_session_auth_error(
+            "GitHub API Error: 401 Unauthorized"
+        ));
     }
 
     // ── profile_name ──────────────────────────────────────────────────────────
