@@ -169,6 +169,11 @@ impl From<&DecisionSource> for SourceLabel {
                 matched_rule: None,
                 origin: None,
             },
+            DecisionSource::AskRule { rule, origin } => Self {
+                step: "ask_rule".into(),
+                matched_rule: Some(rule.clone()),
+                origin: Some(format!("{origin:?}").to_lowercase()),
+            },
             DecisionSource::ReadShortCircuit => Self {
                 step: "read_short_circuit".into(),
                 matched_rule: None,

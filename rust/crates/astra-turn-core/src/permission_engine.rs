@@ -53,7 +53,9 @@ use serde_json::Value;
 
 use crate::action_compensation::explicit_approval_reason;
 use crate::approval_fingerprint::{ApprovalFingerprint, FingerprintedOverrides};
-use crate::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind_with_args};
+use crate::cloud_approval_policy::{
+    CloudGatedToolKind, cloud_gated_tool_kind, cloud_gated_tool_kind_with_args,
+};
 use crate::parallel_tool_exec::is_read_only_tool_with_args;
 use crate::permission_match_target::{
     AllowMatchTarget, allow_rule_for_match_target, default_match_target,
@@ -109,6 +111,10 @@ pub enum DecisionSource {
         reason: String,
     },
     SandboxExpansion,
+    AskRule {
+        rule: String,
+        origin: RuleOrigin,
+    },
     ReadShortCircuit,
     SessionOverride {
         allowed: bool,
@@ -179,6 +185,7 @@ pub enum EvaluationStep {
     SensitivePath,
     ExecuteHardDeny,
     SandboxExpand,
+    AskRules,
     ReadShortCircuit,
     SessionOverride,
     ExplicitApproval,
@@ -188,7 +195,7 @@ pub enum EvaluationStep {
 
 /// Canonical ordering. Any reorder must change this constant AND
 /// flip the pinning test in `tests::evaluation_order_is_stable`.
-pub const EVALUATION_ORDER: [EvaluationStep; 12] = [
+pub const EVALUATION_ORDER: [EvaluationStep; 13] = [
     EvaluationStep::SchemaIdentity,
     EvaluationStep::DenyRules,
     EvaluationStep::SafetyMiddleware,
@@ -196,6 +203,7 @@ pub const EVALUATION_ORDER: [EvaluationStep; 12] = [
     EvaluationStep::SensitivePath,
     EvaluationStep::ExecuteHardDeny,
     EvaluationStep::SandboxExpand,
+    EvaluationStep::AskRules,
     EvaluationStep::ReadShortCircuit,
     EvaluationStep::SessionOverride,
     EvaluationStep::ExplicitApproval,
@@ -628,10 +636,31 @@ pub fn evaluate_permission(
         "not a sandbox expansion",
     );
 
+    if let Some(rule) = ctx
+        .inherited
+        .ask_rule_with_context(tool_name, &rule_match_context)
+    {
+        let reason = format!("Tool '{tool_name}' requires parent approval");
+        let decision = HardDecision::NeedExternal {
+            prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.clone()),
+        };
+        push_matched(&mut trace, EvaluationStep::AskRules, &decision, &reason);
+        return envelope(
+            decision,
+            DecisionSource::AskRule {
+                rule: rule.to_string(),
+                origin: RuleOrigin::Inherited,
+            },
+            trace,
+            will_save,
+            risk_tags,
+        );
+    }
+    push_skipped(&mut trace, EvaluationStep::AskRules, "no ask rule matched");
+
     if explicit_approval_reason(tool_name, args).is_none()
         && is_read_only_tool_with_args(tool_name, Some(args))
-        && !(ctx.mode() == PermissionMode::Auto
-            && !ctx.inherited.is_tool_allowed_by_allowlist(tool_name))
+        && ctx.inherited.is_tool_allowed_by_allowlist(tool_name)
     {
         let decision = HardDecision::Allow;
         push_matched(
@@ -980,7 +1009,7 @@ fn fingerprinted_override(
 }
 
 fn content_aware_fingerprint(tool_name: &str, args: &Value) -> ApprovalFingerprint {
-    match cloud_gated_tool_kind_with_args(tool_name, Some(args)) {
+    match cloud_gated_tool_kind(tool_name) {
         Some(CloudGatedToolKind::Execute) => command_hint_from_args(args).map_or_else(
             || ApprovalFingerprint::bare(tool_name),
             |cmd| {
@@ -1017,22 +1046,20 @@ fn risk_tags_for_request(tool_name: &str, args: &Value) -> Vec<RiskTag> {
                 push_risk_tag(&mut tags, RiskTag::GitDestructive);
             }
         }
-        Some(CloudGatedToolKind::Write) => {
-            if sensitive_path_match(args).is_some() {
-                push_risk_tag(&mut tags, RiskTag::WritesSensitiveFile);
-            }
+        Some(CloudGatedToolKind::Write) if sensitive_path_match(args).is_some() => {
+            push_risk_tag(&mut tags, RiskTag::WritesSensitiveFile);
         }
+        Some(CloudGatedToolKind::Write) => {}
         None => {}
     }
-    if tool_name == "mo_query" {
-        if let SafetyMiddlewareDecision::Deny(reason) =
+    if tool_name == "mo_query"
+        && let SafetyMiddlewareDecision::Deny(reason) =
             evaluate_tool_safety_request(tool_name, args)
-            && reason
-                .to_ascii_lowercase()
-                .contains("statements are blocked")
-        {
-            push_risk_tag(&mut tags, RiskTag::SqlDestructive);
-        }
+        && reason
+            .to_ascii_lowercase()
+            .contains("statements are blocked")
+    {
+        push_risk_tag(&mut tags, RiskTag::SqlDestructive);
     }
     tags
 }
@@ -1062,6 +1089,7 @@ mod tests {
                 EvaluationStep::SensitivePath,
                 EvaluationStep::ExecuteHardDeny,
                 EvaluationStep::SandboxExpand,
+                EvaluationStep::AskRules,
                 EvaluationStep::ReadShortCircuit,
                 EvaluationStep::SessionOverride,
                 EvaluationStep::ExplicitApproval,
@@ -1170,6 +1198,24 @@ mod tests {
             envelope.source,
             envelope.trace
         );
+    }
+
+    #[test]
+    fn ask_rule_precedes_read_short_circuit() {
+        let ctx = crate::permission_types::PermissionSyncContext::new(
+            crate::permission_types::InheritedPermissions {
+                mode: crate::permission_types::PermissionMode::Prompt,
+                ask_rules: vec![crate::permission_types::PermissionRule::parse("bash(*)")],
+                ..Default::default()
+            },
+        );
+        let envelope =
+            evaluate_permission("bash", &serde_json::json!({"command": "git status"}), &ctx);
+        assert!(matches!(
+            envelope.decision,
+            HardDecision::NeedExternal { .. }
+        ));
+        assert!(matches!(envelope.source, DecisionSource::AskRule { .. }));
     }
 
     #[test]

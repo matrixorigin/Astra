@@ -6,9 +6,9 @@
 //!
 //! - `OnceThisCall`   — equivalent to AllowOnce, no persistence
 //! - `RestOfTurn`     — auto-approve identical fingerprints for
-//!                      this LLM round only
+//!   this LLM round only
 //! - `RestOfSession`  — auto-approve until the session ends
-//!                      (per-fingerprint, NOT a global mode flip)
+//!   (per-fingerprint, NOT a global mode flip)
 //! - `Project`        — write to .kiro/permissions.json
 //! - `User`           — write to ~/.astra/permissions.json
 //!

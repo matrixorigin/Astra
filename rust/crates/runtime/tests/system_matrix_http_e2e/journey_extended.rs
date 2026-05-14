@@ -8,8 +8,8 @@ use sqlx::Row;
 use std::time::Duration;
 
 use super::harness::{
-    E2E_PASSWORD, E2eAuthMode, bootstrap, collect_sse_body_text, delete_no_content, get_json,
-    grant_astra_admin_role, post_empty, post_json, put_json,
+    E2E_PASSWORD, E2eAuthMode, bootstrap, collect_sse_body_text, delete_json, delete_no_content,
+    get_json, grant_astra_admin_role, post_empty, post_json, put_json,
 };
 use astra_services::session_journal::{JournalEventType, read_journal};
 use axum::{body::Body, http::Request};
@@ -54,9 +54,9 @@ pub async fn run_session_cancel_then_delete() {
         Some("cancelled")
     );
 
-    let st_del =
-        delete_no_content(app, &format!("/sessions/{session_id}"), Some(auth.as_str())).await;
-    assert_eq!(st_del, StatusCode::NO_CONTENT, "delete session");
+    let (st_del, del_j) =
+        delete_json(app, &format!("/sessions/{session_id}"), Some(auth.as_str())).await;
+    assert_eq!(st_del, StatusCode::NO_CONTENT, "delete session: {del_j}");
 
     let (st_get, _) = get_json(
         app,

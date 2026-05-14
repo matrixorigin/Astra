@@ -617,10 +617,6 @@ async fn hard_delete_session_rows(
             "DELETE FROM skill_selection_events WHERE session_id = ?",
         ),
         (
-            "skill_selector_turn_metrics",
-            "DELETE FROM skill_selector_turn_metrics WHERE session_id = ?",
-        ),
-        (
             "session_sync_log",
             "DELETE FROM session_sync_log WHERE session_id = ?",
         ),

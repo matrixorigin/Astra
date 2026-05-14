@@ -87,10 +87,7 @@ pub async fn check_tool_permission(
 
     // Try to request permission from parent
     let Some(mailbox) = mailbox else {
-        let reason = format!(
-            "{} No parent is available to approve this tool call.",
-            prompt.reason
-        );
+        let reason = format!("Tool '{tool_name}' requires permission but no parent available");
         ctx.write()
             .await
             .record_blocked_tool_with_reason(tool_name, Some(&reason));

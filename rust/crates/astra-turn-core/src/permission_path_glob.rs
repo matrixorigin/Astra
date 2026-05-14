@@ -104,7 +104,7 @@ fn glob_match_chars(p: &[char], pi: usize, s: &[char], si: usize) -> bool {
                 let alts = split_brace_alternatives(&p[pi + 1..close]);
                 let after_brace = close + 1;
                 for alt in alts {
-                    let mut composed: Vec<char> = alt.iter().copied().collect();
+                    let mut composed: Vec<char> = alt.to_vec();
                     composed.extend_from_slice(&p[after_brace..]);
                     if glob_match_chars(&composed, 0, s, si) {
                         return true;

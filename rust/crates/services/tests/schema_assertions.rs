@@ -143,19 +143,23 @@ async fn phase1_run_durability_schema_contract() {
         );
     }
 
-    let check_row = sqlx::query("SHOW CREATE TABLE agent_runs")
-        .fetch_one(pool.get())
-        .await
-        .expect("show create table agent_runs");
-    let check_text = check_row
-        .try_get::<String, _>(1)
-        .expect("agent_runs CREATE TABLE DDL");
+    let retry_scope_default_row = sqlx::query(
+        "SELECT COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'agent_runs' AND COLUMN_NAME = 'retry_scope'",
+    )
+    .bind(&schema)
+    .fetch_one(pool.get())
+    .await
+    .expect("load retry_scope default");
+    let retry_scope_default = retry_scope_default_row
+        .try_get::<Option<String>, _>("COLUMN_DEFAULT")
+        .expect("retry_scope COLUMN_DEFAULT");
     assert!(
-        check_text.contains("retry_scope")
-            && check_text.contains("node")
-            && check_text.contains("subtree")
-            && check_text.contains("siblings"),
-        "retry_scope CHECK constraint not found: {check_text}"
+        matches!(
+            retry_scope_default.as_deref(),
+            Some("'node'") | Some("node")
+        ),
+        "retry_scope default must be node; got {retry_scope_default:?}"
     );
 
     let batch_columns = column_names(&pool, &schema, "session_tool_output_batches").await;

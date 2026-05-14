@@ -41,7 +41,7 @@ pub fn normalized_argv_prefix(cmd: &str) -> String {
 
     let mut tokens = Vec::new();
     for raw in cmd.split_whitespace() {
-        if SHELL_METACHARS.iter().any(|m| *m == raw) {
+        if SHELL_METACHARS.contains(&raw) {
             break;
         }
         if raw.starts_with('-') {

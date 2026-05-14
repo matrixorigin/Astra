@@ -160,6 +160,24 @@ fn content_aware_fingerprint(
     }
 }
 
+fn sensitive_path_match(args: &serde_json::Value) -> Option<String> {
+    if let Some(path) = path_hint_from_args(args)
+        && !path.is_empty()
+        && (is_dangerous_file_path(&path)
+            || astra_turn_core::permission_redact::matches_sensitive_path(&path))
+    {
+        return Some(path);
+    }
+    if let Some(cmd) = command_hint_from_args(args)
+        && !cmd.is_empty()
+        && (is_dangerous_file_path(cmd)
+            || astra_turn_core::permission_redact::matches_sensitive_path(cmd))
+    {
+        return Some(cmd.to_string());
+    }
+    None
+}
+
 // ─── Permission types: re-exports from astra-turn-core ──────────────
 //
 // Issue #326 P1 / R1 §1 / R2 Major 4: previously this file defined
@@ -1969,23 +1987,27 @@ impl PermissionManager {
                 };
                 self.session_overrides.insert(fp, true);
                 let rule = Self::make_allow_rule(tool, &rule_args);
-                self.add_allow_rule(&rule);
-                let persist_error = self.take_last_save_error();
-                let scope = if self.project_root.is_some() {
-                    "project"
+                if sensitive_path_match(&rule_args).is_some() {
+                    eprintln!("{}", format!("  ✓ {rule}: allowed for this session").dim());
                 } else {
-                    "session"
-                };
-                if let Some(err) = persist_error {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "  ⚠ {rule}: allowed for this session; failed to save {scope} rule: {err}"
-                        )
-                        .yellow()
-                    );
-                } else {
-                    eprintln!("{}", format!("  ✓ {rule}: always allowed ({scope})").dim());
+                    self.add_allow_rule(&rule);
+                    let persist_error = self.take_last_save_error();
+                    let scope = if self.project_root.is_some() {
+                        "project"
+                    } else {
+                        "session"
+                    };
+                    if let Some(err) = persist_error {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "  ⚠ {rule}: allowed for this session; failed to save {scope} rule: {err}"
+                            )
+                            .yellow()
+                        );
+                    } else {
+                        eprintln!("{}", format!("  ✓ {rule}: always allowed ({scope})").dim());
+                    }
                 }
                 ApprovalDecision::AllowSession
             }
@@ -2656,15 +2678,24 @@ impl PermissionManager {
 
         if matches!(envelope.source, DecisionSource::SensitivePath { .. })
             && matches!(envelope.decision, HardDecision::NeedExternal { .. })
-            && self.mode == PermissionMode::Auto
-            && (self.settings.allow_sensitive_path_writes
-                || self.user_settings.allow_sensitive_path_writes)
         {
-            astra_core::agent_warn!(
-                "permission",
-                "Auto mode allowed write to sensitive path (opt-in): tool={name}"
-            );
-            return PermissionDecision::Allow;
+            if let Some(allowed) = self.check_overrides(&content_aware_fingerprint(name, args)) {
+                return if allowed {
+                    PermissionDecision::Allow
+                } else {
+                    PermissionDecision::Deny("Sensitive path denied for session".into())
+                };
+            }
+            if self.mode == PermissionMode::Auto
+                && (self.settings.allow_sensitive_path_writes
+                    || self.user_settings.allow_sensitive_path_writes)
+            {
+                astra_core::agent_warn!(
+                    "permission",
+                    "Auto mode allowed write to sensitive path (opt-in): tool={name}"
+                );
+                return PermissionDecision::Allow;
+            }
         }
 
         match envelope.decision {
@@ -6187,8 +6218,9 @@ mod tests {
             settings_path.display()
         );
         let on_disk = std::fs::read_to_string(&settings_path).unwrap();
+        let saved: PermissionSettings = serde_json::from_str(&on_disk).unwrap();
         assert!(
-            on_disk.contains(&new_rule),
+            saved.allow.contains(&new_rule),
             "saved rule must appear in {}: got {on_disk}",
             settings_path.display()
         );

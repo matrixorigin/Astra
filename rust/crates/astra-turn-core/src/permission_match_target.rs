@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::approval_fingerprint::ApprovalFingerprint;
-use crate::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind_with_args};
+use crate::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
 use crate::parallel_tool_exec::is_read_only_tool_with_args;
 use crate::permission_rule_grammar::{PermissionRuleV2, serialize_rule_v2};
 use crate::permission_scope::AllowScope;
@@ -48,9 +48,9 @@ impl AllowMatchTarget {
 /// conservative, content-aware choice.
 #[must_use]
 pub fn default_match_target(tool_name: &str, args: &Value) -> AllowMatchTarget {
-    match cloud_gated_tool_kind_with_args(tool_name, Some(args)) {
+    match cloud_gated_tool_kind(tool_name) {
         Some(CloudGatedToolKind::Execute) => command_hint_from_args(args)
-            .map(|cmd| normalized_argv_prefix(&cmd))
+            .map(normalized_argv_prefix)
             .filter(|prefix| !prefix.is_empty())
             .map(AllowMatchTarget::Prefix)
             .unwrap_or(AllowMatchTarget::Tool),
@@ -67,7 +67,7 @@ pub fn default_match_target(tool_name: &str, args: &Value) -> AllowMatchTarget {
 
 #[must_use]
 pub fn custom_prefix_source(tool_name: &str, args: &Value) -> String {
-    match cloud_gated_tool_kind_with_args(tool_name, Some(args)) {
+    match cloud_gated_tool_kind(tool_name) {
         Some(CloudGatedToolKind::Execute) => command_hint_from_args(args)
             .map(ToOwned::to_owned)
             .unwrap_or_default(),
@@ -109,12 +109,12 @@ pub fn fingerprint_for_match_target(
 ) -> ApprovalFingerprint {
     match target {
         AllowMatchTarget::Tool => ApprovalFingerprint::bare(tool_name),
-        AllowMatchTarget::Exact => match cloud_gated_tool_kind_with_args(tool_name, Some(args)) {
+        AllowMatchTarget::Exact => match cloud_gated_tool_kind(tool_name) {
             Some(CloudGatedToolKind::Execute) => command_hint_from_args(args)
                 .map(|cmd| {
                     ApprovalFingerprint::shell_exact(
                         tool_name,
-                        &cmd,
+                        cmd,
                         is_read_only_tool_with_args(tool_name, Some(args)),
                     )
                 })
@@ -124,21 +124,19 @@ pub fn fingerprint_for_match_target(
             }
             None => ApprovalFingerprint::bare(tool_name),
         },
-        AllowMatchTarget::Prefix(prefix) => {
-            match cloud_gated_tool_kind_with_args(tool_name, Some(args)) {
-                Some(CloudGatedToolKind::Execute) if !prefix.is_empty() => {
-                    ApprovalFingerprint::shell_prefix(
-                        tool_name,
-                        prefix,
-                        is_read_only_tool_with_args(tool_name, Some(args)),
-                    )
-                }
-                Some(CloudGatedToolKind::Write) if !prefix.is_empty() => {
-                    ApprovalFingerprint::file_op_pattern(tool_name, Some(prefix))
-                }
-                _ => ApprovalFingerprint::bare(tool_name),
+        AllowMatchTarget::Prefix(prefix) => match cloud_gated_tool_kind(tool_name) {
+            Some(CloudGatedToolKind::Execute) if !prefix.is_empty() => {
+                ApprovalFingerprint::shell_prefix(
+                    tool_name,
+                    prefix,
+                    is_read_only_tool_with_args(tool_name, Some(args)),
+                )
             }
-        }
+            Some(CloudGatedToolKind::Write) if !prefix.is_empty() => {
+                ApprovalFingerprint::file_op_pattern(tool_name, Some(prefix))
+            }
+            _ => ApprovalFingerprint::bare(tool_name),
+        },
     }
 }
 
@@ -147,7 +145,7 @@ pub fn match_target_description(
     scope: AllowScope,
     target: &AllowMatchTarget,
     tool_name: &str,
-    args: &Value,
+    _args: &Value,
 ) -> String {
     let duration = match scope {
         AllowScope::OnceThisCall => "for this request",
@@ -157,7 +155,7 @@ pub fn match_target_description(
         AllowScope::User => "for this user",
     };
     let is_execute = matches!(
-        cloud_gated_tool_kind_with_args(tool_name, Some(args)),
+        cloud_gated_tool_kind(tool_name),
         Some(CloudGatedToolKind::Execute)
     );
     match target {
@@ -180,7 +178,7 @@ pub fn match_target_description(
 }
 
 fn exact_rule(tool_name: &str, args: &Value) -> Option<String> {
-    match cloud_gated_tool_kind_with_args(tool_name, Some(args))? {
+    match cloud_gated_tool_kind(tool_name)? {
         CloudGatedToolKind::Execute => {
             let cmd = command_hint_from_args(args)?;
             Some(serialize_rule_v2(&PermissionRuleV2 {
@@ -214,11 +212,11 @@ fn exact_rule(tool_name: &str, args: &Value) -> Option<String> {
     }
 }
 
-fn prefix_rule(tool_name: &str, args: &Value, prefix: &str) -> Option<String> {
+fn prefix_rule(tool_name: &str, _args: &Value, prefix: &str) -> Option<String> {
     if prefix.is_empty() {
         return None;
     }
-    match cloud_gated_tool_kind_with_args(tool_name, Some(args))? {
+    match cloud_gated_tool_kind(tool_name)? {
         CloudGatedToolKind::Execute => Some(serialize_rule_v2(&PermissionRuleV2 {
             tool: display_tool_name(tool_name),
             argv_exact: None,

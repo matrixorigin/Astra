@@ -520,7 +520,6 @@ pub fn catastrophic_command_reason(command: &str) -> Option<String> {
     // Normalize: trim, lowercase, collapse whitespace runs to a single
     // space so `rm  -rf  /` matches the same pattern as `rm -rf /`.
     let normalized: String = command
-        .trim()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -1815,12 +1814,10 @@ fn scan_sql_destructive_keyword(sql: &str) -> Option<&'static str> {
         }
         let upper: String = word.chars().map(|c| c.to_ascii_uppercase()).collect();
         word.clear();
-        for &kw in DESTRUCTIVE_KEYWORDS {
-            if upper == kw {
-                return Some(kw);
-            }
-        }
-        None
+        DESTRUCTIVE_KEYWORDS
+            .iter()
+            .find(|&&kw| upper == kw)
+            .copied()
     };
 
     while i < n {

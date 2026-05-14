@@ -1392,7 +1392,7 @@ mod tests {
         let tool_calls = vec![json!({
             "id": "call-bash-denied",
             "name": "bash",
-            "arguments": r#"{"command": "rm -rf /"}"#
+            "arguments": r#"{"command": "echo hi"}"#
         })];
 
         let mut messages = Vec::new();

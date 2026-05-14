@@ -237,34 +237,34 @@ impl PermissionRule {
             return false;
         }
         if let Some(expected) = &self.op
-            && !ctx
+            && ctx
                 .op
                 .as_deref()
-                .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+                .is_none_or(|actual| !actual.eq_ignore_ascii_case(expected))
         {
             return false;
         }
         if let Some(expected) = &self.cwd_root
-            && !ctx
+            && ctx
                 .cwd
                 .as_deref()
-                .is_some_and(|cwd| cwd_matches_root(cwd, expected))
+                .is_none_or(|cwd| !cwd_matches_root(cwd, expected))
         {
             return false;
         }
         if let Some(expected) = &self.git_branch
-            && !ctx
+            && ctx
                 .git_branch
                 .as_deref()
-                .is_some_and(|actual| actual == expected)
+                .is_none_or(|actual| actual != expected)
         {
             return false;
         }
         if let Some(expected) = &self.domain
-            && !ctx
+            && ctx
                 .domain
                 .as_deref()
-                .is_some_and(|actual| domain_matches(expected, actual))
+                .is_none_or(|actual| !domain_matches(expected, actual))
         {
             return false;
         }
@@ -346,10 +346,7 @@ impl RuleMatchContext {
     #[must_use]
     pub fn from_tool_args(tool_name: &str, args: &serde_json::Value) -> Self {
         let cwd = std::env::current_dir().ok();
-        let op = match crate::cloud_approval_policy::cloud_gated_tool_kind_with_args(
-            tool_name,
-            Some(args),
-        ) {
+        let op = match crate::cloud_approval_policy::cloud_gated_tool_kind(tool_name) {
             Some(crate::cloud_approval_policy::CloudGatedToolKind::Execute) => Some("execute"),
             Some(crate::cloud_approval_policy::CloudGatedToolKind::Write) => Some("write"),
             None => Some("read"),
@@ -629,6 +626,17 @@ impl InheritedPermissions {
         self.deny_rules
             .iter()
             .any(|r| r.matches_with_context(tool_name, ctx))
+    }
+
+    /// Return the inherited ask rule matching this tool call, if any.
+    pub fn ask_rule_with_context(
+        &self,
+        tool_name: &str,
+        ctx: &RuleMatchContext,
+    ) -> Option<&PermissionRule> {
+        self.ask_rules
+            .iter()
+            .find(|r| r.matches_with_context(tool_name, ctx))
     }
 
     /// Check if a tool is in the allowed_tools set (if set).
